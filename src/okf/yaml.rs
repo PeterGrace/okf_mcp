@@ -9,12 +9,23 @@
 //!   `json.dumps` also writes as `"null"`).
 //! - Rendering a null item in a block list writes `null`, not Python's `None`.
 //! - A `\u`/`\U` escape naming a surrogate is an error (Python accepts it).
-//! - Error messages quote with `"` where Python's `repr` uses `'`.
+//! - Error text follows Rust `Debug` escaping, not Python `repr`, so the parity
+//!   tests compare error lines, never messages.
+//! - Null-key consequences: `{null: a, "null": b}` is a duplicate-key error
+//!   here, and `block_item` on a null-key map writes `- "null": a` where
+//!   Python writes `- None: a`.
+//! - `"\U00110000"` is a "bad escape" error where Python raises an uncaught
+//!   `ValueError`.
+//! - Flow collections nested more than `MAX_FLOW_DEPTH` (128) levels deep are an
+//!   error (a stack overflow would abort the server).
 
+use std::fmt::Write;
 use std::sync::LazyLock;
 
 use indexmap::IndexMap;
 use regex::Regex;
+
+use super::pystr::{is_py_space, py_rstrip, py_strip};
 
 /// A parsed YAML value. Every scalar is a string, as in `okf.py`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +68,8 @@ impl Value {
 /// A frontmatter parse failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
+// The fields are public on purpose: this is a plain error record that callers
+// read directly, the documented exception to the private-fields rule.
 pub struct YamlError {
     /// What went wrong.
     pub message: String,
@@ -89,14 +102,22 @@ fn skip_chars(text: &str, n: usize) -> &str {
     }
 }
 
+/// Deepest nesting of `[`/`{` the inline parser accepts. A deeper input is an
+/// error, because unbounded recursion would overflow the stack and abort the
+/// whole server (Python raises a catchable `RecursionError` near 1000).
+const MAX_FLOW_DEPTH: usize = 128;
+
 /// Parser for one line's worth of inline YAML (a scalar or a flow collection).
 struct Inline<'a> {
     chars: Vec<char>,
     pos: usize,
     line: Option<usize>,
     source: &'a str,
+    depth: usize,
 }
 
+// `'a` is a lifetime parameter: `source` is a borrowed `&str` that must
+// outlive the parser, much like holding a reference to a Python string.
 impl<'a> Inline<'a> {
     fn new(source: &'a str, line: Option<usize>) -> Self {
         Self {
@@ -104,6 +125,7 @@ impl<'a> Inline<'a> {
             pos: 0,
             line,
             source,
+            depth: 0,
         }
     }
 
@@ -124,10 +146,12 @@ impl<'a> Inline<'a> {
     fn node(&mut self, flow: bool) -> Result<Value, YamlError> {
         self.skip_ws();
         match self.peek() {
-            Some('{') => self.flow_map(),
-            Some('[') => self.flow_seq(),
+            Some('{') => self.nested(Self::flow_map),
+            Some('[') => self.nested(Self::flow_seq),
             Some('"') => self.double_quoted().map(Value::Str),
             Some('\'') => self.single_quoted().map(Value::Str),
+            // `c @ (...)` binds the matched character to `c` while also
+            // requiring it to be one of the listed alternatives.
             Some(c @ ('&' | '*' | '!' | '|' | '>' | '%' | '@' | '`')) => {
                 Err(self.err(&format!("unsupported YAML indicator {c:?}")))
             }
@@ -135,10 +159,26 @@ impl<'a> Inline<'a> {
         }
     }
 
+    /// Runs a flow-collection parser one level deeper, enforcing the limit.
+    fn nested(
+        &mut self,
+        parse: fn(&mut Self) -> Result<Value, YamlError>,
+    ) -> Result<Value, YamlError> {
+        if self.depth >= MAX_FLOW_DEPTH {
+            return Err(self.err("flow collections nested too deeply"));
+        }
+        self.depth += 1;
+        let result = parse(self);
+        self.depth -= 1;
+        result
+    }
+
     fn double_quoted(&mut self) -> Result<String, YamlError> {
         self.pos += 1;
         let mut out = String::new();
         loop {
+            // `let ... else` binds the pattern or runs the diverging block
+            // (here: return early), like `if x is None: return ...` in Python.
             let Some(c) = self.peek() else {
                 return Err(self.err("unterminated double-quoted string"));
             };
@@ -165,15 +205,12 @@ impl<'a> Inline<'a> {
                     };
                     let start = self.pos + 2;
                     let hex: String = self.chars.iter().skip(start).take(width).collect();
-                    let decoded = (hex.chars().count() == width
-                        && hex.chars().all(|h| h.is_ascii_hexdigit()))
-                    .then(|| u32::from_str_radix(&hex, 16).ok())
-                    .flatten()
-                    .and_then(char::from_u32);
-                    match decoded {
-                        Some(ch) => out.push(ch),
-                        None => return Err(self.err("bad escape")),
+                    if hex.chars().count() != width || !hex.chars().all(|h| h.is_ascii_hexdigit()) {
+                        return Err(self.err("bad escape"));
                     }
+                    let code = u32::from_str_radix(&hex, 16).map_err(|_| self.err("bad escape"))?;
+                    let decoded = char::from_u32(code).ok_or_else(|| self.err("bad escape"))?;
+                    out.push(decoded);
                     self.pos = start + width;
                 }
                 other => {
@@ -225,11 +262,15 @@ impl<'a> Inline<'a> {
             }
             self.pos += 1;
         }
-        let text: String = self.chars[start..self.pos].iter().collect();
-        let text = text.trim_end();
-        match text {
-            "" | "~" | "null" | "Null" | "NULL" => None,
-            other => Some(other.to_string()),
+        let mut end = self.pos;
+        while end > start && is_py_space(self.chars[end - 1]) {
+            end -= 1;
+        }
+        let text: String = self.chars[start..end].iter().collect();
+        if matches!(text.as_str(), "" | "~" | "null" | "Null" | "NULL") {
+            None
+        } else {
+            Some(text)
         }
     }
 
@@ -360,7 +401,7 @@ pub fn parse_inline(text: &str, line: Option<usize>) -> Result<Value, YamlError>
 
 /// Strips a value's surrounding whitespace, or all of it when it is a comment.
 pub(crate) fn strip_comment(text: &str) -> &str {
-    let trimmed = text.trim();
+    let trimmed = py_strip(text);
     if trimmed.starts_with('#') {
         ""
     } else {
@@ -369,19 +410,28 @@ pub(crate) fn strip_comment(text: &str) -> &str {
 }
 
 /// `key: value` at the start of a (dedented) block-mapping line.
+// `LazyLock` is a lazily initialized static: the regex compiles on first use,
+// like a module-level `re.compile(...)` that Rust can't run at import time.
+// `\w` is spelled out because Rust's differs from Python's (see `pystr`).
 static MAP_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"^([A-Za-z0-9_][\w.\-/ ]*?|"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')[ \t]*:(?:[ \t]+(.*)|[ \t]*)$"#,
+        r#"^([A-Za-z0-9_][\p{L}\p{N}_.\-/ ]*?|"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')[ \t]*:(?:[ \t]+(.*)|[ \t]*)$"#,
     )
     .expect("MAP_KEY regex is valid")
 });
+
+/// True for a line that carries content (not blank, not a comment).
+fn is_content_line(text: &str) -> bool {
+    let stripped = py_strip(text);
+    !stripped.is_empty() && !stripped.starts_with('#')
+}
 
 /// Lines that carry content (not blank, not a comment).
 fn content_lines<'a>(lines: &[NumberedLine<'a>]) -> Vec<NumberedLine<'a>> {
     lines
         .iter()
         .copied()
-        .filter(|(_, t)| !t.trim().is_empty() && !t.trim().starts_with('#'))
+        .filter(|(_, t)| is_content_line(t))
         .collect()
 }
 
@@ -408,7 +458,7 @@ pub fn parse_value(
     if let Some(style) = text.chars().next().filter(|c| matches!(c, '|' | '>')) {
         let indent = children
             .iter()
-            .filter(|(_, t)| !t.trim().is_empty())
+            .filter(|(_, t)| !py_strip(t).is_empty())
             .map(|(_, t)| indent_of(t))
             .min()
             .unwrap_or(0);
@@ -419,12 +469,12 @@ pub fn parse_value(
         let joined = body.join(if style == '|' { "\n" } else { " " });
         return Ok(Value::Str(format!("{}\n", joined.trim_end_matches('\n'))));
     }
-    let has_content = !content_lines(children).is_empty();
+    let has_content = children.iter().any(|(_, t)| is_content_line(t));
     if !text.is_empty() {
         if text.starts_with(['[', '{']) && has_content {
             // A flow collection continued over several lines.
             let mut parts = vec![text];
-            parts.extend(children.iter().map(|(_, t)| t.trim()));
+            parts.extend(children.iter().map(|(_, t)| py_strip(t)));
             return parse_inline(&parts.join(" "), Some(line));
         }
         if has_content {
@@ -435,11 +485,10 @@ pub fn parse_value(
         }
         return parse_inline(text, Some(line));
     }
-    let content = content_lines(children);
-    if content.is_empty() {
-        Ok(Value::Null)
+    if has_content {
+        parse_node(&content_lines(children))
     } else {
-        parse_node(&content)
+        Ok(Value::Null)
     }
 }
 
@@ -454,6 +503,8 @@ fn parse_node(content: &[NumberedLine<'_>]) -> Result<Value, YamlError> {
 }
 
 /// Splits block-list lines into (item line, its child lines).
+// `'c` and `'a` are two lifetimes: the slice of lines lives for `'c`, while the
+// line text inside it lives for `'a`; the results borrow from both.
 fn split_items<'c, 'a>(
     content: &'c [NumberedLine<'a>],
     indent: usize,
@@ -464,7 +515,7 @@ fn split_items<'c, 'a>(
         let (number, text) = content[i];
         if indent_of(text) != indent || !is_seq_start(&text[indent..]) {
             return Err(YamlError::new(
-                format!("bad indentation or structure: {:?}", text.trim()),
+                format!("bad indentation or structure: {:?}", py_strip(text)),
                 Some(number),
             ));
         }
@@ -482,7 +533,7 @@ fn parse_seq(content: &[NumberedLine<'_>], indent: usize) -> Result<Value, YamlE
     let mut items = Vec::new();
     for ((number, text), kids) in split_items(content, indent)? {
         let rest = &text[indent + 1..];
-        let item = rest.trim();
+        let item = py_strip(rest);
         if item.is_empty() || item.starts_with('#') {
             items.push(if kids.is_empty() {
                 Value::Null
@@ -512,13 +563,13 @@ fn parse_map(content: &[NumberedLine<'_>], indent: usize) -> Result<Value, YamlE
         let (number, text) = content[i];
         if indent_of(text) != indent {
             return Err(YamlError::new(
-                format!("bad indentation: {:?}", text.trim()),
+                format!("bad indentation: {:?}", py_strip(text)),
                 Some(number),
             ));
         }
         let Some(caps) = MAP_KEY.captures(&text[indent..]) else {
             return Err(YamlError::new(
-                format!("expected 'key: value', got {:?}", text.trim()),
+                format!("expected 'key: value', got {:?}", py_strip(text)),
                 Some(number),
             ));
         };
@@ -530,7 +581,7 @@ fn parse_map(content: &[NumberedLine<'_>], indent: usize) -> Result<Value, YamlE
             indent_of(child) > indent
                 || (indent_of(child) == indent
                     && is_seq_start(&child[indent..])
-                    && inline.trim().is_empty())
+                    && py_strip(inline).is_empty())
         } {
             j += 1;
         }
@@ -576,7 +627,7 @@ const RESERVED_WORDS: [&str; 10] = [
 /// * `text` - the scalar.
 /// * `flow` - whether it sits inside a flow collection, where `,[]{}` are syntax.
 pub fn needs_quote(text: &str, flow: bool) -> bool {
-    if text.is_empty() || text != text.trim() || !PLAIN_SAFE.is_match(text) {
+    if text.is_empty() || text != py_strip(text) || !PLAIN_SAFE.is_match(text) {
         return true;
     }
     if RESERVED_WORDS.contains(&text.to_lowercase().as_str())
@@ -603,7 +654,7 @@ pub fn double_quote(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str(&format!("\\x{:02x}", c as u32))
+                write!(out, "\\x{:02x}", c as u32).expect("writing to a String cannot fail");
             }
             c => out.push(c),
         }
@@ -677,9 +728,8 @@ pub fn block_item(value: &Value, indent: usize) -> Vec<String> {
                         .as_str()
                         .map(|s| scalar(s, false, false))
                         .unwrap_or_default();
-                    format!("{lead}{}: {rendered}", scalar(k, false, false))
-                        .trim_end()
-                        .to_string()
+                    let line = format!("{lead}{}: {rendered}", scalar(k, false, false));
+                    py_rstrip(&line).to_string()
                 })
                 .collect()
         }
@@ -936,6 +986,65 @@ mod tests {
     }
 
     #[test]
+    fn map_key_uses_python_word_class() {
+        let ok = lines(&["  a\u{b2}: 1"]);
+        assert_eq!(
+            parse_value("", &ok, 2).unwrap(),
+            map(&[("a\u{b2}", s("1"))])
+        );
+        let combining = lines(&["  e\u{301}x: 1"]);
+        assert!(parse_value("", &combining, 2).is_err());
+    }
+
+    #[test]
+    fn flow_nesting_is_limited() {
+        assert!(parse_inline(&"[".repeat(10_000), None).is_err());
+        let err =
+            parse_inline(&format!("{}{}", "[".repeat(200), "]".repeat(200)), None).unwrap_err();
+        assert!(err.message.contains("nested too deeply"));
+        let ok = format!("{}{}", "[".repeat(100), "]".repeat(100));
+        assert!(parse_inline(&ok, None).is_ok());
+    }
+
+    #[test]
+    fn block_scalar_blank_line_uses_python_whitespace() {
+        let children = lines(&["    a", "\u{3000}", "    b"]);
+        assert_eq!(parse_value("|", &children, 2).unwrap(), s("a\n\nb\n"));
+    }
+
+    #[test]
+    fn tab_indented_child_line_is_an_error() {
+        // okf.py: `expected 'key: value', got 'a: 1'` (tabs don't count as indent).
+        let children = lines(&["\ta: 1"]);
+        let err = parse_value("", &children, 2).unwrap_err();
+        assert!(
+            err.message.starts_with("expected 'key: value'"),
+            "{}",
+            err.message
+        );
+        let mixed = lines(&["  a: 1", "\tb: 2"]);
+        let err = parse_value("", &mixed, 2).unwrap_err();
+        assert!(
+            err.message.starts_with("bad indentation"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn seq_item_mapping_with_nested_child_line() {
+        // okf.py: "value on the key line and indented lines below it".
+        let children = lines(&["  - k: v", "      n: x"]);
+        let err = parse_value("", &children, 2).unwrap_err();
+        assert!(err.message.contains("value on the key line"));
+        let fine = lines(&["  - k: v", "    n: x"]);
+        assert_eq!(
+            parse_value("", &fine, 2).unwrap(),
+            Value::Seq(vec![map(&[("k", s("v")), ("n", s("x"))])])
+        );
+    }
+
+    #[test]
     fn to_json_shapes() {
         let value = map(&[("a", Value::Seq(vec![s("x"), Value::Null]))]);
         assert_eq!(value.to_json(), serde_json::json!({"a": ["x", null]}));
@@ -974,5 +1083,24 @@ mod tests {
         use hegel::generators;
         let text: String = tc.draw(generators::text());
         let _ = parse_inline(&text, Some(1));
+    }
+
+    #[hegel::test]
+    fn block_parsing_never_panics(tc: hegel::TestCase) {
+        use hegel::generators;
+        let alphabet = [
+            " ", "-", ":", "\t", "#", "|", "[", "a", "e\u{301}", "\u{3000}",
+        ];
+        let pieces = generators::vecs(generators::sampled_from(&alphabet)).max_size(8);
+        let drawn: Vec<Vec<&str>> = tc.draw(generators::vecs(pieces).min_size(1).max_size(6));
+        let owned: Vec<String> = drawn.iter().map(|line| line.concat()).collect();
+        let children: Vec<NumberedLine<'_>> = owned
+            .iter()
+            .enumerate()
+            .map(|(i, text)| (i + 3, text.as_str()))
+            .collect();
+        for inline in ["", "|", "["] {
+            let _ = parse_value(inline, &children, 2);
+        }
     }
 }
