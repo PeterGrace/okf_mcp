@@ -1,8 +1,9 @@
-#[macro_use] extern crate tracing;
+#[macro_use]
+extern crate tracing;
 
 use console_subscriber as tokio_console_subscriber;
-use tracing_subscriber::{EnvFilter, Registry, prelude::*};
 use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::{prelude::*, EnvFilter, Registry};
 fn main() {
     let _ = dotenv::dotenv();
 
@@ -20,7 +21,6 @@ fn main() {
                 .with_line_number(true),
         )
         .with_span_events(FmtSpan::NONE);
-
 
     let subscriber = Registry::default()
         .with(console_layer)
