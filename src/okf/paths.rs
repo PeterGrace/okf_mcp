@@ -6,6 +6,7 @@
 //! Unlike `okf.py`, filesystem paths (absolute or relative to a working
 //! directory) are not accepted: a server has no meaningful working directory.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::sync::LazyLock;
 
@@ -22,11 +23,15 @@ pub const RESERVED: [&str; 2] = ["index.md", "log.md"];
 /// Top-level directories that hold repository machinery, not concepts.
 pub const MACHINERY_DIRS: [&str; 3] = [".git", ".claude", "tools"];
 
+// `LazyLock` builds the value on first use and caches it: like a module-level
+// `re.compile(...)` in Python, but deferred until needed.
 static KEBAB_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9-]*\.md$").expect("KEBAB_NAME regex is valid"));
 
 /// Python's `posixpath.normpath` for relative paths: collapses `.`, `..` and
 /// repeated slashes. An empty result is `.`; leading `..` components are kept.
+/// A leading `//` collapses to `/` (Python keeps `//`), which never matters
+/// because callers strip leading slashes first.
 ///
 /// # Examples
 /// ```
@@ -59,17 +64,49 @@ pub fn normpath(path: &str) -> String {
     }
 }
 
-/// The directory part of a path (`""` for a top-level file).
+/// Does this normalized path leave the catalog (is `..` or starts with `../`)?
+///
+/// A component such as `..a` is an ordinary name, not a parent reference.
+///
+/// # Arguments
+/// * `normalized` - a path already passed through [`normpath`].
+///
+/// # Returns
+/// `true` when the path climbs above its starting directory.
+pub fn escapes_root(normalized: &str) -> bool {
+    normalized == ".." || normalized.starts_with("../")
+}
+
+/// The directory part of a path.
+///
+/// # Arguments
+/// * `path` - a `/`-separated path.
+///
+/// # Returns
+/// Everything before the last `/`, or `""` for a top-level file.
 pub fn dirname(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
 /// The final component of a path.
+///
+/// # Arguments
+/// * `path` - a `/`-separated path.
+///
+/// # Returns
+/// Everything after the last `/`, or the whole path if it has none.
 pub fn basename(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, name)| name)
 }
 
 /// Joins a directory and a path (Python's `os.path.join` for two parts).
+///
+/// # Arguments
+/// * `dir` - the directory; may be empty.
+/// * `path` - the path to append; if it starts with `/` it replaces `dir`.
+///
+/// # Returns
+/// The joined path.
 pub fn join(dir: &str, path: &str) -> String {
     if path.starts_with('/') || dir.is_empty() {
         path.to_string()
@@ -81,6 +118,12 @@ pub fn join(dir: &str, path: &str) -> String {
 }
 
 /// Is this markdown file a concept (not `index.md`, `log.md` or machinery docs)?
+///
+/// # Arguments
+/// * `path` - a bundle-relative markdown path.
+///
+/// # Returns
+/// `true` when the file's name is not in [`NON_CONCEPTS`].
 pub fn is_concept(path: &str) -> bool {
     !NON_CONCEPTS.contains(&basename(path))
 }
@@ -96,21 +139,27 @@ pub fn is_concept(path: &str) -> bool {
 /// assert_eq!(paths, ["a.md", "c.md", "a/z.md", "b/x.md"]);
 /// ```
 pub fn walk_order(left: &str, right: &str) -> Ordering {
-    let left_parts: Vec<&str> = left.split('/').collect();
-    let right_parts: Vec<&str> = right.split('/').collect();
-    for (i, (l, r)) in left_parts.iter().zip(&right_parts).enumerate() {
-        if l == r {
-            continue;
+    // `split` is a lazy iterator, and `peekable` lets us look one item ahead
+    // without consuming it: a component is a file when nothing follows it.
+    let mut left_parts = left.split('/').peekable();
+    let mut right_parts = right.split('/').peekable();
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (Some(l), Some(r)) if l == r => {}
+            (Some(l), Some(r)) => {
+                let left_is_file = left_parts.peek().is_none();
+                let right_is_file = right_parts.peek().is_none();
+                return match (left_is_file, right_is_file) {
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (true, true) | (false, false) => l.cmp(r),
+                };
+            }
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
         }
-        let left_is_file = i == left_parts.len() - 1;
-        let right_is_file = i == right_parts.len() - 1;
-        return match (left_is_file, right_is_file) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            (true, true) | (false, false) => l.cmp(r),
-        };
     }
-    left_parts.len().cmp(&right_parts.len())
 }
 
 /// Resolves a caller's concept reference to a bundle-relative path.
@@ -126,11 +175,12 @@ pub fn walk_order(left: &str, right: &str) -> Ordering {
 /// * [`OkfError::NotFound`] when no candidate exists.
 pub fn resolve_concept(workspace: &dyn Workspace, reference: &str) -> Result<String, OkfError> {
     let bare = reference.trim_start_matches('/');
-    for candidate in [bare.to_string(), format!("{bare}.md")] {
+    // `Cow` holds either a borrowed `&str` or an owned `String`, so the first
+    // candidate needs no allocation.
+    let candidates = [Cow::Borrowed(bare), Cow::Owned(format!("{bare}.md"))];
+    for candidate in candidates {
         let candidate = normpath(&candidate);
-        if candidate.starts_with("..")
-            || !candidate.ends_with(".md")
-            || !workspace.is_file(&candidate)
+        if escapes_root(&candidate) || !candidate.ends_with(".md") || !workspace.is_file(&candidate)
         {
             continue;
         }
@@ -173,7 +223,7 @@ pub fn new_concept_path(
         path.push_str(".md");
     }
     let path = normpath(&path);
-    if path.starts_with("..") || path.starts_with('/') {
+    if escapes_root(&path) || path.starts_with('/') {
         return Err(invalid("not a path inside the catalog"));
     }
     let name = basename(&path);
@@ -194,6 +244,8 @@ pub fn new_concept_path(
             reason: "already exists".to_string(),
         });
     }
+    // `bool::then` runs the closure only when the bool is true, giving `Some(..)`
+    // (else `None`): Python's `x if cond else None`.
     let note = (!KEBAB_NAME.is_match(name))
         .then(|| format!("{name} isn't short, lowercase and hyphenated"));
     Ok((path, note))
@@ -299,6 +351,26 @@ mod tests {
         let ws = workspace();
         let (path, _) = new_concept_path(&ws, "\u{1f}infra/padded\u{1f}").unwrap();
         assert_eq!(path, "infra/padded.md");
+    }
+
+    #[test]
+    fn normpath_matches_python_pairs() {
+        for (input, expected) in [
+            ("a//b/./c/", "a/b/c"),
+            ("a/../../b", "../b"),
+            ("", "."),
+            ("x/..", "."),
+            ("..a/b", "..a/b"),
+        ] {
+            assert_eq!(normpath(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn dotdot_prefixed_names_are_not_escapes() {
+        let ws = MemWorkspace::from_files([("..a/b.md", "x")]);
+        assert_eq!(resolve_concept(&ws, "..a/b").unwrap(), "..a/b.md");
+        assert!(!escapes_root("..a/b") && escapes_root("../a") && escapes_root(".."));
     }
 
     #[hegel::test]

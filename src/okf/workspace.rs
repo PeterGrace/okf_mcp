@@ -5,11 +5,12 @@
 //! refuse paths that escape the catalog root.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use crate::error::OkfError;
-use crate::okf::paths::{normpath, walk_order};
+use crate::okf::paths::{dirname, escapes_root, normpath, walk_order};
 
 /// Read and write access to one catalog's files.
 ///
@@ -18,14 +19,15 @@ pub trait Workspace: Send + Sync {
     /// Reads a file as UTF-8.
     ///
     /// # Errors
-    /// [`OkfError::Io`] if the file is missing, unreadable or not UTF-8.
+    /// [`OkfError::Io`] if the file is missing, unreadable or not UTF-8;
+    /// [`OkfError::InvalidPath`] if the path escapes the catalog.
     fn read_to_string(&self, path: &str) -> Result<String, OkfError>;
 
     /// Writes a file atomically (all or nothing), creating parent directories.
     ///
     /// # Errors
     /// [`OkfError::Io`] on any filesystem failure; [`OkfError::InvalidPath`]
-    /// if the path escapes the catalog.
+    /// if the path escapes the catalog or is not a file path (the root).
     fn write_atomic(&self, path: &str, contents: &str) -> Result<(), OkfError>;
 
     /// Is there a file or directory at `path`?
@@ -50,7 +52,7 @@ pub trait Workspace: Send + Sync {
 /// Normalizes a bundle-relative path and refuses one that leaves the bundle.
 fn checked(path: &str) -> Result<String, OkfError> {
     let normalized = normpath(path.trim_start_matches('/'));
-    if normalized.starts_with("..") {
+    if escapes_root(&normalized) {
         return Err(OkfError::InvalidPath {
             path: path.to_string(),
             reason: "outside the catalog".to_string(),
@@ -59,30 +61,75 @@ fn checked(path: &str) -> Result<String, OkfError> {
     Ok(normalized)
 }
 
+/// Like [`checked`], but also refuses the catalog root itself, which can
+/// never be a file. Every write goes through this.
+fn checked_file(path: &str) -> Result<String, OkfError> {
+    let normalized = checked(path)?;
+    if normalized == "." {
+        return Err(OkfError::InvalidPath {
+            path: path.to_string(),
+            reason: "not a file path".to_string(),
+        });
+    }
+    Ok(normalized)
+}
+
 /// Is any directory component hidden (starts with `.`)?
 fn in_dot_directory(path: &str) -> bool {
-    let mut parts: Vec<&str> = path.split('/').collect();
-    parts.pop();
-    parts.iter().any(|p| p.starts_with('.'))
+    dirname(path).split('/').any(|p| p.starts_with('.'))
+}
+
+/// Where a path lands once symlinks are resolved.
+enum Resolution {
+    /// Nothing there (or a dangling link): the caller's usual behavior applies.
+    Missing,
+    /// Resolves to somewhere under the catalog root.
+    Inside,
+    /// Resolves outside the catalog root, through a symlink.
+    Outside,
 }
 
 /// A catalog on disk, rooted at a directory.
+///
+/// Containment policy: the root is canonicalized once in [`DiskWorkspace::new`].
+/// Every read and predicate canonicalizes its target and refuses (or reports
+/// `false` for) anything that resolves outside the root, so a committed
+/// symlink cannot expose `/etc`. Writes canonicalize the deepest existing
+/// ancestor of the target before creating anything, and refuse to replace a
+/// symlink. Symlinked directories are never traversed by `list_markdown`.
+///
+/// Accepted gap: the check and the use are separate steps, so a symlink swapped
+/// in between could win the race. Only git changes the catalog tree, and git
+/// operations are serialized by the server, so this is not closed further.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskWorkspace {
+    /// The canonical (symlink-free, absolute) root.
     root: PathBuf,
 }
 
 impl DiskWorkspace {
     /// Creates a workspace rooted at `root`.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    ///
+    /// `impl Into<PathBuf>` accepts anything convertible to a path (`&str`,
+    /// `String`, `&Path`, `PathBuf`), like a Python function taking `str | Path`.
+    ///
+    /// # Errors
+    /// [`OkfError::Io`] if `root` does not exist or can't be canonicalized.
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, OkfError> {
+        let root = root.into();
+        let canonical = root.canonicalize().map_err(|source| OkfError::Io {
+            path: root.display().to_string(),
+            source,
+        })?;
+        Ok(Self { root: canonical })
     }
 
-    /// The root directory.
+    /// The canonical root directory.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// The lexical on-disk path for a bundle-relative path (no symlink checks).
     fn full(&self, path: &str) -> Result<PathBuf, OkfError> {
         let rel = checked(path)?;
         Ok(if rel == "." {
@@ -92,6 +139,22 @@ impl DiskWorkspace {
         })
     }
 
+    /// Resolves symlinks in `full` and classifies the result.
+    fn resolve(&self, full: &Path) -> Resolution {
+        match full.canonicalize() {
+            Err(_) => Resolution::Missing,
+            Ok(real) if real.starts_with(&self.root) => Resolution::Inside,
+            Ok(_) => Resolution::Outside,
+        }
+    }
+
+    /// The full path if it exists inside the catalog, else `None`.
+    fn existing_inside(&self, path: &str) -> Option<PathBuf> {
+        let full = self.full(path).ok()?;
+        matches!(self.resolve(&full), Resolution::Inside).then_some(full)
+    }
+
+    /// Recursively lists `.md` files under `dir`, whose catalog-relative name is `prefix`.
     fn collect(&self, dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<(), OkfError> {
         let io_err = |source| OkfError::Io {
             path: prefix.to_string(),
@@ -99,18 +162,24 @@ impl DiskWorkspace {
         };
         for entry in std::fs::read_dir(dir).map_err(io_err)? {
             let entry = entry.map_err(io_err)?;
-            let name = entry.file_name().to_string_lossy().into_owned();
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                tracing::warn!(?file_name, "skipping non-UTF-8 file name");
+                continue;
+            };
             let rel = if prefix.is_empty() {
-                name.clone()
+                name.to_string()
             } else {
                 format!("{prefix}/{name}")
             };
+            // `file_type` does not follow symlinks, so a link to a directory
+            // is not a directory here and is never descended into.
             let file_type = entry.file_type().map_err(io_err)?;
             if file_type.is_dir() {
                 if !name.starts_with('.') {
                     self.collect(&entry.path(), &rel, out)?;
                 }
-            } else if name.ends_with(".md") {
+            } else if name.ends_with(".md") && !(file_type.is_symlink() && entry.path().is_dir()) {
                 out.push(rel);
             }
         }
@@ -120,37 +189,81 @@ impl DiskWorkspace {
 
 impl Workspace for DiskWorkspace {
     fn read_to_string(&self, path: &str) -> Result<String, OkfError> {
-        std::fs::read_to_string(self.full(path)?).map_err(|source| OkfError::Io {
+        let full = self.full(path)?;
+        if matches!(self.resolve(&full), Resolution::Outside) {
+            return Err(OkfError::InvalidPath {
+                path: path.to_string(),
+                reason: "resolves outside the catalog (symlink)".to_string(),
+            });
+        }
+        std::fs::read_to_string(full).map_err(|source| OkfError::Io {
             path: path.to_string(),
             source,
         })
     }
 
     fn write_atomic(&self, path: &str, contents: &str) -> Result<(), OkfError> {
-        let target = self.full(path)?;
+        let target = self.full(&checked_file(path)?)?;
         let io_err = |source| OkfError::Io {
             path: path.to_string(),
             source,
         };
-        let parent = target.parent().unwrap_or(&self.root).to_path_buf();
-        std::fs::create_dir_all(&parent).map_err(io_err)?;
-        // Write a sibling temp file, then rename over the target: a reader sees
-        // the old file or the new one, never half of it.
-        let file_name = target
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let temp = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
-        std::fs::write(&temp, contents).map_err(io_err)?;
-        std::fs::rename(&temp, &target).map_err(io_err)
+        let refuse = |reason: &str| OkfError::InvalidPath {
+            path: path.to_string(),
+            reason: reason.to_string(),
+        };
+        // A file path always has a parent (at worst the root).
+        let parent = target
+            .parent()
+            .expect("a path below the catalog root has a parent");
+        // Walk up to the deepest directory that exists and make sure it is
+        // really inside the catalog, before creating anything.
+        let mut ancestor = parent;
+        while !ancestor.exists() {
+            ancestor = ancestor
+                .parent()
+                .expect("the catalog root exists, so the walk stops there");
+        }
+        let real_ancestor = ancestor.canonicalize().map_err(io_err)?;
+        if !real_ancestor.starts_with(&self.root) {
+            return Err(refuse("resolves outside the catalog (symlink)"));
+        }
+        // Never replace a symlink silently.
+        if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(refuse("is a symlink; refusing to replace it"));
+        }
+        std::fs::create_dir_all(parent).map_err(io_err)?;
+        // Write a uniquely named sibling temp file, then rename over the target:
+        // a reader sees the old file or the new one, never half of it, and
+        // concurrent writers never share a temp file. The temp file is deleted
+        // when `tmp` is dropped, and Rust runs `Drop` on every early return
+        // (like a `with` block's `__exit__`), so no failure path leaks it.
+        // The new file gets default permissions, so an existing file's mode is
+        // not kept (fine for .md files).
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".okf-")
+            .suffix(".tmp")
+            .tempfile_in(parent)
+            .map_err(io_err)?;
+        tmp.write_all(contents.as_bytes()).map_err(io_err)?;
+        // Durable before the rename: XFS/btrfs can otherwise leave an empty
+        // file after a crash.
+        tmp.as_file().sync_all().map_err(io_err)?;
+        tmp.persist(&target).map_err(|e| io_err(e.error))?;
+        Ok(())
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        self.existing_inside(path).is_some_and(|p| p.exists())
     }
 
     fn is_file(&self, path: &str) -> bool {
-        self.full(path).is_ok_and(|p| p.is_file())
+        // `is_ok_and`/`is_some_and` run the closure only on `Ok`/`Some`.
+        self.existing_inside(path).is_some_and(|p| p.is_file())
     }
 
     fn is_dir(&self, path: &str) -> bool {
-        self.full(path).is_ok_and(|p| p.is_dir())
+        self.existing_inside(path).is_some_and(|p| p.is_dir())
     }
 
     fn list_markdown(&self) -> Result<Vec<String>, OkfError> {
@@ -172,10 +285,16 @@ pub struct MemWorkspace {
 
 impl MemWorkspace {
     /// Builds a workspace from `(path, contents)` pairs.
+    ///
+    /// # Panics
+    /// If a path escapes the catalog (a bad test fixture).
     pub fn from_files<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
         let map = files
             .into_iter()
-            .map(|(p, c)| (p.to_string(), c.to_string()))
+            .map(|(p, c)| {
+                let rel = checked_file(p).expect("fixture path must be inside the catalog");
+                (rel, c.to_string())
+            })
             .collect();
         Self {
             files: RwLock::new(map),
@@ -198,11 +317,24 @@ impl Workspace for MemWorkspace {
     }
 
     fn write_atomic(&self, path: &str, contents: &str) -> Result<(), OkfError> {
-        let rel = checked(path)?;
-        self.files
-            .write()
-            .expect("MemWorkspace lock poisoned")
-            .insert(rel, contents.to_string());
+        let rel = checked_file(path)?;
+        let mut files = self.files.write().expect("MemWorkspace lock poisoned");
+        let dir_prefix = format!("{rel}/");
+        let conflict = if files.keys().any(|k| k.starts_with(&dir_prefix)) {
+            Some("is a directory")
+        } else {
+            // Any proper prefix of the path that is a file blocks the write.
+            rel.match_indices('/')
+                .any(|(i, _)| files.contains_key(&rel[..i]))
+                .then_some("a parent component is a file")
+        };
+        if let Some(reason) = conflict {
+            return Err(OkfError::InvalidPath {
+                path: path.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+        files.insert(rel, contents.to_string());
         Ok(())
     }
 
@@ -244,6 +376,33 @@ mod tests {
         ("notes.txt", "not markdown"),
     ];
 
+    /// A temp dir holding a `catalog` subdirectory filled with `files`, so a
+    /// stray write outside the root shows up as an extra entry in the temp dir.
+    fn disk_catalog(files: &[(&str, &str)]) -> (tempfile::TempDir, DiskWorkspace) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("catalog");
+        for (path, contents) in files {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, contents).unwrap();
+        }
+        let ws = DiskWorkspace::new(&root).unwrap();
+        (dir, ws)
+    }
+
+    /// Names of `.okf-*` temp files directly inside `dir` or its subdirectories.
+    fn leftover_temp_files(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()) {
+            if entry.file_name().to_string_lossy().starts_with(".okf-") {
+                found.push(entry.path());
+            } else if entry.file_type().unwrap().is_dir() {
+                found.extend(leftover_temp_files(&entry.path()));
+            }
+        }
+        found
+    }
+
     fn assert_contract(ws: &dyn Workspace) {
         assert_eq!(
             ws.list_markdown().unwrap(),
@@ -266,6 +425,18 @@ mod tests {
         ws.write_atomic("b.md", "b2").unwrap();
         assert_eq!(ws.read_to_string("b.md").unwrap(), "b2");
         assert!(ws.write_atomic("../escape.md", "x").is_err());
+        for root_like in ["", ".", "a/.."] {
+            assert!(
+                matches!(
+                    ws.write_atomic(root_like, "x"),
+                    Err(OkfError::InvalidPath { .. })
+                ),
+                "{root_like:?}"
+            );
+        }
+        // A directory is not a file, and a file is not a directory.
+        assert!(ws.write_atomic("infra", "x").is_err());
+        assert!(ws.write_atomic("b.md/c.md", "x").is_err());
     }
 
     #[test]
@@ -275,19 +446,119 @@ mod tests {
 
     #[test]
     fn disk_workspace_contract() {
-        let dir = tempfile::tempdir().unwrap();
-        for (path, contents) in FILES {
-            let full = dir.path().join(path);
-            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-            std::fs::write(full, contents).unwrap();
-        }
-        let ws = DiskWorkspace::new(dir.path());
+        let (dir, ws) = disk_catalog(&FILES);
         assert_contract(&ws);
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        assert!(leftover_temp_files(ws.root()).is_empty());
+        // Nothing appeared next to the catalog root.
+        let siblings: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .map(|e| e.unwrap().file_name())
             .collect();
-        assert!(leftovers.is_empty());
+        assert_eq!(siblings, ["catalog"]);
+    }
+
+    #[test]
+    fn new_fails_for_a_missing_root() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            DiskWorkspace::new(dir.path().join("nope")),
+            Err(OkfError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn concurrent_writes_to_one_file_never_corrupt_it() {
+        let (_dir, ws) = disk_catalog(&FILES);
+        let payload_a = "A".repeat(1_000_000);
+        let payload_b = "B".repeat(1_000_000);
+        std::thread::scope(|scope| {
+            for payload in [&payload_a, &payload_b] {
+                let ws = &ws;
+                scope.spawn(move || {
+                    for _ in 0..50 {
+                        ws.write_atomic("race.md", payload).unwrap();
+                    }
+                });
+            }
+        });
+        let result = ws.read_to_string("race.md").unwrap();
+        assert!(result == payload_a || result == payload_b);
+        assert!(leftover_temp_files(ws.root()).is_empty());
+    }
+
+    #[test]
+    fn failed_write_leaves_no_temp_file() {
+        let (_dir, ws) = disk_catalog(&FILES);
+        assert!(ws.write_atomic("infra", "x").is_err());
+        assert!(leftover_temp_files(ws.root()).is_empty());
+    }
+
+    #[cfg(unix)]
+    mod symlinks {
+        use std::os::unix::fs::symlink;
+
+        use super::*;
+
+        /// A catalog plus a sibling `outside` directory holding `secret.md`.
+        fn with_outside() -> (tempfile::TempDir, DiskWorkspace, PathBuf) {
+            let (dir, ws) = disk_catalog(&FILES);
+            let outside = dir.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("secret.md"), "secret").unwrap();
+            (dir, ws, outside)
+        }
+
+        #[test]
+        fn read_through_symlinked_directory_is_refused() {
+            let (_dir, ws, outside) = with_outside();
+            symlink(&outside, ws.root().join("evil")).unwrap();
+            assert!(matches!(
+                ws.read_to_string("evil/secret.md"),
+                Err(OkfError::InvalidPath { .. })
+            ));
+            assert!(!ws.is_file("evil/secret.md"));
+            assert!(!ws.is_dir("evil"));
+            assert!(!ws.exists("evil/secret.md"));
+        }
+
+        #[test]
+        fn write_through_symlinked_directory_is_refused() {
+            let (_dir, ws, outside) = with_outside();
+            symlink(&outside, ws.root().join("out")).unwrap();
+            assert!(ws.write_atomic("out/x.md", "x").is_err());
+            assert!(ws.write_atomic("out/new/x.md", "x").is_err());
+            assert!(!outside.join("x.md").exists());
+            assert!(!outside.join("new").exists());
+            assert!(leftover_temp_files(&outside).is_empty());
+        }
+
+        #[test]
+        fn write_never_replaces_a_symlink() {
+            let (_dir, ws, _outside) = with_outside();
+            symlink(ws.root().join("b.md"), ws.root().join("link.md")).unwrap();
+            assert!(ws.write_atomic("link.md", "x").is_err());
+            assert_eq!(ws.read_to_string("b.md").unwrap(), "b");
+        }
+
+        #[test]
+        fn list_markdown_does_not_traverse_symlinked_directories() {
+            let (_dir, ws, outside) = with_outside();
+            symlink(&outside, ws.root().join("evil")).unwrap();
+            symlink(&outside, ws.root().join("dirlink.md")).unwrap();
+            let listed = ws.list_markdown().unwrap();
+            assert!(!listed.iter().any(|p| p.contains("secret")));
+            assert!(!listed.contains(&"dirlink.md".to_string()));
+        }
+
+        #[test]
+        fn symlink_to_a_file_inside_the_catalog_is_readable() {
+            let (_dir, ws, _outside) = with_outside();
+            symlink(ws.root().join("b.md"), ws.root().join("alias.md")).unwrap();
+            assert_eq!(ws.read_to_string("alias.md").unwrap(), "b");
+            assert!(ws
+                .list_markdown()
+                .unwrap()
+                .contains(&"alias.md".to_string()));
+        }
     }
 }
