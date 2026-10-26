@@ -1,0 +1,17 @@
+[package]
+name = "okf_mcp"
+version = "0.1.0"
+edition = "2021"
+authors = ["Peter Grace <pete.grace@gmail.com>"]
+
+[dependencies]
+ctrlc = { version = "3.4.5", features = ["termination"] }
+lazy_static = "1.5.0"
+serde = { version = "1.0.216", features = ["derive"] }
+thiserror = "2.0.6"
+tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros", "time"] }
+tracing = "0.1.41"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
+console-subscriber = "0.4.1"
+dotenv = "0.15.0"
