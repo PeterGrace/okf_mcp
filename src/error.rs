@@ -2,12 +2,13 @@
 
 /// Errors from reading, parsing or editing an OKF catalog.
 ///
-/// Later milestones add variants (auth, git, lint, publish); each variant
-/// carries the catalog-relative path it concerns so an agent can act on it.
+/// Later milestones add variants (auth, git, lint, publish); variants that
+/// concern one document carry its catalog-relative path, so an agent can act
+/// on it.
 #[derive(Debug, thiserror::Error)]
 pub enum OkfError {
     /// No concept or document at the given path.
-    #[error("no concept {path:?}")]
+    #[error("{path}: no such concept or document")]
     NotFound {
         /// The path as the caller gave it.
         path: String,

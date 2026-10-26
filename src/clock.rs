@@ -27,7 +27,10 @@ impl Clock for SystemClock {
 
 /// A clock frozen at one instant, for tests and parity runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FixedClock(pub DateTime<Utc>);
+pub struct FixedClock(
+    /// The instant every call to `now()` returns.
+    pub DateTime<Utc>,
+);
 
 impl Clock for FixedClock {
     fn now(&self) -> DateTime<Utc> {
@@ -75,6 +78,6 @@ mod tests {
     #[test]
     fn system_clock_is_close_to_utc_now() {
         let delta = (SystemClock.now() - Utc::now()).num_seconds().abs();
-        assert!(delta < 5);
+        assert!(delta < 5, "SystemClock drifted {delta}s from Utc::now()");
     }
 }
