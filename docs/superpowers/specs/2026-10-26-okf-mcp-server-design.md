@@ -321,12 +321,15 @@ time server (`time_server` in config) over NTP and logs at `error` if the offset
   placement, `log` heading insertion, secret rules, sprawl scoring, path validation.
 - **Property tests** (Hegel): render then parse returns the same values; textual edits
   change only the target key's lines; any frontmatter the server writes parses.
-- **Differential parity tests against `okf.py`.** A fixture corpus (a snapshot of the real
-  catalog plus hand-made edge cases) is processed by both implementations with a fixed
-  clock (`okf.py` run with a patched `now_utc`). File-writing commands must produce
-  byte-identical files; `lint`, `links`, `oldest` and `sprawl` must produce equal JSON.
-  The outputs are also committed as golden files so the tests keep working after `okf.py`
-  is retired.
+- **Differential parity tests against `okf.py`.** Two corpora are processed by both
+  implementations with a fixed clock (`okf.py` run through a shim with a patched
+  `now_utc`): a committed synthetic corpus of hand-made edge cases
+  (`tests/fixtures/catalog`), and the real catalog, read from the local checkout named
+  by `OKF_PARITY_CATALOG` and never copied into this repository (it is private and this
+  repository is on GitHub). File-writing commands must produce byte-identical files;
+  `lint`, `links`, `oldest` and `sprawl` must produce equal JSON. `okf.py`'s outputs for
+  the synthetic corpus are committed as golden files, which ordinary `cargo test`
+  checks, so the tests keep working after `okf.py` is retired.
 - **Git integration tests** against a temporary bare repository: worktree creation,
   publish, push-race retry, rebase conflict abort, `union` merges of concurrent `log.md`
   lines, session-end cleanup of clean versus dirty worktrees.
