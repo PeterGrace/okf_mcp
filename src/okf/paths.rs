@@ -5,6 +5,9 @@
 //! slash (`infra/time-server.md`); `/` alone is never a filesystem root.
 //! Unlike `okf.py`, filesystem paths (absolute or relative to a working
 //! directory) are not accepted: a server has no meaningful working directory.
+//! Escapes are detected by exact `..` components ([`escapes_root`]), so a name
+//! like `..a` is an ordinary component: a deliberate divergence from
+//! `okf.py`'s `startswith("..")`.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;

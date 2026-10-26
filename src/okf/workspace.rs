@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -42,7 +43,8 @@ pub trait Workspace: Send + Sync {
     fn is_dir(&self, path: &str) -> bool;
 
     /// Every `.md` file, skipping dot-directories, in `os.walk` order
-    /// (see [`walk_order`]).
+    /// (see [`walk_order`]). Every returned path is readable through this
+    /// workspace.
     ///
     /// # Errors
     /// [`OkfError::Io`] if a directory can't be listed.
@@ -98,9 +100,15 @@ enum Resolution {
 /// ancestor of the target before creating anything, and refuse to replace a
 /// symlink. Symlinked directories are never traversed by `list_markdown`.
 ///
+/// Listing contract: `list_markdown` returns only paths readable through this
+/// workspace. A symlink is listed only if it resolves inside the root to a
+/// regular file; dangling and outside links are skipped with a warning. This
+/// deliberately differs from `okf.py`'s `os.walk`, which lists them.
+///
 /// Accepted gap: the check and the use are separate steps, so a symlink swapped
-/// in between could win the race. Only git changes the catalog tree, and git
-/// operations are serialized by the server, so this is not closed further.
+/// in between could win the race. That is accepted provided the caller
+/// serializes writes and git operations on a worktree. That serialization is
+/// planned for M3 (the spec's write and publish flow) and is not enforced here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskWorkspace {
     /// The canonical (symlink-free, absolute) root.
@@ -179,7 +187,20 @@ impl DiskWorkspace {
                 if !name.starts_with('.') {
                     self.collect(&entry.path(), &rel, out)?;
                 }
-            } else if name.ends_with(".md") && !(file_type.is_symlink() && entry.path().is_dir()) {
+            } else if name.ends_with(".md") {
+                if file_type.is_symlink() {
+                    let path = entry.path();
+                    let skip_reason = match self.resolve(&path) {
+                        Resolution::Missing => Some("dangling symlink"),
+                        Resolution::Outside => Some("symlink resolves outside the catalog"),
+                        Resolution::Inside if !path.is_file() => Some("symlink to a non-file"),
+                        Resolution::Inside => None,
+                    };
+                    if let Some(reason) = skip_reason {
+                        tracing::warn!(path = %rel, reason, "not listing symlink");
+                        continue;
+                    }
+                }
                 out.push(rel);
             }
         }
@@ -203,7 +224,8 @@ impl Workspace for DiskWorkspace {
     }
 
     fn write_atomic(&self, path: &str, contents: &str) -> Result<(), OkfError> {
-        let target = self.full(&checked_file(path)?)?;
+        let rel = checked_file(path)?;
+        let target = self.root.join(rel);
         let io_err = |source| OkfError::Io {
             path: path.to_string(),
             source,
@@ -231,6 +253,15 @@ impl Workspace for DiskWorkspace {
         // Never replace a symlink silently.
         if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(refuse("is a symlink; refusing to replace it"));
+        }
+        // Components missing under the checked ancestor cannot exist, unless
+        // one is a dangling symlink (canonicalize failed on it).
+        let mut probe = ancestor.to_path_buf();
+        for component in parent.strip_prefix(ancestor).into_iter().flatten() {
+            probe.push(component);
+            if std::fs::symlink_metadata(&probe).is_ok() {
+                return Err(refuse("dangling symlink in path"));
+            }
         }
         std::fs::create_dir_all(parent).map_err(io_err)?;
         // Write a uniquely named sibling temp file, then rename over the target:
@@ -272,6 +303,14 @@ impl Workspace for DiskWorkspace {
         out.sort_by(|a, b| walk_order(a, b));
         Ok(out)
     }
+}
+
+/// Is there any key starting with `prefix`? One ordered-map probe, O(log n).
+fn has_key_with_prefix(files: &BTreeMap<String, String>, prefix: &str) -> bool {
+    files
+        .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+        .next()
+        .is_some_and(|(key, _)| key.starts_with(prefix))
 }
 
 /// An in-memory catalog for tests. Directories exist implicitly as prefixes
@@ -320,7 +359,7 @@ impl Workspace for MemWorkspace {
         let rel = checked_file(path)?;
         let mut files = self.files.write().expect("MemWorkspace lock poisoned");
         let dir_prefix = format!("{rel}/");
-        let conflict = if files.keys().any(|k| k.starts_with(&dir_prefix)) {
+        let conflict = if has_key_with_prefix(&files, &dir_prefix) {
             Some("is a directory")
         } else {
             // Any proper prefix of the path that is a file blocks the write.
@@ -347,8 +386,7 @@ impl Workspace for MemWorkspace {
         if rel == "." {
             return true;
         }
-        let prefix = format!("{rel}/");
-        self.files().keys().any(|k| k.starts_with(&prefix))
+        has_key_with_prefix(&self.files(), &format!("{rel}/"))
     }
 
     fn list_markdown(&self) -> Result<Vec<String>, OkfError> {
@@ -548,6 +586,33 @@ mod tests {
             let listed = ws.list_markdown().unwrap();
             assert!(!listed.iter().any(|p| p.contains("secret")));
             assert!(!listed.contains(&"dirlink.md".to_string()));
+        }
+
+        #[test]
+        fn listing_skips_dangling_and_outside_file_links() {
+            let (_dir, ws, outside) = with_outside();
+            symlink(ws.root().join("gone.md"), ws.root().join("dangling.md")).unwrap();
+            symlink(outside.join("secret.md"), ws.root().join("leak.md")).unwrap();
+            symlink(ws.root().join("b.md"), ws.root().join("ok.md")).unwrap();
+            let listed = ws.list_markdown().unwrap();
+            assert!(listed.contains(&"ok.md".to_string()));
+            assert!(!listed.contains(&"dangling.md".to_string()));
+            assert!(!listed.contains(&"leak.md".to_string()));
+            for path in &listed {
+                assert!(ws.read_to_string(path).is_ok(), "{path}");
+            }
+        }
+
+        #[test]
+        fn write_through_dangling_symlink_directory_says_so() {
+            let (_dir, ws, outside) = with_outside();
+            symlink(outside.join("missing"), ws.root().join("dang")).unwrap();
+            let err = ws.write_atomic("dang/x.md", "x").unwrap_err();
+            assert!(
+                err.to_string().contains("dangling symlink in path"),
+                "{err}"
+            );
+            assert!(!outside.join("missing").exists());
         }
 
         #[test]
