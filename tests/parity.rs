@@ -17,6 +17,9 @@
 //! `okf` module docs) as a fixture. `infra/hosts/lone-cr.md` in particular
 //! must keep having no frontmatter (see `lone_cr_fixture_has_no_frontmatter`).
 //! `tests/fixtures/catalog/AGENTS.md` is itself a corpus file, not a readme.
+//! Never add a symlinked `.md` file: `list_markdown` deliberately skips
+//! dangling and outside links that `okf.py`'s `os.walk` lists (the listing
+//! contract on `DiskWorkspace`), and git checkouts may not keep symlinks.
 //!
 //! The real catalog is never copied into this repository: it is private.
 
@@ -168,6 +171,19 @@ fn assert_entries_equal(rust: &Json, python: &Json, what: &str) {
         rust.as_array().expect("rust list"),
         python.as_array().expect("python list"),
     );
+    // Same files in the same order first, so a listing difference is reported
+    // as such rather than as a confusing mismatch of two different files.
+    let paths = |entries: &[Json]| -> Vec<Json> {
+        entries
+            .iter()
+            .map(|entry| entry.get("path").cloned().unwrap_or(Json::Null))
+            .collect()
+    };
+    assert_eq!(
+        paths(rust),
+        paths(python),
+        "{what}: Rust (left) and okf.py (right) list different files or orders"
+    );
     for (r, p) in rust.iter().zip(python) {
         assert_eq!(r, p, "{what}: Rust (left) and okf.py (right) disagree");
         // `Map` equality ignores key order, even with serde_json's
@@ -178,11 +194,6 @@ fn assert_entries_equal(rust: &Json, python: &Json, what: &str) {
             "{what}: same content, different key order (Rust left, okf.py right)"
         );
     }
-    assert_eq!(
-        rust.len(),
-        python.len(),
-        "{what}: different number of entries"
-    );
 }
 
 fn golden_path(name: &str) -> PathBuf {

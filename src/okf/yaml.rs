@@ -26,7 +26,7 @@ use std::sync::LazyLock;
 use indexmap::IndexMap;
 use regex::Regex;
 
-use super::pystr::{is_py_space, py_rstrip, py_strip};
+use crate::okf::pystr::{is_py_space, py_rstrip, py_strip};
 
 /// A parsed YAML value. Every scalar is a string, as in `okf.py`.
 #[derive(Debug, Clone, PartialEq, Eq)]

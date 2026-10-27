@@ -8,14 +8,12 @@ usage:
     okf_shim.py markdown ROOT        every .md under ROOT: body headings with slugs, footnotes
     okf_shim.py render               stdin: JSON list of values; stdout: each with its renderings
     okf_shim.py sha256               okf.py's SHA-256, to check that the goldens are current
-    okf_shim.py run --now TS ARG...  run okf.py's CLI with now_utc() frozen at TS (later milestones)
 """
 import hashlib
 import importlib.util
 import json
 import os
 import sys
-from datetime import datetime
 from types import ModuleType
 from typing import NoReturn, Union
 
@@ -112,12 +110,6 @@ def main(argv: list[str]) -> None:
         result = render(load_okf(), values)
     elif command == "sha256" and not args:
         result = sha256()
-    elif command == "run" and len(args) >= 2 and args[0] == "--now":
-        okf = load_okf()
-        frozen = datetime.fromisoformat(args[1].replace("Z", "+00:00"))
-        setattr(okf, "now_utc", lambda: frozen)  # freeze the clock okf.py reads
-        okf.main(args[2:])
-        return
     else:
         usage(f"bad arguments {argv!r}")
     # ASCII-only output: under `python3 -I` stdout's encoding comes from the
