@@ -502,13 +502,10 @@ fn parse_node(content: &[NumberedLine<'_>]) -> Result<Value, YamlError> {
     }
 }
 
-/// Splits block-list lines into (item line, its child lines).
-// `'c` and `'a` are two lifetimes: the slice of lines lives for `'c`, while the
-// line text inside it lives for `'a`; the results borrow from both.
-fn split_items<'c, 'a>(
-    content: &'c [NumberedLine<'a>],
-    indent: usize,
-) -> Result<Vec<(NumberedLine<'a>, &'c [NumberedLine<'a>])>, YamlError> {
+/// Parses a block list. Items are validated and parsed one at a time, as
+/// `okf.py`'s generator-based `_split_items` does, so an error in an early
+/// item is reported before a malformed later line is even looked at.
+fn parse_seq(content: &[NumberedLine<'_>], indent: usize) -> Result<Value, YamlError> {
     let mut items = Vec::new();
     let mut i = 0;
     while i < content.len() {
@@ -523,15 +520,8 @@ fn split_items<'c, 'a>(
         while j < content.len() && indent_of(content[j].1) > indent {
             j += 1;
         }
-        items.push((content[i], &content[i + 1..j]));
+        let kids = &content[i + 1..j];
         i = j;
-    }
-    Ok(items)
-}
-
-fn parse_seq(content: &[NumberedLine<'_>], indent: usize) -> Result<Value, YamlError> {
-    let mut items = Vec::new();
-    for ((number, text), kids) in split_items(content, indent)? {
         let rest = &text[indent + 1..];
         let item = py_strip(rest);
         if item.is_empty() || item.starts_with('#') {
@@ -915,6 +905,34 @@ mod tests {
             err.message
         );
         assert_eq!(err.line, Some(4));
+    }
+
+    #[test]
+    fn list_items_are_validated_lazily_like_okf_py() {
+        // okf.py's generator reports item 1's error before looking at item 3.
+        let children = [(4, " - b"), (5, "  lit"), (6, "- three")];
+        let err = parse_value("", &children, 3).unwrap_err();
+        assert!(
+            err.message.starts_with("value on the key line"),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.line, Some(4));
+
+        let children = [
+            (3, "  - two"),
+            (4, "  - id: one"),
+            (5, "   - c"),
+            (6, "  by: a"),
+            (7, "    deep"),
+        ];
+        let err = parse_value("", &children, 3).unwrap_err();
+        assert!(
+            err.message.starts_with("bad indentation"),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.line, Some(5));
     }
 
     #[test]
