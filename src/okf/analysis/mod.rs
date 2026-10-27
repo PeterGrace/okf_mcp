@@ -8,6 +8,7 @@
 //! exception to the private-fields rule (like `yaml::YamlError`).
 
 pub mod links;
+pub mod oldest;
 pub mod secrets;
 
 /// One lint-style finding: `{"file", "line", "rule", "message"}` in `okf.py`.
