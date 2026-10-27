@@ -1529,6 +1529,8 @@ rayon = "1.12.0"
 
 Create `src/okf/snapshot.rs` with the test module first:
 
+> **Corrected (issue #8), 2026-10-27.** The code below is corrected to what compiled; read `src/okf/snapshot.rs` for the shipped version. Mechanical fixes made inline here: the module doc names `okf::search` in plain code (an intra-doc link to a module Task 11 has not added yet fails `cargo doc -D warnings`; Task 11 makes it a link), the links test annotates `Vec<_>` (the spelled-out six-tuple trips `clippy::type_complexity`), and `backlinks` returns `.map(Vec::as_slice).unwrap_or_default()`. Shipped but not copied here: `_fm_fallback`'s block-item regex is a module-level `LazyLock` (`FALLBACK_ITEM`), `title_and_aliases` returns early for the fallback, `SnapshotDoc` also derives `PartialEq`, the module docs list two more divergences (root machinery docs are kept, outside the link graph; `resolve_concept` sees only snapshot documents, so not a dot-directory file), and there are four more tests (scalar and missing aliases, outside and missing links, dot-directory anchors, a markdown secret found from the document text). No public name, signature or field changed, so Tasks 7-14 need no edits beyond Task 11's link.
+
 ```rust
 #[cfg(test)]
 mod tests {
@@ -1595,7 +1597,7 @@ mod tests {
     fn links_are_resolved_with_existence() {
         let snapshot = Snapshot::build(&catalog()).unwrap();
         let links = snapshot.get("infra/a.md").unwrap().links();
-        let summary: Vec<(usize, &str, &str, bool, Option<&str>, bool)> = links
+        let summary: Vec<_> = links
             .iter()
             .map(|l| {
                 (l.line, l.raw.as_str(), l.target.as_str(), l.absolute, l.fragment.as_deref(), l.target_exists)
@@ -1683,8 +1685,8 @@ Above the tests:
 //!
 //! The design's "In-memory snapshot". M3 keeps one per catalog behind an
 //! `RwLock<Arc<Snapshot>>` and rebuilds it after each fetch or publish; the
-//! analyses in [`crate::okf::analysis`] and [`crate::okf::search`] read it
-//! and never touch the disk.
+//! analyses in [`crate::okf::analysis`] (and M2's `okf::search`) read it and
+//! never touch the disk.
 //!
 //! # Known divergences from `okf.py`
 //!
@@ -1932,7 +1934,8 @@ impl Snapshot {
     /// Links into `path` from documents in the link graph (in-page links
     /// excluded), in walk order.
     pub fn backlinks(&self, path: &str) -> &[Backlink] {
-        self.backlinks.get(path).map_or(&[], Vec::as_slice)
+        // `&[Backlink]` implements `Default` (the empty slice).
+        self.backlinks.get(path).map(Vec::as_slice).unwrap_or_default()
     }
 
     /// Secret-scan findings for every file except `tools/okf.py`.
@@ -4499,7 +4502,7 @@ fn snippet(body: &str, terms: &[String], phrase: &str) -> Option<String> {
 
 - [ ] **Step 4: Give each concept its fields**
 
-In `src/okf/snapshot.rs`: add `search: Option<crate::okf::search::SearchFields>` to `SnapshotDoc`, with:
+In `src/okf/snapshot.rs`: add `search: Option<crate::okf::search::SearchFields>` to `SnapshotDoc` (which derives `PartialEq`, so `SearchFields` must too, as it does), and turn the module doc's plain `okf::search` into the link [`crate::okf::search`] (added (issue #8): Task 6 could not link a module that did not exist yet), with:
 
 ```rust
     /// The search fields; `Some` for concepts only.

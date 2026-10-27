@@ -17,6 +17,8 @@ path = "src/main.rs"
 chrono = { version = "0.4.45", default-features = false, features = ["now"] }
 # Insertion-ordered maps, matching Python dict order for frontmatter mappings.
 indexmap = "2.14.2"
+# Data parallelism for building snapshots and running analyses across documents.
+rayon = "1.12.0"
 regex = "1.13.1"
 # `Serialize` derives for the analysis reports, whose JSON must match okf.py's.
 serde = { version = "1.0.229", features = ["derive"] }
