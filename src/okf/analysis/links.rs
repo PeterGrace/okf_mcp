@@ -4,18 +4,20 @@
 //! Unlinked mentions use one `RegexSet` holding every (concept, name)
 //! pattern, so each prose line is scanned once for all concepts at once,
 //! instead of once per concept per name as in `okf.py`. Concepts are
-//! scanned in parallel.
+//! scanned in parallel. A catalog whose set outgrows the compile limit falls
+//! back to one case-insensitive literal per name, with the boundaries
+//! checked by hand, instead of failing.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use rayon::prelude::*;
-use regex::{Regex, RegexSet, RegexSetBuilder};
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde::Serialize;
 
 use crate::okf::markdown::{find_links, split_frontmatter};
 use crate::okf::paths::{basename, dirname, join, normpath};
-use crate::okf::pystr::{ignorecase_literal, py_lstrip, py_strip, py_unquote};
+use crate::okf::pystr::{ignorecase_literal, is_py_word, py_lstrip, py_strip, py_unquote};
 use crate::okf::snapshot::{DocKind, Snapshot, SnapshotDoc};
 
 /// Names shorter than this (in characters) are never matched as mentions.
@@ -185,7 +187,7 @@ pub fn links_report(snapshot: &Snapshot, mentions: bool) -> LinksReport {
 
     report.index_drift = index_drift(snapshot, &graph, &concept_paths);
     if mentions {
-        report.unlinked_mentions = unlinked_mentions(&concepts);
+        report.unlinked_mentions = unlinked_mentions(&concepts, &MentionMatcher::new(&concepts));
     }
     report.summary = LinksSummary {
         concepts: concepts.len(),
@@ -303,8 +305,27 @@ struct MentionMatcher<'a> {
     targets: Vec<(&'a str, Vec<String>)>,
     /// For each set pattern: `(index into targets, index into its names)`.
     owners: Vec<(usize, usize)>,
-    /// One [`mention_pattern`] per `owners` entry, in the same order.
-    set: RegexSet,
+    /// How lines are searched for the names, one pattern per `owners` entry.
+    search: NameSearch,
+}
+
+/// The compile limit for the one-set matcher. Hundreds of patterns with
+/// Unicode classes outgrow `regex`'s default 10 MiB; 256 MiB still bounds
+/// compile memory. On the real catalog (143 concepts) the whole report, set
+/// compile included, takes about 150 ms in release mode.
+const SET_SIZE_LIMIT: usize = 256 << 20;
+
+/// How [`MentionMatcher`] finds the names in a line.
+enum NameSearch {
+    /// One [`mention_pattern`] per name, all in one set: each line is
+    /// scanned once for every name.
+    Set(RegexSet),
+    /// The fallback for a catalog whose set outgrows [`SET_SIZE_LIMIT`]: one
+    /// case-insensitive literal per name, each occurrence's neighbours
+    /// checked by [`is_mention_at`]. Slower (one scan per name per line),
+    /// but small, since the Unicode boundary classes are not compiled into
+    /// every pattern.
+    Literals(Vec<Regex>),
 }
 
 impl<'a> MentionMatcher<'a> {
@@ -312,45 +333,113 @@ impl<'a> MentionMatcher<'a> {
     /// a long enough name are left out, as `okf.py` leaves them out of
     /// `patterns`.
     fn new(concepts: &[&'a SnapshotDoc]) -> Self {
+        Self::with_set_limit(concepts, SET_SIZE_LIMIT)
+    }
+
+    /// [`MentionMatcher::new`] with a given compile limit for the set, so
+    /// tests can force the [`NameSearch::Literals`] fallback.
+    fn with_set_limit(concepts: &[&'a SnapshotDoc], set_limit: usize) -> Self {
         let targets: Vec<(&str, Vec<String>)> = concepts
             .iter()
             .map(|doc| (doc.path(), names_for(doc)))
             .filter(|(_, names)| !names.is_empty())
             .collect();
-        let mut owners = Vec::new();
-        let mut patterns = Vec::new();
-        for (target, (_, names)) in targets.iter().enumerate() {
-            for (name_index, name) in names.iter().enumerate() {
-                owners.push((target, name_index));
-                patterns.push(mention_pattern(name));
-            }
-        }
-        // Hundreds of patterns with Unicode classes outgrow the default
-        // 10 MiB compile limit. 256 MiB still bounds compile memory. On the
-        // real catalog (143 concepts) the whole report, set compile
-        // included, takes about 150 ms in release mode; a catalog that
-        // exceeds the limit needs the two-stage matcher of plan Task 7 step 5.
-        let set = RegexSetBuilder::new(patterns)
-            .size_limit(256 << 20)
-            .dfa_size_limit(256 << 20)
-            .build()
-            .expect("escaped mention patterns always compile");
+        let owners: Vec<(usize, usize)> = targets
+            .iter()
+            .enumerate()
+            .flat_map(|(target, (_, names))| (0..names.len()).map(move |name| (target, name)))
+            .collect();
+        let name_of = |&(target, name): &(usize, usize)| targets[target].1[name].as_str();
+        let built =
+            RegexSetBuilder::new(owners.iter().map(|owner| mention_pattern(name_of(owner))))
+                .size_limit(set_limit)
+                .dfa_size_limit(set_limit)
+                .build();
+        // The patterns are escaped literals in a fixed frame, so the only way
+        // the build fails is the size limit (`regex::Error::CompiledTooBig`).
+        let search = match built {
+            Ok(set) => NameSearch::Set(set),
+            Err(_) => NameSearch::Literals(
+                owners
+                    .iter()
+                    .map(|owner| literal_regex(name_of(owner)))
+                    .collect(),
+            ),
+        };
         Self {
             targets,
             owners,
-            set,
+            search,
+        }
+    }
+
+    /// The patterns (indexes into `owners`) that match `line`, ascending.
+    fn matching(&self, line: &str) -> Vec<usize> {
+        match &self.search {
+            NameSearch::Set(set) => set.matches(line).into_iter().collect(),
+            NameSearch::Literals(literals) => literals
+                .iter()
+                .enumerate()
+                .filter(|(_, literal)| has_mention(literal, line))
+                .map(|(pattern, _)| pattern)
+                .collect(),
         }
     }
 }
 
+/// `(?i:NAME)` alone, for [`NameSearch::Literals`].
+///
+/// Compiled without a size limit: an escaped literal's program grows
+/// linearly with the name, which is already held in memory, so it always
+/// compiles.
+fn literal_regex(name: &str) -> Regex {
+    RegexBuilder::new(&format!("(?i:{})", ignorecase_literal(name)))
+        .size_limit(usize::MAX)
+        .build()
+        .expect("an escaped literal without a size limit always compiles")
+}
+
+/// Does `literal` occur in `line` at a mention boundary?
+///
+/// Tries every start, overlapping ones included: each literal character
+/// matches exactly one character, so there is one match per start, and
+/// checking each start's neighbours is what `okf.py`'s lookarounds do.
+fn has_mention(literal: &Regex, line: &str) -> bool {
+    let mut start = 0;
+    // `find_at` searches from byte `start` and returns the leftmost match.
+    while let Some(found) = literal.find_at(line, start) {
+        if is_mention_at(line, found.start(), found.end()) {
+            return true;
+        }
+        // Resume one character after this match's start.
+        start = found.start()
+            + line[found.start()..]
+                .chars()
+                .next()
+                .map_or(1, char::len_utf8);
+    }
+    false
+}
+
+/// `(?<![\w/-])` before byte `start` and `(?![\w-])` after byte `end`.
+fn is_mention_at(line: &str, start: usize, end: usize) -> bool {
+    // `next_back` is the last character before `start`; `None` at the edges.
+    let before = line[..start].chars().next_back();
+    let after = line[end..].chars().next();
+    !before.is_some_and(|c| is_py_word(c) || c == '/' || c == '-')
+        && !after.is_some_and(|c| is_py_word(c) || c == '-')
+}
+
 /// `link_analysis`'s mention pass: for each concept (in walk order), every
 /// other concept it names in prose without linking to it.
-fn unlinked_mentions(concepts: &[&SnapshotDoc]) -> Vec<UnlinkedMention> {
-    let matcher = MentionMatcher::new(concepts);
+fn unlinked_mentions(
+    concepts: &[&SnapshotDoc],
+    matcher: &MentionMatcher<'_>,
+) -> Vec<UnlinkedMention> {
     // One task per mentioning concept; `collect` keeps concept order.
     let per_source: Vec<Vec<UnlinkedMention>> = concepts
         .par_iter()
-        .map(|source| mentions_in(source, &matcher))
+        .map(|source| mentions_in(source, matcher))
         .collect();
     per_source.into_iter().flatten().collect()
 }
@@ -361,11 +450,11 @@ fn mentions_in(source: &SnapshotDoc, matcher: &MentionMatcher<'_>) -> Vec<Unlink
     let linked: HashSet<&str> = source.links().iter().map(|l| l.target.as_str()).collect();
     let mut hits: Vec<Vec<MentionHit>> = vec![Vec::new(); matcher.targets.len()];
     for (line, masked, original) in prose_lines(source.text()) {
-        let matched = matcher.set.matches(&masked);
+        let matched = matcher.matching(&masked);
         let mut previous_target = None;
         // Ascending pattern order: a target's names are contiguous and
         // sorted, so the first match per target is `okf.py`'s first name.
-        for pattern in matched.iter() {
+        for pattern in matched {
             let (target, name) = matcher.owners[pattern];
             if previous_target == Some(target) {
                 continue;
@@ -578,6 +667,118 @@ mod tests {
 
         // Assert: okf.py's names_for on the same document.
         assert_eq!(names, ["Zeta", "beta.md", "\u{c9}clair"]);
+    }
+
+    /// Fenced code, URLs, link text and code spans hide a name; a
+    /// percent-encoded fragment is decoded before the anchor check; a concept
+    /// whose names are all shorter than `MIN_NAME_LEN` is never a target.
+    const MASKING_CATALOG: [(&str, &str); 5] = [
+        ("index.md", "* [A](a/)\n"),
+        (
+            "a/index.md",
+            "# Concepts\n\n* [Beta](/a/beta.md)\n* [Gamma](/a/gamma.md)\n* [Abc](/a/abc.md)\n",
+        ),
+        (
+            "a/beta.md",
+            "---\ntitle: Beta Host\n---\n# Real Part\n[g](/a/gamma.md) [c](/a/abc.md)\n",
+        ),
+        (
+            "a/gamma.md",
+            "# Real Part\n## Real Part\nBeta Host and abc abc.\n",
+        ),
+        (
+            "a/abc.md",
+            "[g](/a/gamma.md#Real%2DPart%2D1) [h](/a/gamma.md#real%2Dpart-2)\n```\nBeta Host\n\
+             ```\nsee https://example.org/Beta Host\n[Beta Host](https://example.org/x) and \
+             `Beta Host`\n",
+        ),
+    ];
+
+    #[test]
+    fn masked_mentions_short_names_and_encoded_fragments_match_okf_py() {
+        // Act
+        let report = report(&MASKING_CATALOG);
+
+        // Assert: okf.py links --json on the same files.
+        assert_eq!(
+            report.broken_anchors,
+            [issue("a/abc.md", 1, "/a/gamma.md#real%2Dpart-2")]
+        );
+        assert_eq!(
+            report.unlinked_mentions,
+            [UnlinkedMention {
+                file: "a/gamma.md".to_string(),
+                target: "a/beta.md".to_string(),
+                hits: vec![MentionHit {
+                    line: 3,
+                    name: "Beta Host".to_string(),
+                    text: "Beta Host and abc abc.".to_string(),
+                }],
+            }]
+        );
+        assert_eq!(
+            report.summary,
+            LinksSummary {
+                concepts: 3,
+                broken: 0,
+                broken_anchors: 1,
+                relative: 0,
+                orphans: 1,
+                dead_ends: 1,
+                index_drift: 0,
+                unlinked_mentions: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn literal_fallback_reports_what_the_set_reports() {
+        for files in [&CATALOG[..], &MASKING_CATALOG[..]] {
+            // Arrange: a one-byte limit makes every set build fail.
+            let workspace = MemWorkspace::from_files(files.iter().copied());
+            let snapshot = Snapshot::build(&workspace).expect("snapshot");
+            let concepts: Vec<&SnapshotDoc> = snapshot.concepts().collect();
+            let set = MentionMatcher::new(&concepts);
+            let fallback = MentionMatcher::with_set_limit(&concepts, 1);
+            assert!(matches!(set.search, NameSearch::Set(_)));
+            assert!(matches!(fallback.search, NameSearch::Literals(_)));
+
+            // Act
+            let from_set = unlinked_mentions(&concepts, &set);
+            let from_fallback = unlinked_mentions(&concepts, &fallback);
+
+            // Assert
+            assert!(!from_set.is_empty());
+            assert_eq!(from_fallback, from_set);
+        }
+    }
+
+    #[test]
+    fn literal_fallback_boundaries_follow_okf_py() {
+        let literal = literal_regex("Time Server");
+        for hit in [
+            "the time server.",
+            "TIME SERVER",
+            "(time server)",
+            "t\u{131}me server",
+        ] {
+            assert!(has_mention(&literal, hit), "{hit}");
+        }
+        for miss in [
+            "time servers",
+            "/time server",
+            "x-time server",
+            "time server-x",
+            "time_server",
+        ] {
+            assert!(!has_mention(&literal, miss), "{miss}");
+        }
+        // Overlapping occurrences: the first is preceded by `-`, the second
+        // (starting inside the first) is a mention, as in Python's search.
+        let literal = literal_regex("ab.ab");
+        assert!(has_mention(&literal, "-ab.ab.ab"));
+        assert!(!has_mention(&literal, "-ab.ab"));
+        assert!(!has_mention(&literal, "ab.abc"));
     }
 
     #[test]
