@@ -8,6 +8,7 @@
 //! exception to the private-fields rule (like `yaml::YamlError`).
 
 pub mod links;
+pub mod lint;
 pub mod oldest;
 pub mod secrets;
 pub mod sprawl;

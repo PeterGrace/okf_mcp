@@ -125,7 +125,7 @@ Each was checked against the source or by running it on 2026-10-27.
 | `src/okf/analysis/oldest.rs` | T8 (create) | `oldest` |
 | `src/okf/analysis/sprawl.rs` | T9 (create) | `sprawl_of`, `sprawl` |
 | `src/okf/analysis/lint.rs` | T10 (create) | `CommitTimes`, `lint` |
-| `src/okf/analysis/testdata/lint-mini.json` | T10 (create) | `okf.py`'s lint output for the unit-test catalog |
+| `src/okf/analysis/testdata/lint-mini.json`, `lint-quirks.json` | T10 (create) | `okf.py`'s lint output for the unit-test catalogs |
 | `src/okf/search.rs` | T11 (create) | `SearchFields`, `SearchQuery`, `SearchHit`, `search` |
 | `tests/parity/okf_shim.py` | T12 (modify) | `analysis` command |
 | `tests/parity.rs` | T12 (modify), T13 (modify) | Analysis goldens and live parity |
@@ -3628,9 +3628,12 @@ git commit -m "analysis: sprawl (port of okf.py sprawl_of/cmd_sprawl)"
 
 Port of `check_ts` (1815) and `lint` (1835-1972). Git commit times come in as data (decision 2).
 
+> **Corrected (issue #12), 2026-10-27.** The four tests below pass against the shipped code (they now share `lint_files`, `commit_times` and `assert_matches_okf_py` helpers); read `src/okf/analysis/lint.rs` for the shipped version, which restructures without changing behaviour. Documents are checked in parallel (`docs().par_iter()`, one `Linter` per document holding its path, collected in order and concatenated, so ties still sort in `okf.py`'s discovery order); routing is by `DocKind` (`Index`, `Concept`, nothing for `Log`/`Machinery`) instead of path tests; sprawl is scored in that same per-concept pass rather than a second loop (the `sprawl` rule occurs at most once per file, so no tie changes); link findings are a free function `link_findings`. `FUTURE_SLACK` is a `TimeDelta::minutes(2)` constant and both slack checks compare differences (`ts - now > FUTURE_SLACK`, `generated_at - committed > FUTURE_SLACK`), which cannot overflow where `committed + Duration` panics near year 9999. The dirty/committed lookup is a private `CommitTimes::committed_clean`; the final sort uses `sort_by` on borrowed `(file, line, rule)` instead of `sort_by_key` cloning strings. Shipped tests beyond Step 1: `quirks_match_okf_py` against a second `okf.py` output, `testdata/lint-quirks.json` (a generated stamp with a `+05:00` offset printed with its local fields, commits inside the slack, stamps just inside and outside the future slack, `stale_after` equal to now, a block-scalar stamp with a trailing newline, full-width digits, null and empty values, non-string stamps, a broken anchor, a folder index whose bad frontmatter is not parsed, `okf_version: ~`), and `root_index_parse_errors_are_reported`; `non_string_values_are_reported_with_python_repr` was confirmed against `okf.py`, which raises `TypeError` on the list (and a mapping) status. `testdata/lint-mini.json` was regenerated from `okf.py` and equals the JSON below. The JSON equals `okf.py lint --json` (values) on `tests/fixtures/catalog` (with `okf.py`'s own `last_commit_times`, with none, and with synthetic commit times that fire `generated-after-commit`) and on `pg_knowledge_catalog` with its real git times (now 0 errors and 3 `sprawl` warnings; verified fact 9's count of 2 predates catalog growth). No public name, signature or field changed (`lint`, `CommitTimes::new`, `LintReport`), so Tasks 12-14 need no edits.
+
 **Files:**
 - Create: `src/okf/analysis/lint.rs`
 - Create: `src/okf/analysis/testdata/lint-mini.json`
+- Create: `src/okf/analysis/testdata/lint-quirks.json` (added by issue #12)
 - Modify: `src/okf/analysis/mod.rs` (`pub mod lint;`)
 - Create: `changelog/<ts>-m2-task-10-lint.md`
 

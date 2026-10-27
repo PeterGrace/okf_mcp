@@ -1,0 +1,210 @@
+{
+  "errors": [
+    {
+      "file": "bare.md",
+      "line": 1,
+      "rule": "no-frontmatter",
+      "message": "concept has no YAML frontmatter block"
+    },
+    {
+      "file": "broken.md",
+      "line": 3,
+      "rule": "frontmatter-parse",
+      "message": "frontmatter does not parse: expected ',' or ']' in flow list in '[x'"
+    },
+    {
+      "file": "infra/sub/index.md",
+      "line": 1,
+      "rule": "index-frontmatter",
+      "message": "non-root index.md must not have frontmatter"
+    },
+    {
+      "file": "notype.md",
+      "line": 1,
+      "rule": "no-type",
+      "message": "frontmatter has no 'type'"
+    },
+    {
+      "file": "shapes.md",
+      "line": 3,
+      "rule": "timestamp",
+      "message": "generated.at is not an ISO 8601 timestamp: '2026-10-01'"
+    },
+    {
+      "file": "stamps.md",
+      "line": 4,
+      "rule": "future-timestamp",
+      "message": "generated.at 2027-01-01T00:00:00Z is in the future (now 2026-10-27T12:00:00Z)"
+    },
+    {
+      "file": "stamps.md",
+      "line": 10,
+      "rule": "timestamp",
+      "message": "sources[1].last_modified is not a valid date/time: '2026-13-01T00:00:00Z'"
+    },
+    {
+      "file": "stamps.md",
+      "line": 14,
+      "rule": "broken-link",
+      "message": "link target does not exist: /gone.md"
+    }
+  ],
+  "warnings": [
+    {
+      "file": "bare.md",
+      "line": 1,
+      "rule": "index-drift",
+      "message": "not listed in index.md"
+    },
+    {
+      "file": "bare.md",
+      "line": 1,
+      "rule": "orphan",
+      "message": "no other concept links to this concept"
+    },
+    {
+      "file": "broken.md",
+      "line": 1,
+      "rule": "index-drift",
+      "message": "not listed in index.md"
+    },
+    {
+      "file": "broken.md",
+      "line": 1,
+      "rule": "orphan",
+      "message": "no other concept links to this concept"
+    },
+    {
+      "file": "index.md",
+      "line": 1,
+      "rule": "okf-version",
+      "message": "root index.md does not declare okf_version"
+    },
+    {
+      "file": "notype.md",
+      "line": 1,
+      "rule": "index-drift",
+      "message": "not listed in index.md"
+    },
+    {
+      "file": "notype.md",
+      "line": 1,
+      "rule": "no-description",
+      "message": "frontmatter has no 'description'"
+    },
+    {
+      "file": "notype.md",
+      "line": 1,
+      "rule": "orphan",
+      "message": "no other concept links to this concept"
+    },
+    {
+      "file": "notype.md",
+      "line": 3,
+      "rule": "generated-after-commit",
+      "message": "generated.at 2026-10-20T00:00:00Z is later than the file's last commit 2026-10-19T00:00:00Z"
+    },
+    {
+      "file": "shapes.md",
+      "line": 1,
+      "rule": "index-drift",
+      "message": "not listed in index.md"
+    },
+    {
+      "file": "shapes.md",
+      "line": 1,
+      "rule": "no-description",
+      "message": "frontmatter has no 'description'"
+    },
+    {
+      "file": "shapes.md",
+      "line": 1,
+      "rule": "no-title",
+      "message": "frontmatter has no 'title'"
+    },
+    {
+      "file": "shapes.md",
+      "line": 1,
+      "rule": "orphan",
+      "message": "no other concept links to this concept"
+    },
+    {
+      "file": "shapes.md",
+      "line": 3,
+      "rule": "generated-shape",
+      "message": "generated should be a mapping with 'by' and 'at'"
+    },
+    {
+      "file": "shapes.md",
+      "line": 4,
+      "rule": "reviewed-shape",
+      "message": "reviewed should be a mapping with by, at, outcome, note"
+    },
+    {
+      "file": "shapes.md",
+      "line": 5,
+      "rule": "sources-shape",
+      "message": "sources should be a list"
+    },
+    {
+      "file": "stamps.md",
+      "line": 1,
+      "rule": "no-description",
+      "message": "frontmatter has no 'description'"
+    },
+    {
+      "file": "stamps.md",
+      "line": 1,
+      "rule": "no-title",
+      "message": "frontmatter has no 'title'"
+    },
+    {
+      "file": "stamps.md",
+      "line": 1,
+      "rule": "orphan",
+      "message": "no other concept links to this concept"
+    },
+    {
+      "file": "stamps.md",
+      "line": 3,
+      "rule": "status",
+      "message": "status 'bogus' is not draft, stable or deprecated"
+    },
+    {
+      "file": "stamps.md",
+      "line": 5,
+      "rule": "timestamp-utc",
+      "message": "verified[0].at is not in UTC: '2026-10-01T10:00:00-04:00'"
+    },
+    {
+      "file": "stamps.md",
+      "line": 5,
+      "rule": "verified-shape",
+      "message": "verified[1] should be a mapping with 'by' and 'at'"
+    },
+    {
+      "file": "stamps.md",
+      "line": 8,
+      "rule": "reviewed-outcome",
+      "message": "reviewed.outcome 'maybe' is not one of verified, updated, partial, unverifiable"
+    },
+    {
+      "file": "stamps.md",
+      "line": 9,
+      "rule": "stale",
+      "message": "stale_after 2026-01-01T00:00:00Z has passed; re-check the concept"
+    },
+    {
+      "file": "stamps.md",
+      "line": 10,
+      "rule": "sources-shape",
+      "message": "sources[0] has no 'resource'"
+    },
+    {
+      "file": "stamps.md",
+      "line": 14,
+      "rule": "relative-link",
+      "message": "relative link infra/index.md; prefer a bundle-root absolute path"
+    }
+  ]
+}
