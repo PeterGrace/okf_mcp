@@ -24,7 +24,7 @@ use indexmap::IndexMap;
 use regex::Regex;
 
 use crate::error::OkfError;
-use crate::okf::pystr::{py_lstrip, py_rstrip, py_strip};
+use crate::okf::pystr::{py_lstrip, py_repr_str, py_rstrip, py_strip};
 use crate::okf::yaml::{
     indent_of, is_seq_start, parse_value, strip_comment, NumberedLine, Value, YamlError,
 };
@@ -514,7 +514,7 @@ fn parse_frontmatter_lines(lines: &[String]) -> Result<IndexMap<String, Value>, 
     for b in blocks_of(lines) {
         if data.contains_key(&b.key) {
             return Err(YamlError {
-                message: format!("duplicate key {:?}", b.key),
+                message: format!("duplicate key {}", py_repr_str(&b.key)),
                 line: Some(b.start + 2),
             });
         }
@@ -531,7 +531,10 @@ fn parse_frontmatter_lines(lines: &[String]) -> Result<IndexMap<String, Value>, 
     for (i, line) in lines.iter().enumerate() {
         if !covered[i] && !py_strip(line).is_empty() && !py_lstrip(line).starts_with('#') {
             return Err(YamlError {
-                message: format!("line is not part of any key: {:?}", py_strip(line)),
+                message: format!(
+                    "line is not part of any key: {}",
+                    py_repr_str(py_strip(line))
+                ),
                 line: Some(i + 2),
             });
         }
@@ -570,6 +573,18 @@ mod tests {
                 crate::okf::yaml::scalar(text, false, true)
             )]
         }
+    }
+
+    #[test]
+    fn parse_errors_quote_like_python_repr() {
+        // Expected text is what `okf.py` (Python 3.14) raises for the same input.
+        let error = doc("---\na: 1\na: 2\n---\n").parse().unwrap_err();
+        assert_eq!(error.message, "duplicate key 'a'");
+        let error = doc("---\nk: [\u{e9}\n---\n").parse().unwrap_err();
+        assert_eq!(
+            error.message,
+            "expected ',' or ']' in flow list in '[\u{e9}'"
+        );
     }
 
     #[test]
