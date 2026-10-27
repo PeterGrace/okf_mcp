@@ -11,6 +11,11 @@
 //! The ported regexes emulate Python's `\b` with consumed neighbours and widen
 //! `i` for `re.I` (the plan's verified facts 6 and 7); every expectation in
 //! the tests was taken from `okf.py`.
+//!
+//! The score adds its parts the way Python 3.12+'s `sum()` does (with
+//! compensation; see `py_float_sum`), so parity assumes `okf.py` runs on
+//! Python 3.12 or later: older versions add naively and can round a score
+//! differently (`3.15` vs `3.1500000000000004`).
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
