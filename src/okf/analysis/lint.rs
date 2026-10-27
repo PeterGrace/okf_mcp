@@ -661,6 +661,9 @@ mod tests {
 
     #[test]
     fn root_index_parse_errors_are_reported() {
+        // The expectation is `okf.py`'s `lint()` output for this one-file
+        // catalog (no git), copied verbatim: one finding is not worth a
+        // third JSON fixture.
         let report = lint_files(
             [("index.md", "---\ntitle: R\nokf_version: [x\n---\n")],
             None,
