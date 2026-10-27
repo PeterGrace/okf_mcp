@@ -89,8 +89,15 @@ pub trait Workspace: Send + Sync {
     /// `.git` or `.worktrees` (at any depth), in `os.walk` order (see
     /// [`walk_order`]). This is `okf.py` `lint`'s secret-scan walk: unlike
     /// [`Workspace::list_markdown`], other dot-directories (`.claude`) are
-    /// included. The same symlink rules apply: every returned path is
-    /// readable through this workspace.
+    /// included. Only directories are pruned, so a `.git` *file* (the link a
+    /// git worktree holds) is listed, as `os.walk` lists it. The same symlink
+    /// rules apply: every returned path resolves to a regular file inside
+    /// this workspace.
+    ///
+    /// A listed file's content may not be UTF-8 (images, other binaries), so
+    /// [`Workspace::read_to_string`] and [`Workspace::read_text`] can still
+    /// fail on it with [`OkfError::Io`]. Callers must tolerate that; the
+    /// secret scan skips such a file, as `okf.py` skips `UnicodeDecodeError`.
     ///
     /// # Errors
     /// [`OkfError::Io`] if a directory can't be listed.
@@ -198,6 +205,11 @@ impl Listing {
 /// with a warning. This deliberately differs from `okf.py`'s `os.walk`, which
 /// lists them. Special files (FIFOs, sockets, devices) are never listed: a
 /// read would block or fail on them.
+///
+/// Accepted gap: an entry whose name is not valid UTF-8 is skipped with a
+/// warning (paths here are `String`s), and so is everything below a directory
+/// with such a name. `os.walk` lists them, so `okf.py`'s secret scan reads such
+/// a file and this port's does not.
 ///
 /// Accepted gap: the check and the use are separate steps, so a symlink swapped
 /// in between could win the race. That is accepted provided the caller
@@ -585,7 +597,7 @@ impl Workspace for MemWorkspace {
 mod tests {
     use super::*;
 
-    const FILES: [(&str, &str); 10] = [
+    const FILES: [(&str, &str); 11] = [
         ("index.md", "root"),
         ("b.md", "b"),
         ("infra/index.md", "infra"),
@@ -596,6 +608,7 @@ mod tests {
         (".git/config", "git internals"),
         (".worktrees/s1/index.md", "a session worktree"),
         ("infra/.git/HEAD", "a nested repository"),
+        ("infra/hosts/.git", "gitdir: a worktree's link file"),
     ];
 
     /// A temp dir holding a `catalog` subdirectory filled with `files`, so a
@@ -631,7 +644,8 @@ mod tests {
             ["b.md", "index.md", "infra/index.md", "infra/hosts/x.md"]
         );
         // Every file, in os.walk order (files before subdirectories), skipping
-        // only `.git` and `.worktrees` directories. Other dot-directories count.
+        // only `.git` and `.worktrees` directories. Other dot-directories count,
+        // and so does a `.git` file.
         assert_eq!(
             ws.list_files().unwrap(),
             [
@@ -641,6 +655,7 @@ mod tests {
                 "notes.txt",
                 ".claude/skill.md",
                 "infra/index.md",
+                "infra/hosts/.git",
                 "infra/hosts/x.md",
             ]
         );
@@ -910,9 +925,12 @@ mod tests {
             let (_dir, ws, outside) = with_outside();
             symlink(&outside, ws.root().join("evil")).unwrap();
             symlink(&outside, ws.root().join("dirlink.md")).unwrap();
-            let listed = ws.list_markdown().unwrap();
-            assert!(!listed.iter().any(|p| p.contains("secret")));
-            assert!(!listed.contains(&"dirlink.md".to_string()));
+            // Both walks share the symlink rules.
+            for listed in [ws.list_markdown().unwrap(), ws.list_files().unwrap()] {
+                assert!(!listed.iter().any(|p| p.contains("secret")));
+                assert!(!listed.contains(&"dirlink.md".to_string()));
+                assert!(!listed.iter().any(|p| p.starts_with("evil")));
+            }
         }
 
         #[test]
@@ -921,12 +939,14 @@ mod tests {
             symlink(ws.root().join("gone.md"), ws.root().join("dangling.md")).unwrap();
             symlink(outside.join("secret.md"), ws.root().join("leak.md")).unwrap();
             symlink(ws.root().join("b.md"), ws.root().join("ok.md")).unwrap();
-            let listed = ws.list_markdown().unwrap();
-            assert!(listed.contains(&"ok.md".to_string()));
-            assert!(!listed.contains(&"dangling.md".to_string()));
-            assert!(!listed.contains(&"leak.md".to_string()));
-            for path in &listed {
-                assert!(ws.read_to_string(path).is_ok(), "{path}");
+            // Both walks share the symlink rules.
+            for listed in [ws.list_markdown().unwrap(), ws.list_files().unwrap()] {
+                assert!(listed.contains(&"ok.md".to_string()));
+                assert!(!listed.contains(&"dangling.md".to_string()));
+                assert!(!listed.contains(&"leak.md".to_string()));
+                for path in &listed {
+                    assert!(ws.read_to_string(path).is_ok(), "{path}");
+                }
             }
         }
 
