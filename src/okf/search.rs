@@ -411,6 +411,24 @@ mod tests {
     }
 
     #[test]
+    fn every_tier_is_reachable() {
+        let snapshot = Snapshot::build(&MemWorkspace::from_files([(
+            "a.md",
+            "---\ntitle: Alpha\ntags: [time sync]\ndescription: Keeps clocks right.\n---\n\
+             Chrony runs here.\n",
+        )]))
+        .unwrap();
+        let tier = |text: &str| search(&snapshot, &SearchQuery::new(text))[0].rank.tier;
+        // The whole multi-word query inside one tag.
+        assert_eq!(tier("time sync"), 1);
+        // The phrase is nowhere; the best field holding a term decides.
+        assert_eq!(tier("chrony alpha"), 4);
+        assert_eq!(tier("chrony sync"), 5);
+        assert_eq!(tier("chrony clocks"), 6);
+        assert_eq!(tier("runs chrony"), 7);
+    }
+
+    #[test]
     fn snippets_show_the_first_matching_body_line() {
         let hits = search(&snapshot(), &SearchQuery::new("time server"));
         let body = hits.iter().find(|h| h.path == "/notes/body.md").unwrap();

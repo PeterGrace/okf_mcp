@@ -4508,7 +4508,7 @@ fn snippet(body: &str, terms: &[String], phrase: &str) -> Option<String> {
 > - `tier` finds each term's best field once (`try_fold`, `None` as soon as one term is found nowhere); the best of those is the best field holding any term. A one-term query is its own phrase (tier 0-3), and the phrase is only searched from that field onward, since a field holding the phrase holds every term.
 > - `snippet` zips the body's lines with the lines of the already-lowercased `SearchFields::body` (lowercasing never adds or removes `\n`) in one pass, instead of lowercasing every line into a `Vec`; `hit` takes the `SearchFields` for that.
 > - `limit == 0` returns before matching.
-> - Four extra tests: split-term tiers (4+), the 160-character cut on multi-byte text, only concepts carrying fields, and the serialized hit omitting `rank`.
+> - Five extra tests: split-term tiers (4+), every tier 1-7 (added in review of PR #24), the 160-character cut on multi-byte text, only concepts carrying fields, and the serialized hit omitting `rank`.
 
 - [ ] **Step 4: Give each concept its fields**
 
