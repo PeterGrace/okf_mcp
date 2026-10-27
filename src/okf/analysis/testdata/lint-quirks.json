@@ -1,0 +1,114 @@
+{
+  "errors": [
+    {
+      "file": "edge.md",
+      "line": 1,
+      "rule": "no-type",
+      "message": "frontmatter has no 'type'"
+    },
+    {
+      "file": "edge.md",
+      "line": 8,
+      "rule": "timestamp",
+      "message": "sources[2].last_modified is not an ISO 8601 timestamp: ['1']"
+    },
+    {
+      "file": "local.md",
+      "line": 7,
+      "rule": "future-timestamp",
+      "message": "reviewed.at 2026-10-27T12:02:00.000001Z is in the future (now 2026-10-27T12:00:00Z)"
+    },
+    {
+      "file": "local.md",
+      "line": 9,
+      "rule": "broken-anchor",
+      "message": "no heading in the target matches the anchor: /edge.md#nope"
+    },
+    {
+      "file": "odd.md",
+      "line": 5,
+      "rule": "timestamp",
+      "message": "generated.at is not an ISO 8601 timestamp: ['1']"
+    },
+    {
+      "file": "odd.md",
+      "line": 8,
+      "rule": "timestamp",
+      "message": "stale_after is not a valid date/time: '2026-01-01T00:00:00Z\\n'"
+    },
+    {
+      "file": "sub/index.md",
+      "line": 1,
+      "rule": "index-frontmatter",
+      "message": "non-root index.md must not have frontmatter"
+    },
+    {
+      "file": "wide.md",
+      "line": 5,
+      "rule": "timestamp",
+      "message": "stale_after is not a valid date/time: '２０２６-01-01T00:00:00Z'"
+    }
+  ],
+  "warnings": [
+    {
+      "file": "edge.md",
+      "line": 7,
+      "rule": "stale",
+      "message": "stale_after 2026-10-27T12:00:00Z has passed; re-check the concept"
+    },
+    {
+      "file": "edge.md",
+      "line": 8,
+      "rule": "sources-shape",
+      "message": "sources[0] has no 'resource'"
+    },
+    {
+      "file": "index.md",
+      "line": 1,
+      "rule": "okf-version",
+      "message": "root index.md does not declare okf_version"
+    },
+    {
+      "file": "local.md",
+      "line": 5,
+      "rule": "generated-after-commit",
+      "message": "generated.at 2026-10-20T10:00:00Z is later than the file's last commit 2026-10-20T04:00:00Z"
+    },
+    {
+      "file": "local.md",
+      "line": 5,
+      "rule": "timestamp-utc",
+      "message": "generated.at is not in UTC: '2026-10-20T10:00:00+05:00'"
+    },
+    {
+      "file": "local.md",
+      "line": 7,
+      "rule": "reviewed-outcome",
+      "message": "reviewed.outcome None is not one of verified, updated, partial, unverifiable"
+    },
+    {
+      "file": "odd.md",
+      "line": 7,
+      "rule": "reviewed-outcome",
+      "message": "reviewed.outcome None is not one of verified, updated, partial, unverifiable"
+    },
+    {
+      "file": "sub/index.md",
+      "line": 1,
+      "rule": "index-drift",
+      "message": "not listed in index.md"
+    },
+    {
+      "file": "wide.md",
+      "line": 1,
+      "rule": "index-drift",
+      "message": "not listed in index.md"
+    },
+    {
+      "file": "wide.md",
+      "line": 1,
+      "rule": "orphan",
+      "message": "no other concept links to this concept"
+    }
+  ]
+}
