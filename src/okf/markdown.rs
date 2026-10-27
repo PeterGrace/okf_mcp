@@ -54,35 +54,6 @@ static HEADING: LazyLock<Regex> = LazyLock::new(|| {
 });
 static FENCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[\s\x1c-\x1f]{0,3}(```|~~~)").expect("FENCE regex is valid"));
-/// The fence marker (`` ``` `` or `~~~`) if `line` opens or closes a fenced
-/// block (`okf.py`'s `FENCE_RE.match`).
-///
-/// # Returns
-/// The marker, borrowed from `line`; `None` if the line is not a fence.
-pub(crate) fn fence_marker(line: &str) -> Option<&str> {
-    FENCE
-        .captures(line)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str())
-}
-
-/// The open fence after a fence line with `marker`: a fence closes only with
-/// the marker that opened it (`okf.py`'s
-/// `None if fence == f.group(1) else (fence or f.group(1))`).
-///
-/// # Arguments
-/// * `open` - the marker of the fence open before this line, if any.
-/// * `marker` - this line's marker, from [`fence_marker`].
-///
-/// # Returns
-/// The marker of the fence open after this line, if any.
-pub(crate) fn next_fence<'a>(open: Option<&'a str>, marker: &'a str) -> Option<&'a str> {
-    match open {
-        Some(open) if open == marker => None,
-        Some(open) => Some(open),
-        None => Some(marker),
-    }
-}
 static FOOTNOTE_DEF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[\^([^\]]+)\]:").expect("FOOTNOTE_DEF regex is valid"));
 static HTML_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
@@ -195,6 +166,35 @@ pub fn body_split(text: &str) -> (Vec<&str>, Vec<&str>) {
     (Vec::new(), lines)
 }
 
+/// The fence marker (`` ``` `` or `~~~`) if `line` opens or closes a fenced
+/// block (`okf.py`'s `FENCE_RE.match`).
+///
+/// # Returns
+/// The marker, borrowed from `line`; `None` if the line is not a fence.
+pub(crate) fn fence_marker(line: &str) -> Option<&str> {
+    FENCE
+        .captures(line)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+}
+
+/// The open fence after a fence line with `marker`: a fence closes only with
+/// the marker that opened it (`okf.py`'s
+/// `None if fence == f.group(1) else (fence or f.group(1))`).
+///
+/// # Arguments
+/// * `open` - the marker of the fence open before this line, if any.
+/// * `marker` - this line's marker, from [`fence_marker`].
+///
+/// # Returns
+/// The marker of the fence open after this line, if any.
+pub(crate) fn next_fence<'a>(open: Option<&'a str>, marker: &'a str) -> Option<&'a str> {
+    match open {
+        Some(open) if open == marker => None,
+        Some(open) => Some(open),
+        None => Some(marker),
+    }
+}
 /// An ATX heading found in a list of lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Heading {
