@@ -62,7 +62,8 @@ pub trait Workspace: Send + Sync {
     /// [`OkfError::Io`] on any filesystem failure (`PermissionDenied` for a
     /// file this process may not write); [`OkfError::InvalidPath`] if the
     /// path escapes the catalog, is not a file path (the root), is a
-    /// directory, or has a file as a parent component.
+    /// directory, a symlink or another non-regular file (FIFO, socket,
+    /// device), or has a file as a parent component.
     fn write_atomic(&self, path: &str, contents: &str) -> Result<(), OkfError>;
 
     /// Is there a file or directory at `path`?
@@ -298,16 +299,24 @@ impl Workspace for DiskWorkspace {
         if !real_ancestor.starts_with(&self.root) {
             return Err(refuse("resolves outside the catalog (symlink)"));
         }
+        // Never replace a symlink silently, and check this first so nothing
+        // below stats through one (`symlink_metadata` does not follow links).
+        let target_type = std::fs::symlink_metadata(&target)
+            .ok()
+            .map(|m| m.file_type());
+        if target_type.is_some_and(|t| t.is_symlink()) {
+            return Err(refuse("is a symlink; refusing to replace it"));
+        }
         // The same refusals as `MemWorkspace`, before touching the disk.
         if !ancestor.is_dir() {
             return Err(refuse("a parent component is a file"));
         }
-        if target.is_dir() {
+        if target_type.is_some_and(|t| t.is_dir()) {
             return Err(refuse("is a directory"));
         }
-        // Never replace a symlink silently.
-        if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(refuse("is a symlink; refusing to replace it"));
+        // A FIFO, socket or device would be silently replaced by the rename.
+        if target_type.is_some_and(|t| !t.is_file()) {
+            return Err(refuse("not a regular file"));
         }
         // Components missing under the checked ancestor cannot exist, unless
         // one is a dangling symlink (canonicalize failed on it).
@@ -396,7 +405,9 @@ fn has_key_with_prefix(files: &BTreeMap<String, String>, prefix: &str) -> bool {
 /// of file paths.
 ///
 /// It refuses the same malformed writes as [`DiskWorkspace`] (onto a
-/// directory, below a file) but does not simulate permissions or symlinks.
+/// directory, below a file) but does not simulate permissions, symlinks or
+/// special files, so the disk-only refusals ("is a symlink", "not a regular
+/// file", `PermissionDenied`) never occur here.
 #[derive(Debug, Default)]
 pub struct MemWorkspace {
     // `RwLock` gives interior mutability: `write_atomic` takes `&self` (like the
@@ -671,6 +682,11 @@ mod tests {
             std::fs::write(&probe, "p").unwrap();
             std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o444)).unwrap();
             if std::fs::OpenOptions::new().write(true).open(&probe).is_ok() {
+                // Root: Python's `open(path, "w")` succeeds, so the port must too.
+                let target = ws.root().join("b.md");
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
+                ws.write_atomic("b.md", "new").unwrap();
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
                 return;
             }
             let target = ws.root().join("b.md");
@@ -684,6 +700,22 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "b");
             assert_eq!(mode(&target), 0o444);
             assert!(leftover_temp_files(ws.root()).is_empty());
+        }
+
+        #[test]
+        fn write_onto_a_fifo_is_refused() {
+            let (_dir, ws) = disk_catalog(&FILES);
+            let fifo = ws.root().join("pipe.md");
+            let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+            if !made.is_ok_and(|status| status.success()) {
+                return; // no mkfifo on this system
+            }
+            assert!(matches!(
+                ws.write_atomic("pipe.md", "x"),
+                Err(OkfError::InvalidPath { reason, .. }) if reason == "not a regular file"
+            ));
+            let kind = std::fs::symlink_metadata(&fifo).unwrap().file_type();
+            assert!(std::os::unix::fs::FileTypeExt::is_fifo(&kind));
         }
 
         #[test]
@@ -745,6 +777,16 @@ mod tests {
             symlink(ws.root().join("b.md"), ws.root().join("link.md")).unwrap();
             assert!(ws.write_atomic("link.md", "x").is_err());
             assert_eq!(ws.read_to_string("b.md").unwrap(), "b");
+        }
+
+        #[test]
+        fn write_onto_a_symlink_to_an_outside_directory_says_symlink() {
+            let (_dir, ws, outside) = with_outside();
+            symlink(&outside, ws.root().join("dirlink")).unwrap();
+            assert!(matches!(
+                ws.write_atomic("dirlink", "x"),
+                Err(OkfError::InvalidPath { reason, .. }) if reason.starts_with("is a symlink")
+            ));
         }
 
         #[test]
