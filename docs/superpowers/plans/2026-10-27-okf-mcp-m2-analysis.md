@@ -76,7 +76,7 @@ Each was checked against the source or by running it on 2026-10-27.
 7. **`regex` has no lookaround or backreferences.** A lookbehind `(?<![X])` becomes a consumed `(?:\A|[^X])` before the match with the real match in a capture group, and a scan resumes at the group's end (M1's `find_links` technique, `src/okf/markdown.rs:100`). A trailing `\b` after a word character becomes a consumed `(?:[^\p{L}\p{N}_]|\z)`; a leading `\b` before a word character becomes `(?:\A|[^\p{L}\p{N}_])`. `ASSIGN_RE`'s `\2?` (an optional repeat of the opening quote) only consumes a closing quote that the value class `[^\s"'...]` already excludes, so dropping it changes no captured value and no later match start.
 8. **Unicode classes compile:** `[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]` builds in `regex` 1.13.1 and classifies U+00AD, U+2028, U+00A0, space and U+0378 as non-printable, `a` and U+1F600 as printable (Python's `str.isprintable` is false for Cc, Cf, Cs, Co, Cn, Zl, Zp, Zs except the ASCII space).
 9. **Real-catalog baseline:** `python3 tools/okf.py lint --json` on `pg_knowledge_catalog` gives 0 errors and 2 warnings (both `sprawl`) in 0.29 s. `scan_secrets` on `tools/okf.py` itself reports one `secret:assignment` hit (line 1789), which `okf.py` suppresses only because it skips its own file. Non-markdown extensions in the catalog: `.py`, `.sh`, `.txt`, none.
-10. **Python `repr` of str:** `repr("a'b")` = `"a'b"`, `repr("a\"b'")` = `'a"b\''`, `repr("x​y\tz\xe9\x85")` = `'x​y\tzé\x85'`. **`urllib.parse.unquote("a%20b%zz%C3%A9%FF")`** = `"a b%zzé�"`. Its UTF-8 `errors="replace"` decoding replaces maximal invalid subparts, as Rust's `String::from_utf8_lossy` does, so decoding all `%XX` bytes and literal characters into one byte buffer and calling `from_utf8_lossy` gives the same result.
+10. **Python `repr` of str:** `repr("a'b")` = `"a'b"`, `repr("a\"b'")` = `'a"b\''`, `repr("x\u200by\tz\xe9\x85")` = `'x\u200by\tzé\x85'` (U+200B is category Cf, so it is escaped; `é` is printable and kept). **`urllib.parse.unquote("a%20b%zz%C3%A9%FF")`** = `"a b%zz\xe9\ufffd"` (Python escapes; the result holds the real `é` and U+FFFD). Its UTF-8 `errors="replace"` decoding replaces maximal invalid subparts, as Rust's `String::from_utf8_lossy` does, so decoding all `%XX` bytes and literal characters into one byte buffer and calling `from_utf8_lossy` gives the same result.
 11. **`rayon` 1.12.0:** `IntoParallelRefIterator::par_iter` (`rayon-1.12.0/src/iter/mod.rs:262-295`) and `ParallelIterator::collect` (`:2054`) into `Vec<T>` or `Result<Vec<T>, E>` keep the input order for indexed iterators (checked by running). Minimum Rust 1.80.
 12. **`chrono` 0.4.45** with only the `now` feature (which enables `std` and `alloc`): `NaiveDate::from_ymd_opt` (`naive/date/mod.rs:196`), `NaiveTime::from_hms_micro_opt` (`naive/time/mod.rs:377`), `NaiveDateTime::new` (`naive/datetime/mod.rs:99`), `checked_add_days` (`:756`), `FixedOffset::east_opt` (`offset/fixed.rs:62`) and `local_minus_utc` (`:107`), `DateTime::from_naive_utc_and_offset` (`datetime/mod.rs:94`), `naive_local` (`:576`), `TimeDelta::num_microseconds` (`time_delta.rs:347`), `DateTime::from_timestamp` (`datetime/mod.rs:803`), `with_timezone` (`:412`), `fixed_offset` (`:420`), `DateTime::<Utc>::UNIX_EPOCH` (`:917`), `NaiveDate::and_hms_opt` (`naive/date/mod.rs:780`), `Timelike::nanosecond`. `DateTime<Tz>`'s `Ord` compares instants.
 13. **M1 API used here:** `Workspace` (`src/okf/workspace.rs:21`; `read_text` is the universal-newline read, `list_markdown` the `walk_md` port), `DiskWorkspace::collect` (`:209`), `MemWorkspace` (`:412`), `find_links` (`src/okf/markdown.rs:100`, returns `LinkMatch { text, target, range, target_range }`), `split_frontmatter` (`:136`), `body_split` (`:157`), `headings` (`:183`, returns `Heading { index, level, text, slug }` with GitHub slugs), `anchors_in` (`:289`, not lowercased), `resolve_link` (`:340`, `Option<ResolvedLink { path, absolute }>`), `Doc::from_text` (`src/okf/doc.rs:169`), `Doc::parse` (`:261`), `Doc::block` (`:252`), `Doc::key_line` (`:282`), `Doc::frontmatter` (`:223`), `paths::{normpath, join, dirname, basename, escapes_root, is_concept, walk_order, NON_CONCEPTS, RESERVED}` (`src/okf/paths.rs`), `pystr::{is_py_word, py_strip, py_lstrip, universal_newlines}` (`src/okf/pystr.rs`), `yaml::Value` (`Null | Str | Seq | Map`, `src/okf/yaml.rs:33`), `clock::{Clock, FixedClock, TIMESTAMP_FORMAT}`.
@@ -1957,7 +1957,10 @@ impl Snapshot {
 /// Reads one markdown file and derives everything the analyses need.
 fn read_document(workspace: &dyn Workspace, path: &str) -> Result<SnapshotDoc, OkfError> {
     let raw = workspace.read_to_string(path)?;
-    // `Doc` copies the lines it needs, so `raw` can then become the text.
+    // `Doc` keeps its own copy of every line (head, frontmatter and tail), so
+    // each document is held twice: as `doc` (byte-exact) and as `text`
+    // (universal newlines). That doubles memory per document, which is
+    // acceptable at catalog sizes (a few MB); `raw` itself is moved, not copied.
     let doc = Doc::from_text(path, &raw);
     let text = match universal_newlines(&raw) {
         std::borrow::Cow::Owned(normalized) => normalized,
@@ -2632,11 +2635,12 @@ impl<'a> MentionMatcher<'a> {
             }
         }
         // Hundreds of patterns with Unicode classes outgrow the default
-        // 10 MiB compile limit; the input is escaped literals, so raising it
-        // is safe.
+        // 10 MiB compile limit. 256 MiB still bounds compile memory; Step 5
+        // measures the real catalog, and a catalog that exceeds the limit
+        // needs the two-stage matcher described there.
         let set = RegexSetBuilder::new(patterns)
-            .size_limit(1 << 30)
-            .dfa_size_limit(1 << 30)
+            .size_limit(256 << 20)
+            .dfa_size_limit(256 << 20)
             .build()
             .expect("escaped mention patterns always compile");
         Self {
@@ -3159,7 +3163,7 @@ Use it in `headings` too, replacing its inline `FENCE.captures` (one definition 
 
 Expected values are `okf.py`'s output for the same files (run on 2026-10-27).
 
-```rust
+````rust
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3253,7 +3257,7 @@ Then 2026-10-06 it was fixed.
         assert_eq!(volatile_reason("fixedly"), None, "no word boundary after `fixed`");
     }
 }
-```
+````
 
 > `"\u{130}NCIDENT".to_lowercase()` is `"i\u{307}ncident"` in both Python 3.14 and Rust (checked).
 
