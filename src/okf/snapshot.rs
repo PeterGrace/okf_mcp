@@ -580,6 +580,8 @@ mod tests {
                 "---\nokf_version: \"0.2\"\n---\n* [Infra](infra/)\n",
             ),
             ("AGENTS.md", "# Agents\n[x](/nowhere.md)\n"),
+            ("log.md", "# Log\n"),
+            ("infra/README.md", "# Infra\n"),
             ("infra/index.md", "* [A](/infra/a.md)\n"),
             (
                 "infra/a.md",
@@ -605,12 +607,17 @@ mod tests {
             [
                 ("AGENTS.md", DocKind::Machinery),
                 ("index.md", DocKind::Index),
+                ("log.md", DocKind::Log),
+                ("infra/README.md", DocKind::Machinery),
                 ("infra/a.md", DocKind::Concept),
                 ("infra/b.md", DocKind::Concept),
                 ("infra/index.md", DocKind::Index),
             ]
         );
         assert!(!snapshot.get("AGENTS.md").unwrap().in_link_graph());
+        // Only the root machinery files are outside the graph (`build_docs`
+        // keeps a nested README.md).
+        assert!(snapshot.get("infra/README.md").unwrap().in_link_graph());
         assert!(snapshot.get("infra/a.md").unwrap().in_link_graph());
         assert_eq!(snapshot.concepts().count(), 2);
     }
