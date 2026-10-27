@@ -13,7 +13,9 @@
 //! - only `\n` and `\r\n` end lines. Python's `splitlines` also splits on a
 //!   lone `\r`, `\x0b`, `\x0c`, `\x1c`-`\x1e`, `\x85`, U+2028 and U+2029,
 //!   which would corrupt a document containing them;
-//! - a line ending in `\r\r\n` keeps its extra `\r` as part of its text.
+//! - a line ending in `\r\r\n` keeps its extra `\r` as part of its text, so
+//!   a key line `k:\r` is not recognized as a key (okf.py strips both `\r`s
+//!   and sees `k`). Real catalog files don't contain such lines.
 
 use std::ops::Range;
 use std::sync::LazyLock;
