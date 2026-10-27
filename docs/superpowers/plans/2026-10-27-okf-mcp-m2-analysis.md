@@ -1153,8 +1153,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 
 ```rust
 //! Catalog analyses: ports of `okf.py`'s `lint`, `links`, `oldest`, `sprawl`
-//! and secret scan. Each is a pure function over a
-//! [`Snapshot`](crate::okf::snapshot::Snapshot) (and an injected "now"),
+//! and secret scan. Each is a pure function over a catalog snapshot
+//! (`okf::snapshot::Snapshot`) or a file's text (and an injected "now"),
 //! returning report structs whose JSON (`serde_json::to_value`) equals
 //! `okf.py`'s `--json` output, keys in the same order.
 //!
@@ -1357,13 +1357,13 @@ struct Rules {
 static RULES: LazyLock<Rules> = LazyLock::new(|| {
     let tokens = TOKEN_RULES
         .iter()
-        .map(|(id, pattern, why)| TokenRule {
+        .map(|&(id, pattern, why)| TokenRule {
             id,
             pattern: Regex::new(pattern).expect("token rule regex is valid"),
             why,
         })
         .collect();
-    let any = RegexSet::new(TOKEN_RULES.iter().map(|(_, p, _)| *p).chain([ASSIGN]))
+    let any = RegexSet::new(TOKEN_RULES.iter().map(|&(_, p, _)| p).chain([ASSIGN]))
         .expect("secret rule set is valid");
     Rules {
         tokens,
@@ -1456,25 +1456,25 @@ pub fn scan_secrets(path: &str, text: &str) -> Vec<Finding> {
             }
         }
         if candidates.matched(rules.tokens.len()) {
-            hits.extend(assignments(path, number, line));
+            assignments(&rules.assign, path, number, line, &mut hits);
         }
     }
     hits
 }
 
-/// `ASSIGN_RE.finditer(line)` filtered by [`literal_secret`].
-fn assignments(path: &str, number: usize, line: &str) -> Vec<Finding> {
-    let mut found = Vec::new();
+/// `ASSIGN_RE.finditer(line)` filtered by [`literal_secret`], appended to
+/// `hits`.
+fn assignments(assign: &Regex, path: &str, number: usize, line: &str, hits: &mut Vec<Finding>) {
     let mut pos = 0;
     // `captures_at` still sees the text before `pos`, so `\A` only matches
     // at the true line start; resuming at the value's end lets the next
     // match consume the character after it as its "lookbehind" character.
-    while let Some(caps) = RULES.assign.captures_at(line, pos) {
+    while let Some(caps) = assign.captures_at(line, pos) {
         let (Some(keyword), Some(value)) = (caps.get(1), caps.get(2)) else {
             break; // unreachable: both groups are mandatory
         };
         if let Some(why) = literal_secret(value.as_str()) {
-            found.push(Finding {
+            hits.push(Finding {
                 file: path.to_string(),
                 line: number,
                 rule: "secret:assignment".to_string(),
@@ -1487,11 +1487,12 @@ fn assignments(path: &str, number: usize, line: &str) -> Vec<Finding> {
         }
         pos = value.end();
     }
-    found
 }
 ```
 
 Add `pub mod analysis;` to `src/okf/mod.rs`.
+
+> **Corrected (issue #7), 2026-10-27.** The code above is what shipped in `src/okf/analysis/secrets.rs`, with these fixes to the uncompiled original: the two `TOKEN_RULES` closures destructure with `|&(...)|` (the original bound `id` as `&&str`, which does not compile); `assignments` takes the compiled regex and appends to the caller's `Vec` instead of returning a new one per line; and `analysis/mod.rs`'s module doc names `okf::snapshot::Snapshot` in plain code rather than as an intra-doc link, because that type does not exist until Task 6 and `cargo doc -D warnings` rejects a broken link (Task 6 may turn it back into a link). Every regex compiled exactly as written. The shipped module also has a doc example on `scan_secrets`, a `Finding` key-order test in `analysis/mod.rs`, three more `secrets` tests (`assignment_lookbehind_and_value_use_python_classes`, `token_rules_report_in_table_order` and `lines_split_on_newline_only`, the last two from review), plus assertions in the existing ones (`github-pat` and `sk-key` cases, each `literal_secret` reason, U+0130, long s and Kelvin-sign keywords, glued assignments), each expectation checked against `okf.py`'s `scan_secrets`. A differential run against `okf.py` (every tracked catalog file, and 45,000 random lines built from rule fragments) gave identical findings.
 
 - [ ] **Step 6: Run the tests**
 

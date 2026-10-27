@@ -2,6 +2,7 @@
 //! path rules. Everything here is pure logic over a [`workspace::Workspace`],
 //! so it needs neither git nor a real filesystem in tests.
 
+pub mod analysis;
 pub mod doc;
 pub mod markdown;
 pub mod paths;
