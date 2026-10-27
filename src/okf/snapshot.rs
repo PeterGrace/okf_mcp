@@ -579,7 +579,7 @@ fn strip_quotes(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::okf::workspace::MemWorkspace;
+    use crate::okf::workspace::{DiskWorkspace, MemWorkspace};
 
     fn catalog() -> MemWorkspace {
         MemWorkspace::from_files([
@@ -834,6 +834,32 @@ mod tests {
             .map(|f| (f.file.as_str(), f.line))
             .collect();
         assert_eq!(found, [("doc.md", 2)]);
+    }
+
+    /// A disk catalog holding one file that is not valid UTF-8.
+    fn disk_catalog_with_binary(binary_path: &str) -> (tempfile::TempDir, DiskWorkspace) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "# A\n").unwrap();
+        std::fs::write(dir.path().join(binary_path), [0xff, 0xfe, b'\n']).unwrap();
+        let workspace = DiskWorkspace::new(dir.path()).unwrap();
+        (dir, workspace)
+    }
+
+    #[test]
+    fn an_unreadable_markdown_file_fails_the_build() {
+        let (_dir, workspace) = disk_catalog_with_binary("bad.md");
+        assert!(matches!(
+            Snapshot::build(&workspace),
+            Err(OkfError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_other_file_is_skipped_by_the_secret_scan() {
+        let (_dir, workspace) = disk_catalog_with_binary("blob.bin");
+        let snapshot = Snapshot::build(&workspace).unwrap();
+        assert_eq!(snapshot.docs().len(), 1);
+        assert!(snapshot.secret_findings().is_empty());
     }
 
     #[test]
