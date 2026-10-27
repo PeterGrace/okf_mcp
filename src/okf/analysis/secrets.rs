@@ -203,6 +203,10 @@ pub fn scan_secrets(path: &str, text: &str) -> Vec<Finding> {
     // `&*RULES` forces the `LazyLock` and borrows the `Rules` inside it.
     let rules = &*RULES;
     let mut hits = Vec::new();
+    // Mirrors `okf.py`'s `for n, line in enumerate(text.split("\n"), 1)`.
+    // Not `splitlines()`: `\x0b`, `\x0c`, `\x1c`-`\x1e`, `\x85`, U+2028 and
+    // U+2029 survive the universal-newline read and stay inside a line, so
+    // line numbers count `\n` only.
     for (index, line) in text.split('\n').enumerate() {
         let candidates = rules.any.matches(line);
         if !candidates.matched_any() {
@@ -305,6 +309,14 @@ mod tests {
         let sk = fake("s", "k-", 1) + "proj-" + &"a1".repeat(10);
         assert_eq!(rules(&sk), ["secret:sk-key"]);
         assert!(rules(&format!("-{sk}")).is_empty(), "preceded by a dash");
+    }
+
+    #[test]
+    fn lines_split_on_newline_only() {
+        // U+2028, form feed and U+0085 would end a line for `splitlines()`.
+        let text = format!("a\u{2028}b\x0cc\u{85}d\npassword: {}", "Ab1".repeat(4));
+        let lines: Vec<usize> = scan_secrets("x.md", &text).iter().map(|f| f.line).collect();
+        assert_eq!(lines, [2]);
     }
 
     #[test]
