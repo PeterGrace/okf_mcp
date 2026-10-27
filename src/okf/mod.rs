@@ -3,6 +3,7 @@
 //! so it needs neither git nor a real filesystem in tests.
 
 pub mod doc;
+pub mod markdown;
 pub mod paths;
 pub mod pystr;
 pub mod workspace;
