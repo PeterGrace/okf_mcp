@@ -51,6 +51,9 @@ pub trait Workspace: Send + Sync {
 
     /// Writes a file atomically (all or nothing), creating parent directories.
     ///
+    /// On disk, as with `okf.py`'s `open(path, "w")`, an existing file keeps
+    /// its permissions and a new one gets 0o666 less the process umask.
+    ///
     /// # Errors
     /// [`OkfError::Io`] on any filesystem failure; [`OkfError::InvalidPath`]
     /// if the path escapes the catalog or is not a file path (the root).
@@ -74,6 +77,15 @@ pub trait Workspace: Send + Sync {
     /// # Errors
     /// [`OkfError::Io`] if a directory can't be listed.
     fn list_markdown(&self) -> Result<Vec<String>, OkfError>;
+}
+
+/// The mode requested for a newly created file: 0o666, which the kernel
+/// masks with the process umask, as for Python's `open(path, "w")`.
+#[cfg(unix)]
+fn new_file_permissions() -> std::fs::Permissions {
+    // `PermissionsExt` is a Unix-only extension trait adding `from_mode`.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::Permissions::from_mode(0o666)
 }
 
 /// Normalizes a bundle-relative path and refuses one that leaves the bundle.
@@ -294,13 +306,25 @@ impl Workspace for DiskWorkspace {
         // concurrent writers never share a temp file. The temp file is deleted
         // when `tmp` is dropped, and Rust runs `Drop` on every early return
         // (like a `with` block's `__exit__`), so no failure path leaks it.
-        // The new file gets default permissions, so an existing file's mode is
-        // not kept (fine for .md files).
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".okf-")
-            .suffix(".tmp")
-            .tempfile_in(parent)
-            .map_err(io_err)?;
+        //
+        // Permissions match Python's `open(path, "w")`, which rewrites in place:
+        // an existing file keeps its mode, and a new one gets 0o666 minus the
+        // umask. `tempfile` alone would create the file at 0o600.
+        let existing = std::fs::metadata(&target).ok().map(|m| m.permissions());
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".okf-").suffix(".tmp");
+        // (Other platforms have only a read-only flag, and new files are writable.)
+        #[cfg(unix)]
+        if existing.is_none() {
+            // The mode passed to open(2) is masked by the umask in the kernel,
+            // so there is no need to read the umask (std has no safe getter).
+            builder.permissions(new_file_permissions());
+        }
+        let mut tmp = builder.tempfile_in(parent).map_err(io_err)?;
+        if let Some(permissions) = existing {
+            // fchmod(2) on the open file: not masked by the umask.
+            tmp.as_file().set_permissions(permissions).map_err(io_err)?;
+        }
         tmp.write_all(contents.as_bytes()).map_err(io_err)?;
         // Durable before the rename: XFS/btrfs can otherwise leave an empty
         // file after a crash.
@@ -565,6 +589,40 @@ mod tests {
         let (_dir, ws) = disk_catalog(&FILES);
         assert!(ws.write_atomic("infra", "x").is_err());
         assert!(leftover_temp_files(ws.root()).is_empty());
+    }
+
+    #[cfg(unix)]
+    mod modes {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::*;
+
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        fn rewriting_a_file_keeps_its_mode() {
+            let (_dir, ws) = disk_catalog(&FILES);
+            let target = ws.root().join("b.md");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+            ws.write_atomic("b.md", "new").unwrap();
+            assert_eq!(mode(&target), 0o640);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        }
+
+        #[test]
+        fn a_new_file_gets_the_umask_mode_like_python_open() {
+            let (dir, ws) = disk_catalog(&FILES);
+            // `File::create` asks for 0o666 and the kernel applies the umask,
+            // exactly as Python's `open(path, "w")` does.
+            let reference = dir.path().join("reference");
+            std::fs::File::create(&reference).unwrap();
+            ws.write_atomic("fresh.md", "x").unwrap();
+            assert_eq!(mode(&ws.root().join("fresh.md")), mode(&reference));
+            ws.write_atomic("new/dir/deep.md", "x").unwrap();
+            assert_eq!(mode(&ws.root().join("new/dir/deep.md")), mode(&reference));
+        }
     }
 
     #[cfg(unix)]

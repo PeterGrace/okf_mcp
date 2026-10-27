@@ -358,14 +358,14 @@ fn live_render_parity() {
     assert_entries_equal(&rust_render(&inputs), &python_render(&inputs), "render");
 }
 
-/// Writes `contents` to `tests/golden/<name>` atomically: a temp file in the
-/// same directory, renamed over the old file, so a reader never sees half.
+/// Writes `contents` to `tests/golden/<name>` through the port's own atomic
+/// writer: a reader never sees half a file, an existing golden keeps its
+/// mode, and a new one gets the usual umask mode.
 fn write_golden(name: &str, contents: &str) {
-    let mut temp = tempfile::NamedTempFile::new_in(GOLDEN).expect("create temp golden");
-    temp.write_all(contents.as_bytes())
-        .expect("write temp golden");
-    temp.persist(golden_path(name))
-        .expect("rename temp golden into place");
+    DiskWorkspace::new(GOLDEN)
+        .expect("golden dir exists")
+        .write_atomic(name, contents)
+        .unwrap_or_else(|e| panic!("write golden {name}: {e}"));
 }
 
 fn pretty(json: &Json) -> String {
@@ -392,6 +392,7 @@ fn regenerate_goldens() {
         ("render.json", pretty(&python_render(&render_inputs()))),
         ("SOURCE", source_record(&python_sha256())),
     ];
+    std::fs::create_dir_all(GOLDEN).expect("create golden dir");
     for (name, contents) in &files {
         write_golden(name, contents);
     }
