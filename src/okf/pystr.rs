@@ -4,6 +4,11 @@
 //! edge cases, and the ports must match `okf.py` exactly. For regexes: Python's
 //! `\w` is `[\p{L}\p{N}_]` and Python's `\s` is `[\s\x1c-\x1f]`, whereas the
 //! Rust `regex` classes differ, so ported patterns must spell these classes out.
+//!
+//! The module is `pub(crate)` (see `okf/mod.rs`): its items are `pub` only so
+//! the rest of the crate can call them; nothing outside the crate can. That is
+//! why the examples live in the unit tests below rather than in doc tests,
+//! which compile as a separate crate and so cannot see crate-private items.
 
 use std::borrow::Cow;
 // `as _` imports the trait only for its methods (`write!` on a `String`),
@@ -59,12 +64,6 @@ pub fn py_lstrip(s: &str) -> &str {
 ///
 /// Returns the input unchanged, without allocating, when it has no `\r`.
 /// (`Cow` is "clone on write": either a borrow of `text` or a new `String`.)
-///
-/// # Examples
-/// ```
-/// use okf_mcp::okf::pystr::universal_newlines;
-/// assert_eq!(universal_newlines("a\r\nb\rc\n"), "a\nb\nc\n");
-/// ```
 pub fn universal_newlines(text: &str) -> Cow<'_, str> {
     let Some(first) = text.find('\r') else {
         return Cow::Borrowed(text);
@@ -98,13 +97,6 @@ pub fn universal_newlines(text: &str) -> Cow<'_, str> {
 ///
 /// # Returns
 /// The quoted text, byte for byte what Python's `repr(text)` prints.
-///
-/// # Examples
-/// ```
-/// use okf_mcp::okf::pystr::py_repr_str;
-/// assert_eq!(py_repr_str("it's"), "\"it's\"");
-/// assert_eq!(py_repr_str("caf\u{e9}\t"), "'caf\u{e9}\\t'");
-/// ```
 pub fn py_repr_str(text: &str) -> String {
     static NON_PRINTABLE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]$")
@@ -230,12 +222,6 @@ pub fn py_truthy(value: Option<&Value>) -> bool {
 ///
 /// # Returns
 /// A regex fragment; it only has Python's `re.I` meaning inside `(?i:...)`.
-///
-/// # Examples
-/// ```
-/// use okf_mcp::okf::pystr::ignorecase_literal;
-/// assert_eq!(ignorecase_literal("a.i"), "a\\.[iI\u{130}\u{131}]");
-/// ```
 pub fn ignorecase_literal(literal: &str) -> String {
     let escaped = regex::escape(literal);
     // `regex::escape` only adds backslashes before ASCII punctuation, so no
@@ -260,12 +246,6 @@ pub fn ignorecase_literal(literal: &str) -> String {
 ///
 /// # Returns
 /// The decoded text, borrowed without allocating when `text` has no `%`.
-///
-/// # Examples
-/// ```
-/// use okf_mcp::okf::pystr::py_unquote;
-/// assert_eq!(py_unquote("a%20b%zz"), "a b%zz");
-/// ```
 pub fn py_unquote(text: &str) -> Cow<'_, str> {
     if !text.contains('%') {
         return Cow::Borrowed(text);
@@ -309,6 +289,8 @@ mod tests {
     #[test]
     fn repr_str_picks_quotes_and_escapes_like_python() {
         assert_eq!(py_repr_str("abc"), "'abc'");
+        assert_eq!(py_repr_str("it's"), "\"it's\"");
+        assert_eq!(py_repr_str("caf\u{e9}\t"), "'caf\u{e9}\\t'");
         assert_eq!(py_repr_str("a'b"), "\"a'b\"");
         assert_eq!(py_repr_str("a\"b'"), "'a\"b\\''");
         assert_eq!(
@@ -353,6 +335,7 @@ mod tests {
 
     #[test]
     fn ignorecase_literal_matches_like_python_re_i() {
+        assert_eq!(ignorecase_literal("a.i"), "a\\.[iI\u{130}\u{131}]");
         let pattern = Regex::new(&format!("^(?i:{})$", ignorecase_literal("Time.Server"))).unwrap();
         assert!(pattern.is_match("TIME.SERVER"));
         assert!(pattern.is_match("t\u{130}me.server"));
@@ -365,6 +348,7 @@ mod tests {
     #[test]
     fn unquote_matches_urllib() {
         assert_eq!(py_unquote("plain"), "plain");
+        assert_eq!(py_unquote("a%20b%zz"), "a b%zz");
         assert_eq!(py_unquote("a%20b%zz%C3%A9%FF"), "a b%zz\u{e9}\u{fffd}");
         assert_eq!(py_unquote("%E2%82\u{e9}"), "\u{fffd}\u{e9}");
         assert_eq!(py_unquote("100%"), "100%");
@@ -404,6 +388,7 @@ mod tests {
 
     #[test]
     fn universal_newlines_translates_crlf_and_lone_cr() {
+        assert_eq!(universal_newlines("a\r\nb\rc\n"), "a\nb\nc\n");
         assert_eq!(universal_newlines("a\r\nb\r\n"), "a\nb\n");
         assert_eq!(universal_newlines("a\rb\r"), "a\nb\n");
         assert_eq!(universal_newlines("\r\r\n\n\r"), "\n\n\n\n");

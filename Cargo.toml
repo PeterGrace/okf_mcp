@@ -12,6 +12,12 @@ path = "src/lib.rs"
 name = "okf_mcp"
 path = "src/main.rs"
 
+[features]
+# Exposes test doubles (`okf::workspace::MemWorkspace`) to integration tests
+# and to dependents' tests. Off by default, so the shipped library and binary
+# carry no test-only code; the crate's own unit tests see them via `cfg(test)`.
+test-util = []
+
 [dependencies]
 # Wall-clock timestamps for catalog stamps (UTC only; no local-time database needed).
 chrono = { version = "0.4.45", default-features = false, features = ["now"] }
