@@ -1,0 +1,1 @@
+# Lone CR ##Old Mac line endings.[^1][^1]: Note.    More.## Second

@@ -5,6 +5,7 @@
 //! `\w` is `[\p{L}\p{N}_]` and Python's `\s` is `[\s\x1c-\x1f]`, whereas the
 //! Rust `regex` classes differ, so ported patterns must spell these classes out.
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -42,6 +43,41 @@ pub fn py_lstrip(s: &str) -> &str {
     s.trim_start_matches(is_py_space)
 }
 
+/// Python's universal newlines: what `open(path, encoding="utf-8").read()`
+/// (text mode, `newline=None`) returns for text read from disk. Every `\r\n`
+/// and every lone `\r` becomes `\n`; nothing else changes (other Unicode line
+/// separators are left alone, as in Python).
+///
+/// `okf.py` reads files this way for markdown analysis (headings, links,
+/// footnotes, anchors), but reads them byte-preserving (`newline=""`) for
+/// frontmatter editing. Only the analysis path may use this.
+///
+/// Returns the input unchanged, without allocating, when it has no `\r`.
+/// (`Cow` is "clone on write": either a borrow of `text` or a new `String`.)
+///
+/// # Examples
+/// ```
+/// use okf_mcp::okf::pystr::universal_newlines;
+/// assert_eq!(universal_newlines("a\r\nb\rc\n"), "a\nb\nc\n");
+/// ```
+pub fn universal_newlines(text: &str) -> Cow<'_, str> {
+    let Some(first) = text.find('\r') else {
+        return Cow::Borrowed(text);
+    };
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..first]);
+    let mut rest = &text[first..];
+    // Invariant at the top of each pass: `rest` starts with `\r`.
+    while let Some(after_cr) = rest.strip_prefix('\r') {
+        out.push('\n');
+        let after = after_cr.strip_prefix('\n').unwrap_or(after_cr);
+        let next = after.find('\r').unwrap_or(after.len());
+        out.push_str(&after[..next]);
+        rest = &after[next..];
+    }
+    Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +105,30 @@ mod tests {
         assert!(is_py_space('\x1c'));
         assert!(is_py_space(' '));
         assert!(!is_py_space('a'));
+    }
+
+    #[test]
+    fn universal_newlines_without_cr_borrows() {
+        let text = "a\nb\u{2028}c";
+        assert!(matches!(universal_newlines(text), Cow::Borrowed(t) if t == text));
+        assert!(matches!(universal_newlines(""), Cow::Borrowed("")));
+    }
+
+    #[test]
+    fn universal_newlines_translates_crlf_and_lone_cr() {
+        assert_eq!(universal_newlines("a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(universal_newlines("a\rb\r"), "a\nb\n");
+        assert_eq!(universal_newlines("\r\r\n\n\r"), "\n\n\n\n");
+        assert_eq!(universal_newlines("\r\n\r\n"), "\n\n");
+        assert_eq!(universal_newlines("\u{e9}\r\u{65e5}"), "\u{e9}\n\u{65e5}");
+    }
+
+    #[test]
+    fn universal_newlines_leaves_other_separators() {
+        assert_eq!(
+            universal_newlines("a\rb\x0bc\x0cd\u{85}e"),
+            "a\nb\x0bc\x0cd\u{85}e"
+        );
     }
 
     #[test]

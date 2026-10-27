@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use okf_mcp::okf::doc::Doc;
-use okf_mcp::okf::markdown::{body_split, headings};
+use okf_mcp::okf::markdown::{body_split, footnote_defs, headings};
 use okf_mcp::okf::workspace::{DiskWorkspace, Workspace};
 use okf_mcp::okf::yaml::{block_item, flow_value, Value};
 use serde_json::{json, Value as Json};
@@ -56,16 +56,21 @@ fn rust_frontmatter(root: &Path) -> Json {
     Json::Array(entries.collect())
 }
 
-fn rust_headings(root: &Path) -> Json {
+fn rust_markdown(root: &Path) -> Json {
     let (workspace, files) = markdown_files(root);
     let entries = files.iter().map(|path| {
-        let text = workspace.read_to_string(path).expect("read corpus file");
+        // Analysis reads use universal newlines, as okf.py's text-mode reads do.
+        let text = workspace.read_text(path).expect("read corpus file");
         let (_, body) = body_split(&text);
         let found: Vec<Json> = headings(&body)
             .into_iter()
             .map(|h| json!([h.index, h.level, h.text, h.slug]))
             .collect();
-        json!({"path": path, "headings": found})
+        let footnotes: serde_json::Map<String, Json> = footnote_defs(&body)
+            .into_iter()
+            .map(|(label, lines)| (label, json!(lines)))
+            .collect();
+        json!({"path": path, "headings": found, "footnotes": footnotes})
     });
     Json::Array(entries.collect())
 }
@@ -170,11 +175,11 @@ fn frontmatter_matches_golden() {
 }
 
 #[test]
-fn headings_match_golden() {
+fn markdown_matches_golden() {
     assert_entries_equal(
-        &rust_headings(Path::new(FIXTURES)),
-        &read_golden("headings.json"),
-        "headings",
+        &rust_markdown(Path::new(FIXTURES)),
+        &read_golden("markdown.json"),
+        "markdown",
     );
 }
 
@@ -265,16 +270,16 @@ fn live_frontmatter_parity() {
 
 #[test]
 #[ignore = "needs python3 and okf.py; run with --ignored"]
-fn live_headings_parity() {
+fn live_markdown_parity() {
     for root in corpora() {
-        let python = shim(&["headings", &root.to_string_lossy()], None);
+        let python = shim(&["markdown", &root.to_string_lossy()], None);
         if root == Path::new(FIXTURES) {
-            update_golden("headings.json", &python);
+            update_golden("markdown.json", &python);
         }
         assert_entries_equal(
-            &rust_headings(&root),
+            &rust_markdown(&root),
             &python,
-            &format!("headings of {}", root.display()),
+            &format!("markdown of {}", root.display()),
         );
     }
 }

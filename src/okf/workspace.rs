@@ -12,6 +12,7 @@ use std::sync::RwLock;
 
 use crate::error::OkfError;
 use crate::okf::paths::{dirname, escapes_root, normpath, walk_order};
+use crate::okf::pystr::universal_newlines;
 
 /// Read and write access to one catalog's files.
 ///
@@ -23,6 +24,30 @@ pub trait Workspace: Send + Sync {
     /// [`OkfError::Io`] if the file is missing, unreadable or not UTF-8;
     /// [`OkfError::InvalidPath`] if the path escapes the catalog.
     fn read_to_string(&self, path: &str) -> Result<String, OkfError>;
+
+    /// Reads a file as UTF-8 text for markdown analysis (headings, links,
+    /// footnotes, anchors), with `\r\n` and lone `\r` turned into `\n`.
+    ///
+    /// This is how `okf.py` reads files for analysis (Python text mode,
+    /// universal newlines; see [`universal_newlines`]), so `## Closing ##\r\n`
+    /// is the heading `Closing` here too. Frontmatter parsing and editing
+    /// ([`crate::okf::doc::Doc`]) must use [`Workspace::read_to_string`]
+    /// instead, which keeps every byte.
+    ///
+    /// A file without `\r` is returned as read, with no extra allocation.
+    ///
+    /// # Errors
+    /// As [`Workspace::read_to_string`].
+    fn read_text(&self, path: &str) -> Result<String, OkfError> {
+        let raw = self.read_to_string(path)?;
+        // `Cow::Borrowed` means nothing changed: hand back `raw` itself. The
+        // borrow of `raw` ends with this `match`, so it can then be moved.
+        let normalized = match universal_newlines(&raw) {
+            std::borrow::Cow::Owned(text) => Some(text),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
+        Ok(normalized.unwrap_or(raw))
+    }
 
     /// Writes a file atomically (all or nothing), creating parent directories.
     ///
@@ -405,13 +430,14 @@ impl Workspace for MemWorkspace {
 mod tests {
     use super::*;
 
-    const FILES: [(&str, &str); 6] = [
+    const FILES: [(&str, &str); 7] = [
         ("index.md", "root"),
         ("b.md", "b"),
         ("infra/index.md", "infra"),
         ("infra/hosts/x.md", "x"),
         (".claude/skill.md", "hidden"),
         ("notes.txt", "not markdown"),
+        ("crlf.txt", "a\r\nb\rc\n"),
     ];
 
     /// A temp dir holding a `catalog` subdirectory filled with `files`, so a
@@ -447,6 +473,16 @@ mod tests {
             ["b.md", "index.md", "infra/index.md", "infra/hosts/x.md"]
         );
         assert_eq!(ws.read_to_string("/infra/index.md").unwrap(), "infra");
+        assert_eq!(ws.read_to_string("crlf.txt").unwrap(), "a\r\nb\rc\n");
+        assert_eq!(ws.read_text("crlf.txt").unwrap(), "a\nb\nc\n");
+        assert_eq!(
+            ws.read_text("b.md").unwrap(),
+            ws.read_to_string("b.md").unwrap()
+        );
+        assert!(matches!(
+            ws.read_text("../x"),
+            Err(OkfError::InvalidPath { .. })
+        ));
         assert!(ws.is_file("b.md") && !ws.is_dir("b.md"));
         assert!(ws.is_dir("infra") && ws.is_dir("") && !ws.is_file("infra"));
         assert!(!ws.exists("missing.md"));

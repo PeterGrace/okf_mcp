@@ -4,7 +4,7 @@
 Loads okf.py from the path in $OKF_PY (standard library only, no install).
 
     okf_shim.py frontmatter ROOT     every .md under ROOT: parsed frontmatter or error line
-    okf_shim.py headings ROOT        every .md under ROOT: body headings with slugs
+    okf_shim.py markdown ROOT        every .md under ROOT: body headings with slugs, footnotes
     okf_shim.py render               stdin: JSON list of values; stdout: flow/block renderings
     okf_shim.py run --now TS ARG...  run okf.py's CLI with now_utc() frozen at TS (later milestones)
 """
@@ -41,14 +41,16 @@ def frontmatter(okf, root):
     return out
 
 
-def headings(okf, root):
+def markdown(okf, root):
     out = []
     for rel in okf.walk_md(root):
+        # Text mode with universal newlines, as okf.py reads files for analysis.
         with open(os.path.join(root, rel), encoding="utf-8") as fh:
             text = fh.read()
         _, body = okf.body_split(text)
         out.append({"path": rel,
-                    "headings": [[i, level, t, slug] for i, level, t, slug in okf.heading_slugs(body)]})
+                    "headings": [[i, level, t, slug] for i, level, t, slug in okf.heading_slugs(body)],
+                    "footnotes": okf.footnote_defs(body)})
     return out
 
 
@@ -61,8 +63,8 @@ def main():
     command, args = sys.argv[1], sys.argv[2:]
     if command == "frontmatter":
         result = frontmatter(okf, args[0])
-    elif command == "headings":
-        result = headings(okf, args[0])
+    elif command == "markdown":
+        result = markdown(okf, args[0])
     elif command == "render":
         result = render(okf, json.load(sys.stdin))
     elif command == "run":

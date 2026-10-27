@@ -85,12 +85,24 @@
     }
   },
   {
+    "path": "infra/hosts/crlf-headings.md",
+    "has_frontmatter": true,
+    "value": {
+      "type": "Host",
+      "title": "CRLF headings"
+    }
+  },
+  {
     "path": "infra/hosts/crlf-host.md",
     "has_frontmatter": true,
     "value": {
       "type": "Host",
       "title": "CRLF host"
     }
+  },
+  {
+    "path": "infra/hosts/lone-cr.md",
+    "has_frontmatter": false
   },
   {
     "path": "infra/hosts/no-frontmatter.md",

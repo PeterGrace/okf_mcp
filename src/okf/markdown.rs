@@ -7,6 +7,17 @@
 //! lookaround (`LINK_RE`'s `(?<!!)` and `slugify`'s underscore rule) are
 //! done by hand so no input can trip a backtracking limit.
 //!
+//! # Line endings
+//!
+//! `okf.py` reads files for markdown analysis in Python text mode, which turns
+//! `\r\n` and lone `\r` into `\n` (universal newlines). The functions here
+//! take text as given, so callers must read it the same way: through
+//! [`Workspace::read_text`](crate::okf::workspace::Workspace::read_text), or
+//! [`universal_newlines`](crate::okf::pystr::universal_newlines) for text from
+//! elsewhere. Raw `\r\n` text would make `## Closing ##\r` the heading
+//! `Closing ##` (slug `closing-`) where `okf.py` sees `Closing`. Frontmatter
+//! editing ([`crate::okf::doc`]) stays byte-preserving and never normalizes.
+//!
 //! # Known divergences from `okf.py`
 //!
 //! * **`resolve_link` directory detection is lexical.** Python asks the OS
@@ -350,6 +361,22 @@ pub fn resolve_link(workspace: &dyn Workspace, link: &str, source: &str) -> Opti
 mod tests {
     use super::*;
     use crate::okf::workspace::MemWorkspace;
+
+    #[test]
+    fn crlf_text_read_for_analysis_matches_okf_py() {
+        let raw =
+            "---\r\nk: v\r\n---\r\n## Closing ##\r\n```\r\n# no\r\n```\r\n[^n]: a\r\n    b\r\n";
+        let workspace = MemWorkspace::from_files([("crlf.md", raw)]);
+        let text = workspace.read_text("crlf.md").expect("readable");
+        let (_, body) = body_split(&text);
+        let found = headings(&body);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].text.as_str(), found[0].slug.as_str()),
+            ("Closing", "closing")
+        );
+        assert_eq!(footnote_defs(&body).get("n"), Some(&vec![4, 5]));
+    }
 
     #[test]
     fn find_links_skips_images_and_keeps_inner_links() {

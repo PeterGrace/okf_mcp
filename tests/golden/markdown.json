@@ -8,7 +8,8 @@
         "Agents",
         "agents"
       ]
-    ]
+    ],
+    "footnotes": {}
   },
   {
     "path": "index.md",
@@ -19,7 +20,8 @@
         "Fixture catalog",
         "fixture-catalog"
       ]
-    ]
+    ],
+    "footnotes": {}
   },
   {
     "path": "log.md",
@@ -36,7 +38,8 @@
         "2026-10-26",
         "2026-10-26"
       ]
-    ]
+    ],
+    "footnotes": {}
   },
   {
     "path": "infra/index.md",
@@ -53,7 +56,8 @@
         "Concepts",
         "concepts"
       ]
-    ]
+    ],
+    "footnotes": {}
   },
   {
     "path": "infra/time-server.md",
@@ -76,11 +80,70 @@
         "Plan: CLI first, MCP later",
         "plan-cli-first-mcp-later"
       ]
-    ]
+    ],
+    "footnotes": {
+      "chrony": [
+        18,
+        19
+      ]
+    }
+  },
+  {
+    "path": "infra/hosts/crlf-headings.md",
+    "headings": [
+      [
+        1,
+        1,
+        "CRLF headings",
+        "crlf-headings"
+      ],
+      [
+        3,
+        2,
+        "Closing",
+        "closing"
+      ],
+      [
+        14,
+        3,
+        "Trailing spaces",
+        "trailing-spaces"
+      ]
+    ],
+    "footnotes": {
+      "crlf": [
+        11,
+        12
+      ]
+    }
   },
   {
     "path": "infra/hosts/crlf-host.md",
-    "headings": []
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "infra/hosts/lone-cr.md",
+    "headings": [
+      [
+        0,
+        1,
+        "Lone CR",
+        "lone-cr"
+      ],
+      [
+        6,
+        2,
+        "Second",
+        "second"
+      ]
+    ],
+    "footnotes": {
+      "1": [
+        4,
+        5
+      ]
+    }
   },
   {
     "path": "infra/hosts/no-frontmatter.md",
@@ -91,27 +154,33 @@
         "Heading `code` and *emphasis*",
         "heading-code-and-emphasis"
       ]
-    ]
+    ],
+    "footnotes": {}
   },
   {
     "path": "people/bad-colon.md",
-    "headings": []
+    "headings": [],
+    "footnotes": {}
   },
   {
     "path": "people/duplicate-key.md",
-    "headings": []
+    "headings": [],
+    "footnotes": {}
   },
   {
     "path": "people/flow-error.md",
-    "headings": []
+    "headings": [],
+    "footnotes": {}
   },
   {
     "path": "people/quoted-top-key.md",
-    "headings": []
+    "headings": [],
+    "footnotes": {}
   },
   {
     "path": "people/stray-line.md",
-    "headings": []
+    "headings": [],
+    "footnotes": {}
   },
   {
     "path": "people/unicode.md",
@@ -128,10 +197,12 @@
         "Ünïcode Wörds",
         "ünïcode-wörds-1"
       ]
-    ]
+    ],
+    "footnotes": {}
   },
   {
     "path": "people/unterminated.md",
-    "headings": []
+    "headings": [],
+    "footnotes": {}
   }
 ]
