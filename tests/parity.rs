@@ -13,6 +13,11 @@
 //! - Regeneration: `UPDATE_GOLDEN=1 cargo test --test parity -- --ignored`
 //!   rewrites every golden file and `SOURCE` from okf.py (`regenerate_goldens`).
 //!
+//! Fixture rules: never add a documented divergence (the lists in the
+//! `okf` module docs) as a fixture. `infra/hosts/lone-cr.md` in particular
+//! must keep having no frontmatter (see `lone_cr_fixture_has_no_frontmatter`).
+//! `tests/fixtures/catalog/AGENTS.md` is itself a corpus file, not a readme.
+//!
 //! The real catalog is never copied into this repository: it is private.
 
 use std::ffi::OsStr;
@@ -44,7 +49,9 @@ fn markdown_files(root: &Path) -> (DiskWorkspace, Vec<String>) {
 /// character or `" in "`, whichever comes first, without trailing spaces or
 /// colons. What follows is quoted source text, which okf.py writes with
 /// `repr()` and the port with `Debug` escaping, so only the prefix compares.
-/// `okf_shim.py`'s `error_kind` implements the same rule.
+/// The `expected ...` family (whose own text has quotes) collapses to
+/// `expected` on purpose: finer string rules aren't stable across Python
+/// `repr` and Rust `Debug`. `okf_shim.py`'s `error_kind` implements the same rule.
 fn error_kind(message: &str) -> &str {
     let cut = ["'", "\"", " in "]
         .iter()
@@ -199,6 +206,26 @@ fn frontmatter_matches_golden() {
         &rust_frontmatter(Path::new(FIXTURES)),
         &read_golden("frontmatter.json"),
         "frontmatter",
+    );
+}
+
+/// `infra/hosts/lone-cr.md` must stay frontmatter-free: `Doc` ends lines
+/// only at `\n`/`\r\n` (a documented divergence in `src/okf/doc.rs`), so a
+/// lone-`\r` file with frontmatter would compare a known difference.
+#[test]
+fn lone_cr_fixture_has_no_frontmatter() {
+    let golden = read_golden("frontmatter.json");
+    let entry = golden
+        .as_array()
+        .expect("frontmatter.json is a list")
+        .iter()
+        .find(|entry| entry["path"] == "infra/hosts/lone-cr.md")
+        .expect("lone-cr.md is in the corpus");
+    assert_eq!(
+        entry["has_frontmatter"],
+        json!(false),
+        "lone-cr.md must not have frontmatter: lone-\\r line endings in frontmatter are \
+         a documented divergence (see the module docs of src/okf/doc.rs)"
     );
 }
 

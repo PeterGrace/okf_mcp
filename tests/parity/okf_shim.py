@@ -17,12 +17,12 @@ import os
 import sys
 from datetime import datetime
 from types import ModuleType
-from typing import Union
+from typing import NoReturn, Union
 
 Json = Union[None, bool, int, str, list["Json"], dict[str, "Json"]]
 
 
-def usage(problem: str) -> None:
+def usage(problem: str) -> NoReturn:
     """Print the problem and the usage text to stderr, then exit with status 2."""
     sys.stderr.write(f"okf_shim: {problem}\n{__doc__}")
     sys.exit(2)
@@ -32,7 +32,6 @@ def okf_path() -> str:
     path = os.environ.get("OKF_PY")
     if not path or not os.path.isfile(path):
         usage("set OKF_PY to the path of tools/okf.py")
-        raise AssertionError("unreachable")  # usage() exits; this narrows the type for mypy
     return path
 
 
@@ -42,7 +41,6 @@ def load_okf() -> ModuleType:
     spec = importlib.util.spec_from_file_location("okf", okf_path())
     if spec is None or spec.loader is None:
         usage("OKF_PY is not a loadable Python file")
-        raise AssertionError("unreachable")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -53,7 +51,9 @@ def error_kind(message: str) -> str:
     character or " in ", whichever comes first, without trailing spaces or
     colons. What follows is quoted source text, which okf.py writes with
     repr() and the Rust port with Debug escaping, so only the prefix compares.
-    tests/parity.rs implements the same rule."""
+    The "expected ..." family (whose own text has quotes) collapses to
+    "expected" on purpose: finer string rules aren't stable across Python
+    repr and Rust Debug. tests/parity.rs implements the same rule."""
     cuts = [i for i in (message.find("'"), message.find('"'), message.find(" in ")) if i >= 0]
     return message[:min(cuts, default=len(message))].rstrip(" :")
 
@@ -120,7 +120,8 @@ def main(argv: list[str]) -> None:
         return
     else:
         usage(f"bad arguments {argv!r}")
-        return
+    # ASCII-only output: under `python3 -I` stdout's encoding comes from the
+    # locale, and the JSON must not depend on it.
     json.dump(result, sys.stdout, ensure_ascii=True)
 
 
