@@ -5167,6 +5167,14 @@ fn every_analysis_runs_on_a_real_catalog() {
 
 Run it and paste the timings into the PR and the milestone changelog. The target is a snapshot build plus lint well under a second in release mode (`okf.py lint` takes 0.29 s on the same catalog, verified fact 9); report the real numbers whether or not they meet it.
 
+> **Corrected (issue #16), 2026-10-27.** Shipped with these differences; read `tests/smoke.rs`, `README.md` and the design's "Milestones" section:
+> - `timed` is a free function taking `impl FnOnce() -> usize` instead of a closure taking `&dyn Fn`, and the sprawl query is `SprawlQuery::default()` (`n: 5`, added by issue #11).
+> - The search runs once, timed by hand, and its hits feed the assertion (the plan's code searched twice). The test also prints the snapshot's secret-finding count and the "snapshot plus lint" total, and asserts the snapshot is not empty. Lint runs with `None` commit times; `tests/parity.rs` times it with real git.
+> - Results on `pg_knowledge_catalog` at `c30d23e` (171 documents), release mode: snapshot 9.1 ms, links with mentions 155 ms (161 mentions), lint 2.9 ms (0 errors, 3 warnings), snapshot plus lint 12.0 ms, oldest 0.14 ms, sprawl 1.0 ms, search 0.23 ms. `okf.py lint --json` takes 0.23 s on the same checkout (verified fact 9's 0.29 s predates catalog growth).
+> - The README also shows a short library example (checked by compiling and running it against the real catalog) and documents the smoke test, the Python 3.12+ requirement and the `test-util` feature.
+> - The design gained two subsections under "Milestones": "What M2 shipped differently" (the deviations and divergences that change the design) and "Carried into M3" (review items for M3's tool layer: the `search` tool's `tags` wording, `CommitTimes` keys from git, caching the mention matcher, `test-util` for integration tests, and this plan's deferred table). The `okf::timestamp` row and the "In-memory snapshot" note were added as Step 3 asks.
+> - Besides `changelog/<ts>-m2-analysis.md`, the task has its own `changelog/<ts>-m2-task-14-wrap-up.md` (the per-task convention, and issue #16's file list).
+
 - [ ] **Step 2: README**
 
 Create `README.md`:
