@@ -4503,7 +4503,12 @@ fn snippet(body: &str, terms: &[String], phrase: &str) -> Option<String> {
 }
 ```
 
-> `fields.contains` takes `_` for the body arm because `index` only ever comes from `0..FIELDS`; that is the one catch-all, and it is covered by the tests.
+> **Corrected (issue #13), 2026-10-27.** The public API above shipped as written (`SearchFields`, `SearchQuery::new`, `SearchRank { deprecated, tier }`, `SearchHit`, `search`, `SnapshotDoc::search_fields`), so Tasks 12-14 are unaffected. The private internals differ; read `src/okf/search.rs`:
+> - A private `Field` enum (`Names`, `Tags`, `Description`, `Body`, discriminants 0-3) replaces the `usize` field index and `FIELDS`, so `contains` matches exhaustively with no `_` arm.
+> - `tier` finds each term's best field once (`try_fold`, `None` as soon as one term is found nowhere); the best of those is the best field holding any term. A one-term query is its own phrase (tier 0-3), and the phrase is only searched from that field onward, since a field holding the phrase holds every term.
+> - `snippet` zips the body's lines with the lines of the already-lowercased `SearchFields::body` (lowercasing never adds or removes `\n`) in one pass, instead of lowercasing every line into a `Vec`; `hit` takes the `SearchFields` for that.
+> - `limit == 0` returns before matching.
+> - Five extra tests: split-term tiers (4+), every tier 1-7 (added in review of PR #24), the 160-character cut on multi-byte text, only concepts carrying fields, and the serialized hit omitting `rank`.
 
 - [ ] **Step 4: Give each concept its fields**
 
