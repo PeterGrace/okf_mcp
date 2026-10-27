@@ -2212,6 +2212,10 @@ Port of `link_analysis` (`okf.py` 1005-1091), `names_for` (996) and `prose_lines
 - Modify: `src/okf/analysis/mod.rs` (`pub mod links;`)
 - Create: `changelog/<ts>-m2-task-07-links.md`
 
+> **Corrected (issue #9), 2026-10-27.** The code below compiled and passed as written, with one fix made inline: `names_for` drops the stem's `.md` with `strip_suffix` (Python's `[:-3]`); `trim_end_matches` stripped every trailing `.md`, so `beta.md.md` gave the name `beta` instead of `beta.md`. Shipped but not copied here: the `names_for_drops_one_md_and_short_or_repeated_names` test (checked against `okf.py`'s `names_for`), Rust-idiom comments, `rustfmt` layout, and the `RegexSet` comment now records the Step 5 measurement. Step 5 measured the whole report on `pg_knowledge_catalog` (143 concepts, 161 unlinked mentions) at 152 ms in release mode, under the 500 ms bound, so the single `RegexSet` stays and the two-stage matcher was not built. The JSON equals `okf.py links --json` on that catalog, on `tests/fixtures/catalog` and on this task's test catalog. No public name, signature or field changed, so Tasks 8-14 need no edits.
+
+> **Superseded (issue #9, review of PR #23), 2026-10-27.** `MentionMatcher::new` below panics (`.expect`) when the set outgrows its 256 MiB compile limit. The shipped matcher instead falls back to `NameSearch::Literals`: one `(?i:NAME)` literal per name, compiled without a size limit, with each occurrence's neighbours checked by hand (`has_mention`, `is_mention_at`, using `pystr::is_py_word`). So `links_report` stays infallible and its signature is unchanged. `unlinked_mentions` now takes the matcher, so tests can force the fallback with `MentionMatcher::with_set_limit`. Three more tests cover this and the review's gaps: masked mentions, a short-named concept and a percent-encoded fragment at the report level; fallback equals set; and the fallback's boundaries. Read `src/okf/analysis/links.rs` for the shipped code. The matcher is still built on every call; M3 can cache one per snapshot.
+
 - [ ] **Step 1: Write the failing tests**
 
 Create `src/okf/analysis/links.rs` with:
@@ -2607,7 +2611,8 @@ fn index_drift(
 /// `names_for`: the file stem, the title and the aliases, at least
 /// [`MIN_NAME_LEN`] characters long, sorted and without duplicates.
 fn names_for(doc: &SnapshotDoc) -> Vec<String> {
-    let stem = basename(doc.path()).trim_end_matches(".md");
+    let name = basename(doc.path());
+    let stem = name.strip_suffix(".md").unwrap_or(name);
     let mut names: Vec<String> = std::iter::once(stem)
         .chain(doc.title())
         .chain(doc.aliases().iter().map(String::as_str))

@@ -7,6 +7,7 @@
 //! Report structs are plain records with public fields, the documented
 //! exception to the private-fields rule (like `yaml::YamlError`).
 
+pub mod links;
 pub mod secrets;
 
 /// One lint-style finding: `{"file", "line", "rule", "message"}` in `okf.py`.
