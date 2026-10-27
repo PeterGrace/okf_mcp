@@ -62,6 +62,9 @@ Deliberately deferred:
   - `datetime.fromisoformat` week dates (`2026-W43-1`) and offsets with sub-minute precision are rejected by the port (`okf.py` accepts them). Neither occurs in a catalog.
   - A link whose normalized target escapes the catalog root is always broken in the port; `okf.py` asks the OS about the outside path.
   - Symlinks are listed per M1's listing contract (`DiskWorkspace` skips dangling and outside links that `os.walk` lists).
+  - Non-UTF-8 file and directory names are skipped by `DiskWorkspace`'s walks (paths are `String`s); `os.walk` lists them, so `okf.py`'s secret scan reads such a file and the port's does not.
+
+> **Corrected (issue #3), 2026-10-27.** Added the non-UTF-8 name divergence above, raised in review of PR #17; it is recorded as an accepted gap in `DiskWorkspace`'s listing contract (`src/okf/workspace.rs`). The shipped `list_files` doc also says a listed file's content may not be UTF-8, so callers (Task 6's `scan_all`) must tolerate read errors, which `scan_all` already does.
 
 ## Verified facts the code relies on
 

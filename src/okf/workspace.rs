@@ -84,6 +84,24 @@ pub trait Workspace: Send + Sync {
     /// # Errors
     /// [`OkfError::Io`] if a directory can't be listed.
     fn list_markdown(&self) -> Result<Vec<String>, OkfError>;
+
+    /// Every regular file of any type, skipping only directories named
+    /// `.git` or `.worktrees` (at any depth), in `os.walk` order (see
+    /// [`walk_order`]). This is `okf.py` `lint`'s secret-scan walk: unlike
+    /// [`Workspace::list_markdown`], other dot-directories (`.claude`) are
+    /// included. Only directories are pruned, so a `.git` *file* (the link a
+    /// git worktree holds) is listed, as `os.walk` lists it. The same symlink
+    /// rules apply: every returned path resolves to a regular file inside
+    /// this workspace.
+    ///
+    /// A listed file's content may not be UTF-8 (images, other binaries), so
+    /// [`Workspace::read_to_string`] and [`Workspace::read_text`] can still
+    /// fail on it with [`OkfError::Io`]. Callers must tolerate that; the
+    /// secret scan skips such a file, as `okf.py` skips `UnicodeDecodeError`.
+    ///
+    /// # Errors
+    /// [`OkfError::Io`] if a directory can't be listed.
+    fn list_files(&self) -> Result<Vec<String>, OkfError>;
 }
 
 /// The mode requested for a newly created file: 0o666, which the kernel
@@ -125,6 +143,13 @@ fn in_dot_directory(path: &str) -> bool {
     dirname(path).split('/').any(|p| p.starts_with('.'))
 }
 
+/// Is any directory component `.git` or `.worktrees`?
+fn in_skipped_directory(path: &str) -> bool {
+    dirname(path)
+        .split('/')
+        .any(|p| matches!(p, ".git" | ".worktrees"))
+}
+
 /// Where a path lands once symlinks are resolved.
 enum Resolution {
     /// Nothing there (or a dangling link): the caller's usual behavior applies.
@@ -135,6 +160,35 @@ enum Resolution {
     Outside,
 }
 
+/// Which files a directory walk returns.
+// `Copy` makes this enum a plain value (like an int): passing it to the
+// recursive `collect` copies it instead of moving or borrowing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Listing {
+    /// `.md` files outside dot-directories (`okf.py`'s `walk_md`).
+    Markdown,
+    /// Every file outside `.git` and `.worktrees` directories (`lint`'s secret walk).
+    AllFiles,
+}
+
+impl Listing {
+    /// Does the walk descend into a directory with this name?
+    fn descends_into(self, dir_name: &str) -> bool {
+        match self {
+            Listing::Markdown => !dir_name.starts_with('.'),
+            Listing::AllFiles => !matches!(dir_name, ".git" | ".worktrees"),
+        }
+    }
+
+    /// Does the walk list a file with this name?
+    fn includes(self, file_name: &str) -> bool {
+        match self {
+            Listing::Markdown => file_name.ends_with(".md"),
+            Listing::AllFiles => true,
+        }
+    }
+}
+
 /// A catalog on disk, rooted at a directory.
 ///
 /// Containment policy: the root is canonicalized once in [`DiskWorkspace::new`].
@@ -142,12 +196,20 @@ enum Resolution {
 /// `false` for) anything that resolves outside the root, so a committed
 /// symlink cannot expose `/etc`. Writes canonicalize the deepest existing
 /// ancestor of the target before creating anything, and refuse to replace a
-/// symlink. Symlinked directories are never traversed by `list_markdown`.
+/// symlink. Symlinked directories are never traversed by `list_markdown` or
+/// `list_files`.
 ///
-/// Listing contract: `list_markdown` returns only paths readable through this
-/// workspace. A symlink is listed only if it resolves inside the root to a
-/// regular file; dangling and outside links are skipped with a warning. This
-/// deliberately differs from `okf.py`'s `os.walk`, which lists them.
+/// Listing contract: `list_markdown` and `list_files` return only paths
+/// readable through this workspace. A symlink is listed only if it resolves
+/// inside the root to a regular file; dangling and outside links are skipped
+/// with a warning. This deliberately differs from `okf.py`'s `os.walk`, which
+/// lists them. Special files (FIFOs, sockets, devices) are never listed: a
+/// read would block or fail on them.
+///
+/// Accepted gap: an entry whose name is not valid UTF-8 is skipped with a
+/// warning (paths here are `String`s), and so is everything below a directory
+/// with such a name. `os.walk` lists them, so `okf.py`'s secret scan reads such
+/// a file and this port's does not.
 ///
 /// Accepted gap: the check and the use are separate steps, so a symlink swapped
 /// in between could win the race. That is accepted provided the caller
@@ -206,8 +268,15 @@ impl DiskWorkspace {
         matches!(self.resolve(&full), Resolution::Inside).then_some(full)
     }
 
-    /// Recursively lists `.md` files under `dir`, whose catalog-relative name is `prefix`.
-    fn collect(&self, dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<(), OkfError> {
+    /// Recursively lists the files `listing` selects under `dir`, whose
+    /// catalog-relative name is `prefix`.
+    fn collect(
+        &self,
+        listing: Listing,
+        dir: &Path,
+        prefix: &str,
+        out: &mut Vec<String>,
+    ) -> Result<(), OkfError> {
         let io_err = |source| OkfError::Io {
             path: prefix.to_string(),
             source,
@@ -228,27 +297,43 @@ impl DiskWorkspace {
             // is not a directory here and is never descended into.
             let file_type = entry.file_type().map_err(io_err)?;
             if file_type.is_dir() {
-                if !name.starts_with('.') {
-                    self.collect(&entry.path(), &rel, out)?;
+                if listing.descends_into(name) {
+                    self.collect(listing, &entry.path(), &rel, out)?;
                 }
-            } else if name.ends_with(".md") {
-                if file_type.is_symlink() {
-                    let path = entry.path();
-                    let skip_reason = match self.resolve(&path) {
-                        Resolution::Missing => Some("dangling symlink"),
-                        Resolution::Outside => Some("symlink resolves outside the catalog"),
-                        Resolution::Inside if !path.is_file() => Some("symlink to a non-file"),
-                        Resolution::Inside => None,
-                    };
-                    if let Some(reason) = skip_reason {
-                        tracing::warn!(path = %rel, reason, "not listing symlink");
-                        continue;
-                    }
-                }
-                out.push(rel);
+                continue;
             }
+            if !listing.includes(name) {
+                continue;
+            }
+            if file_type.is_symlink() {
+                let path = entry.path();
+                let skip_reason = match self.resolve(&path) {
+                    Resolution::Missing => Some("dangling symlink"),
+                    Resolution::Outside => Some("symlink resolves outside the catalog"),
+                    Resolution::Inside if !path.is_file() => Some("symlink to a non-file"),
+                    Resolution::Inside => None,
+                };
+                if let Some(reason) = skip_reason {
+                    tracing::warn!(path = %rel, reason, "not listing symlink");
+                    continue;
+                }
+            } else if !file_type.is_file() {
+                // Not a directory, symlink or regular file: a FIFO, socket or
+                // device, which a read would block on or fail.
+                tracing::warn!(path = %rel, "not listing a special file (FIFO, socket or device)");
+                continue;
+            }
+            out.push(rel);
         }
         Ok(())
+    }
+
+    /// Runs one walk from the root and sorts it into `os.walk` order.
+    fn listing(&self, listing: Listing) -> Result<Vec<String>, OkfError> {
+        let mut out = Vec::new();
+        self.collect(listing, &self.root, "", &mut out)?;
+        out.sort_by(|a, b| walk_order(a, b));
+        Ok(out)
     }
 }
 
@@ -386,10 +471,11 @@ impl Workspace for DiskWorkspace {
     }
 
     fn list_markdown(&self) -> Result<Vec<String>, OkfError> {
-        let mut out = Vec::new();
-        self.collect(&self.root, "", &mut out)?;
-        out.sort_by(|a, b| walk_order(a, b));
-        Ok(out)
+        self.listing(Listing::Markdown)
+    }
+
+    fn list_files(&self) -> Result<Vec<String>, OkfError> {
+        self.listing(Listing::AllFiles)
     }
 }
 
@@ -494,13 +580,24 @@ impl Workspace for MemWorkspace {
         out.sort_by(|a, b| walk_order(a, b));
         Ok(out)
     }
+
+    fn list_files(&self) -> Result<Vec<String>, OkfError> {
+        let mut out: Vec<String> = self
+            .files()
+            .keys()
+            .filter(|k| !in_skipped_directory(k))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| walk_order(a, b));
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const FILES: [(&str, &str); 7] = [
+    const FILES: [(&str, &str); 11] = [
         ("index.md", "root"),
         ("b.md", "b"),
         ("infra/index.md", "infra"),
@@ -508,6 +605,10 @@ mod tests {
         (".claude/skill.md", "hidden"),
         ("notes.txt", "not markdown"),
         ("crlf.txt", "a\r\nb\rc\n"),
+        (".git/config", "git internals"),
+        (".worktrees/s1/index.md", "a session worktree"),
+        ("infra/.git/HEAD", "a nested repository"),
+        ("infra/hosts/.git", "gitdir: a worktree's link file"),
     ];
 
     /// A temp dir holding a `catalog` subdirectory filled with `files`, so a
@@ -541,6 +642,22 @@ mod tests {
         assert_eq!(
             ws.list_markdown().unwrap(),
             ["b.md", "index.md", "infra/index.md", "infra/hosts/x.md"]
+        );
+        // Every file, in os.walk order (files before subdirectories), skipping
+        // only `.git` and `.worktrees` directories. Other dot-directories count,
+        // and so does a `.git` file.
+        assert_eq!(
+            ws.list_files().unwrap(),
+            [
+                "b.md",
+                "crlf.txt",
+                "index.md",
+                "notes.txt",
+                ".claude/skill.md",
+                "infra/index.md",
+                "infra/hosts/.git",
+                "infra/hosts/x.md",
+            ]
         );
         assert_eq!(ws.read_to_string("/infra/index.md").unwrap(), "infra");
         assert_eq!(ws.read_to_string("crlf.txt").unwrap(), "a\r\nb\rc\n");
@@ -719,6 +836,20 @@ mod tests {
         }
 
         #[test]
+        fn listings_skip_special_files() {
+            let (_dir, ws) = disk_catalog(&FILES);
+            let made = std::process::Command::new("mkfifo")
+                .arg(ws.root().join("pipe.md"))
+                .status();
+            if !made.is_ok_and(|status| status.success()) {
+                return; // no mkfifo on this system
+            }
+            // Reading a FIFO would block forever, so neither walk lists it.
+            assert!(!ws.list_files().unwrap().contains(&"pipe.md".to_string()));
+            assert!(!ws.list_markdown().unwrap().contains(&"pipe.md".to_string()));
+        }
+
+        #[test]
         fn a_new_file_gets_the_umask_mode_like_python_open() {
             let (dir, ws) = disk_catalog(&FILES);
             // `File::create` asks for 0o666 and the kernel applies the umask,
@@ -794,9 +925,12 @@ mod tests {
             let (_dir, ws, outside) = with_outside();
             symlink(&outside, ws.root().join("evil")).unwrap();
             symlink(&outside, ws.root().join("dirlink.md")).unwrap();
-            let listed = ws.list_markdown().unwrap();
-            assert!(!listed.iter().any(|p| p.contains("secret")));
-            assert!(!listed.contains(&"dirlink.md".to_string()));
+            // Both walks share the symlink rules.
+            for listed in [ws.list_markdown().unwrap(), ws.list_files().unwrap()] {
+                assert!(!listed.iter().any(|p| p.contains("secret")));
+                assert!(!listed.contains(&"dirlink.md".to_string()));
+                assert!(!listed.iter().any(|p| p.starts_with("evil")));
+            }
         }
 
         #[test]
@@ -805,12 +939,14 @@ mod tests {
             symlink(ws.root().join("gone.md"), ws.root().join("dangling.md")).unwrap();
             symlink(outside.join("secret.md"), ws.root().join("leak.md")).unwrap();
             symlink(ws.root().join("b.md"), ws.root().join("ok.md")).unwrap();
-            let listed = ws.list_markdown().unwrap();
-            assert!(listed.contains(&"ok.md".to_string()));
-            assert!(!listed.contains(&"dangling.md".to_string()));
-            assert!(!listed.contains(&"leak.md".to_string()));
-            for path in &listed {
-                assert!(ws.read_to_string(path).is_ok(), "{path}");
+            // Both walks share the symlink rules.
+            for listed in [ws.list_markdown().unwrap(), ws.list_files().unwrap()] {
+                assert!(listed.contains(&"ok.md".to_string()));
+                assert!(!listed.contains(&"dangling.md".to_string()));
+                assert!(!listed.contains(&"leak.md".to_string()));
+                for path in &listed {
+                    assert!(ws.read_to_string(path).is_ok(), "{path}");
+                }
             }
         }
 
