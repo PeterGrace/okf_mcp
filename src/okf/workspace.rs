@@ -50,10 +50,14 @@ pub trait Workspace: Send + Sync {
     /// Writes a file atomically (all or nothing), creating parent directories.
     ///
     /// On disk, as with `okf.py`'s `open(path, "w")`, an existing file keeps
-    /// its permissions and a new one gets 0o666 less the process umask.
+    /// its permissions, a read-only one is refused, and a new one gets 0o666
+    /// less the process umask. Unlike Python's in-place rewrite, replacing by
+    /// rename does not keep the owner, group, ACLs, extended attributes or
+    /// hard links of an existing file.
     ///
     /// # Errors
-    /// [`OkfError::Io`] on any filesystem failure; [`OkfError::InvalidPath`]
+    /// [`OkfError::Io`] on any filesystem failure (`PermissionDenied` for a
+    /// read-only file); [`OkfError::InvalidPath`]
     /// if the path escapes the catalog or is not a file path (the root).
     fn write_atomic(&self, path: &str, contents: &str) -> Result<(), OkfError>;
 
@@ -309,6 +313,14 @@ impl Workspace for DiskWorkspace {
         // an existing file keeps its mode, and a new one gets 0o666 minus the
         // umask. `tempfile` alone would create the file at 0o600.
         let existing = std::fs::metadata(&target).ok().map(|m| m.permissions());
+        // Python's `open(path, "w")` fails on a read-only file; a rename would
+        // silently replace it, so refuse first.
+        if existing.as_ref().is_some_and(|p| p.readonly()) {
+            return Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "file is read-only",
+            )));
+        }
         let mut builder = tempfile::Builder::new();
         builder.prefix(".okf-").suffix(".tmp");
         // (Other platforms have only a read-only flag, and new files are writable.)
@@ -607,6 +619,22 @@ mod tests {
             ws.write_atomic("b.md", "new").unwrap();
             assert_eq!(mode(&target), 0o640);
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        }
+
+        #[test]
+        fn a_read_only_file_is_refused_like_python_open() {
+            let (_dir, ws) = disk_catalog(&FILES);
+            let target = ws.root().join("b.md");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let error = ws.write_atomic("b.md", "new").unwrap_err();
+            assert!(
+                matches!(&error, OkfError::Io { path, source }
+                    if path == "b.md" && source.kind() == std::io::ErrorKind::PermissionDenied),
+                "{error:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "b");
+            assert_eq!(mode(&target), 0o444);
+            assert!(leftover_temp_files(ws.root()).is_empty());
         }
 
         #[test]
