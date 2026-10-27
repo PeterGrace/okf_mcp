@@ -1,95 +1,95 @@
 [
   {
+    "flow": "plain",
     "block": [
       "  - plain"
-    ],
-    "flow": "plain"
+    ]
   },
   {
+    "flow": "\"needs: quotes\"",
     "block": [
       "  - \"needs: quotes\""
-    ],
-    "flow": "\"needs: quotes\""
+    ]
   },
   {
+    "flow": "\"true\"",
     "block": [
       "  - \"true\""
-    ],
-    "flow": "\"true\""
+    ]
   },
   {
+    "flow": "\"12\"",
     "block": [
       "  - \"12\""
-    ],
-    "flow": "\"12\""
+    ]
   },
   {
+    "flow": "\"\"",
     "block": [
       "  - \"\""
-    ],
-    "flow": "\"\""
+    ]
   },
   {
+    "flow": "\" padded\"",
     "block": [
       "  - \" padded\""
-    ],
-    "flow": "\" padded\""
+    ]
   },
   {
+    "flow": "\"with, comma\"",
     "block": [
       "  - with, comma"
-    ],
-    "flow": "\"with, comma\""
+    ]
   },
   {
+    "flow": "\"multi\\nline\\ttab\"",
     "block": [
       "  - \"multi\\nline\\ttab\""
-    ],
-    "flow": "\"multi\\nline\\ttab\""
+    ]
   },
   {
+    "flow": "claude-code/claude-opus-5-5",
     "block": [
       "  - claude-code/claude-opus-5-5"
-    ],
-    "flow": "claude-code/claude-opus-5-5"
+    ]
   },
   {
+    "flow": "[a, b c, \"d,e\", null, [nested]]",
     "block": [
       "  - [a, b c, \"d,e\", null, [nested]]"
-    ],
-    "flow": "[a, b c, \"d,e\", null, [nested]]"
+    ]
   },
   {
+    "flow": "{ by: human:pgrace, at: 2026-10-26T23:01:11Z }",
     "block": [
-      "  - at: 2026-10-26T23:01:11Z",
-      "    by: human:pgrace"
-    ],
-    "flow": "{ at: 2026-10-26T23:01:11Z, by: human:pgrace }"
+      "  - by: human:pgrace",
+      "    at: 2026-10-26T23:01:11Z"
+    ]
   },
   {
+    "flow": "{ id: x, resource: \"a: b\", title: null }",
     "block": [
       "  - id: x",
       "    resource: \"a: b\"",
       "    title:"
-    ],
-    "flow": "{ id: x, resource: \"a: b\", title: null }"
+    ]
   },
   {
+    "flow": "{ nested: { k: v } }",
     "block": [
       "  - { nested: { k: v } }"
-    ],
-    "flow": "{ nested: { k: v } }"
+    ]
   },
   {
+    "flow": "{  }",
     "block": [
       "  - {  }"
-    ],
-    "flow": "{  }"
+    ]
   },
   {
+    "flow": "[]",
     "block": [
       "  - []"
-    ],
-    "flow": "[]"
+    ]
   }
 ]

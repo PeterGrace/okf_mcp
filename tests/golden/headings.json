@@ -1,5 +1,6 @@
 [
   {
+    "path": "AGENTS.md",
     "headings": [
       [
         0,
@@ -7,10 +8,10 @@
         "Agents",
         "agents"
       ]
-    ],
-    "path": "AGENTS.md"
+    ]
   },
   {
+    "path": "index.md",
     "headings": [
       [
         1,
@@ -18,10 +19,10 @@
         "Fixture catalog",
         "fixture-catalog"
       ]
-    ],
-    "path": "index.md"
+    ]
   },
   {
+    "path": "log.md",
     "headings": [
       [
         0,
@@ -35,10 +36,10 @@
         "2026-10-26",
         "2026-10-26"
       ]
-    ],
-    "path": "log.md"
+    ]
   },
   {
+    "path": "infra/index.md",
     "headings": [
       [
         0,
@@ -52,10 +53,10 @@
         "Concepts",
         "concepts"
       ]
-    ],
-    "path": "infra/index.md"
+    ]
   },
   {
+    "path": "infra/time-server.md",
     "headings": [
       [
         1,
@@ -75,14 +76,14 @@
         "Plan: CLI first, MCP later",
         "plan-cli-first-mcp-later"
       ]
-    ],
-    "path": "infra/time-server.md"
+    ]
   },
   {
-    "headings": [],
-    "path": "infra/hosts/crlf-host.md"
+    "path": "infra/hosts/crlf-host.md",
+    "headings": []
   },
   {
+    "path": "infra/hosts/no-frontmatter.md",
     "headings": [
       [
         2,
@@ -90,30 +91,30 @@
         "Heading `code` and *emphasis*",
         "heading-code-and-emphasis"
       ]
-    ],
-    "path": "infra/hosts/no-frontmatter.md"
+    ]
   },
   {
-    "headings": [],
-    "path": "people/bad-colon.md"
+    "path": "people/bad-colon.md",
+    "headings": []
   },
   {
-    "headings": [],
-    "path": "people/duplicate-key.md"
+    "path": "people/duplicate-key.md",
+    "headings": []
   },
   {
-    "headings": [],
-    "path": "people/flow-error.md"
+    "path": "people/flow-error.md",
+    "headings": []
   },
   {
-    "headings": [],
-    "path": "people/quoted-top-key.md"
+    "path": "people/quoted-top-key.md",
+    "headings": []
   },
   {
-    "headings": [],
-    "path": "people/stray-line.md"
+    "path": "people/stray-line.md",
+    "headings": []
   },
   {
+    "path": "people/unicode.md",
     "headings": [
       [
         1,
@@ -127,11 +128,10 @@
         "Ünïcode Wörds",
         "ünïcode-wörds-1"
       ]
-    ],
-    "path": "people/unicode.md"
+    ]
   },
   {
-    "headings": [],
-    "path": "people/unterminated.md"
+    "path": "people/unterminated.md",
+    "headings": []
   }
 ]

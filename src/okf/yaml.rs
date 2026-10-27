@@ -50,7 +50,9 @@ impl Value {
     }
 
     /// Converts to JSON (strings, arrays, objects, null), the shape the parity
-    /// tests compare against `okf.py`'s `json.dumps` output.
+    /// tests compare against `okf.py`'s `json.dumps` output. Map keys keep
+    /// their source order (serde_json's `preserve_order` feature), as Python
+    /// dicts do.
     pub fn to_json(&self) -> serde_json::Value {
         match self {
             Value::Null => serde_json::Value::Null,
@@ -1066,6 +1068,13 @@ mod tests {
     fn to_json_shapes() {
         let value = map(&[("a", Value::Seq(vec![s("x"), Value::Null]))]);
         assert_eq!(value.to_json(), serde_json::json!({"a": ["x", null]}));
+    }
+
+    #[test]
+    fn to_json_keeps_source_key_order() {
+        let value = map(&[("z", s("1")), ("a", s("2")), ("m", s("3"))]);
+        let text = serde_json::to_string(&value.to_json()).expect("serializable");
+        assert_eq!(text, r#"{"z":"1","a":"2","m":"3"}"#);
     }
 
     #[hegel::test]

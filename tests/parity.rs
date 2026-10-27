@@ -130,6 +130,13 @@ fn assert_entries_equal(rust: &Json, python: &Json, what: &str) {
     );
     for (r, p) in rust.iter().zip(python) {
         assert_eq!(r, p, "{what}: Rust (left) and okf.py (right) disagree");
+        // `Map` equality ignores key order, even with serde_json's
+        // `preserve_order`; the serialized text does not, so compare it too.
+        assert_eq!(
+            serde_json::to_string(r).expect("serialize Rust entry"),
+            serde_json::to_string(p).expect("serialize okf.py entry"),
+            "{what}: same content, different key order (Rust left, okf.py right)"
+        );
     }
     assert_eq!(
         rust.len(),
