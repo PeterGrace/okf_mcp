@@ -44,7 +44,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use okf_mcp::clock::format_timestamp;
 use okf_mcp::okf::analysis::links::links_report;
 use okf_mcp::okf::analysis::lint::{lint, CommitTimes};
@@ -167,10 +167,15 @@ fn render_inputs() -> Vec<Json> {
 
 /// An aware timestamp as a UTC instant (panics on anything else: test input).
 fn instant(text: &str) -> DateTime<Utc> {
+    aware(text).with_timezone(&Utc)
+}
+
+/// An aware timestamp with the offset it was written with, as okf.py's
+/// `parse_ts` returns it (panics on anything else: test input).
+fn aware(text: &str) -> DateTime<FixedOffset> {
     parse_iso(text)
         .and_then(|t| t.aware())
         .unwrap_or_else(|| panic!("{text} is an aware timestamp"))
-        .with_timezone(&Utc)
 }
 
 /// Reads a commit-times file (`{"times": {path: stamp}, "dirty": [path]}`),
@@ -183,8 +188,9 @@ fn commit_times_from_file(path: &str) -> CommitTimes {
         .expect("times is an object")
         .iter()
         .map(|(path, at)| {
-            let at = instant(at.as_str().expect("a time is a string"));
-            (path.clone(), at.fixed_offset())
+            // Offset kept, exactly as the shim's `okf.parse_ts` keeps it.
+            let at = aware(at.as_str().expect("a time is a string"));
+            (path.clone(), at)
         })
         .collect();
     let dirty: HashSet<String> = data["dirty"]
