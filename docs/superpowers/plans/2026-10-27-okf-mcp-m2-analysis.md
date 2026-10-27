@@ -818,9 +818,10 @@ Put above the test module:
 //!
 //! # Known divergences from `okf.py`
 //!
-//! * ISO week dates (`2026-W43-1`) and offsets with seconds or fractions
-//!   (`+05:30:15`) are rejected; Python accepts them. Neither occurs in a
+//! * ISO week dates (`2026-W43-1`) and offsets with a fraction of a second
+//!   (`+05:30:15.5`) are rejected; Python accepts them. Neither occurs in a
 //!   catalog, and `lint`'s `ISO_RE` rejects both before parsing anyway.
+//!   (Whole-second offsets such as `+05:30:15` are accepted, as in Python.)
 //! * Python returns a *naive* datetime when there is no offset, and `okf.py`
 //!   then crashes comparing it with an aware one. Callers here treat
 //!   [`PyDateTime::Naive`] as "not a usable timestamp" instead.

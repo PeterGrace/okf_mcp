@@ -348,6 +348,9 @@ fn parse_fields(bytes: &[u8]) -> Option<(Fields, bool)> {
             has_separator = next == b':';
         }
         // A single character after a field is "left over", whatever it is.
+        // This check must stay ahead of the `match` below: it is what lets
+        // `10:+05:00` and `10:00:00.Z` parse (CPython tests `p >= p_end`
+        // before looking at the separator) while `10:00:00xx+05:00` fails.
         if pos == bytes.len() {
             ended = Some(true);
             break;
