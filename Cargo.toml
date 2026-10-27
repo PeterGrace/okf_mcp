@@ -16,8 +16,6 @@ path = "src/main.rs"
 # Wall-clock timestamps for catalog stamps (UTC only; no local-time database needed).
 chrono = { version = "0.4.45", default-features = false, features = ["now"] }
 ctrlc = { version = "3.4.5", features = ["termination"] }
-# Lookaround regexes (okf.py's LINK_RE, slugify) that the `regex` crate can't express.
-fancy-regex = "0.20.0"
 # Insertion-ordered maps, matching Python dict order for frontmatter mappings.
 indexmap = "2.14.2"
 lazy_static = "1.5.0"

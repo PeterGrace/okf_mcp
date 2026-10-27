@@ -2,25 +2,39 @@
 //! headings and their GitHub anchor slugs, HTML anchors, footnotes, and
 //! links with their resolution to bundle paths.
 //!
-//! Port of the corresponding helpers in `tools/okf.py`. Patterns that need
-//! lookaround use `fancy_regex`; the rest use the faster `regex` crate.
+//! Port of the corresponding helpers in `tools/okf.py`. Everything uses the
+//! linear-time `regex` crate; the two places where Python's patterns use
+//! lookaround (`LINK_RE`'s `(?<!!)` and `slugify`'s underscore rule) are
+//! done by hand so no input can trip a backtracking limit.
+//!
+//! # Known divergences from `okf.py`
+//!
+//! * **`resolve_link` directory detection is lexical.** Python asks the OS
+//!   about an unnormalized path. Here `"/a/zz/../b"` gives `a/b/index.md`
+//!   (Python: `a/b` when `zz` does not exist), `"/infra/x.md/.."` gives
+//!   `infra/index.md` (Python: `infra`), and `".."` from `y.md` gives `..`
+//!   (Python: `../index.md`). Later broken-link code must treat
+//!   `escapes_root` paths explicitly.
+//! * **Unicode tables differ.** Python 3.14 (Unicode 16) and the `regex`
+//!   crate classify about 55 code points differently, which can change a
+//!   slug; this cannot be fixed in code.
+//! * **`headings` assumes its lines contain no `\n`.**
 
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::LazyLock;
 
 use indexmap::IndexMap;
 use regex::Regex;
 
 use crate::okf::paths::{dirname, join, normpath};
-use crate::okf::pystr::{py_rstrip, py_strip};
+use crate::okf::pystr::{is_py_word, py_rstrip, py_strip};
 use crate::okf::workspace::Workspace;
 
 /// A markdown link `[text](target "title")`, not an image (`![...]`).
-static LINK: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
-    fancy_regex::Regex::new(
-        r#"(?<!!)\[((?:[^\]\\]|\\.)*)\]\(([^)\s\x1c-\x1f]+)(?:[\s\x1c-\x1f]+"[^"]*")?\)"#,
-    )
-    .expect("LINK regex is valid")
+static LINK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\[((?:[^\]\\]|\\.)*)\]\(([^)\s\x1c-\x1f]+)(?:[\s\x1c-\x1f]+"[^"]*")?\)"#)
+        .expect("LINK regex is valid")
 });
 static HEADING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$").expect("HEADING regex is valid")
@@ -30,20 +44,18 @@ static FENCE: LazyLock<Regex> =
 static FOOTNOTE_DEF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[\^([^\]]+)\]:").expect("FOOTNOTE_DEF regex is valid"));
 static HTML_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)<a[\s\x1c-\x1f][^>]*(?:name|id)=["']([^"']+)["']"#)
+    Regex::new(r#"(?i)<a[\s\x1c-\x1f][^>]*(?:name|[i\u{130}\u{131}]d)=["']([^"']+)["']"#)
         .expect("HTML_ANCHOR regex is valid")
 });
-static URI_SCHEME: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^[a-z][a-z0-9+.-]*:").expect("URI_SCHEME regex is valid"));
+static URI_SCHEME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^[a-zA-Z\u{130}\u{131}][a-zA-Z0-9+.\-\u{130}\u{131}]*:")
+        .expect("URI_SCHEME regex is valid")
+});
 static SLUG_LINK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"!?\[((?:[^\]\\]|\\.)*)\]\([^)]*\)").expect("SLUG_LINK regex is valid")
 });
 static SLUG_TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<[^>]+>").expect("SLUG_TAG regex is valid"));
-static SLUG_EMPHASIS: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
-    fancy_regex::Regex::new(r"\*+|(?<![\p{L}\p{N}_])_+|_+(?![\p{L}\p{N}_])")
-        .expect("SLUG_EMPHASIS regex is valid")
-});
 static SLUG_PUNCTUATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[^\p{L}\p{N}_\- ]").expect("SLUG_PUNCTUATION regex is valid"));
 
@@ -62,6 +74,9 @@ pub struct LinkMatch {
 
 /// Finds every markdown link (not image) in `text`, left to right.
 ///
+/// All ranges are byte offsets into `text` (which may span lines), lie on
+/// `char` boundaries, and are safe to pass to `String::replace_range`.
+///
 /// # Examples
 /// ```
 /// use okf_mcp::okf::markdown::find_links;
@@ -70,25 +85,47 @@ pub struct LinkMatch {
 /// assert_eq!(links[0].target, "/infra/x.md#ports");
 /// ```
 pub fn find_links(text: &str) -> Vec<LinkMatch> {
-    LINK.captures_iter(text)
-        // fancy_regex reports backtracking-limit failures per match; `flatten`
-        // drops those (a link too pathological to parse is not a link).
-        .flatten()
-        .filter_map(|caps| {
-            let whole = caps.get(0)?;
-            let label = caps.get(1)?;
-            let target = caps.get(2)?;
-            Some(LinkMatch {
-                text: label.as_str().to_string(),
-                target: target.as_str().to_string(),
-                range: whole.range(),
-                target_range: target.range(),
-            })
-        })
-        .collect()
+    let mut links = Vec::new();
+    let mut pos = 0;
+    while pos <= text.len() {
+        // `captures_at` searches from `pos` but still sees the text before it.
+        let Some(caps) = LINK.captures_at(text, pos) else {
+            break;
+        };
+        let (Some(whole), Some(label), Some(target)) = (caps.get(0), caps.get(1), caps.get(2))
+        else {
+            break; // unreachable: groups 0-2 are mandatory
+        };
+        let next_char_after = |at: usize| at + text[at..].chars().next().map_or(1, char::len_utf8);
+        // Python's `(?<!!)` rejects a match at this position and the search
+        // retries one character later, which is how links nested inside
+        // image text (`![a [b](c)](d)`) are found. Do the same.
+        if text[..whole.start()].ends_with('!') {
+            pos = next_char_after(whole.start());
+            continue;
+        }
+        links.push(LinkMatch {
+            text: label.as_str().to_string(),
+            target: target.as_str().to_string(),
+            range: whole.range(),
+            target_range: target.range(),
+        });
+        // A match is never empty (it needs `[](x)`), but never loop forever.
+        pos = if whole.end() > whole.start() {
+            whole.end()
+        } else {
+            next_char_after(whole.end())
+        };
+    }
+    links
 }
 
 /// Splits a document's text into `(frontmatter, body, number of lines before the body)`.
+///
+/// ```
+/// use okf_mcp::okf::markdown::split_frontmatter;
+/// assert_eq!(split_frontmatter("---\na: 1\n---\nbody"), ("a: 1", "body", 3));
+/// ```
 ///
 /// Port of `okf.py`'s `split_frontmatter`: frontmatter needs a `---\n`
 /// first line and a later line starting with `---`.
@@ -108,6 +145,11 @@ pub fn split_frontmatter(text: &str) -> (&str, &str, usize) {
 /// Splits a document's text on `\n` into (frontmatter lines with delimiters, body lines).
 ///
 /// Port of `okf.py`'s `body_split`. Without frontmatter the first part is empty.
+///
+/// ```
+/// use okf_mcp::okf::markdown::body_split;
+/// assert_eq!(body_split("---\na: 1\n---\nx"), (vec!["---", "a: 1", "---"], vec!["x"]));
+/// ```
 pub fn body_split(text: &str) -> (Vec<&str>, Vec<&str>) {
     let lines: Vec<&str> = text.split('\n').collect();
     if lines.first().map(|l| l.trim_end_matches('\r')) == Some("---") {
@@ -152,6 +194,8 @@ pub fn headings(lines: &[&str]) -> Vec<Heading> {
             continue;
         }
         if let Some(caps) = HEADING.captures(line) {
+            // Indexing is safe: group 1 (the `#`s) is mandatory in HEADING; indexing a
+            // group that did not participate would panic.
             let level = caps[1].len();
             let text = caps.get(2).map_or("", |m| py_strip(m.as_str())).to_string();
             found.push(Heading {
@@ -162,7 +206,8 @@ pub fn headings(lines: &[&str]) -> Vec<Heading> {
             });
         }
     }
-    let mut seen: IndexMap<String, usize> = IndexMap::new();
+    // Only looked up, never iterated, so plain hashing is enough.
+    let mut seen: HashMap<String, usize> = HashMap::new();
     for heading in &mut found {
         let base = slugify(&heading.text);
         let slug = match seen.get(&base) {
@@ -188,10 +233,51 @@ pub fn headings(lines: &[&str]) -> Vec<Heading> {
 /// ```
 pub fn slugify(text: &str) -> String {
     let text = SLUG_LINK.replace_all(text, "$1");
-    let text = SLUG_TAG.replace_all(&text, "").replace('`', "");
-    let text = SLUG_EMPHASIS.replace_all(&text, "");
+    let text = SLUG_TAG.replace_all(&text, "");
+    // Only allocate the backtick-free copy when there is a backtick.
+    let text = if text.contains('`') {
+        Cow::Owned(text.replace('`', ""))
+    } else {
+        text
+    };
+    let text = strip_emphasis(&text);
     let lowered = py_strip(&text).to_lowercase();
     SLUG_PUNCTUATION.replace_all(&lowered, "").replace(' ', "-")
+}
+
+/// Removes emphasis markers the way `slugify`'s Python pattern
+/// `\*+|(?<!\w)_+|_+(?!\w)` does, in one linear pass.
+///
+/// Every `*` goes. A run of `_` goes whole unless it sits between two word
+/// characters (so `snake_case` keeps its underscore). Neighbours are judged in
+/// the original text, so `a*_b` loses both.
+fn strip_emphasis(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    let mut previous: Option<char> = None;
+    while let Some((start, c)) = chars.next() {
+        match c {
+            '*' => {}
+            '_' => {
+                let mut end = start + 1;
+                while let Some(&(at, '_')) = chars.peek() {
+                    end = at + 1;
+                    chars.next();
+                }
+                let next = text[end..].chars().next();
+                let between_words =
+                    previous.is_some_and(is_py_word) && next.is_some_and(is_py_word);
+                if between_words {
+                    out.push_str(&text[start..end]);
+                }
+                previous = Some('_');
+                continue;
+            }
+            _ => out.push(c),
+        }
+        previous = Some(c);
+    }
+    out
 }
 
 /// Every fragment a link may target in a document: heading slugs plus HTML
@@ -211,16 +297,16 @@ pub fn footnote_defs(lines: &[&str]) -> IndexMap<String, Vec<usize>> {
     let mut current: Option<String> = None;
     for (index, line) in lines.iter().enumerate() {
         if let Some(caps) = FOOTNOTE_DEF.captures(line) {
+            // Indexing is safe: group 1 is mandatory in FOOTNOTE_DEF.
             let label = caps[1].to_string();
             defs.entry(label.clone()).or_default().push(index);
             current = Some(label);
-        } else if let (Some(label), true) =
-            (&current, line.starts_with("    ") || line.starts_with('\t'))
+        } else if current.is_some()
+            && (line.starts_with("    ") || line.starts_with('\t'))
+            && !py_strip(line).is_empty()
         {
-            if !py_strip(line).is_empty() {
-                defs.entry(label.clone()).or_default().push(index);
-            } else {
-                current = None;
+            if let Some(lines) = current.as_deref().and_then(|label| defs.get_mut(label)) {
+                lines.push(index);
             }
         } else {
             current = None;
@@ -433,6 +519,96 @@ mod tests {
         assert!(anchors_in("<a\u{1f}name=\"zz\">").contains("zz"));
         let defs = footnote_defs(&["[^a]: x", "    \u{1f}", "    more"]);
         assert_eq!(defs["a"], [0]);
+    }
+
+    #[test]
+    fn pathological_inputs_neither_panic_nor_drop_later_links() {
+        // Python finds exactly the trailing link here (checked at 1000 reps).
+        let text = format!("{}[ok](x)", "[a](b ".repeat(100_000));
+        let targets: Vec<_> = find_links(&text).into_iter().map(|l| l.target).collect();
+        assert_eq!(targets, ["x"]);
+        // Python: slugify("__a" * n) == "a" + "__a" * (n - 1).
+        let expected = format!("a{}", "__a".repeat(99_999));
+        assert_eq!(slugify(&"__a".repeat(100_000)), expected);
+    }
+
+    #[test]
+    fn target_range_with_title_and_multibyte_prefix() {
+        // Python's character spans (checked) are starts 10 and 27, targets 14..19 and 31..32;
+        // `\u{e9}` and `\u{fc}` add one byte each to the byte offsets below.
+        let line = "\u{e9} ![x](y) [t](/a.md \"ti\") \u{fc}[k](z)";
+        let links = find_links(line);
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            (links[0].range.start, links[0].target_range.clone()),
+            (11, 15..20)
+        );
+        assert_eq!(&line[links[0].target_range.clone()], "/a.md");
+        assert_eq!(&line[links[0].range.clone()], "[t](/a.md \"ti\")");
+        assert_eq!(
+            (links[1].range.start, links[1].target_range.clone()),
+            (29, 33..34)
+        );
+    }
+
+    #[test]
+    fn unclosed_fence_hides_later_headings() {
+        let found = headings(&["# a", "```", "# b", "## c"]);
+        let texts: Vec<_> = found.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["a"]);
+    }
+
+    #[test]
+    fn slugify_emphasis_table_matches_python() {
+        // Expected values come from okf.py's slugify.
+        let table = [
+            ("_a_", "a"),
+            ("a__b", "a__b"),
+            ("__init__", "init"),
+            ("*a*_b_", "ab"),
+            ("a_*_b", "ab"),
+            ("a*_b", "ab"),
+            ("x_ y", "x-y"),
+            ("_", ""),
+            ("__", ""),
+            ("\u{b2}_x", "\u{b2}_x"),
+            ("\u{e9}_", "\u{e9}"),
+            ("a_\u{301}", "a"),
+            ("`c_d`", "c_d"),
+            ("[l_k](u)", "l_k"),
+            ("<i>_t_</i>", "t"),
+            ("snake_case_", "snake_case"),
+        ];
+        for (input, expected) in table {
+            assert_eq!(slugify(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn dotless_and_dotted_i_fold_like_python() {
+        let ws = MemWorkspace::from_files([("a.md", "")]);
+        // Python: resolve_link("\u{131}map:x") is external, as are the others.
+        for link in ["\u{131}map:x", "\u{130}map:x", "\u{212a}ey:x", "\u{17f}:x"] {
+            assert_eq!(resolve_link(&ws, link, "y.md"), None, "{link:?}");
+        }
+        // Python: both are anchors.
+        assert!(anchors_in("<a \u{131}d=\"m\">").contains("m"));
+        assert!(anchors_in("<a \u{130}d=\"m\">").contains("m"));
+    }
+
+    #[hegel::test]
+    fn link_ranges_are_consistent(tc: hegel::TestCase) {
+        use hegel::generators;
+        let text: String = tc.draw(generators::text());
+        let wrapped = format!(
+            "[\u{e9}]({}) !{text}[a](b) \u{fc}[c](d \"t\")",
+            text.replace(')', "")
+        );
+        for link in find_links(&wrapped) {
+            assert_eq!(&wrapped[link.target_range.clone()], link.target);
+            assert!(link.range.start < link.target_range.start);
+            assert!(link.target_range.end < link.range.end);
+        }
     }
 
     #[hegel::test]

@@ -5,10 +5,26 @@
 //! `\w` is `[\p{L}\p{N}_]` and Python's `\s` is `[\s\x1c-\x1f]`, whereas the
 //! Rust `regex` classes differ, so ported patterns must spell these classes out.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 /// Python's `str.isspace()`: Unicode White_Space plus U+001C..U+001F, which
 /// Rust's `char::is_whitespace` leaves out.
 pub fn is_py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// Python's `\w` for one character: a letter (`\p{L}`), a number (`\p{N}`) or `_`.
+///
+/// Not `char::is_alphanumeric` (which counts combining marks and other
+/// `Alphabetic` characters that Python's `\w` rejects). Matches the class the
+/// ported regexes spell out, by asking the `regex` crate with that very class.
+pub fn is_py_word(c: char) -> bool {
+    static WORD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^[\p{L}\p{N}_]$").expect("word regex is valid"));
+    let mut buffer = [0u8; 4];
+    WORD.is_match(c.encode_utf8(&mut buffer))
 }
 
 /// Python's `s.strip()`.
@@ -29,6 +45,18 @@ pub fn py_lstrip(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_predicate_matches_the_regex_class() {
+        let class = Regex::new(r"^[\p{L}\p{N}_]$").expect("valid");
+        for c in [
+            'a', 'Z', '0', '\u{b2}', '\u{301}', '_', '\u{e9}', '\u{65e5}', '-', ' ', '*',
+        ] {
+            assert_eq!(is_py_word(c), class.is_match(&c.to_string()), "{c:?}");
+        }
+        assert!(is_py_word('\u{b2}'));
+        assert!(!is_py_word('\u{301}'));
+    }
 
     #[test]
     fn strip_handles_separators_and_ideographic_space() {
