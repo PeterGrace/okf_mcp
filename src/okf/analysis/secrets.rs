@@ -294,6 +294,28 @@ mod tests {
         );
         let pem = format!("-----BEGIN {} PRIVATE KEY-----", "RSA");
         assert_eq!(rules(&pem), ["secret:private-key"]);
+        let pat = fake("github", "_pat_", 1) + &"a".repeat(22);
+        assert_eq!(rules(&format!(" {pat}")), ["secret:github-pat"]);
+        assert!(
+            rules(&format!("x{pat}")).is_empty(),
+            "preceded by a token character"
+        );
+        // `sk-` takes `-`-separated segments before its 20+ key characters,
+        // and `-` is in its lookbehind class.
+        let sk = fake("s", "k-", 1) + "proj-" + &"a1".repeat(10);
+        assert_eq!(rules(&sk), ["secret:sk-key"]);
+        assert!(rules(&format!("-{sk}")).is_empty(), "preceded by a dash");
+    }
+
+    #[test]
+    fn token_rules_report_in_table_order() {
+        let github = fake("gh", "p_", 1) + &"A1".repeat(18);
+        let slack = fake("xo", "xb-", 1) + &"1234567890".repeat(2);
+        // Slack comes first on the line, but github-token is earlier in the table.
+        assert_eq!(
+            rules(&format!("{slack} {github}")),
+            ["secret:github-token", "secret:slack-token"]
+        );
     }
 
     #[test]
@@ -332,10 +354,14 @@ mod tests {
             rules(&format!("Client_Secret={}", fake("", "aB", 6))),
             ["secret:assignment"]
         );
-        assert_eq!(
-            rules(&format!("API-KEY = {}", "q".repeat(20))),
-            ["secret:assignment"]
-        );
+        let mixed_case = &scan_secrets("x.md", &format!("password: {}", "aBcDeF".repeat(2)))[0];
+        assert!(mixed_case
+            .message
+            .ends_with("(value is 12+ mixed-case characters)"));
+        let unbroken = &scan_secrets("x.md", &format!("API-KEY = {}", "q".repeat(20)))[0];
+        assert!(unbroken
+            .message
+            .ends_with("(value is a 20+ character unbroken token)"));
     }
 
     #[test]
