@@ -42,10 +42,9 @@ pub trait Workspace: Send + Sync {
     /// footnotes, anchors), with `\r\n` and lone `\r` turned into `\n`.
     ///
     /// This is how `okf.py` reads files for analysis (Python text mode,
-    /// universal newlines, as the crate-internal `pystr::universal_newlines`
-    /// does), so `## Closing ##\r\n` is the heading `Closing` here too. Frontmatter parsing and editing
-    /// ([`crate::okf::doc::Doc`]) must use [`Workspace::read_to_string`]
-    /// instead, which keeps every byte.
+    /// universal newlines), so `## Closing ##\r\n` is the heading `Closing`
+    /// here too. Frontmatter parsing and editing ([`crate::okf::doc::Doc`])
+    /// must use [`Workspace::read_to_string`] instead, which keeps every byte.
     ///
     /// A file without `\r` is returned as read, with no extra allocation.
     ///
