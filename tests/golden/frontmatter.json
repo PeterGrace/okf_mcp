@@ -191,6 +191,10 @@
     "has_frontmatter": false
   },
   {
+    "path": "markdown/footnotes.md",
+    "has_frontmatter": false
+  },
+  {
     "path": "markdown/slugs.md",
     "has_frontmatter": false
   },

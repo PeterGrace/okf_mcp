@@ -277,6 +277,35 @@
     "footnotes": {}
   },
   {
+    "path": "markdown/footnotes.md",
+    "headings": [
+      [
+        0,
+        1,
+        "Footnotes",
+        "footnotes"
+      ]
+    ],
+    "footnotes": {
+      "z": [
+        4,
+        5
+      ],
+      "a": [
+        6,
+        7
+      ],
+      "dup": [
+        10,
+        11
+      ],
+      "x": [
+        14,
+        15
+      ]
+    }
+  },
+  {
     "path": "markdown/slugs.md",
     "headings": [
       [
