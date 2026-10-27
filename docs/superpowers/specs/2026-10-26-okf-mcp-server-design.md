@@ -1,7 +1,8 @@
 # OKF MCP server: design
 
 - **Date:** 2026-10-26
-- **Status:** approved design, pending implementation plan
+- **Status:** approved design. M1 (core library) and M2 (analysis) are delivered; see
+  "Milestones"
 - **Catalog concept:** `/projects/someday/okf-mcp-server.md` in `pg_knowledge_catalog`
 - **Replaces:** `tools/okf.py` in every OKF catalog (retired once this server reaches parity
   and has been in real use)
@@ -134,6 +135,12 @@ A session that has a worktree for a catalog reads that catalog from a snapshot o
 worktree instead, rebuilt lazily after the session's writes, so an agent sees its own
 pending edits.
 
+M2 delivered the immutable snapshot itself as `okf::snapshot::Snapshot`
+(`Snapshot::build(&dyn Workspace)`): pure and workspace-based, with each document's
+kind, text, parsed frontmatter, title and aliases, links, anchors, backlinks, search
+fields, and the secret findings of every file. M3's `catalog` owns the
+`RwLock<Arc<Snapshot>>`, the rebuilds and the swap.
+
 ### Crate layout
 
 A library crate with a thin `main.rs`:
@@ -147,7 +154,10 @@ A library crate with a thin `main.rs`:
 | `okf::doc` | Frontmatter/body split; textual, byte-preserving key edits (`set_block`, `append_seq_item`, `delete_block`, `KEY_ORDER` insertion) |
 | `okf::markdown` | ATX headings outside fences, GitHub slugs with repeat numbering, HTML anchors, footnotes, link parsing and resolution |
 | `okf::ops` | `stamp`, `review`, `question`, `unquestion`, `source`, `log`, `index`, `create`, `edit`, `replace_body`, `set_frontmatter`, `mv`, `split`, `delete` |
-| `okf::analysis` | Links report, `oldest`, `sprawl`, `lint`, secret scan |
+| `okf::timestamp` | Port of the `datetime.fromisoformat` subset `okf.py` relies on (CPython's C parser, quirks included), `isoformat()` and `ISO_RE` |
+| `okf::snapshot` | The in-memory catalog snapshot (see "In-memory snapshot"); `catalog` in M3 holds it behind `RwLock<Arc<_>>` |
+| `okf::analysis` | Links report, `oldest`, `sprawl`, `lint`, secret scan: pure functions over a `Snapshot` and an injected "now". `lint` takes git commit times as an input (`Option<&CommitTimes>`; `None` means git is unavailable), which the `git` module fills in M3 |
+| `okf::search` | Ranked search within one snapshot (decision 3 of the M2 plan); hits carry an `Ord` rank key so the `search` tool can merge catalogs |
 | `okf::workspace` | `Workspace` trait (read, write atomically, list, exists, rename, remove) with a disk implementation and an in-memory one for tests |
 | `git` | git CLI wrapper: fetch, ff-only merge, worktree add/remove, status, add, commit, pull --rebase, push, rebase --abort |
 | `catalog` | Per-catalog state: clone, snapshot, refresh, session worktrees, publish, pruning |
@@ -168,7 +178,7 @@ JSON (rmcp `Json<T>`, `schemars` schemas) plus a short text summary. Concept pat
 | Tool | Parameters | Result |
 |---|---|---|
 | `list_catalogs` | none | Catalogs the key can reach; this connection's selection; default write target; last fetch time and HEAD per catalog |
-| `search` | `query`, `catalogs?`, `type?`, `tags?`, `status?`, `limit?` (default 20) | Ranked hits: catalog, path, title, description, snippet. Rank: title/alias match, then tag, then description, then body; case-insensitive; deprecated concepts last |
+| `search` | `query`, `catalogs?`, `type?`, `tags?`, `status?`, `limit?` (default 20) | Ranked hits: catalog, path, title, description, snippet. Every whitespace-separated term must occur (case-insensitive substring) in some field; the tier is the best field holding the whole query, else the best holding a term (fields, best first: title/alias, tag, description, body); deprecated concepts last; ties by path (decision 3 of the M2 plan). The `tags` filter matches whole tags only, while free text matches tags by substring: the tool description must say so |
 | `get_concept` | `path`, `links?`, `raw?` | Frontmatter as JSON and the body; with `links`, resolved outbound links (path, title, description, broken flag) and inbound backlinks; with `raw`, the file verbatim |
 | `read_document` | `path?` (default `/index.md`) | Raw text of an `index.md`, `log.md` or `AGENTS.md` |
 | `open_questions` | none | Every queued `open_questions` entry, grouped by concept, 1-based |
@@ -352,14 +362,58 @@ time server (`time_server` in config) over NTP and logs at `error` if the offset
 
 | Milestone | Delivers |
 |---|---|
-| M1. Core library | `okf::yaml`, `okf::doc`, `okf::markdown`, `okf::workspace`, `clock`; the parity test harness |
-| M2. Analysis | `lint`, links report, `oldest`, `sprawl`, secret scan; snapshot and search |
+| M1. Core library (delivered) | `okf::yaml`, `okf::doc`, `okf::markdown`, `okf::workspace`, `clock`; the parity test harness ([plan](../plans/2026-10-26-okf-mcp-m1-core-library.md)) |
+| M2. Analysis (delivered) | `lint`, links report, `oldest`, `sprawl`, secret scan; snapshot and search; `okf::timestamp` ([plan](../plans/2026-10-27-okf-mcp-m2-analysis.md); PRs #17-#29) |
 | M3. Read-only server | axum, rmcp, auth, `selection`, clone and refresh, read tools, `hash-key`. Deployable and useful on its own |
 | M4. Writes | Session worktrees, content and bookkeeping write tools, `publish`, `discard`, `pending_changes`, `stranded_sessions` |
 | M5. Restructuring | `move_concept`, `split_concept`, `delete_concept` |
 | M6. Deployment | Dockerfile, k8s manifests, webhook, NTP check, operator docs |
 
 Per the project's `CLAUDE.md`, each iteration adds a dated note under `changelog/`.
+
+### What M2 shipped differently
+
+The M2 plan's "Simplifications and deviations relative to the design" has the full list;
+the ones that change this design:
+
+- The snapshot is `okf::snapshot`, not part of `catalog` (see "In-memory snapshot"), and
+  search is its own module, `okf::search`.
+- The secret scan runs on every file once, inside `Snapshot::build`, so `lint` reads the
+  findings rather than walking the catalog again. `tools/okf.py` is skipped, as `okf.py`
+  skips itself.
+- `lint` takes commit times as an input; M2 has no git code.
+- Parity compares parsed JSON values, not bytes: `json.dumps` escapes non-ASCII and
+  serde_json writes it raw. Key order is checked separately.
+- Known divergences from `okf.py`, kept on purpose and documented in the module that has
+  each: a list or mapping `status` is reported with its `repr` (`okf.py`'s lint crashes);
+  a naive timestamp in `oldest` is ignored, as is a fallback `at:` value that is not a
+  date (`okf.py` crashes on both); ISO week dates and fractional-second offsets are
+  rejected; a link escaping the catalog root is always broken; symlinks follow M1's
+  listing contract, and non-UTF-8 file names are skipped; `resolve_concept` only finds
+  snapshot documents (not a file in a dot-directory); the root `AGENTS.md`, `CLAUDE.md`
+  and `README.md` are in the snapshot but outside the link graph. Sprawl scores match
+  `okf.py` on Python 3.12 or later, whose float `sum()` is compensated.
+
+### Carried into M3
+
+Items raised in M2 reviews that belong to M3's tool layer:
+
+- **`search` tool description** (PR #24): say that the `tags` filter matches whole tags
+  only, while free text matches tags by substring.
+- **Commit times from git** (PR #27): key `CommitTimes` by catalog-relative paths. Git
+  prints paths relative to the repository root, so strip the catalog's prefix when the
+  catalog is not the repository root, or `generated-after-commit` silently stops firing.
+  Documented on `CommitTimes::new`.
+- **Mention matcher** (PR #23): `links_report` builds its unlinked-mention matcher on
+  every call; cache one per snapshot once snapshots are long-lived.
+- **`MemWorkspace` in integration tests** (PR #29): it is compiled only for unit tests or
+  with the `test-util` feature, so an integration test that needs it must enable
+  `test-util`.
+- The deferred items in the M2 plan's "Deliberately deferred" table: the git module that
+  fills `CommitTimes`, snapshot swapping and rebuilds, cross-catalog search merge, the
+  per-session write lock and `core.symlinks=false` clones (M3); secret refusal on write,
+  the no-frontmatter `set_block` error and `.okf-*.tmp` handling before `git add -A`
+  (M4).
 
 ## Out of scope
 
