@@ -1,0 +1,4 @@
+# Byte-exact test data: CRLF, lone-CR and BOM fixtures must never be
+# converted on checkout or commit.
+tests/fixtures/** -text
+tests/golden/** -text
