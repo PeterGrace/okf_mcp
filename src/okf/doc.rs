@@ -3,12 +3,19 @@
 //!
 //! Port of `okf.py`'s `Doc` and `append_seq_item`. Every byte outside the
 //! edited key's lines is preserved, including comments, blank lines, key
-//! order and the file's newline style.
+//! order and each line's own newline style. A deliberate improvement over
+//! `okf.py`: it rejoins every frontmatter line with the first line's newline,
+//! so a file with mixed `\n` and `\r\n` endings would change on every edit
+//! there; here each line keeps its own ending, and only lines an edit inserts
+//! use the first line's.
 //!
-//! Divergence from `okf.py`: only `\n` and `\r\n` end lines. Python's
-//! `splitlines` also splits on `\x0b`, `\x0c`, `\x1c`-`\x1e`, `\x85`,
-//! U+2028 and U+2029, which would corrupt a document containing them.
+//! Divergences from `okf.py`:
+//! - only `\n` and `\r\n` end lines. Python's `splitlines` also splits on a
+//!   lone `\r`, `\x0b`, `\x0c`, `\x1c`-`\x1e`, `\x85`, U+2028 and U+2029,
+//!   which would corrupt a document containing them;
+//! - a line ending in `\r\r\n` keeps its extra `\r` as part of its text.
 
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use indexmap::IndexMap;
@@ -17,7 +24,7 @@ use regex::Regex;
 use crate::error::OkfError;
 use crate::okf::pystr::{py_lstrip, py_rstrip, py_strip};
 use crate::okf::yaml::{
-    block_item, indent_of, is_seq_start, parse_value, strip_comment, NumberedLine, Value, YamlError,
+    indent_of, is_seq_start, parse_value, strip_comment, NumberedLine, Value, YamlError,
 };
 
 /// Preferred position of top-level keys, used only when a key is created.
@@ -55,13 +62,30 @@ pub struct Block {
     pub end: usize,
 }
 
+/// Where a block-list key's items sit, as returned by [`Doc::seq_items`].
+///
+/// A plain read-only result, so its fields are public.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqItems {
+    /// The number of spaces before each item's dash.
+    pub indent: usize,
+    /// Each item's lines as an index range into [`Doc::frontmatter`].
+    pub spans: Vec<Range<usize>>,
+}
+
 /// A parsed markdown file: opening delimiter, frontmatter lines, and the rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Doc {
     path: String,
     head: Vec<String>,
+    /// Frontmatter line texts, without their endings.
     frontmatter: Vec<String>,
+    /// `endings[i]` is the exact ending (`""`, `"\n"` or `"\r\n"`) of
+    /// `frontmatter[i]`. Every edit goes through `splice_lines` to keep the
+    /// two vectors the same length.
+    endings: Vec<&'static str>,
     tail: Vec<String>,
+    /// The ending given to lines an edit inserts.
     newline: &'static str,
     has_frontmatter: bool,
 }
@@ -69,11 +93,58 @@ pub struct Doc {
 /// Splits text into lines that keep their `\n` (Python's `splitlines(keepends=True)`
 /// restricted to `\n` and `\r\n`).
 fn lines_with_endings(text: &str) -> Vec<String> {
+    // `split_inclusive` is like `splitlines(keepends=True)`: each piece keeps its `\n`.
     text.split_inclusive('\n').map(str::to_string).collect()
 }
 
+/// Python's `line.rstrip("\r\n")`: removes every trailing `\r` and `\n`.
 fn strip_line_ending(line: &str) -> &str {
     line.trim_end_matches(['\r', '\n'])
+}
+
+/// The exact ending of `line`: `"\r\n"`, `"\n"` or `""` (one ending only).
+fn line_ending(line: &str) -> &'static str {
+    if line.ends_with("\r\n") {
+        "\r\n"
+    } else if line.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    }
+}
+
+/// The top-level key blocks of frontmatter `lines`, in order.
+fn blocks_of(lines: &[String]) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(caps) = TOP_KEY.captures(&lines[i]) else {
+            i += 1;
+            continue;
+        };
+        let mut last = i;
+        let mut j = i + 1;
+        while j < lines.len() {
+            let line = &lines[j];
+            if py_strip(line).is_empty() {
+                j += 1;
+                continue;
+            }
+            if line.starts_with([' ', '\t']) || is_seq_start(line) {
+                last = j;
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        blocks.push(Block {
+            key: caps[1].to_string(),
+            start: i,
+            end: last + 1,
+        });
+        i = last + 1;
+    }
+    blocks
 }
 
 impl Doc {
@@ -94,7 +165,7 @@ impl Doc {
     /// assert_eq!(doc.render(), "---\ntype: Note\n---\nBody\n");
     /// ```
     pub fn from_text(path: &str, text: &str) -> Self {
-        let lines = lines_with_endings(text);
+        let mut lines = lines_with_endings(text);
         let newline = if lines.first().is_some_and(|l| l.ends_with("\r\n")) {
             "\r\n"
         } else {
@@ -104,26 +175,34 @@ impl Doc {
             path: path.to_string(),
             head: Vec::new(),
             frontmatter: Vec::new(),
-            tail: lines.clone(),
+            endings: Vec::new(),
+            tail: Vec::new(),
             newline,
             has_frontmatter: false,
         };
-        if lines.first().map(|l| strip_line_ending(l)) != Some("---") {
+        let opens = lines.first().map(|l| strip_line_ending(l)) == Some("---");
+        let closing = opens
+            .then(|| {
+                lines
+                    .iter()
+                    .skip(1)
+                    .position(|l| matches!(py_rstrip(strip_line_ending(l)), "---" | "..."))
+            })
+            .flatten();
+        let Some(offset) = closing else {
+            doc.tail = lines;
             return doc;
-        }
-        let closing = lines
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find(|(_, l)| matches!(py_rstrip(strip_line_ending(l)), "---" | "..."));
-        if let Some((j, _)) = closing {
-            doc.has_frontmatter = true;
-            doc.head = lines[..1].to_vec();
-            doc.frontmatter = lines[1..j]
-                .iter()
-                .map(|l| strip_line_ending(l).to_string())
-                .collect();
-            doc.tail = lines[j..].to_vec();
+        };
+        // `split_off(n)` moves `lines[n..]` out into a new Vec (like `rest = lines[n:]; del lines[n:]`).
+        doc.tail = lines.split_off(offset + 1);
+        let frontmatter = lines.split_off(1);
+        doc.head = lines;
+        doc.has_frontmatter = true;
+        for mut line in frontmatter {
+            let ending = line_ending(&line);
+            line.truncate(line.len() - ending.len());
+            doc.frontmatter.push(line);
+            doc.endings.push(ending);
         }
         doc
     }
@@ -143,42 +222,31 @@ impl Doc {
         &self.frontmatter
     }
 
+    /// Replaces `frontmatter[range]` with `new_lines` (Python's slice
+    /// assignment `fm[a:b] = new_lines`; an empty `new_lines` is `del fm[a:b]`).
+    /// Inserted lines get [`Doc`]'s `newline`; the endings vector stays in step.
+    fn splice_lines(&mut self, range: Range<usize>, new_lines: Vec<String>) {
+        let endings = std::iter::repeat_n(self.newline, new_lines.len());
+        // `splice` returns an iterator over the removed items; dropping it applies the edit.
+        self.endings.splice(range.clone(), endings);
+        self.frontmatter.splice(range, new_lines);
+    }
+
     /// The top-level key blocks, in file order.
+    ///
+    /// # Returns
+    /// One [`Block`] per `key:` line, with its continuation lines.
     pub fn blocks(&self) -> Vec<Block> {
-        let lines = &self.frontmatter;
-        let mut blocks = Vec::new();
-        let mut i = 0;
-        while i < lines.len() {
-            let Some(caps) = TOP_KEY.captures(&lines[i]) else {
-                i += 1;
-                continue;
-            };
-            let mut last = i;
-            let mut j = i + 1;
-            while j < lines.len() {
-                let line = &lines[j];
-                if py_strip(line).is_empty() {
-                    j += 1;
-                    continue;
-                }
-                if line.starts_with([' ', '\t']) || is_seq_start(line) {
-                    last = j;
-                    j += 1;
-                    continue;
-                }
-                break;
-            }
-            blocks.push(Block {
-                key: caps[1].to_string(),
-                start: i,
-                end: last + 1,
-            });
-            i = last + 1;
-        }
-        blocks
+        blocks_of(&self.frontmatter)
     }
 
     /// The block for `key`, if present.
+    ///
+    /// # Arguments
+    /// * `key` - the top-level key.
+    ///
+    /// # Returns
+    /// The first block with that key, or `None`.
     pub fn block(&self, key: &str) -> Option<Block> {
         self.blocks().into_iter().find(|b| b.key == key)
     }
@@ -213,13 +281,13 @@ impl Doc {
         self.block(key).map_or(1, |b| b.start + 2)
     }
 
-    /// Reassembles the file text.
+    /// Reassembles the file text, each line with its own ending.
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.extend(self.head.iter().map(String::as_str));
-        for line in &self.frontmatter {
+        for (line, ending) in self.frontmatter.iter().zip(&self.endings) {
             out.push_str(line);
-            out.push_str(self.newline);
+            out.push_str(ending);
         }
         out.extend(self.tail.iter().map(String::as_str));
         out
@@ -239,11 +307,12 @@ impl Doc {
     ///
     /// # Arguments
     /// * `key` - the top-level key.
-    /// * `new_lines` - the replacement lines, starting with `key:`.
+    /// * `new_lines` - the replacement lines; `new_lines[0]` must be the
+    ///   `key:` line, or the key will not be found again.
     pub fn set_block(&mut self, key: &str, new_lines: Vec<String>) {
         let blocks = self.blocks();
         if let Some(b) = blocks.iter().find(|b| b.key == key) {
-            self.frontmatter.splice(b.start..b.end, new_lines);
+            self.splice_lines(b.start..b.end, new_lines);
             return;
         }
         let mut position = self.frontmatter.len();
@@ -269,21 +338,33 @@ impl Doc {
                 position = start;
             }
         }
-        self.frontmatter.splice(position..position, new_lines);
+        self.splice_lines(position..position, new_lines);
     }
 
     /// Removes `key`'s lines, if present.
+    ///
+    /// # Arguments
+    /// * `key` - the top-level key; a missing key is a no-op.
     pub fn delete_block(&mut self, key: &str) {
         if let Some(b) = self.block(key) {
-            self.frontmatter.drain(b.start..b.end);
+            self.splice_lines(b.start..b.end, Vec::new());
         }
     }
 
-    /// For a block-list key: the item indent and each item's `(start, end)` span.
+    /// Where a block-list key's items sit.
     ///
-    /// Returns `None` when the key is absent, has an inline value, or its
+    /// Comment and blank lines are skipped, so a trailing comment after the
+    /// last item is not part of any span (a new item goes before it, as in
+    /// `okf.py`).
+    ///
+    /// # Arguments
+    /// * `key` - the top-level key.
+    ///
+    /// # Returns
+    /// The item indent (2 when there are no items) and each item's span, or
+    /// `None` when the key is absent, has an inline value, or its
     /// continuation isn't a plain block list.
-    pub fn seq_items(&self, key: &str) -> Option<(usize, Vec<(usize, usize)>)> {
+    pub fn seq_items(&self, key: &str) -> Option<SeqItems> {
         let b = self.block(key)?;
         let inline = self.frontmatter[b.start]
             .split_once(':')
@@ -291,11 +372,12 @@ impl Doc {
         if !strip_comment(inline).is_empty() {
             return None;
         }
-        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut spans: Vec<Range<usize>> = Vec::new();
         let mut item_indent: Option<usize> = None;
         for i in b.start + 1..b.end {
             let line = &self.frontmatter[i];
-            if py_strip(line).is_empty() || py_strip(line).starts_with('#') {
+            let stripped = py_strip(line);
+            if stripped.is_empty() || stripped.starts_with('#') {
                 continue;
             }
             // `indent` counts ASCII spaces, so slicing at it is always a char boundary.
@@ -311,15 +393,18 @@ impl Doc {
                 }
             };
             if indent == expected && is_seq_start(&line[indent..]) {
-                spans.push((i, i + 1));
+                spans.push(i..i + 1);
             } else if indent > expected {
                 // A continuation of the last item; `?` returns None when there is none.
-                spans.last_mut()?.1 = i + 1;
+                spans.last_mut()?.end = i + 1;
             } else {
                 return None;
             }
         }
-        Some((item_indent.unwrap_or(2), spans))
+        Some(SeqItems {
+            indent: item_indent.unwrap_or(2),
+            spans,
+        })
     }
 
     /// Appends an item to a list-valued key, creating or normalizing the key.
@@ -327,33 +412,41 @@ impl Doc {
     /// Port of `okf.py`'s `append_seq_item`. A missing or null key becomes a
     /// new block list; a block list gets the item after its last item; a bare
     /// mapping becomes the first item of a new list; a flow list is
-    /// rewritten as a block list (each old item via `render_item`).
+    /// rewritten as a block list (each old item via `render_item`). The key's
+    /// current value comes from parsing the frontmatter first.
+    ///
+    /// Shared quirk with `okf.py`: in the bare block mapping case, an indented
+    /// comment shallower than the keys sets the indent used for the first
+    /// item, so the comment text becomes that item's text. Callers should
+    /// write the result with [`Doc::render_checked`], which catches a broken
+    /// outcome.
     ///
     /// # Arguments
     /// * `key` - the list key (`verified`, `sources`, `open_questions`).
     /// * `item_lines` - returns the new item's lines for a given dash indent.
-    /// * `current` - the key's parsed value (`None` if absent or null).
-    /// * `render_item` - renders an existing item when a flow list is rewritten.
+    /// * `render_item` - renders an existing item when a flow list is rewritten
+    ///   (normally [`crate::okf::yaml::block_item`]).
     ///
     /// # Errors
+    /// [`OkfError::FrontmatterParse`] when the frontmatter does not parse, and
     /// [`OkfError::Shape`] when the key is a scalar.
     pub fn append_seq_item(
         &mut self,
         key: &str,
-        item_lines: impl Fn(usize) -> Vec<String>,
-        current: Option<&Value>,
+        item_lines: impl FnOnce(usize) -> Vec<String>,
         render_item: impl Fn(&Value, usize) -> Vec<String>,
     ) -> Result<(), OkfError> {
-        let block = self.block(key);
-        let (Some(b), Some(value)) = (block, current.filter(|v| **v != Value::Null)) else {
+        let parsed = self.parse_checked()?;
+        let current = parsed.get(key).filter(|v| !matches!(v, Value::Null));
+        let (Some(b), Some(value)) = (self.block(key), current) else {
             let mut lines = vec![format!("{key}:")];
             lines.extend(item_lines(2));
             self.set_block(key, lines);
             return Ok(());
         };
-        if let (Some((indent, spans)), Value::Seq(_)) = (self.seq_items(key), value) {
-            let end = spans.last().map_or(b.end, |s| s.1);
-            self.frontmatter.splice(end..end, item_lines(indent));
+        if let (Some(items), Value::Seq(_)) = (self.seq_items(key), value) {
+            let end = items.spans.last().map_or(b.end, |s| s.end);
+            self.splice_lines(end..end, item_lines(items.indent));
             return Ok(());
         }
         let inline = strip_comment(
@@ -392,7 +485,7 @@ impl Doc {
                     2
                 };
                 lines.extend(item_lines(new_indent));
-                self.frontmatter.splice(b.start..b.end, lines);
+                self.splice_lines(b.start..b.end, lines);
                 Ok(())
             }
             Value::Seq(items) => {
@@ -401,7 +494,7 @@ impl Doc {
                     lines.extend(render_item(item, 2));
                 }
                 lines.extend(item_lines(2));
-                self.frontmatter.splice(b.start..b.end, lines);
+                self.splice_lines(b.start..b.end, lines);
                 Ok(())
             }
             Value::Null | Value::Str(_) => Err(OkfError::Shape {
@@ -412,24 +505,11 @@ impl Doc {
     }
 }
 
-/// [`block_item`] as a `render_item` callback for [`Doc::append_seq_item`].
-pub fn render_block_item(value: &Value, indent: usize) -> Vec<String> {
-    block_item(value, indent)
-}
-
 /// Parses frontmatter lines (no delimiters) the way `Doc.parse` does.
 fn parse_frontmatter_lines(lines: &[String]) -> Result<IndexMap<String, Value>, YamlError> {
-    let doc = Doc {
-        path: String::new(),
-        head: Vec::new(),
-        frontmatter: lines.to_vec(),
-        tail: Vec::new(),
-        newline: "\n",
-        has_frontmatter: true,
-    };
     let mut data = IndexMap::new();
     let mut covered = vec![false; lines.len()];
-    for b in doc.blocks() {
+    for b in blocks_of(lines) {
         if data.contains_key(&b.key) {
             return Err(YamlError {
                 message: format!("duplicate key {:?}", b.key),
@@ -460,6 +540,7 @@ fn parse_frontmatter_lines(lines: &[String]) -> Result<IndexMap<String, Value>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::okf::yaml::block_item;
 
     // `concat!` keeps each line's indentation (a `\` line continuation would strip it).
     const SAMPLE: &str = concat!(
@@ -603,7 +684,13 @@ mod tests {
     #[test]
     fn seq_items_finds_spans() {
         let d = doc("---\nq:\n  - \"one\"\n  - two\n    cont\n---\n");
-        assert_eq!(d.seq_items("q"), Some((2, vec![(1, 2), (2, 4)])));
+        assert_eq!(
+            d.seq_items("q"),
+            Some(SeqItems {
+                indent: 2,
+                spans: vec![1..2, 2..4]
+            })
+        );
         assert_eq!(doc("---\nq: [a]\n---\n").seq_items("q"), None);
         assert_eq!(doc("---\nq:\n  a: b\n---\n").seq_items("q"), None);
     }
@@ -611,13 +698,8 @@ mod tests {
     #[test]
     fn append_creates_missing_key() {
         let mut d = doc("---\ntype: Note\n---\n");
-        d.append_seq_item(
-            "open_questions",
-            quoted_item("Why?"),
-            None,
-            render_block_item,
-        )
-        .unwrap();
+        d.append_seq_item("open_questions", quoted_item("Why?"), block_item)
+            .unwrap();
         assert_eq!(
             d.frontmatter(),
             ["type: Note", "open_questions:", "  - \"Why?\""]
@@ -627,19 +709,13 @@ mod tests {
     #[test]
     fn append_extends_block_list() {
         let mut d = doc(SAMPLE);
-        let current = d.parse().unwrap()["sources"].clone();
         let entry = Value::Map(
             [("id".to_string(), Value::Str("two".into()))]
                 .into_iter()
                 .collect(),
         );
-        d.append_seq_item(
-            "sources",
-            |i| block_item(&entry, i),
-            Some(&current),
-            render_block_item,
-        )
-        .unwrap();
+        d.append_seq_item("sources", |i| block_item(&entry, i), block_item)
+            .unwrap();
         assert_eq!(d.frontmatter()[7], "  - id: two");
         assert!(d.render_checked().is_ok());
     }
@@ -647,12 +723,10 @@ mod tests {
     #[test]
     fn append_converts_flow_list() {
         let mut d = doc("---\nverified: [{ by: a, at: b }]\n---\n");
-        let current = d.parse().unwrap()["verified"].clone();
         d.append_seq_item(
             "verified",
             |i| vec![format!("{}- {{ by: c, at: d }}", " ".repeat(i))],
-            Some(&current),
-            render_block_item,
+            block_item,
         )
         .unwrap();
         assert_eq!(
@@ -669,12 +743,10 @@ mod tests {
     #[test]
     fn append_converts_bare_mappings() {
         let mut d = doc("---\nverified: { by: a, at: b }\n---\n");
-        let current = d.parse().unwrap()["verified"].clone();
         d.append_seq_item(
             "verified",
             |i| vec![format!("{}- new", " ".repeat(i))],
-            Some(&current),
-            render_block_item,
+            block_item,
         )
         .unwrap();
         assert_eq!(
@@ -683,12 +755,10 @@ mod tests {
         );
 
         let mut d = doc("---\nverified:\n  by: a\n  at: b\n---\n");
-        let current = d.parse().unwrap()["verified"].clone();
         d.append_seq_item(
             "verified",
             |i| vec![format!("{}- new", " ".repeat(i))],
-            Some(&current),
-            render_block_item,
+            block_item,
         )
         .unwrap();
         assert_eq!(
@@ -701,9 +771,8 @@ mod tests {
     #[test]
     fn append_refuses_scalar() {
         let mut d = doc("---\nsources: nope\n---\n");
-        let current = d.parse().unwrap()["sources"].clone();
         let err = d
-            .append_seq_item("sources", |_| vec![], Some(&current), render_block_item)
+            .append_seq_item("sources", |_| vec![], block_item)
             .unwrap_err();
         assert!(matches!(err, OkfError::Shape { .. }));
     }
@@ -740,6 +809,138 @@ mod tests {
         let mut d = doc("---\nx_custom: 1\n\x1f\n---\n");
         d.set_block("other", vec!["other: 2".into()]);
         assert_eq!(d.frontmatter(), ["x_custom: 1", "other: 2", "\x1f"]);
+    }
+
+    #[test]
+    fn per_line_endings_survive_render_and_edits() {
+        let text = "---\n,\r\n---\n[a\n---\n";
+        assert_eq!(doc(text).render(), text);
+
+        let mut d = doc("---\ntype: x\r\nother: 1\n---\n");
+        d.set_block("tags", vec!["tags: [a]".into()]);
+        assert_eq!(d.render(), "---\ntype: x\r\ntags: [a]\nother: 1\n---\n");
+
+        let odd = "---\na: 1\r\r\n---\n";
+        let d = doc(odd);
+        assert_eq!(d.frontmatter(), ["a: 1\r"]);
+        assert_eq!(d.render(), odd);
+    }
+
+    #[test]
+    fn inserted_lines_use_the_first_lines_ending() {
+        let mut d = doc("---\r\ntype: x\r\n---\r\n");
+        d.set_block("title", vec!["title: T".into()]);
+        assert_eq!(d.render(), "---\r\ntype: x\r\ntitle: T\r\n---\r\n");
+    }
+
+    #[test]
+    fn set_block_inserts_before_later_ranked_keys() {
+        let mut d = doc("---\nsources:\n  - a\n---\n");
+        d.set_block("type", vec!["type: Note".into()]);
+        assert_eq!(d.frontmatter(), ["type: Note", "sources:", "  - a"]);
+    }
+
+    #[test]
+    fn seq_items_skips_comments() {
+        let d = doc("---\nq:\n  # lead\n  - a\n  # mid\n  - b\n    cont\n  # trailing\n---\n");
+        assert_eq!(
+            d.seq_items("q"),
+            Some(SeqItems {
+                indent: 2,
+                spans: vec![2..3, 4..6]
+            })
+        );
+        let only_comments = doc("---\nq:\n  # nothing\n---\n");
+        assert_eq!(
+            only_comments.seq_items("q"),
+            Some(SeqItems {
+                indent: 2,
+                spans: vec![]
+            })
+        );
+    }
+
+    #[test]
+    fn append_goes_before_a_trailing_comment() {
+        let mut d = doc("---\nq:\n  - a\n  # trailing\n---\n");
+        d.append_seq_item("q", quoted_item("b"), block_item)
+            .unwrap();
+        assert_eq!(
+            d.frontmatter(),
+            ["q:", "  - a", "  - \"b\"", "  # trailing"]
+        );
+    }
+
+    #[test]
+    fn append_twice_to_missing_key_keeps_both() {
+        let mut d = doc("---\ntype: Note\n---\n");
+        d.append_seq_item("open_questions", quoted_item("One?"), block_item)
+            .unwrap();
+        d.append_seq_item("open_questions", quoted_item("Two?"), block_item)
+            .unwrap();
+        assert_eq!(
+            d.frontmatter(),
+            [
+                "type: Note",
+                "open_questions:",
+                "  - \"One?\"",
+                "  - \"Two?\""
+            ]
+        );
+    }
+
+    #[test]
+    fn append_on_crlf_document_uses_crlf() {
+        let mut d = doc("---\r\ntype: Note\r\n---\r\n");
+        d.append_seq_item("open_questions", quoted_item("Why?"), block_item)
+            .unwrap();
+        assert_eq!(
+            d.render(),
+            "---\r\ntype: Note\r\nopen_questions:\r\n  - \"Why?\"\r\n---\r\n"
+        );
+    }
+
+    #[test]
+    fn append_converts_bare_mapping_with_wide_indent() {
+        let mut d = doc("---\nverified:\n    by: a\n    at: b\n---\n");
+        d.append_seq_item(
+            "verified",
+            |i| vec![format!("{}- new", " ".repeat(i))],
+            block_item,
+        )
+        .unwrap();
+        assert_eq!(
+            d.frontmatter(),
+            ["verified:", "    - by: a", "      at: b", "    - new"]
+        );
+        assert!(d.render_checked().is_ok());
+    }
+
+    #[hegel::test]
+    fn mixed_endings_round_trip_and_edits_touch_one_line(tc: hegel::TestCase) {
+        use hegel::generators;
+        let pieces = vec!["type: x", "# c", "", "  - a", "k: [a, b]"];
+        let endings = vec!["\n", "\r\n"];
+        let count = tc.draw(generators::integers::<usize>().max_value(10));
+        let mut lines: Vec<String> = Vec::new();
+        for _ in 0..count {
+            let piece: &str = tc.draw(generators::sampled_from(&pieces));
+            let ending: &str = tc.draw(generators::sampled_from(&endings));
+            lines.push(format!("{piece}{ending}"));
+        }
+        let text = format!("---\n{}---\nbody\n", lines.concat());
+        let mut d = doc(&text);
+        assert_eq!(d.render(), text);
+
+        d.set_block("zz_new", vec!["zz_new: 1".into()]);
+        // The new key lands before any trailing blank lines, with the first line's ending.
+        let trailing_blank = lines
+            .iter()
+            .rev()
+            .take_while(|l| l.trim_end_matches(['\r', '\n']).is_empty())
+            .count();
+        lines.insert(lines.len() - trailing_blank, "zz_new: 1\n".to_string());
+        assert_eq!(d.render(), format!("---\n{}---\nbody\n", lines.concat()));
     }
 
     #[hegel::test]
