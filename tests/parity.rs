@@ -8,11 +8,14 @@
 //!   through `tests/parity/okf_shim.py` on the synthetic corpus and, when
 //!   `OKF_PARITY_CATALOG` names a catalog checkout, on that real catalog too.
 //!   Set `OKF_PY` to okf.py's path (default
-//!   `~/repos/pg_knowledge_catalog/tools/okf.py`). With `UPDATE_GOLDEN=1`
-//!   they rewrite the golden files from okf.py's output.
+//!   `~/repos/pg_knowledge_catalog/tools/okf.py`). `live_goldens_come_from_this_okf_py`
+//!   fails when okf.py's SHA-256 differs from `tests/golden/SOURCE`.
+//! - Regeneration: `UPDATE_GOLDEN=1 cargo test --test parity -- --ignored`
+//!   rewrites every golden file and `SOURCE` from okf.py (`regenerate_goldens`).
 //!
 //! The real catalog is never copied into this repository: it is private.
 
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -104,34 +107,6 @@ fn rust_markdown(root: &Path) -> Json {
     Json::Array(entries.collect())
 }
 
-/// Values whose renderings are compared. A top-level null is left out on
-/// purpose: okf.py renders it as `- None`, a bug the port fixes.
-fn render_inputs() -> Json {
-    json!([
-        "plain",
-        "needs: quotes",
-        "true",
-        "12",
-        "",
-        " padded",
-        "with, comma",
-        "multi\nline\ttab",
-        "claude-code/claude-opus-5-5",
-        ["a", "b c", "d,e", null, ["nested"]],
-        {"by": "human:pgrace", "at": "2026-10-26T23:01:11Z"},
-        {"id": "x", "resource": "a: b", "title": null},
-        {"nested": {"k": "v"}},
-        {},
-        [],
-        "1", "-1", "+1", "1.5", ".5", "1e3", "0x1F", "0o17", "1_000", "2026-10-26",
-        "yes", "no", "on", "off", "y", "n", "True", "FALSE", "null", "Null", "NULL", "~",
-        ".inf", ".NaN", "-", "- a", "#x", "a #b", "a#b", "@x", "&x", "*x", "!x", "%x", "`x",
-        "'q'", "\"q\"", "[x]", "{x}", "?", "? x", "|", ">", "a:", "a:b",
-        ["1", "true", "null", "~", "yes", "", "- x"],
-        {"n": "12", "b": "false", "z": "~", "e": "", "k": "null"}
-    ])
-}
-
 fn json_to_value(json: &Json) -> Value {
     match json {
         Json::Null => Value::Null,
@@ -142,20 +117,38 @@ fn json_to_value(json: &Json) -> Value {
                 .map(|(k, v)| (k.clone(), json_to_value(v)))
                 .collect(),
         ),
-        Json::Bool(_) | Json::Number(_) => panic!("render inputs are strings, lists and maps only"),
+        Json::Bool(_) | Json::Number(_) => {
+            panic!("render inputs are strings, lists and maps only, got {json}")
+        }
     }
 }
 
-fn rust_render(inputs: &Json) -> Json {
-    let items = inputs
-        .as_array()
-        .expect("render inputs are a list")
-        .iter()
-        .map(|input| {
-            let value = json_to_value(input);
-            json!({"flow": flow_value(&value), "block": block_item(&value, 2)})
-        });
+/// Renders each input value the way `okf_shim.py render` does.
+fn rust_render(inputs: &[Json]) -> Json {
+    let items = inputs.iter().map(|input| {
+        let value = json_to_value(input);
+        json!({"input": input, "flow": flow_value(&value), "block": block_item(&value, 2)})
+    });
     Json::Array(items.collect())
+}
+
+/// The values whose renderings are compared: the `input` of each entry in
+/// `render.json`, so the golden file describes itself. To compare a new
+/// value, add an entry with just its `input` (any `flow`/`block`) and
+/// regenerate. A top-level null is left out on purpose: okf.py renders it as
+/// `- None`, a bug the port fixes.
+fn render_inputs() -> Vec<Json> {
+    let golden = read_golden("render.json");
+    let entries = golden.as_array().expect("render.json is a list");
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .get("input")
+                .cloned()
+                .expect("render entry has an input")
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +240,11 @@ fn okf_py() -> PathBuf {
 }
 
 /// Runs the shim (`python3 -I`: isolated mode, no user site or PYTHON* env).
-fn shim(args: &[&str], stdin: Option<&Json>) -> Json {
+///
+/// Arguments are `OsStr`s (the OS's own string type, which need not be
+/// UTF-8), so a corpus path reaches Python byte for byte instead of through a
+/// lossy UTF-8 conversion.
+fn shim(args: &[&OsStr], stdin: Option<&Json>) -> Json {
     let mut child = Command::new("python3")
         .arg("-I")
         .arg(SHIM)
@@ -255,7 +252,7 @@ fn shim(args: &[&str], stdin: Option<&Json>) -> Json {
         .env("OKF_PY", okf_py())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("python3 is installed");
     {
@@ -266,8 +263,14 @@ fn shim(args: &[&str], stdin: Option<&Json>) -> Json {
                 .expect("write shim stdin");
         }
     }
+    // Reads stdout and stderr to the end (concurrently, so neither pipe fills).
     let output = child.wait_with_output().expect("shim runs");
-    assert!(output.status.success(), "okf_shim.py {args:?} failed");
+    assert!(
+        output.status.success(),
+        "okf_shim.py {args:?} failed ({}):\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     serde_json::from_slice(&output.stdout).expect("shim prints JSON")
 }
 
@@ -279,25 +282,58 @@ fn corpora() -> Vec<PathBuf> {
     roots
 }
 
-fn update_golden(name: &str, python: &Json) {
-    if std::env::var_os("UPDATE_GOLDEN").is_some() {
-        let text = serde_json::to_string_pretty(python).expect("serialize golden");
-        std::fs::create_dir_all(GOLDEN).expect("create golden dir");
-        std::fs::write(golden_path(name), format!("{text}\n")).expect("write golden");
+fn python_frontmatter(root: &Path) -> Json {
+    shim(&[OsStr::new("frontmatter"), root.as_os_str()], None)
+}
+
+fn python_markdown(root: &Path) -> Json {
+    shim(&[OsStr::new("markdown"), root.as_os_str()], None)
+}
+
+fn python_render(inputs: &[Json]) -> Json {
+    shim(&[OsStr::new("render")], Some(&Json::from(inputs.to_vec())))
+}
+
+fn python_sha256() -> String {
+    let digest = shim(&[OsStr::new("sha256")], None);
+    digest.as_str().expect("sha256 is a string").to_string()
+}
+
+/// Is `UPDATE_GOLDEN` exactly `1`? (Merely being set, or `0`, is not enough.)
+fn updating_goldens() -> bool {
+    std::env::var_os("UPDATE_GOLDEN").as_deref() == Some(OsStr::new("1"))
+}
+
+/// The content of `tests/golden/SOURCE` for an okf.py with this digest.
+fn source_record(sha256: &str) -> String {
+    format!("okf.py sha256 {sha256}\n")
+}
+
+#[test]
+#[ignore = "needs python3 and okf.py; run with --ignored"]
+fn live_goldens_come_from_this_okf_py() {
+    if updating_goldens() {
+        return; // `regenerate_goldens` is rewriting SOURCE right now.
     }
+    let recorded = std::fs::read_to_string(golden_path("SOURCE")).unwrap_or_default();
+    let current = source_record(&python_sha256());
+    assert_eq!(
+        recorded.trim(),
+        current.trim(),
+        "okf.py ({}) differs from the one the goldens were generated from \
+         (tests/golden/SOURCE): the goldens may be stale. Check the okf.py diff, \
+         then regenerate with UPDATE_GOLDEN=1 cargo test --test parity -- --ignored",
+        okf_py().display()
+    );
 }
 
 #[test]
 #[ignore = "needs python3 and okf.py; run with --ignored"]
 fn live_frontmatter_parity() {
     for root in corpora() {
-        let python = shim(&["frontmatter", &root.to_string_lossy()], None);
-        if root == Path::new(FIXTURES) {
-            update_golden("frontmatter.json", &python);
-        }
         assert_entries_equal(
             &rust_frontmatter(&root),
-            &python,
+            &python_frontmatter(&root),
             &format!("frontmatter of {}", root.display()),
         );
     }
@@ -307,13 +343,9 @@ fn live_frontmatter_parity() {
 #[ignore = "needs python3 and okf.py; run with --ignored"]
 fn live_markdown_parity() {
     for root in corpora() {
-        let python = shim(&["markdown", &root.to_string_lossy()], None);
-        if root == Path::new(FIXTURES) {
-            update_golden("markdown.json", &python);
-        }
         assert_entries_equal(
             &rust_markdown(&root),
-            &python,
+            &python_markdown(&root),
             &format!("markdown of {}", root.display()),
         );
     }
@@ -323,7 +355,44 @@ fn live_markdown_parity() {
 #[ignore = "needs python3 and okf.py; run with --ignored"]
 fn live_render_parity() {
     let inputs = render_inputs();
-    let python = shim(&["render"], Some(&inputs));
-    update_golden("render.json", &python);
-    assert_entries_equal(&rust_render(&inputs), &python, "render");
+    assert_entries_equal(&rust_render(&inputs), &python_render(&inputs), "render");
+}
+
+/// Writes `contents` to `tests/golden/<name>` atomically: a temp file in the
+/// same directory, renamed over the old file, so a reader never sees half.
+fn write_golden(name: &str, contents: &str) {
+    let mut temp = tempfile::NamedTempFile::new_in(GOLDEN).expect("create temp golden");
+    temp.write_all(contents.as_bytes())
+        .expect("write temp golden");
+    temp.persist(golden_path(name))
+        .expect("rename temp golden into place");
+}
+
+fn pretty(json: &Json) -> String {
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(json).expect("serialize golden")
+    )
+}
+
+/// With `UPDATE_GOLDEN=1`, regenerates every golden file and `SOURCE` from
+/// okf.py. Everything is computed before anything is written, and each file
+/// is replaced atomically. Run the live tests afterwards to see the diff's
+/// effect on Rust.
+#[test]
+#[ignore = "needs python3 and okf.py; run with UPDATE_GOLDEN=1 and --ignored"]
+fn regenerate_goldens() {
+    if !updating_goldens() {
+        return;
+    }
+    let root = Path::new(FIXTURES);
+    let files = [
+        ("frontmatter.json", pretty(&python_frontmatter(root))),
+        ("markdown.json", pretty(&python_markdown(root))),
+        ("render.json", pretty(&python_render(&render_inputs()))),
+        ("SOURCE", source_record(&python_sha256())),
+    ];
+    for (name, contents) in &files {
+        write_golden(name, contents);
+    }
 }

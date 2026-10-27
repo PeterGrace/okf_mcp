@@ -1,65 +1,87 @@
 [
   {
+    "input": "plain",
     "flow": "plain",
     "block": [
       "  - plain"
     ]
   },
   {
+    "input": "needs: quotes",
     "flow": "\"needs: quotes\"",
     "block": [
       "  - \"needs: quotes\""
     ]
   },
   {
+    "input": "true",
     "flow": "\"true\"",
     "block": [
       "  - \"true\""
     ]
   },
   {
+    "input": "12",
     "flow": "\"12\"",
     "block": [
       "  - \"12\""
     ]
   },
   {
+    "input": "",
     "flow": "\"\"",
     "block": [
       "  - \"\""
     ]
   },
   {
+    "input": " padded",
     "flow": "\" padded\"",
     "block": [
       "  - \" padded\""
     ]
   },
   {
+    "input": "with, comma",
     "flow": "\"with, comma\"",
     "block": [
       "  - with, comma"
     ]
   },
   {
+    "input": "multi\nline\ttab",
     "flow": "\"multi\\nline\\ttab\"",
     "block": [
       "  - \"multi\\nline\\ttab\""
     ]
   },
   {
+    "input": "claude-code/claude-opus-5-5",
     "flow": "claude-code/claude-opus-5-5",
     "block": [
       "  - claude-code/claude-opus-5-5"
     ]
   },
   {
+    "input": [
+      "a",
+      "b c",
+      "d,e",
+      null,
+      [
+        "nested"
+      ]
+    ],
     "flow": "[a, b c, \"d,e\", null, [nested]]",
     "block": [
       "  - [a, b c, \"d,e\", null, [nested]]"
     ]
   },
   {
+    "input": {
+      "by": "human:pgrace",
+      "at": "2026-10-26T23:01:11Z"
+    },
     "flow": "{ by: human:pgrace, at: 2026-10-26T23:01:11Z }",
     "block": [
       "  - by: human:pgrace",
@@ -67,6 +89,11 @@
     ]
   },
   {
+    "input": {
+      "id": "x",
+      "resource": "a: b",
+      "title": null
+    },
     "flow": "{ id: x, resource: \"a: b\", title: null }",
     "block": [
       "  - id: x",
@@ -75,300 +102,368 @@
     ]
   },
   {
+    "input": {
+      "nested": {
+        "k": "v"
+      }
+    },
     "flow": "{ nested: { k: v } }",
     "block": [
       "  - { nested: { k: v } }"
     ]
   },
   {
+    "input": {},
     "flow": "{  }",
     "block": [
       "  - {  }"
     ]
   },
   {
+    "input": [],
     "flow": "[]",
     "block": [
       "  - []"
     ]
   },
   {
+    "input": "1",
     "flow": "\"1\"",
     "block": [
       "  - \"1\""
     ]
   },
   {
+    "input": "-1",
     "flow": "\"-1\"",
     "block": [
       "  - \"-1\""
     ]
   },
   {
+    "input": "+1",
     "flow": "\"+1\"",
     "block": [
       "  - \"+1\""
     ]
   },
   {
+    "input": "1.5",
     "flow": "\"1.5\"",
     "block": [
       "  - \"1.5\""
     ]
   },
   {
+    "input": ".5",
     "flow": "\".5\"",
     "block": [
       "  - \".5\""
     ]
   },
   {
+    "input": "1e3",
     "flow": "\"1e3\"",
     "block": [
       "  - \"1e3\""
     ]
   },
   {
+    "input": "0x1F",
     "flow": "0x1F",
     "block": [
       "  - 0x1F"
     ]
   },
   {
+    "input": "0o17",
     "flow": "0o17",
     "block": [
       "  - 0o17"
     ]
   },
   {
+    "input": "1_000",
     "flow": "\"1_000\"",
     "block": [
       "  - \"1_000\""
     ]
   },
   {
+    "input": "2026-10-26",
     "flow": "2026-10-26",
     "block": [
       "  - 2026-10-26"
     ]
   },
   {
+    "input": "yes",
     "flow": "\"yes\"",
     "block": [
       "  - \"yes\""
     ]
   },
   {
+    "input": "no",
     "flow": "\"no\"",
     "block": [
       "  - \"no\""
     ]
   },
   {
+    "input": "on",
     "flow": "\"on\"",
     "block": [
       "  - \"on\""
     ]
   },
   {
+    "input": "off",
     "flow": "\"off\"",
     "block": [
       "  - \"off\""
     ]
   },
   {
+    "input": "y",
     "flow": "\"y\"",
     "block": [
       "  - \"y\""
     ]
   },
   {
+    "input": "n",
     "flow": "\"n\"",
     "block": [
       "  - \"n\""
     ]
   },
   {
+    "input": "True",
     "flow": "\"True\"",
     "block": [
       "  - \"True\""
     ]
   },
   {
+    "input": "FALSE",
     "flow": "\"FALSE\"",
     "block": [
       "  - \"FALSE\""
     ]
   },
   {
+    "input": "null",
     "flow": "\"null\"",
     "block": [
       "  - \"null\""
     ]
   },
   {
+    "input": "Null",
     "flow": "\"Null\"",
     "block": [
       "  - \"Null\""
     ]
   },
   {
+    "input": "NULL",
     "flow": "\"NULL\"",
     "block": [
       "  - \"NULL\""
     ]
   },
   {
+    "input": "~",
     "flow": "\"~\"",
     "block": [
       "  - \"~\""
     ]
   },
   {
+    "input": ".inf",
     "flow": ".inf",
     "block": [
       "  - .inf"
     ]
   },
   {
+    "input": ".NaN",
     "flow": ".NaN",
     "block": [
       "  - .NaN"
     ]
   },
   {
+    "input": "-",
     "flow": "\"-\"",
     "block": [
       "  - \"-\""
     ]
   },
   {
+    "input": "- a",
     "flow": "\"- a\"",
     "block": [
       "  - \"- a\""
     ]
   },
   {
+    "input": "#x",
     "flow": "\"#x\"",
     "block": [
       "  - \"#x\""
     ]
   },
   {
+    "input": "a #b",
     "flow": "\"a #b\"",
     "block": [
       "  - \"a #b\""
     ]
   },
   {
+    "input": "a#b",
     "flow": "a#b",
     "block": [
       "  - a#b"
     ]
   },
   {
+    "input": "@x",
     "flow": "\"@x\"",
     "block": [
       "  - \"@x\""
     ]
   },
   {
+    "input": "&x",
     "flow": "\"&x\"",
     "block": [
       "  - \"&x\""
     ]
   },
   {
+    "input": "*x",
     "flow": "\"*x\"",
     "block": [
       "  - \"*x\""
     ]
   },
   {
+    "input": "!x",
     "flow": "\"!x\"",
     "block": [
       "  - \"!x\""
     ]
   },
   {
+    "input": "%x",
     "flow": "\"%x\"",
     "block": [
       "  - \"%x\""
     ]
   },
   {
+    "input": "`x",
     "flow": "\"`x\"",
     "block": [
       "  - \"`x\""
     ]
   },
   {
+    "input": "'q'",
     "flow": "\"'q'\"",
     "block": [
       "  - \"'q'\""
     ]
   },
   {
+    "input": "\"q\"",
     "flow": "\"\\\"q\\\"\"",
     "block": [
       "  - \"\\\"q\\\"\""
     ]
   },
   {
+    "input": "[x]",
     "flow": "\"[x]\"",
     "block": [
       "  - \"[x]\""
     ]
   },
   {
+    "input": "{x}",
     "flow": "\"{x}\"",
     "block": [
       "  - \"{x}\""
     ]
   },
   {
+    "input": "?",
     "flow": "\"?\"",
     "block": [
       "  - \"?\""
     ]
   },
   {
+    "input": "? x",
     "flow": "\"? x\"",
     "block": [
       "  - \"? x\""
     ]
   },
   {
+    "input": "|",
     "flow": "\"|\"",
     "block": [
       "  - \"|\""
     ]
   },
   {
+    "input": ">",
     "flow": "\">\"",
     "block": [
       "  - \">\""
     ]
   },
   {
+    "input": "a:",
     "flow": "\"a:\"",
     "block": [
       "  - \"a:\""
     ]
   },
   {
+    "input": "a:b",
     "flow": "a:b",
     "block": [
       "  - a:b"
     ]
   },
   {
+    "input": [
+      "1",
+      "true",
+      "null",
+      "~",
+      "yes",
+      "",
+      "- x"
+    ],
     "flow": "[\"1\", \"true\", \"null\", \"~\", \"yes\", \"\", \"- x\"]",
     "block": [
       "  - [\"1\", \"true\", \"null\", \"~\", \"yes\", \"\", \"- x\"]"
     ]
   },
   {
+    "input": {
+      "n": "12",
+      "b": "false",
+      "z": "~",
+      "e": "",
+      "k": "null"
+    },
     "flow": "{ \"n\": \"12\", b: \"false\", z: \"~\", e: \"\", k: \"null\" }",
     "block": [
       "  - \"n\": \"12\"",
