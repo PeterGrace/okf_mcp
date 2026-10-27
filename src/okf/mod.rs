@@ -6,5 +6,6 @@ pub mod doc;
 pub mod markdown;
 pub mod paths;
 pub mod pystr;
+pub mod timestamp;
 pub mod workspace;
 pub mod yaml;
