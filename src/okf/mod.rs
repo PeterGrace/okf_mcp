@@ -7,6 +7,7 @@ pub mod doc;
 pub mod markdown;
 pub mod paths;
 pub mod pystr;
+pub mod search;
 pub mod snapshot;
 pub mod timestamp;
 pub mod workspace;

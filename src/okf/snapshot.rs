@@ -4,7 +4,7 @@
 //!
 //! The design's "In-memory snapshot". M3 keeps one per catalog behind an
 //! `RwLock<Arc<Snapshot>>` and rebuilds it after each fetch or publish; the
-//! analyses in [`crate::okf::analysis`] (and M2's `okf::search`) read it and
+//! analyses in [`crate::okf::analysis`] and [`crate::okf::search`] read it and
 //! never touch the disk.
 //!
 //! Ports `okf.py`'s `build_docs` and `_fm_fallback`, and replaces its repeated
@@ -41,6 +41,7 @@ use crate::okf::doc::Doc;
 use crate::okf::markdown::{anchors_in, find_links, resolve_link, split_frontmatter};
 use crate::okf::paths::{basename, escapes_root, is_concept, normpath};
 use crate::okf::pystr::{py_strip, universal_newlines};
+use crate::okf::search::SearchFields;
 use crate::okf::workspace::Workspace;
 use crate::okf::yaml::{Value, YamlError};
 
@@ -142,6 +143,7 @@ pub struct SnapshotDoc {
     aliases: Vec<String>,
     links: Vec<SnapshotLink>,
     anchors: BTreeSet<String>,
+    search: Option<SearchFields>,
 }
 
 impl SnapshotDoc {
@@ -196,6 +198,14 @@ impl SnapshotDoc {
     /// Lowercased heading slugs and HTML anchors.
     pub fn anchors(&self) -> &BTreeSet<String> {
         &self.anchors
+    }
+
+    /// The lowercased fields [`crate::okf::search::search`] matches against.
+    ///
+    /// # Returns
+    /// `Some` for concepts, `None` for every other kind (search skips them).
+    pub fn search_fields(&self) -> Option<&SearchFields> {
+        self.search.as_ref()
     }
 
     /// Does `okf.py`'s link analysis see this file?
@@ -361,9 +371,10 @@ fn read_document(workspace: &dyn Workspace, path: &str) -> Result<SnapshotDoc, O
     let (title, aliases) = title_and_aliases(&frontmatter, &text);
     let links = links_of(workspace, path, &text);
     let anchors = lowercase_anchors(&text);
-    Ok(SnapshotDoc {
+    let kind = DocKind::of(path);
+    let mut document = SnapshotDoc {
         path: path.to_string(),
-        kind: DocKind::of(path),
+        kind,
         text,
         doc,
         frontmatter,
@@ -371,7 +382,14 @@ fn read_document(workspace: &dyn Workspace, path: &str) -> Result<SnapshotDoc, O
         aliases,
         links,
         anchors,
-    })
+        search: None,
+    };
+    // The fields are derived from the finished document (title, aliases,
+    // frontmatter, body), so they are filled in last.
+    if kind == DocKind::Concept {
+        document.search = Some(SearchFields::of(&document));
+    }
+    Ok(document)
 }
 
 /// `build_docs`' title and aliases: from parsed frontmatter, else the regex
