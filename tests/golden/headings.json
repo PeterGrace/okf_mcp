@@ -1,0 +1,137 @@
+[
+  {
+    "headings": [
+      [
+        0,
+        1,
+        "Agents",
+        "agents"
+      ]
+    ],
+    "path": "AGENTS.md"
+  },
+  {
+    "headings": [
+      [
+        1,
+        1,
+        "Fixture catalog",
+        "fixture-catalog"
+      ]
+    ],
+    "path": "index.md"
+  },
+  {
+    "headings": [
+      [
+        0,
+        1,
+        "Log",
+        "log"
+      ],
+      [
+        2,
+        2,
+        "2026-10-26",
+        "2026-10-26"
+      ]
+    ],
+    "path": "log.md"
+  },
+  {
+    "headings": [
+      [
+        0,
+        1,
+        "Infra",
+        "infra"
+      ],
+      [
+        2,
+        1,
+        "Concepts",
+        "concepts"
+      ]
+    ],
+    "path": "infra/index.md"
+  },
+  {
+    "headings": [
+      [
+        1,
+        1,
+        "Overview",
+        "overview"
+      ],
+      [
+        6,
+        2,
+        "Overview",
+        "overview-1"
+      ],
+      [
+        12,
+        3,
+        "Plan: CLI first, MCP later",
+        "plan-cli-first-mcp-later"
+      ]
+    ],
+    "path": "infra/time-server.md"
+  },
+  {
+    "headings": [],
+    "path": "infra/hosts/crlf-host.md"
+  },
+  {
+    "headings": [
+      [
+        2,
+        1,
+        "Heading `code` and *emphasis*",
+        "heading-code-and-emphasis"
+      ]
+    ],
+    "path": "infra/hosts/no-frontmatter.md"
+  },
+  {
+    "headings": [],
+    "path": "people/bad-colon.md"
+  },
+  {
+    "headings": [],
+    "path": "people/duplicate-key.md"
+  },
+  {
+    "headings": [],
+    "path": "people/flow-error.md"
+  },
+  {
+    "headings": [],
+    "path": "people/quoted-top-key.md"
+  },
+  {
+    "headings": [],
+    "path": "people/stray-line.md"
+  },
+  {
+    "headings": [
+      [
+        1,
+        1,
+        "Ünïcode Wörds",
+        "ünïcode-wörds"
+      ],
+      [
+        3,
+        1,
+        "Ünïcode Wörds",
+        "ünïcode-wörds-1"
+      ]
+    ],
+    "path": "people/unicode.md"
+  },
+  {
+    "headings": [],
+    "path": "people/unterminated.md"
+  }
+]

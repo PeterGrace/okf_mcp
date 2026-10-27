@@ -1,0 +1,95 @@
+[
+  {
+    "block": [
+      "  - plain"
+    ],
+    "flow": "plain"
+  },
+  {
+    "block": [
+      "  - \"needs: quotes\""
+    ],
+    "flow": "\"needs: quotes\""
+  },
+  {
+    "block": [
+      "  - \"true\""
+    ],
+    "flow": "\"true\""
+  },
+  {
+    "block": [
+      "  - \"12\""
+    ],
+    "flow": "\"12\""
+  },
+  {
+    "block": [
+      "  - \"\""
+    ],
+    "flow": "\"\""
+  },
+  {
+    "block": [
+      "  - \" padded\""
+    ],
+    "flow": "\" padded\""
+  },
+  {
+    "block": [
+      "  - with, comma"
+    ],
+    "flow": "\"with, comma\""
+  },
+  {
+    "block": [
+      "  - \"multi\\nline\\ttab\""
+    ],
+    "flow": "\"multi\\nline\\ttab\""
+  },
+  {
+    "block": [
+      "  - claude-code/claude-opus-5-5"
+    ],
+    "flow": "claude-code/claude-opus-5-5"
+  },
+  {
+    "block": [
+      "  - [a, b c, \"d,e\", null, [nested]]"
+    ],
+    "flow": "[a, b c, \"d,e\", null, [nested]]"
+  },
+  {
+    "block": [
+      "  - at: 2026-10-26T23:01:11Z",
+      "    by: human:pgrace"
+    ],
+    "flow": "{ at: 2026-10-26T23:01:11Z, by: human:pgrace }"
+  },
+  {
+    "block": [
+      "  - id: x",
+      "    resource: \"a: b\"",
+      "    title:"
+    ],
+    "flow": "{ id: x, resource: \"a: b\", title: null }"
+  },
+  {
+    "block": [
+      "  - { nested: { k: v } }"
+    ],
+    "flow": "{ nested: { k: v } }"
+  },
+  {
+    "block": [
+      "  - {  }"
+    ],
+    "flow": "{  }"
+  },
+  {
+    "block": [
+      "  - []"
+    ],
+    "flow": "[]"
+  }
+]
