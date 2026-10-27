@@ -333,6 +333,12 @@ mod tests {
         assert_eq!(py_str(&Value::Str("plain".to_string())), "plain");
         assert_eq!(py_str(&Value::Null), "None");
         assert_eq!(py_repr_opt(None), "None");
+        let seq = Value::Seq(vec![Value::Str("a".to_string()), Value::Null]);
+        assert_eq!(py_str(&seq), "['a', None]");
+        let mut pair = IndexMap::new();
+        pair.insert("k".to_string(), Value::Str("v".to_string()));
+        assert_eq!(py_str(&Value::Map(pair)), "{'k': 'v'}");
+        assert_eq!(py_repr_opt(Some(&Value::Str("x".to_string()))), "'x'");
     }
 
     #[test]

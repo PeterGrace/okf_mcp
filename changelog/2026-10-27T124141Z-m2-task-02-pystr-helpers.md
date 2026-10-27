@@ -46,3 +46,21 @@ fragments go through `urllib.parse.unquote`. These helpers give them one home.
 - `cargo test`: 130 unit, 5 parity (5 ignored live-parity tests), 14 doc tests passed.
 - `cargo test --test parity -- --ignored`: 5 passed.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`: clean.
+
+## Review follow-up (PR #18)
+
+- Parity compares full parse-error messages: `error_kind` (which cut each message at
+  its first quote, because M1 quoted with Rust `Debug`) is removed from
+  `tests/parity.rs` and `tests/parity/okf_shim.py`. Both now emit the whole message
+  as `error_message`, and `tests/golden/frontmatter.json` was regenerated from
+  `okf.py` (`UPDATE_GOLDEN=1`, `SOURCE` unchanged). Each of the 19 `errors/*`
+  fixtures now checks the message byte for byte, which is the regression guard for
+  this task's claim. The plan gains a second dated `Corrected (issue #4)` note.
+- `repr_and_str_of_values_follow_python` also covers `py_str` of a list and a mapping
+  and `py_repr_opt(Some(..))`.
+- Not changed: `py_repr_str` still asks a regex about each non-ASCII character. Its
+  callers are error and lint messages over short frontmatter values, so a
+  general-category table would add code without a measurable gain.
+- Gates after the follow-up: 130 unit, 4 parity (5 ignored), 14 doc tests; live
+  parity 5 passed. (The parity count drops by one: `error_kind`'s own test went with
+  it.)
