@@ -53,8 +53,8 @@ fragments go through `urllib.parse.unquote`. These helpers give them one home.
   its first quote, because M1 quoted with Rust `Debug`) is removed from
   `tests/parity.rs` and `tests/parity/okf_shim.py`. Both now emit the whole message
   as `error_message`, and `tests/golden/frontmatter.json` was regenerated from
-  `okf.py` (`UPDATE_GOLDEN=1`, `SOURCE` unchanged). Each of the 19 `errors/*`
-  fixtures now checks the message byte for byte, which is the regression guard for
+  `okf.py` (`UPDATE_GOLDEN=1`, `SOURCE` unchanged). Each of the 19 corpus files
+  that fail to parse (under `errors/` and `people/`) now checks the message byte for byte, which is the regression guard for
   this task's claim. The plan gains a second dated `Corrected (issue #4)` note.
 - `repr_and_str_of_values_follow_python` also covers `py_str` of a list and a mapping
   and `py_repr_opt(Some(..))`.

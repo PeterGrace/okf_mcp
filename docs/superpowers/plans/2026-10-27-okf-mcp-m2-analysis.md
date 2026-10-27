@@ -682,7 +682,7 @@ Add a test to `src/okf/doc.rs`'s test module:
 
 Fix any unit test that asserted a `{:?}`-style message. `tests/parity.rs`'s `error_kind` keeps working (it cuts at the first quote of either kind).
 
-> **Corrected (issue #4), 2026-10-27.** `error_kind` is gone (review of PR #18): with repr quoting the messages match `okf.py` in full, so `tests/parity.rs` and `tests/parity/okf_shim.py` compare the whole message as `error_message`, and `tests/golden/frontmatter.json` was regenerated with it. Every `errors/*` fixture now checks message text byte for byte.
+> **Corrected (issue #4), 2026-10-27.** `error_kind` is gone (review of PR #18): with repr quoting the messages match `okf.py` in full, so `tests/parity.rs` and `tests/parity/okf_shim.py` compare the whole message as `error_message`, and `tests/golden/frontmatter.json` was regenerated with it. Every corpus file whose frontmatter fails to parse now checks message text byte for byte.
 
 - [ ] **Step 6: Gates, changelog, commit**
 
