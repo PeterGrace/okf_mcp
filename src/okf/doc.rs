@@ -545,7 +545,7 @@ fn parse_frontmatter_lines(lines: &[String]) -> Result<IndexMap<String, Value>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::okf::yaml::block_item;
+    use crate::okf::yaml::{block_item, ScalarStyle};
 
     // `concat!` keeps each line's indentation (a `\` line continuation would strip it).
     const SAMPLE: &str = concat!(
@@ -570,7 +570,7 @@ mod tests {
             vec![format!(
                 "{}- {}",
                 " ".repeat(indent),
-                crate::okf::yaml::scalar(text, false, true)
+                crate::okf::yaml::scalar(text, ScalarStyle::Quoted)
             )]
         }
     }
@@ -970,12 +970,12 @@ mod tests {
         let lines: Vec<String> = values
             .iter()
             .enumerate()
-            .map(|(i, v)| format!("k{i}: {}", crate::okf::yaml::scalar(v, false, false)))
+            .map(|(i, v)| format!("k{i}: {}", crate::okf::yaml::scalar(v, ScalarStyle::Block)))
             .collect();
         let mut d = doc(&format!("---\n{}\n---\nbody\n", lines.join("\n")));
         let new_line = format!(
             "k{target}: {}",
-            crate::okf::yaml::scalar(&replacement, false, false)
+            crate::okf::yaml::scalar(&replacement, ScalarStyle::Block)
         );
         d.set_block(&format!("k{target}"), vec![new_line.clone()]);
         for (i, line) in d.frontmatter().iter().enumerate() {
