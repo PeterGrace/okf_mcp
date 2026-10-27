@@ -13,6 +13,21 @@
 //! - Regeneration: `UPDATE_GOLDEN=1 cargo test --test parity -- --ignored`
 //!   rewrites every golden file and `SOURCE` from okf.py (`regenerate_goldens`).
 //!
+//! The analyses (`links`, `oldest`, `sprawl`, `lint`; `analysis.json`) run
+//! with a frozen "now" ([`FIXED_NOW`]) and the commit times in
+//! `tests/fixtures/commit-times.json`. The secret rules are covered by a
+//! corpus written to a temp directory at test time ([`secrets_corpus`];
+//! `secrets.json`), because a secret-shaped string must never be committed.
+//! The live test also runs every analysis on `OKF_PARITY_CATALOG` with real
+//! git on both sides. okf.py's lint and sprawl assume Python 3.12 or later
+//! (`sum()` of floats is compensated from 3.12 on; `src/okf/analysis/sprawl.rs`).
+//!
+//! JSON is compared as parsed values, never as text: okf.py's `json.dumps`
+//! escapes non-ASCII (`\u2082`) where serde_json writes it raw, and the
+//! shim prints ASCII-only JSON either way. Numbers are compared as serde_json
+//! parses them, so an integer never equals a float (`18` is not `18.0`), and
+//! object key order is checked separately (`Map` equality ignores it).
+//!
 //! Fixture rules: never add a documented divergence (the lists in the
 //! `okf` module docs) as a fixture. `infra/hosts/lone-cr.md` in particular
 //! must keep having no frontmatter (see `lone_cr_fixture_has_no_frontmatter`).
@@ -23,13 +38,22 @@
 //!
 //! The real catalog is never copied into this repository: it is private.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use chrono::{DateTime, Utc};
+use okf_mcp::clock::format_timestamp;
+use okf_mcp::okf::analysis::links::links_report;
+use okf_mcp::okf::analysis::lint::{lint, CommitTimes};
+use okf_mcp::okf::analysis::oldest::{oldest, OldestQuery};
+use okf_mcp::okf::analysis::sprawl::{sprawl, SprawlQuery};
 use okf_mcp::okf::doc::Doc;
 use okf_mcp::okf::markdown::{body_split, footnote_defs, headings};
+use okf_mcp::okf::snapshot::Snapshot;
+use okf_mcp::okf::timestamp::parse_iso;
 use okf_mcp::okf::workspace::{DiskWorkspace, Workspace};
 use okf_mcp::okf::yaml::{block_item, flow_value, Value};
 use serde_json::{json, Value as Json};
@@ -37,6 +61,12 @@ use serde_json::{json, Value as Json};
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/catalog");
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
 const SHIM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/parity/okf_shim.py");
+const COMMIT_TIMES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/commit-times.json"
+);
+/// The frozen "now" of the analysis goldens.
+const FIXED_NOW: &str = "2026-10-27T12:00:00Z";
 
 // ---------------------------------------------------------------------------
 // The Rust side, in the shim's JSON shapes
@@ -135,9 +165,189 @@ fn render_inputs() -> Vec<Json> {
         .collect()
 }
 
+/// An aware timestamp as a UTC instant (panics on anything else: test input).
+fn instant(text: &str) -> DateTime<Utc> {
+    parse_iso(text)
+        .and_then(|t| t.aware())
+        .unwrap_or_else(|| panic!("{text} is an aware timestamp"))
+        .with_timezone(&Utc)
+}
+
+/// Reads a commit-times file (`{"times": {path: stamp}, "dirty": [path]}`),
+/// the same file the shim hands okf.py's `last_commit_times`.
+fn commit_times_from_file(path: &str) -> CommitTimes {
+    let text = std::fs::read_to_string(path).expect("read commit times");
+    let data: Json = serde_json::from_str(&text).expect("commit times are JSON");
+    let times: HashMap<String, _> = data["times"]
+        .as_object()
+        .expect("times is an object")
+        .iter()
+        .map(|(path, at)| {
+            let at = instant(at.as_str().expect("a time is a string"));
+            (path.clone(), at.fixed_offset())
+        })
+        .collect();
+    let dirty: HashSet<String> = data["dirty"]
+        .as_array()
+        .expect("dirty is a list")
+        .iter()
+        .map(|p| p.as_str().expect("a dirty path is a string").to_string())
+        .collect();
+    CommitTimes::new(times, dirty)
+}
+
+/// okf.py's `last_commit_times(root)`, run through git the same way.
+///
+/// `None` when `git log` fails (okf.py's "git unavailable"). A failing
+/// `git status` is not checked, as in okf.py: its empty output gives no
+/// dirty paths. Paths are stripped with `str::trim` where okf.py uses
+/// `str.strip`; they differ only on control characters and non-ASCII
+/// spaces, which git quotes (`core.quotePath`), so no git path tells them
+/// apart.
+fn git_commit_times(root: &Path) -> Option<CommitTimes> {
+    // A closure (Python lambda) capturing `root`; `.ok()` turns a failure to
+    // start git into `None`.
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .ok()
+    };
+    // `?` on an Option returns `None` from the function early.
+    let log = git(&["log", "--format=%x00%cI", "--name-only", "--no-renames"])
+        .filter(|output| output.status.success())?;
+    let mut times = HashMap::new();
+    let mut current = None;
+    for line in String::from_utf8_lossy(&log.stdout).split('\n') {
+        if let Some(stamp) = line.strip_prefix('\0') {
+            current = parse_iso(stamp).and_then(|t| t.aware());
+        } else if let (false, Some(at)) = (line.trim().is_empty(), current) {
+            // `entry().or_insert` is `dict.setdefault`: the newest commit
+            // (git log's first) wins.
+            times.entry(line.trim().to_string()).or_insert(at);
+        }
+    }
+    let status = git(&["status", "--porcelain", "--untracked-files=all"])?;
+    let dirty = String::from_utf8_lossy(&status.stdout)
+        .split('\n')
+        .filter(|line| !line.trim().is_empty())
+        // `l[3:]`: the porcelain status columns are ASCII, so bytes = chars.
+        .filter_map(|line| line.get(3..))
+        .map(|rest| {
+            let renamed_to = rest.rsplit(" -> ").next().unwrap_or(rest);
+            renamed_to.trim_matches('"').to_string()
+        })
+        .collect();
+    Some(CommitTimes::new(times, dirty))
+}
+
+/// Every analysis of `root`, in the shim's `analysis` JSON shape.
+fn rust_analysis(root: &Path, now: DateTime<Utc>, commits: Option<&CommitTimes>) -> Json {
+    let workspace = DiskWorkspace::new(root).expect("corpus root exists");
+    let snapshot = Snapshot::build(&workspace).expect("snapshot builds");
+    let all = OldestQuery {
+        n: 1_000_000,
+        open_questions_only: false,
+    };
+    // `..Default::default()` fills the remaining fields (Python's
+    // `dataclasses.replace` the other way round).
+    let questions = OldestQuery {
+        open_questions_only: true,
+        ..OldestQuery::default()
+    };
+    let every_concept = SprawlQuery {
+        concept: None,
+        n: 1_000_000,
+    };
+    let rows = sprawl(&snapshot, every_concept).expect("sprawl of every concept");
+    // `impl Serialize` accepts any report type (a generic, resolved at
+    // compile time); `to_value` builds the same tree `json.loads` would.
+    fn value(report: impl serde::Serialize) -> Json {
+        serde_json::to_value(report).expect("report serializes")
+    }
+    json!({
+        "links": value(links_report(&snapshot, true)),
+        "oldest": value(oldest(&snapshot, now, all)),
+        "oldest_open_questions": value(oldest(&snapshot, now, questions)),
+        "sprawl": value(rows),
+        "lint": value(lint(&snapshot, now, commits)),
+    })
+}
+
+/// A corpus holding one hit for every secret rule, plus near misses.
+///
+/// Built in a temp directory at test time: secret-shaped strings never go
+/// into a committed file (GitHub push protection, and the catalog's own
+/// lint). Each one is assembled with `format!` so this source file does not
+/// hold it either.
+fn secrets_corpus() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let github = format!("gh{}_{}", "p", "A1".repeat(18));
+    let pat = format!("github_{}_{}", "pat", "B2".repeat(11));
+    let slack = format!("xo{}-{}", "xb", "1234567890".repeat(2));
+    let sk = format!("s{}-{}", "k", "C3".repeat(12));
+    let aws = format!("AK{}{}", "IA", "Z".repeat(16));
+    let pem = format!("-----BEGIN {} PRIVATE KEY-----", "OPENSSH");
+    let value = format!("Ab{}", "c1".repeat(4));
+    let files = [
+        (
+            "index.md",
+            "---\nokf_version: \"0.2\"\n---\n* [Keys](/keys.md)\n".to_string(),
+        ),
+        (
+            "keys.md",
+            format!(
+                "---\ntype: Note\ntitle: Keys\ndescription: d\n---\n{github}\n{pat}\n{slack}\n{sk}\n\
+                 id {aws}\n{pem}\npassword: \"{value}\" token={value} secret: changeme\n\
+                 x{github}\n{aws}Q\n"
+            ),
+        ),
+        ("notes.txt", format!("api_key = {value}\n")),
+        (".claude/settings.md", format!("CLIENT_SECRET: {value}\n")),
+    ];
+    for (path, contents) in files {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().expect("has a parent")).expect("mkdir");
+        std::fs::write(full, contents).expect("write corpus file");
+    }
+    // Not UTF-8: both implementations skip it.
+    std::fs::write(dir.path().join("blob.bin"), [0xff, 0xfe, 0x00]).expect("write blob");
+    dir
+}
+
 // ---------------------------------------------------------------------------
 // Comparison helpers
 // ---------------------------------------------------------------------------
+
+/// Recursive comparison of parsed JSON that names the path of the first
+/// difference and checks object key order (serde_json's `Map` equality
+/// ignores it). Values are compared after parsing, so how either side
+/// escaped non-ASCII text does not matter.
+fn assert_json_equal(rust: &Json, python: &Json, what: &str) {
+    match (rust, python) {
+        (Json::Object(r), Json::Object(p)) => {
+            let (rk, pk): (Vec<&String>, Vec<&String>) = (r.keys().collect(), p.keys().collect());
+            assert_eq!(
+                rk, pk,
+                "{what}: keys or key order (Rust left, okf.py right)"
+            );
+            for (key, value) in r {
+                assert_json_equal(value, &p[key], &format!("{what}.{key}"));
+            }
+        }
+        (Json::Array(r), Json::Array(p)) => {
+            // `zip` stops at the shorter list, so compare the common prefix
+            // first (naming the first differing element), then the lengths.
+            for (i, (a, b)) in r.iter().zip(p).enumerate() {
+                assert_json_equal(a, b, &format!("{what}[{i}]"));
+            }
+            assert_eq!(r.len(), p.len(), "{what}: length (Rust left, okf.py right)");
+        }
+        _ => assert_eq!(rust, python, "{what} (Rust left, okf.py right)"),
+    }
+}
 
 /// Compares two lists entry by entry so a failure names the file at fault.
 fn assert_entries_equal(rust: &Json, python: &Json, what: &str) {
@@ -224,6 +434,23 @@ fn markdown_matches_golden() {
 }
 
 #[test]
+fn analysis_matches_golden() {
+    let commits = commit_times_from_file(COMMIT_TIMES);
+    assert_json_equal(
+        &rust_analysis(Path::new(FIXTURES), instant(FIXED_NOW), Some(&commits)),
+        &read_golden("analysis.json"),
+        "analysis",
+    );
+}
+
+#[test]
+fn secrets_match_golden() {
+    let corpus = secrets_corpus();
+    let rust = rust_analysis(corpus.path(), instant(FIXED_NOW), None);
+    assert_json_equal(&rust["lint"], &read_golden("secrets.json"), "secrets lint");
+}
+
+#[test]
 fn render_matches_golden() {
     assert_entries_equal(
         &rust_render(&render_inputs()),
@@ -306,6 +533,18 @@ fn python_render(inputs: &[Json]) -> Json {
     shim(&[OsStr::new("render")], Some(&Json::from(inputs.to_vec())))
 }
 
+fn python_analysis(root: &Path, now: &str, commits: &str) -> Json {
+    shim(
+        &[
+            OsStr::new("analysis"),
+            root.as_os_str(),
+            OsStr::new(now),
+            OsStr::new(commits),
+        ],
+        None,
+    )
+}
+
 fn python_sha256() -> String {
     let digest = shim(&[OsStr::new("sha256")], None);
     digest.as_str().expect("sha256 is a string").to_string()
@@ -370,6 +609,54 @@ fn live_render_parity() {
     assert_entries_equal(&rust_render(&inputs), &python_render(&inputs), "render");
 }
 
+#[test]
+#[ignore = "needs python3 and okf.py; run with --ignored"]
+fn live_analysis_parity() {
+    let fixtures = Path::new(FIXTURES);
+    let commits = commit_times_from_file(COMMIT_TIMES);
+    assert_json_equal(
+        &rust_analysis(fixtures, instant(FIXED_NOW), Some(&commits)),
+        &python_analysis(fixtures, FIXED_NOW, COMMIT_TIMES),
+        "analysis of the synthetic corpus",
+    );
+    let corpus = secrets_corpus();
+    assert_json_equal(
+        &rust_analysis(corpus.path(), instant(FIXED_NOW), None)["lint"],
+        &python_analysis(corpus.path(), FIXED_NOW, "none")["lint"],
+        "lint of the secrets corpus",
+    );
+    // `let ... else`: bind the value or leave the function (the real
+    // catalog is optional).
+    let Some(real) = std::env::var_os("OKF_PARITY_CATALOG").map(PathBuf::from) else {
+        return;
+    };
+    // One shared "now", to the second, for both sides.
+    let now_text = format_timestamp(Utc::now());
+    let now = instant(&now_text);
+    let started = std::time::Instant::now();
+    let rust = rust_analysis(&real, now, git_commit_times(&real).as_ref());
+    eprintln!(
+        "Rust analysis of {} took {:?}",
+        real.display(),
+        started.elapsed()
+    );
+    let started = std::time::Instant::now();
+    let python = python_analysis(&real, &now_text, "git");
+    eprintln!(
+        "okf.py analysis of {} took {:?}",
+        real.display(),
+        started.elapsed()
+    );
+    assert_json_equal(&rust, &python, &format!("analysis of {}", real.display()));
+    let lint = &rust["lint"];
+    eprintln!(
+        "lint of {}: {} errors, {} warnings",
+        real.display(),
+        lint["errors"].as_array().map_or(0, Vec::len),
+        lint["warnings"].as_array().map_or(0, Vec::len)
+    );
+}
+
 /// Writes `contents` to `tests/golden/<name>` through the port's own atomic
 /// writer: a reader never sees half a file, an existing golden keeps its
 /// mode, and a new one gets the usual umask mode.
@@ -402,6 +689,14 @@ fn regenerate_goldens() {
         ("frontmatter.json", pretty(&python_frontmatter(root))),
         ("markdown.json", pretty(&python_markdown(root))),
         ("render.json", pretty(&python_render(&render_inputs()))),
+        (
+            "analysis.json",
+            pretty(&python_analysis(root, FIXED_NOW, COMMIT_TIMES)),
+        ),
+        (
+            "secrets.json",
+            pretty(&python_analysis(secrets_corpus().path(), FIXED_NOW, "none")["lint"]),
+        ),
         ("SOURCE", source_record(&python_sha256())),
     ];
     std::fs::create_dir_all(GOLDEN).expect("create golden dir");

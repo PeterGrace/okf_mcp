@@ -4592,6 +4592,8 @@ Extends M1's harness: the shim gets an `analysis` command that runs `okf.py`'s `
 - Regenerate: `tests/golden/*.json` (the new fixtures change `frontmatter.json` and `markdown.json` too); create `tests/golden/analysis.json`, `tests/golden/secrets.json`
 - Create: `changelog/<ts>-m2-task-12-parity.md`
 
+> **Corrected (issue #14), 2026-10-27.** Shipped as planned (read `tests/parity.rs` and `tests/parity/okf_shim.py`), with these fixes made inline below: the shim patches `now_utc` and `last_commit_times` with `setattr` (`mypy --strict` rejects assigning an undeclared attribute of a `ModuleType`), and `git_commit_times` checks only `git log`'s exit status, as `okf.py` does (a failing `git status` gives no dirty paths rather than "git unavailable"); and the secrets corpus names its dot-directory key `CLIENT_SECRET` instead of `Client_Secret`, because `okf.py`'s finding message puts the quoted key right after the word `secret` and a colon, so that message, committed in `secrets.json`, itself matched the assignment rule (a 12+ character mixed-case value). Upper case still exercises the case-insensitive keyword, and `okf.py`'s `scan_secrets` now finds nothing in any file this PR commits. Also shipped: the shim's `Json` alias includes `float` (sprawl scores, `age_days`); `rust_analysis` serializes through one generic `value` helper and builds the open-questions query from `OldestQuery::default()`; the live test also prints `okf.py`'s time and the real catalog's lint counts. **Non-ASCII JSON:** the harness compares parsed values, never text. `json.dumps` escapes non-ASCII (`\u2082`) and serde_json writes it raw; the shim already prints ASCII-only JSON, both sides are parsed into `serde_json::Value`, and `assert_json_equal` compares them recursively (key order checked separately; an integer never equals a float). The goldens are written by serde_json, so they hold raw UTF-8 (`analysis.json` does). Every fixture ran in `okf.py` without error; none uses a list or mapping `status` (`okf.py` raises `TypeError`, a documented divergence). Results: the golden diff only adds the nine `analysis/` documents to `frontmatter.json` and `markdown.json` (the root `index.md` changed only in its body); live parity passes on the synthetic corpus, the secrets corpus and `pg_knowledge_catalog` at `01eaa78` with real git (lint 0 errors, 3 `sprawl` warnings, the fresh baseline of verified fact 9), with Python 3.14.4. Real-catalog analysis (all five reports, mentions on) took 146 ms in release mode against 2.8 s for `okf.py` through the shim. No public name changed, so Tasks 13-14 need no edits (`tests/parity.rs` uses no `pystr` item or `MemWorkspace`, which Task 13 narrows).
+
 - [ ] **Step 1: Create the fixtures**
 
 Run this script from the repository root (it is not committed; the files it writes are). It was checked on 2026-10-27: `okf.py` runs every analysis on the resulting corpus without error, and the corpus exercises every lint rule except the secret rules (which live in the runtime corpus, Step 4): broken links (missing, escaping the root, an existing text file, a dot-directory target), broken and percent-encoded anchors, relative links, orphans, dead ends, index drift (unlisted, misfiled under `# Sections`, a folder index with frontmatter), an unlinked mention (masked in code, URL, fence and footnote), a sprawl warning, an exempt backlog, `oldest`'s fallback for unparseable frontmatter, a tie between equal instants with different offsets, and every timestamp rule.
@@ -4768,15 +4770,15 @@ and add (new imports: `contextlib`, `io`):
 def analysis(okf: ModuleType, root: str, now: str, commits: str) -> Json:
     """Run the analysis commands as okf.py's CLI does, returning their JSON."""
     fixed = okf.parse_ts(now)
-    okf.now_utc = lambda: fixed
+    setattr(okf, "now_utc", lambda: fixed)
     if commits == "none":
-        okf.last_commit_times = lambda _root: (None, set())
+        setattr(okf, "last_commit_times", lambda _root: (None, set()))
     elif commits != "git":
         with open(commits, encoding="utf-8") as fh:
             data = json.load(fh)
         times = {path: okf.parse_ts(at) for path, at in data["times"].items()}
         dirty = set(data["dirty"])
-        okf.last_commit_times = lambda _root: (times, dirty)
+        setattr(okf, "last_commit_times", lambda _root: (times, dirty))
 
     def run(*argv: str) -> Json:
         out = io.StringIO()
@@ -4846,10 +4848,9 @@ fn commit_times_from_file(path: &str) -> CommitTimes {
 
 /// `okf.py`'s `last_commit_times(root)`, run through git the same way.
 fn git_commit_times(root: &Path) -> Option<CommitTimes> {
-    let git = |args: &[&str]| {
-        Command::new("git").arg("-C").arg(root).args(args).output().ok().filter(|o| o.status.success())
-    };
-    let log = git(&["log", "--format=%x00%cI", "--name-only", "--no-renames"])?;
+    let git = |args: &[&str]| Command::new("git").arg("-C").arg(root).args(args).output().ok();
+    let log = git(&["log", "--format=%x00%cI", "--name-only", "--no-renames"])
+        .filter(|output| output.status.success())?;
     let mut times = HashMap::new();
     let mut current = None;
     for line in String::from_utf8_lossy(&log.stdout).split('\n') {
@@ -4940,7 +4941,7 @@ fn secrets_corpus() -> tempfile::TempDir {
             ),
         ),
         ("notes.txt", format!("api_key = {value}\n")),
-        (".claude/settings.md", format!("Client_Secret: {value}\n")),
+        (".claude/settings.md", format!("CLIENT_SECRET: {value}\n")),
     ];
     for (path, contents) in files {
         let full = dir.path().join(path);

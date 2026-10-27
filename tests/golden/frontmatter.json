@@ -15,6 +15,157 @@
     "has_frontmatter": false
   },
   {
+    "path": "analysis/backlog.md",
+    "has_frontmatter": true,
+    "value": {
+      "type": "Backlog",
+      "title": "Fixture backlog"
+    }
+  },
+  {
+    "path": "analysis/broken-stamps.md",
+    "has_frontmatter": true,
+    "error_line": 4,
+    "error_message": "duplicate key 'title'"
+  },
+  {
+    "path": "analysis/hub.md",
+    "has_frontmatter": true,
+    "value": {
+      "type": "Hub",
+      "title": "Analysis Hub",
+      "description": "Links of every kind.",
+      "aliases": [
+        "the hub"
+      ],
+      "tags": [
+        "analysis",
+        "links"
+      ],
+      "generated": {
+        "by": "fixture",
+        "at": "2026-10-20T00:00:00Z"
+      }
+    }
+  },
+  {
+    "path": "analysis/index.md",
+    "has_frontmatter": false
+  },
+  {
+    "path": "analysis/lead.md",
+    "has_frontmatter": true,
+    "value": {
+      "type": "Service",
+      "title": "Lead Concept",
+      "status": "draft",
+      "sources": [
+        {
+          "id": "s1",
+          "resource": "a"
+        },
+        {
+          "id": "s2",
+          "resource": "b"
+        },
+        {
+          "id": "s3",
+          "resource": "c"
+        },
+        {
+          "id": "s4",
+          "resource": "d"
+        },
+        {
+          "id": "s5",
+          "resource": "e"
+        }
+      ]
+    }
+  },
+  {
+    "path": "analysis/offsets.md",
+    "has_frontmatter": true,
+    "value": {
+      "type": "Note",
+      "title": "Offsets",
+      "description": "Non-UTC and fractional stamps.",
+      "generated": {
+        "by": "fixture",
+        "at": "2026-10-26T10:00:00.5+05:30"
+      },
+      "reviewed": {
+        "by": "fixture",
+        "at": "2026-10-26T04:30:00.5Z",
+        "outcome": "verified",
+        "note": "same instant"
+      },
+      "stale_after": "2026-11-01T00:00:00Z"
+    }
+  },
+  {
+    "path": "analysis/stamps.md",
+    "has_frontmatter": true,
+    "value": {
+      "type": "Note",
+      "title": "Stamp Rules",
+      "status": "bogus",
+      "generated": {
+        "by": "fixture",
+        "at": "2027-01-01T00:00:00Z"
+      },
+      "verified": [
+        {
+          "by": "fixture",
+          "at": "2026-10-01T10:00:00-04:00"
+        },
+        "plain"
+      ],
+      "reviewed": {
+        "by": "fixture",
+        "at": "2026-10-02T00:00:00Z",
+        "outcome": "maybe"
+      },
+      "stale_after": "2026-01-01T00:00:00Z",
+      "open_questions": [
+        "Is the clock right?",
+        {
+          "asked": "by fixture"
+        }
+      ],
+      "sources": [
+        {
+          "id": "a"
+        },
+        {
+          "id": "b",
+          "resource": "r",
+          "last_modified": "2026-13-01T00:00:00Z"
+        },
+        {
+          "id": "c",
+          "resource": "r",
+          "last_modified": "2026-10-01T00:00:00+00:00"
+        }
+      ]
+    }
+  },
+  {
+    "path": "analysis/sub/deep.md",
+    "has_frontmatter": true,
+    "value": {
+      "type": "Note",
+      "title": "Deep"
+    }
+  },
+  {
+    "path": "analysis/sub/index.md",
+    "has_frontmatter": true,
+    "value": {
+      "note": "folder indexes must not have frontmatter"
+    }
+  },
+  {
     "path": "errors/bad-escape.md",
     "has_frontmatter": true,
     "error_line": 3,
