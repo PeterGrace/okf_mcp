@@ -26,7 +26,7 @@ use std::sync::LazyLock;
 use indexmap::IndexMap;
 use regex::Regex;
 
-use crate::okf::pystr::{is_py_space, py_rstrip, py_strip};
+use crate::okf::pystr::{is_py_space, py_repr_str, py_rstrip, py_strip};
 
 /// A parsed YAML value. Every scalar is a string, as in `okf.py`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +133,10 @@ impl<'a> Inline<'a> {
     }
 
     fn err(&self, message: &str) -> YamlError {
-        YamlError::new(format!("{message} in {:?}", self.source), self.line)
+        YamlError::new(
+            format!("{message} in {}", py_repr_str(self.source)),
+            self.line,
+        )
     }
 
     fn skip_ws(&mut self) {
@@ -156,7 +159,11 @@ impl<'a> Inline<'a> {
             // `c @ (...)` binds the matched character to `c` while also
             // requiring it to be one of the listed alternatives.
             Some(c @ ('&' | '*' | '!' | '|' | '>' | '%' | '@' | '`')) => {
-                Err(self.err(&format!("unsupported YAML indicator {c:?}")))
+                // `encode_utf8` writes the char into a stack buffer and returns it as `&str`.
+                Err(self.err(&format!(
+                    "unsupported YAML indicator {}",
+                    py_repr_str(c.encode_utf8(&mut [0u8; 4]))
+                )))
             }
             _ => Ok(self.plain(flow).map_or(Value::Null, Value::Str)),
         }
@@ -303,7 +310,7 @@ impl<'a> Inline<'a> {
             }
             let key = self.key()?;
             if map.contains_key(&key) {
-                return Err(self.err(&format!("duplicate key {key:?}")));
+                return Err(self.err(&format!("duplicate key {}", py_repr_str(&key))));
             }
             self.skip_ws();
             let value = if matches!(self.peek(), Some(',' | '}')) {
@@ -394,7 +401,10 @@ pub fn parse_inline(text: &str, line: Option<usize>) -> Result<Value, YamlError>
     let value = parser.node(false)?;
     if parser.peek() == Some(':') {
         return Err(YamlError::new(
-            format!("unquoted ': ' inside a plain value {text:?}; quote it"),
+            format!(
+                "unquoted ': ' inside a plain value {}; quote it",
+                py_repr_str(text)
+            ),
             line,
         ));
     }
@@ -515,7 +525,10 @@ fn parse_seq(content: &[NumberedLine<'_>], indent: usize) -> Result<Value, YamlE
         let (number, text) = content[i];
         if indent_of(text) != indent || !is_seq_start(&text[indent..]) {
             return Err(YamlError::new(
-                format!("bad indentation or structure: {:?}", py_strip(text)),
+                format!(
+                    "bad indentation or structure: {}",
+                    py_repr_str(py_strip(text))
+                ),
                 Some(number),
             ));
         }
@@ -556,13 +569,13 @@ fn parse_map(content: &[NumberedLine<'_>], indent: usize) -> Result<Value, YamlE
         let (number, text) = content[i];
         if indent_of(text) != indent {
             return Err(YamlError::new(
-                format!("bad indentation: {:?}", py_strip(text)),
+                format!("bad indentation: {}", py_repr_str(py_strip(text))),
                 Some(number),
             ));
         }
         let Some(caps) = MAP_KEY.captures(&text[indent..]) else {
             return Err(YamlError::new(
-                format!("expected 'key: value', got {:?}", py_strip(text)),
+                format!("expected 'key: value', got {}", py_repr_str(py_strip(text))),
                 Some(number),
             ));
         };
@@ -589,7 +602,7 @@ fn parse_map(content: &[NumberedLine<'_>], indent: usize) -> Result<Value, YamlE
         };
         if map.contains_key(&key) {
             return Err(YamlError::new(
-                format!("duplicate key {key:?}"),
+                format!("duplicate key {}", py_repr_str(&key)),
                 Some(number),
             ));
         }
@@ -751,6 +764,21 @@ mod tests {
 
     fn lines(texts: &[&'static str]) -> Vec<NumberedLine<'static>> {
         texts.iter().enumerate().map(|(i, t)| (i + 3, *t)).collect()
+    }
+
+    #[test]
+    fn flow_errors_quote_like_python_repr() {
+        // Expected text is what `okf.py` (Python 3.14) raises for the same input.
+        let err = parse_inline("{by: a, by: b}", Some(3)).unwrap_err();
+        assert_eq!(err.message, "duplicate key 'by' in '{by: a, by: b}'");
+        assert_eq!(err.line, Some(3));
+        let err = parse_inline("{\"\u{e9}\": 1, \"\u{e9}\": 2}", None).unwrap_err();
+        assert_eq!(
+            err.message,
+            "duplicate key '\u{e9}' in '{\"\u{e9}\": 1, \"\u{e9}\": 2}'"
+        );
+        let err = parse_inline("&x", None).unwrap_err();
+        assert_eq!(err.message, "unsupported YAML indicator '&' in '&x'");
     }
 
     #[test]

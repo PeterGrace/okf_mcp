@@ -651,11 +651,13 @@ Expected: PASS. If a `py_repr_str` expectation fails, check it with `python3 -c 
 
 - [ ] **Step 5: YAML error messages quote with Python `repr`**
 
-`lint` reports `frontmatter does not parse: {message}`, so the parser's messages must be `okf.py`'s byte for byte. `okf.py` quotes source text with `!r`; M1 used Rust's `{:?}`, which differs (`"a"` versus `'a'`, `\u{e9}` versus `é`). Replace every `{:?}`/`{x:?}` in a `YamlError` message with `py_repr_str`. The eight sites (`grep -n ':?}' src/okf/yaml.rs src/okf/doc.rs`), with their `okf.py` originals:
+`lint` reports `frontmatter does not parse: {message}`, so the parser's messages must be `okf.py`'s byte for byte. `okf.py` quotes source text with `!r`; M1 used Rust's `{:?}`, which differs (`"a"` versus `'a'`, `\u{e9}` versus `é`). Replace every `{:?}`/`{x:?}` in a `YamlError` message with `py_repr_str`. The ten sites (`grep -n ':?}' src/okf/yaml.rs src/okf/doc.rs`, excluding test assertions), with their `okf.py` originals:
 
 | File:line (M1) | Rust after the change | `okf.py` |
 |---|---|---|
 | `src/okf/yaml.rs:136` | `format!("{message} in {}", py_repr_str(self.source))` | `f"{msg} in {self.s!r}"` (90) |
+| `src/okf/yaml.rs:159` | `format!("unsupported YAML indicator {}", py_repr_str(c.encode_utf8(&mut [0u8; 4])))` | 111 |
+| `src/okf/yaml.rs:306` | `format!("duplicate key {}", py_repr_str(&key))` (in `flow_map`) | 197 |
 | `src/okf/yaml.rs:397` | `format!("unquoted ': ' inside a plain value {}; quote it", py_repr_str(text))` | 233 |
 | `src/okf/yaml.rs:518` | `format!("bad indentation or structure: {}", py_repr_str(py_strip(text)))` | 282 |
 | `src/okf/yaml.rs:559` | `format!("bad indentation: {}", py_repr_str(py_strip(text)))` | 316 |
@@ -663,6 +665,8 @@ Expected: PASS. If a `py_repr_str` expectation fails, check it with `python3 -c 
 | `src/okf/yaml.rs:592` | `format!("duplicate key {}", py_repr_str(&key))` | 330 |
 | `src/okf/doc.rs:517` | `format!("duplicate key {}", py_repr_str(&b.key))` | 467 |
 | `src/okf/doc.rs:534` | `format!("line is not part of any key: {}", py_repr_str(py_strip(line)))` | 474 |
+
+> **Corrected (issue #4), 2026-10-27.** The table listed eight sites; there are ten. Added `yaml.rs:159` (`unsupported YAML indicator`, unchanged output for its ASCII indicators but converted for consistency) and `yaml.rs:306` (`duplicate key` in `flow_map`, which `tests/fixtures/catalog/errors/flow-duplicate-key.md` exercises and Task 10's lint parity depends on). `yaml.rs` gained `flow_errors_quote_like_python_repr` for both; `parse_errors_quote_like_python_repr` asserts the full message `expected ',' or ']' in flow list in '[\u{e9}'` rather than its suffix.
 
 Add a test to `src/okf/doc.rs`'s test module:
 
@@ -677,6 +681,8 @@ Add a test to `src/okf/doc.rs`'s test module:
 ```
 
 Fix any unit test that asserted a `{:?}`-style message. `tests/parity.rs`'s `error_kind` keeps working (it cuts at the first quote of either kind).
+
+> **Corrected (issue #4), 2026-10-27.** `error_kind` is gone (review of PR #18): with repr quoting the messages match `okf.py` in full, so `tests/parity.rs` and `tests/parity/okf_shim.py` compare the whole message as `error_message`, and `tests/golden/frontmatter.json` was regenerated with it. Every corpus file whose frontmatter fails to parse now checks message text byte for byte.
 
 - [ ] **Step 6: Gates, changelog, commit**
 
