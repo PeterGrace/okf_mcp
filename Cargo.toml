@@ -18,6 +18,8 @@ chrono = { version = "0.4.45", default-features = false, features = ["now"] }
 # Insertion-ordered maps, matching Python dict order for frontmatter mappings.
 indexmap = "2.14.2"
 regex = "1.13.1"
+# `Serialize` derives for the analysis reports, whose JSON must match okf.py's.
+serde = { version = "1.0.229", features = ["derive"] }
 # `preserve_order` keeps JSON object keys in insertion order (Python dict
 # order), so `Value::to_json` keeps frontmatter keys in source order.
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
