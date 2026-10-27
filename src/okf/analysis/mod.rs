@@ -1,6 +1,6 @@
 //! Catalog analyses: ports of `okf.py`'s `lint`, `links`, `oldest`, `sprawl`
 //! and secret scan. Each is a pure function over a catalog snapshot
-//! (`okf::snapshot::Snapshot`) or a file's text (and an injected "now"),
+//! ([`crate::okf::snapshot::Snapshot`]) or a file's text (and an injected "now"),
 //! returning report structs whose JSON (`serde_json::to_value`) equals
 //! `okf.py`'s `--json` output, keys in the same order.
 //!
