@@ -10,6 +10,7 @@
 pub mod links;
 pub mod oldest;
 pub mod secrets;
+pub mod sprawl;
 
 /// One lint-style finding: `{"file", "line", "rule", "message"}` in `okf.py`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]

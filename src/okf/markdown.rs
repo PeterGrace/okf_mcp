@@ -166,6 +166,35 @@ pub fn body_split(text: &str) -> (Vec<&str>, Vec<&str>) {
     (Vec::new(), lines)
 }
 
+/// The fence marker (`` ``` `` or `~~~`) if `line` opens or closes a fenced
+/// block (`okf.py`'s `FENCE_RE.match`).
+///
+/// # Returns
+/// The marker, borrowed from `line`; `None` if the line is not a fence.
+pub(crate) fn fence_marker(line: &str) -> Option<&str> {
+    FENCE
+        .captures(line)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+}
+
+/// The open fence after a fence line with `marker`: a fence closes only with
+/// the marker that opened it (`okf.py`'s
+/// `None if fence == f.group(1) else (fence or f.group(1))`).
+///
+/// # Arguments
+/// * `open` - the marker of the fence open before this line, if any.
+/// * `marker` - this line's marker, from [`fence_marker`].
+///
+/// # Returns
+/// The marker of the fence open after this line, if any.
+pub(crate) fn next_fence<'a>(open: Option<&'a str>, marker: &'a str) -> Option<&'a str> {
+    match open {
+        Some(open) if open == marker => None,
+        Some(open) => Some(open),
+        None => Some(marker),
+    }
+}
 /// An ATX heading found in a list of lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Heading {
@@ -184,14 +213,8 @@ pub fn headings(lines: &[&str]) -> Vec<Heading> {
     let mut found = Vec::new();
     let mut fence: Option<&str> = None;
     for (index, line) in lines.iter().enumerate() {
-        if let Some(caps) = FENCE.captures(line) {
-            let marker = caps.get(1).map_or("", |m| m.as_str());
-            // A fence closes only with the same marker that opened it.
-            fence = match fence {
-                Some(open) if open == marker => None,
-                Some(open) => Some(open),
-                None => Some(marker),
-            };
+        if let Some(marker) = fence_marker(line) {
+            fence = next_fence(fence, marker);
             continue;
         }
         if fence.is_some() {
