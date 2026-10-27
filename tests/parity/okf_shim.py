@@ -4,7 +4,7 @@
 Loads okf.py from the path in $OKF_PY (standard library only, no install).
 
 usage:
-    okf_shim.py frontmatter ROOT     every .md under ROOT: parsed frontmatter or error line and kind
+    okf_shim.py frontmatter ROOT     every .md under ROOT: parsed frontmatter or error line and message
     okf_shim.py markdown ROOT        every .md under ROOT: body headings with slugs, footnotes
     okf_shim.py render               stdin: JSON list of values; stdout: each with its renderings
     okf_shim.py sha256               okf.py's SHA-256, to check that the goldens are current
@@ -44,18 +44,6 @@ def load_okf() -> ModuleType:
     return module
 
 
-def error_kind(message: str) -> str:
-    """The stable part of a YamlError message: the text before the first quote
-    character or " in ", whichever comes first, without trailing spaces or
-    colons. What follows is quoted source text, which okf.py writes with
-    repr() and the Rust port with Debug escaping, so only the prefix compares.
-    The "expected ..." family (whose own text has quotes) collapses to
-    "expected" on purpose: finer string rules aren't stable across Python
-    repr and Rust Debug. tests/parity.rs implements the same rule."""
-    cuts = [i for i in (message.find("'"), message.find('"'), message.find(" in ")) if i >= 0]
-    return message[:min(cuts, default=len(message))].rstrip(" :")
-
-
 def frontmatter(okf: ModuleType, root: str) -> list[Json]:
     out: list[Json] = []
     for rel in okf.walk_md(root):
@@ -66,7 +54,7 @@ def frontmatter(okf: ModuleType, root: str) -> list[Json]:
                 entry["value"] = doc.parse()
             except okf.YamlError as ex:
                 entry["error_line"] = ex.line
-                entry["error_kind"] = error_kind(str(ex))
+                entry["error_message"] = str(ex)
         out.append(entry)
     return out
 

@@ -18,79 +18,79 @@
     "path": "errors/bad-escape.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "bad escape"
+    "error_message": "bad escape in '\"\\\\x4G\"'"
   },
   {
     "path": "errors/bad-indentation.md",
     "has_frontmatter": true,
     "error_line": 4,
-    "error_kind": "bad indentation"
+    "error_message": "bad indentation: 'at: y'"
   },
   {
     "path": "errors/bad-structure.md",
     "has_frontmatter": true,
     "error_line": 4,
-    "error_kind": "bad indentation or structure"
+    "error_message": "bad indentation or structure: '- b'"
   },
   {
     "path": "errors/expected-key-value.md",
     "has_frontmatter": true,
     "error_line": 4,
-    "error_kind": "expected"
+    "error_message": "expected 'key: value', got 'just text'"
   },
   {
     "path": "errors/flow-duplicate-key.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "duplicate key"
+    "error_message": "duplicate key 'by' in '{by: a, by: b}'"
   },
   {
     "path": "errors/flow-list-separator.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "expected"
+    "error_message": "expected ',' or ']' in flow list in '[a, \"b\" c]'"
   },
   {
     "path": "errors/flow-map-separator.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "expected"
+    "error_message": "expected ',' or '}' in flow map in '{by: \"a\" at: b}'"
   },
   {
     "path": "errors/flow-missing-colon.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "expected"
+    "error_message": "expected ':' after key in '{by}'"
   },
   {
     "path": "errors/invalid-escape.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "invalid escape \\q"
+    "error_message": "invalid escape \\q in '\"\\\\q\"'"
   },
   {
     "path": "errors/nested-duplicate-key.md",
     "has_frontmatter": true,
     "error_line": 4,
-    "error_kind": "duplicate key"
+    "error_message": "duplicate key 'by'"
   },
   {
     "path": "errors/trailing-text.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "unexpected trailing text"
+    "error_message": "unexpected trailing text in '\"quoted\" trailing'"
   },
   {
     "path": "errors/unsupported-indicator.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "unsupported YAML indicator"
+    "error_message": "unsupported YAML indicator '&' in '&anchor value'"
   },
   {
     "path": "errors/unterminated-single.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "unterminated single-quoted string"
+    "error_message": "unterminated single-quoted string in \"'never closed\""
   },
   {
     "path": "infra/index.md",
@@ -202,25 +202,25 @@
     "path": "people/bad-colon.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "unquoted"
+    "error_message": "unquoted ': ' inside a plain value 'Bad: colon in plain value'; quote it"
   },
   {
     "path": "people/duplicate-key.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "duplicate key"
+    "error_message": "duplicate key 'type'"
   },
   {
     "path": "people/flow-error.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "expected"
+    "error_message": "expected ',' or ']' in flow list in '[a, b'"
   },
   {
     "path": "people/quoted-top-key.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "line is not part of any key"
+    "error_message": "line is not part of any key: '\"quoted\": no'"
   },
   {
     "path": "people/unicode.md",
@@ -235,13 +235,13 @@
     "path": "people/unterminated.md",
     "has_frontmatter": true,
     "error_line": 3,
-    "error_kind": "unterminated double-quoted string"
+    "error_message": "unterminated double-quoted string in '\"never closed'"
   },
   {
     "path": "people/value-and-children.md",
     "has_frontmatter": true,
     "error_line": 2,
-    "error_kind": "value on the key line and indented lines below it"
+    "error_message": "value on the key line and indented lines below it"
   },
   {
     "path": "yaml/block-scalars.md",

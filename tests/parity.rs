@@ -48,34 +48,6 @@ fn markdown_files(root: &Path) -> (DiskWorkspace, Vec<String>) {
     (workspace, files)
 }
 
-/// The stable part of a YAML error message: the text before the first quote
-/// character or `" in "`, whichever comes first, without trailing spaces or
-/// colons. What follows is quoted source text, which okf.py writes with
-/// `repr()` and the port with `Debug` escaping, so only the prefix compares.
-/// The `expected ...` family (whose own text has quotes) collapses to
-/// `expected` on purpose: finer string rules aren't stable across Python
-/// `repr` and Rust `Debug`. `okf_shim.py`'s `error_kind` implements the same rule.
-fn error_kind(message: &str) -> &str {
-    let cut = ["'", "\"", " in "]
-        .iter()
-        .filter_map(|needle| message.find(needle))
-        .min()
-        .unwrap_or(message.len());
-    message[..cut].trim_end_matches([' ', ':'])
-}
-
-#[test]
-fn error_kind_keeps_the_text_before_quoted_source() {
-    assert_eq!(error_kind("duplicate key \"a\""), "duplicate key");
-    assert_eq!(error_kind("bad indentation: 'x'"), "bad indentation");
-    assert_eq!(error_kind("bad escape in \"\\\\x4\""), "bad escape");
-    assert_eq!(
-        error_kind("expected ',' or ']' in flow list in \"[a\""),
-        "expected"
-    );
-    assert_eq!(error_kind("value on the key line"), "value on the key line");
-}
-
 fn rust_frontmatter(root: &Path) -> Json {
     let (workspace, files) = markdown_files(root);
     let entries = files.iter().map(|path| {
@@ -89,7 +61,9 @@ fn rust_frontmatter(root: &Path) -> Json {
                 Ok(map) => entry["value"] = Value::Map(map).to_json(),
                 Err(error) => {
                     entry["error_line"] = json!(error.line);
-                    entry["error_kind"] = json!(error_kind(&error.message));
+                    // The whole message: the port quotes source text with
+                    // Python `repr` (`okf::pystr::py_repr_str`), as okf.py does.
+                    entry["error_message"] = json!(error.message);
                 }
             }
         }
