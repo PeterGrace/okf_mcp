@@ -131,6 +131,23 @@ mod tests {
         );
     }
 
+    #[hegel::test]
+    fn universal_newlines_matches_python_replace(tc: hegel::TestCase) {
+        use hegel::generators;
+        // Mostly line-ending pieces, so `\r\n` pairs and lone `\r`s are common.
+        let pieces = vec!["\r", "\n", "\r\n", "a", "\u{e9}", "\u{2028}"];
+        let count = tc.draw(generators::integers::<usize>().max_value(20));
+        let mut text = String::new();
+        for _ in 0..count {
+            let piece: &str = tc.draw(generators::sampled_from(&pieces));
+            text.push_str(piece);
+        }
+        text.push_str(&tc.draw(generators::text()));
+        let normalized = universal_newlines(&text);
+        assert_eq!(normalized, text.replace("\r\n", "\n").replace('\r', "\n"));
+        assert!(!normalized.contains('\r'));
+    }
+
     #[test]
     fn one_sided_strips() {
         assert_eq!(py_rstrip(" a \x1f"), " a");

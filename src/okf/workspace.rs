@@ -4,6 +4,7 @@
 //! Paths are bundle-relative (`infra/time-server.md`). Implementations must
 //! refuse paths that escape the catalog root.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::ops::Bound;
@@ -40,13 +41,10 @@ pub trait Workspace: Send + Sync {
     /// As [`Workspace::read_to_string`].
     fn read_text(&self, path: &str) -> Result<String, OkfError> {
         let raw = self.read_to_string(path)?;
-        // `Cow::Borrowed` means nothing changed: hand back `raw` itself. The
-        // borrow of `raw` ends with this `match`, so it can then be moved.
-        let normalized = match universal_newlines(&raw) {
-            std::borrow::Cow::Owned(text) => Some(text),
-            std::borrow::Cow::Borrowed(_) => None,
-        };
-        Ok(normalized.unwrap_or(raw))
+        match universal_newlines(&raw) {
+            Cow::Owned(text) => Ok(text),
+            Cow::Borrowed(_) => Ok(raw),
+        }
     }
 
     /// Writes a file atomically (all or nothing), creating parent directories.
