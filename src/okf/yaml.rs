@@ -669,17 +669,49 @@ pub fn double_quote(text: &str) -> String {
     out
 }
 
-/// Renders a scalar, quoting only when needed (or always, with `force`).
+/// Where a scalar is written, which decides whether it needs quotes.
+///
+/// Replaces M1's two positional bools (`flow`, `force`): a call such as
+/// `scalar(x, ScalarStyle::Quoted)` says what it means at the call site.
+// `Copy` makes this a plain value like a Python int: passing it to `scalar`
+// copies it rather than moving it, so a caller can reuse the same variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarStyle {
+    /// A block value (`key: value`, `- item`): quoted only when needed.
+    Block,
+    /// Inside a flow collection (`[a, b]`, `{ k: v }`), where `,[]{}` are
+    /// syntax: quoted when needed there.
+    Flow,
+    /// Always double-quoted.
+    Quoted,
+}
+
+/// Renders a scalar in the given style.
+///
+/// # Arguments
+/// * `text` - the scalar's value.
+/// * `style` - where it is written; see [`ScalarStyle`].
+///
+/// # Returns
+/// `text` unchanged when it can be written plain in that style, otherwise
+/// [`double_quote`]d.
 ///
 /// # Examples
 /// ```
-/// use okf_mcp::okf::yaml::scalar;
-/// assert_eq!(scalar("plain text", false, false), "plain text");
-/// assert_eq!(scalar("a: b", false, false), "\"a: b\"");
-/// assert_eq!(scalar("x", false, true), "\"x\"");
+/// use okf_mcp::okf::yaml::{scalar, ScalarStyle};
+/// assert_eq!(scalar("plain text", ScalarStyle::Block), "plain text");
+/// assert_eq!(scalar("a: b", ScalarStyle::Block), "\"a: b\"");
+/// assert_eq!(scalar("x", ScalarStyle::Quoted), "\"x\"");
 /// ```
-pub fn scalar(text: &str, flow: bool, force: bool) -> String {
-    if force || needs_quote(text, flow) {
+pub fn scalar(text: &str, style: ScalarStyle) -> String {
+    // `match` on an enum must cover every variant (no `_` arm), so adding a
+    // style later is a compile error here until it is handled.
+    let quote = match style {
+        ScalarStyle::Block => needs_quote(text, false),
+        ScalarStyle::Flow => needs_quote(text, true),
+        ScalarStyle::Quoted => true,
+    };
+    if quote {
         double_quote(text)
     } else {
         text.to_string()
@@ -692,7 +724,7 @@ pub fn flow_value(value: &Value) -> String {
         Value::Map(map) => {
             let items: Vec<String> = map
                 .iter()
-                .map(|(k, v)| format!("{}: {}", scalar(k, true, false), flow_value(v)))
+                .map(|(k, v)| format!("{}: {}", scalar(k, ScalarStyle::Flow), flow_value(v)))
                 .collect();
             format!("{{ {} }}", items.join(", "))
         }
@@ -701,7 +733,7 @@ pub fn flow_value(value: &Value) -> String {
             format!("[{}]", items.join(", "))
         }
         Value::Null => "null".to_string(),
-        Value::Str(s) => scalar(s, true, false),
+        Value::Str(s) => scalar(s, ScalarStyle::Flow),
     }
 }
 
@@ -732,16 +764,16 @@ pub fn block_item(value: &Value, indent: usize) -> Vec<String> {
                     };
                     let rendered = v
                         .as_str()
-                        .map(|s| scalar(s, false, false))
+                        .map(|s| scalar(s, ScalarStyle::Block))
                         .unwrap_or_default();
-                    let line = format!("{lead}{}: {rendered}", scalar(k, false, false));
+                    let line = format!("{lead}{}: {rendered}", scalar(k, ScalarStyle::Block));
                     py_rstrip(&line).to_string()
                 })
                 .collect()
         }
         Value::Map(_) | Value::Seq(_) => vec![format!("{pad}- {}", flow_value(value))],
         Value::Null => vec![format!("{pad}- null")],
-        Value::Str(s) => vec![format!("{pad}- {}", scalar(s, false, false))],
+        Value::Str(s) => vec![format!("{pad}- {}", scalar(s, ScalarStyle::Block))],
     }
 }
 
@@ -1106,11 +1138,19 @@ mod tests {
         assert_eq!(text, r#"{"z":"1","a":"2","m":"3"}"#);
     }
 
+    #[test]
+    fn scalar_styles() {
+        assert_eq!(scalar("a,b", ScalarStyle::Block), "a,b");
+        assert_eq!(scalar("a,b", ScalarStyle::Flow), "\"a,b\"");
+        assert_eq!(scalar("plain", ScalarStyle::Quoted), "\"plain\"");
+        assert_eq!(scalar("a: b", ScalarStyle::Block), "\"a: b\"");
+    }
+
     #[hegel::test]
     fn scalar_round_trips_through_parse_inline(tc: hegel::TestCase) {
         use hegel::generators;
         let text: String = tc.draw(generators::text());
-        let rendered = scalar(&text, false, false);
+        let rendered = scalar(&text, ScalarStyle::Block);
         assert_eq!(parse_inline(&rendered, None).unwrap(), Value::Str(text));
     }
 
