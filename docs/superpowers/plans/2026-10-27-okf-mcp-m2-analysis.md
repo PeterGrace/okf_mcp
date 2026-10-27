@@ -3164,6 +3164,8 @@ git commit -m "analysis: oldest (port of okf.py describe/cmd_oldest)"
 
 Port of `VOLATILE_RE`, `DATE_RE`, `LEADIN_RE`, `SPRAWL_*`, `volatile_reason`, `sprawl_of` and `cmd_sprawl` (`okf.py` 1236-1337).
 
+> **Corrected (issue #11), 2026-10-27.** The code below compiled and the three tests passed as written, but the score was wrong on the real catalog: Python 3.12+ `sum()` adds floats with Neumaier compensation, so `/home/robot-mower.md`'s parts `1.05 + 0.5 + 1.0 + 0.0 + 0.6000000000000001` sum to `3.1500000000000004` (rounds to `3.2`) where a plain `+` chain gives `3.15` (rounds to `3.1`). The score now goes through a private `py_float_sum` (a port of CPython's `builtin_sum_impl` float loop), fixed inline below. Read `src/okf/analysis/sprawl.rs` for the shipped version, which also restructures without changing behaviour: the fence toggle is a shared `markdown::next_fence` beside `fence_marker` (used by `headings` too, so the whole fence rule has one definition); the code-line set is a `Vec<bool>` instead of a `HashSet`; `sprawl` scores concepts with `rayon`, drops exempt rows before sorting, and partitions the top `n` with `select_nth_unstable_by` as `oldest` does; `SprawlQuery` has a `Default` (`n: 5`, `okf.py`'s default). Shipped tests beyond Step 2: `scores_add_like_python_sum`, `dates_resume_after_each_match_like_findall`, `quirks_match_okf_py` (fences closed only by their own marker, lead-ins in code, invalid frontmatter, a padded `"  BACKLOG "` type, Python-cased dates, `n: 0`, a non-concept name), and more `volatile_reason` cases, each expectation from `okf.py`. The JSON equals `okf.py sprawl --json` (values) on this task's catalogs, `tests/fixtures/catalog`, `pg_knowledge_catalog` (142 concepts, plus three by name including the exempt backlog) and 400 generated files. No public name, signature or field changed (`sprawl`, `sprawl_of`, `SprawlQuery`, `SprawlReport`, `SprawlSection`, `VolatileItem`, `SPRAWL_WARN`), so Tasks 10-14 need no edits.
+
 **Files:**
 - Create: `src/okf/analysis/sprawl.rs`
 - Modify: `src/okf/analysis/mod.rs` (`pub mod sprawl;`)
@@ -3525,14 +3527,15 @@ pub fn sprawl_of(doc: &SnapshotDoc) -> SprawlReport {
         }
     }
 
-    // The weights in okf.py's order and arithmetic: weight * count, summed left to right.
-    let score = round_one(
-        (1.0 / 20.0) * lines as f64
-            + (1.0 / 2.0) * found.len() as f64
-            + (1.0 / 3.0) * sources as f64
-            + 1.5 * volatile.len() as f64
-            + (1.0 / 5.0) * dates.len() as f64,
-    );
+    // okf.py's weights and arithmetic: weight * count, in `parts` order,
+    // added by Python's (compensated) `sum`.
+    let score = round_one(py_float_sum([
+        (1.0 / 20.0) * lines as f64,
+        (1.0 / 2.0) * found.len() as f64,
+        (1.0 / 3.0) * sources as f64,
+        1.5 * volatile.len() as f64,
+        (1.0 / 5.0) * dates.len() as f64,
+    ]));
     let large = 12.max(lines / 5);
     let mut candidates: Vec<SprawlSection> = sections
         .iter()
