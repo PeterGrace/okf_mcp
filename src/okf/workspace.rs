@@ -22,7 +22,9 @@ pub trait Workspace: Send + Sync {
     /// Reads a file as UTF-8.
     ///
     /// # Errors
-    /// [`OkfError::Io`] if the file is missing, unreadable or not UTF-8;
+    /// [`OkfError::NotFound`] if there is no file at `path` (every
+    /// implementation reports a missing file this way, never as `Io`);
+    /// [`OkfError::Io`] if it is unreadable or not UTF-8;
     /// [`OkfError::InvalidPath`] if the path escapes the catalog.
     fn read_to_string(&self, path: &str) -> Result<String, OkfError>;
 
@@ -50,15 +52,17 @@ pub trait Workspace: Send + Sync {
     /// Writes a file atomically (all or nothing), creating parent directories.
     ///
     /// On disk, as with `okf.py`'s `open(path, "w")`, an existing file keeps
-    /// its permissions, a read-only one is refused, and a new one gets 0o666
-    /// less the process umask. Unlike Python's in-place rewrite, replacing by
-    /// rename does not keep the owner, group, ACLs, extended attributes or
-    /// hard links of an existing file.
+    /// its permissions, one this process may not open for writing is refused
+    /// (the kernel decides, as for Python), and a new one gets 0o666 less the
+    /// process umask. Unlike Python's in-place rewrite, replacing by rename
+    /// does not keep the owner, group, ACLs, extended attributes or hard links
+    /// of an existing file.
     ///
     /// # Errors
     /// [`OkfError::Io`] on any filesystem failure (`PermissionDenied` for a
-    /// read-only file); [`OkfError::InvalidPath`]
-    /// if the path escapes the catalog or is not a file path (the root).
+    /// file this process may not write); [`OkfError::InvalidPath`] if the
+    /// path escapes the catalog, is not a file path (the root), is a
+    /// directory, or has a file as a parent component.
     fn write_atomic(&self, path: &str, contents: &str) -> Result<(), OkfError>;
 
     /// Is there a file or directory at `path`?
@@ -256,9 +260,14 @@ impl Workspace for DiskWorkspace {
                 reason: "resolves outside the catalog (symlink)".to_string(),
             });
         }
-        std::fs::read_to_string(full).map_err(|source| OkfError::Io {
-            path: path.to_string(),
-            source,
+        std::fs::read_to_string(full).map_err(|source| match source.kind() {
+            std::io::ErrorKind::NotFound => OkfError::NotFound {
+                path: path.to_string(),
+            },
+            _ => OkfError::Io {
+                path: path.to_string(),
+                source,
+            },
         })
     }
 
@@ -289,6 +298,13 @@ impl Workspace for DiskWorkspace {
         if !real_ancestor.starts_with(&self.root) {
             return Err(refuse("resolves outside the catalog (symlink)"));
         }
+        // The same refusals as `MemWorkspace`, before touching the disk.
+        if !ancestor.is_dir() {
+            return Err(refuse("a parent component is a file"));
+        }
+        if target.is_dir() {
+            return Err(refuse("is a directory"));
+        }
         // Never replace a symlink silently.
         if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(refuse("is a symlink; refusing to replace it"));
@@ -312,15 +328,18 @@ impl Workspace for DiskWorkspace {
         // Permissions match Python's `open(path, "w")`, which rewrites in place:
         // an existing file keeps its mode, and a new one gets 0o666 minus the
         // umask. `tempfile` alone would create the file at 0o600.
-        let existing = std::fs::metadata(&target).ok().map(|m| m.permissions());
-        // Python's `open(path, "w")` fails on a read-only file; a rename would
-        // silently replace it, so refuse first.
-        if existing.as_ref().is_some_and(|p| p.readonly()) {
-            return Err(io_err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "file is read-only",
-            )));
+        let existing = std::fs::metadata(&target).ok().filter(|m| m.is_file());
+        if existing.is_some() {
+            // Python's `open(path, "w")` fails when this process may not write
+            // the file; a rename would silently replace it. Ask the kernel the
+            // same question (open for writing, no create, no truncate), so
+            // ownership, ACLs and root all count as they do for Python.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&target)
+                .map_err(io_err)?;
         }
+        let existing = existing.map(|m| m.permissions());
         let mut builder = tempfile::Builder::new();
         builder.prefix(".okf-").suffix(".tmp");
         // (Other platforms have only a read-only flag, and new files are writable.)
@@ -344,7 +363,8 @@ impl Workspace for DiskWorkspace {
     }
 
     fn exists(&self, path: &str) -> bool {
-        self.existing_inside(path).is_some_and(|p| p.exists())
+        // `existing_inside` already requires the path to exist.
+        self.existing_inside(path).is_some()
     }
 
     fn is_file(&self, path: &str) -> bool {
@@ -374,6 +394,9 @@ fn has_key_with_prefix(files: &BTreeMap<String, String>, prefix: &str) -> bool {
 
 /// An in-memory catalog for tests. Directories exist implicitly as prefixes
 /// of file paths.
+///
+/// It refuses the same malformed writes as [`DiskWorkspace`] (onto a
+/// directory, below a file) but does not simulate permissions or symlinks.
 #[derive(Debug, Default)]
 pub struct MemWorkspace {
     // `RwLock` gives interior mutability: `write_atomic` takes `&self` (like the
@@ -408,10 +431,12 @@ impl MemWorkspace {
 impl Workspace for MemWorkspace {
     fn read_to_string(&self, path: &str) -> Result<String, OkfError> {
         let rel = checked(path)?;
-        self.files().get(&rel).cloned().ok_or_else(|| OkfError::Io {
-            path: path.to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
-        })
+        self.files()
+            .get(&rel)
+            .cloned()
+            .ok_or_else(|| OkfError::NotFound {
+                path: path.to_string(),
+            })
     }
 
     fn write_atomic(&self, path: &str, contents: &str) -> Result<(), OkfError> {
@@ -524,9 +549,14 @@ mod tests {
             ws.read_to_string("../x"),
             Err(OkfError::InvalidPath { .. })
         ));
+        // A missing file is `NotFound` on every workspace, through both reads.
         assert!(matches!(
             ws.read_to_string("missing.md"),
-            Err(OkfError::Io { .. })
+            Err(OkfError::NotFound { path }) if path == "missing.md"
+        ));
+        assert!(matches!(
+            ws.read_text("infra/missing.md"),
+            Err(OkfError::NotFound { path }) if path == "infra/missing.md"
         ));
         ws.write_atomic("new/dir/c.md", "c").unwrap();
         assert_eq!(ws.read_to_string("new/dir/c.md").unwrap(), "c");
@@ -542,9 +572,20 @@ mod tests {
                 "{root_like:?}"
             );
         }
-        // A directory is not a file, and a file is not a directory.
-        assert!(ws.write_atomic("infra", "x").is_err());
-        assert!(ws.write_atomic("b.md/c.md", "x").is_err());
+        // A directory is not a file, and a file is not a directory: both
+        // workspaces refuse these the same way.
+        assert!(matches!(
+            ws.write_atomic("infra", "x"),
+            Err(OkfError::InvalidPath { reason, .. }) if reason == "is a directory"
+        ));
+        assert!(matches!(
+            ws.write_atomic("b.md/c.md", "x"),
+            Err(OkfError::InvalidPath { reason, .. }) if reason == "a parent component is a file"
+        ));
+        assert!(matches!(
+            ws.write_atomic("b.md/deeper/c.md", "x"),
+            Err(OkfError::InvalidPath { reason, .. }) if reason == "a parent component is a file"
+        ));
     }
 
     #[test]
@@ -623,7 +664,15 @@ mod tests {
 
         #[test]
         fn a_read_only_file_is_refused_like_python_open() {
-            let (_dir, ws) = disk_catalog(&FILES);
+            let (dir, ws) = disk_catalog(&FILES);
+            // As root, the kernel lets anyone write a 0o444 file (so does
+            // Python); then there is nothing to refuse, and the test is moot.
+            let probe = dir.path().join("probe");
+            std::fs::write(&probe, "p").unwrap();
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o444)).unwrap();
+            if std::fs::OpenOptions::new().write(true).open(&probe).is_ok() {
+                return;
+            }
             let target = ws.root().join("b.md");
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
             let error = ws.write_atomic("b.md", "new").unwrap_err();
