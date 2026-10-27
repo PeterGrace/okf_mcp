@@ -59,12 +59,14 @@ Deliberately deferred:
 - **Documented divergences** (each listed in the module docs of the file that has it, and tested where testable):
   - `okf.py` crashes (`TypeError`) on a naive timestamp in `oldest` (`generated.at: 2026-10-26`) and on an unhashable `status` in `lint`; the port ignores the naive timestamp and reports the status with its `repr`.
   - `okf.py`'s fallback scan in `oldest` crashes on an `at:` value that matches `AT_RE` but is not a valid date; the port skips it.
-  - `datetime.fromisoformat` week dates (`2026-W43-1`) and offsets with sub-minute precision are rejected by the port (`okf.py` accepts them). Neither occurs in a catalog.
+  - `datetime.fromisoformat` week dates (`2026-W43-1`) and offsets with a fraction of a second (`+05:30:15.5`) are rejected by the port (`okf.py` accepts them). Neither occurs in a catalog. Whole-second offsets (`+05:30:15`) are accepted, as in Python.
   - A link whose normalized target escapes the catalog root is always broken in the port; `okf.py` asks the OS about the outside path.
   - Symlinks are listed per M1's listing contract (`DiskWorkspace` skips dangling and outside links that `os.walk` lists).
   - Non-UTF-8 file and directory names are skipped by `DiskWorkspace`'s walks (paths are `String`s); `os.walk` lists them, so `okf.py`'s secret scan reads such a file and the port's does not.
 
 > **Corrected (issue #3), 2026-10-27.** Added the non-UTF-8 name divergence above, raised in review of PR #17; it is recorded as an accepted gap in `DiskWorkspace`'s listing contract (`src/okf/workspace.rs`). The shipped `list_files` doc also says a listed file's content may not be UTF-8, so callers (Task 6's `scan_all`) must tolerate read errors, which `scan_all` already does.
+
+> **Corrected (issue #5), 2026-10-27.** The sub-minute offset divergence above is narrowed to fractional-second offsets: chrono's `FixedOffset` holds whole seconds, so `+05:30:15` parses and `isoformat()` writes it back as Python does.
 
 ## Verified facts the code relies on
 
@@ -72,7 +74,7 @@ Each was checked against the source or by running it on 2026-10-27.
 
 1. **`okf.py` is unchanged since the M1 goldens:** `sha256sum tools/okf.py` = `b528dd51672c7617756efdd85ae8b17284c9b13b0c8d6e33b31f8532087b1e22`, equal to `tests/golden/SOURCE`.
 2. **`okf.py` functions ported** (line numbers in `~/repos/pg_knowledge_catalog/tools/okf.py`): `walk_md` 598, `is_concept` 606, `split_frontmatter` 823, `body_split` 893, `resolve_link` 918, `prose_lines` 933, `_fm_fallback` 948, `build_docs` 961, `names_for` 996, `link_analysis` 1005, `AT_RE`/`_ats`/`describe`/`cmd_oldest` 1144-1233, `VOLATILE_RE`/`DATE_RE`/`LEADIN_RE`/`SPRAWL_*`/`volatile_reason`/`sprawl_of`/`cmd_sprawl` 1236-1337, `INDEX_HEADING_RE`/`_index_bullet` 1400-1404, `SECRET_RULES`/`ASSIGN_RE`/`PLACEHOLDER_RE`/`_literal_secret`/`_mask`/`scan_secrets` 1734-1791, `last_commit_times` 1798, `check_ts` 1815, `lint` 1835, `ISO_RE` 40, `FUTURE_SLACK` 41, `STATUSES` 36, `OUTCOMES` 37, `parse_ts` 57. `main()` (2209) accepts `--root` after the subcommand (each subparser has `parents=[common]`).
-3. **Python 3.14 `datetime.fromisoformat`** (after `okf.py`'s `.replace("Z", "+00:00")`): accepts `2026-10-26T10:00` (no seconds), a space or any single character as separator (`2026-10-26X10:00:00`), basic format `20261026T100000`, `,` as decimal mark, more than 6 fraction digits (truncated), `24:00:00` (next midnight), `+HHMM` and `+23:59` offsets; a date alone gives a *naive* midnight. It rejects second 60, offset `+24:00`, `2026-02-29`, and non-ASCII digits (`２０２６-...`, though `ISO_RE`'s `\d` lets them through to that error).
+3. **Python 3.14 `datetime.fromisoformat`** (after `okf.py`'s `.replace("Z", "+00:00")`): accepts `2026-10-26T10:00` (no seconds), a space or any single character as separator (`2026-10-26X10:00:00`), basic format `20261026T100000`, `,` as decimal mark, more than 6 fraction digits (truncated), `24:00:00` (next midnight), `+HHMM` and `+23:59` offsets; a date alone gives a *naive* midnight. It rejects second 60, offset `+24:00`, `2026-02-29`, and non-ASCII digits (`２０２６-...`, though `ISO_RE`'s `\d` lets them through to that error). **Added (issue #5), checked against Python 3.14.4's C parser:** one stray character between the time and the offset is ignored (`10:00:00x+05:00`, `10:00:00.Z`, `10:+05:00`); offset fields are only range-checked as a whole (`+0099` is `+01:39`, `+01:60` is `+02:00`, `+23:60` fails); whole-second offsets parse (`-05:30:15`); a zero offset drops its fraction (`+00:00:00.5` is UTC); the basic time form takes a fraction without a decimal mark (`10000012` is `.120000`); and `24:00` moves the date *before* the date is validated (`2026-10-00T24:00` is `2026-10-01`, `0000-12-31T24:00` is `0001-01-01`).
 4. **Python `round(x, 1)` equals Rust `format!("{:.1}", x)`** (both round the exact binary value, ties to even): checked for 0.25→0.2, 0.35→0.3, 2.675→2.7, 18.75→18.8, 0.05→0.1, 0.15→0.1, 0.45→0.5. So the port rounds with `format!("{:.1}", x).parse::<f64>()`.
 5. **Float JSON:** serde_json 1.0.154 writes `f64` with `zmij` shortest round-trip (`serde_json-1.0.154/src/ser.rs:1716-1723`): `18.0`→`18.0`, `18.8`→`18.8`, `1e16`→`1e+16`, the same as Python's `json.dumps`. `to_string_pretty` uses two-space indent like `json.dumps(indent=2)`. Python's `str(18.0)` is `18.0`; Rust's `{:?}` (Debug) for `f64` gives `18.0` while `{}` gives `18`, so lint's sprawl message formats the score with `{:?}`.
 6. **`regex` 1.13.1 case folding:** `(?i)` matches `K`/`k`/U+212A, `s`/U+017F, `ß`/`ẞ`, `µ`/`μ` like Python's `re.I`, but not `i`/`I` against U+0130 `İ` or U+0131 `ı`. Python's `re.I` makes all four of `i`, `I`, `İ`, `ı` match each other, and `[a-z]` match `İ` and `ı`. Ported `re.I` patterns therefore spell out `[iI\u{130}\u{131}]` (and add `\u{130}\u{131}` to `[a-z]`), as M1 did.
@@ -803,6 +805,8 @@ mod tests {
 Run: `cargo test --lib timestamp`
 Expected: compile errors (`parse_iso`, `PyDateTime` not found). Add `pub mod timestamp;` to `src/okf/mod.rs` first.
 
+> **Corrected (issue #5), 2026-10-27.** The shipped parser differs from the code below; read `src/okf/timestamp.rs`. It is a byte-level port of CPython's C `parse_hh_mm_ss_ff` / `parse_isoformat_time`, with its quirks (verified fact 3's issue #5 additions): `parse_fields` returns the fields plus a "leftover" flag that is an error only when no offset follows; `parse_offset` accepts `±HH[:MM[:SS[.f]]]` checked only as a whole (< 24 h) and rejects a fraction on a non-zero offset; `RawDate` keeps the date unvalidated until `24:00` has wrapped it CPython's way (`next_day_unchecked`). The plan's code rejected inputs Python accepts (`+01:60`, `+05:30:15`, `10:00:00x+05:00`, `2026-10-00T24:00`). `to_string_iso` also writes `:SS` for whole-second offsets. The public API is unchanged: `PyDateTime::{Aware, Naive}`, `PyDateTime::{isoformat, aware}`, `IsoFormat::to_string_iso`, `parse_iso(&str) -> Option<PyDateTime>`, `is_iso_timestamp`, so Tasks 8, 10 and 12 need no change. Tests added beyond Step 1: `follows_cpython_quirks`, `rejects_the_documented_divergences`, `aware_drops_naive_values`, `parse_iso_never_panics` (Hegel); `isoformat_round_trips` draws instants over years 1..=9999 and offsets to the second. A one-off differential run of 600,000 generated strings against Python 3.14.4 differed only on week dates and fractional-second offsets.
+
 - [ ] **Step 3: Implement**
 
 Put above the test module:
@@ -814,9 +818,10 @@ Put above the test module:
 //!
 //! # Known divergences from `okf.py`
 //!
-//! * ISO week dates (`2026-W43-1`) and offsets with seconds or fractions
-//!   (`+05:30:15`) are rejected; Python accepts them. Neither occurs in a
+//! * ISO week dates (`2026-W43-1`) and offsets with a fraction of a second
+//!   (`+05:30:15.5`) are rejected; Python accepts them. Neither occurs in a
 //!   catalog, and `lint`'s `ISO_RE` rejects both before parsing anyway.
+//!   (Whole-second offsets such as `+05:30:15` are accepted, as in Python.)
 //! * Python returns a *naive* datetime when there is no offset, and `okf.py`
 //!   then crashes comparing it with an aware one. Callers here treat
 //!   [`PyDateTime::Naive`] as "not a usable timestamp" instead.
