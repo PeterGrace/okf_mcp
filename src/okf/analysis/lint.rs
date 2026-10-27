@@ -54,6 +54,15 @@ impl CommitTimes {
     ///
     /// # Returns
     /// The record [`lint`] reads.
+    ///
+    /// # Key spelling (for the caller filling this from git)
+    /// Both sets are looked up by [`SnapshotDoc::path`] exactly: relative to
+    /// the catalog root, `/`-separated, no leading `/` or `./`. Git prints
+    /// paths relative to the *repository* root, so they match only when the
+    /// catalog is the repository root; otherwise strip the catalog's prefix
+    /// first. Nothing checks this: a key spelled differently is never found,
+    /// and the `generated-after-commit` check silently stops firing for that
+    /// file, as it does in `okf.py` (which also keys by git's output).
     pub fn new(times: HashMap<String, DateTime<FixedOffset>>, dirty: HashSet<String>) -> Self {
         Self { times, dirty }
     }
