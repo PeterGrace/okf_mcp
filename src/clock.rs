@@ -8,7 +8,7 @@ pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
 
 /// A source of the current UTC time.
 ///
-/// `Send + Sync` lets one clock be shared across tokio tasks (Python has no
+/// `Send + Sync` lets one clock be shared across threads and async tasks (Python has no
 /// equivalent; Rust checks thread-safety at compile time).
 pub trait Clock: Send + Sync {
     /// Returns the current instant in UTC.

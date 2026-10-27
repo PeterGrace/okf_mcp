@@ -1,33 +1,17 @@
-#[macro_use]
-extern crate tracing;
+//! The `okf_mcp` binary. For now a stub that only sets up logging; the MCP
+//! server arrives in milestone M3.
 
-use console_subscriber as tokio_console_subscriber;
-use tracing_subscriber::fmt::format::FmtSpan;
-use tracing_subscriber::{prelude::*, EnvFilter, Registry};
+use tracing_subscriber::EnvFilter;
+
+/// Installs a `tracing` subscriber that logs to stderr, filtered by
+/// `RUST_LOG` (default `warn`).
 fn main() {
-    let _ = dotenv::dotenv();
-
-    //region console logging
-    let console_layer = tokio_console_subscriber::spawn();
-    let filter_layer = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("warn"))
-        .unwrap();
-    let format_layer = tracing_subscriber::fmt::layer()
-        .event_format(
-            tracing_subscriber::fmt::format()
-                .with_file(true)
-                .with_thread_ids(true)
-                .with_thread_names(true)
-                .with_line_number(true),
-        )
-        .with_span_events(FmtSpan::NONE);
-
-    let subscriber = Registry::default()
-        .with(console_layer)
-        .with(filter_layer)
-        .with(format_layer);
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
-    //endregion
-
-    info!("Hello, world!");
+    // `try_from_default_env` fails when `RUST_LOG` is unset or invalid; fall
+    // back to warnings only rather than aborting.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+    tracing::warn!("okf_mcp has no server yet; the MCP server arrives in M3");
 }

@@ -15,24 +15,17 @@ path = "src/main.rs"
 [dependencies]
 # Wall-clock timestamps for catalog stamps (UTC only; no local-time database needed).
 chrono = { version = "0.4.45", default-features = false, features = ["now"] }
-ctrlc = { version = "3.4.5", features = ["termination"] }
 # Insertion-ordered maps, matching Python dict order for frontmatter mappings.
 indexmap = "2.14.2"
-lazy_static = "1.5.0"
 regex = "1.13.1"
-serde = { version = "1.0.216", features = ["derive"] }
 # `preserve_order` keeps JSON object keys in insertion order (Python dict
 # order), so `Value::to_json` keeps frontmatter keys in source order.
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 # Atomic writes via unique temp files (DiskWorkspace); also throwaway dirs in tests.
 tempfile = "3.27.0"
 thiserror = "2.0.6"
-tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1.41"
-tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
-console-subscriber = "0.4.1"
-dotenv = "0.15.0"
 
 [dev-dependencies]
 # Property-based tests (Hypothesis-backed); the library is imported as `hegel`.

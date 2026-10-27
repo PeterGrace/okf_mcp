@@ -17,7 +17,7 @@ use crate::okf::pystr::universal_newlines;
 
 /// Read and write access to one catalog's files.
 ///
-/// `Send + Sync` so a workspace can be shared across tokio tasks.
+/// `Send + Sync` so a workspace can be shared across threads and async tasks.
 pub trait Workspace: Send + Sync {
     /// Reads a file as UTF-8.
     ///
