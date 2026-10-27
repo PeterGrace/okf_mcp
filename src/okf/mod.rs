@@ -6,7 +6,9 @@ pub mod analysis;
 pub mod doc;
 pub mod markdown;
 pub mod paths;
-pub mod pystr;
+// `pub(crate)`: visible anywhere inside this crate, invisible to users of the
+// library (like a leading-underscore module in Python, but enforced).
+pub(crate) mod pystr;
 pub mod search;
 pub mod snapshot;
 pub mod timestamp;

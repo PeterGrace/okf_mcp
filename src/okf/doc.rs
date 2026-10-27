@@ -52,7 +52,7 @@ static TOP_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^([A-Za-z_][\p{L}\p{N}_.\-]*)[ \t]*:(?:[ \t]|$)").expect("TOP_KEY regex is valid")
 });
 
-/// One top-level key's span in [`Doc::frontmatter`]: `lines[start]` is the
+/// One top-level key's span in a [`Doc`]'s frontmatter lines: `lines[start]` is the
 /// `key:` line and `lines[start + 1..end]` its continuation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
@@ -71,7 +71,7 @@ pub struct Block {
 pub struct SeqItems {
     /// The number of spaces before each item's dash.
     pub indent: usize,
-    /// Each item's lines as an index range into [`Doc::frontmatter`].
+    /// Each item's lines as an index range into the [`Doc`]'s frontmatter lines.
     pub spans: Vec<Range<usize>>,
 }
 
@@ -220,7 +220,10 @@ impl Doc {
     }
 
     /// The frontmatter lines, without line endings or delimiters.
-    pub fn frontmatter(&self) -> &[String] {
+    ///
+    /// `pub(crate)`: the raw lines are an implementation detail; outside the
+    /// crate, read values with [`Doc::parse`] and positions with [`Doc::key_line`].
+    pub(crate) fn frontmatter(&self) -> &[String] {
         &self.frontmatter
     }
 

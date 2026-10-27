@@ -5,14 +5,24 @@
 //! refuse paths that escape the catalog root.
 
 use std::borrow::Cow;
+// The `MemWorkspace` test double, and the imports and helpers only it uses,
+// exist only when compiling this crate's own tests (`cfg(test)`) or when a
+// dependent turns on the `test-util` feature. `cfg(any(...))` is Rust's
+// conditional compilation: without either, that code is not even compiled,
+// like an `if TESTING:` block that is removed before the program runs.
+#[cfg(any(test, feature = "test-util"))]
 use std::collections::BTreeMap;
 use std::io::Write;
+#[cfg(any(test, feature = "test-util"))]
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::RwLock;
 
 use crate::error::OkfError;
-use crate::okf::paths::{dirname, escapes_root, normpath, walk_order};
+#[cfg(any(test, feature = "test-util"))]
+use crate::okf::paths::dirname;
+use crate::okf::paths::{escapes_root, normpath, walk_order};
 use crate::okf::pystr::universal_newlines;
 
 /// Read and write access to one catalog's files.
@@ -32,8 +42,8 @@ pub trait Workspace: Send + Sync {
     /// footnotes, anchors), with `\r\n` and lone `\r` turned into `\n`.
     ///
     /// This is how `okf.py` reads files for analysis (Python text mode,
-    /// universal newlines; see [`universal_newlines`]), so `## Closing ##\r\n`
-    /// is the heading `Closing` here too. Frontmatter parsing and editing
+    /// universal newlines, as the crate-internal `pystr::universal_newlines`
+    /// does), so `## Closing ##\r\n` is the heading `Closing` here too. Frontmatter parsing and editing
     /// ([`crate::okf::doc::Doc`]) must use [`Workspace::read_to_string`]
     /// instead, which keeps every byte.
     ///
@@ -139,11 +149,13 @@ fn checked_file(path: &str) -> Result<String, OkfError> {
 }
 
 /// Is any directory component hidden (starts with `.`)?
+#[cfg(any(test, feature = "test-util"))]
 fn in_dot_directory(path: &str) -> bool {
     dirname(path).split('/').any(|p| p.starts_with('.'))
 }
 
 /// Is any directory component `.git` or `.worktrees`?
+#[cfg(any(test, feature = "test-util"))]
 fn in_skipped_directory(path: &str) -> bool {
     dirname(path)
         .split('/')
@@ -480,6 +492,7 @@ impl Workspace for DiskWorkspace {
 }
 
 /// Is there any key starting with `prefix`? One ordered-map probe, O(log n).
+#[cfg(any(test, feature = "test-util"))]
 fn has_key_with_prefix(files: &BTreeMap<String, String>, prefix: &str) -> bool {
     files
         .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
@@ -494,6 +507,11 @@ fn has_key_with_prefix(files: &BTreeMap<String, String>, prefix: &str) -> bool {
 /// directory, below a file) but does not simulate permissions, symlinks or
 /// special files, so the disk-only refusals ("is a symlink", "not a regular
 /// file", `PermissionDenied`) never occur here.
+///
+/// Compiled for this crate's unit tests; other crates, and this crate's own
+/// integration tests under `tests/`, see it only with the `test-util` feature
+/// (`cargo test --features test-util`).
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Debug, Default)]
 pub struct MemWorkspace {
     // `RwLock` gives interior mutability: `write_atomic` takes `&self` (like the
@@ -501,6 +519,7 @@ pub struct MemWorkspace {
     files: RwLock<BTreeMap<String, String>>,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl MemWorkspace {
     /// Builds a workspace from `(path, contents)` pairs.
     ///
@@ -525,6 +544,7 @@ impl MemWorkspace {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl Workspace for MemWorkspace {
     fn read_to_string(&self, path: &str) -> Result<String, OkfError> {
         let rel = checked(path)?;

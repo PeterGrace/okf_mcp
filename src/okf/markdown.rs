@@ -12,9 +12,8 @@
 //! `okf.py` reads files for markdown analysis in Python text mode, which turns
 //! `\r\n` and lone `\r` into `\n` (universal newlines). The functions here
 //! take text as given, so callers must read it the same way: through
-//! [`Workspace::read_text`], or
-//! [`universal_newlines`](crate::okf::pystr::universal_newlines) for text from
-//! elsewhere. Raw `\r\n` text would make `## Closing ##\r` the heading
+//! [`Workspace::read_text`], or (inside this crate) the crate-private
+//! `pystr::universal_newlines` for text from elsewhere. Raw `\r\n` text would make `## Closing ##\r` the heading
 //! `Closing ##` (slug `closing-`) where `okf.py` sees `Closing`. Frontmatter
 //! editing ([`crate::okf::doc`]) stays byte-preserving and never normalizes.
 //!

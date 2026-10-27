@@ -90,7 +90,9 @@ impl YamlError {
 }
 
 /// One frontmatter line with its 1-based file line number.
-pub type NumberedLine<'a> = (usize, &'a str);
+///
+/// `pub(crate)`: only `Doc`'s frontmatter parser builds these.
+pub(crate) type NumberedLine<'a> = (usize, &'a str);
 
 /// Number of leading spaces (tabs don't count, as in `okf.py`).
 pub(crate) fn indent_of(text: &str) -> usize {
@@ -462,7 +464,10 @@ pub(crate) fn is_seq_start(text: &str) -> bool {
 ///
 /// # Errors
 /// [`YamlError`] when the value can't be parsed.
-pub fn parse_value(
+///
+/// `pub(crate)`: callers outside the crate parse whole documents with
+/// [`Doc::parse`](crate::okf::doc::Doc::parse) instead.
+pub(crate) fn parse_value(
     inline: &str,
     children: &[NumberedLine<'_>],
     line: usize,
