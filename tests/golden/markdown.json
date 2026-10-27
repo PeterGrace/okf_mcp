@@ -42,6 +42,71 @@
     "footnotes": {}
   },
   {
+    "path": "errors/bad-escape.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/bad-indentation.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/bad-structure.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/expected-key-value.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/flow-duplicate-key.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/flow-list-separator.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/flow-map-separator.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/flow-missing-colon.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/invalid-escape.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/nested-duplicate-key.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/trailing-text.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/unsupported-indicator.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "errors/unterminated-single.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
     "path": "infra/index.md",
     "headings": [
       [
@@ -158,6 +223,156 @@
     "footnotes": {}
   },
   {
+    "path": "markdown/fences.md",
+    "headings": [
+      [
+        0,
+        1,
+        "Fences",
+        "fences"
+      ],
+      [
+        7,
+        2,
+        "Visible: a longer backtick run closes the fence",
+        "visible-a-longer-backtick-run-closes-the-fence"
+      ],
+      [
+        12,
+        2,
+        "Visible: a longer tilde run closes",
+        "visible-a-longer-tilde-run-closes"
+      ],
+      [
+        17,
+        2,
+        "Visible after the indented fence",
+        "visible-after-the-indented-fence"
+      ],
+      [
+        20,
+        2,
+        "Visible: four spaces is not a fence",
+        "visible-four-spaces-is-not-a-fence"
+      ],
+      [
+        24,
+        2,
+        "Closing hashes",
+        "closing-hashes"
+      ],
+      [
+        27,
+        1,
+        "",
+        ""
+      ],
+      [
+        28,
+        2,
+        "Unclosed fence follows",
+        "unclosed-fence-follows"
+      ]
+    ],
+    "footnotes": {}
+  },
+  {
+    "path": "markdown/slugs.md",
+    "headings": [
+      [
+        0,
+        1,
+        "Setup",
+        "setup"
+      ],
+      [
+        1,
+        1,
+        "Setup",
+        "setup-1"
+      ],
+      [
+        2,
+        1,
+        "Setup-1",
+        "setup-1-1"
+      ],
+      [
+        3,
+        1,
+        "Setup",
+        "setup-2"
+      ],
+      [
+        4,
+        2,
+        "setup",
+        "setup-3"
+      ],
+      [
+        5,
+        1,
+        "A_b",
+        "a_b"
+      ],
+      [
+        6,
+        1,
+        "a_b_",
+        "a_b-1"
+      ],
+      [
+        7,
+        1,
+        "a-b?",
+        "a-b"
+      ],
+      [
+        8,
+        1,
+        "Émigré café",
+        "émigré-café"
+      ],
+      [
+        9,
+        1,
+        "`code` & *stuff*",
+        "code--stuff"
+      ],
+      [
+        10,
+        1,
+        "[Link text](/x.md) more",
+        "link-text-more"
+      ],
+      [
+        11,
+        1,
+        "<span>Tagged</span> heading",
+        "tagged-heading"
+      ],
+      [
+        12,
+        1,
+        "snake_case __bold__ _em_",
+        "snake_case-bold-em"
+      ],
+      [
+        13,
+        1,
+        "",
+        ""
+      ],
+      [
+        14,
+        1,
+        "",
+        "-1"
+      ]
+    ],
+    "footnotes": {}
+  },
+  {
     "path": "people/bad-colon.md",
     "headings": [],
     "footnotes": {}
@@ -202,6 +417,60 @@
   },
   {
     "path": "people/value-and-children.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "yaml/block-scalars.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "yaml/bom-heading.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "yaml/bom.md",
+    "headings": [
+      [
+        5,
+        1,
+        "After BOM",
+        "after-bom"
+      ]
+    ],
+    "footnotes": {}
+  },
+  {
+    "path": "yaml/comments-only.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "yaml/empty-frontmatter.md",
+    "headings": [
+      [
+        1,
+        1,
+        "Empty frontmatter",
+        "empty-frontmatter"
+      ]
+    ],
+    "footnotes": {}
+  },
+  {
+    "path": "yaml/escapes.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "yaml/nested-flow.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "yaml/same-indent-lists.md",
     "headings": [],
     "footnotes": {}
   }

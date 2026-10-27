@@ -15,6 +15,84 @@
     "has_frontmatter": false
   },
   {
+    "path": "errors/bad-escape.md",
+    "has_frontmatter": true,
+    "error_line": 3,
+    "error_kind": "bad escape"
+  },
+  {
+    "path": "errors/bad-indentation.md",
+    "has_frontmatter": true,
+    "error_line": 4,
+    "error_kind": "bad indentation"
+  },
+  {
+    "path": "errors/bad-structure.md",
+    "has_frontmatter": true,
+    "error_line": 4,
+    "error_kind": "bad indentation or structure"
+  },
+  {
+    "path": "errors/expected-key-value.md",
+    "has_frontmatter": true,
+    "error_line": 4,
+    "error_kind": "expected"
+  },
+  {
+    "path": "errors/flow-duplicate-key.md",
+    "has_frontmatter": true,
+    "error_line": 3,
+    "error_kind": "duplicate key"
+  },
+  {
+    "path": "errors/flow-list-separator.md",
+    "has_frontmatter": true,
+    "error_line": 3,
+    "error_kind": "expected"
+  },
+  {
+    "path": "errors/flow-map-separator.md",
+    "has_frontmatter": true,
+    "error_line": 3,
+    "error_kind": "expected"
+  },
+  {
+    "path": "errors/flow-missing-colon.md",
+    "has_frontmatter": true,
+    "error_line": 3,
+    "error_kind": "expected"
+  },
+  {
+    "path": "errors/invalid-escape.md",
+    "has_frontmatter": true,
+    "error_line": 3,
+    "error_kind": "invalid escape \\q"
+  },
+  {
+    "path": "errors/nested-duplicate-key.md",
+    "has_frontmatter": true,
+    "error_line": 4,
+    "error_kind": "duplicate key"
+  },
+  {
+    "path": "errors/trailing-text.md",
+    "has_frontmatter": true,
+    "error_line": 3,
+    "error_kind": "unexpected trailing text"
+  },
+  {
+    "path": "errors/unsupported-indicator.md",
+    "has_frontmatter": true,
+    "error_line": 3,
+    "error_kind": "unsupported YAML indicator"
+  },
+  {
+    "path": "errors/unterminated-single.md",
+    "has_frontmatter": true,
+    "error_line": 3,
+    "error_kind": "unterminated single-quoted string"
+  },
+  {
     "path": "infra/index.md",
     "has_frontmatter": false
   },
@@ -109,6 +187,14 @@
     "has_frontmatter": false
   },
   {
+    "path": "markdown/fences.md",
+    "has_frontmatter": false
+  },
+  {
+    "path": "markdown/slugs.md",
+    "has_frontmatter": false
+  },
+  {
     "path": "people/bad-colon.md",
     "has_frontmatter": true,
     "error_line": 3,
@@ -152,5 +238,144 @@
     "has_frontmatter": true,
     "error_line": 2,
     "error_kind": "value on the key line and indented lines below it"
+  },
+  {
+    "path": "yaml/block-scalars.md",
+    "has_frontmatter": true,
+    "value": {
+      "type": "Note",
+      "strip": "stripped\ntext\n",
+      "keep": "kept\ntext\n",
+      "folded_strip": "folded strip\n",
+      "folded_keep": "folded keep\n",
+      "indent_indicator": "  two extra\nbase\n",
+      "commented": "body\n",
+      "empty_block": "\n",
+      "next": "after"
+    }
+  },
+  {
+    "path": "yaml/bom-heading.md",
+    "has_frontmatter": false
+  },
+  {
+    "path": "yaml/bom.md",
+    "has_frontmatter": false
+  },
+  {
+    "path": "yaml/comments-only.md",
+    "has_frontmatter": true,
+    "value": {}
+  },
+  {
+    "path": "yaml/empty-frontmatter.md",
+    "has_frontmatter": true,
+    "value": {}
+  },
+  {
+    "path": "yaml/escapes.md",
+    "has_frontmatter": true,
+    "value": {
+      "type": "Note",
+      "double": "tab\there\nnewline \\ back \"q\" / slash",
+      "controls": "\u0000\u0007\b\u001b\f\r\u000b",
+      "spaces": "  ",
+      "hex": "A~é日𝄞",
+      "single": "it's 'quoted' \\n not an escape",
+      "mixed_flow": [
+        "\t",
+        "a'b",
+        "A"
+      ]
+    }
+  },
+  {
+    "path": "yaml/nested-flow.md",
+    "has_frontmatter": true,
+    "value": {
+      "type": "Note",
+      "map": {
+        "x": [
+          "1",
+          {
+            "y": "z"
+          }
+        ],
+        "w": [],
+        "v": {}
+      },
+      "list": [
+        [
+          "a",
+          "b"
+        ],
+        {},
+        [
+          "c",
+          [
+            "d",
+            [
+              "e"
+            ]
+          ]
+        ],
+        {
+          "k": [
+            "v"
+          ]
+        }
+      ],
+      "spaced": {
+        "a": "b",
+        "c": [
+          "d",
+          "e"
+        ]
+      },
+      "multi": {
+        "outer": [
+          "a",
+          {
+            "inner": "b"
+          },
+          "c"
+        ]
+      },
+      "quoted_inside": [
+        "a, b",
+        "c]",
+        {
+          "k": "v}"
+        }
+      ]
+    }
+  },
+  {
+    "path": "yaml/same-indent-lists.md",
+    "has_frontmatter": true,
+    "value": {
+      "type": "Note",
+      "tags": [
+        "a",
+        "b"
+      ],
+      "sources": [
+        {
+          "id": "x",
+          "resource": "y"
+        },
+        {
+          "id": "z",
+          "resource": "w"
+        }
+      ],
+      "nested": {
+        "list": [
+          "p",
+          "q"
+        ],
+        "after": "r"
+      }
+    }
   }
 ]
