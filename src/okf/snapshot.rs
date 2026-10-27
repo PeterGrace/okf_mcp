@@ -376,6 +376,14 @@ fn read_document(workspace: &dyn Workspace, path: &str) -> Result<SnapshotDoc, O
 
 /// `build_docs`' title and aliases: from parsed frontmatter, else the regex
 /// fallback over `split_frontmatter`'s frontmatter text.
+///
+/// Whether a file has frontmatter is decided by [`Doc`] (raw text, any line
+/// ending, `---` or `...` closer), but the fallback re-splits the analysis
+/// text with `split_frontmatter` (`---\n` opener, `\n---` closer). The two
+/// can disagree, e.g. on a `...` closer, which leaves the fallback an empty
+/// string and no title. `okf.py` does exactly the same (`Doc(path).parse()`,
+/// then `_fm_fallback(fm, ...)` on `split_frontmatter(text)`), so the port
+/// keeps the re-split rather than reusing `Doc`'s lines.
 fn title_and_aliases(frontmatter: &Frontmatter, text: &str) -> (Option<String>, Vec<String>) {
     let data = match frontmatter {
         Frontmatter::Invalid(_) => {
@@ -659,6 +667,18 @@ mod tests {
         assert_eq!(none.frontmatter(), &Frontmatter::Absent);
         assert_eq!((none.title(), none.aliases().len()), (None, 0));
         assert!(snapshot.get("empty.md").unwrap().aliases().is_empty());
+    }
+
+    #[test]
+    fn the_fallback_uses_split_frontmatter_like_okf_py() {
+        // `Doc` sees frontmatter closed by `...`; `split_frontmatter` needs a
+        // `---` closer, so okf.py's fallback gets "" and finds no title.
+        let workspace =
+            MemWorkspace::from_files([("dots.md", "---\ntitle: [x\naliases: [a]\n...\nbody\n")]);
+        let snapshot = Snapshot::build(&workspace).unwrap();
+        let dots = snapshot.get("dots.md").unwrap();
+        assert!(matches!(dots.frontmatter(), Frontmatter::Invalid(_)));
+        assert_eq!((dots.title(), dots.aliases().len()), (None, 0));
     }
 
     #[test]
