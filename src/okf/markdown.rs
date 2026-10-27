@@ -33,8 +33,10 @@ use crate::okf::workspace::Workspace;
 
 /// A markdown link `[text](target "title")`, not an image (`![...]`).
 static LINK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\[((?:[^\]\\]|\\.)*)\]\(([^)\s\x1c-\x1f]+)(?:[\s\x1c-\x1f]+"[^"]*")?\)"#)
-        .expect("LINK regex is valid")
+    Regex::new(
+        r#"(?:\A|[^!])(\[((?:[^\]\\]|\\.)*)\]\(([^)\s\x1c-\x1f]+)(?:[\s\x1c-\x1f]+"[^"]*")?\))"#,
+    )
+    .expect("LINK regex is valid")
 });
 static HEADING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$").expect("HEADING regex is valid")
@@ -85,37 +87,28 @@ pub struct LinkMatch {
 /// assert_eq!(links[0].target, "/infra/x.md#ports");
 /// ```
 pub fn find_links(text: &str) -> Vec<LinkMatch> {
+    // Python's `(?<!!)` means: the char before `[` is not `!`. `regex` has no
+    // lookbehind, so LINK consumes that char instead (`[^!]`, or `\A` at the
+    // text start) and the real link is group 1. Because a rejected `![` simply
+    // fails to match, the scan stays linear. After a match we resume at its
+    // closing `)` (one byte, never `!`), so an adjacent link `[a](b)[c](d)`
+    // can use that `)` as its preceding char, as in Python.
     let mut links = Vec::new();
     let mut pos = 0;
-    while pos <= text.len() {
-        // `captures_at` searches from `pos` but still sees the text before it.
-        let Some(caps) = LINK.captures_at(text, pos) else {
-            break;
-        };
-        let (Some(whole), Some(label), Some(target)) = (caps.get(0), caps.get(1), caps.get(2))
+    // `captures_at` searches from `pos` but still sees the text before it, so
+    // `\A` matches only at the true start of `text`.
+    while let Some(caps) = LINK.captures_at(text, pos) {
+        let (Some(whole), Some(label), Some(target)) = (caps.get(1), caps.get(2), caps.get(3))
         else {
-            break; // unreachable: groups 0-2 are mandatory
+            break; // unreachable: groups 1-3 are mandatory
         };
-        let next_char_after = |at: usize| at + text[at..].chars().next().map_or(1, char::len_utf8);
-        // Python's `(?<!!)` rejects a match at this position and the search
-        // retries one character later, which is how links nested inside
-        // image text (`![a [b](c)](d)`) are found. Do the same.
-        if text[..whole.start()].ends_with('!') {
-            pos = next_char_after(whole.start());
-            continue;
-        }
         links.push(LinkMatch {
             text: label.as_str().to_string(),
             target: target.as_str().to_string(),
             range: whole.range(),
             target_range: target.range(),
         });
-        // A match is never empty (it needs `[](x)`), but never loop forever.
-        pos = if whole.end() > whole.start() {
-            whole.end()
-        } else {
-            next_char_after(whole.end())
-        };
+        pos = whole.end() - 1;
     }
     links
 }
@@ -530,6 +523,16 @@ mod tests {
         // Python: slugify("__a" * n) == "a" + "__a" * (n - 1).
         let expected = format!("a{}", "__a".repeat(99_999));
         assert_eq!(slugify(&"__a".repeat(100_000)), expected);
+    }
+
+    #[test]
+    fn many_rejected_image_openers_stay_linear() {
+        let text = format!("{}[ok](t.md)", "![".repeat(20_000));
+        let links = find_links(&text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "t.md");
+        let adjacent = find_links("[a](b)[c](d)");
+        assert_eq!(adjacent.len(), 2);
     }
 
     #[test]
