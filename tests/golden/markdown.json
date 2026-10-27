@@ -178,11 +178,6 @@
     "footnotes": {}
   },
   {
-    "path": "people/stray-line.md",
-    "headings": [],
-    "footnotes": {}
-  },
-  {
     "path": "people/unicode.md",
     "headings": [
       [
@@ -202,6 +197,11 @@
   },
   {
     "path": "people/unterminated.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "people/value-and-children.md",
     "headings": [],
     "footnotes": {}
   }

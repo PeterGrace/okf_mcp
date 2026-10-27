@@ -9,8 +9,9 @@
 //!   `json.dumps` also writes as `"null"`).
 //! - Rendering a null item in a block list writes `null`, not Python's `None`.
 //! - A `\u`/`\U` escape naming a surrogate is an error (Python accepts it).
-//! - Error text follows Rust `Debug` escaping, not Python `repr`, so the parity
-//!   tests compare error lines, never messages.
+//! - Quoted source text in error messages follows Rust `Debug` escaping, not
+//!   Python `repr`, so the parity tests compare error lines and each message's
+//!   prefix before the first quote or `" in "` (its kind), never whole messages.
 //! - Null-key consequences: `{null: a, "null": b}` is a duplicate-key error
 //!   here, and `block_item` on a null-key map writes `- "null": a` where
 //!   Python writes `- None: a`.

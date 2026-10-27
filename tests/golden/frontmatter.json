@@ -111,27 +111,26 @@
   {
     "path": "people/bad-colon.md",
     "has_frontmatter": true,
-    "error_line": 3
+    "error_line": 3,
+    "error_kind": "unquoted"
   },
   {
     "path": "people/duplicate-key.md",
     "has_frontmatter": true,
-    "error_line": 3
+    "error_line": 3,
+    "error_kind": "duplicate key"
   },
   {
     "path": "people/flow-error.md",
     "has_frontmatter": true,
-    "error_line": 3
+    "error_line": 3,
+    "error_kind": "expected"
   },
   {
     "path": "people/quoted-top-key.md",
     "has_frontmatter": true,
-    "error_line": 3
-  },
-  {
-    "path": "people/stray-line.md",
-    "has_frontmatter": true,
-    "error_line": 2
+    "error_line": 3,
+    "error_kind": "line is not part of any key"
   },
   {
     "path": "people/unicode.md",
@@ -145,6 +144,13 @@
   {
     "path": "people/unterminated.md",
     "has_frontmatter": true,
-    "error_line": 3
+    "error_line": 3,
+    "error_kind": "unterminated double-quoted string"
+  },
+  {
+    "path": "people/value-and-children.md",
+    "has_frontmatter": true,
+    "error_line": 2,
+    "error_kind": "value on the key line and indented lines below it"
   }
 ]
