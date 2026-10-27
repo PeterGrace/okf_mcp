@@ -1,0 +1,2590 @@
+{
+  "links": {
+    "broken": [
+      {
+        "file": "analysis/hub.md",
+        "line": 14,
+        "link": "/analysis/missing.md"
+      },
+      {
+        "file": "analysis/hub.md",
+        "line": 15,
+        "link": "../../outside.md"
+      },
+      {
+        "file": "infra/time-server.md",
+        "line": 48,
+        "link": "/infra/hosts/"
+      },
+      {
+        "file": "markdown/slugs.md",
+        "line": 11,
+        "link": "/x.md"
+      }
+    ],
+    "broken_anchors": [
+      {
+        "file": "analysis/hub.md",
+        "line": 12,
+        "link": "/analysis/lead.md#no-such-heading"
+      },
+      {
+        "file": "analysis/hub.md",
+        "line": 13,
+        "link": "/analysis/lead.md#Open%20items"
+      },
+      {
+        "file": "analysis/hub.md",
+        "line": 15,
+        "link": "#nowhere"
+      }
+    ],
+    "relative": [
+      {
+        "file": "analysis/hub.md",
+        "line": 14,
+        "link": "stamps.md"
+      },
+      {
+        "file": "infra/time-server.md",
+        "line": 49,
+        "link": "../index.md"
+      }
+    ],
+    "orphans": [
+      "analysis/backlog.md",
+      "analysis/broken-stamps.md",
+      "analysis/offsets.md",
+      "analysis/sub/deep.md",
+      "errors/bad-escape.md",
+      "errors/bad-indentation.md",
+      "errors/bad-structure.md",
+      "errors/expected-key-value.md",
+      "errors/flow-duplicate-key.md",
+      "errors/flow-list-separator.md",
+      "errors/flow-map-separator.md",
+      "errors/flow-missing-colon.md",
+      "errors/invalid-escape.md",
+      "errors/nested-duplicate-key.md",
+      "errors/trailing-text.md",
+      "errors/unsupported-indicator.md",
+      "errors/unterminated-single.md",
+      "infra/time-server.md",
+      "infra/hosts/crlf-headings.md",
+      "infra/hosts/crlf-host.md",
+      "infra/hosts/lone-cr.md",
+      "infra/hosts/no-frontmatter.md",
+      "markdown/fences.md",
+      "markdown/footnotes.md",
+      "markdown/slugs.md",
+      "people/bad-colon.md",
+      "people/duplicate-key.md",
+      "people/flow-error.md",
+      "people/quoted-top-key.md",
+      "people/unicode.md",
+      "people/unterminated.md",
+      "people/value-and-children.md",
+      "yaml/block-scalars.md",
+      "yaml/bom-heading.md",
+      "yaml/bom.md",
+      "yaml/comments-only.md",
+      "yaml/empty-frontmatter.md",
+      "yaml/escapes.md",
+      "yaml/nested-flow.md",
+      "yaml/same-indent-lists.md"
+    ],
+    "dead_ends": [
+      "analysis/backlog.md",
+      "analysis/broken-stamps.md",
+      "analysis/lead.md",
+      "errors/bad-escape.md",
+      "errors/bad-indentation.md",
+      "errors/bad-structure.md",
+      "errors/expected-key-value.md",
+      "errors/flow-duplicate-key.md",
+      "errors/flow-list-separator.md",
+      "errors/flow-map-separator.md",
+      "errors/flow-missing-colon.md",
+      "errors/invalid-escape.md",
+      "errors/nested-duplicate-key.md",
+      "errors/trailing-text.md",
+      "errors/unsupported-indicator.md",
+      "errors/unterminated-single.md",
+      "infra/time-server.md",
+      "infra/hosts/crlf-headings.md",
+      "infra/hosts/crlf-host.md",
+      "infra/hosts/lone-cr.md",
+      "infra/hosts/no-frontmatter.md",
+      "markdown/fences.md",
+      "markdown/footnotes.md",
+      "markdown/slugs.md",
+      "people/bad-colon.md",
+      "people/duplicate-key.md",
+      "people/flow-error.md",
+      "people/quoted-top-key.md",
+      "people/unicode.md",
+      "people/unterminated.md",
+      "people/value-and-children.md",
+      "yaml/block-scalars.md",
+      "yaml/bom-heading.md",
+      "yaml/bom.md",
+      "yaml/comments-only.md",
+      "yaml/empty-frontmatter.md",
+      "yaml/escapes.md",
+      "yaml/nested-flow.md",
+      "yaml/same-indent-lists.md"
+    ],
+    "index_drift": [
+      {
+        "file": "analysis/broken-stamps.md",
+        "problem": "not listed in analysis/index.md"
+      },
+      {
+        "file": "errors/bad-escape.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/bad-indentation.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/bad-structure.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/expected-key-value.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/flow-duplicate-key.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/flow-list-separator.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/flow-map-separator.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/flow-missing-colon.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/invalid-escape.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/nested-duplicate-key.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/trailing-text.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/unsupported-indicator.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/unterminated-single.md",
+        "problem": "no errors/index.md to list it"
+      },
+      {
+        "file": "infra/hosts/crlf-headings.md",
+        "problem": "no infra/hosts/index.md to list it"
+      },
+      {
+        "file": "infra/hosts/crlf-host.md",
+        "problem": "no infra/hosts/index.md to list it"
+      },
+      {
+        "file": "infra/hosts/lone-cr.md",
+        "problem": "no infra/hosts/index.md to list it"
+      },
+      {
+        "file": "infra/hosts/no-frontmatter.md",
+        "problem": "no infra/hosts/index.md to list it"
+      },
+      {
+        "file": "markdown/fences.md",
+        "problem": "no markdown/index.md to list it"
+      },
+      {
+        "file": "markdown/footnotes.md",
+        "problem": "no markdown/index.md to list it"
+      },
+      {
+        "file": "markdown/slugs.md",
+        "problem": "no markdown/index.md to list it"
+      },
+      {
+        "file": "people/bad-colon.md",
+        "problem": "no people/index.md to list it"
+      },
+      {
+        "file": "people/duplicate-key.md",
+        "problem": "no people/index.md to list it"
+      },
+      {
+        "file": "people/flow-error.md",
+        "problem": "no people/index.md to list it"
+      },
+      {
+        "file": "people/quoted-top-key.md",
+        "problem": "no people/index.md to list it"
+      },
+      {
+        "file": "people/unicode.md",
+        "problem": "no people/index.md to list it"
+      },
+      {
+        "file": "people/unterminated.md",
+        "problem": "no people/index.md to list it"
+      },
+      {
+        "file": "people/value-and-children.md",
+        "problem": "no people/index.md to list it"
+      },
+      {
+        "file": "yaml/block-scalars.md",
+        "problem": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/bom-heading.md",
+        "problem": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/bom.md",
+        "problem": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/comments-only.md",
+        "problem": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/empty-frontmatter.md",
+        "problem": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/escapes.md",
+        "problem": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/nested-flow.md",
+        "problem": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/same-indent-lists.md",
+        "problem": "no yaml/index.md to list it"
+      },
+      {
+        "file": "analysis/index.md",
+        "problem": "line 14: concept /analysis/hub.md is listed under # Sections (which lists folders); move it to # Concepts"
+      }
+    ],
+    "unlinked_mentions": [
+      {
+        "file": "analysis/hub.md",
+        "target": "analysis/offsets.md",
+        "hits": [
+          {
+            "line": 19,
+            "name": "Offsets",
+            "text": "The Offsets concept explains non-UTC stamps; `Offsets` in code and"
+          }
+        ]
+      }
+    ],
+    "summary": {
+      "concepts": 43,
+      "broken": 4,
+      "broken_anchors": 3,
+      "relative": 2,
+      "orphans": 40,
+      "dead_ends": 39,
+      "index_drift": 37,
+      "unlinked_mentions": 1
+    }
+  },
+  "oldest": [
+    {
+      "path": "/analysis/backlog.md",
+      "title": "Fixture backlog",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/analysis/lead.md",
+      "title": "Lead Concept",
+      "status": "draft",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/analysis/sub/deep.md",
+      "title": "Deep",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/bad-escape.md",
+      "title": "\\x4G",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/bad-indentation.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/bad-structure.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/expected-key-value.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/flow-duplicate-key.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/flow-list-separator.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/flow-map-separator.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/flow-missing-colon.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/invalid-escape.md",
+      "title": "\\q",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/nested-duplicate-key.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/trailing-text.md",
+      "title": "quoted\" trailing",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/unsupported-indicator.md",
+      "title": "&anchor value",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/errors/unterminated-single.md",
+      "title": "never closed",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/infra/hosts/crlf-headings.md",
+      "title": "CRLF headings",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/infra/hosts/crlf-host.md",
+      "title": "CRLF host",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/infra/hosts/lone-cr.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/infra/hosts/no-frontmatter.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/markdown/fences.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/markdown/footnotes.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/markdown/slugs.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/people/bad-colon.md",
+      "title": "Bad: colon in plain value",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/people/duplicate-key.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/people/flow-error.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/people/quoted-top-key.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/people/unicode.md",
+      "title": "Zoë Ünïcode",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/people/unterminated.md",
+      "title": "never closed",
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/people/value-and-children.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/yaml/block-scalars.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/yaml/bom-heading.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/yaml/bom.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/yaml/comments-only.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/yaml/empty-frontmatter.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/yaml/escapes.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/yaml/nested-flow.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/yaml/same-indent-lists.md",
+      "title": null,
+      "status": "stable",
+      "last_touched": null,
+      "last_touched_by": null,
+      "age_days": null,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/analysis/broken-stamps.md",
+      "title": "Broken stamps",
+      "status": "stable",
+      "last_touched": "2026-09-01T00:00:00Z",
+      "last_touched_by": "generated",
+      "age_days": 56.5,
+      "stale": true,
+      "open_questions": []
+    },
+    {
+      "path": "/analysis/hub.md",
+      "title": "Analysis Hub",
+      "status": "stable",
+      "last_touched": "2026-10-20T00:00:00Z",
+      "last_touched_by": "generated",
+      "age_days": 7.5,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/analysis/offsets.md",
+      "title": "Offsets",
+      "status": "stable",
+      "last_touched": "2026-10-26T10:00:00.500000+05:30",
+      "last_touched_by": "generated",
+      "age_days": 1.3,
+      "stale": false,
+      "open_questions": []
+    },
+    {
+      "path": "/infra/time-server.md",
+      "title": "Time server",
+      "status": "stable",
+      "last_touched": "2026-10-26T23:01:11Z",
+      "last_touched_by": "generated",
+      "age_days": 0.5,
+      "stale": false,
+      "open_questions": [
+        "Is the antenna on the roof?"
+      ]
+    },
+    {
+      "path": "/analysis/stamps.md",
+      "title": "Stamp Rules",
+      "status": "bogus",
+      "last_touched": "2027-01-01T00:00:00Z",
+      "last_touched_by": "generated",
+      "age_days": -65.5,
+      "stale": true,
+      "open_questions": [
+        "Is the clock right?",
+        "{'asked': 'by fixture'}"
+      ]
+    }
+  ],
+  "oldest_open_questions": [
+    {
+      "path": "/infra/time-server.md",
+      "title": "Time server",
+      "status": "stable",
+      "last_touched": "2026-10-26T23:01:11Z",
+      "last_touched_by": "generated",
+      "age_days": 0.5,
+      "stale": false,
+      "open_questions": [
+        "Is the antenna on the roof?"
+      ]
+    },
+    {
+      "path": "/analysis/stamps.md",
+      "title": "Stamp Rules",
+      "status": "bogus",
+      "last_touched": "2027-01-01T00:00:00Z",
+      "last_touched_by": "generated",
+      "age_days": -65.5,
+      "stale": true,
+      "open_questions": [
+        "Is the clock right?",
+        "{'asked': 'by fixture'}"
+      ]
+    }
+  ],
+  "sprawl": [
+    {
+      "path": "/analysis/lead.md",
+      "score": 22.2,
+      "exempt": null,
+      "lines": 112,
+      "sections": 5,
+      "sources": 5,
+      "volatile": 4,
+      "dates": 32,
+      "sections_detail": [
+        {
+          "heading": "Lead",
+          "level": 1,
+          "line": 12,
+          "lines": 111,
+          "volatile": null
+        },
+        {
+          "heading": "History",
+          "level": 2,
+          "line": 58,
+          "lines": 30,
+          "volatile": "history"
+        },
+        {
+          "heading": "Open items",
+          "level": 2,
+          "line": 91,
+          "lines": 10,
+          "volatile": "open items"
+        },
+        {
+          "heading": "Incident on Oct 5, 2026",
+          "level": 2,
+          "line": 104,
+          "lines": 23,
+          "volatile": "incident"
+        },
+        {
+          "heading": "Ports",
+          "level": 2,
+          "line": 131,
+          "lines": 2,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [
+        {
+          "kind": "heading",
+          "text": "History",
+          "line": 58,
+          "why": "history"
+        },
+        {
+          "kind": "heading",
+          "text": "Open items",
+          "line": 91,
+          "why": "open items"
+        },
+        {
+          "kind": "heading",
+          "text": "Incident on Oct 5, 2026",
+          "line": 104,
+          "why": "incident"
+        },
+        {
+          "kind": "lead-in",
+          "text": "As of 2026-10-20",
+          "line": 14,
+          "why": "as of"
+        }
+      ],
+      "candidates": [
+        {
+          "heading": "History",
+          "level": 2,
+          "line": 58,
+          "lines": 30,
+          "volatile": "history"
+        },
+        {
+          "heading": "Incident on Oct 5, 2026",
+          "level": 2,
+          "line": 104,
+          "lines": 23,
+          "volatile": "incident"
+        },
+        {
+          "heading": "Open items",
+          "level": 2,
+          "line": 91,
+          "lines": 10,
+          "volatile": "open items"
+        },
+        {
+          "heading": "Lead",
+          "level": 1,
+          "line": 12,
+          "lines": 111,
+          "volatile": null
+        }
+      ]
+    },
+    {
+      "path": "/markdown/slugs.md",
+      "score": 8.2,
+      "exempt": null,
+      "lines": 15,
+      "sections": 15,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [
+        {
+          "heading": "Setup",
+          "level": 1,
+          "line": 1,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "Setup",
+          "level": 1,
+          "line": 2,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "Setup-1",
+          "level": 1,
+          "line": 3,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "Setup",
+          "level": 1,
+          "line": 4,
+          "lines": 1,
+          "volatile": null
+        },
+        {
+          "heading": "setup",
+          "level": 2,
+          "line": 5,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "A_b",
+          "level": 1,
+          "line": 6,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "a_b_",
+          "level": 1,
+          "line": 7,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "a-b?",
+          "level": 1,
+          "line": 8,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "Émigré café",
+          "level": 1,
+          "line": 9,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "`code` & *stuff*",
+          "level": 1,
+          "line": 10,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "[Link text](/x.md) more",
+          "level": 1,
+          "line": 11,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "<span>Tagged</span> heading",
+          "level": 1,
+          "line": 12,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "snake_case __bold__ _em_",
+          "level": 1,
+          "line": 13,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "",
+          "level": 1,
+          "line": 14,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "",
+          "level": 1,
+          "line": 15,
+          "lines": 0,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/markdown/fences.md",
+      "score": 5.3,
+      "exempt": null,
+      "lines": 27,
+      "sections": 8,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [
+        {
+          "heading": "Fences",
+          "level": 1,
+          "line": 1,
+          "lines": 22,
+          "volatile": null
+        },
+        {
+          "heading": "Visible: a longer backtick run closes the fence",
+          "level": 2,
+          "line": 8,
+          "lines": 3,
+          "volatile": null
+        },
+        {
+          "heading": "Visible: a longer tilde run closes",
+          "level": 2,
+          "line": 13,
+          "lines": 3,
+          "volatile": null
+        },
+        {
+          "heading": "Visible after the indented fence",
+          "level": 2,
+          "line": 18,
+          "lines": 1,
+          "volatile": null
+        },
+        {
+          "heading": "Visible: four spaces is not a fence",
+          "level": 2,
+          "line": 21,
+          "lines": 3,
+          "volatile": null
+        },
+        {
+          "heading": "Closing hashes",
+          "level": 2,
+          "line": 25,
+          "lines": 2,
+          "volatile": null
+        },
+        {
+          "heading": "",
+          "level": 1,
+          "line": 28,
+          "lines": 3,
+          "volatile": null
+        },
+        {
+          "heading": "Unclosed fence follows",
+          "level": 2,
+          "line": 29,
+          "lines": 2,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [],
+      "candidates": [
+        {
+          "heading": "Fences",
+          "level": 1,
+          "line": 1,
+          "lines": 22,
+          "volatile": null
+        }
+      ]
+    },
+    {
+      "path": "/infra/time-server.md",
+      "score": 2.8,
+      "exempt": null,
+      "lines": 12,
+      "sections": 3,
+      "sources": 2,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [
+        {
+          "heading": "Overview",
+          "level": 1,
+          "line": 46,
+          "lines": 11,
+          "volatile": null
+        },
+        {
+          "heading": "Overview",
+          "level": 2,
+          "line": 51,
+          "lines": 8,
+          "volatile": null
+        },
+        {
+          "heading": "Plan: CLI first, MCP later",
+          "level": 3,
+          "line": 57,
+          "lines": 4,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/infra/hosts/crlf-headings.md",
+      "score": 1.9,
+      "exempt": null,
+      "lines": 9,
+      "sections": 3,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [
+        {
+          "heading": "CRLF headings",
+          "level": 1,
+          "line": 6,
+          "lines": 8,
+          "volatile": null
+        },
+        {
+          "heading": "Closing",
+          "level": 2,
+          "line": 8,
+          "lines": 7,
+          "volatile": null
+        },
+        {
+          "heading": "Trailing spaces",
+          "level": 3,
+          "line": 19,
+          "lines": 0,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/analysis/hub.md",
+      "score": 1.2,
+      "exempt": null,
+      "lines": 14,
+      "sections": 1,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [
+        {
+          "heading": "Links",
+          "level": 1,
+          "line": 9,
+          "lines": 13,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [],
+      "candidates": [
+        {
+          "heading": "Links",
+          "level": 1,
+          "line": 9,
+          "lines": 13,
+          "volatile": null
+        }
+      ]
+    },
+    {
+      "path": "/infra/hosts/lone-cr.md",
+      "score": 1.2,
+      "exempt": null,
+      "lines": 5,
+      "sections": 2,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [
+        {
+          "heading": "Lone CR",
+          "level": 1,
+          "line": 1,
+          "lines": 4,
+          "volatile": null
+        },
+        {
+          "heading": "Second",
+          "level": 2,
+          "line": 7,
+          "lines": 0,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/analysis/stamps.md",
+      "score": 1.1,
+      "exempt": null,
+      "lines": 1,
+      "sections": 0,
+      "sources": 3,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/markdown/footnotes.md",
+      "score": 1.1,
+      "exempt": null,
+      "lines": 13,
+      "sections": 1,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [
+        {
+          "heading": "Footnotes",
+          "level": 1,
+          "line": 1,
+          "lines": 12,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [],
+      "candidates": [
+        {
+          "heading": "Footnotes",
+          "level": 1,
+          "line": 1,
+          "lines": 12,
+          "volatile": null
+        }
+      ]
+    },
+    {
+      "path": "/people/unicode.md",
+      "score": 1.1,
+      "exempt": null,
+      "lines": 2,
+      "sections": 2,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [
+        {
+          "heading": "Ünïcode Wörds",
+          "level": 1,
+          "line": 7,
+          "lines": 0,
+          "volatile": null
+        },
+        {
+          "heading": "Ünïcode Wörds",
+          "level": 1,
+          "line": 9,
+          "lines": 0,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/yaml/bom.md",
+      "score": 0.8,
+      "exempt": null,
+      "lines": 5,
+      "sections": 1,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [
+        {
+          "heading": "After BOM",
+          "level": 1,
+          "line": 6,
+          "lines": 0,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/yaml/same-indent-lists.md",
+      "score": 0.7,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 2,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/infra/hosts/no-frontmatter.md",
+      "score": 0.6,
+      "exempt": null,
+      "lines": 2,
+      "sections": 1,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [
+        {
+          "heading": "Heading `code` and *emphasis*",
+          "level": 1,
+          "line": 3,
+          "lines": 0,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/yaml/empty-frontmatter.md",
+      "score": 0.6,
+      "exempt": null,
+      "lines": 1,
+      "sections": 1,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [
+        {
+          "heading": "Empty frontmatter",
+          "level": 1,
+          "line": 4,
+          "lines": 0,
+          "volatile": null
+        }
+      ],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/analysis/broken-stamps.md",
+      "score": 0.1,
+      "exempt": null,
+      "lines": 1,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/analysis/offsets.md",
+      "score": 0.1,
+      "exempt": null,
+      "lines": 1,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/analysis/sub/deep.md",
+      "score": 0.1,
+      "exempt": null,
+      "lines": 1,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/infra/hosts/crlf-host.md",
+      "score": 0.1,
+      "exempt": null,
+      "lines": 1,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/yaml/bom-heading.md",
+      "score": 0.1,
+      "exempt": null,
+      "lines": 2,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/bad-escape.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/bad-indentation.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/bad-structure.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/expected-key-value.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/flow-duplicate-key.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/flow-list-separator.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/flow-map-separator.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/flow-missing-colon.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/invalid-escape.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/nested-duplicate-key.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/trailing-text.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/unsupported-indicator.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/errors/unterminated-single.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/people/bad-colon.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/people/duplicate-key.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/people/flow-error.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/people/quoted-top-key.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/people/unterminated.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/people/value-and-children.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/yaml/block-scalars.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/yaml/comments-only.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/yaml/escapes.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    },
+    {
+      "path": "/yaml/nested-flow.md",
+      "score": 0.0,
+      "exempt": null,
+      "lines": 0,
+      "sections": 0,
+      "sources": 0,
+      "volatile": 0,
+      "dates": 0,
+      "sections_detail": [],
+      "volatile_detail": [],
+      "candidates": []
+    }
+  ],
+  "lint": {
+    "errors": [
+      {
+        "file": "analysis/broken-stamps.md",
+        "line": 4,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: duplicate key 'title'"
+      },
+      {
+        "file": "analysis/hub.md",
+        "line": 12,
+        "rule": "broken-anchor",
+        "message": "no heading in the target matches the anchor: /analysis/lead.md#no-such-heading"
+      },
+      {
+        "file": "analysis/hub.md",
+        "line": 13,
+        "rule": "broken-anchor",
+        "message": "no heading in the target matches the anchor: /analysis/lead.md#Open%20items"
+      },
+      {
+        "file": "analysis/hub.md",
+        "line": 14,
+        "rule": "broken-link",
+        "message": "link target does not exist: /analysis/missing.md"
+      },
+      {
+        "file": "analysis/hub.md",
+        "line": 15,
+        "rule": "broken-anchor",
+        "message": "no heading in the target matches the anchor: #nowhere"
+      },
+      {
+        "file": "analysis/hub.md",
+        "line": 15,
+        "rule": "broken-link",
+        "message": "link target does not exist: ../../outside.md"
+      },
+      {
+        "file": "analysis/stamps.md",
+        "line": 5,
+        "rule": "future-timestamp",
+        "message": "generated.at 2027-01-01T00:00:00Z is in the future (now 2026-10-27T12:00:00Z)"
+      },
+      {
+        "file": "analysis/stamps.md",
+        "line": 14,
+        "rule": "timestamp",
+        "message": "sources[1].last_modified is not a valid date/time: '2026-13-01T00:00:00Z'"
+      },
+      {
+        "file": "analysis/sub/index.md",
+        "line": 1,
+        "rule": "index-frontmatter",
+        "message": "non-root index.md must not have frontmatter"
+      },
+      {
+        "file": "errors/bad-escape.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: bad escape in '\"\\\\x4G\"'"
+      },
+      {
+        "file": "errors/bad-indentation.md",
+        "line": 4,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: bad indentation: 'at: y'"
+      },
+      {
+        "file": "errors/bad-structure.md",
+        "line": 4,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: bad indentation or structure: '- b'"
+      },
+      {
+        "file": "errors/expected-key-value.md",
+        "line": 4,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: expected 'key: value', got 'just text'"
+      },
+      {
+        "file": "errors/flow-duplicate-key.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: duplicate key 'by' in '{by: a, by: b}'"
+      },
+      {
+        "file": "errors/flow-list-separator.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: expected ',' or ']' in flow list in '[a, \"b\" c]'"
+      },
+      {
+        "file": "errors/flow-map-separator.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: expected ',' or '}' in flow map in '{by: \"a\" at: b}'"
+      },
+      {
+        "file": "errors/flow-missing-colon.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: expected ':' after key in '{by}'"
+      },
+      {
+        "file": "errors/invalid-escape.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: invalid escape \\q in '\"\\\\q\"'"
+      },
+      {
+        "file": "errors/nested-duplicate-key.md",
+        "line": 4,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: duplicate key 'by'"
+      },
+      {
+        "file": "errors/trailing-text.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: unexpected trailing text in '\"quoted\" trailing'"
+      },
+      {
+        "file": "errors/unsupported-indicator.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: unsupported YAML indicator '&' in '&anchor value'"
+      },
+      {
+        "file": "errors/unterminated-single.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: unterminated single-quoted string in \"'never closed\""
+      },
+      {
+        "file": "infra/hosts/lone-cr.md",
+        "line": 1,
+        "rule": "no-frontmatter",
+        "message": "concept has no YAML frontmatter block"
+      },
+      {
+        "file": "infra/hosts/no-frontmatter.md",
+        "line": 1,
+        "rule": "no-frontmatter",
+        "message": "concept has no YAML frontmatter block"
+      },
+      {
+        "file": "infra/time-server.md",
+        "line": 48,
+        "rule": "broken-link",
+        "message": "link target does not exist: /infra/hosts/"
+      },
+      {
+        "file": "markdown/fences.md",
+        "line": 1,
+        "rule": "no-frontmatter",
+        "message": "concept has no YAML frontmatter block"
+      },
+      {
+        "file": "markdown/footnotes.md",
+        "line": 1,
+        "rule": "no-frontmatter",
+        "message": "concept has no YAML frontmatter block"
+      },
+      {
+        "file": "markdown/slugs.md",
+        "line": 1,
+        "rule": "no-frontmatter",
+        "message": "concept has no YAML frontmatter block"
+      },
+      {
+        "file": "markdown/slugs.md",
+        "line": 11,
+        "rule": "broken-link",
+        "message": "link target does not exist: /x.md"
+      },
+      {
+        "file": "people/bad-colon.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: unquoted ': ' inside a plain value 'Bad: colon in plain value'; quote it"
+      },
+      {
+        "file": "people/duplicate-key.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: duplicate key 'type'"
+      },
+      {
+        "file": "people/flow-error.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: expected ',' or ']' in flow list in '[a, b'"
+      },
+      {
+        "file": "people/quoted-top-key.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: line is not part of any key: '\"quoted\": no'"
+      },
+      {
+        "file": "people/unterminated.md",
+        "line": 3,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: unterminated double-quoted string in '\"never closed'"
+      },
+      {
+        "file": "people/value-and-children.md",
+        "line": 2,
+        "rule": "frontmatter-parse",
+        "message": "frontmatter does not parse: value on the key line and indented lines below it"
+      },
+      {
+        "file": "yaml/bom-heading.md",
+        "line": 1,
+        "rule": "no-frontmatter",
+        "message": "concept has no YAML frontmatter block"
+      },
+      {
+        "file": "yaml/bom.md",
+        "line": 1,
+        "rule": "no-frontmatter",
+        "message": "concept has no YAML frontmatter block"
+      },
+      {
+        "file": "yaml/comments-only.md",
+        "line": 1,
+        "rule": "no-type",
+        "message": "frontmatter has no 'type'"
+      },
+      {
+        "file": "yaml/empty-frontmatter.md",
+        "line": 1,
+        "rule": "no-type",
+        "message": "frontmatter has no 'type'"
+      }
+    ],
+    "warnings": [
+      {
+        "file": "analysis/backlog.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "analysis/backlog.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "analysis/broken-stamps.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "not listed in analysis/index.md"
+      },
+      {
+        "file": "analysis/broken-stamps.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "analysis/hub.md",
+        "line": 7,
+        "rule": "generated-after-commit",
+        "message": "generated.at 2026-10-20T00:00:00Z is later than the file's last commit 2026-10-19T00:00:00Z"
+      },
+      {
+        "file": "analysis/hub.md",
+        "line": 14,
+        "rule": "relative-link",
+        "message": "relative link stamps.md; prefer a bundle-root absolute path"
+      },
+      {
+        "file": "analysis/index.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "line 14: concept /analysis/hub.md is listed under # Sections (which lists folders); move it to # Concepts"
+      },
+      {
+        "file": "analysis/lead.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "analysis/lead.md",
+        "line": 1,
+        "rule": "sprawl",
+        "message": "sprawl score 22.2 > 16 (112 lines, 5 sections, 4 volatile); consider splitting (okf.py sprawl analysis/lead.md, okf-reorganize skill)"
+      },
+      {
+        "file": "analysis/offsets.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "analysis/offsets.md",
+        "line": 5,
+        "rule": "timestamp-utc",
+        "message": "generated.at is not in UTC: '2026-10-26T10:00:00.5+05:30'"
+      },
+      {
+        "file": "analysis/stamps.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "analysis/stamps.md",
+        "line": 4,
+        "rule": "status",
+        "message": "status 'bogus' is not draft, stable or deprecated"
+      },
+      {
+        "file": "analysis/stamps.md",
+        "line": 6,
+        "rule": "timestamp-utc",
+        "message": "verified[0].at is not in UTC: '2026-10-01T10:00:00-04:00'"
+      },
+      {
+        "file": "analysis/stamps.md",
+        "line": 6,
+        "rule": "verified-shape",
+        "message": "verified[1] should be a mapping with 'by' and 'at'"
+      },
+      {
+        "file": "analysis/stamps.md",
+        "line": 9,
+        "rule": "reviewed-outcome",
+        "message": "reviewed.outcome 'maybe' is not one of verified, updated, partial, unverifiable"
+      },
+      {
+        "file": "analysis/stamps.md",
+        "line": 10,
+        "rule": "stale",
+        "message": "stale_after 2026-01-01T00:00:00Z has passed; re-check the concept"
+      },
+      {
+        "file": "analysis/stamps.md",
+        "line": 14,
+        "rule": "sources-shape",
+        "message": "sources[0] has no 'resource'"
+      },
+      {
+        "file": "analysis/sub/deep.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "analysis/sub/deep.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/bad-escape.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/bad-escape.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/bad-indentation.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/bad-indentation.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/bad-structure.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/bad-structure.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/expected-key-value.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/expected-key-value.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/flow-duplicate-key.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/flow-duplicate-key.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/flow-list-separator.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/flow-list-separator.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/flow-map-separator.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/flow-map-separator.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/flow-missing-colon.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/flow-missing-colon.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/invalid-escape.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/invalid-escape.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/nested-duplicate-key.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/nested-duplicate-key.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/trailing-text.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/trailing-text.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/unsupported-indicator.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/unsupported-indicator.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "errors/unterminated-single.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no errors/index.md to list it"
+      },
+      {
+        "file": "errors/unterminated-single.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "infra/hosts/crlf-headings.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no infra/hosts/index.md to list it"
+      },
+      {
+        "file": "infra/hosts/crlf-headings.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "infra/hosts/crlf-headings.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "infra/hosts/crlf-host.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no infra/hosts/index.md to list it"
+      },
+      {
+        "file": "infra/hosts/crlf-host.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "infra/hosts/crlf-host.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "infra/hosts/lone-cr.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no infra/hosts/index.md to list it"
+      },
+      {
+        "file": "infra/hosts/lone-cr.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "infra/hosts/no-frontmatter.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no infra/hosts/index.md to list it"
+      },
+      {
+        "file": "infra/hosts/no-frontmatter.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "infra/time-server.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "infra/time-server.md",
+        "line": 49,
+        "rule": "relative-link",
+        "message": "relative link ../index.md; prefer a bundle-root absolute path"
+      },
+      {
+        "file": "markdown/fences.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no markdown/index.md to list it"
+      },
+      {
+        "file": "markdown/fences.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "markdown/footnotes.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no markdown/index.md to list it"
+      },
+      {
+        "file": "markdown/footnotes.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "markdown/slugs.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no markdown/index.md to list it"
+      },
+      {
+        "file": "markdown/slugs.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "people/bad-colon.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no people/index.md to list it"
+      },
+      {
+        "file": "people/bad-colon.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "people/duplicate-key.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no people/index.md to list it"
+      },
+      {
+        "file": "people/duplicate-key.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "people/flow-error.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no people/index.md to list it"
+      },
+      {
+        "file": "people/flow-error.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "people/quoted-top-key.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no people/index.md to list it"
+      },
+      {
+        "file": "people/quoted-top-key.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "people/unicode.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no people/index.md to list it"
+      },
+      {
+        "file": "people/unicode.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "people/unterminated.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no people/index.md to list it"
+      },
+      {
+        "file": "people/unterminated.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "people/value-and-children.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no people/index.md to list it"
+      },
+      {
+        "file": "people/value-and-children.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "yaml/block-scalars.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/block-scalars.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "yaml/block-scalars.md",
+        "line": 1,
+        "rule": "no-title",
+        "message": "frontmatter has no 'title'"
+      },
+      {
+        "file": "yaml/block-scalars.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "yaml/bom-heading.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/bom-heading.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "yaml/bom.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/bom.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "yaml/comments-only.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/comments-only.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "yaml/comments-only.md",
+        "line": 1,
+        "rule": "no-title",
+        "message": "frontmatter has no 'title'"
+      },
+      {
+        "file": "yaml/comments-only.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "yaml/empty-frontmatter.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/empty-frontmatter.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "yaml/empty-frontmatter.md",
+        "line": 1,
+        "rule": "no-title",
+        "message": "frontmatter has no 'title'"
+      },
+      {
+        "file": "yaml/empty-frontmatter.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "yaml/escapes.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/escapes.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "yaml/escapes.md",
+        "line": 1,
+        "rule": "no-title",
+        "message": "frontmatter has no 'title'"
+      },
+      {
+        "file": "yaml/escapes.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "yaml/nested-flow.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/nested-flow.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "yaml/nested-flow.md",
+        "line": 1,
+        "rule": "no-title",
+        "message": "frontmatter has no 'title'"
+      },
+      {
+        "file": "yaml/nested-flow.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      },
+      {
+        "file": "yaml/same-indent-lists.md",
+        "line": 1,
+        "rule": "index-drift",
+        "message": "no yaml/index.md to list it"
+      },
+      {
+        "file": "yaml/same-indent-lists.md",
+        "line": 1,
+        "rule": "no-description",
+        "message": "frontmatter has no 'description'"
+      },
+      {
+        "file": "yaml/same-indent-lists.md",
+        "line": 1,
+        "rule": "no-title",
+        "message": "frontmatter has no 'title'"
+      },
+      {
+        "file": "yaml/same-indent-lists.md",
+        "line": 1,
+        "rule": "orphan",
+        "message": "no other concept links to this concept"
+      }
+    ]
+  }
+}

@@ -42,6 +42,119 @@
     "footnotes": {}
   },
   {
+    "path": "analysis/backlog.md",
+    "headings": [
+      [
+        0,
+        1,
+        "Items",
+        "items"
+      ]
+    ],
+    "footnotes": {}
+  },
+  {
+    "path": "analysis/broken-stamps.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "analysis/hub.md",
+    "headings": [
+      [
+        0,
+        1,
+        "Links",
+        "links"
+      ]
+    ],
+    "footnotes": {
+      "1": [
+        17
+      ]
+    }
+  },
+  {
+    "path": "analysis/index.md",
+    "headings": [
+      [
+        0,
+        1,
+        "Analysis",
+        "analysis"
+      ],
+      [
+        2,
+        1,
+        "Concepts",
+        "concepts"
+      ],
+      [
+        10,
+        1,
+        "Sections",
+        "sections"
+      ]
+    ],
+    "footnotes": {}
+  },
+  {
+    "path": "analysis/lead.md",
+    "headings": [
+      [
+        0,
+        1,
+        "Lead",
+        "lead"
+      ],
+      [
+        46,
+        2,
+        "History",
+        "history"
+      ],
+      [
+        79,
+        2,
+        "Open items",
+        "open-items"
+      ],
+      [
+        92,
+        2,
+        "Incident on Oct 5, 2026",
+        "incident-on-oct-5-2026"
+      ],
+      [
+        119,
+        2,
+        "Ports",
+        "ports"
+      ]
+    ],
+    "footnotes": {}
+  },
+  {
+    "path": "analysis/offsets.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "analysis/stamps.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "analysis/sub/deep.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
+    "path": "analysis/sub/index.md",
+    "headings": [],
+    "footnotes": {}
+  },
+  {
     "path": "errors/bad-escape.md",
     "headings": [],
     "footnotes": {}

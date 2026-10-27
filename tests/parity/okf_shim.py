@@ -8,16 +8,22 @@ usage:
     okf_shim.py markdown ROOT        every .md under ROOT: body headings with slugs, footnotes
     okf_shim.py render               stdin: JSON list of values; stdout: each with its renderings
     okf_shim.py sha256               okf.py's SHA-256, to check that the goldens are current
+    okf_shim.py analysis ROOT NOW COMMITS
+                                     links, oldest, sprawl and lint --json for ROOT with
+                                     now_utc frozen at NOW; COMMITS is a commit-times JSON
+                                     file, "none" (git unavailable) or "git" (real git)
 """
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import sys
 from types import ModuleType
 from typing import NoReturn, Union
 
-Json = Union[None, bool, int, str, list["Json"], dict[str, "Json"]]
+Json = Union[None, bool, int, float, str, list["Json"], dict[str, "Json"]]
 
 
 def usage(problem: str) -> NoReturn:
@@ -76,6 +82,46 @@ def render(okf: ModuleType, values: list[Json]) -> list[Json]:
     return [{"input": v, "flow": okf.flow_value(v), "block": okf.block_item(v, 2)} for v in values]
 
 
+def analysis(okf: ModuleType, root: str, now: str, commits: str) -> Json:
+    """Run the analysis commands as okf.py's CLI does, returning their JSON.
+
+    okf.py looks `now_utc` and `last_commit_times` up as module globals at
+    call time, so replacing them here freezes the clock and injects the
+    commit times for every command below. (`setattr` rather than attribute
+    assignment: a ModuleType has no declared `now_utc` for mypy to check.)
+    """
+    fixed = okf.parse_ts(now)
+    setattr(okf, "now_utc", lambda: fixed)
+    if commits == "none":
+        setattr(okf, "last_commit_times", lambda _root: (None, set()))
+    elif commits != "git":
+        with open(commits, encoding="utf-8") as fh:
+            data = json.load(fh)
+        times = {path: okf.parse_ts(at) for path, at in data["times"].items()}
+        dirty = set(data["dirty"])
+        setattr(okf, "last_commit_times", lambda _root: (times, dirty))
+
+    def run(*argv: str) -> Json:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            try:
+                okf.main([*argv, "--root", root])
+            except SystemExit:  # lint exits 1 when there are errors
+                pass
+        # Parsed, not passed through as text: the harness compares JSON
+        # values, so okf.py's own formatting (indent, ASCII escapes) is moot.
+        result: Json = json.loads(out.getvalue())
+        return result
+
+    return {
+        "links": run("links", "--json"),
+        "oldest": run("oldest", "--json", "-n", "1000000"),
+        "oldest_open_questions": run("oldest", "--json", "--open-questions"),
+        "sprawl": run("sprawl", "--json", "-n", "1000000"),
+        "lint": run("lint", "--json"),
+    }
+
+
 def sha256() -> str:
     with open(okf_path(), "rb") as fh:
         return hashlib.sha256(fh.read()).hexdigest()
@@ -98,6 +144,10 @@ def main(argv: list[str]) -> None:
         result = render(load_okf(), values)
     elif command == "sha256" and not args:
         result = sha256()
+    elif command == "analysis":
+        if len(args) != 3:
+            usage("analysis takes ROOT NOW COMMITS")
+        result = analysis(load_okf(), *args)
     else:
         usage(f"bad arguments {argv!r}")
     # ASCII-only output: under `python3 -I` stdout's encoding comes from the
