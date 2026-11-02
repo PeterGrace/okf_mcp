@@ -54,7 +54,7 @@ Deliberately deferred:
 - **Export is built in memory, not streamed.** `store::export` (M3) writes the whole `.tar.gz` into a `Vec<u8>` on a blocking thread; the route returns it with a `Content-Length`. The real catalog's export is about 1 MB and took 62 ms in M3's smoke test.
 - **The catalog list is polled directly.** Every tick reads `admin_generation` (for the key cache) and the catalog list (`id`, `name`, `generation`); a new, deleted or re-created catalog shows up in the list whether or not `admin_generation` moved, and a moved `generation` triggers `CatalogState::refresh`. Two small queries per tick.
 - **A path that is not in a granted catalog is "not available", never "forbidden".** The routes answer 404 for a catalog that does not exist *or* that the key does not reach (as `CatalogNotSelected` already words it), so a key cannot probe which catalogs exist; 403 is only for a reachable catalog the key's access level does not allow (a `read` key importing).
-- **Request timeouts apply to every route but `/mcp`.** `/mcp`'s `GET` is a long-lived SSE stream that a timeout would cut; rmcp's keep-alive and `session_idle_timeout` bound it instead.
+- **Request timeouts apply to every route but `/mcp`.** `/mcp`'s `GET` is a long-lived SSE stream that a timeout would cut; rmcp's keep-alive and `session_idle_timeout` bound it instead. `POST /mcp` (a tool call) has no timeout either: every M4 tool reads an in-memory snapshot, and the slowest, `links_report` with mentions, took 319 ms on the real catalog in M3's smoke test. A per-tool timeout can come with M5's write tools if they need one.
 
 ## Verified facts the code relies on
 
