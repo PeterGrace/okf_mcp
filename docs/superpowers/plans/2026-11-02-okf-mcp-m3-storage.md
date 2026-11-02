@@ -4181,6 +4181,8 @@ async fn build(pool: &PgPool, catalog_id: i64) -> Result<Loaded, OkfError> {
 
 > **Corrected (issue #32), 2026-11-02.** Shipped as written except that the private `build` takes the catalog's name too (`build(pool, catalog_id, name)`) and reads the generation with `fetch_optional`, so a catalog deleted between `find` (or `refresh`'s check) and the transaction is `OkfError::CatalogNotSelected` rather than a bare `Database(RowNotFound)`. Both queries share one `GENERATION` constant. Two more tests: `load_refuses_an_unknown_catalog` and `build_names_a_catalog_deleted_before_it_read`. The public API (`CatalogState::{load, current, refresh, id, name}`, `Loaded::{generation, snapshot}`) is unchanged, so Tasks 11 and 13 stand; Task 11's `commit_times` still goes in `build` before `rows` moves. Read `src/catalog.rs`.
 
+> **Corrected (issue #32, review), 2026-11-02.** `CatalogState` also holds `rebuilding: tokio::sync::Mutex<()>`: `refresh` takes it around the build and re-checks the generation (`<=`, since generations only grow) after waiting, so concurrent refreshes of one catalog build once and the later-generation guard on the swap is gone (test `concurrent_refreshes_build_and_swap_once`). `build` opens its transaction with `pool.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")` instead of a separate `SET TRANSACTION`. `Cargo.toml`'s `tokio` gains the `sync` feature. Callers (M4's poll loop, M5's publish) need not serialize refreshes themselves.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --lib catalog::`

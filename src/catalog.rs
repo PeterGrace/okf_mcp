@@ -47,6 +47,11 @@ pub struct CatalogState {
     // or built. It is `std`'s lock, not tokio's: it is never held across an
     // `.await`, so it never blocks an async thread for longer than that copy.
     current: RwLock<Arc<Loaded>>,
+    // Held for the length of one rebuild, so refreshes of this catalog build
+    // one at a time instead of each building the same snapshot. tokio's
+    // `Mutex`, unlike `std`'s, may be held across an `.await`: waiting for it
+    // suspends the task instead of blocking the thread.
+    rebuilding: tokio::sync::Mutex<()>,
 }
 
 impl CatalogState {
@@ -70,6 +75,7 @@ impl CatalogState {
             id: catalog.id,
             name: catalog.name,
             current: RwLock::new(Arc::new(loaded)),
+            rebuilding: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -94,6 +100,10 @@ impl CatalogState {
     /// Rebuilds and swaps in the snapshot if the catalog changed since it was
     /// loaded.
     ///
+    /// Concurrent refreshes of one catalog are safe and build at most once
+    /// per change: a refresh that waited for another's rebuild returns `false`
+    /// if that rebuild already reached the generation it saw.
+    ///
     /// # Arguments
     /// * `pool` - the database.
     ///
@@ -113,20 +123,24 @@ impl CatalogState {
                 catalog: self.name.clone(),
             });
         };
-        if generation == self.current().generation {
+        // Generations only grow, so `<=` means "already this new or newer".
+        if generation <= self.current().generation {
             return Ok(false);
         }
-        let loaded = build(pool, self.id, &self.name).await?;
-        // The write guard is taken after the last `.await` and dropped when
-        // the function returns, so the lock is never held across an `.await`.
-        let mut current = self.current.write().expect("catalog state lock poisoned");
-        // Two refreshes may race; keep whichever saw the newer generation.
-        if loaded.generation > current.generation {
-            *current = Arc::new(loaded);
-            Ok(true)
-        } else {
-            Ok(false)
+        // The guard (`_` prefix: kept only for its lifetime) releases the
+        // mutex when it goes out of scope at the end of the function.
+        let _rebuilding = self.rebuilding.lock().await;
+        // Another refresh may have swapped in this generation while we waited.
+        if generation <= self.current().generation {
+            return Ok(false);
         }
+        // Swaps happen only under `rebuilding`, so this build, which read a
+        // generation at least as new as `generation`, is newer than `current`.
+        let loaded = build(pool, self.id, &self.name).await?;
+        // A statement-long write lock, taken after the last `.await`: the
+        // `std` lock is never held across one.
+        *self.current.write().expect("catalog state lock poisoned") = Arc::new(loaded);
+        Ok(true)
     }
 }
 
@@ -139,9 +153,9 @@ impl CatalogState {
 async fn build(pool: &PgPool, catalog_id: i64, name: &str) -> Result<Loaded, OkfError> {
     // A repeatable-read transaction sees one moment of the database, so the
     // generation and the rows agree even if an import commits meanwhile.
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        .execute(&mut *tx)
+    // `begin_with` sets the isolation level in the `BEGIN` itself.
+    let mut tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .await?;
     // `&mut *tx` reborrows the transaction as a connection for one query.
     let generation: Option<i64> = sqlx::query_scalar(GENERATION)
@@ -264,6 +278,28 @@ mod tests {
         // A reader that took the old snapshot still sees it, whole.
         assert_eq!(before.snapshot().get("a.md").unwrap().text(), "# Old\n");
         assert!(!state.refresh(&db.pool).await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_refreshes_build_and_swap_once() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "pg", "", Utc::now())
+            .await
+            .unwrap();
+        let state = CatalogState::load(&db.pool, "pg").await.unwrap();
+        import_into(&db.pool, &[("a.md", b"# New\n")], false).await;
+
+        // `tokio::join!` runs both futures at once on this task.
+        let (first, second) = tokio::join!(state.refresh(&db.pool), state.refresh(&db.pool));
+
+        assert_eq!(
+            [first.unwrap(), second.unwrap()]
+                .iter()
+                .filter(|&&swapped| swapped)
+                .count(),
+            1
+        );
+        assert_eq!(state.current().generation(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

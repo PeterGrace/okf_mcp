@@ -17,14 +17,17 @@ documents, rebuilt and swapped in when the catalog's `generation` moves.
     commits meanwhile. The rows become a `MemWorkspace` (`from_stored`) and
     `Snapshot::build` runs on `tokio::task::spawn_blocking`.
   - `refresh` reads the generation and returns `false` without rebuilding when it
-    has not moved; when two refreshes race, the newer generation wins.
+    has not moved. Rebuilds of one catalog run one at a time under a
+    `tokio::sync::Mutex<()>`; a refresh that waited re-checks the generation, so
+    concurrent refreshes build once (review of PR #58). `Cargo.toml`'s `tokio`
+    gains the `sync` feature.
   - A deleted catalog is `OkfError::CatalogNotSelected`, from `refresh`'s check or
     from the build's own read (a delete between the check and the transaction).
 - `src/lib.rs`: `pub mod catalog;`.
 - Tests: `catalog::tests::{load_builds_the_snapshot_of_the_live_documents,
   load_refuses_an_unknown_catalog,
   refresh_swaps_in_a_new_snapshot_only_when_the_catalog_changed,
-  a_deleted_catalog_cannot_be_refreshed, build_names_a_catalog_deleted_before_it_read}`.
+  concurrent_refreshes_build_and_swap_once, a_deleted_catalog_cannot_be_refreshed, build_names_a_catalog_deleted_before_it_read}`.
 
 ## Changed
 
@@ -32,7 +35,8 @@ documents, rebuilt and swapped in when the catalog's `generation` moves.
   `build` takes the catalog's name and reads the generation with `fetch_optional`,
   so a catalog deleted mid-build is `CatalogNotSelected` rather than a bare
   `Database(RowNotFound)`; two extra tests. The public API matches the plan, so
-  Tasks 11 and 13 need no change.
+  Tasks 11 and 13 need no change. A second note (after review) records the
+  rebuild mutex and `begin_with`.
 
 ## Notes
 
