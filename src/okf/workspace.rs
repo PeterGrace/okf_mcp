@@ -5,22 +5,13 @@
 //! refuse paths that escape the catalog root.
 
 use std::borrow::Cow;
-// The `MemWorkspace` test double, and the imports and helpers only it uses,
-// exist only when compiling this crate's own tests (`cfg(test)`) or when a
-// dependent turns on the `test-util` feature. `cfg(any(...))` is Rust's
-// conditional compilation: without either, that code is not even compiled,
-// like an `if TESTING:` block that is removed before the program runs.
-#[cfg(any(test, feature = "test-util"))]
 use std::collections::BTreeMap;
 use std::io::Write;
-#[cfg(any(test, feature = "test-util"))]
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-#[cfg(any(test, feature = "test-util"))]
 use std::sync::RwLock;
 
 use crate::error::OkfError;
-#[cfg(any(test, feature = "test-util"))]
 use crate::okf::paths::dirname;
 use crate::okf::paths::{escapes_root, normpath, walk_order};
 use crate::okf::pystr::universal_newlines;
@@ -148,13 +139,11 @@ fn checked_file(path: &str) -> Result<String, OkfError> {
 }
 
 /// Is any directory component hidden (starts with `.`)?
-#[cfg(any(test, feature = "test-util"))]
 fn in_dot_directory(path: &str) -> bool {
     dirname(path).split('/').any(|p| p.starts_with('.'))
 }
 
 /// Is any directory component `.git` or `.worktrees`?
-#[cfg(any(test, feature = "test-util"))]
 fn in_skipped_directory(path: &str) -> bool {
     dirname(path)
         .split('/')
@@ -491,15 +480,26 @@ impl Workspace for DiskWorkspace {
 }
 
 /// Is there any key starting with `prefix`? One ordered-map probe, O(log n).
-#[cfg(any(test, feature = "test-util"))]
-fn has_key_with_prefix(files: &BTreeMap<String, String>, prefix: &str) -> bool {
+fn has_key_with_prefix(files: &BTreeMap<String, StoredFile>, prefix: &str) -> bool {
     files
         .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
         .next()
         .is_some_and(|(key, _)| key.starts_with(prefix))
 }
 
-/// An in-memory catalog for tests. Directories exist implicitly as prefixes
+/// One stored file: its exact bytes and its execute bit (a record, so its
+/// fields are public).
+// `Eq` on top of `PartialEq` promises equality is total (no NaN-like values),
+// which lets tests compare whole records with `assert_eq!`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    /// The file's exact bytes (UTF-8 or not).
+    pub content: Vec<u8>,
+    /// Is the execute bit set (`chmod +x`)?
+    pub executable: bool,
+}
+
+/// An in-memory catalog. Directories exist implicitly as prefixes
 /// of file paths.
 ///
 /// It refuses the same malformed writes as [`DiskWorkspace`] (onto a
@@ -507,20 +507,26 @@ fn has_key_with_prefix(files: &BTreeMap<String, String>, prefix: &str) -> bool {
 /// special files, so the disk-only refusals ("is a symlink", "not a regular
 /// file", `PermissionDenied`) never occur here.
 ///
-/// Compiled for this crate's unit tests; other crates, and this crate's own
-/// integration tests under `tests/`, see it only with the `test-util` feature
-/// (`cargo test --features test-util`).
-#[cfg(any(test, feature = "test-util"))]
+/// Production code: a stored catalog's snapshot is built over one (see
+/// `crate::catalog`), and tests use it as a catalog fixture. Each file is
+/// held as bytes with its execute bit, so non-text files exist (links to them
+/// resolve) but cannot be read as text, as on disk.
 #[derive(Debug, Default)]
 pub struct MemWorkspace {
     // `RwLock` gives interior mutability: `write_atomic` takes `&self` (like the
     // disk version) yet can still change the map, safely across threads.
-    files: RwLock<BTreeMap<String, String>>,
+    files: RwLock<BTreeMap<String, StoredFile>>,
 }
 
-#[cfg(any(test, feature = "test-util"))]
 impl MemWorkspace {
-    /// Builds a workspace from `(path, contents)` pairs.
+    /// Builds a workspace from `(path, contents)` text fixtures, none of them
+    /// executable.
+    ///
+    /// # Arguments
+    /// * `files` - `(catalog-relative path, UTF-8 contents)` pairs.
+    ///
+    /// # Returns
+    /// The workspace holding those files.
     ///
     /// # Panics
     /// If a path escapes the catalog (a bad test fixture).
@@ -529,7 +535,11 @@ impl MemWorkspace {
             .into_iter()
             .map(|(p, c)| {
                 let rel = checked_file(p).expect("fixture path must be inside the catalog");
-                (rel, c.to_string())
+                let file = StoredFile {
+                    content: c.as_bytes().to_vec(),
+                    executable: false,
+                };
+                (rel, file)
             })
             .collect();
         Self {
@@ -537,21 +547,99 @@ impl MemWorkspace {
         }
     }
 
-    fn files(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, String>> {
-        // A poisoned lock means a test panicked mid-write; propagating the panic is right.
+    /// Builds a workspace from stored files (a catalog's rows).
+    ///
+    /// Refuses the inputs [`Workspace::write_atomic`] could never have
+    /// produced, so the result is always a consistent tree.
+    ///
+    /// # Arguments
+    /// * `files` - `(catalog-relative path, file)` pairs. A leading `/` means
+    ///   the catalog root, as for every [`Workspace`] path.
+    ///
+    /// # Returns
+    /// The workspace holding those files, keyed by normalized path.
+    ///
+    /// # Errors
+    /// [`OkfError::InvalidPath`] if a path escapes the catalog or is the root,
+    /// if two paths normalize to the same one (`./a.md` and `a.md`), or if a
+    /// file is also a directory of another (`a` beside `a/b.md`).
+    pub fn from_stored(
+        files: impl IntoIterator<Item = (String, StoredFile)>,
+    ) -> Result<Self, OkfError> {
+        let mut map = BTreeMap::new();
+        for (path, file) in files {
+            // `insert` returns the value it replaced (`Some`) for a key that
+            // was already there: Python's `if key in d` and `d[key] = v` in one.
+            if map.insert(checked_file(&path)?, file).is_some() {
+                return Err(OkfError::InvalidPath {
+                    path,
+                    reason: "a duplicate of another path".to_string(),
+                });
+            }
+        }
+        // One reused buffer for the `"<file>/"` probes, instead of a new
+        // `String` per key.
+        let mut dir_prefix = String::new();
+        let clash = map.keys().find(|key| {
+            dir_prefix.clear();
+            dir_prefix.push_str(key);
+            dir_prefix.push('/');
+            has_key_with_prefix(&map, &dir_prefix)
+        });
+        if let Some(path) = clash {
+            return Err(OkfError::InvalidPath {
+                path: path.clone(),
+                reason: "is a file and a directory".to_string(),
+            });
+        }
+        Ok(Self {
+            files: RwLock::new(map),
+        })
+    }
+
+    /// The stored file at `path`, if there is one.
+    ///
+    /// # Arguments
+    /// * `path` - Catalog-relative path.
+    ///
+    /// # Returns
+    /// A copy of its bytes and execute bit; `None` if there is no such file
+    /// (or the path escapes the catalog).
+    pub fn stored(&self, path: &str) -> Option<StoredFile> {
+        let rel = checked(path).ok()?;
+        self.files().get(&rel).cloned()
+    }
+
+    /// Every file, consuming the workspace (no copy).
+    ///
+    /// # Returns
+    /// Catalog-relative path to file, sorted by path.
+    pub fn into_stored(self) -> BTreeMap<String, StoredFile> {
+        // `into_inner` takes the map out of the lock; it fails only if a
+        // thread panicked while holding the lock.
+        self.files.into_inner().expect("MemWorkspace lock poisoned")
+    }
+
+    fn files(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, StoredFile>> {
+        // A poisoned lock means a thread panicked mid-write; propagating the panic is right.
         self.files.read().expect("MemWorkspace lock poisoned")
     }
 }
 
-#[cfg(any(test, feature = "test-util"))]
 impl Workspace for MemWorkspace {
     fn read_to_string(&self, path: &str) -> Result<String, OkfError> {
         let rel = checked(path)?;
-        self.files()
-            .get(&rel)
-            .cloned()
-            .ok_or_else(|| OkfError::NotFound {
+        let files = self.files();
+        let file = files.get(&rel).ok_or_else(|| OkfError::NotFound {
+            path: path.to_string(),
+        })?;
+        // The same error `std::fs::read_to_string` gives for non-UTF-8 bytes.
+        // `from_utf8` borrows the bytes (no copy until it is known to be text).
+        std::str::from_utf8(&file.content)
+            .map(str::to_string)
+            .map_err(|error| OkfError::Io {
                 path: path.to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
             })
     }
 
@@ -573,7 +661,16 @@ impl Workspace for MemWorkspace {
                 reason: reason.to_string(),
             });
         }
-        files.insert(rel, contents.to_string());
+        // An existing file keeps its execute bit, as a rewrite on disk keeps
+        // its mode; a new file is not executable (0o666 less the umask).
+        let executable = files.get(&rel).is_some_and(|file| file.executable);
+        files.insert(
+            rel,
+            StoredFile {
+                content: contents.as_bytes().to_vec(),
+                executable,
+            },
+        );
         Ok(())
     }
 
@@ -615,6 +712,86 @@ impl Workspace for MemWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored(content: &[u8], executable: bool) -> StoredFile {
+        StoredFile {
+            content: content.to_vec(),
+            executable,
+        }
+    }
+
+    #[test]
+    fn stored_files_keep_bytes_and_execute_bits() {
+        let ws = MemWorkspace::from_stored([
+            ("tools/run.sh".to_string(), stored(b"#!/bin/sh\n", true)),
+            ("img/logo.png".to_string(), stored(b"\x89PNG\0\xff", false)),
+            ("a.md".to_string(), stored(b"# A\n", false)),
+        ])
+        .unwrap();
+
+        assert_eq!(ws.read_to_string("tools/run.sh").unwrap(), "#!/bin/sh\n");
+        assert_eq!(
+            ws.stored("tools/run.sh"),
+            Some(stored(b"#!/bin/sh\n", true))
+        );
+        // Non-UTF-8 content is listed and exists, but reading it as text fails
+        // with `Io`, exactly as `DiskWorkspace` reports it.
+        assert!(ws.is_file("img/logo.png"));
+        assert!(ws
+            .list_files()
+            .unwrap()
+            .contains(&"img/logo.png".to_string()));
+        assert!(matches!(
+            ws.read_to_string("img/logo.png"),
+            Err(OkfError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn a_write_keeps_an_existing_execute_bit_and_new_files_are_not_executable() {
+        let ws = MemWorkspace::from_stored([("run.sh".to_string(), stored(b"old", true))]).unwrap();
+
+        ws.write_atomic("run.sh", "new").unwrap();
+        ws.write_atomic("fresh.sh", "x").unwrap();
+
+        assert_eq!(ws.stored("run.sh"), Some(stored(b"new", true)));
+        assert_eq!(ws.stored("fresh.sh"), Some(stored(b"x", false)));
+    }
+
+    #[test]
+    fn from_stored_refuses_a_path_outside_the_catalog() {
+        let refused = MemWorkspace::from_stored([("../x.md".to_string(), stored(b"", false))]);
+        assert!(matches!(refused, Err(OkfError::InvalidPath { .. })));
+    }
+
+    #[test]
+    fn from_stored_refuses_paths_that_normalize_to_the_same_file() {
+        let refused = MemWorkspace::from_stored([
+            ("./a.md".to_string(), stored(b"one", false)),
+            ("a.md".to_string(), stored(b"two", false)),
+        ]);
+        assert!(matches!(refused, Err(OkfError::InvalidPath { path, .. }) if path == "a.md"));
+    }
+
+    #[test]
+    fn from_stored_refuses_a_file_that_is_also_a_directory() {
+        // `a-x` sorts between `a` and `a/b.md` (`-` < `/`), so the check
+        // cannot just look at the next key.
+        let refused = MemWorkspace::from_stored([
+            ("a".to_string(), stored(b"", false)),
+            ("a-x".to_string(), stored(b"", false)),
+            ("a/b.md".to_string(), stored(b"", false)),
+        ]);
+        assert!(matches!(refused, Err(OkfError::InvalidPath { path, .. }) if path == "a"));
+    }
+
+    #[test]
+    fn into_stored_returns_every_file() {
+        let ws = MemWorkspace::from_files([("a.md", "a"), ("b/c.txt", "c")]);
+        let files = ws.into_stored();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files["b/c.txt"], stored(b"c", false));
+    }
 
     const FILES: [(&str, &str); 11] = [
         ("index.md", "root"),

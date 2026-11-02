@@ -68,10 +68,6 @@ float `sum()`) and `okf.py` (`OKF_PY`, default
 place and never copied into this repository. `#[ignore]` marks a test that
 plain `cargo test` skips; `-- --ignored` runs only those.
 
-The in-memory `MemWorkspace` test double is compiled only for the crate's
-own unit tests, or with the `test-util` feature
-(`cargo test --features test-util`) for an integration test that needs it.
-
 Before a push, also run `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings` and
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`.
