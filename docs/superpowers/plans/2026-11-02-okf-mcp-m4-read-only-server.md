@@ -3925,11 +3925,13 @@ mod tests {
         let found = history(&ctx, params("infra/b")).await.unwrap();
         let log = history(&ctx, params("/log.md")).await.unwrap();
         let missing = history(&ctx, params("nowhere")).await.unwrap_err();
+        let zero = history(&ctx, HistoryParams { limit: Some(0), ..params("infra/b") }).await.unwrap();
 
         assert_eq!((found.catalog.as_str(), found.path.as_str()), ("work", "/infra/b.md"));
         assert_eq!(found.revisions.len(), 1);
         assert_eq!(found.revisions[0].op, "import");
         assert_eq!(log.path, "/log.md");
+        assert_eq!(zero.revisions.len(), 1);
         assert!(matches!(missing, OkfError::NotFound { .. }));
     }
 }
@@ -3967,7 +3969,7 @@ pub struct HistoryParams {
     pub path: String,
     /// The catalog (default: the first selected catalog with any revision of it).
     pub catalog: Option<String>,
-    /// At most this many revisions (default 20).
+    /// At most this many revisions (default 20; 0 counts as 1).
     pub limit: Option<u32>,
 }
 
@@ -4012,7 +4014,8 @@ fn candidates(reference: &str) -> Vec<String> {
 /// A selection error; [`OkfError::NotFound`] if no selected catalog has any
 /// revision of the path; [`OkfError::Database`].
 pub(crate) async fn history(ctx: &ToolContext, params: HistoryParams) -> Result<History, OkfError> {
-    let limit = params.limit.map_or(DEFAULT_LIMIT, i64::from);
+    // At least 1: with 0, every path would look like it has no history.
+    let limit = params.limit.map_or(DEFAULT_LIMIT, |n| i64::from(n.max(1)));
     let paths = candidates(&params.path);
     for state in ctx.read_set(params.catalog.as_deref())? {
         for path in &paths {
