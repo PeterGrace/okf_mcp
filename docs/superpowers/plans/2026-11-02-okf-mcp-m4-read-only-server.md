@@ -1437,6 +1437,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn overlapping_polls_leave_the_newest_key_list() {
+        let db = test_db().await;
+        let key = new_key(&db.pool, "reader").await;
+        let app = app(&db.pool).await;
+
+        key_rows::revoke(&db.pool, "reader", Utc::now()).await.unwrap();
+        // `join!` runs both passes concurrently; `polling` serializes them.
+        let (first, second) = tokio::join!(app.poll(), app.poll());
+
+        first.unwrap();
+        second.unwrap();
+        assert!(app.keys().find(&key).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn poll_reloads_a_catalog_created_again_under_the_same_name() {
         let db = test_db().await;
         catalogs::create(&db.pool, "pg", "first", Utc::now()).await.unwrap();
@@ -1530,9 +1545,15 @@ pub struct App {
     keys: Arc<Keys>,
     // As in `CatalogState`: the lock is held only to clone or swap the `Arc`.
     catalogs: RwLock<Arc<Catalogs>>,
-    // The `admin_generation` the key cache was loaded at. Only the poll loop
-    // writes it, so `Relaxed` ordering is enough.
+    // The `admin_generation` the key cache was loaded at. Written only under
+    // `polling`, so `Relaxed` ordering is enough.
     admin_generation: AtomicI64,
+    // Held for a whole `poll` pass. Without it, two overlapping passes (the
+    // loop and a test's or a later milestone's direct call) could swap an
+    // older key list in after a newer one while storing the newer counter,
+    // and a revoked key would keep working until the next admin change.
+    // tokio's `Mutex`: it is held across `.await`s.
+    polling: tokio::sync::Mutex<()>,
 }
 
 impl App {
@@ -1581,6 +1602,7 @@ impl App {
             keys,
             catalogs: RwLock::new(Arc::new(loaded)),
             admin_generation: AtomicI64::new(admin_generation),
+            polling: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -1625,11 +1647,15 @@ impl App {
     /// moved, and brings the catalogs in line with the catalog list.
     ///
     /// A catalog that fails to load or refresh is logged and retried at the
-    /// next pass; the others are unaffected.
+    /// next pass; the others are unaffected. Passes never overlap: a call
+    /// made while another runs waits for it, then makes its own pass.
     ///
     /// # Errors
     /// [`OkfError::Database`] reading the counters or the list.
     pub async fn poll(&self) -> Result<(), OkfError> {
+        // The guard (`_` prefix: kept only for its lifetime) releases the
+        // mutex when the function returns.
+        let _polling = self.polling.lock().await;
         let admin_generation = catalogs::admin_generation(&self.pool).await?;
         if admin_generation != self.admin_generation.load(Ordering::Relaxed) {
             self.keys.reload(&self.pool).await?;
@@ -1700,11 +1726,11 @@ Add `pub mod app;` to `src/lib.rs` and the crate doc.
 - [ ] **Step 7: Run the tests**
 
 Run: `cargo test --lib -- app:: catalog`
-Expected: the four `app` tests and every `catalog` test pass.
+Expected: the five `app` tests and every `catalog` test pass.
 
 - [ ] **Step 8: Changelog, gates, commit**
 
-Write `changelog/<ts>-m4-task-04-app.md` (Notes: the catalog list is read every tick, so a new catalog appears without `admin_generation`; a failed refresh keeps the old snapshot). Run every gate. Commit:
+Write `changelog/<ts>-m4-task-04-app.md` (Notes: the catalog list is read every tick, so a new catalog appears without `admin_generation`; a failed refresh keeps the old snapshot; passes are serialized, so direct `poll` calls beside the loop are safe). Run every gate. Commit:
 
 ```bash
 git add Cargo.toml Cargo.lock src/app.rs src/catalog.rs src/lib.rs changelog/
@@ -4808,4 +4834,4 @@ git commit -m "docs: M4 smoke test, README, design update and changelog (M4.12)"
 
 - **Design coverage (M4 row).** axum: T6. rmcp: T5, T6. auth: T2 (401), T11 (403). `selection`: T3, wired in T5. Read tools needing no changeset: `list_catalogs` (T5), `search` (T7), `get_concept` and `read_document` (T8), `history` (T9), `open_questions`, `oldest`, `sprawl`, `links_report`, `lint` (T10). `pending_changes` and `stranded_sessions` need changesets and go to M5 (Scope). Import and export routes: T11. `/healthz`: T6. The poll loop ("Noticing changes made outside the server"): T4. Configuration fields: T1. End-to-end tests (missing, wrong and read-only keys; catalog precedence; export): T6, T11; the full write cycle is M5's. #34: T7.
 - **Placeholders.** None; every step that changes code shows it, and every fact a test pins was checked against M1 to M3's code (the closing `---` is the tail's first line in `Doc`; import writes `import` revisions; sprawl paths are `/`-prefixed).
-- **Names across tasks.** `Principal`, `Reach`, `KeyCache`, `Keys::{new, load, reload, find}`, `bearer`, `require_key` (T2) are used by T3, T4, T5, T6, T11. `Selection::{catalogs, write_target}`, `Sources`, `resolve`, `connection_catalogs` (T3) by T5. `App::{load, pool, config, clock, keys, catalogs, catalog, poll, poll_until}` and `Catalogs` (T4) by T5, T6, T11. `CatalogState::description`, `Loaded::{files, last_change}` (T4) by T5. `ToolContext::{new, from_parts, app, principal, catalogs, select, states, read_set, one}`, `OkfServer::{new, tools, context}`, `ToolResult`, `reply`, `tool_error`, `blocking` (T5) by T7 to T11. `OkfError::{Forbidden, kind, is_internal, to_json}` (T2, T5) by T5, T6. `AppError`, `REQUEST_TIMEOUT`, `router`, `serve` (T6) by T11 and the tests. `TestServer::{start, key, client, mcp_url}`, `call`, `structured`, `files`, `Client` (T6) by T11, T12.
+- **Names across tasks.** `Principal`, `Reach`, `KeyCache`, `Keys::{new, load, reload, find}`, `bearer`, `require_key` (T2) are used by T3, T4, T5, T6, T11. `Selection::{catalogs, write_target}`, `Sources`, `resolve`, `connection_catalogs` (T3) by T5. `App::{load, pool, config, clock, keys, catalogs, catalog, poll, poll_until}` (passes serialized by `polling`) and `Catalogs` (T4) by T5, T6, T11. `CatalogState::description`, `Loaded::{files, last_change}` (T4) by T5. `ToolContext::{new, from_parts, app, principal, catalogs, select, states, read_set, one}`, `OkfServer::{new, tools, context}`, `ToolResult`, `reply`, `tool_error`, `blocking` (T5) by T7 to T11. `OkfError::{Forbidden, kind, is_internal, to_json}` (T2, T5) by T5, T6. `AppError`, `REQUEST_TIMEOUT`, `router`, `serve` (T6) by T11 and the tests. `TestServer::{start, key, client, mcp_url}`, `call`, `structured`, `files`, `Client` (T6) by T11, T12.
