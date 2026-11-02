@@ -427,6 +427,7 @@ mod tests {
             (EntryType::Symlink, b"link", 0o644, b""),
             (EntryType::Link, b"hard", 0o644, b""),
             (EntryType::Fifo, b"fifo", 0o644, b""),
+            (EntryType::Char, b"tty", 0o644, b""),
             (EntryType::Regular, b"../escape", 0o644, b""),
             (EntryType::Regular, b"/abs", 0o644, b""),
             (EntryType::Regular, b"bad\xffname", 0o644, b""),
@@ -438,16 +439,17 @@ mod tests {
 
         let problems = problems(read_tarball(tarball.as_slice(), NO_LIMIT));
 
-        assert_eq!(problems.len(), 9, "{problems:#?}");
+        assert_eq!(problems.len(), 10, "{problems:#?}");
         assert_eq!(problems[0], "link: Symlink entries are not allowed");
         assert_eq!(problems[1], "hard: Link entries are not allowed");
         assert_eq!(problems[2], "fifo: Fifo entries are not allowed");
-        assert!(problems[3].starts_with("../escape: '..'"));
-        assert!(problems[4].starts_with("/abs: absolute"));
-        assert!(problems[5].starts_with("bad\u{fffd}name: the name is not UTF-8"));
-        assert!(problems[6].starts_with("./a: the path is not in normal form"));
-        assert!(problems[7].starts_with("a//b: the path is not in normal form"));
-        assert_eq!(problems[8], "ok.md: appears more than once");
+        assert_eq!(problems[3], "tty: Char entries are not allowed");
+        assert!(problems[4].starts_with("../escape: '..'"));
+        assert!(problems[5].starts_with("/abs: absolute"));
+        assert!(problems[6].starts_with("bad\u{fffd}name: the name is not UTF-8"));
+        assert!(problems[7].starts_with("./a: the path is not in normal form"));
+        assert!(problems[8].starts_with("a//b: the path is not in normal form"));
+        assert_eq!(problems[9], "ok.md: appears more than once");
     }
 
     #[test]
