@@ -104,7 +104,9 @@ Each was checked against the source or by running it on 2026-11-02 (a probe crat
 
 | File | Created/modified by | Responsibility |
 |---|---|---|
-| `src/okf/workspace.rs` | T1 (modify), T11 (doc comment) | `MemWorkspace` with bytes and execute bits, production code |
+| `src/okf/workspace.rs` | T1 (modify), T11 (doc comment), T14 (markdown walk) | `MemWorkspace` with bytes and execute bits, production code; both workspaces' listing rules |
+| `src/okf/paths.rs` | T14 (modify) | `SKIP_DIRS`, `SKIP_TOP`, `new_concept_path`'s machinery rule |
+| `tests/fixtures/catalog/**`, `tests/golden/*` | T14 (fixtures, regenerated goldens and `SOURCE`) | Parity corpus and goldens |
 | `Cargo.toml` | T1 (drop `test-util`), T3 (`sqlx`, `tokio`, dev `testcontainers-modules`), T4 (`clap`, `anyhow`, `toml`, `bytesize`, bin rename), T6 (`getrandom`, `base64`, `sha2`, `subtle`), T7 (`tar`, `flate2`) | Dependencies (keep both sides on conflict) |
 | `README.md` | T1 (drop `test-util` note), T13 (rewrite status, CLI, testing) | Front page |
 | `src/okf/analysis/links.rs` | T2 (modify) | `MentionMatcher` owned and `pub(crate)` |
@@ -155,10 +157,13 @@ Edges, explicitly:
 - T10 -> T11
 - T8 -> T12; T9 -> T12
 - every task -> T13 (T2, T6, T11, T12 included)
+- T1 -> T14 (`MemWorkspace::list_markdown` is T1's rewrite); T14 -> T13
 
 Tasks with no dependencies, which can start straight away: **T1, T2, T3**; T7 follows T1. T1 and T2 touch disjoint files; T1 and T3 both touch `Cargo.toml`, and T3 and T7 both touch `Cargo.toml` and `src/lib.rs`. Keep both sides.
 
 > **Corrected (review of PR #37), 2026-11-02.** Added T1 -> T7: Task 7's `archive` uses `StoredFile` from Task 1.
+
+> **Corrected (issue #50), 2026-11-02.** Added Task 14 (follow `okf.py` 481357b) after live parity started failing, with T1 -> T14 (it changes the `MemWorkspace` listing T1 rewrote) and T14 -> T13 (the milestone wrap-up records it and needs live parity green). It touches only `src/okf/workspace.rs`, `src/okf/paths.rs`, the parity fixtures and goldens, so it runs beside T2 to T12.
 
 ---
 
@@ -4496,7 +4501,7 @@ with a note that every subcommand reads `DATABASE_URL` (or `--database-url`) and
 In `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md`:
 - Status line: "M1 (core library), M2 (analysis) and M3 (storage) are delivered".
 - Milestones table: M3 row "(delivered)" with a link to this plan and the PR range.
-- After "What M2 shipped differently", add "What M3 shipped differently": the in-memory workspace holds bytes and execute bits; text means valid UTF-8; the configuration file holds only `max_import_bytes` until later milestones add theirs; subcommands run migrations on connect; `api_keys.default_catalog_id`; import writes rows one at a time in one transaction (with the measured time); lint's commit time is the last revision time, so after a first import it is the import time; every `Corrected (issue #N)` note from this plan that changes the design.
+- After "What M2 shipped differently", add "What M3 shipped differently": the in-memory workspace holds bytes and execute bits; text means valid UTF-8; the configuration file holds only `max_import_bytes` until later milestones add theirs; subcommands run migrations on connect; `api_keys.default_catalog_id`; import writes rows one at a time in one transaction (with the measured time); lint's commit time is the last revision time, so after a first import it is the import time; every `Corrected (issue #N)` note from this plan that changes the design; the markdown walk and `new_concept_path` follow `okf.py` 481357b (Task 14: `install/` skipped at any depth, `docs/` and `tests/` at the root, so `resolve_concept` does not find a file there either).
 - "Carried into M3 and later": mark #31, #32, #33 and #35 done (with their PR numbers), leaving #34 for M4.
 
 - [ ] **Step 4: Milestone changelog**
@@ -4511,6 +4516,177 @@ Run every gate, including both `--ignored` runs. Commit:
 git add tests/smoke.rs README.md docs/superpowers/specs changelog/
 git commit -m "docs: M3 smoke test, README, design update and changelog (M3.13)"
 ```
+
+---
+
+### Task 14: Follow okf.py 481357b: skip `install/`, and `docs/` and `tests/` at the root (#50)
+
+The catalog adopted the okf-catalog-template in `pg_knowledge_catalog` commit `481357b` (2026-10-28), the only `okf.py` change since the M2 goldens. `walk_md` now prunes `SKIP_DIRS = {".git", ".claude", "install"}` at any depth and `SKIP_TOP = {"docs", "tests"}` at the catalog root only; `new_concept_path` refuses a first component in `SKIP_DIRS | SKIP_TOP | {"tools"}`. The port still walked them, so live parity failed 4 of 6 (7 extra `install/**` documents, 2 extra broken links). No other `okf.py` function uses the two sets: lint's secret walk still prunes only `.git` and `.worktrees`, so `list_files` is unchanged.
+
+**Files:**
+- Modify: `src/okf/paths.rs` (`SKIP_DIRS`, `SKIP_TOP` replace `MACHINERY_DIRS`; `new_concept_path`)
+- Modify: `src/okf/workspace.rs` (`Listing::descends_into` takes `at_root`; `Listing::lists`; `MemWorkspace::listing`; drop `in_dot_directory`, `in_skipped_directory`)
+- Create: `tests/fixtures/catalog/{install/setup.md, docs/plan.md, tests/case.md, markdown/install/nested.md, markdown/docs/nested.md}`
+- Modify: `tests/golden/*` (regenerated)
+- Create: `changelog/<ts>-m3-task-14-okf-py-skips.md`
+
+- [ ] **Step 1: Write the failing tests**
+
+In `src/okf/workspace.rs`'s test module:
+
+```rust
+    /// `install/` anywhere, plus `docs/` and `tests/` at the root, beside
+    /// nested `docs/` and `tests/` that are walked as usual.
+    const SKIP_FILES: [(&str, &str); 7] = [
+        ("a.md", "a"),
+        ("install/setup.md", "template machinery"),
+        ("infra/install/x.md", "nested install"),
+        ("docs/plan.md", "template docs"),
+        ("tests/case.md", "template tests"),
+        ("infra/docs/y.md", "nested docs"),
+        ("infra/tests/z.md", "nested tests"),
+    ];
+
+    fn assert_skips_template_machinery(ws: &dyn Workspace) {
+        assert_eq!(
+            ws.list_markdown().unwrap(),
+            ["a.md", "infra/docs/y.md", "infra/tests/z.md"]
+        );
+        // The secret walk is unchanged: it still reads every one of them.
+        assert_eq!(ws.list_files().unwrap().len(), SKIP_FILES.len());
+    }
+
+    #[test]
+    fn mem_markdown_walk_skips_template_machinery() {
+        assert_skips_template_machinery(&MemWorkspace::from_files(SKIP_FILES));
+    }
+
+    #[test]
+    fn disk_markdown_walk_skips_template_machinery() {
+        let (_dir, ws) = disk_catalog(&SKIP_FILES);
+        assert_skips_template_machinery(&ws);
+    }
+
+    #[test]
+    fn listing_lists_checks_each_component() {
+        assert!(Listing::Markdown.lists("a.md"));
+        assert!(!Listing::Markdown.lists("a.txt"));
+        assert!(!Listing::Markdown.lists("docs/a.md"));
+        assert!(Listing::Markdown.lists("x/docs/a.md"));
+        assert!(!Listing::Markdown.lists("x/install/a.md"));
+        assert!(!Listing::Markdown.lists("x/.hidden/a.md"));
+        assert!(Listing::AllFiles.lists("docs/a.txt"));
+        assert!(!Listing::AllFiles.lists("x/.worktrees/a.txt"));
+    }
+```
+
+In `src/okf/paths.rs`'s `new_concept_path_rules`, add `"install/x"`, `"docs/x"` and `"tests/x"` to the `bad` list, and after the first assertion:
+
+```rust
+        // `SKIP_TOP` applies to the first component only, as in `okf.py`.
+        assert_eq!(
+            new_concept_path(&ws, "infra/docs/x").unwrap(),
+            ("infra/docs/x.md".to_string(), None)
+        );
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `cargo test --lib workspace paths`
+Expected: compile error, `no method named lists` found for `Listing`.
+
+- [ ] **Step 3: Implement**
+
+In `src/okf/paths.rs`, replace `MACHINERY_DIRS` with:
+
+```rust
+/// Directories the markdown walk never enters, at any depth (`okf.py`'s
+/// `SKIP_DIRS`). `install/` is the catalog template's setup machinery.
+pub const SKIP_DIRS: [&str; 3] = [".git", ".claude", "install"];
+/// Directories the markdown walk skips at the catalog root only (`okf.py`'s
+/// `SKIP_TOP`): the template's own development docs and tests. A nested
+/// `infra/docs/` is walked as usual.
+pub const SKIP_TOP: [&str; 2] = ["docs", "tests"];
+
+/// Is `first`, a path's first component, repository machinery where no
+/// concept may live? `okf.py`'s `SKIP_DIRS | SKIP_TOP | {"tools"}`.
+fn is_machinery(first: &str) -> bool {
+    first == "tools" || SKIP_DIRS.contains(&first) || SKIP_TOP.contains(&first)
+}
+```
+
+and in `new_concept_path` use `if is_machinery(first) || path.split('/').any(|p| p.starts_with('.'))`.
+
+In `src/okf/workspace.rs`, import `SKIP_DIRS, SKIP_TOP` from `crate::okf::paths` (and drop the now-unused `dirname` import), delete `in_dot_directory` and `in_skipped_directory`, and give `Listing` the rule in one place:
+
+```rust
+    /// Does the walk descend into a directory with this name? `at_root` is
+    /// true for a directory directly under the catalog root.
+    fn descends_into(self, dir_name: &str, at_root: bool) -> bool {
+        match self {
+            Listing::Markdown => {
+                !dir_name.starts_with('.')
+                    && !SKIP_DIRS.contains(&dir_name)
+                    && !(at_root && SKIP_TOP.contains(&dir_name))
+            }
+            Listing::AllFiles => !matches!(dir_name, ".git" | ".worktrees"),
+        }
+    }
+
+    /// Does the walk list the file at `path` (bundle-relative), given that
+    /// it exists? Checks every directory component and the file name.
+    fn lists(self, path: &str) -> bool {
+        // `rsplit_once` splits at the last `/`, like `path.rpartition("/")`.
+        let Some((dir, name)) = path.rsplit_once('/') else {
+            return self.includes(path);
+        };
+        self.includes(name)
+            && dir
+                .split('/')
+                .enumerate()
+                .all(|(depth, dir_name)| self.descends_into(dir_name, depth == 0))
+    }
+```
+
+`DiskWorkspace::collect` calls `listing.descends_into(name, prefix.is_empty())`. `MemWorkspace` gets one private helper, and `list_markdown` / `list_files` become `Ok(self.listing(Listing::Markdown))` / `Ok(self.listing(Listing::AllFiles))`:
+
+```rust
+    /// The stored paths `listing` selects, in `os.walk` order: the same rules
+    /// [`DiskWorkspace`]'s walk applies, checked per path instead of per directory.
+    fn listing(&self, listing: Listing) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .files()
+            .keys()
+            .filter(|path| listing.lists(path))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| walk_order(a, b));
+        out
+    }
+```
+
+Update `Listing::Markdown`'s doc: "`.md` files outside dot-directories, [`SKIP_DIRS`] at any depth and [`SKIP_TOP`] at the root (`okf.py`'s `walk_md`)."
+
+- [ ] **Step 4: Fixtures and goldens**
+
+First regenerate with the corpus unchanged, to see that only `SOURCE` moves:
+
+Run: `UPDATE_GOLDEN=1 cargo test --test parity -- --ignored regenerate_goldens` then `git diff --stat tests/golden`
+Expected: only `tests/golden/SOURCE` (sha256 `3ee65c4dd69cb50c7cb79052856ad0ba425dbc6f4b7935802d887eb02cfa6c03`).
+
+Then add the fixtures, so `okf.py` itself pins the rule: `install/setup.md`, `docs/plan.md`, `tests/case.md` and `markdown/install/nested.md`, each `# Skipped` and a line with `[broken link](missing.md)`; and `markdown/docs/nested.md`, walked, with `# Nested docs`, a line, and `## Kept heading`. Regenerate again.
+Expected: `frontmatter.json`, `markdown.json` and `analysis.json` gain `markdown/docs/nested.md` only (one more concept, orphan, dead end, index drift, sprawl entry, its lint warnings); the `broken` count stays 4, so no skipped fixture was read.
+
+- [ ] **Step 5: Gates, changelog, commit**
+
+Run the gates. Live parity passes 6 of 6. Changelog: Added (the constants, fixtures, tests), Changed (both walks, `new_concept_path`, goldens), Removed (`MACHINERY_DIRS`), Notes (the secret walk is unchanged). Commit:
+
+```bash
+git add src/okf/workspace.rs src/okf/paths.rs tests/fixtures tests/golden changelog/ docs/superpowers/plans
+git commit -m "fix: follow okf.py 481357b: skip install/, and docs/ and tests/ at the root (M3.14)"
+```
+
+PR body: `Closes #50`.
 
 ---
 
