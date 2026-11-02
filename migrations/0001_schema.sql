@@ -108,7 +108,10 @@ CREATE TABLE revisions (
     changeset_id bigint REFERENCES changesets (id) ON DELETE SET NULL,
     message      text NOT NULL,
     created_at   timestamptz NOT NULL,
-    UNIQUE (catalog_id, path, revision)
+    -- A primary key (for logical replication and tooling), named explicitly
+    -- with the name a plain UNIQUE constraint would get, which tests match.
+    CONSTRAINT revisions_catalog_id_path_revision_key
+        PRIMARY KEY (catalog_id, path, revision)
 );
 -- Deleting a changeset (when its catalog is deleted) clears changeset_id on
 -- its revisions; without this index each one would scan all history.
