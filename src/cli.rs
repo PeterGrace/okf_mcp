@@ -330,6 +330,51 @@ mod tests {
         assert_eq!(rows, [("index.md".to_string(), "test".to_string())]);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_reads_a_tarball_file_and_explains_a_missing_one() {
+        let db = crate::db::pg_support::TestDb::start().await;
+        let clock = FixedClock(chrono::Utc::now());
+        let create = CatalogCommand::Create {
+            name: "pg".to_string(),
+            description: String::new(),
+        };
+        run(cli(Some(db.url.clone()), Command::Catalog(create)), &clock)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = dir.path().join("pg.tar.gz");
+        let script = archive::ExportFile {
+            path: "tools/run.sh",
+            content: b"#!/bin/sh\n",
+            executable: true,
+            modified: clock.0,
+        };
+        archive::write_tarball(File::create(&tarball).unwrap(), &[script]).unwrap();
+        let import = |source: PathBuf| Command::Import {
+            catalog: "pg".to_string(),
+            source,
+            replace: false,
+            actor: "test".to_string(),
+        };
+
+        run(cli(Some(db.url.clone()), import(tarball)), &clock)
+            .await
+            .unwrap();
+        let missing = dir.path().join("missing.tar.gz");
+        let error = run(cli(Some(db.url.clone()), import(missing.clone())), &clock)
+            .await
+            .unwrap_err();
+
+        let rows: Vec<(String, bool)> = sqlx::query_as("SELECT path, executable FROM documents")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, [("tools/run.sh".to_string(), true)]);
+        assert!(error
+            .to_string()
+            .contains(&format!("open {}", missing.display())));
+    }
+
     #[tokio::test]
     async fn import_checks_the_database_before_reading_the_source() {
         // A source that does not exist: reading it first would report "open".
