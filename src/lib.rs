@@ -2,11 +2,13 @@
 //!
 //! The library holds everything except process startup: the OKF document
 //! model (`okf`), catalog archives (`archive`), the per-catalog in-memory
-//! snapshots (`catalog`), the database (`db`), API keys (`keys`), the
-//! catalog store (`store`), the configuration file (`config`), the command
-//! line (`cli`), errors, and the clock. `main.rs` only starts it.
+//! snapshots (`catalog`), the database (`db`), API keys (`keys`) and the
+//! requests they authenticate (`auth`), the catalog store (`store`), the
+//! configuration file (`config`), the command line (`cli`), errors, and the
+//! clock. `main.rs` only starts it.
 
 pub mod archive;
+pub mod auth;
 pub mod catalog;
 pub mod cli;
 pub mod clock;

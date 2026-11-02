@@ -148,8 +148,9 @@ ignored, so one file serves every version.
 
 Catalogs and keys are not in the config; they are rows. The only secret is
 `DATABASE_URL`, from an environment variable backed by a k8s Secret (CNPG generates
-it). Raw API keys are never stored or logged; incoming keys are hashed and compared in
-constant time.
+it). Raw API keys are never stored or logged; incoming keys are hashed and looked up by
+hash (a timing difference in the lookup reveals nothing about a key, so there is no
+constant-time scan).
 
 ### Storage
 
