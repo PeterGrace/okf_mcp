@@ -510,7 +510,7 @@ check keeps `okf.py`'s 2-minute slack. Revision times are written by the server
 |---|---|
 | M1. Core library (delivered) | `okf::yaml`, `okf::doc`, `okf::markdown`, `okf::workspace`, `clock`; the parity test harness ([plan](../plans/2026-10-26-okf-mcp-m1-core-library.md)) |
 | M2. Analysis (delivered) | `lint`, links report, `oldest`, `sprawl`, secret scan; snapshot and search; `okf::timestamp` ([plan](../plans/2026-10-27-okf-mcp-m2-analysis.md); PRs #17-#30) |
-| M3. Storage (delivered) | `config`, `db` and migrations, `store`, `archive`; `catalog` with snapshot swap and the cached mention matcher; import and export subcommands; `catalog` and `key` subcommands; revision-based commit times for lint. Export then import reproduces the real catalog's file contents and modes byte for byte ([plan](../plans/2026-11-02-okf-mcp-m3-storage.md); PRs #48-#61) |
+| M3. Storage (delivered) | `config`, `db` and migrations, `store`, `archive`; `catalog` with snapshot swap and the cached mention matcher; import and export subcommands; `catalog` and `key` subcommands; revision-based commit times for lint. Export then import reproduces the real catalog's file contents and modes byte for byte ([plan](../plans/2026-11-02-okf-mcp-m3-storage.md); PRs #48, #49 and #51-#61) |
 | M4. Read-only server | axum, rmcp, auth, `selection`, the read tools that need no changeset (including `history`), the import and export routes, `/healthz`. Deployable and useful on its own |
 | M5. Writes | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` |
 | M6. Restructuring | `move_concept`, `split_concept`, `delete_concept` |
