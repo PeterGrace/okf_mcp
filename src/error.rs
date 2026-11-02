@@ -78,4 +78,13 @@ pub enum OkfError {
         #[from]
         source: sqlx::migrate::MigrateError,
     },
+
+    /// The configuration file is unreadable or invalid.
+    #[error("{path}: {message}")]
+    Config {
+        /// The file, as given.
+        path: String,
+        /// What is wrong with it.
+        message: String,
+    },
 }

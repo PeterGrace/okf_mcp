@@ -9,12 +9,19 @@ name = "okf_mcp"
 path = "src/lib.rs"
 
 [[bin]]
-name = "okf_mcp"
+name = "okf-mcp"
 path = "src/main.rs"
 
 [dependencies]
+# Application-level errors in the command line (the library uses OkfError).
+anyhow = "1.0.104"
+# Sizes with units in the configuration ("64MiB").
+bytesize = { version = "2.7.0", features = ["serde"] }
 # Wall-clock timestamps for catalog stamps (UTC only; no local-time database needed).
 chrono = { version = "0.4.45", default-features = false, features = ["now"] }
+# The command line (`okf-mcp migrate | catalog | key | import | export`);
+# `env` lets DATABASE_URL fill `--database-url`.
+clap = { version = "4.6.7", features = ["derive", "env"] }
 # Gzip for catalog archives (.tar.gz import and export).
 flate2 = "1.1.10"
 # Insertion-ordered maps, matching Python dict order for frontmatter mappings.
@@ -38,6 +45,8 @@ sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio
 thiserror = "2.0.6"
 # The async runtime sqlx runs on, and the CLI's entry point.
 tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }
+# The configuration file.
+toml = "1.1"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
 
