@@ -515,6 +515,24 @@
     "footnotes": {}
   },
   {
+    "path": "markdown/docs/nested.md",
+    "headings": [
+      [
+        0,
+        1,
+        "Nested docs",
+        "nested-docs"
+      ],
+      [
+        4,
+        2,
+        "Kept heading",
+        "kept-heading"
+      ]
+    ],
+    "footnotes": {}
+  },
+  {
     "path": "people/bad-colon.md",
     "headings": [],
     "footnotes": {}

@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use crate::error::OkfError;
-use crate::okf::paths::dirname;
-use crate::okf::paths::{escapes_root, normpath, walk_order};
+use crate::okf::paths::{escapes_root, normpath, walk_order, SKIP_DIRS, SKIP_TOP};
 use crate::okf::pystr::universal_newlines;
 
 /// Read and write access to one catalog's files.
@@ -138,18 +137,6 @@ fn checked_file(path: &str) -> Result<String, OkfError> {
     Ok(normalized)
 }
 
-/// Is any directory component hidden (starts with `.`)?
-fn in_dot_directory(path: &str) -> bool {
-    dirname(path).split('/').any(|p| p.starts_with('.'))
-}
-
-/// Is any directory component `.git` or `.worktrees`?
-fn in_skipped_directory(path: &str) -> bool {
-    dirname(path)
-        .split('/')
-        .any(|p| matches!(p, ".git" | ".worktrees"))
-}
-
 /// Where a path lands once symlinks are resolved.
 enum Resolution {
     /// Nothing there (or a dangling link): the caller's usual behavior applies.
@@ -165,19 +152,39 @@ enum Resolution {
 // recursive `collect` copies it instead of moving or borrowing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Listing {
-    /// `.md` files outside dot-directories (`okf.py`'s `walk_md`).
+    /// `.md` files outside dot-directories, [`SKIP_DIRS`] at any depth and
+    /// [`SKIP_TOP`] at the root (`okf.py`'s `walk_md`).
     Markdown,
     /// Every file outside `.git` and `.worktrees` directories (`lint`'s secret walk).
     AllFiles,
 }
 
 impl Listing {
-    /// Does the walk descend into a directory with this name?
-    fn descends_into(self, dir_name: &str) -> bool {
+    /// Does the walk descend into a directory with this name? `at_root` is
+    /// true for a directory directly under the catalog root.
+    fn descends_into(self, dir_name: &str, at_root: bool) -> bool {
         match self {
-            Listing::Markdown => !dir_name.starts_with('.'),
+            Listing::Markdown => {
+                !dir_name.starts_with('.')
+                    && !SKIP_DIRS.contains(&dir_name)
+                    && !(at_root && SKIP_TOP.contains(&dir_name))
+            }
             Listing::AllFiles => !matches!(dir_name, ".git" | ".worktrees"),
         }
+    }
+
+    /// Does the walk list the file at `path` (bundle-relative), given that
+    /// it exists? Checks every directory component and the file name.
+    fn lists(self, path: &str) -> bool {
+        // `rsplit_once` splits at the last `/`, like `path.rpartition("/")`.
+        let Some((dir, name)) = path.rsplit_once('/') else {
+            return self.includes(path);
+        };
+        self.includes(name)
+            && dir
+                .split('/')
+                .enumerate()
+                .all(|(depth, dir_name)| self.descends_into(dir_name, depth == 0))
     }
 
     /// Does the walk list a file with this name?
@@ -297,7 +304,7 @@ impl DiskWorkspace {
             // is not a directory here and is never descended into.
             let file_type = entry.file_type().map_err(io_err)?;
             if file_type.is_dir() {
-                if listing.descends_into(name) {
+                if listing.descends_into(name, prefix.is_empty()) {
                     self.collect(listing, &entry.path(), &rel, out)?;
                 }
                 continue;
@@ -624,6 +631,19 @@ impl MemWorkspace {
         // A poisoned lock means a thread panicked mid-write; propagating the panic is right.
         self.files.read().expect("MemWorkspace lock poisoned")
     }
+
+    /// The stored paths `listing` selects, in `os.walk` order: the same rules
+    /// [`DiskWorkspace`]'s walk applies, checked per path instead of per directory.
+    fn listing(&self, listing: Listing) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .files()
+            .keys()
+            .filter(|path| listing.lists(path))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| walk_order(a, b));
+        out
+    }
 }
 
 impl Workspace for MemWorkspace {
@@ -687,25 +707,11 @@ impl Workspace for MemWorkspace {
     }
 
     fn list_markdown(&self) -> Result<Vec<String>, OkfError> {
-        let mut out: Vec<String> = self
-            .files()
-            .keys()
-            .filter(|k| k.ends_with(".md") && !in_dot_directory(k))
-            .cloned()
-            .collect();
-        out.sort_by(|a, b| walk_order(a, b));
-        Ok(out)
+        Ok(self.listing(Listing::Markdown))
     }
 
     fn list_files(&self) -> Result<Vec<String>, OkfError> {
-        let mut out: Vec<String> = self
-            .files()
-            .keys()
-            .filter(|k| !in_skipped_directory(k))
-            .cloned()
-            .collect();
-        out.sort_by(|a, b| walk_order(a, b));
-        Ok(out)
+        Ok(self.listing(Listing::AllFiles))
     }
 }
 
@@ -928,6 +934,50 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(siblings, ["catalog"]);
+    }
+
+    /// `install/` anywhere, plus `docs/` and `tests/` at the root, beside
+    /// nested `docs/` and `tests/` that are walked as usual.
+    const SKIP_FILES: [(&str, &str); 7] = [
+        ("a.md", "a"),
+        ("install/setup.md", "template machinery"),
+        ("infra/install/x.md", "nested install"),
+        ("docs/plan.md", "template docs"),
+        ("tests/case.md", "template tests"),
+        ("infra/docs/y.md", "nested docs"),
+        ("infra/tests/z.md", "nested tests"),
+    ];
+
+    fn assert_skips_template_machinery(ws: &dyn Workspace) {
+        assert_eq!(
+            ws.list_markdown().unwrap(),
+            ["a.md", "infra/docs/y.md", "infra/tests/z.md"]
+        );
+        // The secret walk is unchanged: it still reads every one of them.
+        assert_eq!(ws.list_files().unwrap().len(), SKIP_FILES.len());
+    }
+
+    #[test]
+    fn mem_markdown_walk_skips_template_machinery() {
+        assert_skips_template_machinery(&MemWorkspace::from_files(SKIP_FILES));
+    }
+
+    #[test]
+    fn disk_markdown_walk_skips_template_machinery() {
+        let (_dir, ws) = disk_catalog(&SKIP_FILES);
+        assert_skips_template_machinery(&ws);
+    }
+
+    #[test]
+    fn listing_lists_checks_each_component() {
+        assert!(Listing::Markdown.lists("a.md"));
+        assert!(!Listing::Markdown.lists("a.txt"));
+        assert!(!Listing::Markdown.lists("docs/a.md"));
+        assert!(Listing::Markdown.lists("x/docs/a.md"));
+        assert!(!Listing::Markdown.lists("x/install/a.md"));
+        assert!(!Listing::Markdown.lists("x/.hidden/a.md"));
+        assert!(Listing::AllFiles.lists("docs/a.txt"));
+        assert!(!Listing::AllFiles.lists("x/.worktrees/a.txt"));
     }
 
     #[test]
