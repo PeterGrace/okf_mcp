@@ -1156,7 +1156,6 @@ mod tests {
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
-    use clap::Parser;
 
     fn cli(database_url: Option<String>, command: Command) -> Cli {
         Cli {
@@ -1178,7 +1177,14 @@ mod tests {
     async fn migrate_applies_the_schema() {
         let db = crate::db::pg_support::TestDb::start().await;
 
-        run(cli(Some(db.url.clone()), Command::Migrate), &FixedClock(chrono::Utc::now()))
+        let clock = FixedClock(chrono::Utc::now());
+
+        run(cli(Some(db.url.clone()), Command::Migrate), &clock)
+            .await
+            .unwrap();
+        // A second run finds nothing to apply: every later subcommand
+        // migrates on connect, so this must be a no-op.
+        run(cli(Some(db.url.clone()), Command::Migrate), &clock)
             .await
             .unwrap();
 
@@ -1211,7 +1217,9 @@ The tests build `Cli` directly rather than parsing, so a `DATABASE_URL` in the d
 
 - [ ] **Step 3: Run them to see them fail**
 
-Run: `cargo test --lib config cli`
+> **Corrected (issue #40), 2026-11-02.** `cargo test` takes one test-name filter; a second one before `--` is a usage error. Commands that filter on two names pass them after `--` (`cargo test --lib -- config cli`), here and in Tasks 5, 6, 8 and 11.
+
+Run: `cargo test --lib -- config cli`
 Expected: compile errors (`cannot find type Config`, `Cli`).
 
 - [ ] **Step 4: Implement**
@@ -1414,7 +1422,7 @@ The binary name `okf-mcp` needs no design edit: it is already the design's name.
 
 - [ ] **Step 6: Run the tests**
 
-Run: `cargo test --lib config cli`, then `cargo run -- --help` and `cargo run -- migrate` (no `DATABASE_URL`: the error names it).
+Run: `cargo test --lib -- config cli`, then `cargo run -- --help` and `cargo run -- migrate` (no `DATABASE_URL`: the error names it).
 Expected: PASS; the help lists `serve` and `migrate`.
 
 - [ ] **Step 7: Gates, changelog, commit**
@@ -1575,7 +1583,7 @@ mod tests {
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test --lib store::catalogs cli`
+Run: `cargo test --lib -- store::catalogs cli`
 Expected: compile errors (`unresolved module store`).
 
 - [ ] **Step 3: Implement**
@@ -1879,7 +1887,7 @@ async fn run_catalog(pool: &PgPool, command: CatalogCommand, clock: &dyn Clock) 
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test --lib store::catalogs cli`
+Run: `cargo test --lib -- store::catalogs cli`
 Expected: PASS.
 
 - [ ] **Step 5: Gates, changelog, commit**
@@ -2085,7 +2093,7 @@ mod tests {
 
 - [ ] **Step 3: Run them to see them fail**
 
-Run: `cargo test --lib keys cli`
+Run: `cargo test --lib -- keys cli`
 Expected: compile errors (`unresolved module keys`).
 
 - [ ] **Step 4: Implement**
@@ -2570,7 +2578,7 @@ In the design's "Storage" table, the `api_keys` row's `default_catalog` becomes 
 
 - [ ] **Step 5: Run the tests**
 
-Run: `cargo test --lib keys cli`
+Run: `cargo test --lib -- keys cli`
 Expected: PASS.
 
 - [ ] **Step 6: Gates, changelog, commit**
@@ -3281,7 +3289,7 @@ mod tests {
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test --lib store::documents store::import`
+Run: `cargo test --lib -- store::documents store::import`
 Expected: compile errors (`unresolved module documents`, `import`).
 
 - [ ] **Step 3: Implement `store::documents`**
@@ -3734,7 +3742,7 @@ In the design's "Import" step 3, replace "write the differences as `import` revi
 
 - [ ] **Step 6: Run the tests**
 
-Run: `cargo test --lib store cli`
+Run: `cargo test --lib -- store cli`
 Expected: PASS.
 
 - [ ] **Step 7: Gates, changelog, commit**
@@ -4226,7 +4234,7 @@ Before opening the PR, edit issue #31's body (`gh issue edit 31 --body-file ...`
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test --lib commit_times lint_flags`
+Run: `cargo test --lib -- commit_times lint_flags`
 Expected: compile errors (`cannot find function commit_times`, `no method named lint`).
 
 - [ ] **Step 3: Implement**
