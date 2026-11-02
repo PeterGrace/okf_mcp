@@ -3,3 +3,4 @@
 //! from the caller, so every stored timestamp comes from the server clock.
 
 pub mod catalogs;
+pub mod keys;

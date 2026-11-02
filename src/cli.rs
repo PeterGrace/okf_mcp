@@ -9,13 +9,14 @@ use std::path::PathBuf;
 // `Context` adds a message to an error (anyhow's `.context(..)`), like
 // `raise X from e` with a better message.
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use sqlx::PgPool;
 
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::db;
 use crate::store::catalogs;
+use crate::store::keys::{self, Access, Grants, NewKey};
 
 /// `okf-mcp`: an MCP server for OKF knowledge catalogs.
 // `derive(Parser)` generates the argument parser from the struct, as
@@ -48,6 +49,9 @@ pub enum Command {
     // A nested subcommand: `okf-mcp catalog create ...`.
     #[command(subcommand)]
     Catalog(CatalogCommand),
+    /// Create, list, revoke, grant or ungrant API keys.
+    #[command(subcommand)]
+    Key(KeyCommand),
 }
 
 /// `okf-mcp catalog ...`.
@@ -73,6 +77,64 @@ pub enum CatalogCommand {
     },
 }
 
+/// `okf-mcp key ...`.
+#[derive(Debug, Subcommand)]
+pub enum KeyCommand {
+    /// Create a key and print it once.
+    Create(KeyCreateArgs),
+    /// List keys (never the keys themselves).
+    List,
+    /// Revoke a key.
+    Revoke {
+        /// The key's id.
+        id: String,
+    },
+    /// Grant a key a catalog.
+    Grant {
+        /// The key's id.
+        id: String,
+        /// The catalog.
+        catalog: String,
+    },
+    /// Remove a key's grant of a catalog (and clear it as the key's default).
+    Ungrant {
+        /// The key's id.
+        id: String,
+        /// The catalog.
+        catalog: String,
+    },
+}
+
+/// `okf-mcp key create`'s options.
+// `derive(Args)` makes this struct a group of options that a subcommand
+// variant (`Create(KeyCreateArgs)`) can hold.
+#[derive(Debug, Args)]
+pub struct KeyCreateArgs {
+    /// Unique id (`[A-Za-z0-9._-]+`).
+    pub id: String,
+    /// Access level.
+    #[arg(long, value_enum)]
+    pub access: Access,
+    /// Granted catalogs, comma-separated.
+    // Exactly one of `--catalogs` and `--all`: clap refuses both or neither.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        required_unless_present = "all",
+        conflicts_with = "all"
+    )]
+    pub catalogs: Vec<String>,
+    /// Grant every catalog, present and future.
+    #[arg(long)]
+    pub all: bool,
+    /// The key's default catalog (must be granted).
+    #[arg(long)]
+    pub default: Option<String>,
+    /// The actor its writes are recorded as (default: the id).
+    #[arg(long)]
+    pub actor: Option<String>,
+}
+
 /// Runs one command line.
 ///
 /// # Arguments
@@ -96,6 +158,10 @@ pub async fn run(cli: Cli, clock: &dyn Clock) -> anyhow::Result<()> {
         Command::Catalog(command) => {
             let pool = connect(cli.database_url.as_deref()).await?;
             run_catalog(&pool, command, clock).await?;
+        }
+        Command::Key(command) => {
+            let pool = connect(cli.database_url.as_deref()).await?;
+            run_key(&pool, command, clock).await?;
         }
     }
     Ok(())
@@ -131,6 +197,73 @@ async fn run_catalog(
         CatalogCommand::Delete { name, force } => {
             catalogs::delete(pool, &name, force).await?;
             println!("deleted catalog {name}");
+        }
+    }
+    Ok(())
+}
+
+/// Runs `okf-mcp key ...`. `create` prints the key alone on stdout (so
+/// `$(okf-mcp key create ...)` captures it) and a reminder on stderr; nothing
+/// else ever prints or logs a key.
+///
+/// # Arguments
+/// * `pool` - the migrated database.
+/// * `command` - which key subcommand.
+/// * `clock` - the source of `created_at` and `revoked_at`.
+///
+/// # Errors
+/// The store's refusal or database error.
+async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyhow::Result<()> {
+    match command {
+        KeyCommand::Create(args) => {
+            let grants = if args.all {
+                Grants::All
+            } else {
+                Grants::Catalogs(&args.catalogs)
+            };
+            let new = NewKey {
+                id: &args.id,
+                access: args.access,
+                grants,
+                default_catalog: args.default.as_deref(),
+                actor: args.actor.as_deref().unwrap_or(&args.id),
+            };
+            let key = keys::create(pool, &new, clock.now()).await?;
+            println!("{key}");
+            eprintln!("store this key now: it is not shown again");
+        }
+        KeyCommand::List => {
+            for key in keys::list(pool).await? {
+                let catalogs = if key.all_catalogs {
+                    "*".to_string()
+                } else {
+                    key.catalogs.join(",")
+                };
+                let state = if key.revoked_at.is_some() {
+                    "revoked"
+                } else {
+                    "active"
+                };
+                println!(
+                    "{}\t{}\t{state}\t{catalogs}\tdefault {}\t{}",
+                    key.id,
+                    key.access.as_str(),
+                    key.default_catalog.as_deref().unwrap_or("-"),
+                    key.actor
+                );
+            }
+        }
+        KeyCommand::Revoke { id } => {
+            keys::revoke(pool, &id, clock.now()).await?;
+            println!("revoked key {id}");
+        }
+        KeyCommand::Grant { id, catalog } => {
+            keys::grant(pool, &id, &catalog).await?;
+            println!("granted {catalog} to key {id}");
+        }
+        KeyCommand::Ungrant { id, catalog } => {
+            keys::ungrant(pool, &id, &catalog).await?;
+            println!("removed {catalog} from key {id}");
         }
     }
     Ok(())
@@ -225,6 +358,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names, ["pg"]);
+    }
+
+    #[test]
+    fn key_create_needs_catalogs_or_all_but_not_both() {
+        let parsed = Cli::try_parse_from([
+            "okf-mcp",
+            "key",
+            "create",
+            "k",
+            "--access",
+            "write",
+            "--catalogs",
+            "pg,work",
+        ])
+        .unwrap();
+        let Some(Command::Key(KeyCommand::Create(args))) = parsed.command else {
+            panic!("expected key create");
+        };
+        assert_eq!(
+            (args.access, args.catalogs, args.all),
+            (
+                Access::Write,
+                vec!["pg".to_string(), "work".to_string()],
+                false
+            )
+        );
+
+        let both = Cli::try_parse_from([
+            "okf-mcp",
+            "key",
+            "create",
+            "k",
+            "--access",
+            "read",
+            "--catalogs",
+            "pg",
+            "--all",
+        ]);
+        let neither = Cli::try_parse_from(["okf-mcp", "key", "create", "k", "--access", "read"]);
+        assert_eq!(
+            both.unwrap_err().kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            neither.unwrap_err().kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn key_subcommands_run_against_the_database() {
+        let db = crate::db::pg_support::TestDb::start().await;
+        let clock = FixedClock(chrono::Utc::now());
+        let url = Some(db.url.clone());
+        let create = KeyCommand::Create(KeyCreateArgs {
+            id: "k".to_string(),
+            access: Access::Read,
+            catalogs: Vec::new(),
+            all: true,
+            default: None,
+            actor: None,
+        });
+
+        run(cli(url.clone(), Command::Key(create)), &clock)
+            .await
+            .unwrap();
+        run(cli(url.clone(), Command::Key(KeyCommand::List)), &clock)
+            .await
+            .unwrap();
+        let revoke = KeyCommand::Revoke {
+            id: "k".to_string(),
+        };
+        run(cli(url, Command::Key(revoke)), &clock).await.unwrap();
+
+        let rows: Vec<(String, bool, bool)> =
+            sqlx::query_as("SELECT actor, all_catalogs, revoked_at IS NOT NULL FROM api_keys")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        // The actor defaults to the id.
+        assert_eq!(rows, [("k".to_string(), true, true)]);
     }
 
     #[tokio::test]

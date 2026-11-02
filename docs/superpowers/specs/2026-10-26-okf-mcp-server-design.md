@@ -121,7 +121,7 @@ Subcommands:
 | `import NAME PATH [--replace]` | Imports a directory or `.tar.gz` into a catalog (see "Import") |
 | `export NAME OUT.tar.gz` | Writes the export tarball |
 | `key create ID --access read\|write\|admin --catalogs pg,work\|--all [--default pg] [--actor A]` | Generates a random key, stores its SHA-256, prints the key once |
-| `key list`, `key revoke ID`, `key grant ID CATALOG`, `key ungrant ID CATALOG` | Manage keys |
+| `key list`, `key revoke ID`, `key grant ID CATALOG`, `key ungrant ID CATALOG` | Manage keys (`grant` and `ungrant` refuse a key created with `--all`) |
 
 Every subcommand that touches the database applies the embedded migrations first
 (idempotent); `migrate` exists for deploy hooks that want them as a separate step.
@@ -163,7 +163,7 @@ One Postgres database. Migrations live in `migrations/` and are embedded with
 | `revisions` | Append-only history: `catalog_id`, `path`, `revision`, `op` (`create`, `update`, `delete`, `import`), `content` (NULL for a delete), `actor`, `changeset_id`, `message`, `created_at` |
 | `changesets` | One per (MCP session, catalog): `id`, `catalog_id`, `session_id`, `key_id`, `actor`, `state` (`open`, `published`, `discarded`), `created_at`, `updated_at` |
 | `changeset_entries` | Per changed path: `changeset_id`, `path`, `base_revision` (NULL for a path with no live document), `content` (NULL for a delete), `replay` (the entry's listing and log operations, JSON, while every change to the entry came from one; NULL once any other edit touches it) |
-| `api_keys` | `id`, `sha256`, `access`, `all_catalogs`, `default_catalog`, `actor`, `created_at`, `revoked_at` |
+| `api_keys` | `id`, `sha256`, `access`, `all_catalogs`, `default_catalog_id` (references `catalogs`; cleared when that catalog is deleted, or when the key loses its grant), `actor`, `created_at`, `revoked_at` |
 | `key_catalogs` | `(key_id, catalog_id)` grants |
 | `server_state` | One row: `admin_generation`, bumped by every `catalog` and `key` subcommand |
 
