@@ -32,7 +32,7 @@ Deliberately deferred:
 | Item | Goes to | Why |
 |---|---|---|
 | `pending_changes`, `stranded_sessions`, `lint pending`, the write tools, changesets, overlays, publish | M5 | Design milestone table: they need a changeset |
-| How a changeset is identified when a client negotiates MCP `2026-07-28` (no sessions; see Decision 2) | M5 (design question) | Sessions only matter to changesets |
+| How a changeset is identified when a client negotiates MCP `2026-07-28` (no sessions; see Decision 2), and binding it to the key that created it (an M4 session is not tied to a key) | M5 (design question) | Sessions only matter to changesets |
 | Discarding empty changesets on session close or idle, the 24-hour prune | M5 | Design "Session lifecycle"; M4 creates no changesets. M4 does set rmcp's session idle timeout from `session_idle_timeout` |
 | The NTP offset check, `time_server`, the clock offset in `/healthz` | M7 | Design milestone table |
 | `move_concept`, `split_concept`, `delete_concept` | M6 | Design milestone table |
@@ -4881,7 +4881,7 @@ Rewrite the status line (M1 to M4 delivered) and add "Running the server": `okf-
 - Status line at the top: M1 to M4 delivered.
 - Add "What M4 shipped differently", listing the plan's deviations (key lookup by hash; the text block is the JSON; lists wrapped in objects; `open_questions` from `oldest`; export built in memory; the import body cap's gzip slack; the catalog list polled each tick; `poll` passes serialized; 404 for unreachable catalogs; no timeout on `/mcp`) and every dated `Corrected` note from this plan.
 - In "Carried into M3 and later", mark #34 done in M4 (PR number), and the cross-catalog search merge.
-- Add under "Session lifecycle", or as a new "Open questions for M5" paragraph: "MCP `2026-07-28` removes sessions; rmcp 3.8 serves a client on that version statelessly, with no `Mcp-Session-Id`. 'One changeset per (MCP session, catalog)' needs a different identity for such clients (for example per key and a client-chosen name); M5 decides (M4 plan, Decision 2)."
+- Add under "Session lifecycle", or as a new "Open questions for M5" paragraph: "MCP `2026-07-28` removes sessions; rmcp 3.8 serves a client on that version statelessly, with no `Mcp-Session-Id`. 'One changeset per (MCP session, catalog)' needs a different identity for such clients (for example per key and a client-chosen name); M5 decides (M4 plan, Decision 2). Whatever the identity, M5 binds it to the key that created it: in M4 a session is not tied to a key, so another valid key that learned an `Mcp-Session-Id` could attach to that session's streams (it gains no access, since every request is authorized by its own key), and changesets must not inherit that."
 
 - [ ] **Step 4: The milestone changelog**
 
