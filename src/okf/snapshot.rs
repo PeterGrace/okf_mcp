@@ -277,20 +277,27 @@ impl Snapshot {
         })
     }
 
-    /// The matcher `links_report` uses for unlinked mentions, over every
-    /// concept in the link graph.
+    /// The concepts `okf.py`'s link analysis sees (in the link graph, kind
+    /// Concept), in `os.walk` order.
+    ///
+    /// The one definition shared by `links_report`, whose mention *sources*
+    /// they are, and [`Snapshot::mention_matcher`], whose *targets* they are,
+    /// so the two can't drift apart.
+    pub(crate) fn link_graph_concepts(&self) -> impl Iterator<Item = &SnapshotDoc> {
+        self.docs
+            .iter()
+            .filter(|doc| doc.in_link_graph() && doc.kind == DocKind::Concept)
+    }
+
+    /// The matcher `links_report` uses for unlinked mentions, over
+    /// [`Snapshot::link_graph_concepts`].
     ///
     /// # Returns
     /// The matcher, built on the first call and reused by every later one
     /// (the snapshot is immutable, so it never goes stale).
     pub(crate) fn mention_matcher(&self) -> &MentionMatcher {
         self.mention_matcher.get_or_init(|| {
-            // The concepts `links_report` collects: in the link graph, kind Concept.
-            let concepts: Vec<&SnapshotDoc> = self
-                .docs
-                .iter()
-                .filter(|doc| doc.in_link_graph() && doc.kind == DocKind::Concept)
-                .collect();
+            let concepts: Vec<&SnapshotDoc> = self.link_graph_concepts().collect();
             MentionMatcher::new(&concepts)
         })
     }
@@ -681,6 +688,24 @@ mod tests {
             report,
             crate::okf::analysis::links::links_report(&snapshot, true)
         );
+    }
+
+    #[test]
+    fn link_graph_concepts_are_the_concepts_outside_root_machinery() {
+        // Arrange
+        let snapshot = Snapshot::build(&MemWorkspace::from_files([
+            ("AGENTS.md", "# Agents\n"),
+            ("index.md", "* [A](/a.md)\n"),
+            ("a.md", "---\ntype: Note\n---\nBody.\n"),
+            ("infra/b.md", "---\ntype: Host\n---\nBody.\n"),
+        ]))
+        .unwrap();
+
+        // Act
+        let paths: Vec<&str> = snapshot.link_graph_concepts().map(|d| d.path()).collect();
+
+        // Assert
+        assert_eq!(paths, ["a.md", "infra/b.md"]);
     }
 
     fn catalog() -> MemWorkspace {

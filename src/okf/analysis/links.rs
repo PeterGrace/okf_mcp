@@ -124,11 +124,8 @@ pub fn links_report(snapshot: &Snapshot, mentions: bool) -> LinksReport {
         .iter()
         .filter(|d| d.in_link_graph())
         .collect();
-    let concepts: Vec<&SnapshotDoc> = graph
-        .iter()
-        .copied()
-        .filter(|d| d.kind() == DocKind::Concept)
-        .collect();
+    // The same concepts the cached mention matcher targets.
+    let concepts: Vec<&SnapshotDoc> = snapshot.link_graph_concepts().collect();
     let concept_paths: HashSet<&str> = concepts.iter().map(|d| d.path()).collect();
 
     let mut report = LinksReport::default();
