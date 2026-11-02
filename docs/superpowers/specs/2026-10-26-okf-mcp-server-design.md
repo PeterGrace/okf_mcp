@@ -35,7 +35,8 @@ webhook. Before M3 was planned, pgrace replaced that with Postgres storage:
 - Export is an authenticated route that builds a tarball on request. There is no
   automated mirror to git.
 
-What did not change: HTTP transport, bearer keys, catalog selection, the tool list, the
+What did not change: HTTP transport, bearer keys, catalog selection, the existing tools
+(this revision adds `history`, `revert`, `adopt_changeset` and an `admin` access level), the
 write rules, the time rules, and everything M1 and M2 built. Documents are stored as
 their exact text, so `okf::doc`'s byte-preserving edits, the snapshot and every analysis
 work unchanged over an in-memory workspace loaded from the database.
@@ -52,7 +53,7 @@ work unchanged over an in-memory workspace loaded from the database.
 | Scope | Full read-write: every `okf.py` command plus content editing, search and concept retrieval |
 | Implementation | Port everything to Rust. No Python at runtime |
 | Write grouping | One changeset per (MCP session, catalog), created on first write and kept in the database; explicit `publish` |
-| Concurrency | Publish checks each changed document's base revision in one transaction; `log` and `index` edits are replayed onto the current text instead |
+| Concurrency | Publishes to a catalog are serialized by a per-catalog lock; each checks its documents' base revisions, replays bookkeeping edits of `log.md` and `index.md` onto the current text, and re-checks links into deleted or moved paths |
 | Getting data in and out | Import from an OKF directory or tarball; export as a tarball through an authenticated route. No git anywhere in the server |
 | Administration | `okf-mcp` subcommands against the database (`migrate`, `catalog`, `key`, `import`, `export`), plus the HTTP import and export routes |
 
@@ -150,13 +151,18 @@ One Postgres database. Migrations live in `migrations/` and are embedded with
 
 | Table | Holds |
 |---|---|
-| `catalogs` | `id`, `name` (unique, `[a-z0-9-]+`), `description`, `created_at` |
+| `catalogs` | `id`, `name` (unique, `[a-z0-9-]+`), `description`, `generation` (bumped by every publish and import), `created_at` |
 | `documents` | One row per file: `catalog_id`, `path` (catalog-relative, `/`-separated), `content` (`bytea`, the file's exact bytes), `executable` (the file's execute bit, so scripts round-trip), `revision` (+1 per change, never reused for a path), `deleted_at` (a tombstone: a deleted document keeps its row, so a path created again continues its revision numbering), `updated_at`, `updated_by`; derived `kind`, `concept_type`, `title`, `status`, `tags`. Primary key `(catalog_id, path)` |
 | `revisions` | Append-only history: `catalog_id`, `path`, `revision`, `op` (`create`, `update`, `delete`, `import`), `content` (NULL for a delete), `actor`, `changeset_id`, `message`, `created_at` |
 | `changesets` | One per (MCP session, catalog): `id`, `catalog_id`, `session_id`, `key_id`, `actor`, `state` (`open`, `published`, `discarded`), `created_at`, `updated_at` |
 | `changeset_entries` | Per changed path: `changeset_id`, `path`, `base_revision` (NULL for a path with no live document), `content` (NULL for a delete), `replay` (the entry's listing and log operations, JSON, while every change to the entry came from one; NULL once any other edit touches it) |
 | `api_keys` | `id`, `sha256`, `access`, `all_catalogs`, `default_catalog`, `actor`, `created_at`, `revoked_at` |
 | `key_catalogs` | `(key_id, catalog_id)` grants |
+
+Constraints the design relies on: `revisions` is unique on `(catalog_id, path,
+revision)`; `changesets` has a partial unique index on `(catalog_id, session_id) WHERE
+state = 'open'`, so a racing "get or create" cannot open two changesets for one session;
+`api_keys.sha256` is unique and indexed.
 
 Every file of a catalog is a document: concepts, `index.md`, `log.md`, `AGENTS.md`, and
 non-markdown files such as `tools/okf.py`. Content is stored as bytes (`bytea`, since
@@ -184,8 +190,9 @@ A session with an open changeset for a catalog reads that catalog through an ove
 the published snapshot plus its changeset entries, rebuilt lazily after the session's
 writes, so an agent sees its own pending edits.
 
-The server runs one replica. A second replica would need Postgres `LISTEN`/`NOTIFY` on
-publish to rebuild its snapshots; that is not planned.
+The server runs one replica. It notices changes made outside it (a CLI import) through
+the catalog's `generation` counter (see "Publish"). A second replica would need the same
+check before every read, or Postgres `LISTEN`/`NOTIFY`; that is not planned.
 
 ### Crate layout
 
@@ -310,33 +317,57 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
 
 ### Publish
 
-1. Lint the overlay. Refuse if any **changed** file has errors; errors elsewhere are
-   returned as warnings (as `okf.py publish` does).
-2. Nothing changed: return "nothing to publish".
-3. In one transaction, with the changeset's documents locked (`SELECT ... FOR UPDATE`;
-   tombstones are rows, so a previously deleted path locks too). A path that has never
-   existed has no row to lock, so its entry is written with `INSERT ... ON CONFLICT DO
-   NOTHING`; zero rows inserted means another session created it first, which is a
-   conflict like any other (never the opaque `Database` error):
-   - an entry with a `replay` whose base revision is stale has its operations
-     re-applied to the current text, as git's `union` merge did for concurrent
-     `log.md` lines. The write rules (secret scan, frontmatter parses) and lint run
-     again on the replayed result; a failure rolls back and is returned like a
-     pre-publish failure;
-   - any other entry whose base revision is not the current one is a conflict: roll
-     back and return `Conflict { files }` with each file's base and current revision.
-     The changeset stays open; the agent re-reads, re-applies and publishes again;
-   - otherwise write each document (revision + 1), a `revisions` row carrying the
-     message and actor, and mark the changeset `published`.
-4. After the commit: rebuild and swap the catalog snapshot. Return the new revisions
-   and changed paths.
+Every write to a catalog's published state (publish, import) runs under that catalog's
+**publish lock**: an in-process mutex, plus a Postgres advisory lock
+(`pg_advisory_xact_lock` on the catalog id) held by the transaction, so a CLI import
+running beside the server is serialized too. Publishes to one catalog therefore run one
+at a time, each against the current published state.
+
+1. Nothing changed: return "nothing to publish".
+2. Take the publish lock and begin the transaction. If the catalog's `generation` (a
+   counter bumped by every publish and import) differs from the in-memory snapshot's,
+   rebuild the snapshot first, so the checks below see the current state.
+3. Check each entry against the current document:
+   - an entry with a `replay` whose base is stale (the base revision is not the current
+     one, or the base is NULL and the path now has a live document, such as a new
+     folder's `index.md` that another session created first) has its operations
+     re-applied to the current content, as git's `union` merge did for concurrent
+     `log.md` lines. The operations are idempotent where that matters (creating a
+     folder index that exists, listing a concept already listed);
+   - any other entry whose base is stale (including a NULL base on a path that now has
+     a live document) is a conflict: roll back and return `Conflict { files }` with
+     each file's base and current revision. The changeset stays open; the agent
+     re-reads, re-applies and publishes again.
+4. Build the overlay (the current snapshot plus the entries, replays applied) and run
+   the checks on it:
+   - the write rules (secret scan, frontmatter parses) on every replayed result;
+   - lint: refuse if any **changed** file has errors; errors elsewhere are returned as
+     warnings (as `okf.py publish` does);
+   - links into deleted or moved paths: refuse if any document outside the changeset
+     still links to a path this changeset deletes or moves away from. This catches a
+     link another session published after this session's `delete_concept` check ran.
+   A failure rolls back and is returned like any other refusal.
+5. Write each document (revision + 1), a `revisions` row carrying the message and actor,
+   bump `generation`, mark the changeset `published`, and commit.
+6. Still holding the in-process lock (the advisory lock ended with the transaction),
+   rebuild and swap the catalog snapshot. Return the new revisions and changed paths.
+
+The checks run while the lock is held, so they stay small: the overlay shares the
+current snapshot's documents and re-reads only the changed ones (about 10 ms for a full
+snapshot plus lint of the real catalog in M2's smoke test). Reads never take the lock.
+The unique constraints are a backstop: a violation still maps to `Conflict`, never to
+the opaque `Database` error.
+
+The server also polls `generation` every 30 seconds, so a catalog changed by a CLI
+import while the server runs is picked up without a restart.
 
 ### Import
 
 `okf-mcp import NAME PATH` or `POST /catalogs/{name}/import`:
 
 1. Read every file of the directory or tarball, with its execute bit. From a
-   directory, `.git/`, `.worktrees/` and `__pycache__/` are skipped; every other file is
+   directory, `.git` (a directory, or the link file a git worktree has), `.worktrees/`
+   and `__pycache__/` are skipped; every other file is
    kept, dotfiles included (a catalog tracks `.claude/skills/`, `.gitattributes` and
    `.okf-catalog.json`). A tarball's paths are taken as they are, with no prefix
    stripped, so `git archive --format=tar.gz HEAD` on a checkout imports exactly its
@@ -482,6 +513,9 @@ Raised in M2 reviews and filed as issues (label `milestone-3`):
   catalog-relative paths". With Postgres storage it becomes: fill `CommitTimes` from
   each document's last revision time (M3), and mark the session's changeset paths dirty
   (M5). Keys are document paths, which are already catalog-relative.
+  M3 also updates the doc comments that still describe the git plan
+  (`src/okf/analysis/lint.rs` module docs and `CommitTimes::new`, `src/okf/workspace.rs`,
+  `src/error.rs`).
 - **#32 Snapshot swapping** (`RwLock<Arc<Snapshot>>`, rebuilt after publish or import):
   M3.
 - **#33 Mention matcher cache** per snapshot (PR #23): M3, after #32.

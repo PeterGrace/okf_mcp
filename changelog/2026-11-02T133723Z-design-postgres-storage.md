@@ -17,9 +17,14 @@
   base revisions in one transaction (`Conflict { files }`); `log` and `index` edits are
   replayed onto the current text, as git's `union` merge did. That covers every
   bookkeeping change to an `index.md` (`index`, `create_concept`'s listing, and the
-  listing changes of move, split and delete); a free-text `index.md` edit is not
-  replayable. Replayed results go through the write rules and lint again, and a
-  concurrent create of the same path is a `Conflict`, not a database error. Changesets survive a pod
+  listing changes of move, split and delete, including a new folder's `index.md` that
+  another session created first); a free-text `index.md` edit is not replayable.
+- **Publish lock:** publishes and imports of a catalog are serialized (an in-process
+  mutex plus a Postgres advisory lock), so each publish checks against the current
+  state: base revisions, replay, the write rules and lint on the result, and links into
+  paths it deletes or moves (another session may have published a link meanwhile). A
+  `generation` counter lets the server notice a CLI import. Unique constraints on
+  `revisions`, open `changesets` per session, and `api_keys.sha256` are the backstop. Changesets survive a pod
   restart; `adopt_changeset` picks up a stranded one.
 - **Added:** import (directory or tarball; `git archive` for a clean checkout) and
   export (an authenticated route building a tarball on request, with no top-level
