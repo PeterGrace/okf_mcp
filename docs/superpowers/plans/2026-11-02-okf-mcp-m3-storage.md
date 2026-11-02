@@ -70,7 +70,7 @@ Each was checked against the source or by running it on 2026-11-02 (a probe crat
 2. **Pool and migrations.** `PgPoolOptions::new()` (`R/sqlx-core-0.9.0/src/pool/options.rs:143`), `.max_connections(u32)` (`:173`), `.connect(&str).await` (`:528`). `sqlx::migrate!("./migrations")` needs the `macros` feature (`R/sqlx-0.9.0/src/lib.rs:97-98`), embeds the files at compile time relative to `CARGO_MANIFEST_DIR`, and rejects a bare `"migrations"` (`R/sqlx-macros-core-0.9.0/src/common.rs:17-24`). Adding a migration file does not trigger a rebuild without `build.rs` printing `cargo:rerun-if-changed=migrations` (`R/sqlx-0.9.0/src/macros/mod.rs:22-33`). `Migrator::run(&pool)` (`R/sqlx-core-0.9.0/src/migrate/migrator.rs:176`) returns `Result<(), MigrateError>`; a second run is a no-op.
 3. **Transactions and queries.** `pool.begin()` gives `Transaction<'static, Postgres>` (`pool/mod.rs:371`); execute with `&mut *tx` (`transaction.rs:229`, `DerefMut` to `PgConnection`); `commit()` (`:120`); dropping without commit rolls back (`:269-277`). `.bind(..)` (`query.rs:87`); `fetch_one/fetch_all/fetch_optional/execute` (`query.rs:185,247,269,291`); `#[derive(sqlx::FromRow)]` (the `macros` feature includes `derive`); a tuple is a `FromRow` type. `execute(..).rows_affected()` (`query_result.rs:9`).
 4. **Types.** `bytea` ↔ `Vec<u8>` (NUL and 0xFF round-trip), `text[]` ↔ `Vec<String>`, `timestamptz` ↔ `chrono::DateTime<Utc>`, `bigint` ↔ `i64`, `integer` ↔ `i32`, `boolean` ↔ `bool`, nullable ↔ `Option<T>` (bind `None::<String>`). The crate's `chrono` 0.4.45 with `default-features = false, features = ["now"]` works with sqlx's `chrono` feature.
-5. **Errors.** `sqlx::Error::as_database_error()` (`R/sqlx-core-0.9.0/src/error.rs:144`) then `.is_unique_violation()` (`:260`; code `23505`) and `.constraint()` (`R/sqlx-postgres-0.9.0/src/error.rs:241`). The constraint for `UNIQUE (catalog_id, path, revision)` on `revisions` is named `revisions_catalog_id_path_revision_key`; a partial unique index reports its index name. `SELECT pg_advisory_xact_lock($1)` (bind `i64`, run with `execute`, since it returns `void`) blocks other transactions until commit or rollback; the plan uses the two-key `int4, int4` form of the same function with a namespace key (PostgreSQL docs, "Advisory Lock Functions"), which takes the same path in the server.
+5. **Errors.** `sqlx::Error::as_database_error()` (`R/sqlx-core-0.9.0/src/error.rs:144`) then `.is_unique_violation()` (`:260`; code `23505`) and `.constraint()` (`R/sqlx-postgres-0.9.0/src/error.rs:241`). The constraint for `revisions`' key `(catalog_id, path, revision)` is named `revisions_catalog_id_path_revision_key` (a primary key named explicitly since review of PR #49; a duplicate still reports it with `is_unique_violation()`); a partial unique index reports its index name. `SELECT pg_advisory_xact_lock($1)` (bind `i64`, run with `execute`, since it returns `void`) blocks other transactions until commit or rollback; the plan uses the two-key `int4, int4` form of the same function with a namespace key (PostgreSQL docs, "Advisory Lock Functions"), which takes the same path in the server.
 6. **testcontainers.** `testcontainers-modules` 0.15.0 requires `testcontainers ^0.27` (not 0.28): depend only on the modules crate and use its re-export `testcontainers_modules::testcontainers` (`R/testcontainers-modules-0.15.0/src/lib.rs:212`). `Postgres::default().with_tag("17-alpine").start().await` (`ImageExt::with_tag`, `R/testcontainers-0.27.3/src/core/image/image_ext.rs:66`; `AsyncRunner::start`, `runners/async_runner.rs:65`); the default tag `11-alpine` is end-of-life, so always set one. `get_host().await` and `get_host_port_ipv4(5432).await`; URL `postgres://postgres:postgres@{host}:{port}/postgres` (`R/testcontainers-modules-0.15.0/src/postgres/mod.rs:103-107`). Dropping the `ContainerAsync` removes the container, on multi-thread and current-thread `#[tokio::test]` alike (`core/async_drop.rs:16-33`). **A container in a `static` is never dropped** (Rust does not drop statics, and there is no reaper), so each test owns its container.
 7. **tar 0.4.46 and flate2 1.1.10.** Writing: `tar::Builder::new(GzEncoder::new(w, Compression::default()))`; `Header::new_ustar()`, `set_entry_type`, `set_size`, `set_mode`, `set_mtime`; `append_data(&mut header, path, reader)` sets the path (adding a GNU long-name entry when needed) and the checksum (`R/tar-0.4.46/src/builder.rs:213-221,851-896`); `into_inner()` then `finish()`. Reading: `Archive::new(GzDecoder::new(r)).entries()`; per entry `path_bytes()` (raw name, `entry.rs:87`), `header().entry_type()`, `header().mode()?` (fails on a garbage mode field), `read_to_end`. GNU long names and local pax headers are folded into the next entry, but **a pax global header (`EntryType::XGlobalHeader`) is yielded as an entry**. tar reads long-name and pax payloads whole with no limit, so the uncompressed cap must wrap the decompressed stream, and `Archive::into_inner()` (`archive.rs:72`) tells "cap exceeded" from other errors. Raw names such as `../escape`, `/abs`, `./a`, `a//b` and non-UTF-8 bytes come through `path_bytes` unchanged.
 8. **`git archive --format=tar.gz HEAD` of `pg_knowledge_catalog`** (HEAD `67ca473b`): 1 `XGlobalHeader` (`pax_global_header`, holding the commit id), 36 `Directory` entries (names end in `/`), 225 `Regular` files (= `git ls-files`). Modes are 0664/0775 (git's `tar.umask` 002), so executability is `mode & 0o111 != 0`; the 19 files at 0775 are exactly the index's `100755` entries. Every mtime is the commit time. The catalog tracks `.claude/skills/*`, `.gitattributes`, `.gitignore`, `.okf-catalog.json`; every file is valid UTF-8 (one is empty).
@@ -710,11 +710,10 @@ mod tests {
                 "server_state",
             ]
         );
-        let admin_generation: i64 =
-            sqlx::query_scalar("SELECT admin_generation FROM server_state")
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
+        let admin_generation: i64 = sqlx::query_scalar("SELECT admin_generation FROM server_state")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(admin_generation, 0);
     }
 
@@ -729,16 +728,22 @@ mod tests {
         .await
         .unwrap();
 
-        let bad_name = sqlx::query("INSERT INTO catalogs (name, created_at) VALUES ('Bad Name', $1)")
-            .bind(chrono::Utc::now())
-            .execute(&db.pool)
-            .await
-            .unwrap_err();
+        let bad_name =
+            sqlx::query("INSERT INTO catalogs (name, created_at) VALUES ('Bad Name', $1)")
+                .bind(chrono::Utc::now())
+                .execute(&db.pool)
+                .await
+                .unwrap_err();
         assert!(bad_name.as_database_error().unwrap().is_check_violation());
 
         let open = "INSERT INTO changesets (catalog_id, session_id, actor, state, created_at, \
                     updated_at) VALUES ($1, 's1', 'a', 'open', $2, $2)";
-        sqlx::query(open).bind(catalog).bind(chrono::Utc::now()).execute(&db.pool).await.unwrap();
+        sqlx::query(open)
+            .bind(catalog)
+            .bind(chrono::Utc::now())
+            .execute(&db.pool)
+            .await
+            .unwrap();
         let second = sqlx::query(open)
             .bind(catalog)
             .bind(chrono::Utc::now())
@@ -766,24 +771,76 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap_err();
+        let duplicate = duplicate.as_database_error().unwrap();
+        assert!(duplicate.is_unique_violation());
         assert_eq!(
-            duplicate.as_database_error().unwrap().constraint(),
+            duplicate.constraint(),
             Some("revisions_catalog_id_path_revision_key")
         );
 
-        // Deleting the catalog cascades to every row that refers to it.
-        sqlx::query("DELETE FROM catalogs WHERE id = $1").bind(catalog).execute(&db.pool).await.unwrap();
-        let left: (i64, i64) = sqlx::query_as(
-            "SELECT (SELECT count(*) FROM changesets), (SELECT count(*) FROM revisions)",
+        // One row in every other table that refers to the catalog.
+        sqlx::query(
+            "INSERT INTO documents (catalog_id, path, content, executable, revision, \
+             updated_at, updated_by) VALUES ($1, 'a.md', $2, false, 1, $3, 'a')",
+        )
+        .bind(catalog)
+        .bind(b"x".to_vec())
+        .bind(chrono::Utc::now())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO api_keys (id, sha256, access, all_catalogs, default_catalog_id, \
+             actor, created_at) VALUES ('k1', $1, 'read', false, $2, 'a', $3)",
+        )
+        .bind(vec![0u8; 32])
+        .bind(catalog)
+        .bind(chrono::Utc::now())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO key_catalogs (key_id, catalog_id) VALUES ('k1', $1)")
+            .bind(catalog)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO changeset_entries (changeset_id, path, content) \
+             SELECT id, 'a.md', $1 FROM changesets",
+        )
+        .bind(b"z".to_vec())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Deleting the catalog cascades to every row that refers to it, and
+        // clears the key's default instead of deleting the key.
+        sqlx::query("DELETE FROM catalogs WHERE id = $1")
+            .bind(catalog)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let left: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM documents), (SELECT count(*) FROM key_catalogs), \
+             (SELECT count(*) FROM changesets), (SELECT count(*) FROM changeset_entries), \
+             (SELECT count(*) FROM revisions)",
         )
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(left, (0, 0));
+        assert_eq!(left, (0, 0, 0, 0, 0));
+        // `Option<i64>` decodes a nullable column: `None` is SQL NULL.
+        let default_catalog: Option<i64> =
+            sqlx::query_scalar("SELECT default_catalog_id FROM api_keys WHERE id = 'k1'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(default_catalog, None);
     }
-
 }
 ```
+
+> **Corrected (issue #39), 2026-11-02.** After review of PR #49: the schema below indexes the foreign keys a catalog or key delete looks up (`changesets_catalog_id`, `changesets_key_id`, `key_catalogs_catalog_id`, `api_keys_default_catalog_id`, `revisions_changeset_id`), and `revisions`' key is a `PRIMARY KEY` named `revisions_catalog_id_path_revision_key` (the name the `UNIQUE` constraint had). `constraints_hold` above also checks the cascade to `documents`, `key_catalogs` and `changeset_entries`, and that deleting a catalog clears `api_keys.default_catalog_id`.
 
 - [ ] **Step 3: Run them to see them fail**
 
@@ -847,12 +904,18 @@ CREATE TABLE api_keys (
     created_at      timestamptz NOT NULL,
     revoked_at      timestamptz
 );
+-- Lets deleting a catalog find the keys whose default it clears.
+CREATE INDEX api_keys_default_catalog_id ON api_keys (default_catalog_id)
+    WHERE default_catalog_id IS NOT NULL;
 
 CREATE TABLE key_catalogs (
     key_id     text NOT NULL REFERENCES api_keys (id) ON DELETE CASCADE,
     catalog_id bigint NOT NULL REFERENCES catalogs (id) ON DELETE CASCADE,
     PRIMARY KEY (key_id, catalog_id)
 );
+-- The primary key leads with key_id, so deleting a catalog needs its own
+-- index to find the grants that cascade.
+CREATE INDEX key_catalogs_catalog_id ON key_catalogs (catalog_id);
 
 CREATE TABLE changesets (
     id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -867,6 +930,10 @@ CREATE TABLE changesets (
 -- A racing "get or create" cannot open two changesets for one session.
 CREATE UNIQUE INDEX changesets_one_open_per_session
     ON changesets (catalog_id, session_id) WHERE state = 'open';
+-- The foreign-key lookups of a catalog or key delete: the partial index above
+-- cannot serve them, since they are not limited to open changesets.
+CREATE INDEX changesets_catalog_id ON changesets (catalog_id);
+CREATE INDEX changesets_key_id ON changesets (key_id) WHERE key_id IS NOT NULL;
 
 CREATE TABLE changeset_entries (
     changeset_id  bigint NOT NULL REFERENCES changesets (id) ON DELETE CASCADE,
@@ -895,8 +962,15 @@ CREATE TABLE revisions (
     changeset_id bigint REFERENCES changesets (id) ON DELETE SET NULL,
     message      text NOT NULL,
     created_at   timestamptz NOT NULL,
-    UNIQUE (catalog_id, path, revision)
+    -- A primary key (for logical replication and tooling), named explicitly
+    -- with the name a plain UNIQUE constraint would get, which tests match.
+    CONSTRAINT revisions_catalog_id_path_revision_key
+        PRIMARY KEY (catalog_id, path, revision)
 );
+-- Deleting a changeset (when its catalog is deleted) clears changeset_id on
+-- its revisions; without this index each one would scan all history.
+CREATE INDEX revisions_changeset_id ON revisions (changeset_id)
+    WHERE changeset_id IS NOT NULL;
 ```
 
 `src/error.rs`, two variants (update the enum's doc to drop "git"; see Task 11 for the rest of that wording):
