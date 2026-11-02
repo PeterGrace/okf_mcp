@@ -1,9 +1,10 @@
 //! `okf.py lint --json`: frontmatter, timestamp, link, index, sprawl and
 //! secret checks, as errors and warnings (a port of `check_ts` and `lint`).
 //!
-//! The one check that needs git (`generated-after-commit`) takes the commit
-//! times as data ([`CommitTimes`]), so this module stays pure; M3's git
-//! module fills them.
+//! The one check that needs commit times (`generated-after-commit`) takes
+//! them as data ([`CommitTimes`]), so this module stays pure: `okf.py` reads
+//! them from git, the server from document revision times
+//! (`crate::store::documents::commit_times`).
 //!
 //! # Known divergences from `okf.py`
 //!
@@ -36,8 +37,8 @@ const FUTURE_SLACK: TimeDelta = TimeDelta::minutes(2);
 /// The `reviewed-shape` message (two code paths report it).
 const REVIEWED_SHAPE: &str = "reviewed should be a mapping with by, at, outcome, note";
 
-/// Each file's last commit time, and the files with uncommitted changes:
-/// what `okf.py`'s `last_commit_times()` returns when git works.
+/// Each file's last commit (or revision) time, and the files with uncommitted
+/// changes: what `okf.py`'s `last_commit_times()` returns when git works.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommitTimes {
     times: HashMap<String, DateTime<FixedOffset>>,
@@ -48,21 +49,21 @@ impl CommitTimes {
     /// Builds the record.
     ///
     /// # Arguments
-    /// * `times` - catalog-relative path (no leading `/`) to the committer
-    ///   time of the last commit touching it (`git log --format=%cI`).
-    /// * `dirty` - paths with uncommitted changes (`git status --porcelain`).
+    /// * `times` - catalog-relative path (no leading `/`) to the time of its
+    ///   last commit (`okf.py`: `git log --format=%cI`) or revision (the
+    ///   server: the document's `updated_at`).
+    /// * `dirty` - paths with uncommitted changes (`okf.py`:
+    ///   `git status --porcelain`).
     ///
     /// # Returns
     /// The record [`lint`] reads.
     ///
-    /// # Key spelling (for the caller filling this from git)
-    /// Both sets are looked up by [`SnapshotDoc::path`] exactly: relative to
-    /// the catalog root, `/`-separated, no leading `/` or `./`. Git prints
-    /// paths relative to the *repository* root, so they match only when the
-    /// catalog is the repository root; otherwise strip the catalog's prefix
-    /// first. Nothing checks this: a key spelled differently is never found,
-    /// and the `generated-after-commit` check silently stops firing for that
-    /// file, as it does in `okf.py` (which also keys by git's output).
+    /// # Key spelling
+    /// Both sets are looked up by [`SnapshotDoc::path`] exactly:
+    /// catalog-relative, `/`-separated, no leading `/` or `./`. The server's
+    /// stored paths already have that form. A caller filling this from git
+    /// must strip the catalog's prefix when the catalog is not the repository
+    /// root, or the check silently stops firing for those files.
     pub fn new(times: HashMap<String, DateTime<FixedOffset>>, dirty: HashSet<String>) -> Self {
         Self { times, dirty }
     }
@@ -100,8 +101,9 @@ impl LintReport {
 /// # Arguments
 /// * `snapshot` - the catalog.
 /// * `now` - the current time, for the future and `stale_after` checks.
-/// * `commits` - git commit times, or `None` when git is unavailable (the
-///   `generated-after-commit` check is then skipped, as in `okf.py`).
+/// * `commits` - commit or revision times, or `None` when they are unknown
+///   (the `generated-after-commit` check is then skipped, as in `okf.py`
+///   without git).
 ///
 /// # Returns
 /// The findings, each list sorted by (file, line, rule) with ties in

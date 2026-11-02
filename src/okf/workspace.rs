@@ -220,8 +220,8 @@ impl Listing {
 ///
 /// Accepted gap: the check and the use are separate steps, so a symlink swapped
 /// in between could win the race. That is accepted provided the caller
-/// serializes writes and git operations on a worktree. That serialization is
-/// planned for M3 (the spec's write and publish flow) and is not enforced here.
+/// does not write the same files concurrently. The server never writes through
+/// a `DiskWorkspace` (it stores catalogs in Postgres); import only reads one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskWorkspace {
     /// The canonical (symlink-free, absolute) root.

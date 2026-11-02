@@ -8,9 +8,11 @@
 
 use std::sync::{Arc, RwLock};
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::error::OkfError;
+use crate::okf::analysis::lint::{lint, CommitTimes, LintReport};
 use crate::okf::snapshot::Snapshot;
 use crate::okf::workspace::{MemWorkspace, StoredFile};
 use crate::store::{catalogs, documents};
@@ -23,6 +25,7 @@ const GENERATION: &str = "SELECT generation FROM catalogs WHERE id = $1";
 pub struct Loaded {
     generation: i64,
     snapshot: Snapshot,
+    commit_times: CommitTimes,
 }
 
 impl Loaded {
@@ -34,6 +37,24 @@ impl Loaded {
     /// The snapshot of the live documents.
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    /// Lint's commit times: each live document's last revision time (after a
+    /// first import, the import time).
+    pub fn commit_times(&self) -> &CommitTimes {
+        &self.commit_times
+    }
+
+    /// Lints the snapshot with its commit times, so `generated-after-commit`
+    /// runs.
+    ///
+    /// # Arguments
+    /// * `now` - the current time (server clock).
+    ///
+    /// # Returns
+    /// The findings, as [`lint`] returns them.
+    pub fn lint(&self, now: DateTime<Utc>) -> LintReport {
+        lint(&self.snapshot, now, Some(&self.commit_times))
     }
 }
 
@@ -170,6 +191,8 @@ async fn build(pool: &PgPool, catalog_id: i64, name: &str) -> Result<Loaded, Okf
     };
     let rows = documents::published(&mut *tx, catalog_id).await?;
     tx.commit().await?;
+    // Before `rows` moves into the closure below: it borrows the rows.
+    let commit_times = documents::commit_times(&rows);
     // Building a snapshot is CPU work (rayon across documents): run it on a
     // blocking thread so the async runtime's threads stay free. `move` hands
     // `rows` to the closure.
@@ -190,6 +213,7 @@ async fn build(pool: &PgPool, catalog_id: i64, name: &str) -> Result<Loaded, Okf
     Ok(Loaded {
         generation,
         snapshot,
+        commit_times,
     })
 }
 
@@ -200,7 +224,7 @@ mod tests {
     use crate::db::test_db;
     use crate::store::catalogs;
     use crate::store::import::{import, ImportOptions};
-    use chrono::Utc;
+    use chrono::{TimeDelta, TimeZone};
 
     fn files(entries: &[(&str, &[u8])]) -> Files {
         entries
@@ -331,5 +355,38 @@ mod tests {
             result,
             Err(OkfError::CatalogNotSelected { catalog }) if catalog == "pg"
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lint_flags_a_stamp_later_than_the_documents_last_revision() {
+        let db = test_db().await;
+        let imported = Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap();
+        catalogs::create(&db.pool, "pg", "", imported)
+            .await
+            .unwrap();
+        let later = "---\ntype: Note\ngenerated: { by: t, at: 2026-11-02T12:10:00Z }\n---\nBody\n";
+        let earlier =
+            "---\ntype: Note\ngenerated: { by: t, at: 2026-11-02T11:00:00Z }\n---\nBody\n";
+        let options = ImportOptions {
+            replace: false,
+            actor: "t",
+            now: imported,
+        };
+        let entries = files(&[
+            ("later.md", later.as_bytes()),
+            ("earlier.md", earlier.as_bytes()),
+        ]);
+        import(&db.pool, "pg", entries, &options).await.unwrap();
+        let state = CatalogState::load(&db.pool, "pg").await.unwrap();
+
+        let report = state.current().lint(imported + TimeDelta::minutes(30));
+
+        let flagged: Vec<&str> = report
+            .warnings
+            .iter()
+            .filter(|finding| finding.rule == "generated-after-commit")
+            .map(|finding| finding.file.as_str())
+            .collect();
+        assert_eq!(flagged, ["later.md"]);
     }
 }

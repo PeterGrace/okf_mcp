@@ -1,10 +1,13 @@
 //! Document rows: the columns derived from content, and a catalog's
 //! published documents.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use sqlx::PgExecutor;
 
 use crate::error::OkfError;
+use crate::okf::analysis::lint::CommitTimes;
 use crate::okf::snapshot::{DocKind, SnapshotDoc};
 use crate::okf::yaml::Value;
 
@@ -47,6 +50,29 @@ pub async fn published<'e>(
     .fetch_all(executor)
     .await?;
     Ok(rows)
+}
+
+/// Lint's commit times from stored documents: each live document's last
+/// revision time stands in for its last git commit (design "Read tools").
+///
+/// After a first import every document's time is the import time, so
+/// `generated-after-commit` flags only stamps later than that import.
+///
+/// # Arguments
+/// * `rows` - the live documents, as [`published`] returns them.
+///
+/// # Returns
+/// Times keyed by catalog-relative path (the stored paths already have the
+/// spelling lint looks up); no dirty paths (M5 adds a session's changeset
+/// paths).
+pub fn commit_times(rows: &[DocumentRow]) -> CommitTimes {
+    let times = rows
+        .iter()
+        // `fixed_offset()` turns a UTC time into one with an explicit `+00:00`
+        // offset, the type lint compares stamps with.
+        .map(|row| (row.path.clone(), row.updated_at.fixed_offset()))
+        .collect();
+    CommitTimes::new(times, HashSet::new())
 }
 
 /// The columns derived from a document's content (design "Storage"),
@@ -125,6 +151,28 @@ mod tests {
     use crate::okf::workspace::MemWorkspace;
     use crate::store::catalogs;
     use chrono::TimeZone;
+
+    #[test]
+    fn commit_times_are_the_documents_update_times() {
+        let at = Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap();
+        let rows = [DocumentRow {
+            path: "a.md".to_string(),
+            content: Vec::new(),
+            executable: false,
+            revision: 1,
+            updated_at: at,
+        }];
+
+        let times = commit_times(&rows);
+
+        let expected = CommitTimes::new(
+            [("a.md".to_string(), at.fixed_offset())]
+                .into_iter()
+                .collect(),
+            HashSet::new(),
+        );
+        assert_eq!(times, expected);
+    }
 
     #[test]
     fn derived_columns_come_from_the_frontmatter() {

@@ -2,10 +2,10 @@
 //! frontmatter, analysis text, links (resolved, with existence), anchors and
 //! backlinks, plus the secret scan of every file.
 //!
-//! The design's "In-memory snapshot". M3 keeps one per catalog behind an
-//! `RwLock<Arc<Snapshot>>` and rebuilds it after each fetch or publish; the
-//! analyses in [`crate::okf::analysis`] and [`crate::okf::search`] read it and
-//! never touch the disk.
+//! The design's "In-memory snapshot". M3 keeps one per catalog in
+//! [`crate::catalog::CatalogState`] and rebuilds it after each publish or
+//! import; the analyses in [`crate::okf::analysis`] and [`crate::okf::search`]
+//! read it and never touch the disk.
 //!
 //! Ports `okf.py`'s `build_docs` and `_fm_fallback`, and replaces its repeated
 //! file reads: each file is read once, and the analysis view (universal

@@ -1,6 +1,6 @@
 //! The OKF document model: a port of `tools/okf.py`'s parsing, editing and
 //! path rules. Everything here is pure logic over a [`workspace::Workspace`],
-//! so it needs neither git nor a real filesystem in tests.
+//! so it needs neither a database nor a real filesystem in tests.
 
 pub mod analysis;
 pub mod doc;
