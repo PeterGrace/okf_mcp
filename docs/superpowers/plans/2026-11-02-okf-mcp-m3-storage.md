@@ -1581,6 +1581,8 @@ mod tests {
     }
 ```
 
+> **Corrected (issue #41), 2026-11-02.** The shipped test module (`src/store/catalogs.rs`) adds `the_lock_holds_other_transactions_off_until_commit` (a second transaction's `pg_try_advisory_xact_lock(CATALOG_LOCK_NAMESPACE, id)` fails while the lock is held and succeeds after the holder commits), and `an_empty_open_changeset_does_not_block_delete` also asserts the catalog is gone. Signatures are unchanged.
+
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `cargo test --lib -- store::catalogs cli`
