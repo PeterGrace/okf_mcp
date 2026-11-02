@@ -143,6 +143,13 @@ pub async fn find<'e>(executor: impl PgExecutor<'e>, name: &str) -> Result<Catal
 /// (cascading foreign keys), under the catalog's lock, and bumps the
 /// administrative generation, in one transaction.
 ///
+/// After the lock it locks the catalog row and its open changesets
+/// (`FOR UPDATE`) before looking for unpublished work. A foreign-key check
+/// takes `FOR KEY SHARE` on the row it references, which conflicts with
+/// `FOR UPDATE`, so a changeset or entry being written concurrently is either
+/// committed first (and seen) or held off until the delete ends (and then
+/// fails its foreign-key check): the refusal cannot be raced.
+///
 /// # Arguments
 /// * `pool` - the database.
 /// * `name` - the catalog's name.
@@ -156,6 +163,21 @@ pub async fn delete(pool: &PgPool, name: &str, force: bool) -> Result<(), OkfErr
     let mut tx = pool.begin().await?;
     let catalog = find(&mut *tx, name).await?;
     lock(&mut tx, catalog.id).await?;
+    // A delete that waited on the lock may find the row already gone.
+    let still_there: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM catalogs WHERE id = $1 FOR UPDATE")
+            .bind(catalog.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if still_there.is_none() {
+        return Err(OkfError::CatalogNotSelected {
+            catalog: name.to_string(),
+        });
+    }
+    sqlx::query("SELECT id FROM changesets WHERE catalog_id = $1 AND state = 'open' FOR UPDATE")
+        .bind(catalog.id)
+        .execute(&mut *tx)
+        .await?;
     // An open changeset with no entries holds no work, so it does not block.
     let unpublished: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM changesets c \
@@ -189,16 +211,16 @@ pub async fn delete(pool: &PgPool, name: &str, force: bool) -> Result<(), OkfErr
 /// * `catalog_id` - the catalog's id.
 ///
 /// # Errors
-/// [`OkfError::Database`].
+/// [`OkfError::Database`], including for an id above `i32::MAX` (the
+/// two-key form takes `int4` keys; the server's cast reports "integer out of
+/// range" rather than this process panicking).
 pub(crate) async fn lock(conn: &mut PgConnection, catalog_id: i64) -> Result<(), OkfError> {
     // The two-key form, under this crate's namespace, so the lock cannot
     // collide with another application's advisory locks on a shared database.
-    let catalog_key =
-        i32::try_from(catalog_id).expect("catalog ids come from an identity starting at 1");
     // `pg_advisory_xact_lock` returns `void`, so run it with `execute`.
-    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2::int4)")
         .bind(CATALOG_LOCK_NAMESPACE)
-        .bind(catalog_key)
+        .bind(catalog_id)
         .execute(&mut *conn)
         .await?;
     Ok(())
@@ -372,11 +394,11 @@ mod tests {
 
         lock(&mut holder, pg.id).await.unwrap();
 
-        let try_lock = "SELECT pg_try_advisory_xact_lock($1, $2)";
+        let try_lock = "SELECT pg_try_advisory_xact_lock($1, $2::int4)";
         let mut other = db.pool.begin().await.unwrap();
         let taken: bool = sqlx::query_scalar(try_lock)
             .bind(CATALOG_LOCK_NAMESPACE)
-            .bind(i32::try_from(pg.id).unwrap())
+            .bind(pg.id)
             .fetch_one(&mut *other)
             .await
             .unwrap();
@@ -384,10 +406,98 @@ mod tests {
         holder.commit().await.unwrap();
         let taken: bool = sqlx::query_scalar(try_lock)
             .bind(CATALOG_LOCK_NAMESPACE)
-            .bind(i32::try_from(pg.id).unwrap())
+            .bind(pg.id)
             .fetch_one(&mut *other)
             .await
             .unwrap();
         assert!(taken, "the lock outlived its transaction");
+    }
+
+    /// Waits until some backend is blocked on a lock, so a test knows the
+    /// spawned delete has reached the point it should wait at.
+    async fn until_a_lock_is_awaited(pool: &PgPool) {
+        for _ in 0..200 {
+            let waiting: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if waiting > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("no backend ever waited on a lock");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_that_waited_finds_the_catalog_gone() {
+        let db = test_db().await;
+        let pg = create(&db.pool, "pg", "", now()).await.unwrap();
+        let mut first = db.pool.begin().await.unwrap();
+        lock(&mut first, pg.id).await.unwrap();
+        // `tokio::spawn` runs the second delete concurrently, like a thread;
+        // it blocks on the lock `first` holds.
+        let pool = db.pool.clone();
+        let second = tokio::spawn(async move { delete(&pool, "pg", false).await });
+        until_a_lock_is_awaited(&db.pool).await;
+
+        sqlx::query("DELETE FROM catalogs WHERE id = $1")
+            .bind(pg.id)
+            .execute(&mut *first)
+            .await
+            .unwrap();
+        first.commit().await.unwrap();
+        let outcome = second.await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            Err(OkfError::CatalogNotSelected { catalog }) if catalog == "pg"
+        ));
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_entry_written_during_a_delete_is_refused_not_cascaded() {
+        let db = test_db().await;
+        let pg = create(&db.pool, "pg", "", now()).await.unwrap();
+        let changeset: i64 = sqlx::query_scalar(
+            "INSERT INTO changesets (catalog_id, session_id, actor, state, created_at, updated_at) \
+             VALUES ($1, 's', 'a', 'open', $2, $2) RETURNING id",
+        )
+        .bind(pg.id)
+        .bind(now())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        // A session's write, not yet committed when the delete starts.
+        let mut writer = db.pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO changeset_entries (changeset_id, path, content) VALUES ($1, 'a.md', $2)",
+        )
+        .bind(changeset)
+        .bind(b"x".to_vec())
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+        let pool = db.pool.clone();
+        let deleting = tokio::spawn(async move { delete(&pool, "pg", false).await });
+        until_a_lock_is_awaited(&db.pool).await;
+
+        writer.commit().await.unwrap();
+        let outcome = deleting.await.unwrap();
+
+        assert!(matches!(outcome, Err(OkfError::Refused { reason }) if reason.contains("--force")));
+        assert_eq!(list(&db.pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_id_beyond_int4_is_a_database_error() {
+        let db = test_db().await;
+        let mut tx = db.pool.begin().await.unwrap();
+
+        let outcome = lock(&mut tx, i64::from(i32::MAX) + 1).await;
+
+        assert!(matches!(outcome, Err(OkfError::Database { .. })));
     }
 }
