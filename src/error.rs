@@ -2,7 +2,7 @@
 
 /// Errors from reading, parsing or editing an OKF catalog.
 ///
-/// Later milestones add variants (auth, git, lint, publish); variants that
+/// Later milestones add variants (auth, lint, publish); variants that
 /// concern one document carry its catalog-relative path, so an agent can act
 /// on it.
 #[derive(Debug, thiserror::Error)]
@@ -51,5 +51,23 @@ pub enum OkfError {
         /// The underlying I/O error.
         #[source]
         source: std::io::Error,
+    },
+
+    /// A database operation failed. M4 logs the details and returns only the
+    /// variant to MCP clients; the CLI prints them.
+    #[error("database: {source}")]
+    Database {
+        /// The driver's error.
+        // `#[from]` generates `From<sqlx::Error>`, so `?` converts it.
+        #[from]
+        source: sqlx::Error,
+    },
+
+    /// Applying the schema migrations failed.
+    #[error("migrations: {source}")]
+    Migrate {
+        /// The migrator's error.
+        #[from]
+        source: sqlx::migrate::MigrateError,
     },
 }
