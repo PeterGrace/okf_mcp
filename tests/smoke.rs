@@ -174,9 +174,11 @@ async fn storage_round_trip_on_a_real_catalog() {
             .summary
             .unlinked_mentions
     });
+    // Wall-clock timing (about 10x apart); the caching itself is checked
+    // deterministically by `the_mention_matcher_is_built_once_per_snapshot`.
     assert!(
         second < first,
-        "the cached matcher makes the second report cheaper"
+        "the cached matcher makes the second report cheaper: {first:?} then {second:?}"
     );
     timed("lint with revision times: findings", || {
         let report = loaded.lint(Utc::now());
