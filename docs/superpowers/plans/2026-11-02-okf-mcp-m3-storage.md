@@ -1151,7 +1151,6 @@ mod tests {
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
-    use clap::Parser;
 
     fn cli(database_url: Option<String>, command: Command) -> Cli {
         Cli {
@@ -1173,7 +1172,14 @@ mod tests {
     async fn migrate_applies_the_schema() {
         let db = crate::db::pg_support::TestDb::start().await;
 
-        run(cli(Some(db.url.clone()), Command::Migrate), &FixedClock(chrono::Utc::now()))
+        let clock = FixedClock(chrono::Utc::now());
+
+        run(cli(Some(db.url.clone()), Command::Migrate), &clock)
+            .await
+            .unwrap();
+        // A second run finds nothing to apply: every later subcommand
+        // migrates on connect, so this must be a no-op.
+        run(cli(Some(db.url.clone()), Command::Migrate), &clock)
             .await
             .unwrap();
 

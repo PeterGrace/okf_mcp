@@ -82,7 +82,6 @@ async fn connect(url: Option<&str>) -> anyhow::Result<PgPool> {
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
-    use clap::Parser;
 
     fn cli(database_url: Option<String>, command: Command) -> Cli {
         Cli {
@@ -104,12 +103,16 @@ mod tests {
     async fn migrate_applies_the_schema() {
         let db = crate::db::pg_support::TestDb::start().await;
 
-        run(
-            cli(Some(db.url.clone()), Command::Migrate),
-            &FixedClock(chrono::Utc::now()),
-        )
-        .await
-        .unwrap();
+        let clock = FixedClock(chrono::Utc::now());
+
+        run(cli(Some(db.url.clone()), Command::Migrate), &clock)
+            .await
+            .unwrap();
+        // A second run finds nothing to apply: every later subcommand
+        // migrates on connect, so this must be a no-op.
+        run(cli(Some(db.url.clone()), Command::Migrate), &clock)
+            .await
+            .unwrap();
 
         let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
