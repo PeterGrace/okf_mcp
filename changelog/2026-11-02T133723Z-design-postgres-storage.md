@@ -9,18 +9,26 @@
   forge credentials (`OKF_GIT_TOKEN`), the Forgejo webhook, the refresh timer, the PVC,
   the `[[catalogs]]` and `[[keys]]` config sections, and the `Git` and `RebaseConflict`
   errors. Nothing in the server is forge-specific.
-- **Storage:** `catalogs`, `documents` (exact text plus derived columns and the execute
-  bit), `revisions`, `changesets`, `changeset_entries`, `api_keys`, `key_catalogs`.
+- **Storage:** `catalogs`, `documents` (exact bytes as `bytea`, derived columns, the
+  execute bit, and tombstones so revision numbers are never reused), `revisions`, `changesets`, `changeset_entries`, `api_keys`, `key_catalogs`.
   Documents keep their exact bytes, so M1's edits and M2's snapshot and analyses work
   unchanged over an in-memory workspace loaded from the rows.
 - **Writes:** per-session changesets in the database replace worktrees. Publish checks
   base revisions in one transaction (`Conflict { files }`); `log` and `index` edits are
-  replayed onto the current text, as git's `union` merge did. Changesets survive a pod
+  replayed onto the current text, as git's `union` merge did. That covers every
+  bookkeeping change to an `index.md` (`index`, `create_concept`'s listing, and the
+  listing changes of move, split and delete); a free-text `index.md` edit is not
+  replayable. Replayed results go through the write rules and lint again, and a
+  concurrent create of the same path is a `Conflict`, not a database error. Changesets survive a pod
   restart; `adopt_changeset` picks up a stranded one.
 - **Added:** import (directory or tarball; `git archive` for a clean checkout) and
-  export (an authenticated route building a tarball on request); `catalog`, `key`,
+  export (an authenticated route building a tarball on request, with no top-level
+  directory so an export imports back as it was); `catalog`, `key`,
   `import`, `export` and `migrate` subcommands; `history`, `revert` and
   `adopt_changeset` tools; `allowed_hosts` config for rmcp's DNS-rebinding check.
+- **Access:** `read` < `write` < `admin`, always within the key's granted catalogs;
+  creating and deleting catalogs is subcommand-only. `adopt_changeset` matches the key,
+  not the actor string; `revert` is subject to the machinery rule.
 - **Milestones re-cut:** M3 storage, M4 read-only server, M5 writes, M6 restructuring,
   M7 deployment.
 - **Carried issues:** #31 becomes revision-based commit times; #32-#35 are placed in

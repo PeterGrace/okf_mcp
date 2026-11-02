@@ -48,13 +48,13 @@ work unchanged over an in-memory workspace loaded from the database.
 | Transport | MCP streamable HTTP via `rmcp` 3.8, mounted in an `axum` 0.8 router, stateful sessions |
 | Storage | Postgres (a CNPG cluster), via `sqlx` with embedded migrations. Postgres is the source of truth |
 | Document form | Each file's exact text; type, title, status and tags are derived columns. Nothing is re-rendered |
-| Auth | Bearer API keys stored as SHA-256 hashes in the database; per-key catalog grants and `read`/`write`/`admin` access |
+| Auth | Bearer API keys stored as SHA-256 hashes in the database; per-key catalog grants and `read`/`write`/`admin` access, each level including the ones before it and always limited to the key's granted catalogs |
 | Scope | Full read-write: every `okf.py` command plus content editing, search and concept retrieval |
 | Implementation | Port everything to Rust. No Python at runtime |
 | Write grouping | One changeset per (MCP session, catalog), created on first write and kept in the database; explicit `publish` |
 | Concurrency | Publish checks each changed document's base revision in one transaction; `log` and `index` edits are replayed onto the current text instead |
 | Getting data in and out | Import from an OKF directory or tarball; export as a tarball through an authenticated route. No git anywhere in the server |
-| Administration | `okf-mcp` subcommands against the database (`catalog`, `key`, `import`, `export`), plus the HTTP import and export routes |
+| Administration | `okf-mcp` subcommands against the database (`migrate`, `catalog`, `key`, `import`, `export`), plus the HTTP import and export routes |
 
 ## Catalog selection
 
@@ -102,7 +102,7 @@ One binary, `okf-mcp`, on tokio with an axum router:
 |---|---|---|
 | `POST/GET/DELETE /mcp` | any key | rmcp `StreamableHttpService` in stateful mode (`Mcp-Session-Id`) |
 | `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as a `.tar.gz`, built on request from the published documents |
-| `POST /catalogs/{name}/import` | `admin` | Replaces or fills a catalog from an uploaded `.tar.gz` (see "Import") |
+| `POST /catalogs/{name}/import` | `admin` on the catalog | Replaces or fills an existing catalog from an uploaded `.tar.gz` (see "Import"). Creating and deleting catalogs is subcommand-only |
 | `GET /healthz` | none | Liveness and readiness: database reachable, snapshots loaded, clock offset |
 
 `tower` middleware: request tracing, timeouts, and the auth layer on every route but
@@ -151,17 +151,21 @@ One Postgres database. Migrations live in `migrations/` and are embedded with
 | Table | Holds |
 |---|---|
 | `catalogs` | `id`, `name` (unique, `[a-z0-9-]+`), `description`, `created_at` |
-| `documents` | One row per file: `catalog_id`, `path` (catalog-relative, `/`-separated), `text`, `executable` (the file's execute bit, so scripts round-trip), `revision` (1 on create, +1 per change), `updated_at`, `updated_by`; derived `kind`, `concept_type`, `title`, `status`, `tags`. Primary key `(catalog_id, path)` |
-| `revisions` | Append-only history: `catalog_id`, `path`, `revision`, `op` (`create`, `update`, `delete`, `import`), `text` (NULL for a delete), `actor`, `changeset_id`, `message`, `created_at` |
+| `documents` | One row per file: `catalog_id`, `path` (catalog-relative, `/`-separated), `content` (`bytea`, the file's exact bytes), `executable` (the file's execute bit, so scripts round-trip), `revision` (+1 per change, never reused for a path), `deleted_at` (a tombstone: a deleted document keeps its row, so a path created again continues its revision numbering), `updated_at`, `updated_by`; derived `kind`, `concept_type`, `title`, `status`, `tags`. Primary key `(catalog_id, path)` |
+| `revisions` | Append-only history: `catalog_id`, `path`, `revision`, `op` (`create`, `update`, `delete`, `import`), `content` (NULL for a delete), `actor`, `changeset_id`, `message`, `created_at` |
 | `changesets` | One per (MCP session, catalog): `id`, `catalog_id`, `session_id`, `key_id`, `actor`, `state` (`open`, `published`, `discarded`), `created_at`, `updated_at` |
-| `changeset_entries` | Per changed path: `changeset_id`, `path`, `base_revision` (NULL for a new file), `text` (NULL for a delete), `replay` (the `log` or `index` operations, JSON, when the entry is replayable) |
+| `changeset_entries` | Per changed path: `changeset_id`, `path`, `base_revision` (NULL for a path with no live document), `content` (NULL for a delete), `replay` (the entry's listing and log operations, JSON, while every change to the entry came from one; NULL once any other edit touches it) |
 | `api_keys` | `id`, `sha256`, `access`, `all_catalogs`, `default_catalog`, `actor`, `created_at`, `revoked_at` |
 | `key_catalogs` | `(key_id, catalog_id)` grants |
 
 Every file of a catalog is a document: concepts, `index.md`, `log.md`, `AGENTS.md`, and
-non-markdown files such as `tools/okf.py`. Files must be UTF-8 text; import skips
-anything else and reports it. The derived columns are recomputed from `text` on every
-write, so they can never disagree with it.
+non-markdown files such as `tools/okf.py`. Content is stored as bytes (`bytea`, since
+Postgres `text` cannot hold NUL), so any file round-trips exactly. A file that is valid
+UTF-8 with no NUL is text: it is loaded into the snapshot, scanned for secrets and, for
+markdown, analyzed. Any other file (an image, say) is stored and exported but not
+analyzed, as `okf.py`'s secret walk skips files it can't read; a markdown file that is
+not text is an import error. The derived columns are recomputed from the content on
+every write, so they can never disagree with it.
 
 ### In-memory snapshot
 
@@ -256,8 +260,8 @@ Nothing is visible to other sessions until `publish`.
 | `delete_concept` | `path` | Removes the concept and its listing in its folder's `index.md`. Refuses while any other document links to it, and lists those links |
 | `publish` | `message` | See "Publish" below |
 | `discard` | `paths?` | Drops this session's changeset entries (all, or the named paths) |
-| `revert` | `path`, `revision` | Adds the document's text at `revision` (or its deletion) to this session's changeset, for review and publish like any other edit |
-| `adopt_changeset` | `id` | Moves a stranded changeset of this key's actor into this session |
+| `revert` | `path`, `revision` | Adds the document's content at `revision` (or its deletion) to this session's changeset, for review and publish like any other edit. Subject to every write rule, so machinery cannot be reverted |
+| `adopt_changeset` | `id` | Moves a stranded changeset created with this same key into this session; an `admin` key may adopt any stranded changeset in its granted catalogs |
 
 `by` defaults to the key's `actor`. A call may override it (for example `human:pgrace`
 when a person really did the verifying); AGENTS.md's honesty rule still applies.
@@ -269,8 +273,8 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
   masked.
 - **Frontmatter still parses** after the edit (as `Doc.save` checks).
 - **Paths stay inside the catalog**: normalized, no `..`, no absolute paths.
-- **Machinery is read-only** through the tools: `AGENTS.md`, `CLAUDE.md`, `README.md`,
-  `tools/`, `.claude/`, `.git*`. Only import writes them.
+- **Machinery is read-only** through every tool, `revert` included: `AGENTS.md`,
+  `CLAUDE.md`, `README.md`, `tools/`, `.claude/`, `.git*`. Only import writes them.
 - **Timestamps come from the server clock** and no tool accepts one.
 
 ## Data flow
@@ -295,8 +299,13 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
 2. `store` gets or creates the open changeset for (session, catalog).
 3. The `okf::ops` function reads through the overlay `Workspace`, computes the new
    content, runs the write rules, and the changed files become changeset entries, each
-   with the published revision it was based on. A `log` or `index` call also records
-   its operation as the entry's replay.
+   with the published revision it was based on. Edits to `log.md` and `index.md` that
+   come from bookkeeping are also recorded as operations in the entry's `replay`:
+   `log` adds a log entry; `index`, `create_concept` (with `index_summary`) and the
+   listing changes of `move_concept`, `split_concept` and `delete_concept` add, rename
+   or remove an `index.md` bullet. A free-text edit of an `index.md` (`edit_document`)
+   clears the entry's `replay`, so that entry conflicts like any other on a stale
+   base.
 4. The session's overlay is marked stale.
 
 ### Publish
@@ -304,10 +313,16 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
 1. Lint the overlay. Refuse if any **changed** file has errors; errors elsewhere are
    returned as warnings (as `okf.py publish` does).
 2. Nothing changed: return "nothing to publish".
-3. In one transaction, with the changeset's documents locked (`SELECT ... FOR UPDATE`):
-   - a replayable entry (`log.md`, `index.md`) whose base revision is stale has its
-     operations re-applied to the current text, as git's `union` merge did for
-     concurrent `log.md` lines;
+3. In one transaction, with the changeset's documents locked (`SELECT ... FOR UPDATE`;
+   tombstones are rows, so a previously deleted path locks too). A path that has never
+   existed has no row to lock, so its entry is written with `INSERT ... ON CONFLICT DO
+   NOTHING`; zero rows inserted means another session created it first, which is a
+   conflict like any other (never the opaque `Database` error):
+   - an entry with a `replay` whose base revision is stale has its operations
+     re-applied to the current text, as git's `union` merge did for concurrent
+     `log.md` lines. The write rules (secret scan, frontmatter parses) and lint run
+     again on the replayed result; a failure rolls back and is returned like a
+     pre-publish failure;
    - any other entry whose base revision is not the current one is a conflict: roll
      back and return `Conflict { files }` with each file's base and current revision.
      The changeset stays open; the agent re-reads, re-applies and publishes again;
@@ -323,9 +338,9 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
 1. Read every file of the directory or tarball, with its execute bit. From a
    directory, `.git/`, `.worktrees/` and `__pycache__/` are skipped; every other file is
    kept, dotfiles included (a catalog tracks `.claude/skills/`, `.gitattributes` and
-   `.okf-catalog.json`). A tarball is taken as it is, so `git archive --format=tar.gz
-   HEAD` on a checkout imports exactly its tracked files; the user runs git, the server
-   never does. Non-UTF-8 files are skipped and reported.
+   `.okf-catalog.json`). A tarball's paths are taken as they are, with no prefix
+   stripped, so `git archive --format=tar.gz HEAD` on a checkout imports exactly its
+   tracked files (the user runs git, the server never does), and so does an export.
 2. Build a snapshot of it and lint it; report the findings (import does not refuse on
    lint, since it brings in what exists).
 3. In one transaction: into an empty catalog, insert every file; with `--replace`,
@@ -337,9 +352,11 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
 ### Export
 
 `GET /catalogs/{name}/export` or `okf-mcp export NAME OUT.tar.gz` streams a `.tar.gz`
-of the published documents under `<name>/`, file modes 0755 for executable documents
-and 0644 otherwise, mtimes set to each document's `updated_at`. Importing an export into an empty catalog reproduces it
-exactly.
+of the published documents at the archive root (no top-level directory, as `git
+archive` writes them), file modes 0755 for executable documents and 0644 otherwise,
+mtimes set to each document's `updated_at`. Importing an export into an empty catalog
+reproduces every file's content and mode; history and revision numbers are not
+exported.
 
 ### Session lifecycle
 
@@ -425,7 +442,7 @@ check keeps `okf.py`'s 2-minute slack. Revision times are written by the server
 |---|---|
 | M1. Core library (delivered) | `okf::yaml`, `okf::doc`, `okf::markdown`, `okf::workspace`, `clock`; the parity test harness ([plan](../plans/2026-10-26-okf-mcp-m1-core-library.md)) |
 | M2. Analysis (delivered) | `lint`, links report, `oldest`, `sprawl`, secret scan; snapshot and search; `okf::timestamp` ([plan](../plans/2026-10-27-okf-mcp-m2-analysis.md); PRs #17-#30) |
-| M3. Storage | `config`, `db` and migrations, `store`, `archive`; `catalog` with snapshot swap and the cached mention matcher; import and export subcommands; `catalog` and `key` subcommands; revision-based commit times for lint. Round-trips the real catalog byte for byte |
+| M3. Storage | `config`, `db` and migrations, `store`, `archive`; `catalog` with snapshot swap and the cached mention matcher; import and export subcommands; `catalog` and `key` subcommands; revision-based commit times for lint. Export then import reproduces the real catalog's file contents and modes byte for byte |
 | M4. Read-only server | axum, rmcp, auth, `selection`, the read tools that need no changeset, the import and export routes, `/healthz`. Deployable and useful on its own |
 | M5. Writes | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `history`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` |
 | M6. Restructuring | `move_concept`, `split_concept`, `delete_concept` |
