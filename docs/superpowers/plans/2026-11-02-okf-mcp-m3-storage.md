@@ -3793,6 +3793,8 @@ git commit -m "store: import a directory or tarball into a catalog, with okf-mcp
 
 Export writes a catalog's live documents as a `.tar.gz` (design "Export"): no top-level directory, modes 0644/0755, each file's mtime its `updated_at`. M4's export route calls the same function.
 
+> **Corrected (issue #45), 2026-11-02.** Shipped with the same call shape, `export::export(&pool, name, out) -> Result<W, OkfError>`, so Tasks 12 and 13 (and M4's route, which passes `Vec::new()`) need no change; read `src/store/export.rs` and `src/cli.rs`. Differences: (1) the bound is `W: Write + Send + 'static`, because `write_tarball` (gzip, CPU work) runs on `tokio::task::spawn_blocking`, as `import`'s analysis does; `Vec<u8>` and `File` qualify, a borrowed writer does not. (2) `catalogs::find` and `documents::published` run in one `REPEATABLE READ, READ ONLY` transaction, so both see one snapshot (taken by the first query): a catalog deleted concurrently is either `CatalogNotSelected` (deleted first) or exported whole as it was, never empty or half-deleted; the transaction ends before compressing. (3) The CLI builds the archive in a `Vec<u8>` for a file too, not only for stdout, so an unknown catalog leaves no file behind, then writes it (file or stdout) in a private `write_output` on `spawn_blocking`; a file goes through a temp file in its directory (mode 0666 minus the umask, via the now `pub(crate)` `okf::workspace::new_file_permissions`), synced and renamed into place (review of PR #59), so a failed write leaves no truncated archive. The `BufWriter` branch below is not used. (4) Extra tests: the planned export test's replace import runs later and changes `a.md`, and checks each entry's mtime is its own `updated_at`; `cli::tests::{export_parses, export_writes_a_tarball_file_and_none_for_an_unknown_catalog}`.
+
 **Files:**
 - Create: `src/store/export.rs`; modify `src/store/mod.rs`
 - Modify: `src/cli.rs` (`export` subcommand)
@@ -3878,7 +3880,7 @@ use crate::store::{catalogs, documents};
 /// # Errors
 /// [`OkfError::CatalogNotSelected`] for an unknown catalog;
 /// [`OkfError::Database`]; [`OkfError::Io`] if writing fails.
-pub async fn export<W: Write>(pool: &PgPool, catalog: &str, out: W) -> Result<W, OkfError> {
+pub async fn export<W: Write + Send + 'static>(pool: &PgPool, catalog: &str, out: W) -> Result<W, OkfError> {
     let catalog = catalogs::find(pool, catalog).await?;
     let rows = documents::published(pool, catalog.id).await?;
     let files: Vec<ExportFile<'_>> = rows
