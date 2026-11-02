@@ -5,12 +5,12 @@
 //! Import rules for a tarball: only regular files become documents; the pax
 //! global header `git archive` writes and directory entries are skipped; any
 //! other entry type (symlink, hardlink, device, FIFO), a path that is not
-//! UTF-8, absolute, has a `..` component or is not in normal form, a
-//! duplicate path, and a file that is also another file's directory (`a`
+//! UTF-8, holds a control character (NUL, which Postgres `text` cannot store,
+//! newline, ...), is absolute, has a `..` component or is not in normal form,
+//! a duplicate path, and a file that is also another file's directory (`a`
 //! beside `a/b.md`) each refuse the whole import, and every problem is
 //! listed. The uncompressed total is capped.
 
-use std::borrow::Cow;
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -133,9 +133,11 @@ fn read_entries<R: Read>(archive: &mut Archive<R>) -> Result<Files, OkfError> {
     }
 }
 
-/// A raw entry name for a message: lossy UTF-8 (bad bytes become U+FFFD).
-fn shown(raw: &[u8]) -> Cow<'_, str> {
-    String::from_utf8_lossy(raw)
+/// A raw entry name for a message: lossy UTF-8 (bad bytes become U+FFFD),
+/// with control characters escaped (`\0`, `\n`) so one problem stays one line.
+fn shown(raw: &[u8]) -> String {
+    // `escape_debug` is lazy (an iterator of chars); `to_string` collects it.
+    String::from_utf8_lossy(raw).escape_debug().to_string()
 }
 
 /// A tar entry name as a catalog path, or the problem line saying why it
@@ -144,6 +146,8 @@ fn checked_path(raw: &[u8]) -> Result<String, String> {
     let reason = match std::str::from_utf8(raw) {
         Err(_) => "the name is not UTF-8",
         Ok("") => "the name is empty",
+        // `char::is_control` as a predicate: Python's `any(c.iscntrl() ...)`.
+        Ok(path) if path.contains(char::is_control) => "the name contains a control character",
         Ok(path) if path.starts_with('/') => "absolute paths are not allowed",
         Ok(path) if path.split('/').any(|part| part == "..") => "'..' components are not allowed",
         Ok(path) if path.split('/').any(|part| part.is_empty() || part == ".") => {
@@ -433,13 +437,14 @@ mod tests {
             (EntryType::Regular, b"bad\xffname", 0o644, b""),
             (EntryType::Regular, b"./a", 0o644, b""),
             (EntryType::Regular, b"a//b", 0o644, b""),
+            (EntryType::Regular, b"line\nbreak", 0o644, b""),
             (EntryType::Regular, b"ok.md", 0o644, b"x"),
             (EntryType::Regular, b"ok.md", 0o644, b"y"),
         ]);
 
         let problems = problems(read_tarball(tarball.as_slice(), NO_LIMIT));
 
-        assert_eq!(problems.len(), 10, "{problems:#?}");
+        assert_eq!(problems.len(), 11, "{problems:#?}");
         assert_eq!(problems[0], "link: Symlink entries are not allowed");
         assert_eq!(problems[1], "hard: Link entries are not allowed");
         assert_eq!(problems[2], "fifo: Fifo entries are not allowed");
@@ -449,7 +454,25 @@ mod tests {
         assert!(problems[6].starts_with("bad\u{fffd}name: the name is not UTF-8"));
         assert!(problems[7].starts_with("./a: the path is not in normal form"));
         assert!(problems[8].starts_with("a//b: the path is not in normal form"));
-        assert_eq!(problems[9], "ok.md: appears more than once");
+        assert_eq!(problems[9], "line\\nbreak: the name contains a control character");
+        assert_eq!(problems[10], "ok.md: appears more than once");
+    }
+
+    #[test]
+    fn a_nul_in_a_pax_path_is_listed_not_stored() {
+        // A local pax header (`x`) whose `path` record carries a NUL, which a
+        // ustar name field cannot. The record is "<length> path=<value>\n",
+        // the length counting the whole record.
+        let record = b"15 path=a\0b.md\n";
+        assert_eq!(record.len(), 15);
+        let tarball = raw_tarball(&[
+            (EntryType::XHeader, b"PaxHeader", 0o644, record),
+            (EntryType::Regular, b"placeholder", 0o644, b"x"),
+        ]);
+
+        let problems = problems(read_tarball(tarball.as_slice(), NO_LIMIT));
+
+        assert_eq!(problems, ["a\\0b.md: the name contains a control character"]);
     }
 
     #[test]
