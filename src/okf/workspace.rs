@@ -106,7 +106,7 @@ pub trait Workspace: Send + Sync {
 /// The mode requested for a newly created file: 0o666, which the kernel
 /// masks with the process umask, as for Python's `open(path, "w")`.
 #[cfg(unix)]
-fn new_file_permissions() -> std::fs::Permissions {
+pub(crate) fn new_file_permissions() -> std::fs::Permissions {
     // `PermissionsExt` is a Unix-only extension trait adding `from_mode`.
     use std::os::unix::fs::PermissionsExt;
     std::fs::Permissions::from_mode(0o666)
