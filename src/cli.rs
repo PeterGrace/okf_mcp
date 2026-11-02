@@ -5,7 +5,7 @@
 //! first (idempotent), so a fresh database needs no separate step.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 
 // `Context` adds a message to an error (anyhow's `.context(..)`), like
@@ -19,6 +19,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::db;
 use crate::store::catalogs;
+use crate::store::export;
 use crate::store::import::{self, ImportOptions};
 
 /// `okf-mcp`: an MCP server for OKF knowledge catalogs.
@@ -64,6 +65,13 @@ pub enum Command {
         /// Recorded as the revisions' actor.
         #[arg(long, default_value = "okf-mcp/import")]
         actor: String,
+    },
+    /// Export a catalog's live documents as a .tar.gz.
+    Export {
+        /// The catalog.
+        catalog: String,
+        /// The file to write, or `-` for stdout.
+        output: PathBuf,
     },
 }
 
@@ -137,6 +145,17 @@ pub async fn run(cli: Cli, clock: &dyn Clock) -> anyhow::Result<()> {
             let report = import::import(&pool, &catalog, files, &options).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::Export { catalog, output } => {
+            let pool = connect(cli.database_url.as_deref()).await?;
+            // Build the archive in memory first: no `StdoutLock` is held across
+            // `.await` (which would make this future impossible to
+            // `tokio::spawn`), and an unknown catalog leaves no file behind.
+            let tarball = export::export(&pool, &catalog, Vec::new()).await?;
+            // Writing is blocking I/O: run it on a blocking thread.
+            tokio::task::spawn_blocking(move || write_output(&output, &tarball))
+                .await
+                .context("the export writer stopped")??;
+        }
     }
     Ok(())
 }
@@ -160,6 +179,26 @@ fn read_source(source: &Path, limit: u64) -> anyhow::Result<Files> {
         archive::read_tarball(BufReader::new(file), limit)?
     };
     Ok(files)
+}
+
+/// Writes an export's archive to a file, or (`-`) to stdout.
+///
+/// # Arguments
+/// * `output` - the path given on the command line.
+/// * `tarball` - the finished `.tar.gz`.
+///
+/// # Errors
+/// The file failing to be created or written, or stdout failing.
+fn write_output(output: &Path, tarball: &[u8]) -> anyhow::Result<()> {
+    if output.as_os_str() == "-" {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(tarball).context("write to stdout")?;
+        // Locked stdout is line-buffered: flush the tail before returning.
+        stdout.flush().context("write to stdout")?;
+    } else {
+        std::fs::write(output, tarball).with_context(|| format!("write {}", output.display()))?;
+    }
+    Ok(())
 }
 
 /// Runs `okf-mcp catalog ...`.
@@ -390,6 +429,65 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("DATABASE_URL"));
+    }
+
+    #[test]
+    fn export_parses() {
+        let parsed = Cli::try_parse_from(["okf-mcp", "export", "pg", "-"]).unwrap();
+
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Export { ref catalog, ref output })
+                if catalog == "pg" && output.as_os_str() == "-"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn export_writes_a_tarball_file_and_none_for_an_unknown_catalog() {
+        let db = crate::db::pg_support::TestDb::start().await;
+        let clock = FixedClock(chrono::Utc::now());
+        let create = CatalogCommand::Create {
+            name: "pg".to_string(),
+            description: String::new(),
+        };
+        run(cli(Some(db.url.clone()), Command::Catalog(create)), &clock)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.md"), "# Index\n").unwrap();
+        let import = Command::Import {
+            catalog: "pg".to_string(),
+            source: dir.path().to_path_buf(),
+            replace: false,
+            actor: "test".to_string(),
+        };
+        run(cli(Some(db.url.clone()), import), &clock)
+            .await
+            .unwrap();
+        let export = |catalog: &str, output: PathBuf| Command::Export {
+            catalog: catalog.to_string(),
+            output,
+        };
+        let written = dir.path().join("pg.tar.gz");
+        let unwritten = dir.path().join("nope.tar.gz");
+
+        run(
+            cli(Some(db.url.clone()), export("pg", written.clone())),
+            &clock,
+        )
+        .await
+        .unwrap();
+        let unknown = run(
+            cli(Some(db.url.clone()), export("nope", unwritten.clone())),
+            &clock,
+        )
+        .await;
+
+        let files = archive::read_tarball(File::open(&written).unwrap(), u64::MAX).unwrap();
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["index.md"]);
+        assert_eq!(files["index.md"].content, b"# Index\n");
+        assert!(unknown.is_err());
+        assert!(!unwritten.exists());
     }
 
     #[tokio::test]

@@ -4,4 +4,5 @@
 
 pub mod catalogs;
 pub mod documents;
+pub mod export;
 pub mod import;
