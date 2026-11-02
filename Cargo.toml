@@ -28,6 +28,8 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 flate2 = "1.1.10"
 # The OS random source for API keys.
 getrandom = "0.4.3"
+# Durations with units in the configuration ("10s", "2h").
+humantime-serde = "1.1.1"
 # Insertion-ordered maps, matching Python dict order for frontmatter mappings.
 indexmap = "2.14.2"
 # Data parallelism for building snapshots and running analyses across documents.
