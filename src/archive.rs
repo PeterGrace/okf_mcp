@@ -303,11 +303,11 @@ impl<R: Read> Read for Capped<R> {
     }
 }
 
-/// The refusal for an import past `max_bytes`.
+/// The refusal for an import (tarball or directory) past `max_bytes`.
 fn too_large(max_bytes: u64) -> OkfError {
     OkfError::ImportRefused {
         problems: vec![format!(
-            "the archive expands past the {max_bytes}-byte limit (max_import_bytes)"
+            "the import exceeds the {max_bytes}-byte limit (max_import_bytes)"
         )],
     }
 }
@@ -467,7 +467,10 @@ mod tests {
         assert!(problems[6].starts_with("bad\u{fffd}name: the name is not UTF-8"));
         assert!(problems[7].starts_with("./a: the path is not in normal form"));
         assert!(problems[8].starts_with("a//b: the path is not in normal form"));
-        assert_eq!(problems[9], "line\\nbreak: the name contains a control character");
+        assert_eq!(
+            problems[9],
+            "line\\nbreak: the name contains a control character"
+        );
         assert_eq!(problems[10], "ok.md: appears more than once");
     }
 
@@ -485,7 +488,10 @@ mod tests {
 
         let problems = problems(read_tarball(tarball.as_slice(), NO_LIMIT));
 
-        assert_eq!(problems, ["a\\0b.md: the name contains a control character"]);
+        assert_eq!(
+            problems,
+            ["a\\0b.md: the name contains a control character"]
+        );
     }
 
     #[test]
@@ -576,10 +582,10 @@ mod tests {
         assert!(read["tools/run.sh"].executable);
         assert!(!read["index.md"].executable);
         assert_eq!(read["img/logo.png"].content, b"\x89PNG\0\xff");
-        assert!(matches!(
-            read_directory(root, 8),
-            Err(OkfError::ImportRefused { .. })
-        ));
+        assert_eq!(
+            problems(read_directory(root, 8)),
+            ["the import exceeds the 8-byte limit (max_import_bytes)"]
+        );
     }
 
     #[test]
