@@ -4579,7 +4579,10 @@ async fn import_needs_admin_refuses_a_full_catalog_without_replace_and_is_read_a
     let first = post_import(&server, "work", &admin, "", tarball.clone()).await;
     assert_eq!(first.status(), 200);
     let report: serde_json::Value = first.json().await.unwrap();
-    let again = post_import(&server, "work", &admin, "", tarball.clone()).await.status();
+    let again = post_import(&server, "work", &admin, "", tarball.clone()).await;
+    assert_eq!(again.status(), 409);
+    let conflict: serde_json::Value = again.json().await.unwrap();
+    assert!(conflict["message"].as_str().unwrap().contains("?replace=true"));
     let replaced: serde_json::Value = post_import(&server, "work", &admin, "?replace=true", tarball)
         .await
         .json()
@@ -4589,7 +4592,6 @@ async fn import_needs_admin_refuses_a_full_catalog_without_replace_and_is_read_a
 
     assert_eq!(as_reader, 403);
     assert_eq!(report["added"], 2);
-    assert_eq!(again, 409);
     assert_eq!(replaced["unchanged"], 2);
     assert_eq!(garbage.status(), 400);
     let refusal: serde_json::Value = garbage.json().await.unwrap();
@@ -4641,6 +4643,7 @@ use tower_http::timeout::TimeoutLayer;
 use crate::app::App;
 use crate::archive::read_tarball;
 use crate::auth::Principal;
+use crate::error::OkfError;
 use crate::http::{AppError, REQUEST_TIMEOUT};
 use crate::mcp::blocking;
 use crate::store::export::export;
@@ -4728,10 +4731,25 @@ async fn import_catalog(
         actor: &principal.actor,
         now: app.clock().now(),
     };
-    let report = import(app.pool(), &name, files, &options).await?;
-    // Swap the new snapshot in now, not at the next poll.
+    let report = import(app.pool(), &name, files, &options)
+        .await
+        // `store::import`'s only refusal is a non-empty catalog without
+        // `replace`; its hint names the CLI flag, so say what HTTP needs.
+        .map_err(|error| match error {
+            OkfError::Refused { .. } => OkfError::Refused {
+                reason: format!(
+                    "catalog {name:?} is not empty; add ?replace=true to replace its contents"
+                ),
+            },
+            other => other,
+        })?;
+    // Swap the new snapshot in now, not at the next poll. The import has
+    // committed, so a failed refresh must not turn it into an error (a
+    // retry would then get 409): log it and leave it to the poll loop.
     if let Some(state) = app.catalog(&name) {
-        state.refresh(app.pool()).await?;
+        if let Err(error) = state.refresh(app.pool()).await {
+            tracing::error!(catalog = %name, %error, "refresh after import failed; the poll loop retries");
+        }
     }
     tracing::info!(catalog = %name, key = %principal.key_id, "imported");
     Ok(Json(report))
