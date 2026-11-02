@@ -4440,9 +4440,12 @@ async fn the_real_catalog_round_trips() {
     let (exported, again) = round_trip(&files).await;
 
     assert_eq!(exported, files);
+    assert_eq!((again.added, again.updated, again.deleted), (0, 0, 0));
     assert_eq!(again.unchanged, files.len());
 }
 ```
+
+> **Corrected (issue #46), 2026-11-02.** The synthetic corpus has no executable file, so as written above `the_synthetic_corpus_round_trips` never checked the execute bit. The shipped test (`tests/roundtrip.rs`) adds an in-memory executable `tools/check.sh` to the files read from the fixture (adding one on disk would change M2's goldens), and asserts that `install/setup.md`, `docs/plan.md` and `tests/case.md` (Task 14's skipped root directories) are read and round-trip. The real-catalog test also asserts `(added, updated, deleted) == (0, 0, 0)` on the second import, as the synthetic one does (review of #60; added inline above). The rest shipped as written, apart from `rustfmt`'s layout.
 
 - [ ] **Step 2: Run them**
 
