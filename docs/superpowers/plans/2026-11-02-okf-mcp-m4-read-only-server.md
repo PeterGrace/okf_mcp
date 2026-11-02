@@ -32,7 +32,7 @@ Deliberately deferred:
 | Item | Goes to | Why |
 |---|---|---|
 | `pending_changes`, `stranded_sessions`, `lint pending`, the write tools, changesets, overlays, publish | M5 | Design milestone table: they need a changeset |
-| How a changeset is identified when a client negotiates MCP `2026-07-28` (no sessions; see Decision 2), and binding it to the key that created it (an M4 session is not tied to a key) | M5 (design question) | Sessions only matter to changesets |
+| How a changeset is identified when a client negotiates MCP `2026-07-28` (no sessions; see Decision 2), and binding it, and the session's streams, to the key that created it (an M4 session is not tied to a key) | M5 (design question) | Sessions only matter to changesets |
 | Discarding empty changesets on session close or idle, the 24-hour prune | M5 | Design "Session lifecycle"; M4 creates no changesets. M4 does set rmcp's session idle timeout from `session_idle_timeout` |
 | The NTP offset check, `time_server`, the clock offset in `/healthz` | M7 | Design milestone table |
 | `move_concept`, `split_concept`, `delete_concept` | M6 | Design milestone table |
@@ -2941,10 +2941,16 @@ async fn a_revoked_key_stops_working_after_a_poll() {
     server.app.poll().await.unwrap();
 
     let arguments = serde_json::json!({}).as_object().unwrap().clone();
-    let after = client
-        .call_tool(rmcp::model::CallToolRequestParams::new("list_catalogs").with_arguments(arguments))
-        .await;
+    // Bounded: if the client retried a 401 instead of failing, the test
+    // must fail rather than hang.
+    let call = client
+        .call_tool(rmcp::model::CallToolRequestParams::new("list_catalogs").with_arguments(arguments));
+    let after = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+        .await
+        .expect("the call answers within 10 s");
     assert!(after.is_err(), "a revoked key still worked: {after:?}");
+    // The server's side, independent of how the client reports it.
+    assert_eq!(post_initialize(&server, Some(&key), None).await, 401);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4185,7 +4191,10 @@ mod tests {
     #[test]
     fn every_report_tool_is_listed_with_an_object_output_schema() {
         let tools = OkfServer::reports_router().list_all();
-        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        // rmcp sorts `list_all` (its tests/test_tool_routers.rs asserts it);
+        // sorting here keeps the test independent of that.
+        let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        names.sort_unstable();
 
         assert_eq!(names, ["links_report", "lint", "oldest", "open_questions", "sprawl"]);
         for tool in &tools {
@@ -4881,7 +4890,7 @@ Rewrite the status line (M1 to M4 delivered) and add "Running the server": `okf-
 - Status line at the top: M1 to M4 delivered.
 - Add "What M4 shipped differently", listing the plan's deviations (key lookup by hash; the text block is the JSON; lists wrapped in objects; `open_questions` from `oldest`; export built in memory; the import body cap's gzip slack; the catalog list polled each tick; `poll` passes serialized; 404 for unreachable catalogs; no timeout on `/mcp`) and every dated `Corrected` note from this plan.
 - In "Carried into M3 and later", mark #34 done in M4 (PR number), and the cross-catalog search merge.
-- Add under "Session lifecycle", or as a new "Open questions for M5" paragraph: "MCP `2026-07-28` removes sessions; rmcp 3.8 serves a client on that version statelessly, with no `Mcp-Session-Id`. 'One changeset per (MCP session, catalog)' needs a different identity for such clients (for example per key and a client-chosen name); M5 decides (M4 plan, Decision 2). Whatever the identity, M5 binds it to the key that created it: in M4 a session is not tied to a key, so another valid key that learned an `Mcp-Session-Id` could attach to that session's streams (it gains no access, since every request is authorized by its own key), and changesets must not inherit that."
+- Add under "Session lifecycle", or as a new "Open questions for M5" paragraph: "MCP `2026-07-28` removes sessions; rmcp 3.8 serves a client on that version statelessly, with no `Mcp-Session-Id`. 'One changeset per (MCP session, catalog)' needs a different identity for such clients (for example per key and a client-chosen name); M5 decides (M4 plan, Decision 2). Whatever the identity, M5 binds it to the key that created it. In M4 each request is authorized by its own key, but a session's streams are not bound to the key that opened it: another valid key that learned an `Mcp-Session-Id` (a random UUID) could attach to the session's `GET /mcp` stream, or resume it with `Last-Event-ID`, and receive messages meant for the first key. M5 records the creating key with the session and refuses any other, before changesets depend on sessions."
 
 - [ ] **Step 4: The milestone changelog**
 
