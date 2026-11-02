@@ -13,9 +13,10 @@ use crate::store::{catalogs, documents};
 /// tombstones.
 ///
 /// The catalog lookup and the document read share one read-only
-/// `REPEATABLE READ` transaction, so they see one snapshot: a catalog
-/// deleted between the two is reported as unknown rather than exported
-/// empty. Compressing is CPU work and runs on a blocking thread.
+/// `REPEATABLE READ` transaction, so they see one snapshot (taken by the
+/// first query): a catalog deleted concurrently is either unknown (deleted
+/// first) or exported whole as it was, never exported empty or half-deleted.
+/// Compressing is CPU work and runs on a blocking thread.
 ///
 /// # Arguments
 /// * `pool` - the database.
