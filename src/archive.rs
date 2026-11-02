@@ -10,6 +10,17 @@
 //! a duplicate path, and a file that is also another file's directory (`a`
 //! beside `a/b.md`) each refuse the whole import, and every problem is
 //! listed. The uncompressed total is capped.
+//!
+//! A directory follows different rules, on purpose (design "Import", step 1):
+//! it is read through M1's listing contract ([`DiskWorkspace`]'s
+//! `list_files`), so it is never refused for its entries. A symlink that
+//! resolves inside the catalog to a regular file is imported as that file's
+//! bytes (a link is flattened); a dangling or outside symlink, a special file
+//! (FIFO, socket, device) and a non-UTF-8 name (with everything below it) are
+//! skipped with a `tracing` warning, not listed as problems. So
+//! `import --replace` from a directory holding such entries drops or flattens
+//! them where the same tree as a tarball would be refused. Only the size cap
+//! refuses a directory import.
 
 use std::collections::btree_map::Entry as MapEntry;
 use std::collections::BTreeMap;
@@ -161,6 +172,8 @@ fn checked_path(raw: &[u8]) -> Result<String, String> {
 /// Reads a catalog directory for import: every file M1's listing contract
 /// returns (symlinks only inside the catalog), except `.git` (a directory or
 /// a worktree's link file), `.worktrees/` and `__pycache__/`. Dotfiles are kept.
+/// Unlike [`read_tarball`], entries the listing skips are not refused (see
+/// the module documentation).
 ///
 /// # Arguments
 /// * `root` - the catalog directory (a checkout, say).
