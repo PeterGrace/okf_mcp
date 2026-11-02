@@ -350,6 +350,10 @@
     "has_frontmatter": false
   },
   {
+    "path": "markdown/docs/nested.md",
+    "has_frontmatter": false
+  },
+  {
     "path": "people/bad-colon.md",
     "has_frontmatter": true,
     "error_line": 3,

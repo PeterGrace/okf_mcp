@@ -23,8 +23,19 @@ use crate::okf::workspace::Workspace;
 pub const NON_CONCEPTS: [&str; 5] = ["index.md", "log.md", "AGENTS.md", "CLAUDE.md", "README.md"];
 /// OKF's reserved filenames.
 pub const RESERVED: [&str; 2] = ["index.md", "log.md"];
-/// Top-level directories that hold repository machinery, not concepts.
-pub const MACHINERY_DIRS: [&str; 3] = [".git", ".claude", "tools"];
+/// Directories the markdown walk never enters, at any depth (`okf.py`'s
+/// `SKIP_DIRS`). `install/` is the catalog template's setup machinery.
+pub const SKIP_DIRS: [&str; 3] = [".git", ".claude", "install"];
+/// Directories the markdown walk skips at the catalog root only (`okf.py`'s
+/// `SKIP_TOP`): the template's own development docs and tests. A nested
+/// `infra/docs/` is walked as usual.
+pub const SKIP_TOP: [&str; 2] = ["docs", "tests"];
+
+/// Is `first`, a path's first component, repository machinery where no
+/// concept may live? `okf.py`'s `SKIP_DIRS | SKIP_TOP | {"tools"}`.
+fn is_machinery(first: &str) -> bool {
+    first == "tools" || SKIP_DIRS.contains(&first) || SKIP_TOP.contains(&first)
+}
 
 // `LazyLock` builds the value on first use and caches it: like a module-level
 // `re.compile(...)` in Python, but deferred until needed.
@@ -236,7 +247,7 @@ pub fn new_concept_path(
         )));
     }
     let first = path.split('/').next().unwrap_or_default();
-    if MACHINERY_DIRS.contains(&first) || path.split('/').any(|p| p.starts_with('.')) {
+    if is_machinery(first) || path.split('/').any(|p| p.starts_with('.')) {
         return Err(invalid(
             "that's repository machinery, not a place for concepts",
         ));
@@ -334,6 +345,11 @@ mod tests {
             new_concept_path(&ws, "/infra/new-thing").unwrap(),
             ("infra/new-thing.md".to_string(), None)
         );
+        // `SKIP_TOP` applies to the first component only, as in `okf.py`.
+        assert_eq!(
+            new_concept_path(&ws, "infra/docs/x").unwrap(),
+            ("infra/docs/x.md".to_string(), None)
+        );
         let (_, note) = new_concept_path(&ws, "infra/New_Thing.md").unwrap();
         assert!(note.is_some());
         for bad in [
@@ -341,6 +357,9 @@ mod tests {
             "infra/index.md",
             "tools/x",
             ".claude/x",
+            "install/x",
+            "docs/x",
+            "tests/x",
             "a/.hidden/x",
             "/infra/time-server",
         ] {
