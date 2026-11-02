@@ -262,8 +262,42 @@ fn write_output(output: &Path, tarball: &[u8]) -> anyhow::Result<()> {
         // Locked stdout is line-buffered: flush the tail before returning.
         stdout.flush().context("write to stdout")?;
     } else {
-        std::fs::write(output, tarball).with_context(|| format!("write {}", output.display()))?;
+        write_file_atomically(output, tarball)
+            .with_context(|| format!("write {}", output.display()))?;
     }
+    Ok(())
+}
+
+/// Writes `contents` to `path` through a temp file in the same directory,
+/// renamed into place once complete, so a failed write (a full disk, say)
+/// never leaves a truncated archive. An existing file is replaced, as
+/// `tar -cf` would.
+///
+/// # Arguments
+/// * `path` - the file to write.
+/// * `contents` - its bytes.
+///
+/// # Errors
+/// The temp file failing to be created, written, synced or renamed.
+fn write_file_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    // `parent()` of a bare file name is `Some("")`: the current directory.
+    let parent = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".okf-export-").suffix(".tmp");
+    // `tempfile` alone creates 0o600; ask for 0o666 minus the umask, as
+    // `File::create` does.
+    #[cfg(unix)]
+    builder.permissions(crate::okf::workspace::new_file_permissions());
+    // The temp file is deleted when `temp` is dropped on any early return
+    // (`Drop`, like a `with` block's `__exit__`), so a failure leaks nothing.
+    let mut temp = builder.tempfile_in(parent)?;
+    temp.write_all(contents)?;
+    // Durable before the rename, so a crash cannot leave an empty file.
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -702,6 +736,13 @@ mod tests {
         assert_eq!(files["index.md"].content, b"# Index\n");
         assert!(unknown.is_err());
         assert!(!unwritten.exists());
+        // The temp file was renamed into place: nothing else is left behind.
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["index.md", "pg.tar.gz"]);
     }
 
     #[tokio::test]
