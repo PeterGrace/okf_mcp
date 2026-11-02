@@ -135,8 +135,8 @@ fn is_valid_id(id: &str) -> bool {
 /// The key itself: print it once; it is not stored and cannot be shown again.
 ///
 /// # Errors
-/// [`OkfError::Refused`] for an invalid or taken id, or a default catalog that
-/// is not granted; [`OkfError::CatalogNotSelected`] for an unknown catalog
+/// [`OkfError::Refused`] for an invalid or taken id, no catalogs, or a default
+/// catalog that is not granted; [`OkfError::CatalogNotSelected`] for an unknown catalog
 /// (granted or default); [`OkfError::Io`] if the OS random source fails;
 /// [`OkfError::Database`] otherwise.
 pub async fn create(
@@ -148,6 +148,15 @@ pub async fn create(
         return Err(OkfError::Refused {
             reason: format!(
                 "key id {:?} must be letters, digits, '.', '_' and '-'",
+                new.id
+            ),
+        });
+    }
+    if matches!(new.grants, Grants::Catalogs([])) {
+        // A slice pattern: `[]` matches an empty slice.
+        return Err(OkfError::Refused {
+            reason: format!(
+                "key {:?} must be granted a catalog, or every catalog",
                 new.id
             ),
         });
@@ -465,6 +474,7 @@ mod tests {
         .await;
         let duplicate = create(&db.pool, &new_key("a", Grants::All, None), now()).await;
         let bad_id = create(&db.pool, &new_key("has space", Grants::All, None), now()).await;
+        let no_catalogs = create(&db.pool, &new_key("d", Grants::Catalogs(&[]), None), now()).await;
         let bad_default = create(
             &db.pool,
             &new_key("c", Grants::Catalogs(&pg), Some("work")),
@@ -472,13 +482,16 @@ mod tests {
         )
         .await;
 
-        assert!(
-            matches!(unknown, Err(OkfError::CatalogNotSelected { ref catalog }) if catalog == "nope")
-        );
-        assert!(
-            matches!(duplicate, Err(OkfError::Refused { reason }) if reason.contains("already exists"))
-        );
+        assert!(matches!(
+            unknown,
+            Err(OkfError::CatalogNotSelected { ref catalog }) if catalog == "nope"
+        ));
+        assert!(matches!(
+            duplicate,
+            Err(OkfError::Refused { reason }) if reason.contains("already exists")
+        ));
         assert!(matches!(bad_id, Err(OkfError::Refused { .. })));
+        assert!(matches!(no_catalogs, Err(OkfError::Refused { .. })));
         assert!(matches!(bad_default, Err(OkfError::Refused { .. })));
         // Only the first key exists, and only its creation bumped the generation.
         assert_eq!(list(&db.pool).await.unwrap().len(), 1);
