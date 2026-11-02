@@ -896,6 +896,10 @@ CREATE TABLE revisions (
     created_at   timestamptz NOT NULL,
     UNIQUE (catalog_id, path, revision)
 );
+-- Deleting a changeset (when its catalog is deleted) clears changeset_id on
+-- its revisions; without this index each one would scan all history.
+CREATE INDEX revisions_changeset_id ON revisions (changeset_id)
+    WHERE changeset_id IS NOT NULL;
 ```
 
 `src/error.rs`, two variants (update the enum's doc to drop "git"; see Task 11 for the rest of that wording):
