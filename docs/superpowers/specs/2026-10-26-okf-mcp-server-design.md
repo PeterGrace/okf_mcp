@@ -173,8 +173,8 @@ Postgres `text` cannot hold NUL), so any file round-trips exactly. A file that i
 UTF-8 is text (NUL bytes included: content is `bytea`): it is loaded into the snapshot,
 scanned for secrets and, for markdown, analyzed. Any other file (an image, say) is
 stored and exported but not analyzed, as `okf.py`'s secret walk skips files it can't
-read; a markdown file that is not text is an import error. The derived columns are recomputed from the content on
-every write, so they can never disagree with it.
+read; a markdown file that is not text is an import error. The derived columns are
+recomputed from the content on every write, so they can never disagree with it.
 
 ### In-memory snapshot
 

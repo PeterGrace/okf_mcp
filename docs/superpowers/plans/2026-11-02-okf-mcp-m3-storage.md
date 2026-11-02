@@ -264,7 +264,7 @@ And in `src/okf/snapshot.rs`'s test module, a link to a binary file must not be 
 
 (If `snapshot.rs`'s test module does not import `MemWorkspace` yet, add `use crate::okf::workspace::MemWorkspace;`.)
 
-> **Corrected (issue #35), 2026-11-02.** The fixture first used `![logo](img/logo.png)`, which yields no link: `markdown::find_links` ports `okf.py`'s `LINK_RE` with its `(?<!!)`, so an image embed is not a link and `links()[0]` panicked. It now uses `[logo](img/logo.png)`; Task 10's `load_builds_the_snapshot_of_the_live_documents` had the same fixture and is fixed the same way.
+> **Corrected (issue #35), 2026-11-02.** The fixture first used `![logo](img/logo.png)`, which yields no link: `markdown::find_links` ports `okf.py`'s `LINK_RE` with its `(?<!!)`, so an image embed is not a link and `links()[0]` panicked. It now uses `[logo](img/logo.png)`; Task 10's `load_builds_the_snapshot_of_the_live_documents` had the same fixture and is fixed the same way. Also, `read_to_string` below validates the borrowed bytes with `std::str::from_utf8` before copying, instead of `String::from_utf8(file.content.clone())`, so a non-text file is never copied (code updated inline).
 
 - [ ] **Step 2: Run them to see them fail**
 
