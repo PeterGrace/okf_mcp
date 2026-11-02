@@ -26,7 +26,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use indexmap::IndexMap;
 // `rayon::prelude` brings the `par_iter` extension method into scope (Rust
@@ -35,6 +35,7 @@ use rayon::prelude::*;
 use regex::Regex;
 
 use crate::error::OkfError;
+use crate::okf::analysis::links::MentionMatcher;
 use crate::okf::analysis::secrets::{scan_secrets, OKF_PY_PATH};
 use crate::okf::analysis::Finding;
 use crate::okf::doc::Doc;
@@ -228,6 +229,12 @@ pub struct Snapshot {
     extra_anchors: HashMap<String, BTreeSet<String>>,
     backlinks: HashMap<String, Vec<Backlink>>,
     secrets: Vec<Finding>,
+    /// The unlinked-mention matcher, built on first use
+    /// ([`Snapshot::mention_matcher`]).
+    // `OnceLock` is a cell written at most once, safely across threads: the
+    // first caller builds the value and every later caller reads it (like a
+    // `functools.cached_property` that is safe to race on).
+    mention_matcher: OnceLock<MentionMatcher>,
 }
 
 impl Snapshot {
@@ -266,6 +273,32 @@ impl Snapshot {
             extra_anchors,
             backlinks,
             secrets,
+            mention_matcher: OnceLock::new(),
+        })
+    }
+
+    /// The concepts `okf.py`'s link analysis sees (in the link graph, kind
+    /// Concept), in `os.walk` order.
+    ///
+    /// The one definition shared by `links_report`, whose mention *sources*
+    /// they are, and [`Snapshot::mention_matcher`], whose *targets* they are,
+    /// so the two can't drift apart.
+    pub(crate) fn link_graph_concepts(&self) -> impl Iterator<Item = &SnapshotDoc> {
+        self.docs
+            .iter()
+            .filter(|doc| doc.in_link_graph() && doc.kind == DocKind::Concept)
+    }
+
+    /// The matcher `links_report` uses for unlinked mentions, over
+    /// [`Snapshot::link_graph_concepts`].
+    ///
+    /// # Returns
+    /// The matcher, built on the first call and reused by every later one
+    /// (the snapshot is immutable, so it never goes stale).
+    pub(crate) fn mention_matcher(&self) -> &MentionMatcher {
+        self.mention_matcher.get_or_init(|| {
+            let concepts: Vec<&SnapshotDoc> = self.link_graph_concepts().collect();
+            MentionMatcher::new(&concepts)
         })
     }
 
@@ -626,6 +659,59 @@ mod tests {
 
         let link = &snapshot.get("a.md").unwrap().links()[0];
         assert!(link.target_exists && link.target_is_file);
+    }
+
+    #[test]
+    fn the_mention_matcher_is_built_once_per_snapshot() {
+        // Arrange
+        let snapshot = Snapshot::build(&MemWorkspace::from_files([
+            (
+                "a.md",
+                "---\ntype: Note\ntitle: Alpha concept\n---\nSee Beta concept.\n",
+            ),
+            ("b.md", "---\ntype: Note\ntitle: Beta concept\n---\nBody.\n"),
+        ]))
+        .unwrap();
+
+        // `OnceLock::get` reads the cell without building it (`None` while
+        // empty), so the test can see whether `links_report` filled it.
+        assert!(snapshot.mention_matcher.get().is_none());
+
+        // Act
+        let report = crate::okf::analysis::links::links_report(&snapshot, true);
+        // `*const T` is a raw pointer; comparing two of them asks "same
+        // object?", like Python's `is`.
+        let built: *const MentionMatcher = snapshot
+            .mention_matcher
+            .get()
+            .expect("links_report built the cached matcher");
+        let again = crate::okf::analysis::links::links_report(&snapshot, true);
+
+        // Assert: the second report and a direct call reuse the first
+        // report's matcher (a `OnceLock` is written once, so it was built
+        // once), and the reports agree.
+        assert!(std::ptr::eq(built, snapshot.mention_matcher()));
+        assert_eq!(report.unlinked_mentions.len(), 1);
+        assert_eq!(report.unlinked_mentions[0].target, "b.md");
+        assert_eq!(report, again);
+    }
+
+    #[test]
+    fn link_graph_concepts_are_the_concepts_outside_root_machinery() {
+        // Arrange
+        let snapshot = Snapshot::build(&MemWorkspace::from_files([
+            ("AGENTS.md", "# Agents\n"),
+            ("index.md", "* [A](/a.md)\n"),
+            ("a.md", "---\ntype: Note\n---\nBody.\n"),
+            ("infra/b.md", "---\ntype: Host\n---\nBody.\n"),
+        ]))
+        .unwrap();
+
+        // Act
+        let paths: Vec<&str> = snapshot.link_graph_concepts().map(|d| d.path()).collect();
+
+        // Assert
+        assert_eq!(paths, ["a.md", "infra/b.md"]);
     }
 
     fn catalog() -> MemWorkspace {
