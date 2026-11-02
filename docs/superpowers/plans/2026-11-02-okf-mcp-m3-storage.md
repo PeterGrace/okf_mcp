@@ -4473,6 +4473,8 @@ git commit -m "test: import/export round trips of the synthetic corpus and the r
 - Modify: `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md`
 - Create: `changelog/<ts>-m3-storage.md` (the milestone note) and `changelog/<ts>-m3-task-13-wrap-up.md`
 
+> **Corrected (issue #47), 2026-11-02.** The smoke test shipped as written (apart from `rustfmt`'s layout and comments); `tests/smoke.rs`'s module doc now describes both tests. The design's "What M3 shipped differently" also records the directory import's leniency (`git archive | okf-mcp import NAME -` is the exact path), the note for M5 on `catalogs::delete`'s row locks, and an open question for M5: the read-only machinery list in "Rules enforced on every write" does not include `install/` or the root `docs/` and `tests/` (#50).
+
 - [ ] **Step 1: The storage smoke test**
 
 Add to `tests/smoke.rs` (keep the M2 test as it is; add `mod support;` at the top):

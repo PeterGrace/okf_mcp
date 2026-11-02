@@ -1,8 +1,8 @@
 # OKF MCP server: design
 
 - **Date:** 2026-10-26; storage redesigned 2026-11-02 (see "Revision: Postgres storage")
-- **Status:** approved design. M1 (core library) and M2 (analysis) are delivered; see
-  "Milestones"
+- **Status:** approved design. M1 (core library), M2 (analysis) and M3 (storage) are
+  delivered; see "Milestones"
 - **Catalog concept:** `/projects/okf-mcp-server.md` in `pg_knowledge_catalog`
 - **Replaces:** `tools/okf.py` in every OKF catalog (how the existing git catalogs hand
   over to the server is decided once the server is complete)
@@ -510,7 +510,7 @@ check keeps `okf.py`'s 2-minute slack. Revision times are written by the server
 |---|---|
 | M1. Core library (delivered) | `okf::yaml`, `okf::doc`, `okf::markdown`, `okf::workspace`, `clock`; the parity test harness ([plan](../plans/2026-10-26-okf-mcp-m1-core-library.md)) |
 | M2. Analysis (delivered) | `lint`, links report, `oldest`, `sprawl`, secret scan; snapshot and search; `okf::timestamp` ([plan](../plans/2026-10-27-okf-mcp-m2-analysis.md); PRs #17-#30) |
-| M3. Storage | `config`, `db` and migrations, `store`, `archive`; `catalog` with snapshot swap and the cached mention matcher; import and export subcommands; `catalog` and `key` subcommands; revision-based commit times for lint. Export then import reproduces the real catalog's file contents and modes byte for byte |
+| M3. Storage (delivered) | `config`, `db` and migrations, `store`, `archive`; `catalog` with snapshot swap and the cached mention matcher; import and export subcommands; `catalog` and `key` subcommands; revision-based commit times for lint. Export then import reproduces the real catalog's file contents and modes byte for byte ([plan](../plans/2026-11-02-okf-mcp-m3-storage.md); PRs #48-#61) |
 | M4. Read-only server | axum, rmcp, auth, `selection`, the read tools that need no changeset (including `history`), the import and export routes, `/healthz`. Deployable and useful on its own |
 | M5. Writes | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` |
 | M6. Restructuring | `move_concept`, `split_concept`, `delete_concept` |
@@ -542,25 +542,94 @@ the ones that change this design:
   and `README.md` are in the snapshot but outside the link graph. Sprawl scores match
   `okf.py` on Python 3.12 or later, whose float `sum()` is compensated.
 
+### What M3 shipped differently
+
+The M3 plan's "Simplifications and deviations relative to the design" and its dated
+`Corrected` notes have the full list; the ones that change this design (most are
+already written into the sections above):
+
+- The in-memory workspace holds every file's bytes and execute bit itself, rather than
+  the store keeping them beside a text-only workspace, so a link to an image resolves
+  (see "In-memory snapshot"). `MemWorkspace::from_stored` refuses the trees a disk
+  write can never produce: two paths that normalize to the same one, and a file that
+  is also another file's directory (`a` beside `a/b.md`).
+- Text means valid UTF-8; NUL no longer matters, since content is `bytea` (see
+  "Storage").
+- The configuration file holds only `max_import_bytes` until later milestones add
+  their fields; unknown keys are ignored (see "Configuration").
+- Every subcommand that touches the database runs the embedded migrations on connect;
+  `migrate` stays for deploy hooks (see "Process and routes").
+- `api_keys.default_catalog_id` references `catalogs` (`ON DELETE SET NULL`) instead of
+  naming the catalog (see "Storage"). `key grant` and `key ungrant` refuse a key
+  created with `--all`, whose grants are not per catalog.
+- The schema indexes the foreign keys a catalog or key delete looks up, and
+  `revisions`' key is its primary key (named `revisions_catalog_id_path_revision_key`)
+  rather than a separate unique constraint.
+- Import writes rows one at a time inside one transaction. On the real catalog (225
+  files) the whole import, lint included, took 79 ms in release mode. It skips a file
+  whose bytes and execute bit are unchanged, so with `--replace` an unchanged file keeps
+  its revision and its derived columns; a later change to how the derived columns are
+  computed must therefore ship a backfill, since re-importing identical bytes cannot
+  repair them. After taking the catalog lock, import (like `catalog delete`) looks the
+  catalog up again, so a concurrent delete is reported as an unknown catalog.
+- A tarball import also refuses a file that is also another file's directory and a
+  path holding a control character (a pax `path` record can carry a NUL, which
+  Postgres `text` cannot store); names are shown escaped in the problem list. A
+  directory import stays lenient on purpose (M1's listing contract, documented in
+  `src/archive.rs`): a symlink inside the catalog is flattened to its target's bytes,
+  and a dangling or outside symlink, a special file and a non-UTF-8 name are skipped
+  with a warning, so `git archive --format=tar.gz HEAD | okf-mcp import NAME -` is the
+  exact path.
+- A file dropped by `import --replace` gets a `delete` revision with `message =
+  'import'`, as step 3 of "Import" says; a tombstone row keeps an empty `content`.
+- Export reads the catalog and its documents in one `REPEATABLE READ, READ ONLY`
+  transaction, so a catalog deleted concurrently is either unknown to the export or
+  exported whole as it was, never half-deleted.
+  The CLI builds the archive in memory and writes a file through a temp file renamed
+  into place, so an unknown catalog or a failed write leaves no truncated file.
+- `CatalogState` builds its snapshot in a `REPEATABLE READ, READ ONLY` transaction and
+  serializes rebuilds of one catalog with an async mutex: concurrent `refresh` calls
+  build and swap once, so M4's poll loop and M5's publish need no lock of their own
+  for it.
+- `catalog delete` locks the catalog row and its open changesets `FOR UPDATE` after the
+  advisory lock, so a concurrent changeset write cannot slip past the unpublished-work
+  check. M5's write path must take `catalogs::lock` before touching changesets, or touch
+  the catalog row (or create the changeset) before writing entries, or retry on
+  SQLSTATE `40P01`, or it can deadlock with a delete (the M3 plan's note for M5).
+- Lint's commit time is the document's last revision time, so after a first import
+  every document's "commit" is the import time, and `generated-after-commit` cannot
+  flag a stamp that falls between the real git commit and the import. The server has
+  no git; this is the closest equivalent.
+- The markdown walk and `new_concept_path` follow `okf.py` 481357b (the catalog
+  template's adoption): `install/` is skipped at any depth and `docs/` and `tests/` at
+  the catalog root, and `new_concept_path` refuses those first components as it does
+  `tools/`. So `Snapshot::resolve_concept`, which sees only walked documents, does not
+  find a file there; `paths::resolve_concept` checks the workspace and still does, as
+  `okf.py`'s does. Import, export and the secret scan still see every file.
+- Open question for M5: the read-only machinery list in "Rules enforced on every
+  write" (`AGENTS.md`, `CLAUDE.md`, `README.md`, `tools/`, `.claude/`, `.git*`) does not
+  include `install/` or the root `docs/` and `tests/`, which `okf.py` now skips (#50).
+  `new_concept_path` already refuses a concept there; whether every write tool treats
+  them as read-only machinery is decided with the write path.
+
 ### Carried into M3 and later
 
 Raised in M2 reviews and filed as issues (label `milestone-3`):
 
-- **#31 Commit times for lint.** Originally "fill `CommitTimes` from git, keyed by
-  catalog-relative paths". With Postgres storage it becomes: fill `CommitTimes` from
-  each document's last revision time (M3), and mark the session's changeset paths dirty
-  (M5). Keys are document paths, which are already catalog-relative.
-  M3 also updates the doc comments that still describe the git plan
-  (`src/okf/analysis/lint.rs` module docs and `CommitTimes::new`, `src/okf/workspace.rs`,
-  `src/okf/mod.rs`, `src/error.rs`).
-- **#32 Snapshot swapping** (`RwLock<Arc<Snapshot>>`, rebuilt after publish or import):
-  M3.
-- **#33 Mention matcher cache** per snapshot (PR #23): M3, after #32.
+- **#31 Commit times for lint** (done in M3, PR #61): `Loaded::lint` fills
+  `CommitTimes` from each document's last revision time; marking the session's
+  changeset paths dirty stays for M5. The doc comments that described the git plan
+  (`src/okf/analysis/lint.rs` module docs and `CommitTimes::new`,
+  `src/okf/workspace.rs`, `src/okf/mod.rs`) no longer describe it; `CommitTimes::new`
+  names both sources (`okf.py`'s git, the server's revisions).
+- **#32 Snapshot swapping** (done in M3, PR #58): `catalog::CatalogState` holds an
+  `RwLock<Arc<Loaded>>`, rebuilt by `refresh` when the catalog's `generation` moves.
+- **#33 Mention matcher cache** per snapshot (done in M3, PR #52):
+  `Snapshot::mention_matcher` builds it once, lazily.
 - **#34 `search` tool description** (PR #24): the `tags` filter matches whole tags only,
-  while free text matches tags by substring. M4, with the tool.
-- **#35 `test-util` for integration tests** (PR #29): any integration test that needs
-  `MemWorkspace` enables `test-util`. M3 makes the in-memory workspace production code,
-  which may make the feature unnecessary.
+  while free text matches tags by substring. M4, with the tool; the issue stays open.
+- **#35 `test-util` for integration tests** (done in M3, PR #48): the in-memory
+  workspace is production code and the feature is gone.
 - From the M2 plan's "Deliberately deferred" table: cross-catalog search merge (M4);
   secret refusal on write, the no-frontmatter `set_block` error (M5). The per-session
   write lock, `core.symlinks=false` clones and `.okf-*.tmp` handling before `git add -A`
