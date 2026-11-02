@@ -5,3 +5,4 @@
 pub mod catalogs;
 pub mod documents;
 pub mod import;
+pub mod keys;
