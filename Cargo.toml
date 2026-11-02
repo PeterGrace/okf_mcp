@@ -52,7 +52,7 @@ tar = "0.4.46"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros"] }
 thiserror = "2.0.6"
 # The async runtime sqlx runs on, and the CLI's entry point.
-tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "sync"] }
 # The configuration file.
 toml = "1.1"
 tracing = "0.1.41"
