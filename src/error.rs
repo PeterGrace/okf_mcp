@@ -53,6 +53,14 @@ pub enum OkfError {
         source: std::io::Error,
     },
 
+    /// An import was refused; every problem found is listed.
+    // `.problems` in the format arguments refers to the field (thiserror syntax).
+    #[error("import refused: {}", .problems.join("; "))]
+    ImportRefused {
+        /// One line per problem: the entry, and what is wrong with it.
+        problems: Vec<String>,
+    },
+
     /// A database operation failed. M4 logs the details and returns only the
     /// variant to MCP clients; the CLI prints them.
     #[error("database: {source}")]
