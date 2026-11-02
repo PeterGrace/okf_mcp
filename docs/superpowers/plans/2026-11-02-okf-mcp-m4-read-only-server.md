@@ -1653,21 +1653,29 @@ impl App {
     /// One pass of the poll loop: reloads the key cache if `admin_generation`
     /// moved, and brings the catalogs in line with the catalog list.
     ///
-    /// A catalog that fails to load or refresh is logged and retried at the
-    /// next pass; the others are unaffected. Passes never overlap: a call
+    /// A catalog that fails to load or refresh, or a key reload that fails,
+    /// is logged and retried at the next pass; the rest of the pass goes
+    /// ahead. Passes never overlap: a call
     /// made while another runs waits for it, then makes its own pass.
     ///
     /// # Errors
-    /// [`OkfError::Database`] reading the counters or the list.
+    /// [`OkfError::Database`] reading the counter or the catalog list.
     pub async fn poll(&self) -> Result<(), OkfError> {
         // The guard (`_` prefix: kept only for its lifetime) releases the
         // mutex when the function returns.
         let _polling = self.polling.lock().await;
         let admin_generation = catalogs::admin_generation(&self.pool).await?;
         if admin_generation != self.admin_generation.load(Ordering::Relaxed) {
-            self.keys.reload(&self.pool).await?;
-            self.admin_generation
-                .store(admin_generation, Ordering::Relaxed);
+            // A failed reload leaves the counter unstored, so the next pass
+            // retries it; the catalog changes below go ahead regardless.
+            match self.keys.reload(&self.pool).await {
+                Ok(()) => self
+                    .admin_generation
+                    .store(admin_generation, Ordering::Relaxed),
+                Err(error) => {
+                    tracing::error!(%error, "key reload failed; retrying at the next poll");
+                }
+            }
         }
         let current = self.catalogs();
         let mut next = Catalogs::new();
