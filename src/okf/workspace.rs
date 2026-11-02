@@ -549,23 +549,49 @@ impl MemWorkspace {
 
     /// Builds a workspace from stored files (a catalog's rows).
     ///
+    /// Refuses the inputs [`Workspace::write_atomic`] could never have
+    /// produced, so the result is always a consistent tree.
+    ///
     /// # Arguments
-    /// * `files` - `(catalog-relative path, file)` pairs.
+    /// * `files` - `(catalog-relative path, file)` pairs. A leading `/` means
+    ///   the catalog root, as for every [`Workspace`] path.
     ///
     /// # Returns
     /// The workspace holding those files, keyed by normalized path.
     ///
     /// # Errors
-    /// [`OkfError::InvalidPath`] if a path escapes the catalog or is the root.
+    /// [`OkfError::InvalidPath`] if a path escapes the catalog or is the root,
+    /// if two paths normalize to the same one (`./a.md` and `a.md`), or if a
+    /// file is also a directory of another (`a` beside `a/b.md`).
     pub fn from_stored(
         files: impl IntoIterator<Item = (String, StoredFile)>,
     ) -> Result<Self, OkfError> {
-        // `collect` into `Result<BTreeMap<_, _>, _>` stops at the first error,
-        // like a loop that raises.
-        let map = files
-            .into_iter()
-            .map(|(path, file)| Ok((checked_file(&path)?, file)))
-            .collect::<Result<BTreeMap<_, _>, OkfError>>()?;
+        let mut map = BTreeMap::new();
+        for (path, file) in files {
+            // `insert` returns the value it replaced (`Some`) for a key that
+            // was already there: Python's `if key in d` and `d[key] = v` in one.
+            if map.insert(checked_file(&path)?, file).is_some() {
+                return Err(OkfError::InvalidPath {
+                    path,
+                    reason: "a duplicate of another path".to_string(),
+                });
+            }
+        }
+        // One reused buffer for the `"<file>/"` probes, instead of a new
+        // `String` per key.
+        let mut dir_prefix = String::new();
+        let clash = map.keys().find(|key| {
+            dir_prefix.clear();
+            dir_prefix.push_str(key);
+            dir_prefix.push('/');
+            has_key_with_prefix(&map, &dir_prefix)
+        });
+        if let Some(path) = clash {
+            return Err(OkfError::InvalidPath {
+                path: path.clone(),
+                reason: "is a file and a directory".to_string(),
+            });
+        }
         Ok(Self {
             files: RwLock::new(map),
         })
@@ -736,6 +762,27 @@ mod tests {
     fn from_stored_refuses_a_path_outside_the_catalog() {
         let refused = MemWorkspace::from_stored([("../x.md".to_string(), stored(b"", false))]);
         assert!(matches!(refused, Err(OkfError::InvalidPath { .. })));
+    }
+
+    #[test]
+    fn from_stored_refuses_paths_that_normalize_to_the_same_file() {
+        let refused = MemWorkspace::from_stored([
+            ("./a.md".to_string(), stored(b"one", false)),
+            ("a.md".to_string(), stored(b"two", false)),
+        ]);
+        assert!(matches!(refused, Err(OkfError::InvalidPath { path, .. }) if path == "a.md"));
+    }
+
+    #[test]
+    fn from_stored_refuses_a_file_that_is_also_a_directory() {
+        // `a-x` sorts between `a` and `a/b.md` (`-` < `/`), so the check
+        // cannot just look at the next key.
+        let refused = MemWorkspace::from_stored([
+            ("a".to_string(), stored(b"", false)),
+            ("a-x".to_string(), stored(b"", false)),
+            ("a/b.md".to_string(), stored(b"", false)),
+        ]);
+        assert!(matches!(refused, Err(OkfError::InvalidPath { path, .. }) if path == "a"));
     }
 
     #[test]

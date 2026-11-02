@@ -359,6 +359,8 @@ Change the field to `files: RwLock<BTreeMap<String, StoredFile>>`, and `has_key_
     }
 ```
 
+> **Corrected (issue #35, review of PR #48), 2026-11-02.** `from_stored` shipped stricter than the code above: it also refuses (`InvalidPath`) two paths that normalize to the same one (`./a.md` and `a.md`, reason "a duplicate of another path") and a file that is also another file's directory (`a` beside `a/b.md`, reason "is a file and a directory"), the trees `write_atomic` can never produce. Its signature is unchanged. Read `src/okf/workspace.rs` for the shipped version; the tests are `from_stored_refuses_paths_that_normalize_to_the_same_file` and `from_stored_refuses_a_file_that_is_also_a_directory`.
+
 `files()` returns `RwLockReadGuard<'_, BTreeMap<String, StoredFile>>`. In `impl Workspace for MemWorkspace`:
 
 ```rust
@@ -2506,6 +2508,8 @@ git commit -m "keys: API key generation, storage, grants and okf-mcp key"
 ### Task 7: `archive`: tarballs and directories, with the import rules
 
 Pure reading and writing of catalog files (design "Import" and "Export"). Reading applies every import rule and lists every problem at once. The size cap counts the decompressed stream, so a small upload cannot expand without bound (verified fact 7).
+
+> **Corrected (issue #35, review of PR #48), 2026-11-02.** Since Task 1, `MemWorkspace::from_stored` refuses a file that is also another file's directory (`a` beside `a/b.md`), which a tarball can hold. The rules below do not list that case, so Task 8's `import` would fail on it with `InvalidPath` from `from_stored`, naming only the first such path. Add it to the listed problems here (a file path that is a prefix directory of another, checked over the sorted `Files` map) so every clash is reported with the others.
 
 **Files:**
 - Modify: `Cargo.toml` (`tar`, `flate2`)

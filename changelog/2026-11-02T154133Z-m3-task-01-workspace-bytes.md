@@ -7,13 +7,17 @@ code and must know every file of the catalog, text or not, with its execute bit.
 ## Added
 
 - `okf::workspace::StoredFile { content: Vec<u8>, executable: bool }`: one stored file.
-- `MemWorkspace::from_stored(files)`: builds a workspace from `(path, StoredFile)` pairs;
-  a path outside the catalog, or the root, is `OkfError::InvalidPath`.
+- `MemWorkspace::from_stored(files)`: builds a workspace from `(path, StoredFile)` pairs.
+  `OkfError::InvalidPath` for a path outside the catalog or the root, two paths that
+  normalize to the same one, or a file that is also another file's directory (review of
+  PR #48: the trees `write_atomic` can never produce).
 - `MemWorkspace::stored(path)`: a copy of one file's bytes and execute bit.
 - `MemWorkspace::into_stored()`: every file, consuming the workspace without a copy.
 - Tests: `stored_files_keep_bytes_and_execute_bits`,
   `a_write_keeps_an_existing_execute_bit_and_new_files_are_not_executable`,
-  `from_stored_refuses_a_path_outside_the_catalog`, `into_stored_returns_every_file`
+  `from_stored_refuses_a_path_outside_the_catalog`,
+  `from_stored_refuses_paths_that_normalize_to_the_same_file`,
+  `from_stored_refuses_a_file_that_is_also_a_directory`, `into_stored_returns_every_file`
   (workspace), `a_link_to_a_binary_file_resolves` (snapshot).
 
 ## Changed
