@@ -836,12 +836,18 @@ CREATE TABLE api_keys (
     created_at      timestamptz NOT NULL,
     revoked_at      timestamptz
 );
+-- Lets deleting a catalog find the keys whose default it clears.
+CREATE INDEX api_keys_default_catalog_id ON api_keys (default_catalog_id)
+    WHERE default_catalog_id IS NOT NULL;
 
 CREATE TABLE key_catalogs (
     key_id     text NOT NULL REFERENCES api_keys (id) ON DELETE CASCADE,
     catalog_id bigint NOT NULL REFERENCES catalogs (id) ON DELETE CASCADE,
     PRIMARY KEY (key_id, catalog_id)
 );
+-- The primary key leads with key_id, so deleting a catalog needs its own
+-- index to find the grants that cascade.
+CREATE INDEX key_catalogs_catalog_id ON key_catalogs (catalog_id);
 
 CREATE TABLE changesets (
     id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -856,6 +862,10 @@ CREATE TABLE changesets (
 -- A racing "get or create" cannot open two changesets for one session.
 CREATE UNIQUE INDEX changesets_one_open_per_session
     ON changesets (catalog_id, session_id) WHERE state = 'open';
+-- The foreign-key lookups of a catalog or key delete: the partial index above
+-- cannot serve them, since they are not limited to open changesets.
+CREATE INDEX changesets_catalog_id ON changesets (catalog_id);
+CREATE INDEX changesets_key_id ON changesets (key_id) WHERE key_id IS NOT NULL;
 
 CREATE TABLE changeset_entries (
     changeset_id  bigint NOT NULL REFERENCES changesets (id) ON DELETE CASCADE,
