@@ -1,11 +1,17 @@
-//! The `okf_mcp` binary. For now a stub that only sets up logging; the MCP
-//! server arrives in milestone M3.
+//! The `okf-mcp` binary: parses the command line and runs it
+//! ([`okf_mcp::cli::run`]).
 
+use clap::Parser;
+use okf_mcp::cli::Cli;
+use okf_mcp::clock::SystemClock;
 use tracing_subscriber::EnvFilter;
 
-/// Installs a `tracing` subscriber that logs to stderr, filtered by
-/// `RUST_LOG` (default `warn`).
-fn main() {
+/// Installs a `tracing` subscriber on stderr (`RUST_LOG`, default `warn`),
+/// then runs the command line.
+// `#[tokio::main]` wraps `main` in a tokio runtime, so it can `.await`.
+// Returning `anyhow::Result` prints the error chain and exits non-zero.
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     // `try_from_default_env` fails when `RUST_LOG` is unset or invalid; fall
     // back to warnings only rather than aborting.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -13,5 +19,5 @@ fn main() {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
-    tracing::warn!("okf_mcp has no server yet; the MCP server arrives in M3");
+    okf_mcp::cli::run(Cli::parse(), &SystemClock).await
 }

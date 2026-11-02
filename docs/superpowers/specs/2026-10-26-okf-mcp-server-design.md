@@ -123,6 +123,9 @@ Subcommands:
 | `key create ID --access read\|write\|admin --catalogs pg,work\|--all [--default pg] [--actor A]` | Generates a random key, stores its SHA-256, prints the key once |
 | `key list`, `key revoke ID`, `key grant ID CATALOG`, `key ungrant ID CATALOG` | Manage keys |
 
+Every subcommand that touches the database applies the embedded migrations first
+(idempotent); `migrate` exists for deploy hooks that want them as a separate step.
+
 The subcommands talk to the database directly (`DATABASE_URL`), so in the cluster they
 run with `kubectl exec`. They need no API key: database access is the authority.
 
@@ -139,6 +142,9 @@ time_server = "mosaic-x5-3819907.internal"
 poll_interval = "10s"
 max_import_bytes = "64MiB"   # uncompressed total of an import
 ```
+
+Each milestone reads only its own fields (M3: `max_import_bytes`); unknown keys are
+ignored, so one file serves every version.
 
 Catalogs and keys are not in the config; they are rows. The only secret is
 `DATABASE_URL`, from an environment variable backed by a k8s Secret (CNPG generates
