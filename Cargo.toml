@@ -22,6 +22,8 @@ chrono = { version = "0.4.45", default-features = false, features = ["now"] }
 # The command line (`okf-mcp migrate | catalog | key | import | export`);
 # `env` lets DATABASE_URL fill `--database-url`.
 clap = { version = "4.6.7", features = ["derive", "env"] }
+# Gzip for catalog archives (.tar.gz import and export).
+flate2 = "1.1.10"
 # Insertion-ordered maps, matching Python dict order for frontmatter mappings.
 indexmap = "2.14.2"
 # Data parallelism for building snapshots and running analyses across documents.
@@ -34,6 +36,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 # Atomic writes via unique temp files (DiskWorkspace); also throwaway dirs in tests.
 tempfile = "3.27.0"
+# Catalog archives: .tar.gz import and export (with flate2).
+tar = "0.4.46"
 # Postgres access with runtime-checked queries, and the schema migrations
 # embedded at compile time (`migrate!` needs `macros`). No TLS feature yet:
 # that is a deployment decision (M7).

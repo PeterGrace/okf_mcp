@@ -494,6 +494,30 @@ fn has_key_with_prefix(files: &BTreeMap<String, StoredFile>, prefix: &str) -> bo
         .is_some_and(|(key, _)| key.starts_with(prefix))
 }
 
+/// Every file that is also another file's directory (`a` beside `a/b.md`), in
+/// path order. Such a map is not a tree: [`MemWorkspace::from_stored`] refuses
+/// it, and `crate::archive` lists every clash as an import problem.
+///
+/// # Arguments
+/// * `files` - catalog-relative path to file.
+///
+/// # Returns
+/// A lazy iterator over the clashing paths, O(log n) per path checked.
+pub(crate) fn files_that_are_directories(
+    files: &BTreeMap<String, StoredFile>,
+) -> impl Iterator<Item = &String> {
+    // One reused buffer for the `"<file>/"` probes, instead of a new `String`
+    // per key. `move` hands the buffer to the closure, which owns it from then
+    // on; `filter` needs `FnMut` because the closure changes it.
+    let mut dir_prefix = String::new();
+    files.keys().filter(move |key| {
+        dir_prefix.clear();
+        dir_prefix.push_str(key);
+        dir_prefix.push('/');
+        has_key_with_prefix(files, &dir_prefix)
+    })
+}
+
 /// One stored file: its exact bytes and its execute bit (a record, so its
 /// fields are public).
 // `Eq` on top of `PartialEq` promises equality is total (no NaN-like values),
@@ -584,16 +608,8 @@ impl MemWorkspace {
                 });
             }
         }
-        // One reused buffer for the `"<file>/"` probes, instead of a new
-        // `String` per key.
-        let mut dir_prefix = String::new();
-        let clash = map.keys().find(|key| {
-            dir_prefix.clear();
-            dir_prefix.push_str(key);
-            dir_prefix.push('/');
-            has_key_with_prefix(&map, &dir_prefix)
-        });
-        if let Some(path) = clash {
+        // `.next()` takes the first clash only; the iterator stops there.
+        if let Some(path) = files_that_are_directories(&map).next() {
             return Err(OkfError::InvalidPath {
                 path: path.clone(),
                 reason: "is a file and a directory".to_string(),
