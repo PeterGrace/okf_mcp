@@ -59,6 +59,8 @@ Deliberately deferred:
 - **`api_keys.default_catalog_id`** references `catalogs` (`ON DELETE SET NULL`) instead of naming the catalog, so deleting a catalog cannot leave a key with a stale default. Task 6 updates the design's table.
 - **Import writes rows one at a time inside one transaction.** A catalog has a few hundred files and import is rare; the smoke test records the real catalog's import time.
 - **A tombstone keeps an empty `content`** (the column is `NOT NULL`); its revision row has `NULL` content, as the design says.
+- **A file dropped by `import --replace` gets a `delete` revision** (with `message = 'import'`), not an `import` one with NULL content: history readers see one spelling for every deletion. Task 8 updates the design's "Import" step 3.
+- **Lint's commit time is the document's last revision time.** After a first import, every document's "commit" is the import, so `generated-after-commit` cannot flag a stamp that falls between the real git commit and the import. The server has no git, so this is the closest equivalent; Task 13 records it under "What M3 shipped differently".
 
 ## Verified facts the code relies on
 
@@ -68,7 +70,7 @@ Each was checked against the source or by running it on 2026-11-02 (a probe crat
 2. **Pool and migrations.** `PgPoolOptions::new()` (`R/sqlx-core-0.9.0/src/pool/options.rs:143`), `.max_connections(u32)` (`:173`), `.connect(&str).await` (`:528`). `sqlx::migrate!("./migrations")` needs the `macros` feature (`R/sqlx-0.9.0/src/lib.rs:97-98`), embeds the files at compile time relative to `CARGO_MANIFEST_DIR`, and rejects a bare `"migrations"` (`R/sqlx-macros-core-0.9.0/src/common.rs:17-24`). Adding a migration file does not trigger a rebuild without `build.rs` printing `cargo:rerun-if-changed=migrations` (`R/sqlx-0.9.0/src/macros/mod.rs:22-33`). `Migrator::run(&pool)` (`R/sqlx-core-0.9.0/src/migrate/migrator.rs:176`) returns `Result<(), MigrateError>`; a second run is a no-op.
 3. **Transactions and queries.** `pool.begin()` gives `Transaction<'static, Postgres>` (`pool/mod.rs:371`); execute with `&mut *tx` (`transaction.rs:229`, `DerefMut` to `PgConnection`); `commit()` (`:120`); dropping without commit rolls back (`:269-277`). `.bind(..)` (`query.rs:87`); `fetch_one/fetch_all/fetch_optional/execute` (`query.rs:185,247,269,291`); `#[derive(sqlx::FromRow)]` (the `macros` feature includes `derive`); a tuple is a `FromRow` type. `execute(..).rows_affected()` (`query_result.rs:9`).
 4. **Types.** `bytea` ↔ `Vec<u8>` (NUL and 0xFF round-trip), `text[]` ↔ `Vec<String>`, `timestamptz` ↔ `chrono::DateTime<Utc>`, `bigint` ↔ `i64`, `integer` ↔ `i32`, `boolean` ↔ `bool`, nullable ↔ `Option<T>` (bind `None::<String>`). The crate's `chrono` 0.4.45 with `default-features = false, features = ["now"]` works with sqlx's `chrono` feature.
-5. **Errors.** `sqlx::Error::as_database_error()` (`R/sqlx-core-0.9.0/src/error.rs:144`) then `.is_unique_violation()` (`:260`; code `23505`) and `.constraint()` (`R/sqlx-postgres-0.9.0/src/error.rs:241`). The constraint for `UNIQUE (catalog_id, path, revision)` on `revisions` is named `revisions_catalog_id_path_revision_key`; a partial unique index reports its index name. `SELECT pg_advisory_xact_lock($1)` (bind `i64`, run with `execute`, since it returns `void`) blocks other transactions until commit or rollback.
+5. **Errors.** `sqlx::Error::as_database_error()` (`R/sqlx-core-0.9.0/src/error.rs:144`) then `.is_unique_violation()` (`:260`; code `23505`) and `.constraint()` (`R/sqlx-postgres-0.9.0/src/error.rs:241`). The constraint for `UNIQUE (catalog_id, path, revision)` on `revisions` is named `revisions_catalog_id_path_revision_key`; a partial unique index reports its index name. `SELECT pg_advisory_xact_lock($1)` (bind `i64`, run with `execute`, since it returns `void`) blocks other transactions until commit or rollback; the plan uses the two-key `int4, int4` form of the same function with a namespace key (PostgreSQL docs, "Advisory Lock Functions"), which takes the same path in the server.
 6. **testcontainers.** `testcontainers-modules` 0.15.0 requires `testcontainers ^0.27` (not 0.28): depend only on the modules crate and use its re-export `testcontainers_modules::testcontainers` (`R/testcontainers-modules-0.15.0/src/lib.rs:212`). `Postgres::default().with_tag("17-alpine").start().await` (`ImageExt::with_tag`, `R/testcontainers-0.27.3/src/core/image/image_ext.rs:66`; `AsyncRunner::start`, `runners/async_runner.rs:65`); the default tag `11-alpine` is end-of-life, so always set one. `get_host().await` and `get_host_port_ipv4(5432).await`; URL `postgres://postgres:postgres@{host}:{port}/postgres` (`R/testcontainers-modules-0.15.0/src/postgres/mod.rs:103-107`). Dropping the `ContainerAsync` removes the container, on multi-thread and current-thread `#[tokio::test]` alike (`core/async_drop.rs:16-33`). **A container in a `static` is never dropped** (Rust does not drop statics, and there is no reaper), so each test owns its container.
 7. **tar 0.4.46 and flate2 1.1.10.** Writing: `tar::Builder::new(GzEncoder::new(w, Compression::default()))`; `Header::new_ustar()`, `set_entry_type`, `set_size`, `set_mode`, `set_mtime`; `append_data(&mut header, path, reader)` sets the path (adding a GNU long-name entry when needed) and the checksum (`R/tar-0.4.46/src/builder.rs:213-221,851-896`); `into_inner()` then `finish()`. Reading: `Archive::new(GzDecoder::new(r)).entries()`; per entry `path_bytes()` (raw name, `entry.rs:87`), `header().entry_type()`, `header().mode()?` (fails on a garbage mode field), `read_to_end`. GNU long names and local pax headers are folded into the next entry, but **a pax global header (`EntryType::XGlobalHeader`) is yielded as an entry**. tar reads long-name and pax payloads whole with no limit, so the uncompressed cap must wrap the decompressed stream, and `Archive::into_inner()` (`archive.rs:72`) tells "cap exceeded" from other errors. Raw names such as `../escape`, `/abs`, `./a`, `a//b` and non-UTF-8 bytes come through `path_bytes` unchanged.
 8. **`git archive --format=tar.gz HEAD` of `pg_knowledge_catalog`** (HEAD `67ca473b`): 1 `XGlobalHeader` (`pax_global_header`, holding the commit id), 36 `Directory` entries (names end in `/`), 225 `Regular` files (= `git ls-files`). Modes are 0664/0775 (git's `tar.umask` 002), so executability is `mode & 0o111 != 0`; the 19 files at 0775 are exactly the index's `100755` entries. Every mtime is the commit time. The catalog tracks `.claude/skills/*`, `.gitattributes`, `.gitignore`, `.okf-catalog.json`; every file is valid UTF-8 (one is empty).
@@ -128,7 +130,7 @@ Each was checked against the source or by running it on 2026-11-02 (a probe crat
 | `src/okf/analysis/lint.rs`, `src/okf/mod.rs` | T11 (doc comments) | Git-era wording |
 | `tests/roundtrip.rs` | T12 (create) | Import/export round trips |
 | `tests/smoke.rs` | T13 (modify) | Storage timings on the real catalog |
-| `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md` | T1 (two paragraphs), T4 (configuration, subcommands), T6 (`default_catalog_id`), T13 (M3 delivered) | Design |
+| `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md` | T1 (two paragraphs), T4 (configuration, subcommands), T6 (`default_catalog_id`), T8 (import step 3), T13 (M3 delivered) | Design |
 | `changelog/*-m3-*.md` | every task | Iteration notes |
 
 ## Task dependencies
@@ -1160,7 +1162,9 @@ pub const DEFAULT_MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
 #[serde(default)]
 pub struct Config {
     /// The largest uncompressed total an import may expand to (`"64MiB"`, or
-    /// a number of bytes). `MiB` is binary; `MB` and `M` are decimal.
+    /// a number of bytes). `MiB` is binary; `MB` and `M` are decimal. For a
+    /// tarball it counts the whole decompressed tar stream (headers and
+    /// 512-byte padding included); for a directory, the files' contents.
     pub max_import_bytes: ByteSize,
 }
 
@@ -1669,12 +1673,21 @@ pub async fn delete(pool: &PgPool, name: &str, force: bool) -> Result<(), OkfErr
 /// # Errors
 /// [`OkfError::Database`].
 pub(crate) async fn lock(conn: &mut PgConnection, catalog_id: i64) -> Result<(), OkfError> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(catalog_id)
+    // The two-key form, under this crate's namespace, so the lock cannot
+    // collide with another application's advisory locks on a shared database.
+    let catalog_key =
+        i32::try_from(catalog_id).expect("catalog ids come from an identity starting at 1");
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(CATALOG_LOCK_NAMESPACE)
+        .bind(catalog_key)
         .execute(&mut *conn)
         .await?;
     Ok(())
 }
+
+/// The first key of every catalog lock (`okf` in ASCII), separating this
+/// crate's advisory locks from anyone else's.
+const CATALOG_LOCK_NAMESPACE: i32 = 0x006f_6b66;
 
 /// Bumps `server_state.admin_generation` inside the caller's transaction.
 ///
@@ -3625,6 +3638,8 @@ A CLI test (add to `src/cli.rs`'s tests) imports a temporary directory:
     }
 ```
 
+In the design's "Import" step 3, replace "write the differences as `import` revisions (unchanged files keep their revision, missing ones are deleted)" with "write the differences as `import` revisions (unchanged files keep their revision; missing ones are deleted, with `delete` revisions whose message is `import`)".
+
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --lib store cli`
@@ -3635,7 +3650,7 @@ Expected: PASS.
 Run the gates. Changelog: Added: `store::documents` (`DocumentRow`, `published`, `Derived`), `store::import` (`import`, `ImportOptions`, `ImportReport`), `okf-mcp import`. Commit:
 
 ```bash
-git add src/store src/cli.rs changelog/
+git add src/store src/cli.rs docs/superpowers/specs changelog/
 git commit -m "store: import a directory or tarball into a catalog, with okf-mcp import"
 ```
 
@@ -3764,7 +3779,10 @@ use crate::store::export;
         Command::Export { catalog, output } => {
             let pool = connect(cli.database_url.as_deref()).await?;
             if output.as_os_str() == "-" {
-                export::export(&pool, &catalog, std::io::stdout().lock()).await?;
+                // Build in memory, then lock stdout: a `StdoutLock` held across
+                // `.await` would make this future impossible to `tokio::spawn`.
+                let tarball = export::export(&pool, &catalog, Vec::new()).await?;
+                std::io::Write::write_all(&mut std::io::stdout().lock(), &tarball)?;
             } else {
                 let file = File::create(&output).with_context(|| format!("create {}", output.display()))?;
                 // `BufWriter` batches small writes; `into_inner` flushes it and reports a failure.
@@ -4390,7 +4408,7 @@ with a note that every subcommand reads `DATABASE_URL` (or `--database-url`) and
 In `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md`:
 - Status line: "M1 (core library), M2 (analysis) and M3 (storage) are delivered".
 - Milestones table: M3 row "(delivered)" with a link to this plan and the PR range.
-- After "What M2 shipped differently", add "What M3 shipped differently": the in-memory workspace holds bytes and execute bits; text means valid UTF-8; the configuration file holds only `max_import_bytes` until later milestones add theirs; subcommands run migrations on connect; the binary is `okf-mcp`; import writes rows one at a time in one transaction (with the measured time); every `Corrected (issue #N)` note from this plan that changes the design.
+- After "What M2 shipped differently", add "What M3 shipped differently": the in-memory workspace holds bytes and execute bits; text means valid UTF-8; the configuration file holds only `max_import_bytes` until later milestones add theirs; subcommands run migrations on connect; `api_keys.default_catalog_id`; import writes rows one at a time in one transaction (with the measured time); lint's commit time is the last revision time, so after a first import it is the import time; every `Corrected (issue #N)` note from this plan that changes the design.
 - "Carried into M3 and later": mark #31, #32, #33 and #35 done (with their PR numbers), leaving #34 for M4.
 
 - [ ] **Step 4: Milestone changelog**
