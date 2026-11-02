@@ -1568,9 +1568,12 @@ impl App {
     /// # Returns
     /// The shared state.
     ///
+    /// A catalog whose snapshot fails to build is logged and left out, as
+    /// [`App::poll`] does, and the next poll tries it again: one bad catalog
+    /// never takes the others offline.
+    ///
     /// # Errors
-    /// [`OkfError::Database`], or a catalog whose stored rows cannot form a
-    /// snapshot (import refuses such rows, so this means a hand-edited database).
+    /// [`OkfError::Database`] reading the counter, the keys or the list.
     pub async fn load(
         pool: PgPool,
         config: Config,
@@ -1588,7 +1591,10 @@ impl App {
                 }
                 // Deleted between the list and the load.
                 Err(OkfError::CatalogNotSelected { .. }) => {}
-                Err(error) => return Err(error),
+                // Not in the map, so the first poll tries to load it again.
+                Err(error) => {
+                    tracing::error!(catalog = %row.name, %error, "load failed; retrying at the next poll");
+                }
             }
         }
         if let Some(name) = &config.default_catalog {
