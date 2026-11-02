@@ -99,11 +99,15 @@ mod tests {
         import(&db.pool, "pg", files.clone(), &options)
             .await
             .unwrap();
+        // A later import that changes `a.md` and deletes `gone.md`:
+        // `tools/run.sh` keeps its first `updated_at`.
+        let later = Utc.with_ymd_and_hms(2026, 11, 2, 13, 0, 0).unwrap();
         files.remove("gone.md");
+        files.insert("a.md".into(), stored(b"# A, again\n", false));
         let options = ImportOptions {
             replace: true,
             actor: "t",
-            now,
+            now: later,
         };
         import(&db.pool, "pg", files.clone(), &options)
             .await
@@ -118,10 +122,23 @@ mod tests {
         );
         // Each entry's mtime is its document's `updated_at`.
         let mut entries = tar::Archive::new(flate2::read::GzDecoder::new(tarball.as_slice()));
-        for entry in entries.entries().unwrap() {
-            let mtime = entry.unwrap().header().mtime().unwrap();
-            assert_eq!(mtime, u64::try_from(now.timestamp()).unwrap());
-        }
+        let mtimes: Vec<(String, u64)> = entries
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let path = entry.path().unwrap().to_string_lossy().into_owned();
+                (path, entry.header().mtime().unwrap())
+            })
+            .collect();
+        let seconds = |time: chrono::DateTime<Utc>| u64::try_from(time.timestamp()).unwrap();
+        assert_eq!(
+            mtimes,
+            [
+                ("a.md".to_string(), seconds(later)),
+                ("tools/run.sh".to_string(), seconds(now)),
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
