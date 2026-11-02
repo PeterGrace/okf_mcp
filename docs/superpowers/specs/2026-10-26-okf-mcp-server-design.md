@@ -410,9 +410,9 @@ snapshot.
 2. Build a snapshot of it and lint it; report the findings (import does not refuse on
    lint, since it brings in what exists).
 3. In one transaction: into an empty catalog, insert every file; with `--replace`,
-   write the differences as `import` revisions (unchanged files keep their revision,
-   missing ones are deleted). Without `--replace`, importing into a non-empty catalog
-   is refused.
+   write the differences as `import` revisions (unchanged files keep their revision;
+   missing ones are deleted, with `delete` revisions whose message is `import`).
+   Without `--replace`, importing into a non-empty catalog is refused.
 4. Rebuild the snapshot.
 
 ### Export
