@@ -148,7 +148,9 @@ pub async fn find<'e>(executor: impl PgExecutor<'e>, name: &str) -> Result<Catal
 /// takes `FOR KEY SHARE` on the row it references, which conflicts with
 /// `FOR UPDATE`, so a changeset or entry being written concurrently is either
 /// committed first (and seen) or held off until the delete ends (and then
-/// fails its foreign-key check): the refusal cannot be raced.
+/// fails its foreign-key check): the refusal cannot be raced. A writer that
+/// holds an uncommitted entry and then needs the catalog row can deadlock
+/// with this (Postgres aborts one side); see the plan's note for M5.
 ///
 /// # Arguments
 /// * `pool` - the database.

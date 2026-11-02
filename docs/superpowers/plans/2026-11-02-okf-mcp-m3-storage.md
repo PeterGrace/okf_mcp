@@ -42,6 +42,8 @@ Deliberately deferred:
 | NTP offset check | M7 | Design milestone table |
 | Config fields `listen`, `allowed_hosts`, `default_catalog`, `session_idle_timeout`, `time_server`, `poll_interval` | M4/M7 | Nothing in M3 reads them; each arrives with its user |
 
+> **Note for M5 (review of PR #55), 2026-11-02.** `store::catalogs::delete` takes `catalogs::lock`, then holds the catalog row `FOR UPDATE` while it locks that catalog's open changesets `FOR UPDATE` (so a concurrent changeset write cannot slip past its unpublished-work check). A write transaction that holds an uncommitted changeset entry and then needs the catalog row (inserting a new changeset, which takes `FOR KEY SHARE` on it, or updating `catalogs`) can therefore deadlock with a delete; Postgres aborts one side with SQLSTATE `40P01`. M5's write path must either take `catalogs::lock` before touching changesets, or touch the catalog row (or create the changeset) before writing entries, or retry on `40P01`.
+
 ## Decisions taken while planning (2026-11-02)
 
 1. **Database tests use testcontainers in plain `cargo test`.** Each test that needs Postgres starts its own throwaway `postgres:17-alpine` container (about 1.4 s, in parallel). The gates therefore need Docker, which this machine has; without it those tests fail at once with "is docker reachable?".
