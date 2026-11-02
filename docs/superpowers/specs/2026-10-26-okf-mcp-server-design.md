@@ -117,7 +117,7 @@ Subcommands:
 |---|---|
 | `serve` (default) | Runs migrations, loads snapshots, serves HTTP |
 | `migrate` | Runs migrations and exits |
-| `catalog create NAME [--description D]`, `catalog list`, `catalog delete NAME` | Manage catalogs |
+| `catalog create NAME [--description D]`, `catalog list`, `catalog delete NAME [--force]` | Manage catalogs. Delete refuses while the catalog has a non-empty open changeset, unless `--force`; it then removes the catalog's documents, revisions, changesets and grants (cascading foreign keys) |
 | `import NAME PATH [--replace]` | Imports a directory or `.tar.gz` into a catalog (see "Import") |
 | `export NAME OUT.tar.gz` | Writes the export tarball |
 | `key create ID --access read\|write\|admin --catalogs pg,work\|--all [--default pg] [--actor A]` | Generates a random key, stores its SHA-256, prints the key once |
@@ -136,7 +136,8 @@ allowed_hosts = ["okf-mcp.example"]
 default_catalog = "pg"
 session_idle_timeout = "2h"
 time_server = "mosaic-x5-3819907.internal"
-max_import_bytes = "64MiB"
+poll_interval = "10s"
+max_import_bytes = "64MiB"   # uncompressed total of an import
 ```
 
 Catalogs and keys are not in the config; they are rows. The only secret is
@@ -158,11 +159,13 @@ One Postgres database. Migrations live in `migrations/` and are embedded with
 | `changeset_entries` | Per changed path: `changeset_id`, `path`, `base_revision` (NULL for a path with no live document), `content` (NULL for a delete), `replay` (the entry's listing and log operations, JSON, while every change to the entry came from one; NULL once any other edit touches it) |
 | `api_keys` | `id`, `sha256`, `access`, `all_catalogs`, `default_catalog`, `actor`, `created_at`, `revoked_at` |
 | `key_catalogs` | `(key_id, catalog_id)` grants |
+| `server_state` | One row: `admin_generation`, bumped by every `catalog` and `key` subcommand |
 
 Constraints the design relies on: `revisions` is unique on `(catalog_id, path,
 revision)`; `changesets` has a partial unique index on `(catalog_id, session_id) WHERE
 state = 'open'`, so a racing "get or create" cannot open two changesets for one session;
-`api_keys.sha256` is unique and indexed.
+`api_keys.sha256` is unique and indexed. Every table that refers to a catalog does so
+with `ON DELETE CASCADE`.
 
 Every file of a catalog is a document: concepts, `index.md`, `log.md`, `AGENTS.md`, and
 non-markdown files such as `tools/okf.py`. Content is stored as bytes (`bytea`, since
@@ -184,7 +187,11 @@ in atomically. Readers clone the `Arc` and never wait on the database.
 
 The snapshot is built through M1's `Workspace` trait over the rows held in memory, so
 `Snapshot::build` and every analysis are unchanged. The in-memory workspace, which M2
-kept behind the `test-util` feature, becomes production code.
+kept behind the `test-util` feature, becomes production code. The `Workspace` trait
+reads and writes `&str` and has no execute bit, so the store keeps two things beside
+it: each text file's execute bit (a write through the workspace keeps an existing
+file's bit; a new file is not executable), and the non-text files, which never enter
+the workspace and are carried through publish and export unchanged.
 
 A session with an open changeset for a catalog reads that catalog through an overlay:
 the published snapshot plus its changeset entries, rebuilt lazily after the session's
@@ -289,7 +296,8 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
 ### Read
 
 1. `auth` hashes the bearer key, looks it up (keys are cached in memory and reloaded
-   when changed), and inserts a `Principal`; failures are HTTP 401 (missing or unknown
+   when `admin_generation` changes; see "Noticing changes made outside the server"),
+   and inserts a `Principal`; failures are HTTP 401 (missing or unknown
    key) or 403 (no access to the route).
 2. rmcp inserts the HTTP request's `http::request::Parts`, including the extensions the
    auth layer added, into every tool call's request context (verified against rmcp
@@ -358,8 +366,23 @@ snapshot plus lint of the real catalog in M2's smoke test). Reads never take the
 The unique constraints are a backstop: a violation still maps to `Conflict`, never to
 the opaque `Database` error.
 
-The server also polls `generation` every 30 seconds, so a catalog changed by a CLI
-import while the server runs is picked up without a restart.
+### Noticing changes made outside the server
+
+The subcommands write to the database directly, beside a running server. Two counters
+let the server notice:
+
+- each catalog's `generation`, bumped by every publish and import;
+- `admin_generation`, a single-row counter (`server_state`) bumped in the same
+  transaction as every `catalog` and `key` subcommand (create, delete, revoke, grant,
+  ungrant).
+
+Every `poll_interval` (default 10 s), the server reads both. A changed
+`admin_generation` reloads the key cache and the catalog list (loading new catalogs,
+dropping deleted ones); a changed `generation` rebuilds that catalog's snapshot. So a
+revoked key or ungranted catalog stops working within `poll_interval`, and a CLI import
+or new catalog is visible within the same bound, with no restart. Publish also checks
+its catalog's `generation` under the lock (step 2), so it never acts on a stale
+snapshot.
 
 ### Import
 
@@ -367,11 +390,18 @@ import while the server runs is picked up without a restart.
 
 1. Read every file of the directory or tarball, with its execute bit. From a
    directory, `.git` (a directory, or the link file a git worktree has), `.worktrees/`
-   and `__pycache__/` are skipped; every other file is
-   kept, dotfiles included (a catalog tracks `.claude/skills/`, `.gitattributes` and
+   and `__pycache__/` are skipped, symlinks follow M1's listing contract (inside the
+   catalog only), and every other file is kept, dotfiles included (a catalog tracks `.claude/skills/`, `.gitattributes` and
    `.okf-catalog.json`). A tarball's paths are taken as they are, with no prefix
    stripped, so `git archive --format=tar.gz HEAD` on a checkout imports exactly its
    tracked files (the user runs git, the server never does), and so does an export.
+   The whole import is refused, listing every offending entry, if the tarball has an
+   entry that is a symlink, hardlink, device, FIFO or anything but a regular file or a
+   directory; a path with a `..` component, a leading `/`, a non-UTF-8 name or a form
+   that `normpath` would change (`./a`, `a//b`); or two entries with the same path. The
+   uncompressed total is counted while reading and the import stops once it passes
+   `max_import_bytes`, so a small compressed upload cannot expand without bound (the
+   HTTP route also caps the request body at the same size).
 2. Build a snapshot of it and lint it; report the findings (import does not refuse on
    lint, since it brings in what exists).
 3. In one transaction: into an empty catalog, insert every file; with `--replace`,
@@ -396,7 +426,9 @@ exported.
   each of its changesets is discarded if empty. A non-empty one stays `open`, is logged
   at `warn`, and is listed by `stranded_sessions`. Changesets are in the database, so a
   pod restart strands sessions but loses no edits; `adopt_changeset` picks one up.
-- A periodic prune marks empty changesets older than 24 hours `discarded`.
+- A periodic prune marks empty changesets older than 24 hours `discarded`. Non-empty
+  stranded changesets are never pruned: they hold unpublished work, and only `discard`
+  (after `adopt_changeset`) or `catalog delete --force` removes them.
 
 ## Errors
 
@@ -474,8 +506,8 @@ check keeps `okf.py`'s 2-minute slack. Revision times are written by the server
 | M1. Core library (delivered) | `okf::yaml`, `okf::doc`, `okf::markdown`, `okf::workspace`, `clock`; the parity test harness ([plan](../plans/2026-10-26-okf-mcp-m1-core-library.md)) |
 | M2. Analysis (delivered) | `lint`, links report, `oldest`, `sprawl`, secret scan; snapshot and search; `okf::timestamp` ([plan](../plans/2026-10-27-okf-mcp-m2-analysis.md); PRs #17-#30) |
 | M3. Storage | `config`, `db` and migrations, `store`, `archive`; `catalog` with snapshot swap and the cached mention matcher; import and export subcommands; `catalog` and `key` subcommands; revision-based commit times for lint. Export then import reproduces the real catalog's file contents and modes byte for byte |
-| M4. Read-only server | axum, rmcp, auth, `selection`, the read tools that need no changeset, the import and export routes, `/healthz`. Deployable and useful on its own |
-| M5. Writes | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `history`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` |
+| M4. Read-only server | axum, rmcp, auth, `selection`, the read tools that need no changeset (including `history`), the import and export routes, `/healthz`. Deployable and useful on its own |
+| M5. Writes | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` |
 | M6. Restructuring | `move_concept`, `split_concept`, `delete_concept` |
 | M7. Deployment | Dockerfile, k8s manifests, CNPG database, NTP check, operator docs |
 
@@ -515,7 +547,7 @@ Raised in M2 reviews and filed as issues (label `milestone-3`):
   (M5). Keys are document paths, which are already catalog-relative.
   M3 also updates the doc comments that still describe the git plan
   (`src/okf/analysis/lint.rs` module docs and `CommitTimes::new`, `src/okf/workspace.rs`,
-  `src/error.rs`).
+  `src/okf/mod.rs`, `src/error.rs`).
 - **#32 Snapshot swapping** (`RwLock<Arc<Snapshot>>`, rebuilt after publish or import):
   M3.
 - **#33 Mention matcher cache** per snapshot (PR #23): M3, after #32.

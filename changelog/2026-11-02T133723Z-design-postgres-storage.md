@@ -31,6 +31,13 @@
   directory so an export imports back as it was); `catalog`, `key`,
   `import`, `export` and `migrate` subcommands; `history`, `revert` and
   `adopt_changeset` tools; `allowed_hosts` config for rmcp's DNS-rebinding check.
+- **Outside changes:** `admin_generation` and each catalog's `generation` are polled
+  every `poll_interval` (10 s), so a CLI key revoke, grant, catalog create or delete,
+  or import reaches the running server within that bound.
+- **Import rules:** a tarball with links, devices, `..`, absolute, non-UTF-8,
+  non-normalized or duplicate paths is refused; `max_import_bytes` caps the
+  uncompressed total. `catalog delete` refuses while a non-empty changeset is open,
+  unless `--force`, and cascades. Non-empty stranded changesets are never pruned.
 - **Access:** `read` < `write` < `admin`, always within the key's granted catalogs;
   creating and deleting catalogs is subcommand-only. `adopt_changeset` matches the key,
   not the actor string; `revert` is subject to the machinery rule.
