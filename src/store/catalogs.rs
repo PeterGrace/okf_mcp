@@ -274,7 +274,8 @@ pub(crate) fn is_unique_violation(error: &sqlx::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+// `pub(crate)` so other store modules' tests share the lock helper below.
+pub(crate) mod tests {
     use super::*;
     use crate::db::test_db;
     use chrono::TimeZone;
@@ -416,8 +417,8 @@ mod tests {
     }
 
     /// Waits until some backend is blocked on a lock, so a test knows the
-    /// spawned delete has reached the point it should wait at.
-    async fn until_a_lock_is_awaited(pool: &PgPool) {
+    /// spawned delete (or import) has reached the point it should wait at.
+    pub(crate) async fn until_a_lock_is_awaited(pool: &PgPool) {
         for _ in 0..200 {
             let waiting: i64 =
                 sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")

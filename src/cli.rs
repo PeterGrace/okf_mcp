@@ -4,7 +4,9 @@
 //! Every subcommand that touches the database runs the embedded migrations
 //! first (idempotent), so a fresh database needs no separate step.
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 
 // `Context` adds a message to an error (anyhow's `.context(..)`), like
 // `raise X from e` with a better message.
@@ -12,10 +14,12 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use sqlx::PgPool;
 
+use crate::archive::{self, Files};
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::db;
 use crate::store::catalogs;
+use crate::store::import::{self, ImportOptions};
 
 /// `okf-mcp`: an MCP server for OKF knowledge catalogs.
 // `derive(Parser)` generates the argument parser from the struct, as
@@ -48,6 +52,19 @@ pub enum Command {
     // A nested subcommand: `okf-mcp catalog create ...`.
     #[command(subcommand)]
     Catalog(CatalogCommand),
+    /// Import a directory or a .tar.gz into an existing catalog.
+    Import {
+        /// The catalog.
+        catalog: String,
+        /// A directory, a .tar.gz file, or `-` for a .tar.gz on stdin.
+        source: PathBuf,
+        /// Replace a non-empty catalog's contents (write the differences).
+        #[arg(long)]
+        replace: bool,
+        /// Recorded as the revisions' actor.
+        #[arg(long, default_value = "okf-mcp/import")]
+        actor: String,
+    },
 }
 
 /// `okf-mcp catalog ...`.
@@ -83,8 +100,8 @@ pub enum CatalogCommand {
 /// # Errors
 /// Any failure, with context, for `main` to print.
 pub async fn run(cli: Cli, clock: &dyn Clock) -> anyhow::Result<()> {
-    // Read now so a bad file fails every command; `import` (Task 8) uses it.
-    let _config = Config::load(cli.config.as_deref())?;
+    // Read first so a bad file fails every command, not only `import`.
+    let config = Config::load(cli.config.as_deref())?;
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
             anyhow::bail!("the MCP server arrives in milestone 4; see `okf-mcp --help`")
@@ -97,8 +114,52 @@ pub async fn run(cli: Cli, clock: &dyn Clock) -> anyhow::Result<()> {
             let pool = connect(cli.database_url.as_deref()).await?;
             run_catalog(&pool, command, clock).await?;
         }
+        Command::Import {
+            catalog,
+            source,
+            replace,
+            actor,
+        } => {
+            // Connect first: a missing or unreachable database fails before a
+            // large tarball (or stdin) is read.
+            let pool = connect(cli.database_url.as_deref()).await?;
+            let limit = config.max_import_bytes.as_u64();
+            // Reading files is blocking I/O: run it on a blocking thread, as
+            // `import` does for its snapshot, so the runtime's threads stay free.
+            let files = tokio::task::spawn_blocking(move || read_source(&source, limit))
+                .await
+                .context("the import reader stopped")??;
+            let options = ImportOptions {
+                replace,
+                actor: &actor,
+                now: clock.now(),
+            };
+            let report = import::import(&pool, &catalog, files, &options).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
     }
     Ok(())
+}
+
+/// Reads an import's files: a directory, a `.tar.gz` file, or (`-`) a
+/// `.tar.gz` on stdin.
+///
+/// # Arguments
+/// * `source` - the path given on the command line.
+/// * `limit` - `max_import_bytes`, the cap on the uncompressed total.
+///
+/// # Errors
+/// The archive's refusal, or the file failing to open.
+fn read_source(source: &Path, limit: u64) -> anyhow::Result<Files> {
+    let files = if source.as_os_str() == "-" {
+        archive::read_tarball(std::io::stdin().lock(), limit)?
+    } else if source.is_dir() {
+        archive::read_directory(source, limit)?
+    } else {
+        let file = File::open(source).with_context(|| format!("open {}", source.display()))?;
+        archive::read_tarball(BufReader::new(file), limit)?
+    };
+    Ok(files)
 }
 
 /// Runs `okf-mcp catalog ...`.
@@ -225,6 +286,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names, ["pg"]);
+    }
+
+    #[test]
+    fn import_parses() {
+        let parsed = Cli::try_parse_from(["okf-mcp", "import", "pg", "-", "--replace"]).unwrap();
+
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Import { ref catalog, ref source, replace: true, ref actor })
+                if catalog == "pg" && source.as_os_str() == "-" && actor == "okf-mcp/import"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_reads_a_directory() {
+        let db = crate::db::pg_support::TestDb::start().await;
+        let clock = FixedClock(chrono::Utc::now());
+        let create = CatalogCommand::Create {
+            name: "pg".to_string(),
+            description: String::new(),
+        };
+        run(cli(Some(db.url.clone()), Command::Catalog(create)), &clock)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.md"), "# Index\n").unwrap();
+        let import = Command::Import {
+            catalog: "pg".to_string(),
+            source: dir.path().to_path_buf(),
+            replace: false,
+            actor: "test".to_string(),
+        };
+
+        run(cli(Some(db.url.clone()), import), &clock)
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT path, updated_by FROM documents")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, [("index.md".to_string(), "test".to_string())]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_reads_a_tarball_file_and_explains_a_missing_one() {
+        let db = crate::db::pg_support::TestDb::start().await;
+        let clock = FixedClock(chrono::Utc::now());
+        let create = CatalogCommand::Create {
+            name: "pg".to_string(),
+            description: String::new(),
+        };
+        run(cli(Some(db.url.clone()), Command::Catalog(create)), &clock)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = dir.path().join("pg.tar.gz");
+        let script = archive::ExportFile {
+            path: "tools/run.sh",
+            content: b"#!/bin/sh\n",
+            executable: true,
+            modified: clock.0,
+        };
+        archive::write_tarball(File::create(&tarball).unwrap(), &[script]).unwrap();
+        let import = |source: PathBuf| Command::Import {
+            catalog: "pg".to_string(),
+            source,
+            replace: false,
+            actor: "test".to_string(),
+        };
+
+        run(cli(Some(db.url.clone()), import(tarball)), &clock)
+            .await
+            .unwrap();
+        let missing = dir.path().join("missing.tar.gz");
+        let error = run(cli(Some(db.url.clone()), import(missing.clone())), &clock)
+            .await
+            .unwrap_err();
+
+        let rows: Vec<(String, bool)> = sqlx::query_as("SELECT path, executable FROM documents")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, [("tools/run.sh".to_string(), true)]);
+        assert!(error
+            .to_string()
+            .contains(&format!("open {}", missing.display())));
+    }
+
+    #[tokio::test]
+    async fn import_checks_the_database_before_reading_the_source() {
+        // A source that does not exist: reading it first would report "open".
+        let import = Command::Import {
+            catalog: "pg".to_string(),
+            source: PathBuf::from("/nonexistent-okf-import.tar.gz"),
+            replace: false,
+            actor: "test".to_string(),
+        };
+
+        let error = run(cli(None, import), &FixedClock(chrono::Utc::now()))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("DATABASE_URL"));
     }
 
     #[tokio::test]
