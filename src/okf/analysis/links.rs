@@ -4,7 +4,8 @@
 //! Unlinked mentions use one `RegexSet` holding every (concept, name)
 //! pattern, so each prose line is scanned once for all concepts at once,
 //! instead of once per concept per name as in `okf.py`. Concepts are
-//! scanned in parallel. A catalog whose set outgrows the compile limit falls
+//! scanned in parallel. The set is compiled once per snapshot and reused by
+//! every later report on it. A catalog whose set outgrows the compile limit falls
 //! back to one case-insensitive literal per name, with the boundaries
 //! checked by hand, instead of failing.
 
@@ -187,7 +188,7 @@ pub fn links_report(snapshot: &Snapshot, mentions: bool) -> LinksReport {
 
     report.index_drift = index_drift(snapshot, &graph, &concept_paths);
     if mentions {
-        report.unlinked_mentions = unlinked_mentions(&concepts, &MentionMatcher::new(&concepts));
+        report.unlinked_mentions = unlinked_mentions(&concepts, snapshot.mention_matcher());
     }
     report.summary = LinksSummary {
         concepts: concepts.len(),
@@ -296,13 +297,18 @@ fn mention_pattern(name: &str) -> String {
     )
 }
 
-/// Every concept's names as one `RegexSet`.
-// `<'a>` is a lifetime parameter: the matcher borrows the concept paths from
-// the snapshot instead of copying them, and the compiler checks that it never
-// outlives the snapshot.
-struct MentionMatcher<'a> {
+/// Every concept's names as one `RegexSet`, built once per snapshot
+/// ([`Snapshot::mention_matcher`]).
+///
+/// It owns its concept paths (copies, not borrows) so it can live inside the
+/// snapshot it was built from: a struct cannot hold a reference into the
+/// struct that holds it.
+// `pub(crate)`: visible inside this crate (the snapshot stores one), not to
+// the crate's users. `#[derive(Clone)]` because `Snapshot` derives it.
+#[derive(Debug, Clone)]
+pub(crate) struct MentionMatcher {
     /// `(concept path, its names)`, in concept order.
-    targets: Vec<(&'a str, Vec<String>)>,
+    targets: Vec<(String, Vec<String>)>,
     /// For each set pattern: `(index into targets, index into its names)`.
     owners: Vec<(usize, usize)>,
     /// How lines are searched for the names, one pattern per `owners` entry.
@@ -311,11 +317,13 @@ struct MentionMatcher<'a> {
 
 /// The compile limit for the one-set matcher. Hundreds of patterns with
 /// Unicode classes outgrow `regex`'s default 10 MiB; 256 MiB still bounds
-/// compile memory. On the real catalog (143 concepts) the whole report, set
-/// compile included, takes about 150 ms in release mode.
+/// compile memory. Compiling the set is most of a links report's time on the
+/// real catalog (143 concepts), so it happens once per snapshot
+/// ([`Snapshot::mention_matcher`]) and later reports reuse it.
 const SET_SIZE_LIMIT: usize = 256 << 20;
 
 /// How [`MentionMatcher`] finds the names in a line.
+#[derive(Debug, Clone)]
 enum NameSearch {
     /// One [`mention_pattern`] per name, all in one set: each line is
     /// scanned once for every name.
@@ -328,20 +336,27 @@ enum NameSearch {
     Literals(Vec<Regex>),
 }
 
-impl<'a> MentionMatcher<'a> {
+impl MentionMatcher {
     /// Builds the set from every concept's [`names_for`]; concepts without
     /// a long enough name are left out, as `okf.py` leaves them out of
     /// `patterns`.
-    fn new(concepts: &[&'a SnapshotDoc]) -> Self {
+    ///
+    /// # Arguments
+    /// * `concepts` - the concepts that can be mentioned, in walk order.
+    ///
+    /// # Returns
+    /// The matcher; it never fails (a set too big to compile falls back to
+    /// [`NameSearch::Literals`]).
+    pub(crate) fn new(concepts: &[&SnapshotDoc]) -> Self {
         Self::with_set_limit(concepts, SET_SIZE_LIMIT)
     }
 
     /// [`MentionMatcher::new`] with a given compile limit for the set, so
     /// tests can force the [`NameSearch::Literals`] fallback.
-    fn with_set_limit(concepts: &[&'a SnapshotDoc], set_limit: usize) -> Self {
-        let targets: Vec<(&str, Vec<String>)> = concepts
+    fn with_set_limit(concepts: &[&SnapshotDoc], set_limit: usize) -> Self {
+        let targets: Vec<(String, Vec<String>)> = concepts
             .iter()
-            .map(|doc| (doc.path(), names_for(doc)))
+            .map(|doc| (doc.path().to_string(), names_for(doc)))
             .filter(|(_, names)| !names.is_empty())
             .collect();
         let owners: Vec<(usize, usize)> = targets
@@ -432,10 +447,7 @@ fn is_mention_at(line: &str, start: usize, end: usize) -> bool {
 
 /// `link_analysis`'s mention pass: for each concept (in walk order), every
 /// other concept it names in prose without linking to it.
-fn unlinked_mentions(
-    concepts: &[&SnapshotDoc],
-    matcher: &MentionMatcher<'_>,
-) -> Vec<UnlinkedMention> {
+fn unlinked_mentions(concepts: &[&SnapshotDoc], matcher: &MentionMatcher) -> Vec<UnlinkedMention> {
     // One task per mentioning concept; `collect` keeps concept order.
     let per_source: Vec<Vec<UnlinkedMention>> = concepts
         .par_iter()
@@ -446,7 +458,7 @@ fn unlinked_mentions(
 
 /// The unlinked mentions in one concept, in target order (`okf.py`'s
 /// `patterns` order), each with its hits in line order.
-fn mentions_in(source: &SnapshotDoc, matcher: &MentionMatcher<'_>) -> Vec<UnlinkedMention> {
+fn mentions_in(source: &SnapshotDoc, matcher: &MentionMatcher) -> Vec<UnlinkedMention> {
     let linked: HashSet<&str> = source.links().iter().map(|l| l.target.as_str()).collect();
     let mut hits: Vec<Vec<MentionHit>> = vec![Vec::new(); matcher.targets.len()];
     for (line, masked, original) in prose_lines(source.text()) {
@@ -461,7 +473,7 @@ fn mentions_in(source: &SnapshotDoc, matcher: &MentionMatcher<'_>) -> Vec<Unlink
             }
             previous_target = Some(target);
             let (target_path, names) = &matcher.targets[target];
-            if *target_path == source.path() || linked.contains(target_path) {
+            if target_path == source.path() || linked.contains(target_path.as_str()) {
                 continue;
             }
             hits[target].push(MentionHit {
@@ -478,7 +490,7 @@ fn mentions_in(source: &SnapshotDoc, matcher: &MentionMatcher<'_>) -> Vec<Unlink
         .filter(|(_, hits)| !hits.is_empty())
         .map(|((target, _), hits)| UnlinkedMention {
             file: source.path().to_string(),
-            target: (*target).to_string(),
+            target: target.clone(),
             hits,
         })
         .collect()

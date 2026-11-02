@@ -540,6 +540,8 @@ initialize it with `mention_matcher: OnceLock::new(),` in `build`, and add:
 
 The existing test that compares `MentionMatcher::new` with `with_set_limit(.., 1)` keeps working with the new signatures.
 
+> **Corrected (issue #33), 2026-11-02.** `with_set_limit` stays private (`fn`, not `pub(crate)`): only `new` and the module's own tests call it. The rest shipped as written; see `src/okf/analysis/links.rs` and `Snapshot::mention_matcher` in `src/okf/snapshot.rs`.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --lib links snapshot` then `cargo test --test parity`
