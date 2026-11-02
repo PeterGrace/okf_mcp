@@ -170,10 +170,10 @@ with `ON DELETE CASCADE`.
 Every file of a catalog is a document: concepts, `index.md`, `log.md`, `AGENTS.md`, and
 non-markdown files such as `tools/okf.py`. Content is stored as bytes (`bytea`, since
 Postgres `text` cannot hold NUL), so any file round-trips exactly. A file that is valid
-UTF-8 with no NUL is text: it is loaded into the snapshot, scanned for secrets and, for
-markdown, analyzed. Any other file (an image, say) is stored and exported but not
-analyzed, as `okf.py`'s secret walk skips files it can't read; a markdown file that is
-not text is an import error. The derived columns are recomputed from the content on
+UTF-8 is text (NUL bytes included: content is `bytea`): it is loaded into the snapshot,
+scanned for secrets and, for markdown, analyzed. Any other file (an image, say) is
+stored and exported but not analyzed, as `okf.py`'s secret walk skips files it can't
+read; a markdown file that is not text is an import error. The derived columns are recomputed from the content on
 every write, so they can never disagree with it.
 
 ### In-memory snapshot
@@ -186,12 +186,11 @@ lazily once, the unlinked-mention matcher. It is rebuilt off the reactor
 in atomically. Readers clone the `Arc` and never wait on the database.
 
 The snapshot is built through M1's `Workspace` trait over the rows held in memory, so
-`Snapshot::build` and every analysis are unchanged. The in-memory workspace, which M2
-kept behind the `test-util` feature, becomes production code. The `Workspace` trait
-reads and writes `&str` and has no execute bit, so the store keeps two things beside
-it: each text file's execute bit (a write through the workspace keeps an existing
-file's bit; a new file is not executable), and the non-text files, which never enter
-the workspace and are carried through publish and export unchanged.
+`Snapshot::build` and every analysis are unchanged. The in-memory workspace, test-only
+in M2, becomes production code. It holds every file's bytes and execute bit, so a link
+to a non-text file resolves, reading such a file as text fails as it does on disk, and
+a write through the workspace keeps an existing file's execute bit (a new file is not
+executable).
 
 A session with an open changeset for a catalog reads that catalog through an overlay:
 the published snapshot plus its changeset entries, rebuilt lazily after the session's

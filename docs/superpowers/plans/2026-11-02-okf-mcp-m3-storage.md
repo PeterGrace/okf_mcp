@@ -239,7 +239,9 @@ And in `src/okf/snapshot.rs`'s test module, a link to a binary file must not be 
             (
                 "a.md".to_string(),
                 StoredFile {
-                    content: b"---\ntype: Note\n---\n![logo](img/logo.png)\n".to_vec(),
+                    // A plain link: `okf.py`'s link pattern skips image syntax
+                    // (`![..](..)`), so an image embed is not a link at all.
+                    content: b"---\ntype: Note\n---\n[logo](img/logo.png)\n".to_vec(),
                     executable: false,
                 },
             ),
@@ -261,6 +263,8 @@ And in `src/okf/snapshot.rs`'s test module, a link to a binary file must not be 
 ```
 
 (If `snapshot.rs`'s test module does not import `MemWorkspace` yet, add `use crate::okf::workspace::MemWorkspace;`.)
+
+> **Corrected (issue #35), 2026-11-02.** The fixture first used `![logo](img/logo.png)`, which yields no link: `markdown::find_links` ports `okf.py`'s `LINK_RE` with its `(?<!!)`, so an image embed is not a link and `links()[0]` panicked. It now uses `[logo](img/logo.png)`; Task 10's `load_builds_the_snapshot_of_the_live_documents` had the same fixture and is fixed the same way.
 
 - [ ] **Step 2: Run them to see them fail**
 
@@ -365,10 +369,13 @@ Change the field to `files: RwLock<BTreeMap<String, StoredFile>>`, and `has_key_
             path: path.to_string(),
         })?;
         // The same error `std::fs::read_to_string` gives for non-UTF-8 bytes.
-        String::from_utf8(file.content.clone()).map_err(|error| OkfError::Io {
-            path: path.to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-        })
+        // `from_utf8` borrows the bytes (no copy until it is known to be text).
+        std::str::from_utf8(&file.content)
+            .map(str::to_string)
+            .map_err(|error| OkfError::Io {
+                path: path.to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+            })
     }
 ```
 
@@ -399,6 +406,8 @@ a non-text file resolves, reading such a file as text fails as it does on disk,
 and a write through the workspace keeps an existing file's execute bit (a new
 file is not executable).
 ```
+
+> **Corrected (issue #35), 2026-11-02.** The sentence before that replacement, "The in-memory workspace, which M2 kept behind the `test-util` feature, becomes production code.", also had to change, or Step 5's `test-util` grep finds it: it reads "The in-memory workspace, test-only in M2, becomes production code." The paragraph then continues "It holds every file's bytes ..." rather than repeating "The in-memory workspace".
 
 - [ ] **Step 4: Run the tests**
 
@@ -3847,7 +3856,8 @@ mod tests {
     async fn load_builds_the_snapshot_of_the_live_documents() {
         let db = test_db().await;
         catalogs::create(&db.pool, "pg", "", Utc::now()).await.unwrap();
-        import_into(&db.pool, &[("a.md", b"---\ntype: Note\n---\n![logo](logo.png)\n"), ("logo.png", b"\x89PNG\0")], false).await;
+        // A plain link: `okf.py` does not count an image embed (`![..](..)`) as a link.
+        import_into(&db.pool, &[("a.md", b"---\ntype: Note\n---\n[logo](logo.png)\n"), ("logo.png", b"\x89PNG\0")], false).await;
 
         let state = CatalogState::load(&db.pool, "pg").await.unwrap();
 
