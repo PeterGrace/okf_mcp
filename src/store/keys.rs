@@ -201,7 +201,15 @@ pub async fn create(
     .await;
     match inserted {
         Ok(_) => {}
-        Err(error) if is_unique_violation(&error) => {
+        // Only the primary key means a taken id; a violation of `sha256`'s
+        // UNIQUE (a SHA-256 collision) propagates as a database error.
+        Err(error)
+            if is_unique_violation(&error)
+                && error
+                    .as_database_error()
+                    .and_then(|db_error| db_error.constraint())
+                    == Some("api_keys_pkey") =>
+        {
             return Err(OkfError::Refused {
                 reason: format!("key {:?} already exists", new.id),
             })
@@ -314,8 +322,9 @@ pub async fn revoke(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), O
     Ok(())
 }
 
-/// Grants a key a catalog (a no-op if already granted), and bumps the
-/// administrative generation.
+/// Grants a key a catalog, and bumps the administrative generation. Already
+/// granted is a no-op that leaves the generation alone, so a running server
+/// does not reload for nothing.
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -323,28 +332,31 @@ pub async fn revoke(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), O
 /// * `catalog` - the catalog's name.
 ///
 /// # Errors
-/// [`OkfError::Refused`] if there is no such key, or it already has every
-/// catalog (`--all`); [`OkfError::CatalogNotSelected`] if there is no such
+/// [`OkfError::Refused`] if there is no such key, it is revoked, or it already
+/// has every catalog (`--all`); [`OkfError::CatalogNotSelected`] if there is no such
 /// catalog; [`OkfError::Database`].
 pub async fn grant(pool: &PgPool, id: &str, catalog: &str) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
     let catalog = catalogs::find(&mut *tx, catalog).await?;
     require_named_grants(&mut tx, id).await?;
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO key_catalogs (key_id, catalog_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
     )
     .bind(id)
     .bind(catalog.id)
     .execute(&mut *tx)
     .await?;
+    if inserted.rows_affected() == 0 {
+        return Ok(());
+    }
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(())
 }
 
-/// Removes a key's grant of a catalog (a no-op if not granted); if it was the
-/// key's default catalog, the default is cleared. Bumps the administrative
-/// generation.
+/// Removes a key's grant of a catalog; if it was the key's default catalog,
+/// the default is cleared. Bumps the administrative generation; not granted
+/// is a no-op that leaves the generation alone.
 ///
 /// # Arguments
 /// As [`grant`].
@@ -355,34 +367,42 @@ pub async fn ungrant(pool: &PgPool, id: &str, catalog: &str) -> Result<(), OkfEr
     let mut tx = pool.begin().await?;
     let catalog = catalogs::find(&mut *tx, catalog).await?;
     require_named_grants(&mut tx, id).await?;
-    sqlx::query("DELETE FROM key_catalogs WHERE key_id = $1 AND catalog_id = $2")
+    let deleted = sqlx::query("DELETE FROM key_catalogs WHERE key_id = $1 AND catalog_id = $2")
         .bind(id)
         .bind(catalog.id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query(
+    let cleared = sqlx::query(
         "UPDATE api_keys SET default_catalog_id = NULL WHERE id = $1 AND default_catalog_id = $2",
     )
     .bind(id)
     .bind(catalog.id)
     .execute(&mut *tx)
     .await?;
+    if deleted.rows_affected() + cleared.rows_affected() == 0 {
+        return Ok(());
+    }
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(())
 }
 
-/// Refuses an unknown key id, and a key granted every catalog: its grants are
-/// not per catalog, so granting or removing one would change nothing it reaches.
+/// Refuses an unknown key id, a revoked key (as [`revoke`] does: its grants
+/// no longer matter), and a key granted every catalog: its grants are not
+/// per catalog, so granting or removing one would change nothing it reaches.
 async fn require_named_grants(conn: &mut PgConnection, id: &str) -> Result<(), OkfError> {
-    let all_catalogs: Option<bool> =
-        sqlx::query_scalar("SELECT all_catalogs FROM api_keys WHERE id = $1")
+    // `Option<(bool, bool)>`: `None` when there is no such row.
+    let key: Option<(bool, bool)> =
+        sqlx::query_as("SELECT all_catalogs, revoked_at IS NOT NULL FROM api_keys WHERE id = $1")
             .bind(id)
             .fetch_optional(&mut *conn)
             .await?;
-    match all_catalogs {
-        Some(false) => Ok(()),
-        Some(true) => Err(OkfError::Refused {
+    match key {
+        Some((false, false)) => Ok(()),
+        Some((_, true)) => Err(OkfError::Refused {
+            reason: format!("key {id:?} is revoked"),
+        }),
+        Some((true, false)) => Err(OkfError::Refused {
             reason: format!("key {id:?} is granted every catalog (--all)"),
         }),
         None => Err(OkfError::Refused {
@@ -518,6 +538,7 @@ mod tests {
         grant(&db.pool, "k", "work").await.unwrap();
         grant(&db.pool, "k", "work").await.unwrap(); // already granted: a no-op
         ungrant(&db.pool, "k", "pg").await.unwrap();
+        ungrant(&db.pool, "k", "pg").await.unwrap(); // not granted: a no-op
         revoke(&db.pool, "k", now()).await.unwrap();
 
         let record = &list(&db.pool).await.unwrap()[1];
@@ -526,8 +547,19 @@ mod tests {
         // Losing the default catalog's grant clears the default.
         assert_eq!(record.default_catalog, None);
         assert_eq!(record.revoked_at, Some(now()));
+        // Two catalogs, two keys, one grant, one ungrant, one revoke: the
+        // no-ops bumped nothing.
+        assert_eq!(catalogs::admin_generation(&db.pool).await.unwrap(), 7);
         assert!(matches!(
             revoke(&db.pool, "k", now()).await,
+            Err(OkfError::Refused { .. })
+        ));
+        assert!(matches!(
+            grant(&db.pool, "k", "pg").await,
+            Err(OkfError::Refused { reason }) if reason.contains("revoked")
+        ));
+        assert!(matches!(
+            ungrant(&db.pool, "k", "work").await,
             Err(OkfError::Refused { .. })
         ));
         assert!(matches!(
