@@ -50,6 +50,7 @@ Deliberately deferred:
 - **The text content of a tool result is the JSON itself, not a summary.** rmcp's `Json<T>` puts the serialized value in both `structuredContent` and one text block (verified fact 5); the design's "plus a short text summary" would mean a hand-written summary per tool for clients that ignore structured content. Task 12 records it.
 - **Report tools wrap `okf.py`'s JSON lists in an object** (`oldest` returns `{"rows": [...]}`, `sprawl` `{"reports": [...]}`), so every output schema has an object root, which clients on older protocol versions require. The rows are unchanged, field for field.
 - **`open_questions` reuses `oldest`.** `oldest` with `open_questions_only` already collects every concept's queued questions (with `okf.py`'s `str()` of each), so the tool numbers them instead of adding an analysis. Concepts come in `oldest`'s order (stalest first).
+- **The import route's body cap has slack.** It is `max_import_bytes` plus 0.1% and 64 KiB, since gzip makes incompressible input slightly larger; the exact limit is enforced on the decompressed stream, as for the CLI.
 - **Export is built in memory, not streamed.** `store::export` (M3) writes the whole `.tar.gz` into a `Vec<u8>` on a blocking thread; the route returns it with a `Content-Length`. The real catalog's export is about 1 MB and took 62 ms in M3's smoke test.
 - **The catalog list is polled directly.** Every tick reads `admin_generation` (for the key cache) and the catalog list (`id`, `name`, `generation`); a new, deleted or re-created catalog shows up in the list whether or not `admin_generation` moved, and a moved `generation` triggers `CatalogState::refresh`. Two small queries per tick.
 - **A path that is not in a granted catalog is "not available", never "forbidden".** The routes answer 404 for a catalog that does not exist *or* that the key does not reach (as `CatalogNotSelected` already words it), so a key cannot probe which catalogs exist; 403 is only for a reachable catalog the key's access level does not allow (a `read` key importing).
@@ -4602,7 +4603,8 @@ async fn an_import_larger_than_max_import_bytes_is_refused() {
     let server = TestServer::start(two_catalogs(), config).await;
     let admin = server.key("admin", Access::Admin, &[], None).await;
 
-    let status = post_import(&server, "work", &admin, "", vec![0u8; 4096]).await.status();
+    // Over the limit plus its 64 KiB of gzip slack.
+    let status = post_import(&server, "work", &admin, "", vec![0u8; 128 * 1024]).await.status();
 
     assert_eq!(status, 413);
 }
@@ -4647,17 +4649,32 @@ use crate::store::keys::Access;
 /// # Returns
 /// A router over `Arc<App>` state.
 pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
-    // A `u64` that does not fit a `usize` is larger than any body anyway.
-    let limit = usize::try_from(app.config().max_import_bytes.as_u64()).unwrap_or(usize::MAX);
+    let limit = body_limit(app.config().max_import_bytes.as_u64());
     Router::new()
         .route("/catalogs/{name}/export", get(export_catalog))
         .route(
             "/catalogs/{name}/import",
-            // The compressed body is never larger than what it expands to,
-            // so the uncompressed cap bounds it too (HTTP 413 beyond it).
             post(import_catalog).layer(DefaultBodyLimit::max(limit)),
         )
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, REQUEST_TIMEOUT))
+}
+
+/// The request-body cap for an import whose decompressed tar stream may be
+/// `max_import_bytes`. gzip makes incompressible input slightly larger (5
+/// bytes per stored 64 KiB block, plus an 18-byte header and trailer), so the
+/// cap adds 0.1% and 64 KiB: a tarball the CLI would accept is never refused
+/// here with 413. `read_tarball` still enforces the exact limit on the
+/// decompressed stream.
+///
+/// # Arguments
+/// * `max_import_bytes` - the configured limit.
+///
+/// # Returns
+/// The body cap, saturating at `usize::MAX`.
+fn body_limit(max_import_bytes: u64) -> usize {
+    let slack = max_import_bytes / 1000 + 64 * 1024;
+    // A `u64` that does not fit a `usize` is larger than any body anyway.
+    usize::try_from(max_import_bytes.saturating_add(slack)).unwrap_or(usize::MAX)
 }
 
 /// `GET /catalogs/{name}/export`: the published documents as a `.tar.gz`.
@@ -4715,12 +4732,28 @@ async fn import_catalog(
 }
 ```
 
+Add a unit test at the end of `src/http/archives.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_body_limit_leaves_room_for_gzip_overhead() {
+        assert_eq!(body_limit(0), 64 * 1024);
+        assert_eq!(body_limit(64 << 20), (64 << 20) + (64 << 20) / 1000 + 64 * 1024);
+        assert_eq!(body_limit(u64::MAX), usize::MAX);
+    }
+}
+```
+
 In `src/http/mod.rs`, add `mod archives;` and put `.merge(archives::routes(&app))` after `.route_service("/mcp", ...)` and before `.route_layer(...)`, replacing the comment that said Task 11 would.
 
 - [ ] **Step 3: Run the tests**
 
-Run: `cargo test --test server`
-Expected: 8 passed.
+Run: `cargo test --test server` and `cargo test --lib -- body_limit`
+Expected: 8 passed, and 1.
 
 - [ ] **Step 4: Changelog, gates, commit**
 
