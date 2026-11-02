@@ -8,8 +8,13 @@ become long-lived in M3 (Task 10), so the set is now compiled once per snapshot.
 
 - `Snapshot::mention_matcher()` (`pub(crate)`): the matcher over every concept in the
   link graph, built on the first call behind a `OnceLock` field and reused afterwards.
-- Test: `the_mention_matcher_is_built_once_per_snapshot` (snapshot): two calls return
-  the same object, and two links reports on one snapshot are equal.
+- `Snapshot::link_graph_concepts()` (`pub(crate)`): the concepts in the link graph, the
+  one filter `links_report` (mention sources) and `mention_matcher` (targets) share
+  (review of PR #52).
+- Tests: `the_mention_matcher_is_built_once_per_snapshot` (snapshot): the cache is
+  empty before the first links report and filled by it, the second report reuses
+  that matcher, and the two reports are equal (tightened in review of PR #52);
+  `link_graph_concepts_are_the_concepts_outside_root_machinery` (snapshot).
 
 ## Changed
 

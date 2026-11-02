@@ -673,21 +673,27 @@ mod tests {
         ]))
         .unwrap();
 
-        // Act
-        let first: *const MentionMatcher = snapshot.mention_matcher();
-        let second: *const MentionMatcher = snapshot.mention_matcher();
-        let report = crate::okf::analysis::links::links_report(&snapshot, true);
+        // `OnceLock::get` reads the cell without building it (`None` while
+        // empty), so the test can see whether `links_report` filled it.
+        assert!(snapshot.mention_matcher.get().is_none());
 
-        // Assert: `*const T` is a raw pointer; comparing two of them asks
-        // "same object?", like Python's `is`.
-        assert!(std::ptr::eq(first, second));
-        assert!(std::ptr::eq(first, snapshot.mention_matcher()));
+        // Act
+        let report = crate::okf::analysis::links::links_report(&snapshot, true);
+        // `*const T` is a raw pointer; comparing two of them asks "same
+        // object?", like Python's `is`.
+        let built: *const MentionMatcher = snapshot
+            .mention_matcher
+            .get()
+            .expect("links_report built the cached matcher");
+        let again = crate::okf::analysis::links::links_report(&snapshot, true);
+
+        // Assert: the second report and a direct call reuse the first
+        // report's matcher (a `OnceLock` is written once, so it was built
+        // once), and the reports agree.
+        assert!(std::ptr::eq(built, snapshot.mention_matcher()));
         assert_eq!(report.unlinked_mentions.len(), 1);
         assert_eq!(report.unlinked_mentions[0].target, "b.md");
-        assert_eq!(
-            report,
-            crate::okf::analysis::links::links_report(&snapshot, true)
-        );
+        assert_eq!(report, again);
     }
 
     #[test]
