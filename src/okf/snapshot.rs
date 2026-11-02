@@ -599,6 +599,35 @@ mod tests {
     use super::*;
     use crate::okf::workspace::{DiskWorkspace, MemWorkspace};
 
+    #[test]
+    fn a_link_to_a_binary_file_resolves() {
+        use crate::okf::workspace::StoredFile;
+        let ws = MemWorkspace::from_stored([
+            (
+                "a.md".to_string(),
+                StoredFile {
+                    // A plain link: `okf.py`'s link pattern skips image syntax
+                    // (`![..](..)`), so an image embed is not a link at all.
+                    content: b"---\ntype: Note\n---\n[logo](img/logo.png)\n".to_vec(),
+                    executable: false,
+                },
+            ),
+            (
+                "img/logo.png".to_string(),
+                StoredFile {
+                    content: b"\x89PNG\0\xff".to_vec(),
+                    executable: false,
+                },
+            ),
+        ])
+        .unwrap();
+
+        let snapshot = Snapshot::build(&ws).unwrap();
+
+        let link = &snapshot.get("a.md").unwrap().links()[0];
+        assert!(link.target_exists && link.target_is_file);
+    }
+
     fn catalog() -> MemWorkspace {
         MemWorkspace::from_files([
             (

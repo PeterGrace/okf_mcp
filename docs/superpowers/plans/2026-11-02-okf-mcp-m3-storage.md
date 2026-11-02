@@ -239,7 +239,9 @@ And in `src/okf/snapshot.rs`'s test module, a link to a binary file must not be 
             (
                 "a.md".to_string(),
                 StoredFile {
-                    content: b"---\ntype: Note\n---\n![logo](img/logo.png)\n".to_vec(),
+                    // A plain link: `okf.py`'s link pattern skips image syntax
+                    // (`![..](..)`), so an image embed is not a link at all.
+                    content: b"---\ntype: Note\n---\n[logo](img/logo.png)\n".to_vec(),
                     executable: false,
                 },
             ),
@@ -261,6 +263,8 @@ And in `src/okf/snapshot.rs`'s test module, a link to a binary file must not be 
 ```
 
 (If `snapshot.rs`'s test module does not import `MemWorkspace` yet, add `use crate::okf::workspace::MemWorkspace;`.)
+
+> **Corrected (issue #35), 2026-11-02.** The fixture first used `![logo](img/logo.png)`, which yields no link: `markdown::find_links` ports `okf.py`'s `LINK_RE` with its `(?<!!)`, so an image embed is not a link and `links()[0]` panicked. It now uses `[logo](img/logo.png)`; Task 10's `load_builds_the_snapshot_of_the_live_documents` had the same fixture and is fixed the same way. Also, `read_to_string` below validates the borrowed bytes with `std::str::from_utf8` before copying, instead of `String::from_utf8(file.content.clone())`, so a non-text file is never copied (code updated inline).
 
 - [ ] **Step 2: Run them to see them fail**
 
@@ -355,6 +359,8 @@ Change the field to `files: RwLock<BTreeMap<String, StoredFile>>`, and `has_key_
     }
 ```
 
+> **Corrected (issue #35, review of PR #48), 2026-11-02.** `from_stored` shipped stricter than the code above: it also refuses (`InvalidPath`) two paths that normalize to the same one (`./a.md` and `a.md`, reason "a duplicate of another path") and a file that is also another file's directory (`a` beside `a/b.md`, reason "is a file and a directory"), the trees `write_atomic` can never produce. Its signature is unchanged. Read `src/okf/workspace.rs` for the shipped version; the tests are `from_stored_refuses_paths_that_normalize_to_the_same_file` and `from_stored_refuses_a_file_that_is_also_a_directory`.
+
 `files()` returns `RwLockReadGuard<'_, BTreeMap<String, StoredFile>>`. In `impl Workspace for MemWorkspace`:
 
 ```rust
@@ -365,10 +371,13 @@ Change the field to `files: RwLock<BTreeMap<String, StoredFile>>`, and `has_key_
             path: path.to_string(),
         })?;
         // The same error `std::fs::read_to_string` gives for non-UTF-8 bytes.
-        String::from_utf8(file.content.clone()).map_err(|error| OkfError::Io {
-            path: path.to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-        })
+        // `from_utf8` borrows the bytes (no copy until it is known to be text).
+        std::str::from_utf8(&file.content)
+            .map(str::to_string)
+            .map_err(|error| OkfError::Io {
+                path: path.to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+            })
     }
 ```
 
@@ -399,6 +408,8 @@ a non-text file resolves, reading such a file as text fails as it does on disk,
 and a write through the workspace keeps an existing file's execute bit (a new
 file is not executable).
 ```
+
+> **Corrected (issue #35), 2026-11-02.** The sentence before that replacement, "The in-memory workspace, which M2 kept behind the `test-util` feature, becomes production code.", also had to change, or Step 5's `test-util` grep finds it: it reads "The in-memory workspace, test-only in M2, becomes production code." The paragraph then continues "It holds every file's bytes ..." rather than repeating "The in-memory workspace".
 
 - [ ] **Step 4: Run the tests**
 
@@ -2498,6 +2509,8 @@ git commit -m "keys: API key generation, storage, grants and okf-mcp key"
 
 Pure reading and writing of catalog files (design "Import" and "Export"). Reading applies every import rule and lists every problem at once. The size cap counts the decompressed stream, so a small upload cannot expand without bound (verified fact 7).
 
+> **Corrected (issue #35, review of PR #48), 2026-11-02.** Since Task 1, `MemWorkspace::from_stored` refuses a file that is also another file's directory (`a` beside `a/b.md`), which a tarball can hold. The rules below do not list that case, so Task 8's `import` would fail on it with `InvalidPath` from `from_stored`, naming only the first such path. Add it to the listed problems here (a file path that is a prefix directory of another, checked over the sorted `Files` map) so every clash is reported with the others.
+
 **Files:**
 - Modify: `Cargo.toml` (`tar`, `flate2`)
 - Create: `src/archive.rs`; modify `src/lib.rs` (`pub mod archive;`)
@@ -3847,7 +3860,8 @@ mod tests {
     async fn load_builds_the_snapshot_of_the_live_documents() {
         let db = test_db().await;
         catalogs::create(&db.pool, "pg", "", Utc::now()).await.unwrap();
-        import_into(&db.pool, &[("a.md", b"---\ntype: Note\n---\n![logo](logo.png)\n"), ("logo.png", b"\x89PNG\0")], false).await;
+        // A plain link: `okf.py` does not count an image embed (`![..](..)`) as a link.
+        import_into(&db.pool, &[("a.md", b"---\ntype: Note\n---\n[logo](logo.png)\n"), ("logo.png", b"\x89PNG\0")], false).await;
 
         let state = CatalogState::load(&db.pool, "pg").await.unwrap();
 
