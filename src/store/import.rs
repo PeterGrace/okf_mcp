@@ -194,6 +194,9 @@ fn analyze(files: Files, now: DateTime<Utc>) -> Result<Analyzed, OkfError> {
     refuse_markdown_that_is_not_text(&files)?;
     let workspace = MemWorkspace::from_stored(files)?;
     let snapshot = Snapshot::build(&workspace)?;
+    // `None`: commit times come from stored revisions, and these incoming
+    // files are not stored yet, so `generated-after-commit` is skipped here.
+    // Linting the loaded catalog (`crate::catalog::Loaded::lint`) runs it.
     let lint = lint(&snapshot, now, None);
     Ok(Analyzed {
         files: workspace.into_stored(),
