@@ -53,9 +53,10 @@ Deliberately deferred:
 
 - **The in-memory workspace holds bytes and execute bits itself.** The design says the store keeps execute bits and non-text files "beside" the `&str` workspace. A link to an image must resolve (the snapshot asks the workspace `is_file`), so the workspace has to know every file. `MemWorkspace` stores each file's bytes and execute bit; `read_to_string` fails with `Io` (`InvalidData`) on non-UTF-8, exactly as `DiskWorkspace` does. Task 1 updates the design's "In-memory snapshot" paragraph.
 - **Text means valid UTF-8.** The design's "valid UTF-8 with no NUL" came from Postgres `text`, which cannot hold NUL. Content is `bytea`, so NUL no longer matters, and `okf.py` reads such a file too. Task 1 updates the design's "Storage" paragraph.
-- **`config` holds only `max_import_bytes` in M3.** The other design fields arrive in the milestone that reads them (table above). Unknown keys are ignored, so one config file serves every milestone.
-- **CLI subcommands run migrations on connect.** `migrate` still exists (for deploy hooks), but every subcommand runs the embedded migrations first (idempotent), so a fresh database works without a separate step.
-- **The binary is renamed `okf-mcp`** (the design's name; `Cargo.toml` still says `okf_mcp`).
+- **`config` holds only `max_import_bytes` in M3.** The other design fields arrive in the milestone that reads them (table above). Unknown keys are ignored, so one config file serves every milestone. Task 4 notes this in the design's "Configuration".
+- **CLI subcommands run migrations on connect.** `migrate` still exists (for deploy hooks), but every subcommand runs the embedded migrations first (idempotent), so a fresh database works without a separate step. Task 4 notes this in the design's "Process and routes".
+- **The binary is renamed `okf-mcp`**: not a deviation, the design already uses that name; `Cargo.toml` said `okf_mcp`.
+- **`api_keys.default_catalog_id`** references `catalogs` (`ON DELETE SET NULL`) instead of naming the catalog, so deleting a catalog cannot leave a key with a stale default. Task 6 updates the design's table.
 - **Import writes rows one at a time inside one transaction.** A catalog has a few hundred files and import is rare; the smoke test records the real catalog's import time.
 - **A tombstone keeps an empty `content`** (the column is `NOT NULL`); its revision row has `NULL` content, as the design says.
 
@@ -127,16 +128,16 @@ Each was checked against the source or by running it on 2026-11-02 (a probe crat
 | `src/okf/analysis/lint.rs`, `src/okf/mod.rs` | T11 (doc comments) | Git-era wording |
 | `tests/roundtrip.rs` | T12 (create) | Import/export round trips |
 | `tests/smoke.rs` | T13 (modify) | Storage timings on the real catalog |
-| `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md` | T1 (two paragraphs), T13 (M3 delivered) | Design |
+| `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md` | T1 (two paragraphs), T4 (configuration, subcommands), T6 (`default_catalog_id`), T13 (M3 delivered) | Design |
 | `changelog/*-m3-*.md` | every task | Iteration notes |
 
 ## Task dependencies
 
 ```
-T1 workspace bytes (#35) ──────────────────────────┐
+T1 workspace bytes (#35) ──> T7 archive ──────────┐
 T2 matcher cache (#33) ─────────────────────────────┼──────────────────────────────┐
 T3 db + schema ──> T4 cli + config ──> T5 catalogs ─┼─> T6 keys                     │
-T7 archive ──────────────────────────────────────── ┴─> T8 import ──> T9 export ──┐ │
+                                    T1, T5, T7 ─────┴─> T8 import ──> T9 export ──┐ │
                                                          T8 ──> T10 catalog state (#32) ──> T11 commit times (#31)
                                                          T8, T9 ──> T12 round trip ──────────┴─> T13 smoke/README/changelog
 ```
@@ -145,6 +146,7 @@ Edges, explicitly:
 
 - T3 -> T4 -> T5
 - T5 -> T6; T5 -> T8
+- T1 -> T7 (`archive` stores `StoredFile`, which T1 creates)
 - T1 -> T8; T7 -> T8
 - T8 -> T9
 - T1 -> T10; T8 -> T10
@@ -152,7 +154,9 @@ Edges, explicitly:
 - T8 -> T12; T9 -> T12
 - every task -> T13 (T2, T6, T11, T12 included)
 
-Tasks with no dependencies, which can start straight away: **T1, T2, T3, T7**. T1, T2 and T7 touch disjoint files except `Cargo.toml` (T1, T7) and `src/lib.rs` (T7); T3 touches `Cargo.toml` and `src/lib.rs` too. Keep both sides.
+Tasks with no dependencies, which can start straight away: **T1, T2, T3**; T7 follows T1. T1 and T2 touch disjoint files; T1 and T3 both touch `Cargo.toml`, and T3 and T7 both touch `Cargo.toml` and `src/lib.rs`. Keep both sides.
+
+> **Corrected (review of PR #37), 2026-11-02.** Added T1 -> T7: Task 7's `archive` uses `StoredFile` from Task 1.
 
 ---
 
@@ -824,7 +828,8 @@ CREATE TABLE api_keys (
     sha256          bytea NOT NULL UNIQUE CHECK (length(sha256) = 32),
     access          text NOT NULL CHECK (access IN ('read', 'write', 'admin')),
     all_catalogs    boolean NOT NULL,
-    default_catalog text,
+    -- Cleared when that catalog is deleted.
+    default_catalog_id bigint REFERENCES catalogs (id) ON DELETE SET NULL,
     actor           text NOT NULL,
     created_at      timestamptz NOT NULL,
     revoked_at      timestamptz
@@ -1305,17 +1310,25 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 5: Run the tests**
+- [ ] **Step 5: Design edits**
+
+In `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md`:
+- "Configuration": after the example TOML, add "Each milestone reads only its own fields (M3: `max_import_bytes`); unknown keys are ignored, so one file serves every version."
+- "Process and routes", subcommand table: after the table, add "Every subcommand that touches the database applies the embedded migrations first (idempotent); `migrate` exists for deploy hooks that want them as a separate step."
+
+The binary name `okf-mcp` needs no design edit: it is already the design's name.
+
+- [ ] **Step 6: Run the tests**
 
 Run: `cargo test --lib config cli`, then `cargo run -- --help` and `cargo run -- migrate` (no `DATABASE_URL`: the error names it).
 Expected: PASS; the help lists `serve` and `migrate`.
 
-- [ ] **Step 6: Gates, changelog, commit**
+- [ ] **Step 7: Gates, changelog, commit**
 
 Run the gates. Changelog: Added: `okf-mcp` CLI (`migrate`, `serve` placeholder), `config::Config` (`max_import_bytes`); Changed: the binary is `okf-mcp`. Commit:
 
 ```bash
-git add Cargo.toml Cargo.lock src/cli.rs src/config.rs src/main.rs src/lib.rs src/db.rs src/error.rs changelog/
+git add Cargo.toml Cargo.lock src/cli.rs src/config.rs src/main.rs src/lib.rs src/db.rs src/error.rs docs/superpowers/specs changelog/
 git commit -m "cli: okf-mcp command line with migrate, and the config file"
 ```
 
@@ -1931,6 +1944,21 @@ mod tests {
         assert!(matches!(revoke(&db.pool, "k", now()).await, Err(OkfError::Refused { .. })));
         assert!(matches!(grant(&db.pool, "nope", "pg").await, Err(OkfError::Refused { .. })));
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_catalog_clears_it_as_a_default() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
+        create(&db.pool, &new_key("k", Grants::All, Some("pg")), now()).await.unwrap();
+        let unknown_default = create(&db.pool, &new_key("j", Grants::All, Some("nope")), now()).await;
+
+        catalogs::delete(&db.pool, "pg", false).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
+
+        // A re-created catalog of the same name is not the old default.
+        assert_eq!(list(&db.pool).await.unwrap()[0].default_catalog, None);
+        assert!(matches!(unknown_default, Err(OkfError::CatalogNotSelected { .. })));
+    }
 }
 ```
 
@@ -2144,27 +2172,32 @@ pub async fn create(pool: &PgPool, new: &NewKey<'_>, now: DateTime<Utc>) -> Resu
             ids
         }
     };
-    if let Some(default) = new.default_catalog {
-        let reachable = match new.grants {
-            Grants::All => catalogs::find(&mut *tx, default).await.is_ok(),
-            Grants::Catalogs(names) => names.iter().any(|name| name == default),
-        };
-        if !reachable {
-            return Err(OkfError::Refused {
-                reason: format!("default catalog {default:?} is not granted to the key"),
-            });
+    let default_catalog_id = match new.default_catalog {
+        None => None,
+        Some(default) => {
+            let granted = match new.grants {
+                Grants::All => true,
+                Grants::Catalogs(names) => names.iter().any(|name| name == default),
+            };
+            if !granted {
+                return Err(OkfError::Refused {
+                    reason: format!("default catalog {default:?} is not granted to the key"),
+                });
+            }
+            // An unknown catalog is `CatalogNotSelected`; any other error propagates.
+            Some(catalogs::find(&mut *tx, default).await?.id)
         }
-    }
+    };
     let key = crate::keys::generate()?;
     let inserted = sqlx::query(
-        "INSERT INTO api_keys (id, sha256, access, all_catalogs, default_catalog, actor, created_at) \
+        "INSERT INTO api_keys (id, sha256, access, all_catalogs, default_catalog_id, actor, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(new.id)
     .bind(crate::keys::hash(&key).to_vec())
     .bind(new.access.as_str())
     .bind(matches!(new.grants, Grants::All))
-    .bind(new.default_catalog)
+    .bind(default_catalog_id)
     .bind(new.actor)
     .bind(now)
     .execute(&mut *tx)
@@ -2198,14 +2231,15 @@ pub async fn create(pool: &PgPool, new: &NewKey<'_>, now: DateTime<Utc>) -> Resu
 /// [`OkfError::Database`].
 pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
     let rows = sqlx::query_as::<_, KeyRow>(
-        "SELECT k.id, k.sha256, k.access, k.all_catalogs, k.default_catalog, k.actor, \
+        "SELECT k.id, k.sha256, k.access, k.all_catalogs, d.name AS default_catalog, k.actor, \
                 k.created_at, k.revoked_at, \
                 COALESCE(array_agg(c.name ORDER BY c.name) FILTER (WHERE c.name IS NOT NULL), \
                          '{}'::text[]) AS catalogs \
          FROM api_keys k \
+         LEFT JOIN catalogs d ON d.id = k.default_catalog_id \
          LEFT JOIN key_catalogs g ON g.key_id = k.id \
          LEFT JOIN catalogs c ON c.id = g.catalog_id \
-         GROUP BY k.id ORDER BY k.id",
+         GROUP BY k.id, d.name ORDER BY k.id",
     )
     .fetch_all(pool)
     .await?;
@@ -2280,9 +2314,9 @@ pub async fn ungrant(pool: &PgPool, id: &str, catalog: &str) -> Result<(), OkfEr
         .bind(catalog.id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE api_keys SET default_catalog = NULL WHERE id = $1 AND default_catalog = $2")
+    sqlx::query("UPDATE api_keys SET default_catalog_id = NULL WHERE id = $1 AND default_catalog_id = $2")
         .bind(id)
-        .bind(&catalog.name)
+        .bind(catalog.id)
         .execute(&mut *tx)
         .await?;
     bump_admin_generation(&mut tx).await?;
@@ -2429,6 +2463,8 @@ async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyho
 }
 ```
 
+In the design's "Storage" table, the `api_keys` row's `default_catalog` becomes `default_catalog_id` (a reference to `catalogs`, cleared when that catalog is deleted).
+
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --lib keys cli`
@@ -2439,7 +2475,7 @@ Expected: PASS.
 Run the gates. Changelog: Added: `keys` (generate, hash, constant-time `matches`), `store::keys` (create, list, revoke, grant, ungrant), `okf-mcp key ...`. Commit:
 
 ```bash
-git add Cargo.toml Cargo.lock src/keys.rs src/store src/lib.rs src/cli.rs changelog/
+git add Cargo.toml Cargo.lock src/keys.rs src/store src/lib.rs src/cli.rs docs/superpowers/specs changelog/
 git commit -m "keys: API key generation, storage, grants and okf-mcp key"
 ```
 
