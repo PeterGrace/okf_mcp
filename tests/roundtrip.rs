@@ -112,5 +112,6 @@ async fn the_real_catalog_round_trips() {
     let (exported, again) = round_trip(&files).await;
 
     assert_eq!(exported, files);
+    assert_eq!((again.added, again.updated, again.deleted), (0, 0, 0));
     assert_eq!(again.unchanged, files.len());
 }
