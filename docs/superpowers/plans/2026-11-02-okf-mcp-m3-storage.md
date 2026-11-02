@@ -4218,6 +4218,8 @@ Before opening the PR, edit issue #31's body (`gh issue edit 31 --body-file ...`
 - Modify: `src/okf/mod.rs` (line 3), `src/error.rs` (enum doc)
 - Create: `changelog/<ts>-m3-task-11-commit-times.md`
 
+> **Corrected (issue #31), 2026-11-02.** Shipped as planned (`store::documents::commit_times`, `Loaded::{commit_times, lint}` with `lint(&self, now: DateTime<Utc>) -> LintReport`, so Task 13's `loaded.lint(Utc::now())` stands), with these differences; read `src/store/documents.rs` and `src/catalog.rs`. (1) `src/error.rs` is unchanged: on main its enum doc already read "Later milestones add variants (auth, lint, publish)", with no git wording. (2) `CommitTimes::new`'s argument docs were rewritten too, not kept: they described only `git log` and `git status`, so they now name both sources (`okf.py`'s git, the server's `updated_at`). The two tests shipped as written.
+
 - [ ] **Step 1: Write the failing tests**
 
 `src/store/documents.rs`:
