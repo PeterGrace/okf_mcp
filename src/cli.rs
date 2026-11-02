@@ -15,6 +15,7 @@ use sqlx::PgPool;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::db;
+use crate::store::catalogs;
 
 /// `okf-mcp`: an MCP server for OKF knowledge catalogs.
 // `derive(Parser)` generates the argument parser from the struct, as
@@ -43,6 +44,33 @@ pub enum Command {
     Serve,
     /// Apply the schema migrations and exit.
     Migrate,
+    /// Create, list or delete catalogs.
+    // A nested subcommand: `okf-mcp catalog create ...`.
+    #[command(subcommand)]
+    Catalog(CatalogCommand),
+}
+
+/// `okf-mcp catalog ...`.
+#[derive(Debug, Subcommand)]
+pub enum CatalogCommand {
+    /// Create an empty catalog.
+    Create {
+        /// Its name (`[a-z0-9-]+`).
+        name: String,
+        /// Free text.
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// List catalogs.
+    List,
+    /// Delete a catalog with its documents, history, pending changes and grants.
+    Delete {
+        /// Its name.
+        name: String,
+        /// Delete even if a session has unpublished changes.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Runs one command line.
@@ -57,7 +85,6 @@ pub enum Command {
 pub async fn run(cli: Cli, clock: &dyn Clock) -> anyhow::Result<()> {
     // Read now so a bad file fails every command; `import` (Task 8) uses it.
     let _config = Config::load(cli.config.as_deref())?;
-    let _ = clock; // The `catalog`, `key` and `import` subcommands (Tasks 5-8) use it.
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
             anyhow::bail!("the MCP server arrives in milestone 4; see `okf-mcp --help`")
@@ -65,6 +92,45 @@ pub async fn run(cli: Cli, clock: &dyn Clock) -> anyhow::Result<()> {
         Command::Migrate => {
             connect(cli.database_url.as_deref()).await?;
             println!("migrations applied");
+        }
+        Command::Catalog(command) => {
+            let pool = connect(cli.database_url.as_deref()).await?;
+            run_catalog(&pool, command, clock).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs `okf-mcp catalog ...`.
+///
+/// # Arguments
+/// * `pool` - the migrated database.
+/// * `command` - which catalog subcommand.
+/// * `clock` - the source of `created_at`.
+///
+/// # Errors
+/// The store's refusal or database error.
+async fn run_catalog(
+    pool: &PgPool,
+    command: CatalogCommand,
+    clock: &dyn Clock,
+) -> anyhow::Result<()> {
+    match command {
+        CatalogCommand::Create { name, description } => {
+            let catalog = catalogs::create(pool, &name, &description, clock.now()).await?;
+            println!("created catalog {}", catalog.name);
+        }
+        CatalogCommand::List => {
+            for catalog in catalogs::list(pool).await? {
+                println!(
+                    "{}\tgeneration {}\t{}",
+                    catalog.name, catalog.generation, catalog.description
+                );
+            }
+        }
+        CatalogCommand::Delete { name, force } => {
+            catalogs::delete(pool, &name, force).await?;
+            println!("deleted catalog {name}");
         }
     }
     Ok(())
@@ -119,6 +185,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(applied, 1);
+    }
+
+    #[test]
+    fn catalog_subcommands_parse() {
+        let parsed =
+            Cli::try_parse_from(["okf-mcp", "catalog", "create", "pg", "--description", "D"])
+                .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Catalog(CatalogCommand::Create { ref name, ref description }))
+                if name == "pg" && description == "D"
+        ));
+        let parsed =
+            Cli::try_parse_from(["okf-mcp", "catalog", "delete", "pg", "--force"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Catalog(CatalogCommand::Delete { force: true, .. }))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_create_runs_against_the_database() {
+        let db = crate::db::pg_support::TestDb::start().await;
+        let create = CatalogCommand::Create {
+            name: "pg".to_string(),
+            description: String::new(),
+        };
+
+        run(
+            cli(Some(db.url.clone()), Command::Catalog(create)),
+            &FixedClock(chrono::Utc::now()),
+        )
+        .await
+        .unwrap();
+
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM catalogs")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(names, ["pg"]);
     }
 
     #[tokio::test]

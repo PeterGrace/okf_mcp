@@ -42,6 +42,8 @@ Deliberately deferred:
 | NTP offset check | M7 | Design milestone table |
 | Config fields `listen`, `allowed_hosts`, `default_catalog`, `session_idle_timeout`, `time_server`, `poll_interval` | M4/M7 | Nothing in M3 reads them; each arrives with its user |
 
+> **Note for M5 (review of PR #55), 2026-11-02.** `store::catalogs::delete` takes `catalogs::lock`, then holds the catalog row `FOR UPDATE` while it locks that catalog's open changesets `FOR UPDATE` (so a concurrent changeset write cannot slip past its unpublished-work check). A write transaction that holds an uncommitted changeset entry and then needs the catalog row (inserting a new changeset, which takes `FOR KEY SHARE` on it, or updating `catalogs`) can therefore deadlock with a delete; Postgres aborts one side with SQLSTATE `40P01`. M5's write path must either take `catalogs::lock` before touching changesets, or touch the catalog row (or create the changeset) before writing entries, or retry on `40P01`.
+
 ## Decisions taken while planning (2026-11-02)
 
 1. **Database tests use testcontainers in plain `cargo test`.** Each test that needs Postgres starts its own throwaway `postgres:17-alpine` container (about 1.4 s, in parallel). The gates therefore need Docker, which this machine has; without it those tests fail at once with "is docker reachable?".
@@ -1583,6 +1585,10 @@ mod tests {
     }
 ```
 
+> **Corrected (issue #41), 2026-11-02.** The shipped test module (`src/store/catalogs.rs`) adds `the_lock_holds_other_transactions_off_until_commit` (a second transaction's `pg_try_advisory_xact_lock(CATALOG_LOCK_NAMESPACE, id)` fails while the lock is held and succeeds after the holder commits), and `an_empty_open_changeset_does_not_block_delete` also asserts the catalog is gone. Signatures are unchanged.
+
+> **Corrected (review of PR #55), 2026-11-02.** `delete` now re-checks the catalog row (`FOR UPDATE`) after the advisory lock, returning `CatalogNotSelected` when a racing delete removed it, and locks the catalog's open changesets `FOR UPDATE` before the unpublished check, so a concurrent changeset write cannot slip past the refusal (M5's write path needs no lock of its own for this). `lock` binds the `i64` id as `$2::int4` instead of `i32::try_from(..).expect(..)`. New tests: `a_delete_that_waited_finds_the_catalog_gone`, `an_entry_written_during_a_delete_is_refused_not_cascaded`, `an_id_beyond_int4_is_a_database_error`. The code below is updated.
+
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `cargo test --lib -- store::catalogs cli`
@@ -1743,6 +1749,23 @@ pub async fn delete(pool: &PgPool, name: &str, force: bool) -> Result<(), OkfErr
     let mut tx = pool.begin().await?;
     let catalog = find(&mut *tx, name).await?;
     lock(&mut tx, catalog.id).await?;
+    // A delete that waited on the lock may find the row already gone.
+    let still_there: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM catalogs WHERE id = $1 FOR UPDATE")
+            .bind(catalog.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if still_there.is_none() {
+        return Err(OkfError::CatalogNotSelected {
+            catalog: name.to_string(),
+        });
+    }
+    // FOR UPDATE conflicts with the FOR KEY SHARE a foreign-key check takes,
+    // so a changeset or entry being written now is either seen below or fails.
+    sqlx::query("SELECT id FROM changesets WHERE catalog_id = $1 AND state = 'open' FOR UPDATE")
+        .bind(catalog.id)
+        .execute(&mut *tx)
+        .await?;
     let unpublished: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM changesets c \
          JOIN changeset_entries e ON e.changeset_id = c.id \
@@ -1775,11 +1798,11 @@ pub async fn delete(pool: &PgPool, name: &str, force: bool) -> Result<(), OkfErr
 pub(crate) async fn lock(conn: &mut PgConnection, catalog_id: i64) -> Result<(), OkfError> {
     // The two-key form, under this crate's namespace, so the lock cannot
     // collide with another application's advisory locks on a shared database.
-    let catalog_key =
-        i32::try_from(catalog_id).expect("catalog ids come from an identity starting at 1");
-    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+    // `$2::int4`: the server casts, so an id above i32::MAX is a database
+    // error ("integer out of range"), not a panic here.
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2::int4)")
         .bind(CATALOG_LOCK_NAMESPACE)
-        .bind(catalog_key)
+        .bind(catalog_id)
         .execute(&mut *conn)
         .await?;
     Ok(())

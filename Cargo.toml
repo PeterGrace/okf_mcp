@@ -56,3 +56,6 @@ hegeltest = "0.50.3"
 # Throwaway Postgres containers for the database tests (needs Docker). Only
 # the modules crate: it re-exports the testcontainers version it supports.
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+# The store's concurrency tests poll `pg_locks` with `tokio::time::sleep`;
+# `time` is named here rather than relied on through another crate's features.
+tokio = { version = "1.54", features = ["time"] }

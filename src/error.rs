@@ -87,4 +87,18 @@ pub enum OkfError {
         /// What is wrong with it.
         message: String,
     },
+
+    /// The named catalog does not exist (from M4, also: the key may not reach it).
+    #[error("catalog {catalog:?} does not exist or is not available")]
+    CatalogNotSelected {
+        /// The catalog name as given.
+        catalog: String,
+    },
+
+    /// An administrative request was refused; the reason says why and what to do.
+    #[error("{reason}")]
+    Refused {
+        /// Why.
+        reason: String,
+    },
 }
