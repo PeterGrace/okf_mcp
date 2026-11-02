@@ -120,13 +120,15 @@ pub async fn run(cli: Cli, clock: &dyn Clock) -> anyhow::Result<()> {
             replace,
             actor,
         } => {
+            // Connect first: a missing or unreachable database fails before a
+            // large tarball (or stdin) is read.
+            let pool = connect(cli.database_url.as_deref()).await?;
             let limit = config.max_import_bytes.as_u64();
             // Reading files is blocking I/O: run it on a blocking thread, as
             // `import` does for its snapshot, so the runtime's threads stay free.
             let files = tokio::task::spawn_blocking(move || read_source(&source, limit))
                 .await
                 .context("the import reader stopped")??;
-            let pool = connect(cli.database_url.as_deref()).await?;
             let options = ImportOptions {
                 replace,
                 actor: &actor,
@@ -329,7 +331,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_import_source_is_explained() {
+    async fn import_checks_the_database_before_reading_the_source() {
+        // A source that does not exist: reading it first would report "open".
         let import = Command::Import {
             catalog: "pg".to_string(),
             source: PathBuf::from("/nonexistent-okf-import.tar.gz"),
@@ -341,9 +344,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("open /nonexistent-okf-import.tar.gz"));
+        assert!(error.to_string().contains("DATABASE_URL"));
     }
 
     #[tokio::test]
