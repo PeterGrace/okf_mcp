@@ -15,6 +15,8 @@ path = "src/main.rs"
 [dependencies]
 # Application-level errors in the command line (the library uses OkfError).
 anyhow = "1.0.104"
+# API keys are 32 random bytes in unpadded base64url (`keys::generate`).
+base64 = "0.23.1"
 # Sizes with units in the configuration ("64MiB").
 bytesize = { version = "2.7.0", features = ["serde"] }
 # Wall-clock timestamps for catalog stamps (UTC only; no local-time database needed).
@@ -24,6 +26,8 @@ chrono = { version = "0.4.45", default-features = false, features = ["now"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 # Gzip for catalog archives (.tar.gz import and export).
 flate2 = "1.1.10"
+# The OS random source for API keys.
+getrandom = "0.4.3"
 # Insertion-ordered maps, matching Python dict order for frontmatter mappings.
 indexmap = "2.14.2"
 # Data parallelism for building snapshots and running analyses across documents.
@@ -34,6 +38,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 # `preserve_order` keeps JSON object keys in insertion order (Python dict
 # order), so `Value::to_json` keeps frontmatter keys in source order.
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+# API keys are stored only as their SHA-256.
+sha2 = "0.11.1"
+# Constant-time comparison of a presented key's hash with a stored one.
+subtle = "2.6.1"
 # Atomic writes via unique temp files (DiskWorkspace); also throwaway dirs in tests.
 tempfile = "3.27.0"
 # Catalog archives: .tar.gz import and export (with flate2).
