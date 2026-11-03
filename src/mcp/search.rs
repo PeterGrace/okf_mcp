@@ -20,6 +20,10 @@ use crate::okf::snapshot::Snapshot;
 /// The design's default `limit`.
 const DEFAULT_LIMIT: usize = 20;
 
+/// The most hits one call returns, whatever `limit` asks for, so a response
+/// stays a reasonable size for an MCP client.
+const MAX_LIMIT: usize = 200;
+
 /// `search`'s arguments. Doc comments are the parameters' descriptions in
 /// the tool's input schema (`JsonSchema` reads them).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -46,7 +50,7 @@ pub struct SearchParams {
     /// Only concepts with this `status` (case-insensitive; a missing status
     /// counts as `stable`).
     pub status: Option<String>,
-    /// At most this many hits (default 20).
+    /// At most this many hits (default 20, at most 200; 0 returns none).
     pub limit: Option<usize>,
 }
 
@@ -76,7 +80,7 @@ pub(crate) async fn run(ctx: &ToolContext, params: SearchParams) -> Result<Searc
         concept_type: params.concept_type,
         tags: params.tags,
         status: params.status,
-        limit: params.limit.unwrap_or(DEFAULT_LIMIT),
+        limit: hit_limit(params.limit),
     };
     // Each catalog's current snapshot, taken once here. The pairs are `Arc`
     // handles (reference-counted pointers, cheap to copy), so the blocking
@@ -99,6 +103,19 @@ pub(crate) async fn run(ctx: &ToolContext, params: SearchParams) -> Result<Searc
     })
     .await;
     Ok(SearchResult { hits })
+}
+
+/// The number of hits a call returns at most.
+///
+/// # Arguments
+/// * `requested` - the `limit` argument, if given.
+///
+/// # Returns
+/// [`DEFAULT_LIMIT`] when none was given, else `requested` capped at
+/// [`MAX_LIMIT`].
+fn hit_limit(requested: Option<usize>) -> usize {
+    // `map_or(default, f)` is Python's `default if x is None else f(x)`.
+    requested.map_or(DEFAULT_LIMIT, |limit| limit.min(MAX_LIMIT))
 }
 
 // As in `catalogs.rs`: the macro turns this block's `#[tool]` methods into a
@@ -173,10 +190,25 @@ mod tests {
         .await;
         let ctx = context(&test, principal(&[], None), Some(&["work", "pg"]));
 
-        let found = run(&ctx, params("routes", &[])).await.unwrap();
+        let mut only_pg = params("routes", &[]);
+        only_pg.catalogs = Some(vec!["pg".to_string()]);
 
-        let catalogs: Vec<&str> = found.hits.iter().map(|hit| hit.catalog.as_str()).collect();
-        assert_eq!(catalogs, ["work", "pg"]);
+        let found = run(&ctx, params("routes", &[])).await.unwrap();
+        let found_in_pg = run(&ctx, only_pg).await.unwrap();
+
+        let names = |result: &SearchResult| -> Vec<String> {
+            result.hits.iter().map(|hit| hit.catalog.clone()).collect()
+        };
+        assert_eq!(names(&found), ["work", "pg"]);
+        // The `catalogs` argument wins over the connection's catalogs.
+        assert_eq!(names(&found_in_pg), ["pg"]);
+    }
+
+    #[test]
+    fn the_limit_defaults_to_20_and_is_capped_at_200() {
+        let limits = [None, Some(0), Some(5), Some(200), Some(10_000)].map(hit_limit);
+
+        assert_eq!(limits, [20, 0, 5, 200, 200]);
     }
 
     #[test]
