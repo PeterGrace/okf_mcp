@@ -6,6 +6,8 @@
 //! schema has an object root). `open_questions` numbers the questions that
 //! `oldest` with `open_questions_only` already collects.
 
+use std::sync::Arc;
+
 use axum::http::request::Parts;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
@@ -14,6 +16,7 @@ use rmcp::{tool, tool_router, Json};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::CatalogState;
 use crate::error::OkfError;
 use crate::mcp::context::ToolContext;
 use crate::mcp::{blocking, reply, OkfServer};
@@ -21,6 +24,7 @@ use crate::okf::analysis::links::{links_report, LinksReport};
 use crate::okf::analysis::lint::LintReport;
 use crate::okf::analysis::oldest::{oldest, OldestQuery, OldestRow};
 use crate::okf::analysis::sprawl::{sprawl, SprawlQuery, SprawlReport};
+use crate::overlay::View;
 
 /// `okf.py`'s default `-n` for `oldest` and `sprawl`.
 const DEFAULT_N: usize = 5;
@@ -125,11 +129,25 @@ pub struct Links {
     pub report: LinksReport,
 }
 
+/// `lint`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct LintParams {
+    /// The catalog (default: the first selected catalog).
+    pub catalog: Option<String>,
+    /// Lint this connection's pending changes (its changeset applied to the
+    /// published catalog) instead of the published catalog; the changed
+    /// paths count as uncommitted for `generated-after-commit`.
+    pub pending: Option<bool>,
+}
+
 /// `lint`'s result: `okf.py lint --json` plus the catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Lint {
     /// The catalog.
     pub catalog: String,
+    /// Whether this connection's pending changes were linted: `pending` was
+    /// asked for and the connection has an open changeset in the catalog.
+    pub pending: bool,
     /// The findings; `flatten` writes `errors` and `warnings` beside `catalog`.
     #[serde(flatten)]
     pub report: LintReport,
@@ -145,21 +163,20 @@ pub struct Lint {
 /// The concepts with questions, in `oldest`'s order (stalest first).
 ///
 /// # Errors
-/// A selection error.
+/// A selection error; as [`ToolContext::view`].
 pub(crate) async fn open_questions(
     ctx: &ToolContext,
     params: CatalogParam,
 ) -> Result<OpenQuestions, OkfError> {
-    let state = ctx.one(params.catalog.as_deref())?;
-    // `current()` is an `Arc` handle to the snapshot; `move` hands it to the
+    // The view holds an `Arc` handle to the snapshot; `move` hands it to the
     // blocking thread, which must own what it reads.
-    let loaded = state.current();
+    let (state, view) = one_view(ctx, params.catalog.as_deref()).await?;
     let now = ctx.app().clock().now();
     let query = OldestQuery {
         n: 0,
         open_questions_only: true,
     };
-    let rows = blocking(move || oldest(loaded.snapshot(), now, query)).await;
+    let rows = blocking(move || oldest(view.snapshot(), now, query)).await;
     let concepts = rows
         .into_iter()
         .map(|row| ConceptQuestions {
@@ -192,19 +209,18 @@ pub(crate) async fn open_questions(
 /// The rows, stalest first.
 ///
 /// # Errors
-/// A selection error.
+/// A selection error; as [`ToolContext::view`].
 pub(crate) async fn oldest_report(
     ctx: &ToolContext,
     params: OldestParams,
 ) -> Result<Oldest, OkfError> {
-    let state = ctx.one(params.catalog.as_deref())?;
-    let loaded = state.current();
+    let (state, view) = one_view(ctx, params.catalog.as_deref()).await?;
     let now = ctx.app().clock().now();
     let query = OldestQuery {
         n: params.n.unwrap_or(DEFAULT_N),
         open_questions_only: params.open_questions_only,
     };
-    let rows = blocking(move || oldest(loaded.snapshot(), now, query)).await;
+    let rows = blocking(move || oldest(view.snapshot(), now, query)).await;
     Ok(Oldest {
         catalog: state.name().to_string(),
         rows,
@@ -221,14 +237,14 @@ pub(crate) async fn oldest_report(
 /// The reports, worst first (one, with `path`).
 ///
 /// # Errors
-/// A selection error; [`OkfError::NotFound`] for an unknown `path`, and
-/// [`OkfError::InvalidPath`] for one that is not a concept.
+/// A selection error; as [`ToolContext::view`]; [`OkfError::NotFound`] for
+/// an unknown `path`, and [`OkfError::InvalidPath`] for one that is not a
+/// concept.
 pub(crate) async fn sprawl_report(
     ctx: &ToolContext,
     params: SprawlParams,
 ) -> Result<Sprawl, OkfError> {
-    let state = ctx.one(params.catalog.as_deref())?;
-    let loaded = state.current();
+    let (state, view) = one_view(ctx, params.catalog.as_deref()).await?;
     let n = params.n.unwrap_or(DEFAULT_N);
     let path = params.path;
     // The trailing `?` re-raises the analysis' error after the thread ends.
@@ -237,7 +253,7 @@ pub(crate) async fn sprawl_report(
             concept: path.as_deref(),
             n,
         };
-        sprawl(loaded.snapshot(), query)
+        sprawl(view.snapshot(), query)
     })
     .await?;
     Ok(Sprawl {
@@ -256,38 +272,64 @@ pub(crate) async fn sprawl_report(
 /// The link report.
 ///
 /// # Errors
-/// A selection error.
+/// A selection error; as [`ToolContext::view`].
 pub(crate) async fn links(ctx: &ToolContext, params: LinksParams) -> Result<Links, OkfError> {
-    let state = ctx.one(params.catalog.as_deref())?;
-    let loaded = state.current();
+    let (state, view) = one_view(ctx, params.catalog.as_deref()).await?;
     let mentions = params.mentions.unwrap_or(true);
-    let report = blocking(move || links_report(loaded.snapshot(), mentions)).await;
+    let report = blocking(move || links_report(view.snapshot(), mentions)).await;
     Ok(Links {
         catalog: state.name().to_string(),
         report,
     })
 }
 
-/// `okf.py lint`, on the published catalog with its commit times.
+/// `okf.py lint`, on the published catalog with its commit times, or with
+/// `pending` on this connection's view of it.
 ///
 /// # Arguments
 /// * `ctx` - the call's context.
-/// * `params` - the catalog, if named.
+/// * `params` - the catalog, if named, and `pending`.
 ///
 /// # Returns
-/// The errors and warnings.
+/// The errors and warnings, and whether pending changes were linted.
 ///
 /// # Errors
-/// A selection error.
-pub(crate) async fn lint_report(ctx: &ToolContext, params: CatalogParam) -> Result<Lint, OkfError> {
+/// A selection error; as [`ToolContext::view`].
+pub(crate) async fn lint_report(ctx: &ToolContext, params: LintParams) -> Result<Lint, OkfError> {
     let state = ctx.one(params.catalog.as_deref())?;
-    let loaded = state.current();
+    let view = if params.pending.unwrap_or(false) {
+        ctx.view(&state).await?
+    } else {
+        View::Published(state.current())
+    };
+    let pending = view.pending();
     let now = ctx.app().clock().now();
-    let report = blocking(move || loaded.lint(now)).await;
+    let report = blocking(move || view.lint(now)).await;
     Ok(Lint {
         catalog: state.name().to_string(),
+        pending,
         report,
     })
+}
+
+/// The one catalog a report runs on, and this connection's view of it.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `catalog` - the call's `catalog` argument.
+///
+/// # Returns
+/// The catalog's state and view.
+///
+/// # Errors
+/// A selection error; as [`ToolContext::view`].
+async fn one_view(
+    ctx: &ToolContext,
+    catalog: Option<&str>,
+) -> Result<(Arc<CatalogState>, View), OkfError> {
+    let state = ctx.one(catalog)?;
+    let view = ctx.view(&state).await?;
+    Ok((state, view))
 }
 
 // `#[tool_router]` collects the `#[tool]` methods below into
@@ -353,13 +395,15 @@ impl OkfServer {
 
     /// The `lint` tool.
     #[tool(
-        description = "Lint the published catalog (okf.py lint --json): errors and warnings \
-                          with file, line, rule and message."
+        description = "Lint a catalog (okf.py lint --json): errors and warnings with file, \
+                          line, rule and message. Without `pending`, the published catalog; with \
+                          `pending: true`, this connection's pending changes applied to it, the \
+                          changed paths counted as uncommitted."
     )]
     async fn lint(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(params): Parameters<CatalogParam>,
+        Parameters(params): Parameters<LintParams>,
     ) -> Result<Json<Lint>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(lint_report(&ctx, params).await)
@@ -369,8 +413,17 @@ impl OkfServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use chrono::{TimeDelta, TimeZone, Utc};
+
+    use crate::clock::FixedClock;
     use crate::config::Config;
-    use crate::mcp::testing::{app_with, context, principal, TestApp};
+    use crate::mcp::testing::{
+        app_at, app_with, context, pending_entry, principal, principal_as, store_key, PendingEdit,
+        TestApp,
+    };
+    use crate::store::keys::Access;
 
     const QUEUED: &str =
         "---\ntype: Note\ntitle: Q\nopen_questions:\n  - Is it up?\n  - Who owns it?\n---\nBody.\n";
@@ -479,9 +532,15 @@ mod tests {
             },
         )
         .await;
-        let findings = lint_report(&ctx, CatalogParam { catalog: None })
-            .await
-            .unwrap();
+        let findings = lint_report(
+            &ctx,
+            LintParams {
+                catalog: None,
+                pending: None,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.catalog, "pg");
         assert_eq!(rows.rows.len(), 1);
@@ -505,8 +564,9 @@ mod tests {
         let ungranted = server
             .lint(
                 Extension(parts.clone()),
-                Parameters(CatalogParam {
+                Parameters(LintParams {
                     catalog: Some("work".to_string()),
+                    pending: None,
                 }),
             )
             .await;
@@ -554,5 +614,55 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_lint_counts_the_changeset_s_paths_as_uncommitted() {
+        let imported = Utc.with_ymd_and_hms(2026, 11, 3, 12, 0, 0).unwrap();
+        // Stamped after the import: `generated-after-commit` on a clean file.
+        let stamped =
+            "---\ntype: Note\ngenerated: { by: t, at: 2026-11-03T12:10:00Z }\n---\nBody\n";
+        let clock = Arc::new(FixedClock(imported + TimeDelta::minutes(30)));
+        let test = app_at(
+            &[("pg", &[("later.md", stamped), ("other.md", stamped)])],
+            Config::default(),
+            imported,
+            clock,
+        )
+        .await;
+        store_key(&test, "writer").await;
+        let ctx = context(
+            &test,
+            principal_as("writer", Access::Write, &[], Some("pg")),
+            None,
+        );
+        let edited = format!("{stamped}More.\n");
+        let edit = PendingEdit {
+            catalog: "pg",
+            path: "later.md",
+            text: Some(&edited),
+            at: imported + TimeDelta::minutes(20),
+        };
+        pending_entry(&test, &ctx, &edit).await;
+        let params = |pending| LintParams {
+            catalog: None,
+            pending,
+        };
+
+        let published = lint_report(&ctx, params(None)).await.unwrap();
+        let pending = lint_report(&ctx, params(Some(true))).await.unwrap();
+
+        let flagged = |lint: &Lint| -> Vec<String> {
+            lint.report
+                .warnings
+                .iter()
+                .filter(|finding| finding.rule == "generated-after-commit")
+                .map(|finding| finding.file.clone())
+                .collect()
+        };
+        assert!(!published.pending);
+        assert!(pending.pending);
+        assert_eq!(flagged(&published), ["later.md", "other.md"]);
+        assert_eq!(flagged(&pending), ["other.md"]);
     }
 }

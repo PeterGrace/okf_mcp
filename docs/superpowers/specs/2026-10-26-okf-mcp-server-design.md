@@ -229,9 +229,13 @@ to a non-text file resolves, reading such a file as text fails as it does on dis
 a write through the workspace keeps an existing file's execute bit (a new file is not
 executable).
 
-A session with an open changeset for a catalog reads that catalog through an overlay:
-the published snapshot plus its changeset entries, rebuilt lazily after the session's
-writes, so an agent sees its own pending edits.
+A connection with an open changeset in a catalog (its key and label, see "Write
+grouping") reads that catalog through an overlay: the published workspace with the
+changeset's entries applied, and a full snapshot of it, built on a blocking thread and
+cached per changeset while the changeset's `version` and the catalog's `generation` are
+unchanged. Each read looks the changeset up (one index lookup; `read` keys, which cannot
+write, skip it), so an agent sees its own pending edits and no one else's. `history` and
+`list_catalogs` report the published state.
 
 The server runs one replica. It notices changes made outside it (a CLI import) through
 the catalog's `generation` counter (see "Publish"). A second replica would need the same
@@ -248,7 +252,8 @@ A library crate with a thin `main.rs`:
 | `store` | Catalog store over `db`: load a catalog's documents, publish a changeset in one transaction, record revisions, import, export |
 | `auth` | Bearer-key middleware; inserts a `Principal { key_id, catalogs, access, default_catalog, actor }` into request extensions |
 | `selection` | Resolve the catalog set and write target from tool argument, header/query, key default, server default |
-| `catalog` | Per-catalog state: the `RwLock<Arc<Snapshot>>`, rebuilds, session overlays, commit times for lint |
+| `catalog` | Per-catalog state: the `RwLock<Arc<Snapshot>>` (with the published workspace and each path's revision), rebuilds, commit times for lint |
+| `overlay` | Each open changeset's overlay (the published workspace with its entries applied, and its snapshot), cached per changeset; the `View` a read tool takes |
 | `okf::yaml`, `okf::doc`, `okf::markdown`, `okf::paths`, `okf::pystr`, `okf::timestamp` | M1 and M2: the document model, unchanged |
 | `okf::ops` | `stamp`, `review`, `question`, `unquestion`, `source`, `log`, `index`, `create`, `edit`, `replace_body`, `set_frontmatter`, `mv`, `split`, `delete`, as pure functions over a `Workspace` |
 | `okf::snapshot`, `okf::analysis`, `okf::search` | M2: the snapshot, links report, `oldest`, `sprawl`, `lint`, secret scan, search |
@@ -288,13 +293,13 @@ first selected catalog.
 | `oldest` | `n?` (default 5), `open_questions_only?` | Port of `oldest --json` |
 | `sprawl` | `path?`, `n?` (default 5) | Port of `sprawl --json` |
 | `links_report` | `mentions?` (default true) | Port of `links --json` |
-| `lint` | `pending?` | Port of `lint --json`, on the published catalog or (with `pending`) on this session's overlay |
+| `lint` | `pending?` | Port of `lint --json`, on the published catalog or (with `pending`) on this connection's overlay, with a `pending` flag saying which |
 | `history` | `path`, `limit?` (default 20, at most 200) | The document's revisions, newest first: revision, op, actor, message, time |
 | `pending_changes` | none | This session's changeset in the catalog: changed paths and a unified diff against the published text |
 | `stranded_sessions` | none | Open changesets whose MCP session has ended: id, catalog, actor, last change, changed paths |
 
 Lint's `generated-after-commit` check reads each document's last revision time where
-`okf.py` reads its last git commit time; paths in the session's changeset count as
+`okf.py` reads its last git commit time; paths in the connection's changeset count as
 uncommitted.
 
 ### Write tools (need `write`)
@@ -357,8 +362,8 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
    auth layer added, into every tool call's request context (verified against rmcp
    3.8.0 while planning M3).
 3. `selection` resolves the catalog set.
-4. For each catalog, the handler takes an `Arc` of the current snapshot, or of the
-   session's overlay if it has an open changeset.
+4. For each catalog, the handler takes an `Arc` of the current snapshot, or of this
+   connection's overlay if its key and label have an open changeset there.
 5. The work runs in memory (search uses `rayon` across documents, then merges and ranks
    across catalogs).
 

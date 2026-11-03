@@ -6,6 +6,7 @@
 //! they need: a swap never changes a snapshot someone is reading, and readers
 //! never wait on the database.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -28,6 +29,11 @@ pub struct Loaded {
     commit_times: CommitTimes,
     files: usize,
     last_change: Option<DateTime<Utc>>,
+    // The published files themselves: an overlay copies this and applies
+    // its changeset's entries (M5 Decision 6).
+    workspace: MemWorkspace,
+    // Each live path's current revision: a new changeset entry's base.
+    revisions: HashMap<String, i32>,
 }
 
 impl Loaded {
@@ -55,6 +61,22 @@ impl Loaded {
     /// The newest document change (`updated_at`), or `None` for an empty catalog.
     pub fn last_change(&self) -> Option<DateTime<Utc>> {
         self.last_change
+    }
+
+    /// The published files, as the snapshot was built from them.
+    pub fn workspace(&self) -> &MemWorkspace {
+        &self.workspace
+    }
+
+    /// A live document's current revision.
+    ///
+    /// # Arguments
+    /// * `path` - normalized, catalog-relative.
+    ///
+    /// # Returns
+    /// Its revision, or `None` if no live document has that path.
+    pub fn revision(&self, path: &str) -> Option<i32> {
+        self.revisions.get(path).copied()
     }
 
     /// Lints the snapshot with its commit times, so `generated-after-commit`
@@ -213,13 +235,18 @@ async fn build(pool: &PgPool, catalog_id: i64, name: &str) -> Result<Loaded, Okf
     // Before `rows` moves into the closure below: it borrows the rows.
     let commit_times = documents::commit_times(&rows);
     let files = rows.len();
+    let revisions: HashMap<String, i32> = rows
+        .iter()
+        .map(|row| (row.path.clone(), row.revision))
+        .collect();
     // `max()` over an empty iterator is `None`, so an empty catalog has no
     // last change.
     let last_change = rows.iter().map(|row| row.updated_at).max();
     // Building a snapshot is CPU work (rayon across documents): run it on a
     // blocking thread so the async runtime's threads stay free. `move` hands
-    // `rows` to the closure.
-    let snapshot = tokio::task::spawn_blocking(move || {
+    // `rows` to the closure. The workspace comes back with the snapshot, so
+    // overlays can copy it.
+    let (workspace, snapshot) = tokio::task::spawn_blocking(move || {
         let files = rows.into_iter().map(|row| {
             let file = StoredFile {
                 content: row.content,
@@ -228,7 +255,10 @@ async fn build(pool: &PgPool, catalog_id: i64, name: &str) -> Result<Loaded, Okf
             (row.path, file)
         });
         let workspace = MemWorkspace::from_stored(files)?;
-        Snapshot::build(&workspace)
+        let snapshot = Snapshot::build(&workspace)?;
+        // `Ok::<_, OkfError>`: the closure's error type, which `?` above
+        // cannot infer on its own.
+        Ok::<_, OkfError>((workspace, snapshot))
     })
     .await
     // A panic in the blocking task is re-raised here, as if it ran inline.
@@ -239,6 +269,8 @@ async fn build(pool: &PgPool, catalog_id: i64, name: &str) -> Result<Loaded, Okf
         commit_times,
         files,
         last_change,
+        workspace,
+        revisions,
     })
 }
 
@@ -247,6 +279,7 @@ mod tests {
     use super::*;
     use crate::archive::Files;
     use crate::db::test_db;
+    use crate::okf::workspace::Workspace;
     use crate::store::catalogs;
     use crate::store::import::{import, ImportOptions};
     use chrono::{TimeDelta, TimeZone};
@@ -319,6 +352,27 @@ mod tests {
         let loaded = empty.current();
         assert_eq!(loaded.files(), 2);
         assert_eq!(loaded.last_change(), Some(imported));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loaded_keeps_the_workspace_and_each_path_s_revision() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "pg", "", Utc::now())
+            .await
+            .unwrap();
+        // Typed, so the byte strings of different lengths share one type.
+        let first: &[(&str, &[u8])] = &[("a.md", b"# A\n"), ("logo.png", b"\x89PNG\0")];
+        let second: &[(&str, &[u8])] = &[("a.md", b"# A2\n"), ("logo.png", b"\x89PNG\0")];
+        import_into(&db.pool, first, false).await;
+        import_into(&db.pool, second, true).await;
+
+        let loaded = CatalogState::load(&db.pool, "pg").await.unwrap().current();
+
+        assert_eq!(loaded.workspace().read_to_string("a.md").unwrap(), "# A2\n");
+        assert!(loaded.workspace().is_file("logo.png"));
+        assert_eq!(loaded.revision("a.md"), Some(2));
+        assert_eq!(loaded.revision("logo.png"), Some(1));
+        assert_eq!(loaded.revision("gone.md"), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

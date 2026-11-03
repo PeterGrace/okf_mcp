@@ -10,12 +10,13 @@ use rmcp::{tool, tool_router, Json};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{CatalogState, Loaded};
+use crate::catalog::CatalogState;
 use crate::error::OkfError;
 use crate::mcp::context::ToolContext;
 use crate::mcp::{blocking, reply, OkfServer};
 use crate::okf::search::{search_catalogs, CatalogHit, SearchQuery};
 use crate::okf::snapshot::Snapshot;
+use crate::overlay::View;
 
 /// The design's default `limit`.
 const DEFAULT_LIMIT: usize = 20;
@@ -72,7 +73,8 @@ pub struct SearchResult {
 /// The merged hits.
 ///
 /// # Errors
-/// A selection error ([`ToolContext::states`]).
+/// A selection error ([`ToolContext::states`]); [`OkfError::Database`]
+/// looking up the connection's changeset ([`ToolContext::view`]).
 pub(crate) async fn run(ctx: &ToolContext, params: SearchParams) -> Result<SearchResult, OkfError> {
     let states = ctx.states(params.catalogs.as_deref())?;
     let query = SearchQuery {
@@ -82,22 +84,20 @@ pub(crate) async fn run(ctx: &ToolContext, params: SearchParams) -> Result<Searc
         status: params.status,
         limit: hit_limit(params.limit),
     };
-    // Each catalog's current snapshot, taken once here. The pairs are `Arc`
-    // handles (reference-counted pointers, cheap to copy), so the blocking
-    // thread can own them; nothing is cloned but the counts.
-    let loaded: Vec<(Arc<CatalogState>, Arc<Loaded>)> = states
-        .into_iter()
-        .map(|state| {
-            let current = state.current();
-            (state, current)
-        })
-        .collect();
-    // `move` hands `loaded` and `query` to the closure, which runs on
+    // Each catalog's view (published, or this connection's overlay), taken
+    // once here. Both hold `Arc`s (reference-counted pointers, cheap to
+    // copy), so the blocking thread can own them.
+    let mut views: Vec<(Arc<CatalogState>, View)> = Vec::with_capacity(states.len());
+    for state in states {
+        let view = ctx.view(&state).await?;
+        views.push((state, view));
+    }
+    // `move` hands `views` and `query` to the closure, which runs on
     // another thread; the borrows below live only inside it.
     let hits = blocking(move || {
-        let catalogs: Vec<(&str, &Snapshot)> = loaded
+        let catalogs: Vec<(&str, &Snapshot)> = views
             .iter()
-            .map(|(state, current)| (state.name(), current.snapshot()))
+            .map(|(state, view)| (state.name(), view.snapshot()))
             .collect();
         search_catalogs(&catalogs, &query)
     })

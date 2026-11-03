@@ -9,9 +9,12 @@ use crate::app::{App, Catalogs};
 use crate::auth::Principal;
 use crate::catalog::CatalogState;
 use crate::error::OkfError;
+use crate::overlay::View;
 use crate::selection::{
     connection_catalogs, connection_label, resolve, Selection, Sources, DEFAULT_LABEL,
 };
+use crate::store::changesets::{self, ChangesetKey};
+use crate::store::keys::Access;
 
 /// One tool call's context.
 // `Arc<T>` is a shared, reference-counted pointer (like holding a Python
@@ -201,6 +204,44 @@ impl ToolContext {
         Ok(self.state(selection.write_target()))
     }
 
+    /// What this call reads of `state`: this key and label's overlay if they
+    /// have an open changeset in the catalog, else the published state.
+    ///
+    /// One lookup in the open-changeset index per call and catalog. A `read`
+    /// key can never write, so it never has a changeset and skips it.
+    ///
+    /// # Arguments
+    /// * `state` - a catalog this call selected.
+    ///
+    /// # Returns
+    /// The view.
+    ///
+    /// # Errors
+    /// [`OkfError::Database`]; an overlay build error
+    /// ([`crate::overlay::build_overlay`]).
+    pub async fn view(&self, state: &CatalogState) -> Result<View, OkfError> {
+        // `Access` is ordered (`Read < Write < Admin`), like an `IntEnum`.
+        if self.principal.access < Access::Write {
+            return Ok(View::Published(state.current()));
+        }
+        let key = ChangesetKey {
+            catalog_id: state.id(),
+            key_id: &self.principal.key_id,
+            label: &self.label,
+        };
+        match changesets::find_open(self.app.pool(), &key).await? {
+            None => Ok(View::Published(state.current())),
+            Some(changeset) => {
+                let overlay = self
+                    .app
+                    .overlays()
+                    .get(self.app.pool(), state, &changeset)
+                    .await?;
+                Ok(View::Pending(overlay))
+            }
+        }
+    }
+
     /// The state of a catalog `select` returned.
     fn state(&self, name: &str) -> Arc<CatalogState> {
         let state = self
@@ -308,5 +349,39 @@ mod tests {
         assert_ne!(drafts.id, first.id);
         assert_eq!(other_key.key_id.as_deref(), Some("bob"));
         assert_ne!(other_key.id, first.id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_view_is_pending_only_for_the_key_and_label_with_an_open_changeset() {
+        let test = app_with(&[("pg", &[("a.md", "# A\n")])], Config::default()).await;
+        store_key(&test, "writer").await;
+        let writer = || {
+            context(
+                &test,
+                principal_as("writer", Access::Write, &[], Some("pg")),
+                None,
+            )
+        };
+        let reader = context(&test, principal(&[], Some("pg")), None);
+        let state = test.app.catalog("pg").unwrap();
+        let before = writer().view(&state).await.unwrap();
+        let edit = PendingEdit {
+            catalog: "pg",
+            path: "a.md",
+            text: Some("# Pending\n"),
+            at: Utc::now(),
+        };
+
+        pending_entry(&test, &writer(), &edit).await;
+        let mine = writer().view(&state).await.unwrap();
+        let other_label = writer().with_label("other").view(&state).await.unwrap();
+        let read_key = reader.view(&state).await.unwrap();
+
+        assert!(!before.pending());
+        assert!(mine.pending());
+        assert_eq!(mine.snapshot().get("a.md").unwrap().text(), "# Pending\n");
+        assert!(!other_label.pending());
+        assert!(!read_key.pending());
+        assert_eq!(read_key.snapshot().get("a.md").unwrap().text(), "# A\n");
     }
 }
