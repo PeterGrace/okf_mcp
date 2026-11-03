@@ -1116,6 +1116,125 @@ mod publish_tests {
         assert_eq!(published_text(&test, "a.md"), NOTE);
     }
 
+    /// `(revision, deleted, content)` of a document row.
+    async fn document_row(test: &TestApp, path: &str) -> (i32, bool, Vec<u8>) {
+        sqlx::query_as(
+            "SELECT revision, deleted_at IS NOT NULL, content FROM documents WHERE path = $1",
+        )
+        .bind(path)
+        .fetch_one(test.app.pool())
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_publish_creates_deletes_and_continues_a_tombstone_s_number() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let created = "---\ntype: Note\ntitle: B\ndescription: B.\n---\n# B\n";
+        let new_file = EntryRow {
+            path: "b.md".to_string(),
+            base_revision: None,
+            content: Some(created.as_bytes().to_vec()),
+            executable: false,
+            replay: None,
+        };
+        // Nothing links to infra/y.md, so its deletion passes the link check.
+        let deletion = EntryRow {
+            path: "infra/y.md".to_string(),
+            base_revision: Some(1),
+            content: None,
+            executable: false,
+            replay: None,
+        };
+        insert_entry(&test, "writer-a", new_file).await;
+        insert_entry(&test, "writer-a", deletion).await;
+
+        let first = publish_as(&ctx, "add b, drop y").await.unwrap();
+        // A tombstone: the number moved on, the content and the snapshot entry are gone.
+        let tombstone = document_row(&test, "infra/y.md").await;
+        let gone = test.app.catalog("pg").unwrap().current();
+        assert_eq!(tombstone, (2, true, Vec::new()));
+        assert!(gone.snapshot().get("infra/y.md").is_none());
+        // The changeset is closed, so this opens a new one: y again, on its tombstone.
+        let again = EntryRow {
+            path: "infra/y.md".to_string(),
+            base_revision: None,
+            content: Some(Y.as_bytes().to_vec()),
+            executable: false,
+            replay: None,
+        };
+        insert_entry(&test, "writer-a", again).await;
+        let second = publish_as(&ctx, "bring y back").await.unwrap();
+
+        let revision = |path: &str, revision: i32, op: &'static str| PublishedRevision {
+            path: path.to_string(),
+            revision,
+            op,
+        };
+        assert_eq!(
+            first.report.revisions,
+            [
+                revision("/b.md", 1, "create"),
+                revision("/infra/y.md", 2, "delete")
+            ]
+        );
+        assert_eq!(
+            second.report.revisions,
+            [revision("/infra/y.md", 3, "create")]
+        );
+        assert_eq!(published_text(&test, "b.md"), created);
+        assert_eq!(published_text(&test, "infra/y.md"), Y);
+        assert_eq!(
+            document_row(&test, "infra/y.md").await,
+            (3, false, Y.as_bytes().to_vec())
+        );
+        // The deletion's history row: no content, and the changeset that made it.
+        let deleted: (Option<Vec<u8>>, Option<i64>) = sqlx::query_as(
+            "SELECT content, changeset_id FROM revisions WHERE path = 'infra/y.md' AND revision = 2",
+        )
+        .fetch_one(test.app.pool())
+        .await
+        .unwrap();
+        assert_eq!(deleted, (None, first.changeset));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revision_written_meanwhile_is_a_conflict_not_a_database_error() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let state = test.app.catalog("pg").unwrap();
+        let written = body(&ctx, "/a.md", "# A\n\nMine.\n").await;
+        // A revision 2 of a.md that the publish lock should have ruled out
+        // (a hand edit of the database): the backstop must report it.
+        sqlx::query(
+            "INSERT INTO revisions (catalog_id, path, revision, op, content, executable, actor, \
+                                    message, created_at) \
+             VALUES ($1, 'a.md', 2, 'update', 'x'::bytea, false, 'intruder', 'x', now())",
+        )
+        .bind(state.id())
+        .execute(test.app.pool())
+        .await
+        .unwrap();
+
+        let error = publish_as(&ctx, "mine").await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            OkfError::Conflict { ref files } if files == &[ConflictFile {
+                path: "/a.md".to_string(),
+                base_revision: Some(1),
+                current_revision: None,
+            }]
+        ));
+        assert_eq!(
+            state_of(&test, written.changeset).await,
+            ChangesetState::Open
+        );
+        assert_eq!(document_row(&test, "a.md").await.0, 1);
+        assert_eq!(published_text(&test, "a.md"), NOTE);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_write_queued_behind_a_publish_lands_in_a_new_changeset() {
         let test = pg().await;
