@@ -4,6 +4,7 @@
 //! plain function, which the module's tests call directly.
 
 mod catalogs;
+mod documents;
 // `pub` (not `pub(crate)`): the context's helpers, like `ToolResult`,
 // `tool_error` and `reply` below, are used by later tool modules, and a
 // public item is never flagged as dead code meanwhile.
@@ -57,7 +58,10 @@ impl OkfServer {
     /// # Returns
     /// The router `#[tool_handler]` dispatches calls through.
     pub fn tools() -> ToolRouter<Self> {
-        Self::catalogs_router() + Self::search_router() + Self::history_router()
+        Self::catalogs_router()
+            + Self::search_router()
+            + Self::documents_router()
+            + Self::history_router()
     }
 
     /// The context of the request rmcp handed a tool. The error is already a
