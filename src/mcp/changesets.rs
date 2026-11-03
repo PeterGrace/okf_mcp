@@ -159,13 +159,12 @@ pub(crate) async fn stranded_sessions(
 
 /// Moves an open changeset to this connection's key and label.
 ///
-/// The changeset is read, then the catalog row locked, then this
-/// connection's open changeset looked up and the changeset relabelled, in
-/// one transaction (Task 1's lock order). The access check reads the row
-/// before the transaction, so the relabel also checks that nothing changed
-/// the changeset since (its `version` moved by exactly the relabel's bump);
-/// if something did (a concurrent adoption, or a write), the call answers
-/// [`OkfError::Busy`] and the agent retries against the new owner.
+/// The changeset is read once to find its catalog. Then, in one
+/// transaction and in the lock order of Tasks 1 and 8, the catalog row is
+/// locked, then the changeset's row, which is read again under that lock.
+/// The access check and this connection's open-changeset lookup use that
+/// locked row, so a concurrent adoption, publish, discard or prune either
+/// finishes first (and is seen) or waits for this one.
 ///
 /// # Arguments
 /// * `ctx` - the call's context.
@@ -176,10 +175,10 @@ pub(crate) async fn stranded_sessions(
 ///
 /// # Errors
 /// [`OkfError::Refused`] if there is no open changeset with that id in a
-/// catalog the key reaches, or if this connection already has another open
-/// changeset in that catalog; [`OkfError::Forbidden`] without `write` (the
-/// key's own) or `admin` (another key's); [`OkfError::Busy`] if the
-/// changeset changed during the call, or on a deadlock;
+/// catalog the key reaches (one message for every such case), or if this
+/// connection already has another open changeset in that catalog;
+/// [`OkfError::Forbidden`] without `write` (the key's own) or `admin`
+/// (another key's); [`OkfError::Busy`] on a deadlock;
 /// [`OkfError::Database`].
 pub(crate) async fn adopt_changeset(
     ctx: &ToolContext,
@@ -193,25 +192,37 @@ pub(crate) async fn adopt_changeset(
     let unknown = || OkfError::Refused {
         reason: format!("no open changeset {id} in a catalog this key reaches"),
     };
-    let row = changesets::by_id(ctx.app().pool(), id)
+    // Used twice with `Option::filter`, which keeps `Some(row)` only when
+    // this returns `true`.
+    let is_open = |row: &changesets::ChangesetRow| row.state == ChangesetState::Open;
+    // A changeset never moves between catalogs, so this unlocked read is
+    // safe for the catalog id; everything else is read again under the lock.
+    let catalog_id = changesets::by_id(ctx.app().pool(), id)
         .await?
-        .filter(|row| row.state == ChangesetState::Open)
-        .ok_or_else(unknown)?;
+        .filter(is_open)
+        .ok_or_else(unknown)?
+        .catalog_id;
     let principal = ctx.principal();
     let state = ctx
         .catalogs()
         .values()
-        .find(|state| state.id() == row.catalog_id && principal.reaches(state.name()))
+        .find(|state| state.id() == catalog_id && principal.reaches(state.name()))
+        .ok_or_else(unknown)?;
+
+    let now = ctx.app().clock().now();
+    // An early `return` or `?` below drops `tx` uncommitted, which rolls it
+    // back (Rust runs the transaction's `Drop` on every exit path).
+    let mut tx = ctx.app().pool().begin().await?;
+    changesets::lock_catalog(&mut tx, catalog_id).await?;
+    let row = changesets::lock(&mut tx, id)
+        .await?
+        .filter(is_open)
         .ok_or_else(unknown)?;
     let own = row.key_id.as_deref() == Some(principal.key_id.as_str());
     let needed = if own { Access::Write } else { Access::Admin };
     principal.require(needed, state.name())?;
-
-    let now = ctx.app().clock().now();
-    let mut tx = ctx.app().pool().begin().await?;
-    changesets::lock_catalog(&mut tx, row.catalog_id).await?;
     let mine = ChangesetKey {
-        catalog_id: row.catalog_id,
+        catalog_id,
         key_id: &principal.key_id,
         label: ctx.label(),
     };
@@ -230,13 +241,6 @@ pub(crate) async fn adopt_changeset(
         }
     }
     let adopted = changesets::adopt(&mut tx, id, &principal.key_id, ctx.label(), now).await?;
-    if adopted.version != row.version + 1 {
-        // Returning drops `tx` uncommitted, which rolls the relabel back
-        // (Rust runs the transaction's `Drop` on every early return).
-        return Err(OkfError::Busy {
-            reason: format!("changeset {id} changed while it was being adopted; try again"),
-        });
-    }
     let entries = changesets::entries(&mut *tx, id).await?;
     tx.commit().await?;
     Ok(Adopted {
