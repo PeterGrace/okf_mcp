@@ -117,9 +117,14 @@ pub fn rewrite_links(
 /// One file's rewrite: `rewrite_links`' loop body.
 ///
 /// # Arguments
-/// * `workspace` - resolves links (directory links need to know which
-///   paths are directories; the replay passes an empty workspace, which is
-///   enough because a redirect's `from` is never a directory).
+/// * `workspace` - resolves links. A directory link written without a
+///   trailing slash (`[x](../a)`) reaches its `index.md` only through
+///   [`Workspace::is_dir`]. The replay passes an empty workspace, which is
+///   enough only while `redirect.from` is a concept (not an `index.md`): no
+///   directory link can point at a concept. `move_concept` and
+///   `split_concept` only ever redirect a concept, and the replay
+///   `debug_assert!`s it. [`rewrite_links`] has the real workspace, so it
+///   also handles an `index.md` source, as `okf.py` does.
 /// * `path` - the file's catalog-relative path.
 /// * `base` - the path its links were written against (`path`, unless it
 ///   was just moved).
