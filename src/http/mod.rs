@@ -198,7 +198,8 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
 ///   and the listener, and `serve` returns once open connections close.
 ///
 /// # Errors
-/// The listener's I/O error.
+/// The listener's I/O error, after the poll loop and the sessions are
+/// stopped (`shutdown` is cancelled on every return).
 pub async fn serve(
     app: Arc<App>,
     listener: TcpListener,
@@ -209,14 +210,17 @@ pub async fn serve(
     let stop = shutdown.clone();
     // `async move { ... }` is a future that resolves once the token is
     // cancelled; axum then stops accepting and waits for open connections.
-    axum::serve(listener, router)
+    let served = axum::serve(listener, router)
         .with_graceful_shutdown(async move { stop.cancelled().await })
-        .await?;
+        .await;
+    // On an error too, stop what this function started (the poll loop and
+    // rmcp's sessions) before returning; cancelling twice is harmless.
+    shutdown.cancel();
     // The loop returns once `shutdown` is cancelled; a panic in it is logged.
     if let Err(error) = poller.await {
         tracing::error!(%error, "the poll loop panicked");
     }
-    Ok(())
+    served
 }
 
 #[cfg(test)]
