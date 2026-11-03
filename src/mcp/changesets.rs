@@ -410,6 +410,14 @@ mod lifecycle_tests {
         )
         .await
         .unwrap();
+        let narrowed_to_pg = stranded_sessions(
+            &connection(&test, "root", Access::Admin, &[], "x"),
+            StrandedParams {
+                catalog: Some("pg".to_string()),
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ids(&alice), [alice_old]);
         let listed = &alice.changesets[0];
@@ -433,6 +441,9 @@ mod lifecycle_tests {
         assert_eq!(both, expected);
         assert!(ids(&admin_of_work).is_empty());
         assert!(ids(&narrowed).is_empty());
+        let mut in_pg = ids(&narrowed_to_pg);
+        in_pg.sort_unstable();
+        assert_eq!(in_pg, expected);
     }
 
     #[tokio::test(flavor = "multi_thread")]
