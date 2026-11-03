@@ -66,8 +66,9 @@ pub enum OkfError {
     #[error("database: {source}")]
     Database {
         /// The driver's error.
-        // `#[from]` generates `From<sqlx::Error>`, so `?` converts it.
-        #[from]
+        // `#[source]`, not `#[from]`: the `From` impl below is written by
+        // hand, so a deadlock becomes `Busy` instead.
+        #[source]
         source: sqlx::Error,
     },
 
@@ -108,6 +109,15 @@ pub enum OkfError {
         /// Why.
         reason: String,
     },
+
+    /// The database aborted the request to keep others going (a deadlock or
+    /// serialization failure), or the changeset changed under it. Nothing
+    /// was stored: retry.
+    #[error("busy: {reason}; retry")]
+    Busy {
+        /// What was aborted.
+        reason: String,
+    },
 }
 
 impl OkfError {
@@ -131,6 +141,7 @@ impl OkfError {
             OkfError::CatalogNotSelected { .. } => "CatalogNotSelected",
             OkfError::Forbidden { .. } => "Forbidden",
             OkfError::Refused { .. } => "Refused",
+            OkfError::Busy { .. } => "Busy",
         }
     }
 
@@ -178,9 +189,37 @@ impl OkfError {
             | OkfError::Migrate { .. }
             | OkfError::Config { .. }
             | OkfError::Forbidden { .. }
-            | OkfError::Refused { .. } => {}
+            | OkfError::Refused { .. }
+            | OkfError::Busy { .. } => {}
         }
         body
+    }
+}
+
+/// SQLSTATEs that mean "Postgres aborted this transaction so others could go
+/// on; running it again will likely succeed": `40P01` (deadlock detected) and
+/// `40001` (serialization failure, from a repeatable-read snapshot).
+const RETRYABLE_SQLSTATES: [&str; 2] = ["40P01", "40001"];
+
+// The conversion `?` uses for every driver error: a retryable failure is
+// `Busy`, anything else `Database`. (Before M5, `#[from]` generated this
+// impl without the check.)
+impl From<sqlx::Error> for OkfError {
+    fn from(source: sqlx::Error) -> Self {
+        // `code()` borrows `source`, so the check finishes before `source`
+        // moves into the variant below. It returns `Option<Cow<str>>`, and
+        // `as_ref()` views the `Cow` as a `&str`.
+        let retryable = source
+            .as_database_error()
+            .and_then(|db_error| db_error.code())
+            .is_some_and(|code| RETRYABLE_SQLSTATES.contains(&code.as_ref()));
+        if retryable {
+            OkfError::Busy {
+                reason: "the database aborted this request to resolve a lock conflict".to_string(),
+            }
+        } else {
+            OkfError::Database { source }
+        }
     }
 }
 

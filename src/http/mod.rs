@@ -70,7 +70,8 @@ impl AppError {
     /// # Returns
     /// 404 for a path or catalog that is not there (or not reachable), 403
     /// for an access level that is not enough, 409 for a refused request, 400
-    /// for a bad input, 500 for the server's own failures.
+    /// for a bad input, 500 for the server's own failures, 503 for a request
+    /// the database aborted (retry it).
     pub fn status(&self) -> StatusCode {
         // No `_` arm: a new variant fails to compile here until it has a status.
         match &self.0 {
@@ -79,6 +80,7 @@ impl AppError {
             }
             OkfError::Forbidden { .. } => StatusCode::FORBIDDEN,
             OkfError::Refused { .. } => StatusCode::CONFLICT,
+            OkfError::Busy { .. } => StatusCode::SERVICE_UNAVAILABLE,
             OkfError::InvalidPath { .. }
             | OkfError::FrontmatterParse { .. }
             | OkfError::Shape { .. }
@@ -307,6 +309,20 @@ mod tests {
                 "message": "internal error; the server log has the details",
             })
         );
+    }
+
+    #[test]
+    fn busy_is_503_and_says_to_retry() {
+        let busy = AppError(OkfError::Busy {
+            reason: "deadlock".to_string(),
+        });
+
+        let status = busy.status();
+        let body = busy.0.to_json();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "Busy");
+        assert!(body["message"].as_str().unwrap().ends_with("retry"));
     }
 
     // `start_paused`: tokio's clock jumps ahead whenever every task is

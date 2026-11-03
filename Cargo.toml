@@ -57,9 +57,10 @@ tempfile = "3.27.0"
 # Catalog archives: .tar.gz import and export (with flate2).
 tar = "0.4.46"
 # Postgres access with runtime-checked queries, and the schema migrations
-# embedded at compile time (`migrate!` needs `macros`). No TLS feature yet:
-# that is a deployment decision (M7).
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros"] }
+# embedded at compile time (`migrate!` needs `macros`). `json`: the
+# `changeset_entries.replay` jsonb column as `serde_json::Value`. No TLS
+# feature yet: that is a deployment decision (M7).
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros", "json"] }
 thiserror = "2.0.6"
 # The async runtime sqlx runs on, and the CLI's entry point.
 # `time`: `tokio::time::interval` for the poll loop (and `sleep` in tests);

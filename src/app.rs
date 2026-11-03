@@ -287,7 +287,8 @@ fn note_failure(broken: &mut Broken, row: &catalogs::Catalog, action: &str, erro
             tracing::debug!(catalog = %row.name, "{action} skipped: the catalog was deleted");
             return;
         }
-        OkfError::Database { .. } => "at the next poll",
+        // Transient: the next pass tries again, as for a database error.
+        OkfError::Database { .. } | OkfError::Busy { .. } => "at the next poll",
         // Every other error comes from the stored data, so the same
         // generation would fail the same way. (`_` matches any variant.)
         _ => {
