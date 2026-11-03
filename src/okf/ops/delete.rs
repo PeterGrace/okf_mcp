@@ -294,6 +294,9 @@ mod tests {
         let refusals = ["infra/index.md", "log.md", "AGENTS.md", "install/setup.md"]
             .map(|path| delete_concept(&workspace, path).unwrap_err());
         let missing = delete_concept(&workspace, "infra/none").unwrap_err();
+        // Plan Decision 4: a machinery reference that names no file is
+        // `NotFound`, since `check_path` runs only on a resolved path.
+        let missing_machinery = delete_concept(&workspace, "install/none.md").unwrap_err();
 
         for error in &refusals {
             assert_eq!(error.kind(), "InvalidPath", "{error}");
@@ -304,5 +307,27 @@ mod tests {
             refusals[3]
         );
         assert!(matches!(missing, OkfError::NotFound { .. }));
+        assert!(matches!(missing_machinery, OkfError::NotFound { .. }));
+    }
+
+    #[test]
+    fn each_link_on_a_line_is_its_own_entry() {
+        let mut files = FILES.to_vec();
+        files.push((
+            "twice.md",
+            "See [z](infra/z.md) and [z again](/infra/z.md#top).\n",
+        ));
+        let workspace = MemWorkspace::from_files(files);
+
+        let error = delete_concept(&workspace, "infra/z.md").unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                OkfError::StillLinked { ref links, .. }
+                    if links == &[link("twice.md", 1), link("twice.md", 1)]
+            ),
+            "{error:?}"
+        );
     }
 }
