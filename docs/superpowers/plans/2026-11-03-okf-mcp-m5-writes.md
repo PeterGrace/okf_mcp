@@ -11133,6 +11133,19 @@ git commit -m "feat: publish with base-revision conflicts, bookkeeping replay, r
 
 ### Task 11: `discard`, `revert` and `pending_changes`
 
+> **Corrected (issue #101), 2026-11-03.** What shipped differs from the code below in these ways (read `src/mcp/changesets.rs`, `src/store/history.rs` and `src/okf/workspace.rs` for the shipped text):
+> - **`discard` takes publish's locks, in publish's order:** the catalog's in-process `publish_lock` first, then in the transaction `catalogs::lock` (the advisory lock), `changesets::lock_catalog` and `changesets::lock`. Step 5's code took only the last two. A closed changeset (`lock` gives `None` or a non-open row) is the same `Refused` ("changeset N is no longer open") as publish's.
+> - **A write queued behind a closing discard lands in a new changeset, never `Busy`** (Task 10's Corrected note). Test: `a_write_queued_behind_a_discard_lands_in_a_new_changeset`, the pattern of `a_write_queued_behind_a_publish_lands_in_a_new_changeset`.
+> - **`pending_changes` follows `ToolContext::view`'s rules:** `own_changeset` skips the open-changeset lookup for a key below `write` (as `view` does), so such a key always gets an empty list. It reads the entries and the published state (`state.current()`), not the overlay, so a changeset whose overlay no longer applies (Task 7's Corrected note: "discard the clashing path") can still be listed and then discarded.
+> - **`PendingFile` gains `current_revision: Option<i32>` and `stale: bool`** (`base_revision != current_revision`; a stale replayable entry is replayed by publish, any other is a `Conflict`). Both are additive; Task 13's JSON assertions are unchanged.
+> - **`RevisionContent` has no `executable` field:** revert does not use it (a revived file is written with `write_atomic`, which keeps an existing file's bit, and scripts are machinery anyway).
+> - **Imports:** store modules are imported inside each function, as in Tasks 10 and 12 (`discard`: `store::{catalogs, changesets}`; `revert`: `store::history`; `pending_changes`: `store::changesets`); the file imports `okf::workspace::Workspace` for `write_atomic`. `unified_diff`'s `as_text` is a nested `fn`, because a closure cannot tie its returned `&str` to its argument's lifetime.
+> - **`stored_path`** (discard's path check) allows machinery, so any stored entry can be dropped; its reason is "not a path inside the catalog", as `rules::check_path`'s.
+> - **Revert to "absent" of a file the changeset created** leaves no entry (Task 8's Corrected note), so the report's `touched` is empty and `pending_changes` does not list it. Test: `reverting_a_created_file_to_absent_leaves_no_entry`. Reverting to a `delete` revision a path already absent in the changeset's view is `Refused`.
+> - **Extra tests** beyond Step 4's: `discard_needs_write_access`, `a_write_queued_behind_a_discard_lands_in_a_new_changeset`, `reverting_a_created_file_to_absent_leaves_no_entry`, `a_stored_path_is_normalized_and_stays_inside`, `the_three_tools_are_listed_with_object_output_schemas`; the discard test also covers a path without an entry, discard without a changeset and a path outside the catalog; the revert test checks `stale` after a later publish. That makes 11 tests in `changes_tests`.
+>
+> No signature in the Interfaces block changed.
+
 Three changeset tools (design "Write tools"):
 - **`discard`** drops entries from this connection's changeset. Given no paths, it drops them all and closes the changeset.
 - **`revert`** adds a document's content at an earlier revision, or its deletion, as an ordinary entry. It goes through `write::apply`, so every write rule applies and machinery stays refused.

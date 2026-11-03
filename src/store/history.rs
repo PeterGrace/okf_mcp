@@ -55,6 +55,47 @@ pub async fn revisions(
     Ok(rows)
 }
 
+/// One revision's content, for `revert`.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RevisionContent {
+    /// `create`, `update`, `delete` or `import`.
+    pub op: String,
+    /// The bytes; `None` for a `delete`.
+    pub content: Option<Vec<u8>>,
+}
+
+/// One path's content at one revision.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `catalog_id` - the catalog.
+/// * `path` - catalog-relative path, as stored (no leading `/`).
+/// * `revision` - the revision number.
+///
+/// # Returns
+/// The revision's content, or `None` if the path has no such revision.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn content_at(
+    pool: &PgPool,
+    catalog_id: i64,
+    path: &str,
+    revision: i32,
+) -> Result<Option<RevisionContent>, OkfError> {
+    // One primary-key lookup: (catalog_id, path, revision).
+    let row = sqlx::query_as::<_, RevisionContent>(
+        "SELECT op, content FROM revisions \
+         WHERE catalog_id = $1 AND path = $2 AND revision = $3",
+    )
+    .bind(catalog_id)
+    .bind(path)
+    .bind(revision)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +145,40 @@ mod tests {
         assert_eq!(all[2].actor, "tester");
         assert_eq!(one, all[..1]);
         assert!(none.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn content_at_reads_one_revision_or_its_deletion() {
+        let db = test_db().await;
+        let catalog = catalogs::create(&db.pool, "pg", "", Utc::now())
+            .await
+            .unwrap();
+        let rounds: [(&[(&str, &str)], bool); 2] = [
+            (&[("a.md", "# One\n"), ("b.md", "# B\n")], false),
+            (&[("b.md", "# B\n")], true),
+        ];
+        for (entries, replace) in rounds {
+            let options = ImportOptions {
+                replace,
+                actor: "tester",
+                now: Utc::now(),
+            };
+            import(&db.pool, "pg", files(entries), &options)
+                .await
+                .unwrap();
+        }
+
+        let first = content_at(&db.pool, catalog.id, "a.md", 1).await.unwrap();
+        let deleted = content_at(&db.pool, catalog.id, "a.md", 2).await.unwrap();
+        let missing = content_at(&db.pool, catalog.id, "a.md", 3).await.unwrap();
+
+        let first = first.expect("revision 1");
+        assert_eq!(
+            (first.op.as_str(), first.content.as_deref()),
+            ("import", Some(&b"# One\n"[..]))
+        );
+        let deleted = deleted.expect("revision 2");
+        assert_eq!((deleted.op.as_str(), deleted.content), ("delete", None));
+        assert!(missing.is_none());
     }
 }

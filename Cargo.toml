@@ -50,6 +50,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 # API keys are stored only as their SHA-256.
 sha2 = "0.11.1"
+# Unified diffs of a changeset against the published text (`pending_changes`).
+similar = "2.7.0"
 # Constant-time comparison of a presented key's hash with a stored one.
 subtle = "2.6.1"
 # Atomic writes via unique temp files (DiskWorkspace); also throwaway dirs in tests.
