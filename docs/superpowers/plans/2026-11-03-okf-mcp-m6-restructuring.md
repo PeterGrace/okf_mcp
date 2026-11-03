@@ -78,7 +78,7 @@ Deliberately deferred:
 
 ## Decisions taken while planning (2026-11-03)
 
-Decisions 1, 2 and 5 are pgrace's or M5's. Decisions 3 and 4 were given by pgrace with their details left to Claude. The rest are Claude's, each marked **(decided by Claude)**; pgrace has since confirmed Decision 7: pgrace asked for the most conservative option wherever the design leaves a question open, decided without stopping to ask.
+Decisions 1, 2 and 5 are pgrace's or M5's. Decisions 3 and 4 were given by pgrace with their details left to Claude. The rest are Claude's, each marked **(decided by Claude)**: pgrace asked for the most conservative option wherever the design leaves a question open, decided without stopping to ask. pgrace has since confirmed Decision 7.
 
 1. **Publish semantics: hybrid (pgrace, 2026-11-03).**
    - **New replay ops.** Index-listing changes made by move, split and delete become new `ReplayOp` variants that rebase at publish like M5's `ListBullet`:
