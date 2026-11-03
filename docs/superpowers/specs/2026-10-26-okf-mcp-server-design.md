@@ -170,7 +170,8 @@ constant-time scan.
 
 TLS to Postgres is turned on by the environment, as for libpq: `PGSSLMODE=verify-full`
 and `PGSSLROOTCERT` (a file with the database's CA certificate). sqlx reads them beneath
-the URL, so the URL itself needs no `sslmode`. The image's sqlx uses rustls.
+the URL, so the URL needs no `sslmode`, and must not name one: a URL's `sslmode` or
+`sslrootcert` overrides the environment's. The image's sqlx uses rustls.
 
 ### Storage
 

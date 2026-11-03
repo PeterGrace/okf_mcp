@@ -101,7 +101,7 @@ Decisions 1 to 6 are pgrace's answers on 2026-11-03. The rest are Claude's, each
    - **`/healthz` stays coarse:** the route needs no key and is public (Decision 1), so `clock` carries only `ok`, `checked_at`, `offset_ms` and `stratum`. The server's name and the error text go only to the logs (`warn` and `error` lines), never to the public body (Brooke's review of PR #138).
    - **Without a `time_server`** there is no check, and `clock` is `null`.
 8. **TLS to Postgres: rustls, configured by environment** (decided by Claude).
-   - **The feature:** sqlx gets `tls-rustls-ring-webpki`. It is pure Rust, so the image needs no OpenSSL, and `ring` builds with the build image's C compiler.
+   - **The feature:** sqlx gets `tls-rustls-ring-webpki`. It is pure Rust, so the binary links no OpenSSL, and `ring` builds with the build image's C compiler.
    - **The settings:** the Deployment sets `PGSSLMODE=verify-full` and `PGSSLROOTCERT` (the CNPG cluster's `<cluster>-ca` secret, key `ca.crt`, mounted as a file). `DATABASE_URL` is the CNPG app secret's `uri`. sqlx reads both variables before it parses the URL (verified fact 4), so `db::connect` doesn't change.
    - **Why it verifies:** CNPG's server certificate names `<cluster>-rw`, `-rw.<ns>`, `-rw.<ns>.svc` and `-rw.<ns>.svc.cluster.local` (verified fact 5). The app secret's host is `<cluster>-rw`, so `verify-full` holds inside the namespace.
    - **Why it must be set:** CNPG's `pg_hba` also accepts plain `host` connections, so TLS is the server's choice and must be set.
@@ -1498,7 +1498,9 @@ Expected: compile error on `rcgen` (not a dependency yet). Once Step 2 adds rcge
 
 - [ ] **Step 2: The dependencies**
 
-In `Cargo.toml`, sqlx's features gain `"tls-rustls-ring-webpki"`. Its comment's last sentence ("No TLS feature yet: that is a deployment decision (M7).") becomes: "`tls-rustls-ring-webpki`: TLS in pure Rust (no OpenSSL in the image). The deployment turns it on with `PGSSLMODE=verify-full` and `PGSSLROOTCERT`, which sqlx reads beneath the URL (M7)."
+In `Cargo.toml`, sqlx's features gain `"tls-rustls-ring-webpki"`. Its comment's last sentence ("No TLS feature yet: that is a deployment decision (M7).") becomes: "`tls-rustls-ring-webpki`: TLS in pure Rust (the binary links no OpenSSL). The deployment turns it on with `PGSSLMODE=verify-full` and `PGSSLROOTCERT`, which sqlx reads beneath the URL (M7). With a TLS backend compiled in, sqlx's default `sslmode=prefer` also tries TLS, unverified, on every connection that sets no mode (local runs, the CLI, the tests)."
+
+> **Corrected (issue #143), 2026-11-03.** The comment said "no OpenSSL in the image", but the runtime image's `ca-certificates` pulls in Debian's `openssl` package (Task 5's note); only the binary links no OpenSSL. Brooke's review of PR #150 added the `prefer` sentence: turning the feature on changes connections that set no mode, though no connection code changes. Decision 8 is reworded the same way.
 
 In `[dev-dependencies]`:
 
@@ -1514,7 +1516,9 @@ If the container doesn't start (`install` or permissions), read its log with `do
 
 - [ ] **Step 3: The design**
 
-In "Configuration", after "The only secret is `DATABASE_URL` ...": "TLS to Postgres is turned on by the environment, as for libpq: `PGSSLMODE=verify-full` and `PGSSLROOTCERT` (a file with the database's CA certificate). sqlx reads them beneath the URL, so the URL itself needs no `sslmode`. The image's sqlx uses rustls."
+In "Configuration", after "The only secret is `DATABASE_URL` ...": "TLS to Postgres is turned on by the environment, as for libpq: `PGSSLMODE=verify-full` and `PGSSLROOTCERT` (a file with the database's CA certificate). sqlx reads them beneath the URL, so the URL needs no `sslmode`, and must not name one: a URL's `sslmode` or `sslrootcert` overrides the environment's. The image's sqlx uses rustls."
+
+> **Corrected (issue #143), 2026-11-03.** Brooke's review of PR #150: "the URL itself needs no `sslmode`" holds only while the URL names none. The paragraph now says a URL's `sslmode` overrides `PGSSLMODE`, and Task 7 Step 7's TLS check confirms the CNPG `uri` carries none.
 
 - [ ] **Step 4: Changelog and commit**
 
@@ -1828,7 +1832,9 @@ This task changes other systems. Its PR in this repo carries only:
   - **Database:** `okf-mcp-db` is 3/3 with `ContinuousArchiving` True.
   - **Server:** the pod is Ready, and the certificate is issued.
   - **`/healthz`:** `curl -s https://okf-mcp.k.vsix.me/healthz` gives `{"database":"ok","catalogs":0,"clock":{...}}`. `clock.ok` is true and `clock.offset_ms` is small. If `clock.ok` is false, read the pod's `warn` line for the cause. If it is DNS, set `time_server` to the address; that value stays in the private ConfigMap and never reaches `/healthz`.
-  - **TLS:** on the database's primary, every `okf_mcp` connection is encrypted: `SELECT bool_and(ssl) FROM pg_stat_ssl JOIN pg_stat_activity USING (pid) WHERE usename = 'okf_mcp'` is true.
+  - **TLS:** on the database's primary, every `okf_mcp` connection is encrypted: `SELECT bool_and(ssl) FROM pg_stat_ssl JOIN pg_stat_activity USING (pid) WHERE usename = 'okf_mcp'` is true. These are the live server's own sessions, so this proves `PGSSLMODE`/`PGSSLROOTCERT` took effect (no test exercises the environment path). Also confirm the CNPG app secret's `uri` carries no `sslmode` or `sslrootcert`, which would override the environment: check for the parameter names without printing the value.
+
+    > **Corrected (issue #143), 2026-11-03.** Brooke's review of PR #150: a URL's `sslmode` overrides `PGSSLMODE`, so the check now names the `uri` and says why the `pg_stat_ssl` query is the proof.
   - **Backup:** take an on-demand backup with the plugin method and wait for `completed`. If it fails like the other cluster's (kubelet 502), record the node and error in the private catalog's things-to-fix and tell pgrace. Don't work around it.
 
 - [ ] **Step 8: The first catalog (go-ahead 3 for the import; pgrace for the key).**

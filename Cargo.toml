@@ -61,9 +61,11 @@ tar = "0.4.46"
 # Postgres access with runtime-checked queries, and the schema migrations
 # embedded at compile time (`migrate!` needs `macros`). `json`: the
 # `changeset_entries.replay` jsonb column as `serde_json::Value`.
-# `tls-rustls-ring-webpki`: TLS in pure Rust (no OpenSSL in the image). The
-# deployment turns it on with `PGSSLMODE=verify-full` and `PGSSLROOTCERT`,
-# which sqlx reads beneath the URL (M7).
+# `tls-rustls-ring-webpki`: TLS in pure Rust (the binary links no OpenSSL).
+# The deployment turns it on with `PGSSLMODE=verify-full` and
+# `PGSSLROOTCERT`, which sqlx reads beneath the URL (M7). With a TLS backend
+# compiled in, sqlx's default `sslmode=prefer` also tries TLS, unverified, on
+# every connection that sets no mode (local runs, the CLI, the tests).
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros", "json", "tls-rustls-ring-webpki"] }
 thiserror = "2.0.6"
 # The async runtime sqlx runs on, and the CLI's entry point.
