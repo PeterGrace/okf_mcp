@@ -4,8 +4,8 @@ A Rust port of `tools/okf.py`, the Open Knowledge Format catalog CLI, on its
 way to becoming a shared MCP server (design:
 `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md`).
 
-Status: milestones 1 (core library), 2 (analysis), 3 (storage) and 4
-(read-only server) are delivered. The library reads a catalog into an
+Status: milestones 1 (core library), 2 (analysis), 3 (storage), 4
+(read-only server) and 5 (writes) are delivered. The library reads a catalog into an
 in-memory `Snapshot` and runs `okf.py`'s analyses on it with the same JSON
 output (compared as parsed values): `lint`, the links report, `oldest`,
 `sprawl` and the secret scan, plus ranked `search`, which `okf.py` does not
@@ -15,7 +15,10 @@ snapshot is built from its rows and swapped when the catalog changes. The
 `okf-mcp` command line administers catalogs and API keys and imports and
 exports catalogs, and `okf-mcp serve` serves the catalogs over MCP
 streamable HTTP with bearer-key auth: every read tool, the export and import
-routes and `/healthz`. Writes (changesets and publish) arrive in milestone 5.
+routes and `/healthz`, and the write tools: each connection's edits collect in a
+changeset held in the database, which reads through that connection see and which
+`publish` turns into published revisions (see "Writing"). Moving, splitting and
+deleting concepts arrive in milestone 6.
 
 ## Command line
 
@@ -62,7 +65,8 @@ listen = "0.0.0.0:8080"            # the default
 allowed_hosts = ["okf-mcp.example"] # /mcp Host names (default: loopback)
 default_catalog = "pg"             # for a key with no default of its own
 poll_interval = "10s"              # how often to look for CLI changes
-session_idle_timeout = "2h"        # an idle MCP session is closed after this
+session_idle_timeout = "2h"        # an idle MCP session is closed after this; also
+                                   # when an untouched changeset counts as stranded
 max_import_bytes = "64MiB"         # uncompressed total of an import
 ```
 
@@ -110,7 +114,8 @@ catalog the key cannot reach is an error, never silently dropped.
 
 ### Tools
 
-Every tool needs a `read` key. Results are JSON (`structuredContent`, and the
+The read tools below need a `read` key; the write tools ("Writing") need
+`write`. Results are JSON (`structuredContent`, and the
 same JSON as the text block); errors are results with `isError: true` and
 `{"error": ..., "message": ...}`.
 
@@ -125,11 +130,15 @@ same JSON as the text block); errors are results with `isError: true` and
 | `oldest` | `okf.py oldest --json` |
 | `sprawl` | `okf.py sprawl --json` |
 | `links_report` | `okf.py links --json` (`mentions`, default true) |
-| `lint` | `okf.py lint --json` on the published catalog |
+| `lint` | `okf.py lint --json` on the published catalog, or with `pending: true` on this connection's changeset applied to it |
+| `pending_changes` | This connection's changeset: each changed path, its base and current revision, whether it is stale or replayable, and a unified diff |
+| `stranded_sessions` | Open changesets nobody changed within `session_idle_timeout`: the key's own, or with an `admin` key every one it reaches |
 
 `get_concept`, `read_document` and `history` without `catalog` answer from
 the first selected catalog that has the path; the reports run on the first
-selected catalog.
+selected catalog. A connection with an open changeset reads through it: its
+own pending edits are visible to it (`history` reads published revisions
+only).
 
 ### Routes
 
@@ -171,15 +180,129 @@ its report, and the next read sees the new snapshot. `/healthz` and the export
 time out after 120 s with 503; `/mcp` has no timeout, since its `GET` is a
 long-lived event stream.
 
+## Writing
+
+### Changesets
+
+A `write` key's edits go to a changeset, one per (catalog, key, label), held
+in Postgres. The label comes from the connection:
+
+1. the `X-OKF-Changeset` header;
+2. else `?changeset=` on the MCP URL (`/mcp?changeset=my-agent`);
+3. else `default`.
+
+The MCP session is never the label: a session id changes on every reconnect,
+so an unlabelled client would land in a new, empty changeset each time. Two
+unlabelled connections of one key therefore share `default` (every write
+locks the changeset's row, so neither loses an edit); an agent that wants
+several changesets names them. The key is part of the identity, so one key
+never sees or publishes another key's changeset.
+
+Nothing in a changeset is visible to other keys or labels until `publish`.
+The connection itself reads through it: `search`, `get_concept`,
+`read_document` and the reports see its pending edits. A changeset survives
+disconnects, closed sessions and server restarts until it is published or
+discarded. Each MCP session also answers only the key that opened it: a
+request naming its `Mcp-Session-Id` with another key gets 404.
+
+An `mcp.json` entry with a label:
+
+```json
+{"mcpServers": {"okf": {"type": "http", "url": "https://okf.example/mcp",
+  "headers": {"Authorization": "Bearer ${OKF_MCP_KEY}", "X-OKF-Catalogs": "pg",
+              "X-OKF-Changeset": "my-agent"}}}}
+```
+
+Each write tool acts on exactly one catalog: its `catalog` argument, else the
+connection's write target (the first selected catalog). Its result names the
+catalog, the changeset id, the label and the touched paths.
+
+### Write tools
+
+Content (`write`):
+
+| Tool | Does |
+|---|---|
+| `create_concept` | A new concept (`path`, `frontmatter` with `type`, `body`); the server writes `generated` itself. With `index_summary` (and `index_section`) it is listed in its folder's `index.md`, creating folder indexes as needed |
+| `edit_document` | Exact replacement (`old_str`, `new_str`, `replace_all`) in a concept or an `index.md`; must match once unless `replace_all`; may not add or change frontmatter |
+| `replace_body` | A concept's new body, its frontmatter kept byte for byte |
+| `set_frontmatter` | Sets one descriptive key (`key`, `value`), or deletes it with `value: null`; the stamps, `open_questions` and `sources` have their own tools |
+
+Bookkeeping (`write`), ports of `okf.py`'s commands with its exact output:
+
+| Tool | Does |
+|---|---|
+| `stamp` | `generated` or `verified` (`field`) with `{ by, at: now }` |
+| `review` | `reviewed` with `outcome` and `note`, queuing any `questions` |
+| `question` | Queues one open question |
+| `unquestion` | Removes one, by 1-based number or exact text |
+| `add_source` | Appends a `sources` entry (`id`, `resource`, `title`, `author`) |
+| `log` | `* **<kind>:** <text>` under today's date in `log.md`, the only way to write it (`kind`: `Update`, `Creation`, `Change`, `Import`) |
+| `index` | Lists a concept in its folder's `index.md` |
+
+Changesets:
+
+| Tool | Key | Does |
+|---|---|---|
+| `pending_changes` | `read` | What this connection's changeset holds, with diffs |
+| `publish` | `write` | Publishes the changeset with a `message` (see below) |
+| `discard` | `write` | Drops the named `paths` from the changeset, or every entry, which closes it (the next write opens a new one) |
+| `revert` | `write` | Adds a document's content at an earlier `revision` (from `history`), or its deletion, to the changeset |
+| `stranded_sessions` | `read` | Changesets idle past `session_idle_timeout`, with their ids |
+| `adopt_changeset` | `write`; `admin` for another key's | Moves a changeset (`id`) to this connection's key and label |
+
+`lint` with `pending: true` checks the changeset before publishing.
+
+### Publish
+
+`publish` runs under the catalog's publish lock, so publishes to one catalog
+run one at a time against the current published state. With nothing to
+publish it answers `published: false`. Otherwise it checks each changed
+file's base revision against the one published now:
+
+- `log` and `index` entries (and `create_concept`'s listing) are replayed
+  onto newer text instead of conflicting, so concurrent agents logging to the
+  same `log.md` all get their lines in;
+- any other file that changed since the changeset first read it refuses the
+  publish with `Conflict`, listing each file's base and current revision
+  (`pending_changes` marks it `stale`). An entry keeps the base of its first
+  edit, so `discard` the conflicting paths, re-read the published text, redo
+  the edit and publish again;
+- a changed file with lint errors, or a link left pointing into a path the
+  changeset deletes, refuses it with `LintFailed`; lint errors elsewhere and
+  warnings come back as `warnings`.
+
+A refused publish leaves the changeset open and unchanged. A successful one
+writes a revision per changed file, carrying the message and the key's actor,
+and closes the changeset. A write that was waiting on the changeset while it
+was published or discarded lands in a new changeset, so no edit is lost.
+
+### Write rules
+
+Every write checks these before anything is stored, and publish checks the
+secret scan and frontmatter again on every changed file:
+
+- the secret scan (a hit is reported with its rule, line and a masked value);
+- frontmatter must still parse;
+- paths stay inside the catalog;
+- machinery is read-only through every tool, `revert` included: `AGENTS.md`,
+  `CLAUDE.md`, `README.md`, `tools/`, the root `docs/` and `tests/`,
+  `.claude/`, `install/` and any `.git*` path. Only an import writes them.
+
+Every timestamp comes from the server's clock; no tool takes one. `by`
+(on `create_concept`, `stamp` and `review`) defaults to the key's actor.
+
 ## Layout
 
 - `src/okf/` - the document model (`yaml`, `doc`, `markdown`, `paths`,
   `workspace`, `timestamp`), the `snapshot`, `analysis::*` (`links`, `lint`,
-  `oldest`, `sprawl`, `secrets`) and `search`.
+  `oldest`, `sprawl`, `secrets`), `search`, the edit operations `ops`
+  (ported from `okf.py`, with the replay of `log` and `index` edits) and the
+  write `rules`.
 - `src/db.rs`, `migrations/` - the Postgres pool and the schema, embedded at
   compile time.
 - `src/store/` - async functions over the pool: `catalogs`, `keys`,
-  `documents`, `import`, `export`.
+  `documents`, `import`, `export`, `history`, `changesets` and `publish`.
 - `src/archive.rs` - reading a `.tar.gz` or a directory with the import rules,
   and writing a `.tar.gz`.
 - `src/keys.rs` - API key generation, hashing and constant-time comparison.
@@ -187,10 +310,15 @@ long-lived event stream.
   rows and rebuilt and swapped when its generation moves; lint with revision
   times.
 - `src/auth.rs` - the key cache and the bearer middleware; `src/selection.rs` -
-  which catalogs a call acts on; `src/app.rs` - the shared state and the poll
-  loop.
-- `src/mcp/` - the rmcp server handler, the tool context and the read tools;
-  `src/http/` - the router, `/healthz`, the archive routes and `serve`.
+  which catalogs a call acts on and the changeset label; `src/app.rs` - the
+  shared state and the poll loop (which also prunes empty changesets).
+- `src/overlay.rs` - a changeset's view (the published files with its entries
+  applied), cached per changeset; `src/write.rs` - the one path every write
+  tool takes into its changeset.
+- `src/mcp/` - the rmcp server handler, the tool context, the read tools, the
+  write tools (`writes`) and the changeset tools (`changesets`); `src/http/` -
+  the router, `/healthz`, the archive routes, the session-to-key binding
+  (`sessions`) and `serve`.
 - `src/cli.rs`, `src/config.rs`, `src/main.rs` - the `okf-mcp` command line
   and its configuration file.
 - `src/clock.rs`, `src/error.rs` - the time source and the error type.
@@ -200,10 +328,16 @@ long-lived event stream.
 - `tests/roundtrip.rs` - import then export reproduces a catalog's files
   exactly, and importing the export again changes nothing.
 - `tests/server.rs` - end-to-end tests of the server over HTTP with rmcp's
-  client: keys, catalog selection, the tools and the archive routes.
+  client: keys, catalog selection, session binding, the tools and the archive
+  routes.
+- `tests/writes.rs` - end-to-end write tests over HTTP: create, link, index,
+  log, publish and export; concurrent `log.md` publishes; a conflict; a
+  changeset surviving a restart; labels.
 - `tests/smoke.rs` - every analysis and a search on a real catalog, the
   storage path (import, load, links, lint, export) through Postgres, and the
-  server (every read tool and the export over HTTP), timed.
+  server (every read tool and the export over HTTP) and the write path
+  (create, stamp, log, lint pending and publish over HTTP, into a throwaway
+  copy), timed.
 - `tests/support/` - a throwaway Postgres container per test, and a test
   server on a free port with rmcp clients.
 - `docs/superpowers/` - the design and the per-milestone plans.
@@ -241,6 +375,7 @@ The report structs derive `serde::Serialize`; their JSON has `okf.py
 ## Testing
 
     cargo test                                   # unit, doc, golden and database tests
+    cargo test --test writes                     # just the end-to-end write tests
     OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog \
         cargo test --test parity -- --ignored    # live parity against okf.py
     OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog \

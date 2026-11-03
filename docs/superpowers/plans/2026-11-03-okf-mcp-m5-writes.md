@@ -12881,6 +12881,8 @@ git commit -m "test: end-to-end writes: publish cycle and export, concurrent log
 
 This task runs the write path on the real catalog and times it, documents the write tools, and closes the milestone in the design. It follows M4's Task 12.
 
+> **Corrected (issue #103), 2026-11-03.** The smoke test compiled and passed as written (after `rustfmt`), with one comment added on indexing a `serde_json::Value` (a missing key gives `Null`). Step 3's design bullet listed "the session" as a label source; Decision 1 rules that out, and the design says `X-OKF-Changeset`, `?changeset=`, else `default`, never the session (fixed inline). The design's "What M5 shipped differently" also has a "Found while building it" list (the queued-write finding of Tasks 10 and 11, the accepted pool limits of Tasks 8 and 10, the broken-overlay rules of Task 7, and Task 13's measurement), and its `Busy` row says the closed-changeset branch is defensive. `write::apply`'s doc comment said `Busy` answers a write that waited behind a publish or discard; Task 10 showed such a write opens a new changeset instead, so the doc now calls that branch a defensive check no test reaches. No interface changed.
+
 **Files:**
 - Modify: `tests/smoke.rs` (add `writes_on_a_real_catalog`)
 - Modify: `README.md`
@@ -13008,7 +13010,7 @@ Keep the testing section's Docker note, and add `cargo test --test writes`.
 - Milestones table: "M5. Writes (delivered)", with the plan link and the PR range.
 - The status line at the top: M1 to M5 delivered.
 - Add "What M5 shipped differently", after M4's. Its "Deviations planned" are the plan's Decisions and its "Simplifications and deviations":
-  - changesets per (catalog, key, label), labels from `X-OKF-Changeset`, `?changeset=`, the session or `default`;
+  - changesets per (catalog, key, label), labels from `X-OKF-Changeset`, `?changeset=`, else `default` (never the session);
   - MCP sessions bound to their key (404 otherwise);
   - the lock order (catalog row `FOR KEY SHARE`, then the changeset row), and `Busy` for `40P01` and `40001`;
   - `install/`, the root `docs/` and `tests/` as machinery;
