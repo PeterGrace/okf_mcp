@@ -185,7 +185,11 @@ pub fn index(
 }
 
 /// Port of `ensure_index`: makes sure `folder/index.md` exists and is
-/// listed in its parent's index, creating parents first.
+/// listed in its parent's index, creating missing ancestor indexes too.
+///
+/// As in `okf.py`, the folder's own `index.md` is written first; then the
+/// parent is ensured (recursively), and only after that is the folder listed
+/// in it. So the notes come out outermost-first.
 ///
 /// A new index is `# <Folder name>` and a TODO line; its parent gains
 /// `* [<Folder name>](<name>/) - TODO: describe this folder` under
@@ -200,7 +204,9 @@ pub fn index(
 ///
 /// # Errors
 /// The workspace's read or write error (a missing root `index.md` is
-/// [`OkfError::NotFound`]).
+/// [`OkfError::NotFound`]). Files written before the error stay written,
+/// so run it on a scratch copy (as the write path does) and drop the copy
+/// on error.
 pub fn ensure_index(
     workspace: &dyn Workspace,
     folder: &str,
