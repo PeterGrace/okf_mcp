@@ -48,7 +48,7 @@ Deliberately deferred:
 5. **The catalog comes from the changeset.** The write tools, `publish`, `discard`, `revert` and `pending_changes` lose their `catalog` parameter. `open_changeset` takes `catalog` (default: the connection's write target).
 6. **Reads see drafts only when asked.** A read tool given `changeset` reads that changeset's overlay for the changeset's own catalog, and the published state for every other catalog it selects. Without it, a read is published, even for a key that has open changesets. If the changeset's catalog is not one the call selects, the read is refused with `Refused`, which names the catalog. `lint`'s `pending` flag is replaced by `changeset`.
 7. **Several open changesets per key and catalog are allowed.** The `(catalog, key, label)` unique index goes. Until Task 5 drops the column, a new changeset's `label` is set to its handle, so the old index can never clash.
-8. **`list_changesets` replaces `stranded_sessions`.** It lists the open changesets the key may use: its own, and with `admin` every key's in the catalogs it reaches. Empty ones are listed too. Each row gives the handle, catalog, key, actor, creation and last-change times, its paths, and `idle` (no change within `session_idle_timeout`). The 24-hour prune of empty changesets stays.
+8. **`list_changesets` replaces `stranded_sessions`.** It lists the open changesets the key may use: its own, and with `admin` every key's in the catalogs it reaches. Empty ones are listed too. Each row gives the handle, catalog, key, actor, creation and last-change times, its paths, and `idle` (no change within `session_idle_timeout`). The 24-hour prune of empty changesets stays, and with handles its effect is visible: a handle that `open_changeset` returned and that gets no write within 24 hours is discarded (`prune_empty`, `src/store/changesets.rs:671-690`; a write bumps `updated_at`, so only empty ones go). Using it afterwards is refused with "changeset … is discarded", plus a hint that an empty changeset is discarded after 24 hours without a write and to open a new one. The `open_changeset` description says so too.
 9. **Every error payload writes catalog paths `/`-prefixed** (pgrace chose the things-to-fix entry). The prefix is applied where the error becomes JSON (`OkfError::to_json`), so the messages and the internal forms that the `okf.py` parity tests pin don't change. It covers:
    - `path` of `NotFound`, `FrontmatterParse`, `Shape`, `SecretDetected` and `EditMismatch`;
    - `file` of each finding in `LintFailed`.
@@ -219,7 +219,7 @@ fn invalid_path_keeps_the_reference_as_given() {
 }
 ```
 
-- [ ] **Step 2: Run them** (`cargo test --lib error::tests`). The first two fail: `"infra/x.md"` is not `"/infra/x.md"`.
+- [ ] **Step 2: Run them** (`cargo test --lib error::tests`). The first two fail on their unprefixed assertions (`"infra/x.md"` is not `"/infra/x.md"`). The `already` assertion already passes; it guards against doubling the slash.
 
 - [ ] **Step 3: Implement.** In `to_json`:
   - write `client_path(path)` for `NotFound`, `FrontmatterParse`, `Shape`, `SecretDetected` and `EditMismatch`;
@@ -450,7 +450,11 @@ impl ToolContext {
         self.principal.require(access, state.name())?;
         if row.state != ChangesetState::Open {
             return Err(OkfError::Refused {
-                reason: format!("changeset {handle} is {}", row.state.as_str()),
+                reason: format!(
+                    "changeset {handle} is {}; open a new one with open_changeset (a \
+                     changeset with no edits is discarded after 24 hours)",
+                    row.state.as_str()
+                ),
             });
         }
         Ok(Pinned { state, row })
@@ -480,7 +484,7 @@ pub struct Opened {
 }
 ```
 
-  The function resolves `ctx.one(params.catalog.as_deref())` and requires `Access::Write`. Then it begins a transaction, runs `changesets::lock_catalog` and `changesets::open`, and commits. The tool description: "Open a changeset in a catalog and return its handle. Every edit, `publish`, `discard`, `revert` and `pending_changes` needs a handle, and the reads take one to see its drafts. Nothing is visible to anyone else until `publish`. Several changesets may be open at once. Write access."
+  The function resolves `ctx.one(params.catalog.as_deref())` and requires `Access::Write`. Then it begins a transaction, runs `changesets::lock_catalog` and `changesets::open`, and commits. The tool description: "Open a changeset in a catalog and return its handle. Every edit, `publish`, `discard`, `revert` and `pending_changes` needs a handle, and the reads take one to see its drafts. Nothing is visible to anyone else until `publish`. Several changesets may be open at once. A changeset with no edits is discarded after 24 hours. Write access."
 
   Its test is `open_changeset_returns_a_handle_that_resolves`: call it, then resolve the handle with `ctx.changeset(.., Access::Write)`.
 
@@ -496,7 +500,7 @@ Every write tool, `publish`, `discard`, `revert` and `pending_changes` acts on t
 - Modify: `src/write.rs` (`apply`'s signature and body, `WriteReport`, tests)
 - Modify: `src/mcp/writes.rs`, `src/mcp/restructure.rs` (every `*Params`: add `changeset`, remove `catalog`; handlers; tool descriptions; tests)
 - Modify: `src/mcp/changesets.rs` (`PublishParams`, `DiscardParams`, `RevertParams`, `pending_changes`' params; `Published`, `Discarded`, `PendingChanges`; drop `own_changeset`; tests)
-- Modify: `src/store/changesets.rs` (drop `get_or_create`, `find_open`, `ChangesetKey`, `GET_OR_CREATE_TRIES` and their tests)
+- Modify: `src/store/changesets.rs` (drop `get_or_create`, `find_open`, `ChangesetKey`, `GET_OR_CREATE_TRIES` and their tests; rewrite `prune_empty`'s doc comment, `src/store/changesets.rs:655-659`, whose `SKIP LOCKED` argument goes through `get_or_create`. It now relies on: the write resolves the handle unlocked, then takes `lock`, which waits for a prune that holds the row and then re-reads its state, so the write sees `discarded` and is refused; a write that took the row first makes the prune skip it)
 - Modify: `src/mcp/context.rs` (`view(state, pinned)`, a `pin` helper, `require_selected`, tests; the draft-read tests become handle-based)
 - Modify: `src/mcp/documents.rs` (`GetConceptParams`, `ReadDocumentParams`, `view_or_note`)
 - Modify: `src/mcp/search.rs` (`SearchParams`, `run`)
@@ -566,7 +570,9 @@ pub async fn open_changeset(client: &Client, catalog: Option<&str>) -> String
 
   And in `src/mcp/search.rs` or `src/mcp/documents.rs`:
   - `get_concept_with_a_changeset_sees_its_draft`;
-  - `a_changeset_outside_the_selected_catalogs_is_refused`: `search` with `catalogs: ["work"]` and a `pg` handle gives `Refused`, naming `pg`.
+  - `a_changeset_outside_the_selected_catalogs_is_refused`: `search` with `catalogs: ["work"]` and a `pg` handle gives `Refused`, naming `pg`;
+  - `get_concept_refuses_a_changeset_outside_its_read_set`: on a connection selecting only `work` (no `catalog` argument, so `get_concept` walks the read set), a `pg` handle gives the same `Refused`;
+  - `lint_counts_only_the_pinned_changeset_s_paths_as_uncommitted`: with a draft of `a.md` in a changeset, `lint` with that handle doesn't report `generated-after-commit` for `a.md`, and `lint` without a handle lints the published catalog with its commit times, as before. Lint's "paths in the connection's changeset count as uncommitted" becomes "the pinned changeset's paths count as uncommitted, and without `changeset` none do". That is the overlay's `commit_times` (`Overlay::lint`), unchanged.
 
   Then implement:
 
@@ -603,7 +609,23 @@ impl ToolContext {
 ///
 /// # Errors
 /// [`OkfError::Refused`] naming the changeset's catalog.
-pub fn require_selected(pinned: Option<&Pinned>, states: &[Arc<CatalogState>]) -> Result<(), OkfError>
+pub fn require_selected(pinned: Option<&Pinned>, states: &[Arc<CatalogState>]) -> Result<(), OkfError> {
+    // `let ... else`: without a pinned changeset there is nothing to check.
+    let Some(pinned) = pinned else {
+        return Ok(());
+    };
+    if states.iter().any(|state| state.id() == pinned.state.id()) {
+        Ok(())
+    } else {
+        Err(OkfError::Refused {
+            reason: format!(
+                "changeset {} is in catalog {:?}, which this call does not read",
+                pinned.row.handle,
+                pinned.state.name()
+            ),
+        })
+    }
+}
 ```
 
   `pinned.row` is the unlocked row read when the handle resolved. `pin` reads it fresh on every call, as `find_open` does today, and `Overlays::get` matches its cache to that row's `version` and the catalog's generation (`src/overlay.rs:235-252`). Every write, publish and discard also drops the cached overlay (`forget`). A write that commits between `pin` and `view` therefore leaves the same window as today: this call may still read the version before it, and the next call rebuilds. It can't leave a stale overlay cached under the newer version. Keep `forget` in the write path.
