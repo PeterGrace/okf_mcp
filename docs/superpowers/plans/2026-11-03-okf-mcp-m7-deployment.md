@@ -1880,6 +1880,8 @@ git commit -m "build: the server image and its GHCR workflow; version 0.7.0 (M7.
 
 - [ ] **Step 3: Check the commands**: each `okf-mcp` command in the doc against `cargo run -- <cmd> --help`. Each YAML example parses (`python3 -c 'import yaml,sys; list(yaml.safe_load_all(open(...)))'` on extracted blocks, or `kubeconform -ignore-missing-schemas` if you write them to a scratch dir).
 
+> **Corrected (issue #145), 2026-11-03.** The guide's Deployment sets `OKF_MCP_CONFIG=/etc/okf-mcp/config.toml` in the environment and passes `args: ["serve"]`, rather than `--config` as an argument, so `kubectl exec ... -- okf-mcp <subcommand>` reads the same file with no flag. Task 7's `args: ["--config", ...]` still works; with it, every `exec`'d subcommand needs `--config` too (Step 8's `import` and `key create` lines omit it, which only matters if `max_import_bytes` is changed). The README's `/healthz` row and configuration block also gained `clock` and `time_server`.
+
 - [ ] **Step 4: Changelog and commit**
 
 ```bash
