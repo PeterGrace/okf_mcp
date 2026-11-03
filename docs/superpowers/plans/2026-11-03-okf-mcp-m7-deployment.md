@@ -67,7 +67,7 @@ Deliberately deferred:
 
 Decisions 1 to 6 are pgrace's answers on 2026-11-03. The rest are Claude's, each marked **(decided by Claude)**.
 
-1. **Exposure: public, keys only (pgrace).** `https://okf-mcp.k.vsix.me`, through ingress-nginx with a `letsencrypt-prod` certificate, as the autobots API is. `*.k.vsix.me` is a wildcard that already resolves to the ingress, so no DNS change is needed. Every route but `/healthz` needs a bearer key (M4). `/healthz` names no catalog (a count only) and no secret. `allowed_hosts` is `["okf-mcp.k.vsix.me"]`.
+1. **Exposure: public, keys only (pgrace).** `https://okf-mcp.k.vsix.me`, through ingress-nginx with a `letsencrypt-prod` certificate, as the autobots API is. `*.k.vsix.me` is a wildcard that already resolves to the ingress, so no DNS change is needed. Every route but `/healthz` needs a bearer key (M4). `/healthz` names no catalog (a count only), no secret and no internal host: its `clock` carries only coarse fields (Decision 7). `allowed_hosts` is `["okf-mcp.k.vsix.me"]`.
 2. **Database: a new CNPG cluster (pgrace).** `okf-mcp-db`, 3 instances, in namespace `okf-mcp`. Its database and owner are `okf_mcp`. `spec.imageName` is the `r.gfpd.us` mirror path, as every CNPG `Cluster` on this cluster must be.
 3. **Backups: barman-cloud to Garage (pgrace).**
    - plugin-barman-cloud is the WAL archiver, writing to a bucket of its own with a key allowed only on that bucket. A daily `ScheduledBackup` takes a base backup. Retention is 30 days.
@@ -97,7 +97,8 @@ Decisions 1 to 6 are pgrace's answers on 2026-11-03. The rest are Claude's, each
 
      Offset is `((t2 - t1) + (t3 - t4)) / 2`, round trip `(t4 - t1) - (t3 - t2)` (RFC 4330 section 5). Timestamps follow the 2036 era rule of RFC 4330 section 3.
    - **When it runs:** a query times out after 5 seconds, DNS included. It runs at startup and every 15 minutes, and logs at `error` past 2 seconds of offset and at `warn` on a failed query.
-   - **`/healthz` reports, never fails:** it shows the last result and its status never depends on it. A time-server outage must not take the server out of its Service. The `error` log is the signal, as the design says.
+   - **`/healthz` reports, never fails:** it shows the last result, and its status never depends on it. A time-server outage must not take the server out of its Service. The `error` log is the signal, as the design says.
+   - **`/healthz` stays coarse:** the route needs no key and is public (Decision 1), so `clock` carries only `ok`, `checked_at`, `offset_ms` and `stratum`. The server's name and the error text go only to the logs (`warn` and `error` lines), never to the public body (Brooke's review of PR #138).
    - **Without a `time_server`** there is no check, and `clock` is `null`.
 8. **TLS to Postgres: rustls, configured by environment** (decided by Claude).
    - **The feature:** sqlx gets `tls-rustls-ring-webpki`. It is pure Rust, so the image needs no OpenSSL, and `ring` builds with the build image's C compiler.
@@ -135,8 +136,8 @@ Decisions 1 to 6 are pgrace's answers on 2026-11-03. The rest are Claude's, each
 Checked on 2026-11-03 against `main` at `6c203f3`, the cargo registry, upstream sources and the live cluster (read-only).
 
 1. **The server code:**
-   - `Config` (`src/config.rs:41-64`) has no `time_server` field yet. Its module doc says "M7 clock check reads" it (`:2-3`).
-   - `Config::validate` (`:109-131`) returns `Err(String)`, and `Config::load` (`:140-160`) wraps it in `OkfError::Config`.
+   - `Config` (`src/config.rs:38-64`, attributes included) has no `time_server` field yet. Its module doc says "M7 clock check reads" it (`:2-3`).
+   - `Config::validate` (`:109-127`) returns `Err(String)`, and `Config::load` (`:140-157`) wraps it in `OkfError::Config`.
    - `DEFAULT_LISTEN` is `0.0.0.0:8080` (`:19-20`).
    - `App::load` (`src/app.rs:83-123`) builds every field. `App` already has `clock()` (`:136`) and `poll_until(self: Arc<Self>, shutdown)` (`:304-325`), the pattern the clock loop copies.
    - `http::serve` (`src/http/mod.rs:238-259`) spawns `poll_until` and awaits it after shutdown.
@@ -145,7 +146,7 @@ Checked on 2026-11-03 against `main` at `6c203f3`, the cargo registry, upstream 
    - The CLI's global flags are `--database-url` (env `DATABASE_URL`) and `--config` (env `OKF_MCP_CONFIG`) (`src/cli.rs:42-46`).
    - `#[command(version)]` (`:37`) prints `CARGO_PKG_VERSION`.
    - Logging reads `RUST_LOG` (`src/main.rs:23-26`).
-2. **`clock`:** `Clock: Send + Sync` with `now() -> DateTime<Utc>` (`src/clock.rs:13-16`), and `format_timestamp` (`:57`). chrono 0.4.45 has `impl Div<i32> for TimeDelta` (`time_delta.rs:576`).
+2. **`clock`:** `Clock: Send + Sync` with `now() -> DateTime<Utc>` (`src/clock.rs:13-16`), and `format_timestamp` (`:56`). chrono 0.4.45 has `impl Div<i32> for TimeDelta` (`time_delta.rs:576`).
 3. **tokio 1.54.1** (`src/net/udp.rs`):
    - `UdpSocket::bind` (`:150`), `connect` (`:348`), `send` (`:570`), `recv` (`:790`), `send_to` (`:1185`), `recv_from` (`:1326`) and `local_addr` (`:297`);
    - `net::lookup_host` (`lookup_host.rs:32`) and `time::timeout` (`time/timeout.rs:86`).
@@ -250,7 +251,7 @@ pub async fn query(server: &str, clock: &dyn Clock, timeout: std::time::Duration
 pub const CHECK_INTERVAL: Duration;   // 15 minutes
 pub const QUERY_TIMEOUT: Duration;    // 5 seconds
 pub const MAX_OFFSET_MS: i64;         // 2000
-pub struct ClockStatus { pub server: String, pub checked_at: String, pub offset_ms: Option<i64>, pub stratum: Option<u8>, pub error: Option<String> }
+pub struct ClockStatus { pub ok: bool, pub checked_at: String, pub offset_ms: Option<i64>, pub stratum: Option<u8> }
 pub async fn check_once(server: &str, clock: &dyn Clock, timeout: Duration) -> ClockStatus;
 
 // src/config.rs (Task 3)
@@ -264,7 +265,7 @@ impl App {
 }
 ```
 
-`/healthz` (Task 3): `{"database": "ok"|"unreachable", "catalogs": <n>, "clock": null | {"server", "checked_at", "offset_ms"?, "stratum"?, "error"?}}`.
+`/healthz` (Task 3): `{"database": "ok"|"unreachable", "catalogs": <n>, "clock": null | {"ok", "checked_at", "offset_ms"?, "stratum"?}}`. No server name or error text: the route is public (Decision 7).
 
 ## File map
 
@@ -319,6 +320,7 @@ M6's `delete_concept` reports `StillLinked { path: "infra/x.md", links: [{source
 - Modify: `src/okf/ops/delete.rs` (the error's `path` and each `LinkSource.source`; tests)
 - Modify: `src/error.rs` (`LinkSource::source`'s doc; the `StillLinked` variant's doc)
 - Modify: `src/mcp/restructure.rs` (one test expectation)
+- Modify: `src/error.rs` and `src/http/mod.rs` (their `StillLinked` test fixtures)
 - Modify: `tests/smoke.rs` (one expectation in `restructuring_on_a_real_catalog`)
 - Modify: `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md` ("Errors", the `StillLinked` row)
 - Create: `changelog/<ts>-m7-task-01-still-linked-slash.md`
@@ -349,6 +351,8 @@ In `src/mcp/restructure.rs` (the delete test near line 432):
 ```
 
 In `tests/smoke.rs` (near line 511): `json!([{"source": "/m6-smoke/moved.md", "line": 15}])`.
+
+Two tests build a `StillLinked` themselves and keep passing either way. Give them the real shape too, so they document it: `src/error.rs` (near line 362, and its expected JSON near line 377) and `src/http/mod.rs` (near line 359). Use `/hub.md`-style paths in both (Brooke's review of PR #138).
 
 - [ ] **Step 2: Run them to see them fail**
 
@@ -396,7 +400,7 @@ The design's `StillLinked` row in "Errors" says that `path` and each source are 
 Run every gate. Commit:
 
 ```bash
-git add src/okf/ops/delete.rs src/error.rs src/mcp/restructure.rs tests/smoke.rs docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md changelog/
+git add src/okf/ops/delete.rs src/error.rs src/http/mod.rs src/mcp/restructure.rs tests/smoke.rs docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md changelog/
 git commit -m "fix: StillLinked paths start with a slash, like every other tool path (M7.01)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -887,7 +891,7 @@ git commit -m "feat: an SNTPv4 client for the clock check (M7.02)" -m "Co-Author
 
 ### Task 3: the clock check and `/healthz`'s `clock`
 
-The design's "Time", made real. `time_server` is read from the config, and is optional and non-blank. `check_once` measures the offset and logs. `App` keeps the last `ClockStatus`. `App::check_clock_until` runs a check at startup and every 15 minutes until shutdown, and `http::serve` spawns it beside the poll loop. `/healthz` adds `clock`, the last status or `null`. Its HTTP status still depends only on the database (Decision 7).
+The design's "Time", made real. `time_server` is read from the config, and is optional and non-blank. `check_once` measures the offset and logs. `App` keeps the last `ClockStatus`. `App::check_clock_until` runs a check at startup and every 15 minutes until shutdown, and `http::serve` spawns it beside the poll loop. `/healthz` adds `clock`, the last status or `null`, with coarse fields only. Its HTTP status still depends only on the database (Decision 7).
 
 **Files:**
 - Create: `src/clock_check.rs`
@@ -971,11 +975,13 @@ pub const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// The largest offset, in milliseconds, that is not logged as an error.
 pub const MAX_OFFSET_MS: i64 = 2_000;
 
-/// The last check, as `/healthz` shows it.
+/// The last check, as `/healthz` shows it. Coarse on purpose: the route
+/// needs no key and is public, so the server's name and the error text go to
+/// the logs only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClockStatus {
-    /// The `time_server` asked.
-    pub server: String,
+    /// Whether the server answered with a usable reply.
+    pub ok: bool,
     /// When the check ran (a catalog timestamp, from our clock).
     pub checked_at: String,
     /// The server's clock minus ours, in milliseconds; absent on failure.
@@ -984,12 +990,9 @@ pub struct ClockStatus {
     /// The server's stratum; absent on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stratum: Option<u8>,
-    /// Why the check failed; absent on success.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
-/// Runs one check and logs its outcome.
+/// Runs one check and logs its outcome (with the server and the error).
 ///
 /// # Arguments
 /// * `server` - the `time_server`.
@@ -997,7 +1000,7 @@ pub struct ClockStatus {
 /// * `timeout` - the limit for the query ([`QUERY_TIMEOUT`] in the server).
 ///
 /// # Returns
-/// The status: an offset and stratum, or the error in words.
+/// The status: an offset and stratum, or `ok: false`.
 pub async fn check_once(server: &str, clock: &dyn Clock, timeout: Duration) -> ClockStatus {
     let checked_at = format_timestamp(clock.now());
     match ntp::query(server, clock, timeout).await {
@@ -1009,21 +1012,19 @@ pub async fn check_once(server: &str, clock: &dyn Clock, timeout: Duration) -> C
                 tracing::debug!(server, offset_ms, stratum = reading.stratum, "clock checked");
             }
             ClockStatus {
-                server: server.to_string(),
+                ok: true,
                 checked_at,
                 offset_ms: Some(offset_ms),
                 stratum: Some(reading.stratum),
-                error: None,
             }
         }
         Err(error) => {
             tracing::warn!(%error, "the clock check failed");
             ClockStatus {
-                server: server.to_string(),
+                ok: false,
                 checked_at,
                 offset_ms: None,
                 stratum: None,
-                error: Some(error.to_string()),
             }
         }
     }
@@ -1052,11 +1053,10 @@ mod tests {
         assert_eq!(
             status,
             ClockStatus {
-                server,
+                ok: true,
                 checked_at: "2026-11-03T12:00:00Z".to_string(),
                 offset_ms: Some(5_000),
                 stratum: Some(1),
-                error: None,
             }
         );
     }
@@ -1069,22 +1069,20 @@ mod tests {
 
         let status = check_once(&server, &clock, Duration::from_millis(200)).await;
 
-        assert_eq!((status.offset_ms, status.stratum), (None, None));
-        assert!(status.error.as_deref().is_some_and(|e| e.contains("did not answer")));
+        assert_eq!((status.ok, status.offset_ms, status.stratum), (false, None, None));
     }
 
     #[test]
-    fn a_status_serializes_only_what_it_has() {
+    fn a_status_names_no_server_and_no_error() {
         let failed = ClockStatus {
-            server: "time.example".to_string(),
+            ok: false,
             checked_at: "2026-11-03T12:00:00Z".to_string(),
             offset_ms: None,
             stratum: None,
-            error: Some("no".to_string()),
         };
         assert_eq!(
             serde_json::to_value(&failed).unwrap(),
-            serde_json::json!({"server": "time.example", "checked_at": "2026-11-03T12:00:00Z", "error": "no"})
+            serde_json::json!({"ok": false, "checked_at": "2026-11-03T12:00:00Z"})
         );
     }
 }
@@ -1146,15 +1144,18 @@ In `src/app.rs`, the import `use crate::clock_check::{self, ClockStatus};`. The 
             // The first tick completes at once: the startup check.
             tokio::select! {
                 () = shutdown.cancelled() => return,
-                _ = ticks.tick() => {
-                    let status = clock_check::check_once(
-                        &server,
-                        self.clock(),
-                        clock_check::QUERY_TIMEOUT,
-                    )
-                    .await;
-                    self.set_clock_status(status);
-                }
+                _ = ticks.tick() => {}
+            }
+            let check = clock_check::check_once(
+                &server,
+                self.clock(),
+                clock_check::QUERY_TIMEOUT,
+            );
+            // A stop during a query ends it at once instead of waiting up to
+            // `QUERY_TIMEOUT` (Brooke's review of PR #138).
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                status = check => self.set_clock_status(status),
             }
         }
     }
@@ -1192,8 +1193,7 @@ Tests in `src/app.rs`'s test module (use `crate::mcp::testing::app_with`, as the
             .expect("the loop stops when cancelled")
             .expect("the loop does not panic");
 
-        assert_eq!(status.server, server.to_string());
-        assert_eq!(status.error, None);
+        assert!(status.ok, "{status:?}");
         // Both ends read the system clock: the offset is a few ms at most.
         assert!(status.offset_ms.is_some_and(|ms| ms.abs() < 1_000), "{status:?}");
     }
@@ -1255,11 +1255,10 @@ A test in `src/http/mod.rs`'s test module:
             .unwrap();
         let before = json_body(before).await;
         test.app.set_clock_status(ClockStatus {
-            server: "time.example".to_string(),
+            ok: false,
             checked_at: "2026-11-03T12:00:00Z".to_string(),
             offset_ms: None,
             stratum: None,
-            error: Some("time.example did not answer within 5s".to_string()),
         });
 
         let after = router(Arc::clone(&test.app), &CancellationToken::new())
@@ -1272,7 +1271,10 @@ A test in `src/http/mod.rs`'s test module:
         assert_eq!(before["clock"], serde_json::Value::Null);
         assert_eq!(status, StatusCode::OK);
         assert_eq!(after["database"], "ok");
-        assert_eq!(after["clock"]["error"], "time.example did not answer within 5s");
+        assert_eq!(
+            after["clock"],
+            serde_json::json!({"ok": false, "checked_at": "2026-11-03T12:00:00Z"})
+        );
     }
 ```
 
@@ -1283,7 +1285,7 @@ Run the gates.
 - [ ] **Step 5: The design**
 
 - **"Time":** after "logs at `error` if the offset exceeds 2 seconds", add "(and at `warn` when the query fails; the query times out after 5 seconds, DNS included)".
-- **"Time":** replace "`/healthz` reports the last offset" with "`/healthz` reports the last check (`clock`: `server`, `checked_at`, and `offset_ms` and `stratum`, or `error`; `null` without a `time_server`). It never changes `/healthz`'s status: a time-server outage must not take the server out of service."
+- **"Time":** replace "`/healthz` reports the last offset" with "`/healthz` reports the last check (`clock`: `ok`, `checked_at`, and `offset_ms` and `stratum` when it succeeded; `null` without a `time_server`). The server's name and any error go only to the logs, since `/healthz` is public. It never changes `/healthz`'s status: a time-server outage must not take the server out of service."
 - **`/healthz` row:** replace "The clock offset joins it in M7" with "plus `clock`, the last clock check (see "Time"), which does not affect the status".
 - **"Configuration":** the sentence "Each milestone reads only its own fields (M3: ...; M4: the rest except `time_server`, which M7's clock check reads)" becomes "...M4: the rest except `time_server`; M7: `time_server`, optional: without it there is no clock check".
 
@@ -1763,7 +1765,7 @@ This task changes other systems. Its PR in this repo carries only:
   - **Argo:** the `okf-mcp` app reaches Synced and Healthy.
   - **Database:** `okf-mcp-db` is 3/3 with `ContinuousArchiving` True.
   - **Server:** the pod is Ready, and the certificate is issued.
-  - **`/healthz`:** `curl -s https://okf-mcp.k.vsix.me/healthz` gives `{"database":"ok","catalogs":0,"clock":{...}}`. `clock.offset_ms` is small and has no `error`. If `clock.error` shows DNS failure, set `time_server` to the address and record it.
+  - **`/healthz`:** `curl -s https://okf-mcp.k.vsix.me/healthz` gives `{"database":"ok","catalogs":0,"clock":{...}}`. `clock.ok` is true and `clock.offset_ms` is small. If `clock.ok` is false, read the pod's `warn` line for the cause. If it is DNS, set `time_server` to the address; that value stays in the private ConfigMap and never reaches `/healthz`.
   - **TLS:** on the database's primary, every `okf_mcp` connection is encrypted: `SELECT bool_and(ssl) FROM pg_stat_ssl JOIN pg_stat_activity USING (pid) WHERE usename = 'okf_mcp'` is true.
   - **Backup:** take an on-demand backup with the plugin method and wait for `completed`. If it fails like the other cluster's (kubelet 502), record the node and error in the private catalog's things-to-fix and tell pgrace. Don't work around it.
 
@@ -1816,9 +1818,11 @@ SELECT (SELECT count(*) FROM catalogs) AS catalogs,
   - **no `plugins` section**, so it never archives into the source's path;
   - `storage.size: 10Gi`.
 
-- [ ] **Step 3: Compare.** When it is Ready, run the same query on it.
-  - Counts must match those taken before the backup. Later writes may make the live counts larger, and that is expected.
-  - Check one document's content matches: pick a path and compare `sha256(content)` on both.
+- [ ] **Step 3: Compare.** When it is Ready, run the same query on it and, at the same moment, on the live database.
+  - **The restore replays the archived WAL to its end**, so it should match the live database as of the last archived segment, not only the counts taken before the backup.
+  - **Hold writes for the drill.** Ask pgrace not to publish while it runs. Then the restored counts must equal the live ones.
+  - **If the live database moved anyway:** require pre-backup ≤ restored ≤ live for each count, and explain any gap from the WAL archive's timing (Brooke's review of PR #138). Never accept fewer rows than were taken before the backup.
+  - **Content:** check that one document's content matches by comparing `sha256(content)` for a chosen path on both.
 
 - [ ] **Step 4: Clean up.** Delete the scratch `Cluster` and its PVCs (`kubectl delete cluster okf-mcp-db-restore`; CNPG removes its PVCs). Confirm nothing named `okf-mcp-db-restore*` is left.
 
