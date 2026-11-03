@@ -35,8 +35,9 @@ use crate::mcp::OkfServer;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The timeout layer for `/healthz` and the export route:
-/// [`REQUEST_TIMEOUT`], then 503. Not 408, which says the *client* was slow to send its request (and
-/// which some clients and proxies retry on their own).
+/// [`REQUEST_TIMEOUT`], then 503. Not 408, which says the *client* was slow
+/// to send its request (and which some clients and proxies retry on their
+/// own).
 ///
 /// # Returns
 /// The layer, for `Router::layer`.
