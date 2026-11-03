@@ -158,7 +158,8 @@ Each milestone reads only its own fields (M3: `max_import_bytes`; M4: the rest e
 `time_server`; M7: `time_server`, optional: without it there is no clock check); unknown
 keys are ignored, so one file serves every version. A zero `poll_interval` or
 `session_idle_timeout`, an empty `allowed_hosts` (which rmcp would read as "accept any
-host") or a blank entry in it, or a blank `time_server`, is refused at load.
+host") or a blank entry in it, or a `time_server` that is blank or has surrounding
+whitespace, is refused at load.
 
 Catalogs and keys are not in the config; they are rows. The only secret is
 `DATABASE_URL`, from an environment variable backed by a k8s Secret (CNPG generates

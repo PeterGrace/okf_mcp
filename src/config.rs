@@ -109,7 +109,8 @@ impl Config {
     /// `session_idle_timeout`, an empty `allowed_hosts` (which rmcp reads as
     /// "accept any `Host`"), or a blank entry in it (which no `Host` matches,
     /// so every request would get 403 with no hint why), or a blank
-    /// `time_server`.
+    /// `time_server` or one with surrounding whitespace (which the lookup
+    /// would fail on every check, seen only as a `warn`).
     pub fn validate(&self) -> Result<(), String> {
         if self.poll_interval.is_zero() {
             return Err("poll_interval must be more than zero".to_string());
@@ -127,14 +128,16 @@ impl Config {
         if self.allowed_hosts.iter().any(|host| host.trim().is_empty()) {
             return Err("allowed_hosts has a blank entry; remove it or name a host".to_string());
         }
-        // `as_deref` turns `&Option<String>` into `Option<&str>`, and
-        // `is_some_and` is `x is not None and pred(x)` in one call.
-        if self
-            .time_server
-            .as_deref()
-            .is_some_and(|server| server.trim().is_empty())
-        {
-            return Err("time_server is blank; name the NTP server or leave it out".to_string());
+        // `if let Some(x) = ...`: Python's `if (x := ...) is not None`.
+        // `as_deref` turns `&Option<String>` into `Option<&str>`.
+        if let Some(server) = self.time_server.as_deref() {
+            let trimmed = server.trim();
+            if trimmed.is_empty() {
+                return Err("time_server is blank; name the NTP server or leave it out".to_string());
+            }
+            if trimmed != server {
+                return Err("time_server has surrounding whitespace; remove it".to_string());
+            }
         }
         Ok(())
     }
@@ -217,6 +220,7 @@ mod tests {
         let none = Config::from_toml("").unwrap();
         let named = Config::from_toml("time_server = \"time.example\"\n").unwrap();
         let blank = Config::from_toml("time_server = \"  \"\n").unwrap();
+        let padded = Config::from_toml("time_server = \" time.example\\t\"\n").unwrap();
 
         assert_eq!(none.time_server, None);
         assert_eq!(named.time_server.as_deref(), Some("time.example"));
@@ -224,6 +228,10 @@ mod tests {
         assert_eq!(
             blank.validate(),
             Err("time_server is blank; name the NTP server or leave it out".to_string())
+        );
+        assert_eq!(
+            padded.validate(),
+            Err("time_server has surrounding whitespace; remove it".to_string())
         );
     }
 
