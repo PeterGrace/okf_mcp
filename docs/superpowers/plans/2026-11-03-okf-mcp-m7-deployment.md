@@ -1480,9 +1480,18 @@ async fn verify_full_refuses_a_server_another_ca_signed() {
         .connect(&verify_full_url(port, root.path()))
         .await;
 
-    assert!(refused.is_err(), "connected to a server the CA did not sign");
+    // Refused for the certificate, not for any reason: a refused or dropped
+    // connection must not pass. sqlx reports rustls's verdict as an I/O
+    // error during the handshake, so the check reads rustls's name for it.
+    let error = refused.expect_err("connected to a server the CA did not sign");
+    assert!(
+        error.to_string().contains("UnknownIssuer"),
+        "refused for another reason than the certificate's issuer: {error}"
+    );
 }
 ```
+
+> **Corrected (issue #143), 2026-11-03.** The refusal test asserted only `is_err()`, which a connection refused for any reason (a container not yet listening, say) would also pass. It now requires rustls's `UnknownIssuer`. sqlx 0.9.0 reports it as `sqlx::Error::Io` ("error communicating with database: invalid peer certificate: UnknownIssuer"), not `sqlx::Error::Tls`, so the check reads the message rather than matching a variant. The start script worked as written: `docker-entrypoint.sh` ran `sh -c` as root, and busybox `install -o postgres` installed the key. `tests/tls.rs` has the shipped code.
 
 Run: `cargo test --test tls`
 Expected: compile error on `rcgen` (not a dependency yet). Once Step 2 adds rcgen but not the TLS feature, the first test fails: sqlx without a TLS implementation can't do `verify-full`.

@@ -168,6 +168,10 @@ compares with stored hashes, which does not help recover a key (SHA-256 is
 preimage-resistant, and `std`'s `HashMap` hasher is randomly keyed), so there is no
 constant-time scan.
 
+TLS to Postgres is turned on by the environment, as for libpq: `PGSSLMODE=verify-full`
+and `PGSSLROOTCERT` (a file with the database's CA certificate). sqlx reads them beneath
+the URL, so the URL itself needs no `sslmode`. The image's sqlx uses rustls.
+
 ### Storage
 
 One Postgres database. Migrations live in `migrations/` and are embedded with
