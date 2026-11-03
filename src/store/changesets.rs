@@ -969,6 +969,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn the_prune_passes_by_a_changeset_get_or_create_found_and_holds() {
+        let db = test_db().await;
+        let pg = setup(&db.pool).await;
+        let alice = key(pg, "alice", "default");
+        let existing = open(&db.pool, &alice, now()).await;
+        let mut writer = db.pool.begin().await.unwrap();
+        lock_catalog(&mut writer, pg).await.unwrap();
+        // The changeset exists, so this takes the conflict path: the
+        // `FOR UPDATE` read, which holds the row until `writer` ends.
+        let found = get_or_create(&mut writer, &alice, "alice", now())
+            .await
+            .unwrap();
+        let cutoff = now() + TimeDelta::hours(1);
+
+        // `SKIP LOCKED`: the prune neither waits for `writer` nor discards
+        // the changeset it holds, though it is empty and idle past the cutoff.
+        let while_held = tokio::time::timeout(PATIENCE, prune_empty(&db.pool, cutoff, now()))
+            .await
+            .expect("the prune must skip the held row, not wait for it")
+            .unwrap();
+        let state_while_held = by_id(&db.pool, existing.id).await.unwrap().unwrap().state;
+        writer.rollback().await.unwrap();
+        let after = prune_empty(&db.pool, cutoff, now()).await.unwrap();
+
+        assert_eq!(found.id, existing.id);
+        assert_eq!((while_held, state_while_held), (0, ChangesetState::Open));
+        assert_eq!(after, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_deadlock_reported_by_postgres_is_busy() {
         let db = test_db().await;
 
