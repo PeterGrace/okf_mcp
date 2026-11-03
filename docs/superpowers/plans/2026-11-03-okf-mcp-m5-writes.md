@@ -1651,7 +1651,7 @@ Expected: the 11 new `store::changesets` tests and `busy_is_503_and_says_to_retr
 
 In `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md`:
 
-1. "Decisions", the "Write grouping" row: "One changeset per (catalog, key, label), created on first write and kept in the database until published or discarded; explicit `publish`. The label is the connection's `X-OKF-Changeset` header, else `?changeset=`, else its `Mcp-Session-Id`, else `default`".
+1. "Decisions", the "Write grouping" row: "One changeset per (catalog, key, label), created on first write and kept in the database until published or discarded; explicit `publish`. The label is the connection's `X-OKF-Changeset` header, else `?changeset=`, else `default` (never the MCP session id, which changes on every reconnect)".
 2. "Storage", the `changesets` row: "One open per (catalog, key, label): `id`, `catalog_id`, `label`, `key_id`, `actor`, `state` (`open`, `published`, `discarded`), `version` (bumped by every change to it or its entries; overlay caches key on it), `created_at`, `updated_at`". In the constraints paragraph: "`changesets` has a partial unique index on `(catalog_id, key_id, label) WHERE state = 'open'`, so a racing get-or-create cannot open two changesets for one identity". Add a paragraph after it:
 
    > **Lock order.** Every transaction that writes changesets or entries takes the catalog row `FOR KEY SHARE` first, then the changeset row (the `UPDATE` that bumps `version`), then entries. `catalog delete` takes the catalog row `FOR UPDATE`, then the open changesets in id order, so writes and deletes wait for each other instead of deadlocking; a write that waited finds the catalog gone and writes nothing. The 24-hour prune takes no catalog lock and skips changesets other transactions hold (`SKIP LOCKED`). A deadlock or serialization failure Postgres still reports (`40P01`, `40001`) is the `Busy` error, which says to retry.
@@ -2665,7 +2665,7 @@ pub fn source(
 - [ ] **Step 5: Run the unit tests**
 
 Run: `cargo test --lib -- okf::ops okf::doc::tests::remove_lines`
-Expected: 15 passed (14 in `okf::ops::frontmatter`, 1 in `okf::doc`).
+Expected: 14 passed (13 in `okf::ops::frontmatter`, 1 in `okf::doc`).
 
 - [ ] **Step 6: The parity script and the shim's `ops` command**
 
@@ -3046,7 +3046,7 @@ Task 2 of `docs/superpowers/plans/2026-11-03-okf-mcp-m5-writes.md` (milestone 5)
   `notes`), `StampField`, `SourceEntry`, `LogKind`, and the crate-internal helpers
   `load_concept`, `save`, `stamp_value`, `refused`.
 - `src/okf/ops/frontmatter.rs`: `stamp`, `review`, `question`, `unquestion`, `source`,
-  `OUTCOMES`; ports of `okf.py:653-750`, with 14 unit tests on a `MemWorkspace` with a
+  `OUTCOMES`; ports of `okf.py:653-750`, with 13 unit tests on a `MemWorkspace` with a
   frozen clock.
 - `src/okf/ops/replay.rs`: the `ReplayOp` type (Task 3 adds its functions).
 - `Doc::remove_lines`, for `unquestion`'s single-item removal.
@@ -4301,7 +4301,7 @@ pub use replay::{insert_index_bullet_text, log_text, replay, ReplayOp};
 - [ ] **Step 4: Run the unit tests**
 
 Run: `cargo test --lib -- okf::ops okf::analysis::links`
-Expected: Task 2's 14 tests, 14 new ones in `okf::ops::replay` (2 of them Hegel properties), 7 in `okf::ops::log_index`, and the links tests all pass. Run `cargo test --doc -- okf::ops` too: the `replay` and `log_text` examples pass.
+Expected: Task 2's 14 tests (13 in `okf::ops::frontmatter`, 1 in `okf::doc`), 14 new ones in `okf::ops::replay` (2 of them Hegel properties), 7 in `okf::ops::log_index`, and the links tests all pass. Run `cargo test --doc -- okf::ops` too: the `replay` and `log_text` examples pass.
 
 - [ ] **Step 5: Extend the parity script and shim**
 
