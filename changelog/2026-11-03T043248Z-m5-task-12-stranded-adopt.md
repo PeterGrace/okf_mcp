@@ -18,9 +18,10 @@ Issue #97 (epic #89). Plan: `docs/superpowers/plans/2026-11-03-okf-mcp-m5-writes
   changeset needs `write`, another key's needs `admin` (`Forbidden` otherwise). An unknown id,
   a closed changeset and one in an unreachable catalog get the same `Refused`, so a key cannot
   probe. It is refused while this connection already has another open changeset in that catalog.
-  If the changeset changes between the access check and the relabel (its `version` moved by
-  more than the relabel's bump), the call answers `Busy` and rolls back.
-- `App::poll` ends each pass by discarding empty open changesets whose last change is over
+  The open, access and ownership checks run on the changeset as re-read under its row lock
+  (`changesets::lock`, after `lock_catalog`), so a concurrent adoption, publish, discard or
+  prune is either seen or waits. (As revised in review; see `*-m5-task-12-review.md`.)
+- Every `App::poll` pass, right after the key reload, discards empty open changesets whose last change is over
   24 hours old (`EMPTY_CHANGESET_HOURS`). A failure is logged at `error` and retried at the
   next pass. It doesn't fail the pass.
 - Tests: six in `mcp::changesets::lifecycle_tests` and
@@ -36,4 +37,5 @@ Issue #97 (epic #89). Plan: `docs/superpowers/plans/2026-11-03-okf-mcp-m5-writes
 
 - The changeset's `actor` stays the opener's after adoption; Task 10's `publish` should record
   the publishing key's actor.
-- Plan: a dated Corrected note on Task 12 records the `version` check.
+- Plan: a dated Corrected note on Task 12 records the locked re-read and the new `stranded`
+  filters.
