@@ -23,7 +23,7 @@
 - Rust 2021 (toolchain 1.99.1). Everything M1 to M6 use.
 - New: the sqlx feature `tls-rustls-ring-webpki`, and the dev-dependency `rcgen` 0.14.10 (test certificates).
 - Docker BuildKit and GitHub Actions (`docker/build-push-action`).
-- k3s with Argo CD, CloudNativePG 1.28.1 and plugin-barman-cloud v0.15.0, ingress-nginx and cert-manager, and Harbor's ghcr.io pull-through cache.
+- k3s with Argo CD, CloudNativePG 1.28.1 and plugin-barman-cloud v0.15.0, ingress-nginx and cert-manager, and the cluster's registry mirror (a ghcr.io pull-through cache).
 
 ---
 
@@ -68,7 +68,7 @@ Deliberately deferred:
 Decisions 1 to 6 are pgrace's answers on 2026-11-03. The rest are Claude's, each marked **(decided by Claude)**.
 
 1. **Exposure: public, keys only (pgrace).** `https://okf-mcp.k.vsix.me`, through ingress-nginx with a `letsencrypt-prod` certificate, as the autobots API is. `*.k.vsix.me` is a wildcard that already resolves to the ingress, so no DNS change is needed. Every route but `/healthz` needs a bearer key (M4). `/healthz` names no catalog (a count only), no secret and no internal host: its `clock` carries only coarse fields (Decision 7). `allowed_hosts` is `["okf-mcp.k.vsix.me"]`.
-2. **Database: a new CNPG cluster (pgrace).** `okf-mcp-db`, 3 instances, in namespace `okf-mcp`. Its database and owner are `okf_mcp`. `spec.imageName` is the `r.gfpd.us` mirror path, as every CNPG `Cluster` on this cluster must be.
+2. **Database: a new CNPG cluster (pgrace).** `okf-mcp-db`, 3 instances, in namespace `okf-mcp`. Its database and owner are `okf_mcp`. `spec.imageName` is the cluster's image-mirror path for the PostgreSQL image, as every CNPG `Cluster` on this cluster must be (the private catalog's CNPG playbook explains why).
 3. **Backups: barman-cloud to Garage (pgrace).**
    - plugin-barman-cloud is the WAL archiver, writing to a bucket of its own with a key allowed only on that bucket. A daily `ScheduledBackup` takes a base backup. Retention is 30 days.
    - The credentials come from Vault through an `ExternalSecret`.
@@ -86,7 +86,7 @@ Decisions 1 to 6 are pgrace's answers on 2026-11-03. The rest are Claude's, each
    - **Build:** `.github/workflows/image.yml` runs on a `v*` tag (and on manual dispatch). It builds the `Dockerfile` and pushes `ghcr.io/petergrace/okf-mcp:<version>` and `:sha-<short>` with the built-in `GITHUB_TOKEN` (`packages: write`). No credential lives on the workstation.
    - **Not CI:** it runs no gates. pgrace deferred CI; the gates stay local.
    - **Pinned actions:** actions are pinned to full commit SHAs with the version in a comment (verified fact 9).
-   - **Pulls:** the cluster pulls through Harbor's ghcr.io cache. Kyverno rewrites `ghcr.io/` to `r.gfpd.us/ghcrio/`, so the Deployment requests `r.gfpd.us/ghcrio/petergrace/okf-mcp:<version>` itself, as the Harbor concept advises. Anything comparing images then sees what it asked for.
+   - **Pulls:** the cluster pulls through its registry mirror's ghcr.io cache, to which an admission policy rewrites `ghcr.io/` images. So the Deployment requests the mirror's path for `petergrace/okf-mcp:<version>` itself, as the private catalog's registry concept advises. Anything comparing images then sees what it asked for. The mirror's host name stays out of this repository (Decision 5; Brooke's review of PR #138).
 7. **The NTP check is a hand-written SNTPv4 client, with no new dependency** (decided by Claude).
    - **The client:** one 48-byte request, one reply. The reply is checked for:
      - mode 4;
@@ -118,7 +118,7 @@ Decisions 1 to 6 are pgrace's answers on 2026-11-03. The rest are Claude's, each
     - **The change:** `path` and every `links[].source` are written `/a/b.md`, like every other path a tool returns. They stay catalog-relative.
     - **Why now:** before the API is reachable by other harnesses.
     - **Not changed:** other `OkfError` variants' `path` fields, which the task lists in its changelog.
-13. **Version 0.7.0** (decided by Claude). `Cargo.toml` goes from `0.1.0` to `0.7.0` (milestone 7); `okf-mcp --version` prints it. The release tag is `v0.7.0`, and the image tags are `0.7.0` and `sha-<short>`.
+13. **Version 0.7.0** (decided by Claude). `Cargo.toml` goes from `0.1.0` to `0.7.0` (milestone 7); `okf-mcp --version` prints it. The release tag is `v0.7.0`, and the image tags are `0.7.0` and `sha-<short>`, with no `:latest` (`flavor: latest=false`; deployments pin a version).
 14. **The first catalog** (decided by Claude).
     - **Catalog and import:** after the server is up, Claude creates catalog `pg` with `kubectl exec ... okf-mcp catalog create pg`, then imports the private catalog's tracked files. It copies `git archive` of `HEAD` into the pod's `/tmp` and runs `okf-mcp import pg /tmp/pg.tar.gz` there. The subcommands use `DATABASE_URL`, so no API key is involved.
     - **Keys:** pgrace creates the admin key (`okf-mcp key create ...`, which prints the key once) and keeps it.
@@ -166,7 +166,7 @@ Checked on 2026-11-03 against `main` at `6c203f3`, the cargo registry, upstream 
    - **`ObjectStore`:** `spec.configuration` with `destinationPath`, `endpointURL`, `s3Credentials.{accessKeyId,secretAccessKey}` (secret name and key), `data.compression: gzip`, `wal.compression: gzip`, and `retentionPolicy: "30d"`.
    - **`ScheduledBackup`:** `spec: {method: plugin, pluginConfiguration: {name: barman-cloud.cloudnative-pg.io}, cluster: {name}, schedule: "0 5 8 * * *", backupOwnerReference: self}`.
    - **Its backups are failing:** that cluster's daily backups have failed since 2026-10-28 with "error dialing backend ... 502", the API server not reaching one node's kubelet. Its WAL archiving works. Task 7's verification takes an on-demand backup and checks that it completes, rather than trusting the schedule.
-7. **Kyverno and Harbor:** the `replace-image-registry-ghcr` policy rewrites a pod's `ghcr.io/` images to `r.gfpd.us/ghcrio/`. Harbor's `ghcrio` project is a pull-through cache that deletes what hasn't been pulled for 7 days and fetches it again on the next pull.
+7. **The registry mirror:** an admission policy rewrites a pod's `ghcr.io/` images to the cluster's registry mirror. The mirror's ghcr.io project is a pull-through cache that deletes what hasn't been pulled for 7 days and fetches it again on the next pull. The names are in the private catalog's registry and cluster concepts.
 8. **The `argo2025` conventions** (at `a1c15d8`):
    - An app is `kustomizations/app-<name>.yaml`: an `Application` with `source.path: kustomizations/<name>`, `syncPolicy.automated {prune, selfHeal}`, `CreateNamespace=true`, and a `sync-wave` annotation.
    - It is listed in `kustomizations/kustomization.yaml`'s `resources`.
@@ -322,6 +322,7 @@ M6's `delete_concept` reports `StillLinked { path: "infra/x.md", links: [{source
 - Modify: `src/mcp/restructure.rs` (one test expectation)
 - Modify: `src/error.rs` and `src/http/mod.rs` (their `StillLinked` test fixtures)
 - Modify: `tests/smoke.rs` (one expectation in `restructuring_on_a_real_catalog`)
+- Modify: `tests/restructure.rs` (the `StillLinked` path and source, lines 263-264)
 - Modify: `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md` ("Errors", the `StillLinked` row)
 - Create: `changelog/<ts>-m7-task-01-still-linked-slash.md`
 
@@ -351,6 +352,15 @@ In `src/mcp/restructure.rs` (the delete test near line 432):
 ```
 
 In `tests/smoke.rs` (near line 511): `json!([{"source": "/m6-smoke/moved.md", "line": 15}])`.
+
+In `tests/restructure.rs` (lines 263-264, the delete refused while linked):
+
+```rust
+    assert_eq!(body["path"], "/infra/time.md");
+    assert_eq!(body["links"], json!([{"source": "/hub.md", "line": 6}]));
+```
+
+(Brooke's second review of PR #138 found these two; the first draft of this plan said the file asserted no source.)
 
 Two tests build a `StillLinked` themselves and keep passing either way. Give them the real shape too, so they document it: `src/error.rs` (near line 362, and its expected JSON near line 377) and `src/http/mod.rs` (near line 359). Use `/hub.md`-style paths in both (Brooke's review of PR #138).
 
@@ -390,7 +400,7 @@ In `src/error.rs`, `LinkSource::source`'s doc becomes "The linking document's pa
 
 - [ ] **Step 4: Run them to see them pass**
 
-Run: `cargo test --lib -- okf::ops::delete mcp::restructure`, then the full gates. `tests/restructure.rs` asserts no `StillLinked` source, so it is unaffected. Check with `grep -n '"source"' tests/restructure.rs`. Then run the release smoke test once:
+Run: `cargo test --lib -- okf::ops::delete mcp::restructure`, then the full gates, which include `tests/restructure.rs`'s updated assertions. Then run the release smoke test once:
 `OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog cargo test --release --test smoke -- --ignored restructuring_on_a_real_catalog`.
 
 - [ ] **Step 5: Design and changelog**
@@ -400,7 +410,7 @@ The design's `StillLinked` row in "Errors" says that `path` and each source are 
 Run every gate. Commit:
 
 ```bash
-git add src/okf/ops/delete.rs src/error.rs src/http/mod.rs src/mcp/restructure.rs tests/smoke.rs docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md changelog/
+git add src/okf/ops/delete.rs src/error.rs src/http/mod.rs src/mcp/restructure.rs tests/smoke.rs tests/restructure.rs docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md changelog/
 git commit -m "fix: StillLinked paths start with a slash, like every other tool path (M7.01)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -665,7 +675,11 @@ fn to_ntp(instant: DateTime<Utc>) -> u64 {
     // `as u32` keeps the low 32 bits: NTP seconds wrap in 2036, and
     // `from_ntp` undoes the wrap.
     let seconds = (instant.timestamp() + NTP_UNIX_OFFSET) as u32;
-    let fraction = (u64::from(instant.timestamp_subsec_nanos()) << 32) / 1_000_000_000;
+    // Rounded to the nearest 2^-32 s, not down: with rounding both ways a
+    // nanosecond survives the round trip exactly (the fraction is finer).
+    // The largest result, for 999_999_999 ns, is still below 2^32.
+    let fraction = ((u64::from(instant.timestamp_subsec_nanos()) << 32) + 500_000_000)
+        / 1_000_000_000;
     (u64::from(seconds) << 32) | fraction
 }
 
@@ -676,7 +690,15 @@ fn from_ntp(stamp: u64) -> Option<DateTime<Utc>> {
     if seconds & 0x8000_0000 == 0 {
         seconds += 1 << 32;
     }
-    let nanos = ((stamp & 0xFFFF_FFFF) * 1_000_000_000) >> 32;
+    // Rounded to the nearest nanosecond (`+ 2^31` before the shift). A
+    // fraction within half a nanosecond of the next second (a server may
+    // send one) rounds to 10^9, which carries into the seconds.
+    let nanos = ((stamp & 0xFFFF_FFFF) * 1_000_000_000 + (1 << 31)) >> 32;
+    let (seconds, nanos) = if nanos == 1_000_000_000 {
+        (seconds + 1, 0)
+    } else {
+        (seconds, nanos)
+    };
     Utc.timestamp_opt(seconds - NTP_UNIX_OFFSET, nanos as u32)
         .single()
 }
@@ -755,13 +777,20 @@ mod tests {
     fn timestamps_round_trip_on_both_sides_of_2036() {
         for instant in [
             at(123),
+            at(5040),
+            at(999) + TimeDelta::nanoseconds(999_999),
             Utc.with_ymd_and_hms(2040, 1, 1, 0, 0, 0).unwrap() + TimeDelta::microseconds(5),
         ] {
-            let back = from_ntp(to_ntp(instant)).unwrap();
-            // The 32-bit fraction is finer than a nanosecond is coarse, so
-            // the round trip loses at most one nanosecond.
-            assert!((back - instant).num_nanoseconds().unwrap().abs() <= 1, "{instant}");
+            // Both conversions round to nearest, and 2^-32 s is finer than a
+            // nanosecond, so the round trip is exact.
+            assert_eq!(from_ntp(to_ntp(instant)), Some(instant));
         }
+    }
+
+    #[test]
+    fn a_fraction_just_under_a_second_carries_into_the_seconds() {
+        let base = to_ntp(at(0)) & !0xFFFF_FFFF;
+        assert_eq!(from_ntp(base | 0xFFFF_FFFF), Some(at(1_000)));
     }
 
     #[test]
@@ -876,7 +905,7 @@ Expected (with `todo!()` bodies): compile errors, then panics.
 
 - [ ] **Step 3: The implementation**
 
-The code above is the implementation; replace the stubs with it. Run `cargo test --lib -- ntp`. Expected: 8 passed.
+The code above is the implementation; replace the stubs with it. Run `cargo test --lib -- ntp`. Expected: 9 passed.
 
 - [ ] **Step 4: Gates, changelog, commit**
 
@@ -1232,7 +1261,7 @@ and after the poller is awaited:
     }
 ```
 
-`Health` gains:
+`Health` gains (with `use crate::clock_check::ClockStatus;` among `src/http/mod.rs`'s imports):
 
 ```rust
     /// The last clock check (design "Time"); `null` without a `time_server`
@@ -1559,6 +1588,9 @@ jobs:
         with:
           # GHCR names are lower case.
           images: ghcr.io/petergrace/okf-mcp
+          # No `:latest`: deployments pin a version (Decision 13).
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}}
             type=sha
@@ -1715,7 +1747,7 @@ This task changes other systems. Its PR in this repo carries only:
   - Ask pgrace to OK the image build and the release tag.
   - Run the workflow on `main` first (`gh workflow run image.yml --ref main`) and watch it (`gh run watch`). It publishes `:sha-<short>` only.
   - Then tag `v0.7.0` on `main` and push the tag. The workflow publishes `:0.7.0`.
-  - Check that the package is anonymous-readable through the cluster's cache: `docker pull r.gfpd.us/ghcrio/petergrace/okf-mcp:0.7.0`.
+  - Check that the package is anonymous-readable through the cluster's cache: `docker pull <mirror>/<ghcr project>/petergrace/okf-mcp:0.7.0`, with the names from the private catalog.
   - If the pull fails because the package is private, ask pgrace to set the package's visibility to public (package settings on GitHub), then pull again.
 
 - [ ] **Step 3: Backup bucket and key (pgrace runs them).** Give pgrace the commands, adapted from the private catalog's object-store concept:
@@ -1744,7 +1776,7 @@ This task changes other systems. Its PR in this repo carries only:
     - `time_server` = the network's time server name;
     - `session_idle_timeout`, `poll_interval` and `max_import_bytes` at their defaults.
   - **`deployment.yaml`:**
-    - one replica, `strategy: Recreate`, image `r.gfpd.us/ghcrio/petergrace/okf-mcp:0.7.0`, `args: ["--config", "/etc/okf-mcp/config.toml", "serve"]`;
+    - one replica, `strategy: Recreate`, image `<mirror>/<ghcr project>/petergrace/okf-mcp:0.7.0` (Decision 6), `args: ["--config", "/etc/okf-mcp/config.toml", "serve"]`;
     - env: `DATABASE_URL` from `okf-mcp-db-app` key `uri`, `PGSSLMODE=verify-full`, `PGSSLROOTCERT=/etc/okf-mcp/pg-ca/ca.crt`, `RUST_LOG=info`;
     - volumes: the ConfigMap, secret `okf-mcp-db-ca` (item `ca.crt`), and an `emptyDir` on `/tmp`;
     - the probes and `securityContext` of Decision 10 and `docs/operations.md`;
@@ -1842,7 +1874,7 @@ SELECT (SELECT count(*) FROM catalogs) AS catalogs,
 
 - [ ] **Step 1: The design.**
   - **"Deployment":**
-    - the image is `ghcr.io/petergrace/okf-mcp`, built by `.github/workflows/image.yml` on tags with the workflow's token, and pulled through Harbor's ghcr.io cache, which Kyverno enforces;
+    - the image is `ghcr.io/petergrace/okf-mcp`, built by `.github/workflows/image.yml` on tags with the workflow's token, and pulled through the cluster's registry mirror (described generically: the mirror's name stays out of this repository);
     - the manifests are only in the Argo CD source repository (this repo is public);
     - TLS to Postgres (`verify-full`);
     - backups with plugin-barman-cloud to an object store, with a restore drill done;
@@ -1886,4 +1918,4 @@ git commit -m "docs: M7 wrap-up: README, design, milestone changelog (M7.09)" -m
   - `ClockStatus`, `check_once`, `CHECK_INTERVAL`, `QUERY_TIMEOUT`, `MAX_OFFSET_MS` (T3);
   - `App::{clock_status, set_clock_status, check_clock_until}` (T3);
   - the `okf-mcp-db`, `okf-mcp-db-app`, `okf-mcp-db-ca`, `okf-mcp-backup` and `okf-mcp-pgbackups` names (T7, T8).
-- **Nothing site-specific in this file:** no internal address, bucket name or Vault path. The host name `okf-mcp.k.vsix.me` and the mirror path are public names.
+- **Nothing site-specific in this file:** no internal address, bucket name, Vault path, registry mirror or policy name. The only site name is the public host `okf-mcp.k.vsix.me`, which Decision 1 makes public anyway.
