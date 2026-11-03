@@ -133,11 +133,11 @@ fn checked_key(key: &str) -> Result<(), OkfError> {
 ///
 /// Every refusal above comes before anything is written: the listing's
 /// folder index (or, when `ensure_index` will create it, the text it will
-/// have) is checked for `index_section` first. Only an error past that
-/// point leaves files written: a read or write failure, or `ensure_index`
-/// finding no root `index.md` to list a new folder in. As for
-/// [`ensure_index`], run the op on a scratch copy, as the write path does,
-/// and drop the copy on error.
+/// have) is checked for `index_section` first, and a missing folder index
+/// needs a root `index.md` to be listed under. Only a read or write failure
+/// past that point leaves files written; as for [`ensure_index`], run the
+/// op on a scratch copy, as the write path does, and drop the copy on
+/// error.
 pub fn create_concept(
     workspace: &dyn Workspace,
     ctx: &OpContext<'_>,
@@ -222,8 +222,9 @@ pub fn create_concept(
 ///
 /// # Errors
 /// [`OkfError::Refused`] with `list_concept`'s wording: no root `index.md`
-/// (the one folder `ensure_index` does not create), or a `section` that is
-/// not a heading of the index.
+/// when the folder's index is missing (`ensure_index` creates every other
+/// folder index, but needs the root's to list them in), or a `section`
+/// that is not a heading of the index.
 fn check_listing(
     workspace: &dyn Workspace,
     concept: &str,
@@ -233,7 +234,10 @@ fn check_listing(
     let index_path = join(folder, "index.md");
     let text = if workspace.exists(&index_path) {
         workspace.read_text(&index_path)?
-    } else if folder.is_empty() {
+    } else if !workspace.exists("index.md") {
+        // `ensure_index` creates every missing folder index below the root,
+        // then lists the topmost new folder in the root's: so the root
+        // `index.md` (this one, for a root concept) must already exist.
         return Err(refused("no index.md in /; create it first".to_string()));
     } else {
         new_index_text(folder)
@@ -660,6 +664,11 @@ mod tests {
         let new_folder = create_concept(&ws, &ctx(), &listed("ops/c", "Hosts")).unwrap_err();
         let rootless = MemWorkspace::from_files([("infra/index.md", infra)]);
         let no_root = create_concept(&rootless, &ctx(), &listed("c", "Hosts")).unwrap_err();
+        let nested = NewConcept {
+            index_section: None,
+            ..listed("ops/new/c", "Hosts")
+        };
+        let nested_no_root = create_concept(&rootless, &ctx(), &nested).unwrap_err();
 
         assert_eq!(
             read(&ws, "infra/index.md"),
@@ -681,7 +690,9 @@ mod tests {
         assert!(!ws.exists("infra/c.md"));
         assert!(!ws.exists("ops/c.md") && !ws.exists("ops/index.md"));
         assert_eq!(read(&ws, "index.md"), ROOT_INDEX);
+        assert_eq!(refusal(nested_no_root), "no index.md in /; create it first");
         assert!(!rootless.exists("c.md"));
+        assert!(!rootless.exists("ops/new/c.md") && !rootless.exists("ops/new/index.md"));
     }
 
     #[test]

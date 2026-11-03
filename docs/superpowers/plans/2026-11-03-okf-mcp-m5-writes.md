@@ -4587,7 +4587,7 @@ git commit -m "feat: okf::ops log, index, ensure_index and idempotent replay (M5
 > - After review of PR #109 (2026-11-03): `EditMismatch` reads "it must occur exactly once, or at least once with replace_all" (Step 1); a shared `non_blank` check makes `create_concept` refuse a blank `title` for a listing and makes `set_frontmatter` refuse a `type` that is not a non-blank string (`type must be a non-blank string; every concept needs one`); `create_concept` refuses `index_section` without `index_summary`; A 14th test, `create_concept_lists_it_under_the_named_section`, covers `index_section`, and the edit test pins `check_path`'s machinery reason.
 > - After the second review of PR #109 (2026-11-03):
 >   - `edit_document` and `replace_body` refuse a result whose frontmatter differs from the original's, in presence or in any line (`keeps_frontmatter`). On a document without frontmatter, including an `index.md`, the refusal is okf.py's "has no frontmatter; add it with your editor first". This closes a hole: text written into such a document could become a `---` block and forge `generated`, `verified` or `reviewed`.
->   - `create_concept` checks its listing before writing anything (`check_listing`): the folder's `index.md`, or the text `ensure_index` will write for a new folder, must have `index_section`, and a root concept needs a root `index.md`. So a listing refusal has no side effects. Only an I/O error, or `ensure_index` finding no root `index.md`, leaves files written.
+>   - `create_concept` checks its listing before writing anything (`check_listing`): the folder's `index.md`, or the text `ensure_index` will write for a new folder, must have `index_section`, and a root concept needs a root `index.md`. So a listing refusal has no side effects. After the third review, a missing folder index also needs a root `index.md`, because `ensure_index` lists the topmost new folder there. So a nested new folder in a catalog without one is refused up front, and only an I/O error leaves files written.
 >   - A 15th test, `edit_and_replace_body_refuse_to_add_frontmatter`, covers the forgery on a concept and on an `index.md`.
 >   - `non_blank` keeps returning the title unstripped, because okf.py's `cmd_index` lists `title` as written.
 >
@@ -4879,6 +4879,11 @@ mod tests {
         let new_folder = create_concept(&ws, &ctx(), &listed("ops/c", "Hosts")).unwrap_err();
         let rootless = MemWorkspace::from_files([("infra/index.md", infra)]);
         let no_root = create_concept(&rootless, &ctx(), &listed("c", "Hosts")).unwrap_err();
+        let nested = NewConcept {
+            index_section: None,
+            ..listed("ops/new/c", "Hosts")
+        };
+        let nested_no_root = create_concept(&rootless, &ctx(), &nested).unwrap_err();
 
         assert_eq!(
             read(&ws, "infra/index.md"),
@@ -4900,7 +4905,9 @@ mod tests {
         assert!(!ws.exists("infra/c.md"));
         assert!(!ws.exists("ops/c.md") && !ws.exists("ops/index.md"));
         assert_eq!(read(&ws, "index.md"), ROOT_INDEX);
+        assert_eq!(refusal(nested_no_root), "no index.md in /; create it first");
         assert!(!rootless.exists("c.md"));
+        assert!(!rootless.exists("ops/new/c.md") && !rootless.exists("ops/new/index.md"));
     }
 
     #[test]
@@ -5391,11 +5398,11 @@ fn checked_key(key: &str) -> Result<(), OkfError> {
 ///
 /// Every refusal above comes before anything is written: the listing's
 /// folder index (or, when `ensure_index` will create it, the text it will
-/// have) is checked for `index_section` first. Only an error past that
-/// point leaves files written: a read or write failure, or `ensure_index`
-/// finding no root `index.md` to list a new folder in. As for
-/// [`ensure_index`], run the op on a scratch copy, as the write path does,
-/// and drop the copy on error.
+/// have) is checked for `index_section` first, and a missing folder index
+/// needs a root `index.md` to be listed under. Only a read or write failure
+/// past that point leaves files written; as for [`ensure_index`], run the
+/// op on a scratch copy, as the write path does, and drop the copy on
+/// error.
 pub fn create_concept(
     workspace: &dyn Workspace,
     ctx: &OpContext<'_>,
@@ -5480,8 +5487,9 @@ pub fn create_concept(
 ///
 /// # Errors
 /// [`OkfError::Refused`] with `list_concept`'s wording: no root `index.md`
-/// (the one folder `ensure_index` does not create), or a `section` that is
-/// not a heading of the index.
+/// when the folder's index is missing (`ensure_index` creates every other
+/// folder index, but needs the root's to list them in), or a `section`
+/// that is not a heading of the index.
 fn check_listing(
     workspace: &dyn Workspace,
     concept: &str,
@@ -5491,7 +5499,10 @@ fn check_listing(
     let index_path = join(folder, "index.md");
     let text = if workspace.exists(&index_path) {
         workspace.read_text(&index_path)?
-    } else if folder.is_empty() {
+    } else if !workspace.exists("index.md") {
+        // `ensure_index` creates every missing folder index below the root,
+        // then lists the topmost new folder in the root's: so the root
+        // `index.md` (this one, for a root concept) must already exist.
         return Err(refused("no index.md in /; create it first".to_string()));
     } else {
         new_index_text(folder)
@@ -8046,6 +8057,8 @@ One function, `write::apply`, carries every write tool's call into the database:
 
 The four content tools (`create_concept`, `edit_document`, `replace_body`, `set_frontmatter`) are thin wrappers over it. Nothing is visible to other connections until `publish` (Task 10).
 
+> **Path forms (issue #94, review of PR #109, 2026-11-03).** Each tool's schema states the path form it takes: `edit_document` takes a full `.md` path (a concept or an `index.md`; `infra/x` is `InvalidPath`), while `replace_body` and `set_frontmatter` take a concept reference (`resolve_concept`: `/infra/x` or `/infra/x.md`). The `path` doc comments in Step 6's params below say so.
+
 > **Interfaces note (Task 8), 2026-11-03.** Four changes to the frame's Interfaces block, made here because Task 8 owns `apply`:
 > 1. **`apply`'s closure gets `&MemWorkspace`, not `&dyn Workspace`.** Ops still take `&dyn Workspace`: `&MemWorkspace` coerces to it at the call (`ops::stamp(ws, ...)` compiles unchanged). The concrete type lets `revert` (Task 11) delete a file through `MemWorkspace::remove`, which the `Workspace` trait lacks. A touched path that is no longer a file after the op becomes a deletion entry (`content: None`), so `OpOutcome` needs no `deleted` field. M6's `delete_concept` uses the same rule.
 > 2. **`apply` takes `by: Option<&str>`.** `OpContext::by` borrows a string that must outlive the blocking closure, so `apply` owns it: the call's `by`, else the key's actor. The full signature is `apply(ctx, catalog, by, op)`.
@@ -8816,7 +8829,7 @@ pub struct CreateConceptParams {
 /// `edit_document`'s arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct EditDocumentParams {
-    /// A concept or an index.md, e.g. `/infra/ntp.md`.
+    /// A full path with `.md`: a concept or an index.md, e.g. `/infra/ntp.md` (`/infra/ntp` is refused).
     pub path: String,
     /// The exact text to replace; without `replace_all` it must occur exactly once, outside the frontmatter.
     pub old_str: String,
@@ -8832,7 +8845,7 @@ pub struct EditDocumentParams {
 /// `replace_body`'s arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct ReplaceBodyParams {
-    /// The concept, e.g. `/infra/ntp.md`.
+    /// The concept, with or without `.md`, e.g. `/infra/ntp` or `/infra/ntp.md`.
     pub path: String,
     /// The new body; the frontmatter is kept byte for byte.
     pub body: String,
@@ -8843,7 +8856,7 @@ pub struct ReplaceBodyParams {
 /// `set_frontmatter`'s arguments.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct SetFrontmatterParams {
-    /// The concept, e.g. `/infra/ntp.md`.
+    /// The concept, with or without `.md`, e.g. `/infra/ntp` or `/infra/ntp.md`.
     pub path: String,
     /// A descriptive key such as `title`, `status` or `tags`; the stamps, `open_questions` and `sources` have their own tools.
     pub key: String,
