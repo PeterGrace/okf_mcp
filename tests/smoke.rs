@@ -6,10 +6,13 @@
 //! twice (the second with the cached mention matcher) and lint with revision
 //! times, and exports the catalog again; `server_on_a_real_catalog` (M4)
 //! serves the imported checkout over HTTP and times each read tool and an
-//! export through rmcp's client.
+//! export through rmcp's client; `writes_on_a_real_catalog` (M5) imports the
+//! checkout into a throwaway catalog, creates a concept with a new folder
+//! index, stamps it, logs it and publishes, timing each write tool and the
+//! publish through rmcp's client.
 //!
-//! All three tests are `#[ignore]`d because they need a catalog checkout (and
-//! the storage and server tests need Docker). Run them in release mode, since the timings
+//! All four tests are `#[ignore]`d because they need a catalog checkout (and
+//! the storage, server and write tests need Docker). Run them in release mode, since the timings
 //! are the point:
 //!
 //! `OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog cargo test --release --test smoke -- --ignored --nocapture`
@@ -288,4 +291,114 @@ async fn server_on_a_real_catalog() {
     assert_eq!(status, reqwest::StatusCode::OK);
     // Every gzip stream starts with the bytes 0x1f 0x8b.
     assert!(export.starts_with(&[0x1f, 0x8b]), "the export is gzip");
+}
+
+/// Write to a real catalog over HTTP and time the write path and publish.
+///
+/// The checkout is imported into the test's own Postgres container, so the
+/// real catalog is never written. The new concept goes in a new folder:
+/// `create_concept` with `index_summary` then also creates the folder's
+/// `index.md` and lists it in the root index, as `ensure_index` does, so
+/// publish replays nothing but checks the changed files against the whole
+/// catalog's lint. Only sizes and timings are printed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a catalog checkout in OKF_PARITY_CATALOG and Docker"]
+async fn writes_on_a_real_catalog() {
+    use okf_mcp::archive::read_directory;
+    use okf_mcp::config::Config;
+    use okf_mcp::store::keys::Access;
+    use serde_json::json;
+    use support::server::{call, TestServer};
+
+    let root = std::env::var_os("OKF_PARITY_CATALOG").expect("set OKF_PARITY_CATALOG");
+    let files = read_directory(std::path::Path::new(&root), u64::MAX).unwrap();
+    let count = files.len();
+    let started = Instant::now();
+    let server = TestServer::start(vec![("pg", files)], Config::default()).await;
+    eprintln!(
+        "start Postgres, import {count} files and start the server: {:?}",
+        started.elapsed()
+    );
+    let key = server.key("smoke", Access::Write, &[], Some("pg")).await;
+    let client = server
+        .client_with(&key, &[("x-okf-changeset", "smoke")])
+        .await
+        .unwrap();
+
+    // The first write builds the overlay (a full snapshot); the later ones
+    // rebuild it after each version bump, so their times show that cost.
+    let calls = [
+        (
+            "create_concept",
+            json!({
+                "path": "/m5-smoke/probe.md",
+                "frontmatter": {
+                    "type": "Note",
+                    "title": "M5 smoke probe",
+                    "description": "Written by the M5 smoke test.",
+                },
+                "body": "# M5 smoke probe\n\nSee the [log](/log.md).\n",
+                "index_summary": "the M5 smoke test's probe",
+            }),
+        ),
+        (
+            "stamp",
+            json!({"path": "/m5-smoke/probe.md", "field": "verified"}),
+        ),
+        ("log", json!({"text": "M5 smoke probe", "kind": "Creation"})),
+        ("pending_changes", json!({})),
+        ("lint", json!({"pending": true})),
+        ("publish", json!({"message": "M5 smoke test"})),
+    ];
+    let mut failed = Vec::new();
+    // `Value::Null` until the publish answers; indexing a `Value` with a
+    // missing key gives `Null` rather than panicking, so the asserts below
+    // fail with a message instead.
+    let mut published = serde_json::Value::Null;
+    for (tool, arguments) in calls {
+        let started = Instant::now();
+        let result = call(&client, tool, arguments).await;
+        let elapsed = started.elapsed();
+        let bytes = result
+            .structured_content
+            .as_ref()
+            .map_or(0, |value| value.to_string().len());
+        eprintln!("{tool}: {bytes} bytes of JSON in {elapsed:?}");
+        if result.is_error == Some(true) {
+            // The `{error, message}` JSON names paths and rules, never document text.
+            failed.push((tool, result.content));
+        } else if tool == "publish" {
+            published = result.structured_content.unwrap_or_default();
+        }
+    }
+    client.cancel().await.unwrap();
+
+    assert!(failed.is_empty(), "these tools returned errors: {failed:?}");
+    assert_eq!(published["published"], true);
+    // `as_array().map_or(&[][..], Vec::as_slice)`: the revisions as a slice,
+    // or an empty one if the field is missing, so the asserts below say what
+    // was published instead of panicking on the lookup.
+    let revisions = published["revisions"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    eprintln!(
+        "publish wrote {} revisions, {} warnings",
+        revisions.len(),
+        published["warnings"].as_array().map_or(0, Vec::len)
+    );
+    let mut paths: Vec<&str> = revisions
+        .iter()
+        .filter_map(|revision| revision["path"].as_str())
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            "/index.md",
+            "/log.md",
+            "/m5-smoke/index.md",
+            "/m5-smoke/probe.md"
+        ],
+        "the probe, its folder index, the root index and log.md"
+    );
 }

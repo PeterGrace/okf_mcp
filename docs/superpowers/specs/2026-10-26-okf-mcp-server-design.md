@@ -1,8 +1,8 @@
 # OKF MCP server: design
 
 - **Date:** 2026-10-26; storage redesigned 2026-11-02 (see "Revision: Postgres storage")
-- **Status:** approved design. M1 (core library), M2 (analysis), M3 (storage) and M4
-  (read-only server) are delivered; see "Milestones"
+- **Status:** approved design. M1 (core library), M2 (analysis), M3 (storage), M4
+  (read-only server) and M5 (writes) are delivered; see "Milestones"
 - **Catalog concept:** `/projects/okf-mcp-server.md` in `pg_knowledge_catalog`
 - **Replaces:** `tools/okf.py` in every OKF catalog (how the existing git catalogs hand
   over to the server is decided once the server is complete)
@@ -101,7 +101,7 @@ One binary, `okf-mcp`, on tokio with an axum router:
 
 | Route | Access | Purpose |
 |---|---|---|
-| `POST/GET/DELETE /mcp` | any key | rmcp `StreamableHttpService`: stateful (`Mcp-Session-Id`) for a client on a protocol version before `2026-07-28`, stateless for one on `2026-07-28` (see "Open questions for M5"). Each `Mcp-Session-Id` is bound to the key whose request opened it; a request naming it with another key, or naming a session with no binding (idle past `session_idle_timeout`, or never issued), gets 404, rmcp's answer for an unknown session |
+| `POST/GET/DELETE /mcp` | any key | rmcp `StreamableHttpService`: stateful (`Mcp-Session-Id`) for a client on a protocol version before `2026-07-28`, stateless for one on `2026-07-28` (see "Questions M5 answered"). Each `Mcp-Session-Id` is bound to the key whose request opened it; a request naming it with another key, or naming a session with no binding (idle past `session_idle_timeout`, or never issued), gets 404, rmcp's answer for an unknown session |
 | `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as `application/gzip` with `Content-Disposition: attachment; filename="<name>.tar.gz"`, built in memory on request from the published documents |
 | `POST /catalogs/{name}/import[?replace=true]` | `admin` on the catalog | Replaces or fills an existing catalog from an uploaded `.tar.gz` (see "Import") and answers with the import report once the new snapshot is swapped in. The key is checked before the body is read; then the tarball is read and checked (400 with every problem), then the catalog is looked up (404), so a key granted every catalog that posts a bad archive to an unknown one gets 400. A non-empty catalog without `?replace=true` is 409, its message naming `?replace=true`. A body over `max_import_bytes` plus 0.1% and 64 KiB of gzip slack is 413, axum's plain-text rejection rather than the error JSON. Creating and deleting catalogs is subcommand-only |
 | `GET /healthz` | none | Liveness and readiness: `{"database": "ok"\|"unreachable", "catalogs": <count>}` (a count, no names: it needs no key), 200 while the database answers within 2 seconds (a pool connection included), else 503. The clock offset joins it in M7 |
@@ -320,8 +320,9 @@ uncommitted.
 
 ### Write tools (need `write`)
 
-Each acts on this session's changeset for the target catalog, creating it on first use.
-Nothing is visible to other sessions until `publish`.
+Each acts on this connection's changeset for the target catalog (its key and label; see
+"Write grouping" in "Decisions"), creating it on first use. Nothing is visible to other
+keys or labels until `publish`.
 
 | Tool | Parameters | Behavior |
 |---|---|---|
@@ -341,7 +342,7 @@ Nothing is visible to other sessions until `publish`.
 | `delete_concept` | `path` | Removes the concept and its listing in its folder's `index.md`. Refuses while any other document links to it, and lists those links |
 | `publish` | `message` | See "Publish" below |
 | `discard` | `paths?` | Drops this connection's changeset entries: the named paths, or all of them, which also marks the changeset `discarded` (the next write opens a new one). Takes publish's locks in publish's order, so a write queued behind a closing discard lands in a new changeset |
-| `revert` | `path`, `revision` | Adds the document's content at `revision` (or its deletion) to this session's changeset, for review and publish like any other edit. Subject to every write rule, so machinery cannot be reverted. A revert is a free edit (no replay); a revision whose content is not UTF-8 is refused, and a revived file is not executable (scripts are machinery, which revert refuses anyway). Sending a file the changeset created back to absent leaves no entry for it |
+| `revert` | `path`, `revision` | Adds the document's content at `revision` (or its deletion) to this connection's changeset, for review and publish like any other edit. Subject to every write rule, so machinery cannot be reverted. A revert is a free edit (no replay); a revision whose content is not UTF-8 is refused, and a revived file is not executable (scripts are machinery, which revert refuses anyway). Sending a file the changeset created back to absent leaves no entry for it |
 | `adopt_changeset` | `id` | Moves an open changeset to this connection's key and label. The key's own needs `write`; another key's needs `admin` on its catalog. Refused while this connection has another open changeset in that catalog; an unknown id, a closed changeset and one in a catalog the key does not reach are refused alike |
 
 `by` defaults to the key's `actor`. A call may override it (for example `human:pgrace`
@@ -471,7 +472,7 @@ at a time, each against the current published state.
    - links into deleted or moved paths: a document outside the changeset that still
      links to a path this changeset deletes or moves away from is a `link-into-deleted`
      error in `LintFailed`. This catches a link another session published after this
-     session's `delete_concept` check ran.
+     changeset's `delete_concept` check ran.
    A failure rolls back and is returned like any other refusal.
 5. Write each changed document (revision + 1, a tombstone's number continued) with its
    derived columns, and a `revisions` row (`create`, `update` or `delete`, the
@@ -580,7 +581,7 @@ One `thiserror` enum, `OkfError`:
 | `EditMismatch { path, matches }` | `old_str` found 0 or more than 1 times |
 | `LintFailed { errors, warnings }` | Publish refused: lint errors in changed files or links into deleted paths (`errors`), with the rest as `warnings`; HTTP 422 |
 | `Conflict { files }` | Publish found documents changed since this changeset read them; `files` lists each path with its base and current revision; HTTP 409 |
-| `Busy` | The database aborted the request to resolve a lock conflict, or the changeset closed under a write; nothing was stored; retry (HTTP 503) |
+| `Busy` | The database aborted the request to resolve a lock conflict (`40P01`, `40001`); nothing was stored; retry (HTTP 503). `write::apply` also answers it if the changeset it locked is no longer open, a defensive check: a write queued behind a publish or discard opens a new changeset instead (see "Publish") |
 | `Database` | Any database failure (details logged, not returned) |
 | `Io` | Filesystem errors (import, export) |
 
@@ -648,7 +649,7 @@ check keeps `okf.py`'s 2-minute slack. Revision times are written by the server
 | M2. Analysis (delivered) | `lint`, links report, `oldest`, `sprawl`, secret scan; snapshot and search; `okf::timestamp` ([plan](../plans/2026-10-27-okf-mcp-m2-analysis.md); PRs #17-#30) |
 | M3. Storage (delivered) | `config`, `db` and migrations, `store`, `archive`; `catalog` with snapshot swap and the cached mention matcher; import and export subcommands; `catalog` and `key` subcommands; revision-based commit times for lint. Export then import reproduces the real catalog's file contents and modes byte for byte ([plan](../plans/2026-11-02-okf-mcp-m3-storage.md); PRs #48, #49 and #51-#61) |
 | M4. Read-only server (delivered) | axum, rmcp, auth, `selection`, the read tools that need no changeset (including `history`), the import and export routes, `/healthz`, the poll loop, `okf-mcp serve`. Deployable and useful on its own ([plan](../plans/2026-11-02-okf-mcp-m4-read-only-server.md); PRs #76-#86) |
-| M5. Writes | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` |
+| M5. Writes (delivered) | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` ([plan](../plans/2026-11-03-okf-mcp-m5-writes.md); PRs #104-#117) |
 | M6. Restructuring | `move_concept`, `split_concept`, `delete_concept` |
 | M7. Deployment | Dockerfile, k8s manifests, CNPG database, NTP check, operator docs |
 
@@ -834,12 +835,137 @@ Plan corrections (each a dated `Corrected` note in the plan):
   `Content-Disposition: attachment; filename="<name>.tar.gz"`. A refresh that fails
   after a committed import is logged and the report still returned.
 
-### Open questions for M5
+### What M5 shipped differently
 
-- **Carried from M3** (see "What M3 shipped differently"): whether
-  `install/` and the root `docs/` and `tests/` are read-only machinery for the write
-  tools; and a backfill of the derived columns whenever `Derived::of` changes, since an
-  import skips files whose bytes are unchanged.
+The M5 plan's "Decisions taken while planning", its "Simplifications and deviations
+relative to the design" and its dated `Corrected` notes have the full list; most are
+already written into the sections above.
+
+Deviations planned:
+
+- Changesets are per (catalog, key, label), not per (MCP session, catalog). The label
+  is the connection's `X-OKF-Changeset` header, else `?changeset=` on the MCP URL, else
+  `default`; never the MCP session id, which changes on every reconnect and would strand
+  an unlabelled client's edits (see "Write grouping" and "Session lifecycle").
+- An MCP session is bound to the key that opened it; any other key naming it gets 404,
+  as for an unknown session (see "Process and routes").
+- Lock order: every changeset transaction takes the catalog row `FOR KEY SHARE`, then
+  the changeset row; `catalogs::delete` takes the row `FOR UPDATE` first. A deadlock or
+  serialization failure (`40P01`, `40001`) is `Busy`, which says to retry (see
+  "Storage").
+- `install/`, the root `docs/` and the root `tests/` are read-only machinery for every
+  write tool, `revert` included (see "Rules enforced on every write").
+- No derived-column backfill: M5 does not change `Derived::of`, and publish computes the
+  derived columns of every document it writes.
+- Overlays are rebuilt whole (a full `Snapshot::build`) and cached per changeset while
+  its `version` and the base snapshot's `generation` are unchanged; no incremental
+  snapshot (see "Write", step 5).
+- The bookkeeping ops are checked byte for byte against `okf.py` (an `ops` command in
+  the parity shim, a golden and a live test).
+- No discard when an MCP session closes (rmcp 3.8 has no per-session close hook, and
+  changesets outlive sessions on purpose); the 24-hour prune of empty changesets stays.
+- `stranded_sessions` lists open, non-empty changesets idle past
+  `session_idle_timeout`, since a closed session is no longer observable.
+- `publish` with nothing to publish returns `published: false` rather than an error.
+- `LintFailed` is HTTP 422.
+- Publish records the publishing key's actor on its revisions.
+- A file whose publish result equals the published one gets no revision.
+- Links into deleted paths are `link-into-deleted` errors in `LintFailed`.
+
+Found while building it:
+
+- **A write queued behind a publish or discard opens a new changeset, not `Busy`**
+  (Tasks 10 and 11). The write waits in `get_or_create`'s `SELECT ... FOR UPDATE`, and
+  when the closing transaction commits, Postgres re-checks `state = 'open'` against the
+  updated row, finds none and the write opens a new changeset. No edit is lost.
+  `write::apply`'s `Busy` branch stays as a defensive check that no test reaches.
+- **Pooled connections are a known limit, accepted for now** (Tasks 8 and 10). Each
+  write holds one pooled connection for its whole transaction, so writers queued on one
+  changeset's row lock each hold one while they wait; a publish holds one and needs a
+  second to refresh a stale snapshot. On the 8-connection pool, many queued writers can
+  leave reads waiting, and many catalogs publishing at once could exhaust it until the
+  acquire timeout fails a publish (see "Write", step 2, and "Publish").
+- **A broken overlay does not hide other catalogs** (Task 7). When a later publish
+  makes a pending entry clash with a published file, `search` lists that catalog under
+  `skipped`, `get_concept` and `read_document` try the next catalog and return the
+  overlay's error only if none has the path, and the reports return the error. The
+  error names the changeset and says to `discard` the clashing path.
+  `pending_changes` reads the entries, not the overlay, so such a changeset can still be
+  listed and discarded.
+- **The overlay is rebuilt under the row lock on every write** (Task 13): about 25 ms
+  per write in a debug build on the real catalog, and eight racing writers on one
+  changeset done within about 190 ms, so the rebuild was kept (see "Write", step 5).
+
+Plan corrections (each a dated `Corrected` note in the plan):
+
+- **#90 (changesets):** `migrate_applies_the_schema` counts `MIGRATOR`'s migrations
+  rather than asserting one; `From<sqlx::Error>` logs a retryable driver error at `warn`
+  before answering `Busy`; a 12th test pins the conflict path's `FOR UPDATE` against
+  the prune's `SKIP LOCKED`; "Lock order" covers key deletes (review of PR #106).
+- **#91 (frontmatter ops):** `OpOutcome::record` moved to Task 3, its first caller;
+  `Doc::remove_lines` is `pub(crate)`; a 14th test pins `unquestion`'s two removal
+  paths against `okf.py` (review of PR #105). A public doc comment may not link the
+  crate-private `load_concept`, `save` or `refused`.
+- **#93 (log, index, replay):** the Hegel properties are derandomized; rustdoc link and
+  HTML fixes; `index` refuses a list or mapping `title` (where `okf.py` crashes), with an
+  8th test, and `ensure_index`'s doc gives its real order (review of PR #107).
+- **#94 (content ops):** `editable_path` starts from `rules::check_path`; after review
+  of PR #109 (three rounds), `EditMismatch`'s wording, a blank `title` or `type`
+  refused, `index_section` needs `index_summary`, `edit_document` and `replace_body`
+  refuse any change to frontmatter (closing a hole that could forge `generated`,
+  `verified` or `reviewed` in a document without frontmatter), and `create_concept`
+  checks its listing before writing anything.
+- **#92 (write rules):** `is_machinery` takes the first component with one
+  `split_once`; the machinery question was marked decided.
+- **#95 (identity):** shipped as planned; the File map credits `app_at` to Task 7.
+- **#96 (overlays):** `Overlays::lookup` also drops idle and outdated entries;
+  `build_overlay` names the changeset in an `InvalidPath`; after review of PR #111 (four
+  rounds), the broken-overlay rules above (`SearchResult::skipped`,
+  `is_broken_overlay` matching only `InvalidPath`).
+- **#98 (write path):** `Overlays::get` takes an executor, and `apply` passes its own
+  transaction, so a cache miss needs no second pooled connection while the row lock is
+  held (with the pool, eight queued writers could each wait for the acquire timeout); a
+  gone path that was never published leaves no entry, so every deletion entry names
+  something published; `WriteReport.touched` lists only paths with an entry;
+  `set_frontmatter`'s `value` is required, and only an explicit null deletes (review of
+  PR #112, two rounds).
+- **#99 (bookkeeping tools):** no mirror enums: `StampField` and `LogKind` derive
+  `JsonSchema` themselves (and `LogKind` a `Default`); `review`'s test uses
+  `verified`; a sixth test checks that a refused op stores nothing (review of PR #113).
+- **#100 (publish):** the queued-write finding above; a deletion entry is never
+  replayed; a replayable entry whose path was deleted since its base is a `Conflict`;
+  the unique-violation backstop re-reads current revisions after rolling back; a no-op
+  publish closes the changeset with no revisions; the pool note above (review of PR
+  #114, two rounds).
+- **#101 (discard, revert, pending):** `discard` takes publish's locks in publish's
+  order, and an empty `paths` list returns at once; `pending_changes` reads entries,
+  not the overlay, and gains `current_revision` and `stale`; reverting a created file
+  to absent leaves no entry; one-line diff notes for a deletion of a path deleted since
+  and for bytes equal to the published ones (review of PR #115, two rounds).
+- **#97 (stranded, adopt, prune):** after review of PR #110, `adopt_changeset`
+  re-reads the changeset under `changesets::lock` and checks it on the locked row (the
+  first draft's version check is gone); `stranded` filters by key and catalog in SQL;
+  the prune runs right after the key reload in `poll`.
+- **#102 (end-to-end):** six tests, not five (two unlabelled connections of one key
+  share `default`); the overlay rebuild was measured and kept; the restart test uses no
+  label; after review of PR #116, `restart` awaits the old server's serve task before
+  starting the new one.
+- **#103 (wrap-up):** the smoke test shipped as planned; `write::apply`'s doc says its
+  `Busy` branch for a closed changeset is defensive.
+
+### Questions M5 answered
+
+- **Changeset identity without sessions** (from M4): (catalog, key, label), the label
+  from `X-OKF-Changeset`, `?changeset=` or `default`, never the session (M5 Decision 1).
+- **Binding a session to its key** (from M4): `http::sessions` records the key that
+  opened each `Mcp-Session-Id`; another key gets 404 (Decision 2).
+- **Writes beside `catalogs::delete`** (from M3): the catalog row is taken first,
+  `FOR KEY SHARE`, by every changeset transaction, so writes and deletes wait for each
+  other instead of deadlocking (Decision 3).
+- **`install/`, the root `docs/` and `tests/`** (from M3): read-only machinery for every
+  write tool (Decision 4).
+- **A backfill of the derived columns** (from M3): not in M5, which does not change
+  `Derived::of`; the first change to it ships its own backfill (Decision 5).
 
 ### Carried into M3 and later
 
@@ -847,7 +973,8 @@ Raised in M2 reviews and filed as issues (label `milestone-3`):
 
 - **#31 Commit times for lint** (done in M3, PR #61): `Loaded::lint` fills
   `CommitTimes` from each document's last revision time; marking the session's
-  changeset paths dirty stays for M5. The doc comments that described the git plan
+  changeset paths dirty stays for M5 (done in M5 Task 7, PR #111:
+  `CommitTimes::with_dirty`). The doc comments that described the git plan
   (`src/okf/analysis/lint.rs` module docs and `CommitTimes::new`,
   `src/okf/workspace.rs`, `src/okf/mod.rs`) no longer describe it; `CommitTimes::new`
   names both sources (`okf.py`'s git, the server's revisions).

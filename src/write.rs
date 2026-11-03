@@ -84,8 +84,11 @@ struct Touched {
 /// - [`OkfError::Forbidden`] for a key below `write` on the catalog;
 /// - [`OkfError::Refused`] (`CATALOG_GONE`) if the catalog was deleted while
 ///   this write waited;
-/// - [`OkfError::Busy`] if the changeset was published or discarded while
-///   this write waited for it (a retry opens a new one);
+/// - [`OkfError::Busy`] for a deadlock or serialization failure, or if the
+///   changeset is no longer open once locked. The second is a defensive
+///   check no test reaches: `get_or_create` already holds the row lock, so a
+///   publish or discard that closes the changeset first makes it open a new
+///   one, and the write lands there;
 /// - an overlay that no longer applies ([`OkfError::InvalidPath`], naming the
 ///   changeset and how to recover);
 /// - the op's own error;
@@ -127,8 +130,9 @@ where
     let opened = changesets::get_or_create(&mut tx, &key, &principal.actor, now).await?;
     let changeset = changesets::lock(&mut tx, opened.id)
         .await?
-        // `filter` keeps the row only while it is still open: a publish or
-        // discard that held the lock may have closed it.
+        // `filter` keeps the row only while it is still open. Defensive:
+        // `get_or_create` already locked the row, and a publish or discard
+        // that closed it before then made `get_or_create` open a new one.
         .filter(|row| row.state == ChangesetState::Open)
         .ok_or_else(|| OkfError::Busy {
             reason: format!(
