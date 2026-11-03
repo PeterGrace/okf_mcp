@@ -132,16 +132,16 @@ pub(crate) async fn stranded_sessions(
     let idle_since = idle_cutoff(now, ctx.app().config().session_idle_timeout);
     let principal = ctx.principal();
     let admin = principal.access >= Access::Admin;
-    let rows = changesets::stranded(ctx.app().pool(), idle_since).await?;
+    // The database narrows by key (unless admin) and catalog, so other
+    // keys' paths never leave it; reach and this connection are left out here.
+    let key_filter = (!admin).then_some(principal.key_id.as_str());
+    let rows = changesets::stranded(ctx.app().pool(), idle_since, key_filter, only).await?;
     let changesets = rows
         .into_iter()
         .filter(|row| {
             let own = row.changeset.key_id.as_deref() == Some(principal.key_id.as_str());
             let this_connection = own && row.changeset.label == ctx.label();
-            principal.reaches(&row.catalog)
-                && only.is_none_or(|catalog_id| catalog_id == row.changeset.catalog_id)
-                && (own || admin)
-                && !this_connection
+            principal.reaches(&row.catalog) && !this_connection
         })
         .map(|row| StrandedChangeset {
             id: row.changeset.id,

@@ -546,11 +546,15 @@ pub async fn set_state(
 }
 
 /// Every open changeset with entries whose last change is before
-/// `idle_since`, across catalogs: what `stranded_sessions` filters by key.
+/// `idle_since`, optionally only one key's or one catalog's: what
+/// `stranded_sessions` filters further by reach and connection.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `idle_since` - the cutoff (now less `session_idle_timeout`).
+/// * `key_id` - only this key's changesets (`None`: every key's, for an
+///   `admin` caller), so other keys' paths never leave the database.
+/// * `catalog_id` - only this catalog's (`None`: every catalog's).
 ///
 /// # Returns
 /// The changesets with their catalog's name and sorted paths, by catalog
@@ -561,10 +565,13 @@ pub async fn set_state(
 pub async fn stranded(
     pool: &PgPool,
     idle_since: DateTime<Utc>,
+    key_id: Option<&str>,
+    catalog_id: Option<i64>,
 ) -> Result<Vec<StrandedRow>, OkfError> {
     // The inner join to the entries keeps only non-empty changesets;
     // grouping by the primary key `c.id` lets the other `c` columns be
-    // selected without listing them in `GROUP BY`.
+    // selected without listing them in `GROUP BY`. A `NULL` parameter
+    // (a Rust `None`) turns its filter off.
     let rows = sqlx::query_as::<_, RawStranded>(
         "SELECT c.id, c.catalog_id, c.label, c.key_id, c.actor, c.state, c.version, \
          c.created_at, c.updated_at, k.name AS catalog, \
@@ -573,10 +580,14 @@ pub async fn stranded(
          JOIN catalogs k ON k.id = c.catalog_id \
          JOIN changeset_entries e ON e.changeset_id = c.id \
          WHERE c.state = 'open' AND c.updated_at < $1 \
+         AND ($2::text IS NULL OR c.key_id = $2) \
+         AND ($3::bigint IS NULL OR c.catalog_id = $3) \
          GROUP BY c.id, k.name \
          ORDER BY k.name, c.updated_at, c.id",
     )
     .bind(idle_since)
+    .bind(key_id)
+    .bind(catalog_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -922,7 +933,14 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let rows = stranded(&db.pool, now() - TimeDelta::hours(2))
+        let cutoff = now() - TimeDelta::hours(2);
+        let rows = stranded(&db.pool, cutoff, None, None).await.unwrap();
+        let owner = idle.key_id.as_deref();
+        let by_owner = stranded(&db.pool, cutoff, owner, Some(pg)).await.unwrap();
+        let by_other_key = stranded(&db.pool, cutoff, Some("nobody"), None)
+            .await
+            .unwrap();
+        let by_other_catalog = stranded(&db.pool, cutoff, None, Some(pg + 1))
             .await
             .unwrap();
 
@@ -930,6 +948,9 @@ mod tests {
         assert_eq!(rows[0].changeset.id, idle.id);
         assert_eq!(rows[0].catalog, "pg");
         assert_eq!(rows[0].paths, ["a.md", "b.md"]);
+        assert_eq!(by_owner, rows);
+        assert!(by_other_key.is_empty());
+        assert!(by_other_catalog.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
