@@ -159,6 +159,13 @@ Accepted in M5 and still open (plan Decision 2), for things-to-fix:
 - `write::apply`'s `Busy` branch for a closed changeset, which no test reaches;
 - a test for `create_concept`'s `parse_checked` guard.
 
+Found in review of PR #137, for things-to-fix:
+
+- `StillLinked.links[].source` is catalog-relative with no leading slash
+  (`m6-smoke/moved.md`), while publish's revisions and the other tools use
+  `/m6-smoke/...`. It predates this task (Task 5's `LinkSource`), and the smoke
+  test now asserts the slash-less form, so a fix changes that assertion too.
+
 Deferred:
 
 - an `okf-mcp reindex` backfill, with the first change to `Derived::of`;
