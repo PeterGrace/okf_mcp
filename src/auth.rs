@@ -334,7 +334,22 @@ mod tests {
 
         assert!(principal.require(Access::Read, "pg").is_ok());
         assert!(matches!(
+            principal.require(Access::Write, "pg"),
+            Err(OkfError::Forbidden { .. })
+        ));
+        assert!(matches!(
             principal.require(Access::Admin, "pg"),
+            Err(OkfError::Forbidden { .. })
+        ));
+        // A write key may write and read, but not administer.
+        let writer = Principal {
+            access: Access::Write,
+            ..principal.clone()
+        };
+        assert!(writer.require(Access::Write, "pg").is_ok());
+        assert!(writer.require(Access::Read, "pg").is_ok());
+        assert!(matches!(
+            writer.require(Access::Admin, "pg"),
             Err(OkfError::Forbidden { .. })
         ));
         // A catalog the key does not reach is "not available", whatever the access.
