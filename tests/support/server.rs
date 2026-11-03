@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::{HeaderName, HeaderValue};
 use chrono::Utc;
@@ -23,9 +24,16 @@ use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{RoleClient, ServiceExt};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::pg::TestDb;
+
+/// The task running `http::serve`.
+type Served = JoinHandle<std::io::Result<()>>;
+
+/// How long `restart` waits for the old server to stop.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A connected MCP client.
 pub type Client = RunningService<RoleClient, ()>;
@@ -57,6 +65,8 @@ pub struct TestServer {
     /// The server's state, to `poll` after changing the database.
     pub app: Arc<App>,
     shutdown: CancellationToken,
+    /// The task running `http::serve`, awaited by `restart`.
+    served: Served,
     /// The database, for changes made "by the subcommands".
     pub db: TestDb,
 }
@@ -100,26 +110,45 @@ impl TestServer {
                 .await
                 .expect("import");
         }
-        let app = App::load(db.pool.clone(), config, Arc::new(SystemClock))
-            .await
-            .expect("app loads");
-        // Port 0: the OS picks a free one.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let base = format!("http://{}", listener.local_addr().expect("address"));
-        let shutdown = CancellationToken::new();
-        tokio::spawn(okf_mcp::http::serve(
-            Arc::clone(&app),
-            listener,
-            shutdown.clone(),
-        ));
+        let (base, app, shutdown, served) = serve_app(&db, config).await;
         Self {
             base,
             app,
             shutdown,
+            served,
             db,
         }
+    }
+
+    /// Stops the server and starts a new one on the same database, as a
+    /// pod restart would: nothing in memory survives, everything stored does.
+    ///
+    /// # Arguments
+    /// * `config` - the new server's settings.
+    ///
+    /// The old server has stopped (its poll loop ended, its connections
+    /// closed) before the new one starts, so the two never share the database.
+    /// Close every client first: an open connection holds the old server up.
+    ///
+    /// # Panics
+    /// As [`TestServer::start`], or if the old server does not stop within
+    /// [`STOP_TIMEOUT`] or its task fails.
+    pub async fn restart(&mut self, config: Config) {
+        self.shutdown.cancel();
+        // A `JoinHandle` is a future of the task's result (like awaiting an
+        // `asyncio.Task`); `&mut` awaits it in place, since `Drop` forbids
+        // moving fields out of `self`. The outer `expect` is the timeout, the
+        // middle one a panic in the task, the inner one `serve`'s I/O error.
+        tokio::time::timeout(STOP_TIMEOUT, &mut self.served)
+            .await
+            .expect("the old server stops")
+            .expect("the old server's task")
+            .expect("the old server serves without an I/O error");
+        let (base, app, shutdown, served) = serve_app(&self.db, config).await;
+        self.base = base;
+        self.app = app;
+        self.shutdown = shutdown;
+        self.served = served;
     }
 
     /// The MCP endpoint.
@@ -183,13 +212,42 @@ impl TestServer {
     /// # Errors
     /// The client's failure to initialize (a refused key, say), as text.
     pub async fn client(&self, key: &str, catalogs: Option<&str>) -> Result<Client, String> {
-        let mut headers = HashMap::new();
-        if let Some(list) = catalogs {
-            headers.insert(
-                HeaderName::from_static("x-okf-catalogs"),
-                HeaderValue::from_str(list).expect("header value"),
-            );
-        }
+        // `Option::map` then `into_iter` yields zero or one pair: no header, or one.
+        let headers: Vec<(&'static str, &str)> = catalogs
+            .map(|list| ("x-okf-catalogs", list))
+            .into_iter()
+            .collect();
+        self.client_with(key, &headers).await
+    }
+
+    /// An MCP client with `key` and extra request headers (`X-OKF-Catalogs`,
+    /// `X-OKF-Changeset`) on every request.
+    ///
+    /// # Arguments
+    /// * `key` - the bearer key.
+    /// * `headers` - `(lowercase name, value)` pairs.
+    ///
+    /// # Returns
+    /// The connected client.
+    ///
+    /// # Errors
+    /// As [`TestServer::client`].
+    ///
+    /// # Panics
+    /// If a name is not lowercase or a value is not a valid header value.
+    pub async fn client_with(
+        &self,
+        key: &str,
+        headers: &[(&'static str, &str)],
+    ) -> Result<Client, String> {
+        let headers: HashMap<HeaderName, HeaderValue> = headers
+            .iter()
+            // `&(name, value)` copies the two references out of each pair.
+            .map(|&(name, value)| {
+                let value = HeaderValue::from_str(value).expect("header value");
+                (HeaderName::from_static(name), value)
+            })
+            .collect();
         let config = StreamableHttpClientTransportConfig::with_uri(self.mcp_url())
             .auth_header(key)
             .custom_headers(headers);
@@ -198,6 +256,36 @@ impl TestServer {
             .await
             .map_err(|error| error.to_string())
     }
+}
+
+/// Loads the app on `db` and serves it on a free port.
+///
+/// # Arguments
+/// * `db` - the database, already migrated and imported.
+/// * `config` - the server's settings.
+///
+/// # Returns
+/// The base URL, the app, the token that stops the server, and the task
+/// serving it.
+///
+/// # Panics
+/// If the app does not load or the bind fails.
+async fn serve_app(db: &TestDb, config: Config) -> (String, Arc<App>, CancellationToken, Served) {
+    let app = App::load(db.pool.clone(), config, Arc::new(SystemClock))
+        .await
+        .expect("app loads");
+    // Port 0: the OS picks a free one.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let shutdown = CancellationToken::new();
+    let served = tokio::spawn(okf_mcp::http::serve(
+        Arc::clone(&app),
+        listener,
+        shutdown.clone(),
+    ));
+    (base, app, shutdown, served)
 }
 
 /// Calls a tool.
