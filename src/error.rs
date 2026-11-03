@@ -237,6 +237,11 @@ impl From<sqlx::Error> for OkfError {
             .and_then(|db_error| db_error.code())
             .is_some_and(|code| RETRYABLE_SQLSTATES.contains(&code.as_ref()));
         if retryable {
+            // `Busy` drops the driver error, and as a non-internal error it is
+            // logged only at debug level, so keep Postgres' report (the
+            // statement and the conflicting lock, never document text) here.
+            // `?source` logs its `Debug` form, which includes the detail.
+            tracing::warn!(error = ?source, "retryable database error, answered Busy");
             OkfError::Busy {
                 reason: "the database aborted this request to resolve a lock conflict".to_string(),
             }
