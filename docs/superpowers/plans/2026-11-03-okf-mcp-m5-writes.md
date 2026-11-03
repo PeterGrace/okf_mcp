@@ -303,7 +303,8 @@ pub struct WriteReport { pub catalog: String, pub changeset: i64, pub label: Str
 #[derive(Serialize, JsonSchema)] (paths in WriteReport start with "/")
 pub async fn apply<F>(ctx: &ToolContext, catalog: Option<&str>, by: Option<&str>, op: F) -> Result<WriteReport, OkfError>
 where F: FnOnce(&MemWorkspace, &OpContext<'_>) -> Result<OpOutcome, OkfError> + Send + 'static;
-// a touched path that is no longer a file after the op is stored as a deletion entry (revert; M6's delete)
+// a touched path that is no longer a file after the op is stored as a deletion entry (revert; M6's delete),
+// unless it has no base revision and is not published now: then no entry is kept (an existing one is removed)
 impl MemWorkspace { pub fn remove(&self, path: &str) -> Result<bool, OkfError>; }    // Task 11
 // target = catalog arg or selection write target; require Access::Write; tx: lock_catalog, get_or_create, changesets::lock;
 // op runs (blocking) on a clone of the overlay workspace; each touched path: rules::check_path + check_content;
@@ -8089,7 +8090,8 @@ The four content tools (`create_concept`, `edit_document`, `replace_body`, `set_
 > - `set_frontmatter` passes `Some(&value)` as it is: Task 4's op already reads a JSON null as a delete.
 > - `WriteReport::label`'s doc no longer names the MCP session (Decision 1: a session id is never a label).
 > - The params and tool descriptions state the path forms (the note above) and Task 4's review refusals: `edit_document` and `replace_body` refuse adding or changing frontmatter, `index_section` needs `index_summary`, `type` must be a non-blank string.
-> - Tests beyond Step 3 and Step 5: `a_deleted_path_is_stored_as_a_deletion_entry`, `concurrent_writes_to_one_changeset_lose_no_edit`; `edit_document_refuses_log_md` also refuses `/a` (no `.md`); `replay_operations_accumulate_until_a_free_edit` checks the appended array's contents. The tool tests' catalog has a root `index.md`.
+> - After review of PR #112 (2026-11-03): a gone path with no base revision that is not published now is not stored; the changeset's own entry for it (a file it created, then removed) is dropped with `remove_entries`. So every deletion entry names something published, at its base or since, and publish (Task 10) either deletes it or reports a conflict; it never sees a delete of a path that was never published. `new_entry` takes the published revision and the path's ops and returns `Err(path)` for "nothing to store". `Busy`'s reason no longer ends in "; retry" (its `Display` adds it). The test `a_deleted_path_is_stored_as_a_deletion_entry` became `a_gone_path_is_a_deletion_only_if_something_is_published`, plus the pure `a_gone_published_path_keeps_its_first_base_revision`.
+> - Tests beyond Step 3 and Step 5: `a_deleted_path_is_stored_as_a_deletion_entry` (renamed after review, above), `concurrent_writes_to_one_changeset_lose_no_edit`; `edit_document_refuses_log_md` also refuses `/a` (no `.md`); `replay_operations_accumulate_until_a_free_edit` checks the appended array's contents. The tool tests' catalog has a root `index.md`.
 
 **Files:**
 - Create: `src/write.rs`; modify `src/lib.rs` (`pub mod write;` and the module list in its doc)

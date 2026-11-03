@@ -70,7 +70,9 @@ struct Touched {
 /// * `op` - the edit. It gets a copy of the overlay workspace (published
 ///   files plus this changeset's entries) and an [`OpContext`] with the
 ///   server clock's `now` and `by`, and returns what it touched. A touched
-///   path that is not a file afterwards is stored as a deletion.
+///   path that is not a file afterwards is stored as a deletion if it is
+///   published (or was when the changeset first edited it); otherwise the
+///   changeset keeps no entry for it.
 ///
 /// # Returns
 /// The changeset, the touched paths and the op's message and notes.
@@ -128,7 +130,7 @@ where
         .filter(|row| row.state == ChangesetState::Open)
         .ok_or_else(|| OkfError::Busy {
             reason: format!(
-                "changeset {} was published or discarded while this write waited; retry",
+                "changeset {} was published or discarded while this write waited",
                 opened.id
             ),
         })?;
@@ -153,8 +155,18 @@ where
     for Touched { path, file } in files {
         // `remove` takes the entry out of the map (no copy).
         let previous = existing.remove(&path);
-        let entry = new_entry(&overlay, previous.as_ref(), &outcome, path, file);
-        changesets::upsert_entry(&mut tx, changeset.id, &entry, now).await?;
+        let published = overlay.base().revision(&path);
+        let replay = outcome.replay.get(&path);
+        match new_entry(previous.as_ref(), published, replay, path, file) {
+            Ok(entry) => changesets::upsert_entry(&mut tx, changeset.id, &entry, now).await?,
+            // Nothing published and nothing left: drop the changeset's own
+            // entry for it (a file it created, then removed), if any.
+            Err(path) if previous.is_some() => {
+                let paths = [path];
+                changesets::remove_entries(&mut tx, changeset.id, Some(&paths), now).await?;
+            }
+            Err(_) => {}
+        }
     }
     tx.commit().await?;
     // The version moved, so the cached overlay is stale; dropping it now
@@ -172,40 +184,54 @@ where
 
 /// The entry to store for one touched path.
 ///
+/// A path that is gone after the edit, was not published when the
+/// changeset first edited it, and is not published now has nothing for
+/// publish to delete: no entry is stored for it. A deletion entry always
+/// names something published (at its base revision or since), so publish
+/// either deletes it or reports a conflict.
+///
 /// # Arguments
-/// * `overlay` - the overlay the edit ran on (for the published revision).
 /// * `previous` - the path's entry before this edit, if any.
-/// * `outcome` - the op's outcome (for the path's replay operations).
+/// * `published` - the path's published revision now, if any.
+/// * `new_ops` - this edit's replay operations for the path, if any.
 /// * `path` - the normalized path.
 /// * `file` - what the path holds now; `None` is a deletion.
 ///
 /// # Returns
 /// The entry: the first edit's base revision (else the published one), the
 /// merged replay, and the content.
+///
+/// # Errors
+/// `Err(path)`, handing the path back, when there is nothing to store.
+// `Result<EntryRow, String>` here is "store this, or nothing for this path";
+// it is not an error the caller reports.
 fn new_entry(
-    overlay: &Overlay,
     previous: Option<&EntryRow>,
-    outcome: &OpOutcome,
+    published: Option<i32>,
+    new_ops: Option<&Vec<ReplayOp>>,
     path: String,
     file: Option<StoredFile>,
-) -> EntryRow {
+) -> Result<EntryRow, String> {
     // The first edit's base stays: publish compares it with the document's
     // revision then, whatever later edits saw.
     let base_revision = match previous {
         Some(entry) => entry.base_revision,
-        None => overlay.base().revision(&path),
+        None => published,
     };
-    let replay = merged_replay(previous, outcome.replay.get(&path));
+    if file.is_none() && base_revision.is_none() && published.is_none() {
+        return Err(path);
+    }
+    let replay = merged_replay(previous, new_ops);
     // `is_some_and` reads the `Option` without unwrapping it; the content
     // then moves out of `file` (no copy).
     let executable = file.as_ref().is_some_and(|file| file.executable);
-    EntryRow {
+    Ok(EntryRow {
         path,
         base_revision,
         content: file.map(|file| file.content),
         executable,
         replay,
-    }
+    })
 }
 
 /// Runs the edit on a copy of the overlay and checks the rules on every
@@ -315,7 +341,8 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::mcp::testing::{
-        app_with, context, files, principal, principal_as, store_key, writer, TestApp,
+        app_with, context, files, pending_entry, principal, principal_as, store_key, writer,
+        PendingEdit, TestApp,
     };
     use crate::okf::workspace::Workspace;
     use crate::store::import::{import, ImportOptions};
@@ -534,22 +561,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_deleted_path_is_stored_as_a_deletion_entry() {
+    async fn a_gone_path_is_a_deletion_only_if_something_is_published() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
-        // An op that reports a path which is not a file afterwards (Task 11's
-        // `revert` removes one with `MemWorkspace::remove`, not added yet).
-        let report = apply(&ctx, None, None, |_, _| Ok(touched(&["gone.md"])))
-            .await
-            .unwrap();
+        // Deletion entries as a removing op leaves them (Task 11's `revert`
+        // removes files with `MemWorkspace::remove`, not added yet): one for
+        // the published a.md, one for new.md, which was never published.
+        for path in ["a.md", "new.md"] {
+            let edit = PendingEdit {
+                catalog: "pg",
+                path,
+                text: None,
+                at: Utc::now(),
+            };
+            pending_entry(&test, &ctx, &edit).await;
+        }
 
+        // Every path is gone in the overlay; gone.md never had an entry.
+        let report = apply(&ctx, None, None, |_, _| {
+            Ok(touched(&["a.md", "new.md", "gone.md"]))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(report.touched, ["/a.md", "/new.md", "/gone.md"]);
         let stored = entries(&test, report.changeset).await;
-        assert_eq!(report.touched, ["/gone.md"]);
-        assert_eq!(stored[0].path, "gone.md");
+        // Only a.md, published, is left to delete; the others are dropped.
+        let paths: Vec<&str> = stored.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, ["a.md"]);
+        assert_eq!(stored[0].content, None);
+    }
+
+    #[test]
+    fn a_gone_published_path_keeps_its_first_base_revision() {
+        let earlier = EntryRow {
+            path: "a.md".to_string(),
+            base_revision: Some(1),
+            content: Some(b"edited".to_vec()),
+            executable: false,
+            replay: None,
+        };
+
+        let fresh = new_entry(None, Some(2), None, "a.md".to_string(), None).unwrap();
+        let after_edit = new_entry(Some(&earlier), None, None, "a.md".to_string(), None).unwrap();
+        let nothing = new_entry(None, None, None, "x.md".to_string(), None);
+
+        assert_eq!((fresh.base_revision, fresh.content), (Some(2), None));
+        // Unpublished since, but the base names what publish must check.
         assert_eq!(
-            (stored[0].content.as_deref(), stored[0].base_revision),
-            (None, None)
+            (after_edit.base_revision, after_edit.content),
+            (Some(1), None)
         );
+        assert_eq!(nothing, Err("x.md".to_string()));
     }
 
     #[tokio::test(flavor = "multi_thread")]

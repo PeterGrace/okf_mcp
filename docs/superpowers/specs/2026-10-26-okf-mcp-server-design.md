@@ -399,7 +399,10 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
 3. On a blocking thread, the `okf::ops` function runs on a copy of the connection's
    overlay workspace (the published files plus the changeset's entries). Every path it
    touched then passes the write rules: inside the catalog, not machinery, secret scan,
-   frontmatter parses. A touched path the op removed is a deletion.
+   frontmatter parses. A touched path the op removed is a deletion if it is published,
+   or was at the entry's base revision; otherwise the changeset keeps no entry for it
+   (a file it created, then removed), so every deletion entry names something
+   published.
 4. Each touched path becomes an entry (insert or replace):
    - **base revision:** the existing entry's base (the first edit's), else the live
      revision in the overlay's published snapshot (NULL if there is none);
