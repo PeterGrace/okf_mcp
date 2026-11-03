@@ -4756,7 +4756,11 @@ In `src/mcp/mod.rs`, add `mod reports;` and `+ Self::reports_router()`.
 > second value no test used, is `test_app() -> TestApp`. (3) The tests assert more than
 > Step 2 lists: `open_questions` also checks the concept's title; the selection test also
 > checks the broken link's target (`gone.md`); the shapes test also checks `oldest`'s
-> catalog and that `sprawl` on an unknown path is `NotFound`. Still four tests. Read
+> catalog and that `sprawl` on an unknown path is `NotFound`. (4) After review (PR #85),
+> a fifth test, `the_tools_answer_selection_and_path_errors_with_error_results`, calls the
+> `#[tool]` methods with request `Parts`, so `context` and `reply`'s error mapping are
+> covered: `lint` on an ungranted catalog is a `CatalogNotSelected` result and `sprawl` on
+> `index` (pg gains an `index.md`) an `InvalidPath` one. So Step 4 runs 5 tests. Read
 > `src/mcp/reports.rs` for the shipped code.
 
 - [ ] **Step 4: Run the tests**

@@ -376,12 +376,15 @@ mod tests {
         "---\ntype: Note\ntitle: Q\nopen_questions:\n  - Is it up?\n  - Who owns it?\n---\nBody.\n";
     const PLAIN: &str = "---\ntype: Note\ntitle: P\n---\nSee [q](q.md) and [gone](gone.md).\n";
 
-    /// `pg` holds a concept with two questions and one with a broken link;
-    /// `work` holds one concept.
+    /// `pg` holds a concept with two questions, one with a broken link and an
+    /// `index.md` (not a concept); `work` holds one concept.
     async fn test_app() -> TestApp {
         app_with(
             &[
-                ("pg", &[("q.md", QUEUED), ("p.md", PLAIN)]),
+                (
+                    "pg",
+                    &[("q.md", QUEUED), ("p.md", PLAIN), ("index.md", "# Index\n")],
+                ),
                 ("work", &[("w.md", PLAIN)]),
             ],
             Config::default(),
@@ -488,6 +491,46 @@ mod tests {
         let json = serde_json::to_value(&findings).unwrap();
         assert_eq!(json["catalog"], "pg");
         assert!(json["errors"].is_array() && json["warnings"].is_array());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tools_answer_selection_and_path_errors_with_error_results() {
+        let test = test_app().await;
+        let server = OkfServer::new(std::sync::Arc::clone(&test.app));
+        // The request a tool sees, with a key granted only `pg`, as the auth
+        // layer would leave it.
+        let (mut parts, _) = axum::http::Request::new(()).into_parts();
+        parts.extensions.insert(principal(&["pg"], Some("pg")));
+
+        let ungranted = server
+            .lint(
+                Extension(parts.clone()),
+                Parameters(CatalogParam {
+                    catalog: Some("work".to_string()),
+                }),
+            )
+            .await;
+        let not_a_concept = server
+            .sprawl(
+                Extension(parts),
+                Parameters(SprawlParams {
+                    catalog: None,
+                    path: Some("index".to_string()),
+                    n: None,
+                }),
+            )
+            .await;
+
+        let ungranted = ungranted.err().expect("an error result");
+        assert_eq!(ungranted.is_error, Some(true));
+        let body = ungranted.structured_content.expect("a JSON body");
+        assert_eq!(body["error"], "CatalogNotSelected");
+        assert_eq!(body["catalog"], "work");
+        let not_a_concept = not_a_concept.err().expect("an error result");
+        assert_eq!(
+            not_a_concept.structured_content.expect("a JSON body")["error"],
+            "InvalidPath"
+        );
     }
 
     #[test]
