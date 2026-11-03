@@ -82,7 +82,9 @@ impl AppError {
                 StatusCode::NOT_FOUND
             }
             OkfError::Forbidden { .. } => StatusCode::FORBIDDEN,
-            OkfError::Refused { .. } | OkfError::Conflict { .. } => StatusCode::CONFLICT,
+            OkfError::Refused { .. } | OkfError::Conflict { .. } | OkfError::StillLinked { .. } => {
+                StatusCode::CONFLICT
+            }
             OkfError::LintFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             OkfError::Busy { .. } => StatusCode::SERVICE_UNAVAILABLE,
             OkfError::InvalidPath { .. }
@@ -350,6 +352,16 @@ mod tests {
 
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
         assert_eq!(lint.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn a_delete_refused_while_linked_is_a_conflict() {
+        let still_linked = AppError(OkfError::StillLinked {
+            path: "x.md".to_string(),
+            links: Vec::new(),
+        });
+
+        assert_eq!(still_linked.status(), StatusCode::CONFLICT);
     }
 
     #[test]
