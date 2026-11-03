@@ -497,7 +497,7 @@ pub struct PendingFile {
     pub stale: bool,
     /// Whether publish can replay the entry onto newer text (log.md and index.md bookkeeping only).
     pub replayable: bool,
-    /// A unified diff against the published text (`/dev/null` for a new or deleted file). A deletion of a path deleted since (no published file) gets a one-line note instead.
+    /// A unified diff against the published text (`/dev/null` for a new or deleted file). A deletion of a path deleted since (no published file), or a file equal to the published one, gets a one-line note instead.
     pub diff: String,
 }
 
@@ -787,13 +787,19 @@ fn pending_files(
 ///
 /// # Returns
 /// The diff text; a one-line "Binary files ... differ" when either side is
-/// not UTF-8, or a one-line note for a deletion of a path that is not
-/// published now (deleted by someone else since the entry was made).
+/// not UTF-8; a one-line note for a deletion of a path that is not
+/// published now (deleted by someone else since the entry was made), or for
+/// pending bytes equal to the published ones.
 fn unified_diff(path: &str, published: Option<&[u8]>, pending: Option<&[u8]>) -> String {
     if published.is_none() && pending.is_none() {
         return format!(
             "No published {path} to delete: it was deleted after this entry was made\n"
         );
+    }
+    // Byte for byte the published file (a revert to the revision published
+    // now, say): a diff would be empty, so say why.
+    if published.is_some() && published == pending {
+        return "No change from the published text\n".to_string();
     }
     // A missing side diffs as empty text. A nested `fn`, not a closure:
     // its signature ties the `&str` it returns to the bytes it borrows,
@@ -2193,6 +2199,17 @@ mod changes_tests {
             fixed.is_ok(),
             "the overlay applies again once the entry is gone"
         );
+    }
+
+    #[test]
+    fn a_file_equal_to_the_published_one_is_a_one_line_note() {
+        let text = Some(&b"# A\n"[..]);
+
+        let same = unified_diff("a.md", text, text);
+        let binary = unified_diff("logo.png", Some(b"\x89PNG\xff"), Some(b"\x89PNG\xff"));
+
+        assert_eq!(same, "No change from the published text\n");
+        assert_eq!(binary, "No change from the published text\n");
     }
 
     #[test]

@@ -11146,7 +11146,8 @@ git commit -m "feat: publish with base-revision conflicts, bookkeeping replay, r
 > - **After review of PR #115 (2026-11-03):**
 >   - `discard` with an empty `paths` list returns at once (`changeset` set, `removed: 0`, `closed: false`), so it takes no lock, does not bump `version` and keeps the cached overlay.
 >   - A deletion entry whose path is not published now (deleted by someone else since) gets a one-line `diff` note ("No published <path> to delete: it was deleted after this entry was made") instead of an empty diff; `change` stays `delete` and `stale` is true.
->   - Two more tests, making 12 in `changes_tests`: `a_changeset_whose_overlay_no_longer_applies_can_be_listed_and_discarded` (an entry under a published file breaks `ctx.view`; `pending_changes` still lists it and `discard` drops it) and `deleting_a_path_deleted_since_is_a_one_line_note`. The discard test also checks that an empty list leaves `version` alone.
+>   - After the second review: pending bytes equal to the published ones (a revert to the revision published now) get the one-line `diff` note "No change from the published text"; test `a_file_equal_to_the_published_one_is_a_one_line_note`. That makes 13 tests in `changes_tests`.
+>   - Two more tests, making 12 in `changes_tests` after the first review: `a_changeset_whose_overlay_no_longer_applies_can_be_listed_and_discarded` (an entry under a published file breaks `ctx.view`; `pending_changes` still lists it and `discard` drops it) and `deleting_a_path_deleted_since_is_a_one_line_note`. The discard test also checks that an empty list leaves `version` alone.
 >
 > No signature in the Interfaces block changed.
 
