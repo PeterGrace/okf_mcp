@@ -967,7 +967,8 @@ form_urlencoded = "1.2.2"
 > as planned): `resolve` treats an empty *connection* list like an empty argument
 > (unset), so no caller can build an empty `Selection`; `connection_catalogs` reads the
 > query when the header names nothing (`" , "`), and reads repeated headers, and
-> repeated `catalogs` parameters, as one list; and a header that is not ASCII is decoded lossily instead of ignored, so a
+> repeated `catalogs` parameters, as one list; and a header that is not visible ASCII
+> is decoded as UTF-8 (only invalid bytes become U+FFFD) instead of ignored, so a
 > garbled name fails naming it in `resolve` rather than silently falling back to the
 > key's default (design: "Catalogs are never silently dropped"). Step 2's tests gained
 > asserts for each. After review (PR #78), the `Refused` message also names
@@ -1262,6 +1263,12 @@ fn non_empty(names: Vec<String>) -> Option<Vec<String>> {
 /// that names nothing (`" , "`) counts as unset, so the query is read. Bytes
 /// that are not UTF-8 are kept (lossily), so a garbled name reaches
 /// [`resolve`] and fails naming it rather than being dropped.
+///
+/// Names are kept exactly as given, and catalog names are matched
+/// case-sensitively, so `PG` does not select `pg`. In the query, `+` decodes
+/// as a space: `?catalogs=pg+work` is the one name `"pg work"`. Separate
+/// names with `,` (or `%2C`). Either mistake fails in [`resolve`], naming
+/// the name it could not find.
 ///
 /// # Arguments
 /// * `parts` - the HTTP request (rmcp passes it to every tool).

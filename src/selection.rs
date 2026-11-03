@@ -74,6 +74,12 @@ fn non_empty(names: Vec<String>) -> Option<Vec<String>> {
 /// that are not UTF-8 are kept (lossily), so a garbled name reaches
 /// [`resolve`] and fails naming it rather than being dropped.
 ///
+/// Names are kept exactly as given, and catalog names are matched
+/// case-sensitively, so `PG` does not select `pg`. In the query, `+` decodes
+/// as a space: `?catalogs=pg+work` is the one name `"pg work"`. Separate
+/// names with `,` (or `%2C`). Either mistake fails in [`resolve`], naming
+/// the name it could not find.
+///
 /// # Arguments
 /// * `parts` - the HTTP request (rmcp passes it to every tool).
 ///
