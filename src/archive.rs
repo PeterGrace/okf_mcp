@@ -41,6 +41,28 @@ use crate::okf::workspace::{files_that_are_directories, DiskWorkspace, StoredFil
 /// A catalog's files: catalog-relative path to file, sorted by path.
 pub type Files = BTreeMap<String, StoredFile>;
 
+/// Literal files, as an import takes them (test support, for the store and
+/// tool tests).
+///
+/// # Arguments
+/// * `entries` - `(path, text)` pairs.
+///
+/// # Returns
+/// The files, none executable.
+#[cfg(test)]
+pub(crate) fn files(entries: &[(&str, &str)]) -> Files {
+    entries
+        .iter()
+        .map(|(path, text)| {
+            let file = StoredFile {
+                content: text.as_bytes().to_vec(),
+                executable: false,
+            };
+            (path.to_string(), file)
+        })
+        .collect()
+}
+
 /// One file to export.
 // `Copy` is cheap here: the struct only borrows (`&'a`) the path and bytes,
 // so copying it copies two pointers, never the content.

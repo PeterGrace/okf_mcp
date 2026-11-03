@@ -5,5 +5,6 @@
 pub mod catalogs;
 pub mod documents;
 pub mod export;
+pub mod history;
 pub mod import;
 pub mod keys;

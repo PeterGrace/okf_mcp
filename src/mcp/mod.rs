@@ -9,6 +9,7 @@ mod documents;
 // `tool_error` and `reply` below, are used by later tool modules, and a
 // public item is never flagged as dead code meanwhile.
 pub mod context;
+mod history;
 mod reports;
 mod search;
 #[cfg(test)]
@@ -61,6 +62,7 @@ impl OkfServer {
         Self::catalogs_router()
             + Self::search_router()
             + Self::documents_router()
+            + Self::history_router()
             + Self::reports_router()
     }
 
