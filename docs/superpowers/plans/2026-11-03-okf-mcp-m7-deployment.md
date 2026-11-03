@@ -271,7 +271,7 @@ impl App {
 
 | File | Created/modified by | Responsibility |
 |---|---|---|
-| `src/okf/ops/delete.rs`, `src/error.rs` (doc), `src/mcp/restructure.rs` (test), `tests/smoke.rs` | T1 | `StillLinked` paths |
+| `src/okf/ops/delete.rs`, `src/error.rs` (doc, test fixture), `src/http/mod.rs` (test fixture), `src/mcp/restructure.rs` (test), `tests/restructure.rs` (lines 263-264), `tests/smoke.rs` | T1 | `StillLinked` paths |
 | `src/ntp.rs` | T2 (create) | SNTP client |
 | `src/lib.rs` | T2 (`pub mod ntp;`), T3 (`pub mod clock_check;`) | Module tree (keep both sides) |
 | `src/clock_check.rs` | T3 (create) | The check and its status |
@@ -914,7 +914,7 @@ mod tests {
 ```
 
 Run: `cargo test --lib -- ntp`
-Expected (with `todo!()` bodies): compile errors, then panics.
+Expected: before Step 2 the module isn't declared, so nothing compiles; after Step 2 (with `todo!()` bodies) the tests compile and panic.
 
 - [ ] **Step 2: Wire the module**
 
@@ -1372,7 +1372,7 @@ Create `tests/tls.rs`:
 
 use std::io::Write;
 
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 use sqlx::postgres::PgPoolOptions;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -1394,8 +1394,10 @@ struct Ca {
     issuer: Issuer<'static, KeyPair>,
 }
 
-fn new_ca() -> Ca {
+fn new_ca(name: &str) -> Ca {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("no names is valid");
+    // A distinct subject per CA, so a failure names which one it saw.
+    params.distinguished_name.push(DnType::CommonName, name);
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let key = KeyPair::generate().expect("a CA key");
     let pem = params.self_signed(&key).expect("a CA certificate").pem();
@@ -1407,7 +1409,8 @@ fn new_ca() -> Ca {
 
 /// A certificate for `127.0.0.1` signed by `ca`, and its key (both PEM).
 fn server_certificate(ca: &Ca) -> (String, String) {
-    let params = CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("an IP name");
+    let mut params = CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("an IP name");
+    params.distinguished_name.push(DnType::CommonName, "okf-mcp test server");
     let key = KeyPair::generate().expect("a server key");
     let certificate = params.signed_by(&key, &ca.issuer).expect("a signed certificate");
     (certificate.pem(), key.serialize_pem())
@@ -1445,7 +1448,7 @@ fn verify_full_url(port: u16, root: &std::path::Path) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn verify_full_connects_encrypted_to_a_server_its_ca_signed() {
-    let ca = new_ca();
+    let ca = new_ca("okf-mcp test CA");
     let (certificate, key) = server_certificate(&ca);
     let (_container, port) = postgres_with_tls(certificate, key).await;
     let root = pem_file(&ca.pem);
@@ -1466,8 +1469,8 @@ async fn verify_full_connects_encrypted_to_a_server_its_ca_signed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn verify_full_refuses_a_server_another_ca_signed() {
-    let ca = new_ca();
-    let stranger = new_ca();
+    let ca = new_ca("okf-mcp test CA");
+    let stranger = new_ca("okf-mcp stranger CA");
     let (certificate, key) = server_certificate(&ca);
     let (_container, port) = postgres_with_tls(certificate, key).await;
     let root = pem_file(&stranger.pem);
@@ -1795,7 +1798,7 @@ This task changes other systems. Its PR in this repo carries only:
     - `session_idle_timeout`, `poll_interval` and `max_import_bytes` at their defaults.
   - **`deployment.yaml`:**
     - one replica, `strategy: Recreate`, image `<mirror>/<ghcr project>/petergrace/okf-mcp:0.7.0` (Decision 6), `args: ["--config", "/etc/okf-mcp/config.toml", "serve"]`;
-    - env: `DATABASE_URL` from `okf-mcp-db-app` key `uri`, `PGSSLMODE=verify-full`, `PGSSLROOTCERT=/etc/okf-mcp/pg-ca/ca.crt`, `RUST_LOG=info`;
+    - env: `DATABASE_URL` from `okf-mcp-db-app` key `uri`, `PGSSLMODE=verify-full`, `PGSSLROOTCERT=/etc/okf-mcp/pg-ca/ca.crt`, and no `RUST_LOG`: the binary's default (`warn,okf_mcp=info,tower_http=info`, `src/main.rs:13`) is the intended level, and `info` for every dependency would be noise;
     - volumes: the ConfigMap, secret `okf-mcp-db-ca` (item `ca.crt`), and an `emptyDir` on `/tmp`;
     - the probes and `securityContext` of Decision 10 and `docs/operations.md`;
     - resources: requests `100m`/`256Mi`, limit `1Gi` memory.
@@ -1936,4 +1939,4 @@ git commit -m "docs: M7 wrap-up: README, design, milestone changelog (M7.09)" -m
   - `ClockStatus`, `check_once`, `CHECK_INTERVAL`, `QUERY_TIMEOUT`, `MAX_OFFSET_MS` (T3);
   - `App::{clock_status, set_clock_status, check_clock_until}` (T3);
   - the `okf-mcp-db`, `okf-mcp-db-app`, `okf-mcp-db-ca`, `okf-mcp-backup` and `okf-mcp-pgbackups` names (T7, T8).
-- **Nothing site-specific in this file:** no internal address, bucket name, Vault path, registry mirror or policy name. The only site name is the public host `okf-mcp.k.vsix.me`, which Decision 1 makes public anyway.
+- **Nothing site-specific in this file:** no internal address, bucket name, Vault mount or path, registry mirror or policy name. It does name the Vault entry `okf-mcp` and the `ClusterSecretStore` `vault-backend` (verified fact 8): object names, not addresses or secrets. The only site name is the public host `okf-mcp.k.vsix.me`, which Decision 1 makes public anyway.
