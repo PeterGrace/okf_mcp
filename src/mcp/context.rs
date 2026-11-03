@@ -152,8 +152,9 @@ impl ToolContext {
     /// # Errors
     /// As [`ToolContext::select`].
     pub fn read_set(&self, catalog: Option<&str>) -> Result<Vec<Arc<CatalogState>>, OkfError> {
-        // `std::slice::from_ref` views one `String` as a one-element slice,
-        // without allocating a `Vec`.
+        // `select` takes a slice of `String`s, so the name is copied into one
+        // `String` (a small allocation); `std::slice::from_ref` then views it
+        // as a one-element slice without also allocating a `Vec`.
         let argument = catalog.map(str::to_string);
         self.states(argument.as_ref().map(std::slice::from_ref))
     }
