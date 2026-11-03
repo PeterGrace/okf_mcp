@@ -356,7 +356,7 @@ pub struct Published {
     pub catalog: String,
     /// This connection's changeset label.
     pub label: String,
-    /// The changeset published, if this connection had one open.
+    /// This connection's open changeset, if it had one. With `published: false` it was not published and stays open (it held no entries, for instance after a discard emptied it).
     pub changeset: Option<i64>,
     /// What was written; `flatten` puts its fields beside these.
     #[serde(flatten)]
