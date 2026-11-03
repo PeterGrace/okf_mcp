@@ -347,7 +347,7 @@ mod tests {
     use crate::mcp::testing::{app_with, context, principal};
 
     const HUB: &str = "---\ntype: Note\ntitle: Hub\ndescription: The hub.\n---\n\
-                       See [leaf](leaf.md) and [gone](gone.md).\n";
+                       See [leaf](leaf.md) and [gone](gone.md). [Top](#hub).\n";
     const LEAF: &str =
         "---\ntype: Note\ntitle: Leaf\ndescription: A leaf.\n---\nBack to [hub](hub.md).\n";
 
@@ -386,9 +386,13 @@ mod tests {
         assert_eq!(concept.title.as_deref(), Some("Hub"));
         assert_eq!(concept.frontmatter["title"], "Hub");
         assert_eq!(concept.frontmatter_error, None);
-        assert_eq!(concept.body, "See [leaf](leaf.md) and [gone](gone.md).\n");
+        assert_eq!(
+            concept.body,
+            "See [leaf](leaf.md) and [gone](gone.md). [Top](#hub).\n"
+        );
         assert_eq!(concept.raw.as_deref(), Some(HUB));
         let links = concept.links.unwrap();
+        // `[Top](#hub)` is an in-page link, so it is left out.
         assert_eq!(links.len(), 2);
         assert_eq!(
             (links[0].target.as_str(), links[0].broken),

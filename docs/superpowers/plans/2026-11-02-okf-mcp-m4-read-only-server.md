@@ -3928,7 +3928,8 @@ In `src/mcp/mod.rs`, add `mod documents;` and `+ Self::documents_router()` to `t
 > Differences: (1) `Doc::body`'s doc comment gained Returns and a doc test. (2) The
 > tests assert more than Step 2 lists: the first also checks `title`, an empty
 > `frontmatter_error`, the whole `body`, the links' and backlink's titles and the broken
-> link's missing description; the second also shows that the first catalog wins when
+> link's missing description, and `HUB` gains an in-page link (`[Top](#hub)`) that must be
+> left out; the second also shows that the first catalog wins when
 > both have the path (`only-pg.md` in both), that a non-concept path (`index`) is
 > `InvalidPath`, that a refusal does not stop the search (`index.md` is refused in `pg`,
 > but `resolve_concept` also tries `index.md.md`, a concept in `work`), that a
