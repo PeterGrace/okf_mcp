@@ -55,8 +55,8 @@ Deliberately deferred:
    - `file` of each finding in `LintFailed`.
 
    `InvalidPath` keeps the caller's reference as given, because it may not be a catalog path at all (`../x`). `Io` and `Config` carry filesystem paths and archive names, and keep them.
-10. **Version 0.8.0.** This breaks the tool API, but nobody uses the write tools yet: claude.ai is read-only (pgrace's instructions file). The read tools change only by adding an optional `changeset`. The release and its rollout follow M7's go-ahead rules (Task 7).
-11. **The header helper script goes** (pgrace). `~/.claude/okf-mcp-changeset.sh` was written and tested on 2026-11-03 for labels. It lives outside this repo, so Task 8 deletes it locally and records that in the catalog.
+10. **Version 0.8.0.** This breaks the tool API, but no client uses the write tools yet: claude.ai is read-only (pgrace's instructions file), and no other client is connected with a write key. The read tools change only by adding an optional `changeset`. The release and its rollout follow M7's go-ahead rules (Task 7).
+11. **The header helper script goes** (pgrace). `~/.claude/okf-mcp-changeset.sh` was written on 2026-11-03 to give each Claude Code session its own label. It was tested only against a dummy server and never configured for a real client, which is consistent with Decision 10. It lives outside this repo, so Task 8 deletes it locally and records that in the catalog.
 
 ## Simplifications and deviations relative to the design
 
@@ -283,6 +283,8 @@ ALTER TABLE changesets
 ALTER TABLE changesets ADD CONSTRAINT changesets_handle_key UNIQUE (handle);
 ```
 
+  Changesets already open when this runs keep their labels (`default` and so on) and get fresh handles, but nothing hands those handles out until Task 5's `list_changesets`. In a development database, drafts left open across Tasks 3 to 5 can't be reached in between. Publish or discard them before Task 3 merges. Production is unaffected: Tasks 2 to 6 ship together in 0.8.0, and the production catalog has no open changesets (claude.ai is read-only).
+
 - [ ] **Step 2: Write the failing store tests** (`src/store/changesets.rs`, using the module's existing database fixture):
 
 ```rust
@@ -433,6 +435,13 @@ impl ToolContext {
             .find(|state| state.id() == row.catalog_id)
             .map(Arc::clone)
             .ok_or_else(unknown)?;
+        // Ownership is checked before `require(access, ..)`, on purpose: a key
+        // that neither owns the changeset nor is `admin` gets
+        // `UnknownChangeset`, never `Forbidden`, so it cannot tell a real
+        // handle from a made-up one (Decision 3). So a `read` key, which owns
+        // none, never resolves one, and `access` only matters for owners and
+        // admins (`pin` and `pending_changes` pass `Access::Read`). Don't
+        // reorder these checks.
         let own = row.key_id.as_deref() == Some(self.principal.key_id.as_str());
         let admin = self.principal.access == Access::Admin;
         if !self.principal.reaches(state.name()) || !(own || admin) {
@@ -608,6 +617,8 @@ impl ToolContext {
 pub fn require_selected(pinned: Option<&Pinned>, states: &[Arc<CatalogState>]) -> Result<(), OkfError>
 ```
 
+  `pinned.row` is the unlocked row read when the handle resolved. `pin` reads it fresh on every call, as `find_open` does today, and `Overlays::get` matches its cache to that row's `version` and the catalog's generation (`src/overlay.rs:235-252`). Every write, publish and discard also drops the cached overlay (`forget`). A write that commits between `pin` and `view` therefore leaves the same window as today: this call may still read the version before it, and the next call rebuilds. It can't leave a stale overlay cached under the newer version. Keep `forget` in the write path.
+
   Each read tool adds this to its params:
 
 ```rust
@@ -717,7 +728,7 @@ This task changes other systems. Its PR in this repo carries only its changelog,
 
 - [ ] **Step 2: Image (go-ahead 1).** Run `gh workflow run image.yml --ref main` and watch it. Then tag `v0.8.0` on `main` and push the tag. Check that the image pulls through the cluster's cache, as in M7 Task 7.
 
-- [ ] **Step 3: Deployment (go-ahead 2).** In a fresh checkout of the site's Argo CD repository, change only the Deployment's image tag from `0.7.0` to `0.8.0`. Show pgrace the diff, commit, and push. Watch the app become Synced/Healthy, and the pod log the migrations (0003, 0004) on start.
+- [ ] **Step 3: Backup, then deployment (go-ahead 2).** 0.8.0 is forward-only. Migration 0004 drops `changesets.label`, and under the Deployment's `Recreate` strategy no 0.7.0 pod runs against the new schema. Going back to 0.7.0 means restoring the database from a backup taken before the upgrade (`docs/operations.md`, section 8, "Upgrades"). So before go-ahead 2, take an on-demand backup of the database (as in M7's restore drill), wait for it to complete, and record its name in the changelog. Say this to pgrace when asking for the go-ahead. Then: In a fresh checkout of the site's Argo CD repository, change only the Deployment's image tag from `0.7.0` to `0.8.0`. Show pgrace the diff, commit, and push. Watch the app become Synced/Healthy, and the pod log the migrations (0003, 0004) on start.
 
 - [ ] **Step 4: Checks.**
   - `/healthz`: database ok, and `clock` ok.

@@ -1,9 +1,9 @@
 # OKF MCP server: design
 
 - **Date:** 2026-10-26; storage redesigned 2026-11-02 (see "Revision: Postgres storage")
-- **Status:** approved design, every milestone delivered: M1 (core library), M2
-  (analysis), M3 (storage), M4 (read-only server), M5 (writes), M6 (restructuring) and
-  M7 (deployment); see "Milestones"
+- **Status:** approved design. M1 (core library), M2 (analysis), M3 (storage), M4
+  (read-only server), M5 (writes), M6 (restructuring) and M7 (deployment) are delivered;
+  M8 (changeset handles) is planned. See "Milestones"
 - **Catalog concept:** `/projects/okf-mcp-server.md` in `pg_knowledge_catalog`
 - **Replaces:** `tools/okf.py` in every OKF catalog (how the existing git catalogs hand
   over to the server is decided once the server is complete)
