@@ -4689,7 +4689,7 @@ mod restructure_publish_tests {
 
         let published = publish_as(&mover, "move x").await.unwrap();
 
-        assert!(published.report.replayed.contains(&"/log.md".to_string()));
+        assert_eq!(published.report.replayed, ["/log.md"]);
         let log = published_text(&test, "log.md");
         assert!(log.contains("* **Update:** from b"), "{log}");
         assert!(log.contains("Added [X](/infra/z.md)."), "{log}");
@@ -4735,7 +4735,7 @@ mod restructure_publish_tests {
         let test = pg().await;
         let mover = writer(&test, "writer-a", "pg").await;
         let other = writer(&test, "writer-b", "pg").await;
-        moved(&mover, "infra/y.md", "infra/w.md").await;
+        let report = moved(&mover, "infra/y.md", "infra/w.md").await;
         created(&other, "/b.md", "See [y](/infra/y.md).\n", false).await;
         publish_as(&other, "add b").await.unwrap();
 
@@ -4752,6 +4752,11 @@ mod restructure_publish_tests {
                 .any(|finding| finding.file == "b.md" && finding.rule == "link-into-deleted"),
             "{errors:?}"
         );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4876,7 +4881,7 @@ mod restructure_publish_tests {
 }
 ```
 
-> **Corrected (issue #126), 2026-11-03.** The tests compiled and passed as written: publish needed no code change, so there is no T7 -> T8 edge. Two changes: the count is 9, not 8 (a review added `a_partial_discard_of_a_move_leaves_a_link_publish_refuses`), and the move test's inline tombstone query became a helper, `tombstoned`, which the delete test now also asserts, since its name promises a tombstone it did not check. The code above is the shipped module, in rustfmt's layout.
+> **Corrected (issue #126), 2026-11-03.** The tests compiled and passed as written: publish needed no code change, so there is no T7 -> T8 edge. Two changes: the count is 9, not 8 (a review added `a_partial_discard_of_a_move_leaves_a_link_publish_refuses`), and the move test's inline tombstone query became a helper, `tombstoned`, which the delete test now also asserts, since its name promises a tombstone it did not check. Review on PR #135 made the log test's `replayed` check exact and has the `link-into-deleted` test assert that the changeset stays `Open`. The code above is the shipped module, in rustfmt's layout.
 
 - [ ] **Step 2: Run them**
 

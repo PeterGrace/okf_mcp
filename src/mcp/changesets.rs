@@ -2449,7 +2449,7 @@ mod restructure_publish_tests {
 
         let published = publish_as(&mover, "move x").await.unwrap();
 
-        assert!(published.report.replayed.contains(&"/log.md".to_string()));
+        assert_eq!(published.report.replayed, ["/log.md"]);
         let log = published_text(&test, "log.md");
         assert!(log.contains("* **Update:** from b"), "{log}");
         assert!(log.contains("Added [X](/infra/z.md)."), "{log}");
@@ -2495,7 +2495,7 @@ mod restructure_publish_tests {
         let test = pg().await;
         let mover = writer(&test, "writer-a", "pg").await;
         let other = writer(&test, "writer-b", "pg").await;
-        moved(&mover, "infra/y.md", "infra/w.md").await;
+        let report = moved(&mover, "infra/y.md", "infra/w.md").await;
         created(&other, "/b.md", "See [y](/infra/y.md).\n", false).await;
         publish_as(&other, "add b").await.unwrap();
 
@@ -2512,6 +2512,11 @@ mod restructure_publish_tests {
                 .any(|finding| finding.file == "b.md" && finding.rule == "link-into-deleted"),
             "{errors:?}"
         );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
     }
 
     #[tokio::test(flavor = "multi_thread")]
