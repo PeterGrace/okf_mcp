@@ -11143,6 +11143,10 @@ git commit -m "feat: publish with base-revision conflicts, bookkeeping replay, r
 > - **`stored_path`** (discard's path check) allows machinery, so any stored entry can be dropped; its reason is "not a path inside the catalog", as `rules::check_path`'s.
 > - **Revert to "absent" of a file the changeset created** leaves no entry (Task 8's Corrected note), so the report's `touched` is empty and `pending_changes` does not list it. Test: `reverting_a_created_file_to_absent_leaves_no_entry`. Reverting to a `delete` revision a path already absent in the changeset's view is `Refused`.
 > - **Extra tests** beyond Step 4's: `discard_needs_write_access`, `a_write_queued_behind_a_discard_lands_in_a_new_changeset`, `reverting_a_created_file_to_absent_leaves_no_entry`, `a_stored_path_is_normalized_and_stays_inside`, `the_three_tools_are_listed_with_object_output_schemas`; the discard test also covers a path without an entry, discard without a changeset and a path outside the catalog; the revert test checks `stale` after a later publish. the revert-to-delete test also refuses a revision that is not UTF-8. That makes 10 tests in `changes_tests`.
+> - **After review of PR #115 (2026-11-03):**
+>   - `discard` with an empty `paths` list returns at once (`changeset` set, `removed: 0`, `closed: false`), so it takes no lock, does not bump `version` and keeps the cached overlay.
+>   - A deletion entry whose path is not published now (deleted by someone else since) gets a one-line `diff` note ("No published <path> to delete: it was deleted after this entry was made") instead of an empty diff; `change` stays `delete` and `stale` is true.
+>   - Two more tests, making 12 in `changes_tests`: `a_changeset_whose_overlay_no_longer_applies_can_be_listed_and_discarded` (an entry under a published file breaks `ctx.view`; `pending_changes` still lists it and `discard` drops it) and `deleting_a_path_deleted_since_is_a_one_line_note`. The discard test also checks that an empty list leaves `version` alone.
 >
 > No signature in the Interfaces block changed.
 
