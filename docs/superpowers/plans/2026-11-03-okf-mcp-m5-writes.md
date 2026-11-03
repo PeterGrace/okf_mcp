@@ -362,16 +362,17 @@ impl CatalogState { pub fn publish_lock(&self) -> &tokio::sync::Mutex<()>; }
 
 ## Task dependencies
 
+Layered (each task needs everything it points from; the edge list below is the source of truth):
+
 ```
-T1 changesets store ──┬─> T6 identity + session binding ─> T7 overlay + reads ─┐
-                      │                                                          │
-                      └─> T12 stranded/adopt/prune ───────┼──────────────────────────┐
-T2 ops: frontmatter ─> T3 ops: log/index/replay ─> T4 ops: content ─┐       │
-                                                                       │       │
-T5 write rules ──────────────────────────────┴─> T8 write path + content tools (needs T4, T5, T6, T7)
-                                                         └─> T9 bookkeeping tools (needs T2, T3, T8)
-                                                         └─> T10 publish (needs T3, T5, T8) ─> T11 discard/revert/pending (needs T8, T10)
-                                                                                  T9, T10, T11, T12 ─> T13 end-to-end + concurrency ─> T14 wrap-up
+Layer 0:  T1 changesets    T2 ops: frontmatter    T5 write rules
+Layer 1:  T6 identity + session binding (T1)      T3 ops: log/index/replay (T2)
+Layer 2:  T7 overlay + reads (T1, T6)    T12 stranded/adopt/prune (T1, T6)    T4 ops: content (T3)
+Layer 3:  T8 write path + content tools (T4, T5, T6, T7)
+Layer 4:  T9 bookkeeping tools (T2, T3, T8)       T10 publish (T3, T5, T8)
+Layer 5:  T11 discard/revert/pending (T8, T10)
+Layer 6:  T13 end-to-end + concurrency (T9, T10, T11, T12)
+Layer 7:  T14 smoke, README, design, changelog (all)
 ```
 
 Edges, explicitly:
@@ -1220,7 +1221,9 @@ pub async fn find_open<'e>(
 ///
 /// The insert skips a conflicting open row (`ON CONFLICT DO NOTHING`, which
 /// waits for a racing insert to commit or roll back), then reads the row
-/// that won. Call it after [`lock_catalog`], in the write's transaction.
+/// that won `FOR UPDATE`. Either way the transaction holds the changeset's
+/// row lock until it ends. Call it after [`lock_catalog`], in the write's
+/// transaction.
 ///
 /// # Arguments
 /// * `conn` - the transaction's connection.
@@ -1259,8 +1262,22 @@ pub async fn get_or_create(
             return Ok(row.into());
         }
         // Read committed: this statement sees the row that won the race.
-        if let Some(row) = find_open(&mut *conn, key).await? {
-            return Ok(row);
+        // `FOR UPDATE` takes that row's lock too, as the insert above does
+        // for a new row, so from here on the write holds its changeset and
+        // the prune (`SKIP LOCKED`) passes it by.
+        let found = sqlx::query_as::<_, RawChangeset>(concat!(
+            "SELECT ",
+            changeset_columns!(),
+            " FROM changesets WHERE catalog_id = $1 AND key_id = $2 AND label = $3 \
+             AND state = 'open' FOR UPDATE"
+        ))
+        .bind(key.catalog_id)
+        .bind(key.key_id)
+        .bind(key.label)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(row) = found {
+            return Ok(row.into());
         }
     }
     Err(OkfError::Busy {
@@ -1549,9 +1566,10 @@ pub async fn adopt(
 /// before `older_than` (design "Session lifecycle": the 24-hour prune).
 ///
 /// Changesets another transaction holds are skipped (`SKIP LOCKED`): a
-/// writer adding the first entry holds its changeset's row from its first
-/// statement, so it is never discarded under that write, and the prune
-/// never waits on a lock.
+/// writer holds its changeset's row from [`get_or_create`] on (the insert
+/// locks a new row, the fallback read locks an existing one `FOR UPDATE`),
+/// so a changeset is never discarded under a write, and the prune never
+/// waits on a lock.
 ///
 /// # Arguments
 /// * `pool` - the database.
