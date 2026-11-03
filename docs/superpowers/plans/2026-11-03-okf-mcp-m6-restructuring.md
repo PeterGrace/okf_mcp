@@ -145,6 +145,7 @@ Decisions 1, 2 and 5 are pgrace's or M5's. Decisions 3 and 4 were given by pgrac
     - `mv` of a concept whose frontmatter does not parse, when it has no old listing to carry, is `FrontmatterParse`; `okf.py` raises `YamlError`;
     - a `split` parent whose `status` is a list or mapping is written with Python's `str()` of it; `okf.py`'s `scalar` raises `TypeError`;
     - a missing root `index.md` under a root-level target is `NotFound`; `okf.py` raises `FileNotFoundError`.
+    - an `mv` target below an existing file is `InvalidPath` "a parent component is a file", refused before anything is written; `okf.py`'s `os.makedirs` raises `FileExistsError` (added by issue #122's review).
 
     Each module's doc lists its divergences.
 15. **The new folder's listing is inserted without a "lists already" check, as `okf.py` does** (decided by Claude). The `ListBullet` replay op it records skips an index that already links the new path. The two differ only for an index holding a link to a path that does not exist yet.
@@ -332,6 +333,7 @@ pub fn py_truthy_str(value: Option<&Value>) -> Option<String>; // src/okf/pystr.
 // Task 3: src/okf/ops/moves.rs, src/okf/workspace.rs
 pub fn move_concept(workspace: &MemWorkspace, old: &str, new: &str) -> Result<OpOutcome, OkfError>;
 impl MemWorkspace { pub fn rename(&self, from: &str, to: &str) -> Result<(), OkfError>; }
+impl MemWorkspace { pub fn check_placement(&self, path: &str) -> Result<(), OkfError>; } // write_atomic's placement check, without writing
 
 // Task 4: src/okf/ops/split.rs, src/okf/markdown.rs
 pub const DEFAULT_SPLIT_TYPE: &str = "Note";
@@ -1910,6 +1912,8 @@ Expected: compile error, `cannot find function move_concept`.
 
 - [ ] **Step 6: Implement `move_concept`**
 
+> **Corrected (issue #122, review of PR #131), 2026-11-03.** `new_concept_path` does not check placement, so a `new` below an existing file (`infra/time.md/x.md`) used to fail first in `ensure_index`'s write, naming an index path the caller never gave. `move_concept` now calls `workspace.check_placement(&new)?` right after `new_concept_path`, so it refuses with `InvalidPath { path: new, reason: "a parent component is a file" }` before anything is written. `MemWorkspace::check_placement` (Interfaces block) wraps `placement_conflict`. The module doc lists this as a third divergence (`okf.py`'s `os.makedirs` raises `FileExistsError`). Three more unit tests cover it and the two documented divergences (`FrontmatterParse`, `NotFound` for a missing root `index.md`), and the workspace tests cover `rename`'s directory-target refusal and `check_placement`. `src/okf/ops/moves.rs` is the code to read.
+
 > **Corrected (issue #121), 2026-11-03.** `move_concept` is `py_truthy_str`'s first caller (with Task 4's `split_concept`). In `src/okf/pystr.rs`, delete the `#[cfg_attr(not(test), expect(dead_code, ...))]` attribute and the four-line comment above it on `py_truthy_str` (Task 2 added them until a caller existed). With this caller the expectation is unfulfilled, and `clippy -D warnings` fails until they go. If Task 3 or 4 has already merged and deleted them, there is nothing to do.
 
 Put this above the test module in `src/okf/ops/moves.rs`:
@@ -2113,14 +2117,24 @@ Expected: the 5 move tests and every workspace test pass.
 In `tests/parity/okf_shim.py`:
 - add `import subprocess` after `import shutil`;
 - add `"mv": {},` to `OPS_DEFAULTS` after `"ensure_index": {},`;
-- in `ops()`, right after `setattr(okf, "now_utc", lambda: fixed)`, add:
+- add a typed stub before `ops()`, and install it right after `setattr(okf, "now_utc", lambda: fixed)`:
+
+> **Corrected (issue #122), 2026-11-03.** The stub is a named, annotated function rather than a 100-character lambda, so it carries types (mypy cannot annotate a lambda) and fits the line length.
+
+```python
+def untracked_git(
+    _root: str, *args: str, check: bool = False
+) -> "subprocess.CompletedProcess[str]":
+    """okf.py's `git` for a copy no repository tracks: every call fails (code 1)."""
+    return subprocess.CompletedProcess(list(args), 1, "", "")
+```
 
 ```python
     # cmd_mv runs `git mv` for a tracked file, else os.rename. The copy is
     # never tracked, so answer `git ls-files --error-unmatch` with "no"
     # (return code 1) without running git: the run needs no git binary and
     # never sees an enclosing repository.
-    setattr(okf, "git", lambda _root, *args, check=False: subprocess.CompletedProcess(args, 1, "", ""))
+    setattr(okf, "git", untracked_git)
 ```
 
 and add to the docstring's `ops` line: "mv runs with git stubbed out (os.rename)".

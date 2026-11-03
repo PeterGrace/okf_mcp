@@ -9,7 +9,12 @@
     "people/other.md": "---\ntype: Person\ntitle: Other\n---\n",
     "infra/ntp.md": "---\ntype: Service\ntitle: NTP\n---\n",
     "root-note.md": "---\ntype: Note\ntitle: Root note\n---\n",
-    "nowhere/thing.md": "---\ntype: Note\ntitle: Thing\n---\n"
+    "nowhere/thing.md": "---\ntype: Note\ntitle: Thing\n---\n",
+    "moves/index.md": "# Moves\n\n# Concepts\n\n* [Alpha](alpha.md) - first letter\n* [Beta](beta.md) - second\n\nSee also [alpha again](alpha.md).\n",
+    "moves/alpha.md": "---\ntype: Note\ntitle: Alpha\n---\nSee [beta](beta.md), [own part](#part) and [hub](/analysis/hub.md).\n\n## Part\n\nText.\n",
+    "moves/beta.md": "---\ntype: Note\ntitle: Beta\ndescription: The   second letter.\n---\nBack to [alpha](alpha.md#part) and [abs](/moves/alpha.md).\r\n",
+    "moves/gamma.md": "---\ntype: Note\ntitle: Gamma\ndescription: Third.\n---\nUnlisted; [beta](/moves/beta.md).\n",
+    "people/linker.md": "---\ntype: Note\ntitle: Linker\n---\nSee [alpha](../moves/alpha.md#part), [beta](/moves/beta.md) and [folder](/moves/).\n"
   },
   "steps": [
     {"cmd": "stamp", "concept": "infra/time-server.md", "field": "generated", "by": "claude-code/claude-opus-5-5"},
@@ -53,6 +58,11 @@
     {"cmd": "ensure_index", "folder": "ops/deep/er"},
     {"cmd": "ensure_index", "folder": "analysis/new-stuff"},
     {"cmd": "ensure_index", "folder": "brand-new"},
-    {"cmd": "ensure_index", "folder": "ops"}
+    {"cmd": "ensure_index", "folder": "ops"},
+    {"cmd": "log", "text": "Linked [alpha](/moves/alpha.md).", "kind": "Update"},
+    {"cmd": "mv", "old": "moves/alpha.md", "new": "moves/renamed.md"},
+    {"cmd": "mv", "old": "/moves/beta", "new": "/elsewhere/new-folder/beta.md"},
+    {"cmd": "mv", "old": "moves/gamma.md", "new": "infra/Gamma_Ray.md"},
+    {"cmd": "mv", "old": "moves/renamed.md", "new": "moves/index.md"}
   ]
 }
