@@ -4,6 +4,9 @@
 //! returning report structs whose JSON (`serde_json::to_value`) equals
 //! `okf.py`'s `--json` output, keys in the same order.
 //!
+//! The report structs also derive `schemars::JsonSchema`, so the MCP tools
+//! that return them have output schemas; it changes no JSON.
+//!
 //! Report structs are plain records with public fields, the documented
 //! exception to the private-fields rule (like `yaml::YamlError`).
 
@@ -14,7 +17,7 @@ pub mod secrets;
 pub mod sprawl;
 
 /// One lint-style finding: `{"file", "line", "rule", "message"}` in `okf.py`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct Finding {
     /// Catalog-relative path, without a leading `/`.
     pub file: String,

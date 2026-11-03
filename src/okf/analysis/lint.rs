@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, FixedOffset, TimeDelta, Utc};
 use indexmap::IndexMap;
 use rayon::prelude::*;
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::clock::TIMESTAMP_FORMAT;
@@ -80,7 +81,7 @@ impl CommitTimes {
 }
 
 /// `{"errors": [...], "warnings": [...]}`, each sorted by (file, line, rule).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct LintReport {
     /// Problems that block `publish`.
     pub errors: Vec<Finding>,
