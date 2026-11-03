@@ -499,6 +499,13 @@ async fn restructuring_on_a_real_catalog() {
 
     assert!(failed.is_empty(), "these tools returned errors: {failed:?}");
     assert_eq!(refusal["error"], "StillLinked");
+    // Line 15 of `moved.md` is the stub `split_concept` leaves under the
+    // section's heading: lines 1-6 are the frontmatter `create_concept`
+    // writes (`---`, `type`, `title`, `description`, `generated`, `---`) and
+    // lines 7-14 the probe's body up to and including the blank line after
+    // `## Part two`. A change to that frontmatter or to the stub's layout
+    // moves it. The folder's own listing in `index.md` is not a link here
+    // (plan Decision 4), so the stub is the only one.
     assert_eq!(
         refusal["links"],
         json!([{"source": "m6-smoke/moved.md", "line": 15}]),
