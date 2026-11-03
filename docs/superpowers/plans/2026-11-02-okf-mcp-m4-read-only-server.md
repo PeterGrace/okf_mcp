@@ -1772,11 +1772,12 @@ Add `pub mod app;` to `src/lib.rs` and the crate doc.
 > `Catalogs`, `CatalogState::description`, `Loaded::{files, last_change}`); later tasks
 > need no change. Differences, all inside `src/app.rs` and its tests: (1) the key-reload
 > half of `poll` is a private `reload_keys_if_changed` (same behaviour: a failed reload
-> is logged, the counter stays unstored, the pass goes on); (2) two more tests pin the
+> is logged, the counter stays unstored, the pass goes on); (2) three more tests pin the
 > review's behaviours, `a_catalog_that_fails_to_load_is_skipped_and_retried` (a stored
 > `../escape.md` row breaks the snapshot; `load` and `poll` skip it, a later `poll`
-> picks it up once fixed) and `a_failed_key_reload_does_not_stop_the_pass_and_is_retried`
-> (the `api_keys` table renamed away for one pass), so `app` has seven tests, not five;
+> picks it up once fixed), `a_failed_refresh_keeps_the_old_snapshot` (the same row plus
+> a bumped `generation`) and `a_failed_key_reload_does_not_stop_the_pass_and_is_retried`
+> (the `api_keys` table renamed away for one pass), so `app` has eight tests, not five;
 > (3) `poll_until_stops_when_cancelled` waits up to 30 s (a deadline, not 100 x 20 ms
 > sleeps) and for 30 s for the task, for a loaded shared machine; (4) the catalog test
 > imports at a fixed time and checks `last_change` equals it, not just `is_some()`.

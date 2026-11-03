@@ -434,6 +434,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_refresh_keeps_the_old_snapshot() {
+        let db = test_db().await;
+        let pg = catalogs::create(&db.pool, "pg", "", Utc::now())
+            .await
+            .unwrap();
+        import_files(&db.pool, "pg", &[("a.md", "# A\n")], false).await;
+        let app = app(&db.pool).await;
+        break_catalog(&db.pool, pg.id).await;
+        sqlx::query("UPDATE catalogs SET generation = generation + 1 WHERE id = $1")
+            .bind(pg.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        app.poll().await.unwrap();
+
+        let loaded = app.catalog("pg").unwrap().current();
+        assert_eq!((loaded.generation(), loaded.files()), (1, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_key_reload_does_not_stop_the_pass_and_is_retried() {
         let db = test_db().await;
         let key = new_key(&db.pool, "reader").await;
