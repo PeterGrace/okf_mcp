@@ -17,12 +17,18 @@ Issue #143, Task 4 of `docs/superpowers/plans/2026-11-03-okf-mcp-m7-deployment.m
 
 ## Changed
 
-- `Cargo.toml`: sqlx gains `tls-rustls-ring-webpki` (TLS in pure Rust, so the image
-  needs no OpenSSL); its comment says the deployment turns TLS on with `PGSSLMODE` and
-  `PGSSLROOTCERT`. `Cargo.lock` follows.
+- `Cargo.toml`: sqlx gains `tls-rustls-ring-webpki` (TLS in pure Rust, so the binary
+  links no OpenSSL; the runtime image still has Debian's `openssl` package through
+  `ca-certificates`). Its comment says the deployment turns TLS on with `PGSSLMODE` and
+  `PGSSLROOTCERT`, and that the default `sslmode=prefer` now tries TLS. `Cargo.lock`
+  follows.
 - Design, "Configuration": TLS to Postgres is set by `PGSSLMODE=verify-full` and
-  `PGSSLROOTCERT`, which sqlx reads beneath the URL. `db::connect` is unchanged.
-- Plan, Task 4: a dated `Corrected` note and the shipped refusal assertion.
+  `PGSSLROOTCERT`, which sqlx reads beneath the URL; a URL's `sslmode` or `sslrootcert`
+  overrides them. `db::connect` is unchanged.
+- Plan: dated `Corrected (issue #143)` notes in Task 4 (the refusal assertion, the
+  `Cargo.toml` comment, the design paragraph) and Task 7 Step 7 (the TLS check also
+  confirms the CNPG `uri` names no `sslmode`); Decision 8 says the binary, not the
+  image, is OpenSSL-free.
 
 ## Notes
 
@@ -31,3 +37,13 @@ Issue #143, Task 4 of `docs/superpowers/plans/2026-11-03-okf-mcp-m7-deployment.m
   verdict as `sqlx::Error::Io`, not `sqlx::Error::Tls`, so the test reads the message.
 - The start script worked as planned: the entrypoint runs `sh -c` as root, and busybox
   `install -o postgres -g postgres -m 600` installs the key Postgres requires it to own.
+- No connection code changed, but connection behaviour did: with a TLS backend compiled
+  in, sqlx's default `sslmode=prefer` tries TLS, without verifying the certificate, on
+  every connection that sets no mode (local runs, the CLI, the plain database tests).
+- A developer shell with `PGSSLMODE=verify-full` exported breaks the plain database
+  tests: their testcontainers Postgres has no TLS, and sqlx reads the variable beneath
+  their URLs. Unset it (or set `PGSSLMODE=prefer`) before `cargo test`. Task 6's
+  operator docs carry this too.
+- The environment path itself (`PGSSLMODE`/`PGSSLROOTCERT` with no URL parameters) is
+  not tested here: a test would set process-wide variables that race with the other
+  tests in the binary. Task 7 Step 7 checks it on the live server's own sessions.
