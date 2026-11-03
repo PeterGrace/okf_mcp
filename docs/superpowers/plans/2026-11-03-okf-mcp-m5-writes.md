@@ -80,9 +80,9 @@ pgrace delegated every open question in this milestone to Claude's recommended a
    - **Where the label comes from,** in order:
      - the connection's `X-OKF-Changeset` header;
      - else `?changeset=` on the MCP URL;
-     - else the request's `Mcp-Session-Id`;
      - else `default`.
    - **Why:** MCP `2026-07-28` removed sessions, so a client on that version still gets a stable changeset. Agents that want several changesets name them.
+   - **Not the session id.** An earlier draft fell back to the `Mcp-Session-Id` before `default`. That would put every unlabelled session client in a new, empty changeset after each reconnect or server restart, stranding its edits until an `adopt_changeset` (review of PR #88). So the session id is never a label. Two unlabelled connections of one key share the `default` changeset, which is safe because every write locks the changeset row (Task 8).
    - **The key** is part of the identity, so one key can never see or publish another key's changeset. An `admin` key adopts one explicitly with `adopt_changeset`.
    - **Changesets outlive sessions.** A changeset is open until it is published or discarded, and a closed session strands nothing. `stranded_sessions` lists open, non-empty changesets not touched within `session_idle_timeout`.
    - **Schema:** migration `0002_changeset_identity.sql` renames `changesets.session_id` to `label`. It replaces the unique index with one on `(catalog_id, key_id, label) WHERE state = 'open'`, and adds a `version` counter that every entry change bumps; overlay caches key on it.
@@ -274,7 +274,7 @@ pub struct ConflictFile { pub path: String, pub base_revision: Option<i32>, pub 
 // Task 6: src/selection.rs, src/mcp/context.rs, src/http/sessions.rs
 pub const CHANGESET_HEADER: &str = "x-okf-changeset";
 pub const CHANGESET_QUERY: &str = "changeset";
-pub fn connection_label(parts: &Parts) -> String;                       // header, query, mcp-session-id, else "default"
+pub fn connection_label(parts: &Parts) -> String;                       // header, query, else "default" (never the session id)
 pub const SESSION_HEADER: &str = "mcp-session-id"; pub const DEFAULT_LABEL: &str = "default";
 impl ToolContext { pub fn label(&self) -> &str; pub fn with_label(self, label: &str) -> Self; }   // set in from_parts; DEFAULT_LABEL in ToolContext::new
 pub struct SessionKeys { /* Mutex<HashMap<String, (String, Instant)>> */ }
@@ -332,12 +332,13 @@ impl CatalogState { pub fn publish_lock(&self) -> &tokio::sync::Mutex<()>; }
 | `src/http/mod.rs` | T1 (`Busy` status), T4, T5, T10 (statuses), T6 (`bind_session` layer) | Router, `AppError::status` |
 | `src/okf/ops/mod.rs` | T2 (create), T3, T4 (add `mod` lines) | Shared op types |
 | `src/okf/ops/frontmatter.rs` | T2 (create) | `stamp`, `review`, `question`, `unquestion`, `source` |
-| `src/okf/ops/log_index.rs`, `src/okf/ops/replay.rs` | T3 (create) | `log`, `index`, `ensure_index`, `ReplayOp`, `replay` |
+| `src/okf/ops/log_index.rs` | T3 (create) | `log`, `index`, `ensure_index` |
+| `src/okf/ops/replay.rs` | T2 (create, the `ReplayOp` enum only), T3 (the functions) | `ReplayOp`, `replay`, `log_text`, `insert_index_bullet_text` |
 | `src/okf/ops/content.rs` | T4 (create) | `create_concept`, `edit_document`, `replace_body`, `set_frontmatter` |
 | `src/okf/mod.rs` | T2 (`pub mod ops;`), T5 (`pub mod rules;`) | Module tree |
 | `tests/parity/okf_shim.py`, `tests/parity.rs`, `tests/golden/ops.json` | T2 (create the `ops` command and golden), T3 (extends the script with `log` and `index`) | Ops parity |
 | `src/okf/rules.rs` | T5 (create) | Write rules |
-| `src/okf/doc.rs` | T2 (`Doc::remove_lines`, `is_top_key`) | Line removal for `unquestion` |
+| `src/okf/doc.rs` | T2 (`Doc::remove_lines`), T4 (`is_top_key`) | Line removal for `unquestion`; top-level key test for `edit_document` |
 | `src/okf/analysis/links.rs` | T3 (`INDEX_HEADING` becomes `pub(crate)`) | Index headings shared with `insert_index_bullet` |
 | `src/okf/workspace.rs` | T7 (`MemWorkspace::with_changes`), T11 (`MemWorkspace::remove`) | Overlay copies, deletions |
 | `src/okf/analysis/lint.rs` | T7 (`CommitTimes::with_dirty`) | Dirty paths for `lint pending` |
@@ -367,7 +368,7 @@ Layered (each task needs everything it points from; the edge list below is the s
 ```
 Layer 0:  T1 changesets    T2 ops: frontmatter    T5 write rules
 Layer 1:  T6 identity + session binding (T1)      T3 ops: log/index/replay (T2)
-Layer 2:  T7 overlay + reads (T1, T6)    T12 stranded/adopt/prune (T1, T6)    T4 ops: content (T3)
+Layer 2:  T7 overlay + reads (T1, T6)    T12 stranded/adopt/prune (T1, T6)    T4 ops: content (T3, T5)
 Layer 3:  T8 write path + content tools (T4, T5, T6, T7)
 Layer 4:  T9 bookkeeping tools (T2, T3, T8)       T10 publish (T3, T5, T8)
 Layer 5:  T11 discard/revert/pending (T8, T10)
@@ -379,6 +380,7 @@ Edges, explicitly:
 - T1 -> T6; T1 -> T7; T1 -> T12
 - T6 -> T7 (`ToolContext::view` reads the label)
 - T2 -> T3 (`OpOutcome.replay` holds `ReplayOp`, whose enum Task 2 creates); T3 -> T4
+- T5 -> T4 (`edit_document` calls `rules::is_machinery`)
 - T4 -> T8; T5 -> T8; T6 -> T8; T7 -> T8
 - T2 -> T9; T3 -> T9; T8 -> T9
 - T3 -> T10; T5 -> T10; T8 -> T10
@@ -844,9 +846,9 @@ Create `migrations/0002_changeset_identity.sql`:
 ```sql
 -- Changeset identity (M5, Decision 1): one open changeset per (catalog,
 -- key, label). The label comes from the connection (`X-OKF-Changeset`,
--- `?changeset=`, the MCP session id, else 'default'), so a client without
--- MCP sessions still gets a stable changeset, and the key is part of the
--- identity so one key never sees another's.
+-- `?changeset=`, else 'default'; never the MCP session id), so a client
+-- keeps its changeset across reconnects and restarts, and the key is part of
+-- the identity so one key never sees another's.
 ALTER TABLE changesets RENAME COLUMN session_id TO label;
 
 DROP INDEX changesets_one_open_per_session;
@@ -4519,7 +4521,7 @@ git commit -m "feat: okf::ops log, index, ensure_index and idempotent replay (M5
 > Interfaces note (written while planning, 2026-11-03):
 > - **`NewConcept` lives in `src/okf/ops/content.rs`**, re-exported from `okf::ops` like the functions.
 > - **`doc::is_top_key(key)` is new and `pub(crate)` in `src/okf/doc.rs`.** It reuses `Doc`'s own key pattern, so `create_concept` and `set_frontmatter` refuse a key that `Doc` could not find again.
-> - **Machinery check:** `edit_document` refuses machinery through a local `is_machinery` that has the same body as Task 5's `rules::is_machinery`. Whichever of Task 4 and Task 5 merges second deletes the local copy and calls `crate::okf::rules::is_machinery` (Task 5, Step 5 says the same).
+> - **Machinery check:** `edit_document` refuses machinery with Task 5's `crate::okf::rules::is_machinery`, so this task depends on Task 5 (edge T5 -> T4; review of PR #88 replaced a temporary local copy).
 
 The four content tools of the design's "Write tools" table. `okf.py` has none of them, so there is no parity golden. They reuse M1's path rules (`new_concept_path`), renderers (`okf::yaml`) and textual frontmatter edits (`Doc`), plus Task 3's `ensure_index` and listing.
 
@@ -5048,9 +5050,9 @@ use crate::okf::ops::{
 };
 use crate::okf::paths::{
     basename, dirname, escapes_root, is_concept, new_concept_path, normpath, resolve_concept,
-    NON_CONCEPTS, RESERVED, SKIP_DIRS, SKIP_TOP,
 };
 use crate::okf::pystr::{py_repr_str, py_strip};
+use crate::okf::rules::is_machinery;
 use crate::okf::workspace::Workspace;
 use crate::okf::yaml::{block_item, flow_value, scalar, ScalarStyle, Value};
 
@@ -5214,20 +5216,6 @@ pub fn create_concept(
     }
     outcome.message = lines.join("\n");
     Ok(outcome)
-}
-
-/// Repository machinery (design "Rules enforced on every write", Decision 4).
-/// The same body as `crate::okf::rules::is_machinery` (Task 5): whichever
-/// task merges second deletes this copy and calls that one.
-fn is_machinery(path: &str) -> bool {
-    let first = path.split('/').next().unwrap_or_default();
-    let root_doc = !path.contains('/') && NON_CONCEPTS.contains(&path) && !RESERVED.contains(&path);
-    root_doc
-        || first == "tools"
-        || SKIP_TOP.contains(&first)
-        || path
-            .split('/')
-            .any(|part| SKIP_DIRS.contains(&part) || part.starts_with(".git"))
 }
 
 /// An `InvalidPath` refusal of `path`.
@@ -5485,8 +5473,7 @@ Task 4 of `docs/superpowers/plans/2026-11-03-okf-mcp-m5-writes.md` (milestone 5)
 
 ## Notes
 
-- `edit_document` checks machinery with a local copy of Task 5's `rules::is_machinery`;
-  whichever of the two tasks merged second removed it (see the plan).
+- `edit_document` checks machinery with Task 5's `rules::is_machinery`.
 - JSON numbers and booleans become strings, as every scalar is in okf.py's model.
 ```
 
@@ -5524,7 +5511,6 @@ git commit -m "feat: okf::ops content ops: create, edit, replace_body, set_front
 - Modify: `src/okf/mod.rs` (`pub mod rules;`)
 - Modify: `src/error.rs` (`SecretDetected`)
 - Modify: `src/http/mod.rs` (`AppError::status`)
-- Modify: `src/okf/ops/content.rs` (only if Task 4 is already on `main`: use `rules::is_machinery`)
 - Modify: `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md` ("Rules enforced on every write", "Errors")
 - Create: `changelog/<ts>-m5-task-05-write-rules.md`
 
@@ -5861,14 +5847,9 @@ pub fn check_content(path: &str, text: &str) -> Result<(), OkfError> {
 }
 ```
 
-- [ ] **Step 5: Use it from `edit_document`, if Task 4 is on `main`**
+- [ ] **Step 5: (none)**
 
-If `src/okf/ops/content.rs` exists on the branch (Task 4 merged first), make `edit_document` use the shared check:
-- delete its local `is_machinery` function;
-- add `use crate::okf::rules::is_machinery;`;
-- remove the now-unused `NON_CONCEPTS`, `RESERVED`, `SKIP_DIRS` and `SKIP_TOP` from its `paths` import.
-
-Otherwise Task 4 does this itself (its interfaces note).
+Task 4 depends on this task and calls `rules::is_machinery` itself.
 
 - [ ] **Step 6: Run the tests**
 
@@ -5914,7 +5895,6 @@ Task 5 of `docs/superpowers/plans/2026-11-03-okf-mcp-m5-writes.md` (milestone 5)
 
 - Design: "Rules enforced on every write" (the machinery list for Decision 4, the masked
   message) and "Errors" (`message` instead of `masked`).
-- `src/okf/ops/content.rs` uses `rules::is_machinery` (only if Task 4 merged first).
 
 ## Notes
 
@@ -5937,9 +5917,9 @@ git commit -m "feat: okf::rules: machinery, path and content checks for writes (
 
 ### Task 6: connection identity: the changeset label and the session binding
 
-> Interfaces note: (1) `selection` also exports `SESSION_HEADER` (`"mcp-session-id"`, the name `http` stores rmcp's `Mcp-Session-Id` under) and `DEFAULT_LABEL` (`"default"`), shared by `connection_label` and `http::sessions`. (2) `ToolContext` gains `with_label(self, label) -> Self`, so tests (and Task 7, Task 12) can build a context on another label; `ToolContext::new` keeps its three arguments and the label `"default"`. (3) `SessionKeys` has `new(idle)`, `bind(session, key_id, now)`, `admits(session, key_id, now) -> bool` and `release(session)`, each taking an `Instant` from the caller so tests need no sleep. (4) A request whose `Mcp-Session-Id` has **no** binding also gets 404: every session rmcp issues passes through the middleware and is bound, so an unbound id is one whose binding idled out (or that never existed), and refusing it means pruning can never let a second key in. (5) A successful `DELETE /mcp` releases the binding. (6) `mcp::testing` gains `principal_as`, `store_key`, `PendingEdit` and `pending_entry`, used here and by Tasks 7 and 12. (7) **Dependency:** Task 7's `ToolContext::view` reads `label()`, so Task 7 needs this task too (add the edge T6 -> T7 to "Task dependencies").
+> Interfaces note: (1) `selection` also exports `SESSION_HEADER` (`"mcp-session-id"`, the name `http` stores rmcp's `Mcp-Session-Id` under) and `DEFAULT_LABEL` (`"default"`), used by `http::sessions` (never by `connection_label`: a session id is not a label, Decision 1). (2) `ToolContext` gains `with_label(self, label) -> Self`, so tests (and Task 7, Task 12) can build a context on another label; `ToolContext::new` keeps its three arguments and the label `"default"`. (3) `SessionKeys` has `new(idle)`, `bind(session, key_id, now)`, `admits(session, key_id, now) -> bool` and `release(session)`, each taking an `Instant` from the caller so tests need no sleep. (4) A request whose `Mcp-Session-Id` has **no** binding also gets 404: every session rmcp issues passes through the middleware and is bound, so an unbound id is one whose binding idled out (or that never existed), and refusing it means pruning can never let a second key in. (5) A successful `DELETE /mcp` releases the binding. (6) `mcp::testing` gains `principal_as`, `store_key`, `PendingEdit` and `pending_entry`, used here and by Tasks 7 and 12. (7) **Dependency:** Task 7's `ToolContext::view` reads `label()`, so Task 7 needs this task too (add the edge T6 -> T7 to "Task dependencies").
 
-Decision 1's label and Decision 2's binding. Every tool call's context carries its connection's changeset label: the `X-OKF-Changeset` header, else `?changeset=` on the MCP URL, else the request's `Mcp-Session-Id`, else `default`. A new middleware, `http::sessions::bind_session`, sits on `/mcp` inside the key layer: it records which key's request opened each MCP session, and answers 404 (rmcp's own answer for an unknown session) to a request that names a session bound to another key, or bound to none. That closes M4's gap: a second key that learns a session id can no longer attach to its `GET /mcp` stream, resume it, or post on it.
+Decision 1's label and Decision 2's binding. Every tool call's context carries its connection's changeset label: the `X-OKF-Changeset` header, else `?changeset=` on the MCP URL, else `default` (never the session id; see Decision 1). A new middleware, `http::sessions::bind_session`, sits on `/mcp` inside the key layer: it records which key's request opened each MCP session, and answers 404 (rmcp's own answer for an unknown session) to a request that names a session bound to another key, or bound to none. That closes M4's gap: a second key that learns a session id can no longer attach to its `GET /mcp` stream, resume it, or post on it.
 
 **Files:**
 - Modify: `src/selection.rs` (`CHANGESET_HEADER`, `CHANGESET_QUERY`, `SESSION_HEADER`, `DEFAULT_LABEL`, `connection_label`)
@@ -5965,7 +5945,7 @@ In `src/selection.rs`'s test module:
     }
 
     #[test]
-    fn the_label_is_the_header_then_the_query_then_the_session_then_default() {
+    fn the_label_is_the_header_then_the_query_then_default_never_the_session() {
         let header = label_parts(
             "/mcp?changeset=q",
             &[(CHANGESET_HEADER, " drafts "), (SESSION_HEADER, "s1")],
@@ -5979,7 +5959,8 @@ In `src/selection.rs`'s test module:
 
         let labels = [&header, &query, &session, &nothing].map(connection_label);
 
-        assert_eq!(labels, ["drafts", "q", "s1", DEFAULT_LABEL]);
+        // A session id alone is not a label: it would change on reconnect.
+        assert_eq!(labels, ["drafts", "q", DEFAULT_LABEL, DEFAULT_LABEL]);
     }
 ```
 
@@ -6180,7 +6161,7 @@ Expected: compile errors (`connection_label`, `label`, `SessionKeys`, `principal
 
 - [ ] **Step 3: The label**
 
-In `src/selection.rs`, extend the module doc with a paragraph ("A connection's changeset label (Decision 1 of M5): the `X-OKF-Changeset` header, else `?changeset=`, else the MCP session id, else `default`."), and add after `CATALOGS_QUERY`:
+In `src/selection.rs`, extend the module doc with a paragraph ("A connection's changeset label (Decision 1 of M5): the `X-OKF-Changeset` header, else `?changeset=`, else `default`. Never the MCP session id, which changes on every reconnect."), and add after `CATALOGS_QUERY`:
 
 ```rust
 /// The header naming a connection's changeset label (M5 Decision 1).
@@ -6193,8 +6174,8 @@ pub const CHANGESET_QUERY: &str = "changeset";
 /// lowercase. Lookups by it match any case on the wire.
 pub const SESSION_HEADER: &str = "mcp-session-id";
 
-/// The label of a connection that names none and has no MCP session (a
-/// client on MCP `2026-07-28`, which has no sessions).
+/// The label of a connection that names none: its key's one unnamed
+/// changeset per catalog, the same across reconnects and restarts.
 pub const DEFAULT_LABEL: &str = "default";
 ```
 
@@ -6214,12 +6195,13 @@ fn header_label(value: &axum::http::HeaderValue) -> Option<String> {
 }
 
 /// The changeset label of a connection (M5 Decision 1): the first of the
-/// `X-OKF-Changeset` header, the `changeset` query parameter and the
-/// `Mcp-Session-Id` header that is not blank, else [`DEFAULT_LABEL`].
+/// `X-OKF-Changeset` header and the `changeset` query parameter that is not
+/// blank, else [`DEFAULT_LABEL`]. Never the `Mcp-Session-Id`: it changes on
+/// every reconnect, which would strand the earlier changeset.
 ///
 /// With the key, the label picks the connection's changeset in each catalog,
-/// so a client without MCP sessions keeps one changeset across requests, and
-/// an agent that wants several names them.
+/// so a client keeps one changeset across requests, reconnects and restarts,
+/// and an agent that wants several names them.
 ///
 /// # Arguments
 /// * `parts` - the HTTP request (rmcp passes it to every tool).
@@ -6240,7 +6222,6 @@ pub fn connection_label(parts: &Parts) -> String {
                 .filter(|(key, _)| key == CHANGESET_QUERY)
                 .find_map(|(_, value)| label_text(&value))
         })
-        .or_else(|| parts.headers.get(SESSION_HEADER).and_then(header_label))
         .unwrap_or_else(|| DEFAULT_LABEL.to_string())
 }
 ```
@@ -12383,20 +12364,19 @@ async fn an_agent_sees_a_conflict_and_can_redo_its_edit() {
 async fn a_changeset_survives_a_server_restart() {
     let mut server = TestServer::start(catalog(), Config::default()).await;
     let key = writer(&server, "writer").await;
-    // A named changeset: a new client after the restart has a new MCP
-    // session, so a session-id label would not find it again.
-    let label = [("x-okf-changeset", "survivor")];
-    let before = server.client_with(&key, &label).await.unwrap();
+    // No label: the `default` changeset is the same across a restart, even
+    // though the new client gets a new MCP session.
+    let before = server.client(&key, None).await.unwrap();
     let written = ok(&before, "log", json!({"text": "before the restart"})).await;
     before.cancel().await.unwrap();
 
     server.restart(Config::default()).await;
-    let after = server.client_with(&key, &label).await.unwrap();
+    let after = server.client(&key, None).await.unwrap();
     let pending = ok(&after, "pending_changes", json!({})).await;
     let published = ok(&after, "publish", json!({"message": "after the restart"})).await;
     after.cancel().await.unwrap();
 
-    assert_eq!(written["label"], "survivor");
+    assert_eq!(written["label"], "default");
     assert_eq!(pending["changeset"], written["changeset"]);
     assert_eq!(pending["files"][0]["path"], "/log.md");
     assert_eq!(published["published"], true);
