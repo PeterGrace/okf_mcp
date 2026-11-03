@@ -30,11 +30,10 @@ Every subcommand reads the database URL from `DATABASE_URL` (or
 `OKF_MCP_CONFIG` (or `--config`); its fields are listed under "Running the
 server" (the subcommands read only `max_import_bytes`, default `64MiB`, the
 largest uncompressed import, but a file that fails validation fails every
-subcommand). Every
-subcommand applies the embedded migrations first, so `migrate` is only needed
-as a separate deploy step. `okf-mcp --help` and `okf-mcp <command> --help`
-list the rest: `catalog list|delete`, `key list|revoke|grant|ungrant`,
-`import --replace`.
+subcommand). Every subcommand applies the embedded migrations first, so
+`migrate` is only needed as a separate deploy step. `okf-mcp --help` and
+`okf-mcp <command> --help` list the rest: `catalog list|delete`,
+`key list|revoke|grant|ungrant`, `import --replace`.
 
 `import` takes a `.tar.gz` file, `-` for one on stdin, or a directory. A
 `git archive` tarball imports exactly the checkout's tracked files, and a
@@ -60,7 +59,7 @@ ignored, so one file serves every version:
 
 ```toml
 listen = "0.0.0.0:8080"            # the default
-allowed_hosts = ["okf-mcp.example"] # Host names /mcp accepts; default localhost, 127.0.0.1, ::1
+allowed_hosts = ["okf-mcp.example"] # /mcp Host names (default: loopback)
 default_catalog = "pg"             # for a key with no default of its own
 poll_interval = "10s"              # how often to look for CLI changes
 session_idle_timeout = "2h"        # an idle MCP session is closed after this
@@ -158,20 +157,19 @@ the other route errors have the body `{"error": ..., "message": ...}`; the
 401, the 413, the timeout layer's 503 below and `/healthz`'s own body are the
 exceptions.
 
-The import checks the key before it reads the upload. It then reads and
-checks the tarball (400 with every problem for an unreadable or
-rule-breaking archive), and only then looks the catalog up, so a key granted
-every catalog that posts a bad archive to an unknown one gets 400, not 404.
-It answers
-409 for a non-empty catalog without `?replace=true` (the message says to
-add it). A body over `max_import_bytes` plus a little gzip slack is 413,
-axum's plain-text rejection rather than the error JSON. Only the upload is
-bounded: if reading and checking it takes more than 120 s the answer is 503
-with `{"error": "Timeout", ...}` and nothing is imported; the import and the
-snapshot refresh after it have no deadline, so a committed import always
-gets its report, and the next read sees the new snapshot. `/healthz` and the
-export time out after 120 s with 503; `/mcp` has no timeout,
-since its `GET` is a long-lived event stream.
+The import checks the key before it reads the upload. It then reads and checks
+the tarball (400 with every problem for an unreadable or rule-breaking
+archive), and only then looks the catalog up, so a key granted every catalog
+that posts a bad archive to an unknown one gets 400, not 404. It answers 409
+for a non-empty catalog without `?replace=true` (the message says to add it).
+A body over `max_import_bytes` plus a little gzip slack is 413, axum's
+plain-text rejection rather than the error JSON. Only the upload is bounded:
+if reading and checking it takes more than 120 s the answer is 503 with
+`{"error": "Timeout", ...}` and nothing is imported; the import and the
+snapshot refresh after it have no deadline, so a committed import always gets
+its report, and the next read sees the new snapshot. `/healthz` and the export
+time out after 120 s with 503; `/mcp` has no timeout, since its `GET` is a
+long-lived event stream.
 
 ## Layout
 
@@ -251,12 +249,12 @@ The report structs derive `serde::Serialize`; their JSON has `okf.py
         cargo test --release --test smoke -- --ignored --nocapture   # timings
     UPDATE_GOLDEN=1 cargo test --test parity -- --ignored regenerate_goldens
 
-`cargo test` needs Docker: every test that touches the database starts its
-own throwaway `postgres:17-alpine` container (via `testcontainers`) and
-removes it when done (the end-to-end server tests too); without Docker those tests fail at once with "is docker
-reachable?". The roundtrip, storage and server smoke runs need Docker too, and the
-real-catalog round trip needs `git` (it imports `git archive` of the
-checkout).
+`cargo test` needs Docker: every test that touches the database starts its own
+throwaway `postgres:17-alpine` container (via `testcontainers`) and removes it
+when done (the end-to-end server tests too); without Docker those tests fail
+at once with "is docker reachable?". The roundtrip, storage and server smoke
+runs need Docker too, and the real-catalog round trip needs `git` (it imports
+`git archive` of the checkout).
 
 The live parity tests need `python3` (3.12 or later: sprawl's scores depend
 on its float `sum()`) and `okf.py` (`OKF_PY`, default
