@@ -1563,8 +1563,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --bin okf-mcp \
     && cp target/release/okf-mcp /usr/local/bin/okf-mcp
 
-# Runtime stage: no git and no OpenSSL (sqlx uses rustls); CA certificates
-# for completeness. A fixed, non-root uid that manifests can name.
+# Runtime stage: no git, and the binary links no OpenSSL (sqlx uses rustls).
+# CA certificates for completeness; that package pulls in Debian's openssl
+# tools, which the server never runs. A fixed, non-root uid that manifests
+# can name.
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
@@ -1576,6 +1578,8 @@ EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/okf-mcp"]
 CMD ["serve"]
 ```
+
+> **Corrected (issue #144), 2026-11-03.** The runtime stage's comment said "no OpenSSL". `ca-certificates` depends on Debian's `openssl` package, so the image has `/usr/bin/openssl`; only the binary links no OpenSSL. The comment above now says so.
 
 - [ ] **Step 3: `.github/workflows/image.yml`**
 
