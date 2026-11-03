@@ -309,10 +309,10 @@ Nothing is visible to other sessions until `publish`.
 
 | Tool | Parameters | Behavior |
 |---|---|---|
-| `create_concept` | `path`, `frontmatter` (object), `body`, `index_summary?`, `index_section?`, `by?` | Validates the path (`new_concept_path` rules: inside the catalog, not reserved, not machinery, must not exist; warns on a non-kebab-case name). Requires `type`. Writes `generated: { by, at: now }` itself and rejects `generated`, `verified`, `reviewed` in `frontmatter`. Renders frontmatter in `KEY_ORDER`. With `index_summary`, lists it in the folder's `index.md`, creating folder indexes and parent listings as `ensure_index` does |
-| `edit_document` | `path`, `old_str`, `new_str`, `replace_all?` | Exact replacement in a concept body or an `index.md`. Without `replace_all`, `old_str` must occur exactly once. Refuses a match that touches frontmatter. Refuses `log.md` and machinery |
-| `replace_body` | `path`, `body` | Replaces a concept's body; frontmatter unchanged byte for byte |
-| `set_frontmatter` | `path`, `key`, `value` (JSON, or null to delete) | Sets or deletes a descriptive key with a textual edit. Refuses `generated`, `verified`, `reviewed`, `open_questions`, `sources` (dedicated tools) and refuses deleting `type` |
+| `create_concept` | `path`, `frontmatter` (object), `body`, `index_summary?`, `index_section?`, `by?` | Validates the path (`new_concept_path` rules: inside the catalog, not reserved, not machinery, must not exist; warns on a non-kebab-case name). Requires `type`. Writes `generated: { by, at: now }` itself and rejects `generated`, `verified`, `reviewed` in `frontmatter`. Renders frontmatter in `KEY_ORDER`. Other keys follow in the caller's order. Strings are quoted only when they must be; mappings and lists of scalars are written in flow style, lists of collections as block lists; JSON numbers and booleans are stored as their text. With `index_summary`, lists it in the folder's `index.md`, creating folder indexes and parent listings as `ensure_index` does, and lists it with its `title`; a summary without a non-blank title, and `index_section` without `index_summary`, are refused. The listing (folder index and `index_section`) is checked before anything is written. Index edits are recorded as replay operations, the concept itself as a free edit |
+| `edit_document` | `path`, `old_str`, `new_str`, `replace_all?` | Exact replacement in a concept body or an `index.md`. Without `replace_all`, `old_str` must occur exactly once (`EditMismatch` gives the count); an empty `old_str` is refused. Refuses a match that touches frontmatter, and any result whose frontmatter differs from the original's (none may be added to a document without it, `index.md` included). Refuses `log.md` and machinery |
+| `replace_body` | `path`, `body` | Replaces a concept's body; frontmatter unchanged byte for byte; a body that would add frontmatter to a document without it is refused |
+| `set_frontmatter` | `path`, `key`, `value` (JSON, or null to delete) | Sets or deletes a descriptive key with a textual edit. Refuses `generated`, `verified`, `reviewed`, `open_questions`, `sources` (dedicated tools) and refuses deleting `type` or setting it to anything but a non-blank string. Values render as in `create_concept`. A document without frontmatter is refused with `okf.py`'s 'has no frontmatter; add it with your editor first' |
 | `stamp` | `path`, `field` (`generated` or `verified`), `by?` | Port of `stamp` |
 | `review` | `path`, `outcome`, `note`, `questions?`, `by?` | Port of `review` |
 | `question` | `path`, `question` | Port of `question` |
@@ -793,7 +793,7 @@ Raised in M2 reviews and filed as issues (label `milestone-3`):
   workspace is production code and the feature is gone.
 - From the M2 plan's "Deliberately deferred" table: cross-catalog search merge (done in
   M4, PR #81: `okf::search::search_catalogs`, best tier first, then catalog order, then
-  path); secret refusal on write, the no-frontmatter `set_block` error (M5). The per-session
+  path); secret refusal on write (M5 Task 5); the no-frontmatter `set_block` error (done in M5 Task 4: `set_frontmatter` refuses such a document). The per-session
   write lock, `core.symlinks=false` clones and `.okf-*.tmp` handling before `git add -A`
   no longer apply: there is no git and no on-disk worktree.
 

@@ -149,6 +149,21 @@ fn blocks_of(lines: &[String]) -> Vec<Block> {
     blocks
 }
 
+/// Can `key` be written as a top-level frontmatter key, one [`Doc::block`]
+/// finds again (`okf.py`'s block-key pattern)?
+///
+/// # Arguments
+/// * `key` - the candidate key.
+///
+/// # Returns
+/// `true` when `key:` matches the block-key pattern with `key` as its key.
+pub(crate) fn is_top_key(key: &str) -> bool {
+    // `is_some_and` is `x is not None and pred(x)`; `&caps[1]` is group 1.
+    TOP_KEY
+        .captures(&format!("{key}:"))
+        .is_some_and(|caps| &caps[1] == key)
+}
+
 impl Doc {
     /// Splits `text` into frontmatter and the rest.
     ///
@@ -1049,5 +1064,15 @@ mod tests {
         use hegel::generators;
         let text: String = tc.draw(generators::text());
         assert_eq!(doc(&text).render(), text);
+    }
+
+    #[test]
+    fn top_keys_follow_the_block_pattern() {
+        assert!(is_top_key("x_custom.v2-b"));
+        assert!(is_top_key("a\u{b2}"));
+        assert!(!is_top_key("bad key"));
+        assert!(!is_top_key("1st"));
+        assert!(!is_top_key("a:b"));
+        assert!(!is_top_key(""));
     }
 }
