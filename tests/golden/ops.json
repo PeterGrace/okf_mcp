@@ -137,7 +137,7 @@
       "output": ""
     },
     {
-      "output": "split 'Background' (5 lines) out of /splits/parent.md into /splits/background.md\nsources copied: s1 (cited by the section's footnotes)\nfootnotes carried: s1\ntouched (pass these to publish):\n  splits/parent.md\n  splits/background.md\n  splits/user.md\n  splits/index.md"
+      "output": "split 'Background' (5 lines) out of /splits/parent.md into /splits/background.md\nsources copied: s1 (cited by the section's footnotes)\nfootnotes carried: s1\ntouched (pass these to publish):\n  splits/parent.md\n  splits/background.md\n  splits/index.md\n  splits/user.md"
     },
     {
       "output": "split 'Last bit' (1 lines) out of /splits/parent.md into /splits/deeper/last.md\nsources copied: s2 (named with --source)\nfootnotes carried: s1\ntouched (pass these to publish):\n  splits/parent.md\n  splits/deeper/last.md\n  splits/deeper/index.md\n  splits/index.md",
@@ -181,7 +181,7 @@
     "splits/background.md": "---\ntype: Note\ntitle: Background\ndescription: Why the parent exists.\nstatus: draft\ngenerated: { by: fixture, at: 2026-10-27T12:00:00Z }\nsources:\n  - id: s1\n    resource: r1\n    title: One\n---\n\nSplit out of [Parent](/splits/parent.md); see it for the surrounding context.\n\nWhy it exists.[^s1]\n\n# Detail\n\nFine print, see [intro](/splits/parent.md#intro).\n\n[^s1]: From s1.\n",
     "splits/deeper/index.md": "# Deeper\n\nTODO: say what this folder holds.\n\n# Concepts\n\n* [Last bit](last.md) - Last bit, split out of Parent.\n",
     "splits/deeper/last.md": "---\ntype: Note\ntitle: Last bit\ndescription: Last bit, split out of Parent.\nstatus: draft\ngenerated: { by: fixture, at: 2026-10-27T12:00:00Z }\nsources:\n  - id: s2\n    resource: https://example.com/two\n---\n\nSplit out of [Parent](/splits/parent.md); see it for the surrounding context.\n\nThe end.[^s1]\n\n[^s1]: From s1.\n",
-    "splits/index.md": "# Splits\n\n# Concepts\n\n* [Parent](parent.md) - the parent\n* [Background](background.md) - Why the parent exists.\n* [Other [things]](other.md) - Other, split out of Parent.\n\n# Sections\n\n* [Deeper](deeper/) - TODO: describe this folder\n",
+    "splits/index.md": "# Splits\n\nStart at [the detail](background.md#detail).\n\n# Concepts\n\n* [Parent](parent.md) - the parent\n* [Background](background.md) - Why the parent exists.\n* [Other [things]](other.md) - Other, split out of Parent.\n\n# Sections\n\n* [Deeper](deeper/) - TODO: describe this folder\n",
     "splits/other.md": "---\ntype: Topic\ntitle: Other [things]\ndescription: Other, split out of Parent.\nstatus: draft\ngenerated: { by: fixture, at: 2026-10-27T12:00:00Z }\nsources:\n  - id: s1\n    resource: r1\n    title: One\n  - id: s2\n    resource: https://example.com/two\n---\n\nSplit out of [Parent](/splits/parent.md); see it for the surrounding context.\n\nUnrelated.[^n2]\n\n[^n2]: Two.\n",
     "splits/parent.md": "---\ntype: Note\ntitle: Parent\nstatus: draft\nsources:\n  - id: s1\n    resource: r1\n    title: One\n  - id: s2\n    resource: https://example.com/two\n---\n# Intro\n\nOpening.[^n0]\n\n## Background\n\n[Background](/splits/background.md): Why the parent exists.\n\n## Other\n\nMoved away. See [Other \\[things\\]](/splits/other.md).\n\n## Last bit\n\nSee [Last bit](/splits/deeper/last.md).\n\n[^n0]: Zero.\n",
     "splits/user.md": "---\ntype: Note\ntitle: User\n---\nSee [bg](/splits/background.md), [detail](background.md#detail), [other](/splits/other.md) and [whole](/splits/parent.md).\n",

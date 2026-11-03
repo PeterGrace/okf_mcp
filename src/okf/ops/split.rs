@@ -260,9 +260,12 @@ pub fn split_concept(
         path: &new,
         written_at: &parent,
     };
+    let index_path = join(folder, "index.md");
+    // How many replay ops the folder index holds before this op's rewrite
+    // (`ensure_index`'s `CreateIndex`, or none): the listing goes there.
+    let listing_at = outcome.replay.get(&index_path).map_or(0, Vec::len);
     let changed = rewrite_links(workspace, &redirect, Some(moved_file))?;
     outcome.record_rewrites(&changed, &redirect);
-    let index_path = join(folder, "index.md");
     // `okf.py` lists the title as it is (no bracket escaping) and inserts
     // without checking the index lists it already (plan Decision 15).
     let bullet = format!(
@@ -280,6 +283,17 @@ pub fn split_concept(
         create_section: false,
     };
     outcome.record(&index_path, op);
+    // `okf.py` rewrites the links before it inserts the bullet, but the
+    // replay must list first: once the index's `Relink` has run, a link it
+    // redirected already reaches the new concept, and `ListBullet`'s replay
+    // skips an index that links its target (plan Decision 15), losing the
+    // bullet. The two commute on the op's own text (a `Relink` changes link
+    // targets inside lines, never which lines are headings or bullets), so
+    // the bullet moves ahead of the `Relink`. `rotate_right(1)` on the tail
+    // slice moves its last item (the bullet) to its front.
+    if let Some(ops) = outcome.replay.get_mut(&index_path) {
+        ops[listing_at..].rotate_right(1);
+    }
 
     let ids = chosen
         .iter()
@@ -525,9 +539,14 @@ fn frontmatter_lines(header: &Header<'_>, ctx: &OpContext<'_>, sources: &[&Value
 }
 
 /// Which footnote definitions leave the parent, and which are re-added at
-/// its end. A label only the section cites goes with it; a definition that
-/// sat inside the section but is still cited elsewhere stays in the parent,
-/// moved to its end. Orphans stay put.
+/// its end, as `cmd_split`'s `drop`/`keep_defs` loop decides:
+/// - a label the section cites and the rest of the parent does not goes
+///   with the section (it is dropped here; [`carried_footnotes`] copies it);
+/// - any other definition whose lines all sat inside the section stays in
+///   the parent, moved to its end. That covers a definition still cited
+///   elsewhere and an orphan (cited nowhere) inside the section alike;
+/// - every other definition, orphans outside the section included, stays
+///   where it is.
 fn parent_footnotes<'b>(
     defs: &IndexMap<String, Vec<usize>>,
     used_moved: &BTreeSet<String>,
@@ -884,6 +903,73 @@ mod tests {
         );
         assert_eq!(text(&workspace, "a/p.md"), parent);
         assert!(!workspace.is_file("a/n.md") && !workspace.is_file("splits/o.md"));
+    }
+
+    #[test]
+    fn links_from_an_index_and_a_log_into_the_section_replay_as_relink() {
+        // `splits/index.md` and `log.md` link into the section's subsection,
+        // so both are rewritten by a `Relink`; the index also gets the
+        // listing's `ListBullet` afterwards.
+        let index = concat!(
+            "# Splits\n\nStart at [the detail](parent.md#detail).\n\n",
+            "# Concepts\n\n* [Parent](parent.md) - the parent\n",
+        );
+        let log = "# Log\n\n## 2026-11-02\n\n* Update: wrote [detail](/splits/parent.md#detail).\n";
+        let files = [
+            ("splits/index.md", index),
+            ("splits/parent.md", PARENT),
+            ("index.md", "# Root\n"),
+            ("log.md", log),
+        ];
+        let workspace = MemWorkspace::from_files(files);
+        let original: std::collections::BTreeMap<&str, &str> = files.into_iter().collect();
+
+        let outcome = split_concept(
+            &workspace,
+            &ctx(),
+            &split("Background", "splits/background.md"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            text(&workspace, "log.md"),
+            log.replace("/splits/parent.md#detail", "/splits/background.md#detail")
+        );
+        assert_eq!(
+            text(&workspace, "splits/index.md"),
+            concat!(
+                "# Splits\n\nStart at [the detail](background.md#detail).\n\n",
+                "# Concepts\n\n* [Parent](parent.md) - the parent\n",
+                "* [Background](background.md) - Background, split out of Parent.\n",
+            )
+        );
+        let redirect = Redirect {
+            from: "splits/parent.md".to_string(),
+            to: "splits/background.md".to_string(),
+            anchors: Some(BTreeMap::from([
+                ("background".to_string(), None),
+                ("detail".to_string(), Some("detail".to_string())),
+            ])),
+        };
+        let relink = ReplayOp::Relink { redirect };
+        // `slice::from_ref` views one value as a one-item slice, without a copy.
+        assert_eq!(outcome.replay["log.md"], std::slice::from_ref(&relink));
+        // The listing replays ahead of the rewrite: after the `Relink`, the
+        // index already links `background.md`, and a `ListBullet` replayed
+        // then would skip it.
+        assert!(matches!(
+            outcome.replay["splits/index.md"][0],
+            ReplayOp::ListBullet { .. }
+        ));
+        assert_eq!(outcome.replay["splits/index.md"][1], relink);
+        for (path, ops) in &outcome.replay {
+            let before = original.get(path.as_str()).copied();
+            assert_eq!(
+                replay(path, before, ops).unwrap(),
+                text(&workspace, path),
+                "{path}"
+            );
+        }
     }
 
     #[test]

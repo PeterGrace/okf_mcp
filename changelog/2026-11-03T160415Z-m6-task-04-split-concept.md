@@ -9,7 +9,8 @@ issue #123).
   of okf.py's `cmd_split` and `find_section`: sources chosen as okf.py chooses them,
   headings re-levelled, footnotes carried or kept, the parent's stub, links to the
   section and its subsections redirected (`Redirect` with anchors), the new concept
-  listed (`ListBullet`); 6 unit tests whose expected texts were produced by okf.py.
+  listed (`ListBullet`); 6 unit tests whose expected texts the plan probed from okf.py
+  (three of them are also parity steps).
 - `markdown::footnote_refs` (FOOTREF_RE, its lookahead done by hand) and the
   crate-internal `atx_heading`; 2 unit tests and a doc example.
 - Parity: 3 setup files and 5 split steps (two refused); `ops.json` regenerated
