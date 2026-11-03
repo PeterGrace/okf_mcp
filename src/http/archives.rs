@@ -171,7 +171,7 @@ async fn import_catalog(
     let files = match tokio::time::timeout(REQUEST_TIMEOUT, upload).await {
         Ok(Ok(files)) => files,
         Ok(Err(refusal)) => return Ok(refusal),
-        Err(_elapsed) => return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+        Err(_elapsed) => return Ok(upload_timed_out()),
     };
     let options = ImportOptions {
         replace: query.replace,
@@ -193,9 +193,10 @@ async fn import_catalog(
     // Swap the new snapshot in now, not at the next poll. The import has
     // committed, so a failed refresh must not turn it into an error (a
     // retry would then get 409): log it and leave it to the poll loop. A
-    // catalog the app has not loaded yet arrives with the next poll, as does
-    // the import of a client that disconnects (dropping this future) before
-    // the refresh ends.
+    // catalog the app has not loaded yet arrives with the next poll. So does
+    // a committed import whose client disconnects (dropping this future)
+    // during the refresh; a disconnect during `import` itself drops its
+    // transaction, which rolls back, and nothing is imported.
     if let Some(state) = app.catalog(&name) {
         if let Err(error) = state.refresh(app.pool()).await {
             tracing::error!(
@@ -208,6 +209,24 @@ async fn import_catalog(
     // The key's id, never the key itself.
     tracing::info!(catalog = %name, key = %principal.key_id, "imported");
     Ok(Json(report).into_response())
+}
+
+/// The answer to an upload not read and checked within [`REQUEST_TIMEOUT`]:
+/// 503 with the `{error, message}` JSON every other refusal of the route
+/// has. Built here rather than as an [`OkfError`] variant, which only this
+/// route would ever return.
+///
+/// # Returns
+/// The response.
+fn upload_timed_out() -> Response {
+    let body = serde_json::json!({
+        "error": "Timeout",
+        "message": format!(
+            "the upload was not received and checked within {} s; nothing was imported",
+            REQUEST_TIMEOUT.as_secs()
+        ),
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
 #[cfg(test)]
@@ -236,6 +255,22 @@ mod tests {
             .body(Body::from(vec![0u8; size]))
             .expect("request");
         router.oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn an_upload_timeout_is_503_with_the_error_json() {
+        let response = upload_timed_out();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "Timeout");
+        assert_eq!(
+            body["message"],
+            "the upload was not received and checked within 120 s; nothing was imported"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

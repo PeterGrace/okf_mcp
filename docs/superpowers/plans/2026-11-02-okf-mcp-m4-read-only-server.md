@@ -5124,7 +5124,11 @@ In `src/http/mod.rs`, add `mod archives;` and put `.merge(archives::routes(&app)
 > committed import is never answered with 503 (a retry would get 409). The handler
 > returns `Result<Response, AppError>`. A unit test,
 > `the_key_is_checked_before_the_body_is_read`, sends an oversized body: 403 for a
-> reader, 413 for an admin. So Step 3 expects 8 server tests and 2 `archives` unit tests.
+> reader, 413 for an admin. (7) A second review made the upload-deadline 503 carry the
+> route's `{error, message}` JSON (`"error": "Timeout"`), from a local `upload_timed_out`
+> rather than a new `OkfError` variant; unit test
+> `an_upload_timeout_is_503_with_the_error_json`. So Step 3 expects 8 server tests and 3
+> `archives` unit tests.
 
 - [ ] **Step 3: Run the tests**
 

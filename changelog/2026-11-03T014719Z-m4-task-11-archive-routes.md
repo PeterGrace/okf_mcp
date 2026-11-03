@@ -27,7 +27,11 @@ Issue #74, Task 11 of `docs/superpowers/plans/2026-11-02-okf-mcp-m4-read-only-se
     commits would answer 503 for an import that happened, and a retry would get 409.
     The handler instead bounds reading and checking the upload with
     `tokio::time::timeout(REQUEST_TIMEOUT, ..)` (503, nothing imported); the import
-    and the refresh after it have no deadline.
+    and the refresh after it have no deadline. That 503 carries the route's usual
+    error JSON, `{"error": "Timeout", "message": "the upload was not received and
+    checked within 120 s; nothing was imported"}`, built by `upload_timed_out` rather
+    than as an `OkfError` variant only this route would return (second review of PR
+    #86; unit test `an_upload_timeout_is_503_with_the_error_json`).
   - The import checks the key (`Principal::require`) before it reads the body (review
     of PR #86): it takes the unread `Request` and calls `Bytes::from_request` after
     the check, so a key that may not import cannot make the server buffer up to
