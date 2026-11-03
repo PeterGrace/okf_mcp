@@ -12527,7 +12527,7 @@ The write path over real HTTP, with rmcp clients, as an agent sees it (design "T
 > - **A sixth test,** `concurrent_writes_from_two_connections_of_one_key_share_one_changeset`: two unlabelled connections of one key (Decision 1's shared `default`) each write three `log` entries at once, and all six bullets are published from the one changeset.
 > - **Assertions follow what shipped:** the create test compares the pending paths and the `(path, op)` pairs of the revisions sorted, rather than relying on their order; the conflict test also asserts `current_revision == 2` and `stale == true` on the still-pending entry (Task 11's Corrected note); the restart test also reads the published `log.md`; the label test checks each result's `label`, that draft b did not see draft a's edit before the publish, and that `pending_changes` names draft b's changeset. One helper, `paths`, replaces `revised` for both `revisions` and `files`.
 > - `client` builds its header list with `Option::map(..).into_iter()` and calls `client_with`; `client_with`'s doc has a `# Panics` section; `restart` cancels the old server before `serve_app` starts the new one. `rustfmt` reflowed the plan's code.
-> - The plan's Step 3 note that "the restart test uses `X-OKF-Changeset`" is wrong: it uses no label, and relies on the `default` label being stable across sessions (Decision 1). The changelog says so.
+> - The restart test uses no label, relying on `default` being stable across sessions (Decision 1); Step 3 said it used `X-OKF-Changeset`. Steps 2 and 3 now say six tests and no label (fixed inline).
 
 **Files:**
 - Modify: `tests/support/server.rs` (`client_with`, `restart`, `serve_app`)
@@ -12852,17 +12852,17 @@ async fn x_okf_changeset_keeps_two_changesets_of_one_key_apart() {
 ```
 
 Run: `cargo test --test writes`
-Expected: 5 passed.
+Expected: 6 passed (the sixth test is in the Corrected note above).
 
 If a test fails because of a shipped detail (a field name in `get_concept`'s result, how `ensure_index` words a bullet), fix the test to the shipped behaviour. Then check the plan's earlier tasks describe that behaviour, and correct them with a dated note if they don't.
 
 - [ ] **Step 3: Changelog, gates, commit**
 
 Write `changelog/<ts>-m5-task-13-end-to-end.md`:
-- **Added:** `tests/writes.rs` (the five tests); `TestServer::{client_with, restart}`.
+- **Added:** `tests/writes.rs` (the six tests); `TestServer::{client_with, restart}`.
 - **Changed:** `client` on `client_with`; `start` and `restart` share `serve_app`.
 - **Notes:**
-  - the restart test uses `X-OKF-Changeset`, since a new client has a new session;
+  - the restart test uses no label: `default` is stable across MCP sessions (Decision 1), so a new client of a new server finds the same changeset;
   - the concurrency test sends both publishes at once, so it exercises the publish lock and the replay;
   - the timings of `cargo test --test writes`.
 
