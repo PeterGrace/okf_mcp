@@ -12,16 +12,23 @@ usage:
                                      links, oldest, sprawl and lint --json for ROOT with
                                      now_utc frozen at NOW; COMMITS is a commit-times JSON
                                      file, "none" (git unavailable) or "git" (real git)
+    okf_shim.py ops ROOT NOW         stdin: an ops script ({"setup": {path: text}, "steps": [...]});
+                                     runs each step through okf.py's cmd_* functions on a temp copy
+                                     of ROOT (plus setup) with now_utc frozen at NOW; stdout: each
+                                     step's output or error, and every file that changed
 """
+import argparse
 import contextlib
 import hashlib
 import importlib.util
 import io
 import json
 import os
+import shutil
 import sys
+import tempfile
 from types import ModuleType
-from typing import NoReturn, Union
+from typing import Any, NoReturn, Union
 
 Json = Union[None, bool, int, float, str, list["Json"], dict[str, "Json"]]
 
@@ -122,6 +129,89 @@ def analysis(okf: ModuleType, root: str, now: str, commits: str) -> Json:
     }
 
 
+# argparse defaults of the commands the ops script may run (okf.py's `main`);
+# a step's own fields override them. `by` defaults to "fixture" here, not
+# okf.py's DEFAULT_ACTOR (which follows $OKF_ACTOR), so goldens are stable.
+OPS_DEFAULTS: dict[str, dict[str, Json]] = {
+    "stamp": {"by": "fixture"},
+    "review": {"question": None, "by": "fixture"},
+    "question": {},
+    "unquestion": {},
+    "source": {"title": None, "author": None},
+}
+
+
+def tree_bytes(root: str) -> dict[str, bytes]:
+    """Every file under root, by root-relative path."""
+    out: dict[str, bytes] = {}
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            with open(full, "rb") as fh:
+                out[os.path.relpath(full, root)] = fh.read()
+    return out
+
+
+def run_op(okf: ModuleType, work: str, step: dict[str, Any]) -> Json:
+    """Run one script step as okf.py's CLI would, returning its output or error.
+
+    okf.py's `die` prints `okf: <msg>` to stderr and exits; that becomes
+    {"error": msg}. Otherwise stdout is the output, and stderr lines (okf.py's
+    notes) are kept without their `okf: ` prefix. Paths under the temp copy
+    are made catalog-relative, so the result does not depend on where it ran.
+    """
+    command = str(step["cmd"])
+    fields = {**OPS_DEFAULTS[command], **{k: v for k, v in step.items() if k != "cmd"}}
+    out, err = io.StringIO(), io.StringIO()
+    failed = False
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            getattr(okf, f"cmd_{command}")(argparse.Namespace(root=work, **fields))
+        except SystemExit:
+            failed = True
+    prefix = work + os.sep
+    stdout = out.getvalue().replace(prefix, "")
+    stderr = err.getvalue().replace(prefix, "")
+    if failed:
+        return {"error": stderr.removeprefix("okf: ").rstrip("\n")}
+    entry: dict[str, Json] = {"output": stdout.rstrip("\n")}
+    notes: list[Json] = [line.removeprefix("okf: ") for line in stderr.splitlines()]
+    if notes:
+        entry["notes"] = notes
+    return entry
+
+
+def ops(okf: ModuleType, root: str, now: str, script: dict[str, Any]) -> Json:
+    """Run an ops script on a temp copy of root with now_utc frozen at now.
+
+    `now_stamp` and `cmd_log` read `now_utc` as a module global at call
+    time, so replacing it freezes every timestamp the commands write. The
+    working directory is the copy while the steps run, because
+    `resolve_concept` also tries its argument relative to the cwd.
+    """
+    fixed = okf.parse_ts(now)
+    setattr(okf, "now_utc", lambda: fixed)
+    home = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        work = os.path.join(tmp, "catalog")
+        shutil.copytree(root, work, symlinks=True)
+        for rel, text in script["setup"].items():
+            full = os.path.join(work, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
+        before = tree_bytes(work)
+        os.chdir(work)
+        try:
+            steps: list[Json] = [run_op(okf, work, step) for step in script["steps"]]
+        finally:
+            os.chdir(home)
+        after = tree_bytes(work)
+    changed = sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
+    files: dict[str, Json] = {p: after[p].decode("utf-8") if p in after else None for p in changed}
+    return {"steps": steps, "files": files}
+
+
 def sha256() -> str:
     with open(okf_path(), "rb") as fh:
         return hashlib.sha256(fh.read()).hexdigest()
@@ -148,6 +238,13 @@ def main(argv: list[str]) -> None:
         if len(args) != 3:
             usage("analysis takes ROOT NOW COMMITS")
         result = analysis(load_okf(), *args)
+    elif command == "ops":
+        if len(args) != 2:
+            usage("ops takes ROOT NOW (and the script on stdin)")
+        script = json.load(sys.stdin)
+        if not isinstance(script, dict):
+            usage("ops reads a JSON object on stdin")
+        result = ops(load_okf(), args[0], args[1], script)
     else:
         usage(f"bad arguments {argv!r}")
     # ASCII-only output: under `python3 -I` stdout's encoding comes from the

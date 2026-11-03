@@ -1,0 +1,33 @@
+{
+  "setup": {
+    "ops/flow.md": "---\ntype: Note\ntitle: Flow shapes\nverified: { by: x, at: 2026-01-01T00:00:00Z }\nopen_questions: [one, \"two, three\", { k: v }]\n---\nBody.\n"
+  },
+  "steps": [
+    {"cmd": "stamp", "concept": "infra/time-server.md", "field": "generated", "by": "claude-code/claude-opus-5-5"},
+    {"cmd": "stamp", "concept": "/infra/time-server", "field": "verified", "by": "human:pgrace"},
+    {"cmd": "stamp", "concept": "analysis/stamps.md", "field": "verified"},
+    {"cmd": "stamp", "concept": "analysis/hub.md", "field": "verified"},
+    {"cmd": "stamp", "concept": "infra/hosts/crlf-host.md", "field": "generated"},
+    {"cmd": "stamp", "concept": "infra/hosts/no-frontmatter.md", "field": "generated"},
+    {"cmd": "stamp", "concept": "ops/flow.md", "field": "verified"},
+    {"cmd": "unquestion", "concept": "ops/flow.md", "question": "3"},
+    {"cmd": "question", "concept": "ops/flow.md", "question": "four"},
+    {"cmd": "review", "concept": "ops/flow.md", "outcome": "verified", "note": "n", "question": ["one", "five"]},
+    {"cmd": "review", "concept": "analysis/hub.md", "outcome": "partial", "note": "Links checked; anchors not.", "question": ["Is the hub still needed?", "Is the hub still needed?"]},
+    {"cmd": "review", "concept": "infra/time-server.md", "outcome": "verified", "note": "Re-checked", "question": ["Is the antenna on the roof?", "Who owns it?"], "by": "human:pgrace"},
+    {"cmd": "review", "concept": "analysis/offsets.md", "outcome": "updated", "note": "x: y"},
+    {"cmd": "question", "concept": "analysis/stamps.md", "question": "Is the clock right?"},
+    {"cmd": "question", "concept": "analysis/lead.md", "question": "Does it need splitting?"},
+    {"cmd": "unquestion", "concept": "analysis/stamps.md", "question": "2"},
+    {"cmd": "unquestion", "concept": "infra/time-server.md", "question": "Is the antenna on the roof?"},
+    {"cmd": "unquestion", "concept": "infra/time-server.md", "question": "1"},
+    {"cmd": "unquestion", "concept": "analysis/lead.md", "question": "5"},
+    {"cmd": "unquestion", "concept": "analysis/hub.md", "question": "no such question"},
+    {"cmd": "unquestion", "concept": "analysis/backlog.md", "question": "1"},
+    {"cmd": "source", "concept": "analysis/lead.md", "id": "s6", "resource": "f", "title": "Six", "author": "human:pgrace"},
+    {"cmd": "source", "concept": "analysis/lead.md", "id": "s1", "resource": "again"},
+    {"cmd": "source", "concept": "analysis/hub.md", "id": "web", "resource": "https://example.com/x", "title": ""},
+    {"cmd": "source", "concept": "analysis/stamps.md", "id": "d", "resource": "r"},
+    {"cmd": "source", "concept": "yaml/same-indent-lists.md", "id": "q", "resource": "r: s"}
+  ]
+}
