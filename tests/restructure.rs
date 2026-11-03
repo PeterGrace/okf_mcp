@@ -260,8 +260,8 @@ async fn a_delete_is_refused_while_linked_then_published() {
     assert_eq!(refused.is_error, Some(true));
     let body = refused.structured_content.expect("the error's JSON");
     assert_eq!(body["error"], "StillLinked");
-    assert_eq!(body["path"], "infra/time.md");
-    assert_eq!(body["links"], json!([{"source": "hub.md", "line": 6}]));
+    assert_eq!(body["path"], "/infra/time.md");
+    assert_eq!(body["links"], json!([{"source": "/hub.md", "line": 6}]));
     assert_eq!(
         deleted["touched"],
         json!(["/infra/time.md", "/infra/index.md"])

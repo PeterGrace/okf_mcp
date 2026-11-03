@@ -183,7 +183,9 @@ pub enum OkfError {
         .links.len()
     )]
     StillLinked {
-        /// The concept's catalog-relative path.
+        /// The concept's path, catalog-relative with a leading `/`
+        /// (`/infra/x.md`), as tool results (`touched`, `message`) and
+        /// `Conflict` write them.
         path: String,
         /// Each link into it, in walk order, then line order.
         links: Vec<LinkSource>,
@@ -206,7 +208,9 @@ pub struct ConflictFile {
 /// public).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct LinkSource {
-    /// The linking document's catalog-relative path.
+    /// The linking document's path, catalog-relative with a leading `/`
+    /// (`/hub.md`), as tool results (`touched`, `message`) and `Conflict`
+    /// write them.
     pub source: String,
     /// The 1-based line of the link (frontmatter lines count, as in lint).
     pub line: usize,
@@ -360,9 +364,9 @@ mod tests {
     #[test]
     fn still_linked_lists_its_links_and_is_a_conflict_not_internal() {
         let error = OkfError::StillLinked {
-            path: "infra/x.md".to_string(),
+            path: "/infra/x.md".to_string(),
             links: vec![LinkSource {
-                source: "hub.md".to_string(),
+                source: "/hub.md".to_string(),
                 line: 5,
             }],
         };
@@ -371,14 +375,14 @@ mod tests {
 
         assert_eq!(error.kind(), "StillLinked");
         assert!(!error.is_internal());
-        assert_eq!(body["path"], "infra/x.md");
+        assert_eq!(body["path"], "/infra/x.md");
         assert_eq!(
             body["links"],
-            serde_json::json!([{"source": "hub.md", "line": 5}])
+            serde_json::json!([{"source": "/hub.md", "line": 5}])
         );
         assert_eq!(
             body["message"],
-            "infra/x.md: still linked from 1 place(s); retarget or remove those links \
+            "/infra/x.md: still linked from 1 place(s); retarget or remove those links \
              first (move_concept retargets them)"
         );
     }
