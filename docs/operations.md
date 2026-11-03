@@ -144,6 +144,8 @@ PGSSLROOTCERT=/etc/okf-mcp/pg-ca/ca.crt   # the database's CA certificate, mount
   override the environment, so `?sslmode=prefer` in the URL would silently
   turn verification off. Check the URL for those parameter names without
   printing it, since it carries the password.
+- **Spell it exactly.** sqlx ignores a `PGSSLMODE` it cannot parse (say,
+  `verify_full`) and falls back to the default below, without a warning.
 - **Without `PGSSLMODE`**, sqlx's default is `sslmode=prefer`: it tries TLS
   without verifying the certificate, and falls back to plain text if the
   server has no TLS. That is fine on a laptop, not in production.
