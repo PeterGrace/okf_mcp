@@ -4,11 +4,15 @@
 
 # Build stage: the same Rust as the workstation's toolchain (1.99.1). Bump both
 # together.
+# Base images go by tag, not digest, on purpose: rebuilds get Debian's security
+# fixes. A pushed release keeps its digest; never rebuild an old tag.
 FROM rust:1.99.1-slim-bookworm AS build
 WORKDIR /build
 COPY . .
 # Cache mounts keep the crate registry and target/ between builds on one
 # builder. target/ is a cache, not a layer, so the binary is copied out of it.
+# They only help local or long-lived builders (CI runners start cold); a
+# cargo-chef dependency layer is the fix if CI build time ever matters.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --locked --bin okf-mcp \
