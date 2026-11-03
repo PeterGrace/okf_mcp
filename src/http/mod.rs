@@ -72,8 +72,9 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        // As for tool errors: internal ones are logged with their details;
-        // the others at debug level, by kind only (a message can name a path).
+        // As for tool errors: internal ones (every 500) are logged with their
+        // details; the others at debug level, by kind only (a message can
+        // name a path).
         if self.0.is_internal() {
             tracing::error!(error = %self.0, "request failed");
         } else {
@@ -237,11 +238,18 @@ mod tests {
         let bad = AppError(OkfError::ImportRefused {
             problems: vec!["x".to_string()],
         });
+        let io = AppError(OkfError::Io {
+            path: "a.md".to_string(),
+            source: std::io::Error::other("disk on fire"),
+        });
         let internal = AppError(OkfError::Database {
             source: sqlx::Error::PoolClosed,
         });
 
-        let statuses = [&missing, &forbidden, &refused, &bad, &internal].map(AppError::status);
+        let errors = [&missing, &forbidden, &refused, &bad, &io, &internal];
+        let statuses = errors.map(AppError::status);
+        // A 500 is exactly an internal error: logged in full, redacted here.
+        let internal_flags = errors.map(|error| error.0.is_internal());
         let response = internal.into_response();
 
         assert_eq!(
@@ -252,8 +260,10 @@ mod tests {
                 StatusCode::CONFLICT,
                 StatusCode::BAD_REQUEST,
                 StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
             ]
         );
+        assert_eq!(internal_flags, [false, false, false, false, true, true]);
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         // The driver's message stays in the log.
         assert_eq!(
