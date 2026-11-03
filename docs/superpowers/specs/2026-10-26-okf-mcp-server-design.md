@@ -111,9 +111,9 @@ One binary, `okf-mcp`, on tokio with an axum router:
 only) is configured from `allowed_hosts` in the config, so the server works behind the
 ingress.
 
-`tower-http` traces every request; every route but `/mcp` has a 120-second timeout
-(`/mcp`'s `GET` is a long-lived event stream, bounded by rmcp's keep-alive and
-`session_idle_timeout` instead). SIGINT or SIGTERM cancels one token that ends rmcp's
+`tower-http` traces every request (one `info` line each, by default); every route but
+`/mcp` has a 120-second timeout, answered with 503 (`/mcp`'s `GET` is a long-lived event
+stream, bounded by rmcp's keep-alive and `session_idle_timeout` instead). SIGINT or SIGTERM cancels one token that ends rmcp's
 sessions, the poll loop and the listener.
 
 Subcommands:
@@ -249,8 +249,9 @@ JSON (rmcp `Json<T>`, `schemars` schemas). Concept paths accept
 Each result's `structuredContent` is the JSON, and its one text block holds the same JSON
 (rmcp's `Json<T>`), rather than a hand-written summary. Errors are results with
 `isError: true` and a body `{"error": <variant>, "message": <text>}` plus the `path`,
-`catalog` or `problems` they concern; a database error says only that the log has the
-details. Without a `catalog` argument, `get_concept`, `read_document` and `history` look
+`catalog` or `problems` they concern; an internal error (database, migration,
+filesystem or configuration: the ones the HTTP routes answer with 500) says only that the
+log has the details. Without a `catalog` argument, `get_concept`, `read_document` and `history` look
 through the selected catalogs in order and answer from the first that has the path, naming
 it; the reports (`open_questions`, `oldest`, `sprawl`, `links_report`, `lint`) run on the
 first selected catalog.
