@@ -2085,6 +2085,8 @@ pub enum ReplayOp {
 
 Create `src/okf/ops/mod.rs`:
 
+> **Corrected (issue #91), 2026-11-03.** `OpOutcome::record` is not added here: nothing in Task 2 calls it, and an unused `pub(crate)` method fails `clippy -D warnings` (`dead_code`). Task 3, its first caller, adds it (Task 3, Step 3). The code below is what shipped.
+
 ```rust
 //! Edit operations on a catalog: Rust ports of `okf.py`'s concept commands
 //! (`stamp`, `review`, `question`, `unquestion`, `source`), its bookkeeping
@@ -2167,13 +2169,6 @@ impl OpOutcome {
         if !self.touched.iter().any(|p| p == path) {
             self.touched.push(path.to_string());
         }
-    }
-
-    /// Records that `path` was written by a replayable edit.
-    pub(crate) fn record(&mut self, path: &str, op: ReplayOp) {
-        self.touch(path);
-        // `entry(..).or_default()` is `dict.setdefault(key, [])`.
-        self.replay.entry(path.to_string()).or_default().push(op);
     }
 }
 
@@ -2374,8 +2369,11 @@ fn list_or_nothing<'d>(
 /// `infra/x.md: generated { by: a, at: 2026-11-03T12:00:00Z }`.
 ///
 /// # Errors
-/// As [`load_concept`]; [`OkfError::Shape`] when `verified` is a scalar;
-/// [`OkfError::FrontmatterParse`] if the edit would break the frontmatter.
+/// [`OkfError::NotFound`] when no concept matches `concept`;
+/// [`OkfError::InvalidPath`] when it names a non-concept (`log.md`, an
+/// `index.md`); [`OkfError::Refused`] when it has no frontmatter;
+/// [`OkfError::FrontmatterParse`] when its frontmatter does not parse, or
+/// the edit would break it; [`OkfError::Shape`] when `verified` is a scalar.
 pub fn stamp(
     workspace: &dyn Workspace,
     ctx: &OpContext<'_>,
@@ -2450,7 +2448,7 @@ pub fn review(
     // append below then converts a mapping or refuses a scalar.
     let have: &[Value] = match data.get(OPEN_QUESTIONS) {
         Some(Value::Seq(items)) => items,
-        _ => &[],
+        None | Some(Value::Null | Value::Str(_) | Value::Map(_)) => &[],
     };
     let mut added: Vec<&str> = Vec::new();
     let mut lines = Vec::new();
@@ -2490,7 +2488,8 @@ pub fn review(
 /// The outcome; nothing is touched when the question is already queued.
 ///
 /// # Errors
-/// As [`load_concept`]; [`OkfError::Shape`] when `open_questions` is not a list.
+/// As [`stamp`] when loading the concept; [`OkfError::Shape`] when
+/// `open_questions` is not a list.
 pub fn question(
     workspace: &dyn Workspace,
     _ctx: &OpContext<'_>,
@@ -2562,7 +2561,7 @@ fn question_index(path: &str, questions: &[Value], question: &str) -> Result<usi
 ///
 /// # Errors
 /// [`OkfError::Refused`] when there are no open questions, the index is out
-/// of range, or no question matches; as [`load_concept`] otherwise.
+/// of range, or no question matches; as [`stamp`] when loading the concept.
 pub fn unquestion(
     workspace: &dyn Workspace,
     _ctx: &OpContext<'_>,
@@ -2622,7 +2621,7 @@ pub fn unquestion(
 ///
 /// # Errors
 /// [`OkfError::Shape`] when `sources` is not a list; [`OkfError::Refused`]
-/// when an entry with this id exists; as [`load_concept`] otherwise.
+/// when an entry with this id exists; as [`stamp`] when loading the concept.
 pub fn source(
     workspace: &dyn Workspace,
     _ctx: &OpContext<'_>,
@@ -3086,6 +3085,8 @@ git commit -m "feat: okf::ops frontmatter ops, ported from okf.py with byte pari
 > - **`ensure_index` is `pub`**, not `pub(crate)`, so `tests/parity.rs` (a separate crate) can compare it with `okf.py`'s.
 > - **Two crate-internal helpers** that Task 4's `create_concept` uses: `log_index::{Listing, list_concept}`, the listing half of `index`.
 > - **Visibility change:** `okf::analysis::links::INDEX_HEADING` becomes `pub(crate)`, so `insert_index_bullet_text` uses the same `^#+\s` pattern as the index-drift check.
+
+> **Corrected (issue #91), 2026-11-03.** Two changes from Task 2's implementation: Task 3 adds `OpOutcome::record` (Step 3), which Task 2 left out because nothing there called it; and a public item's doc comment may not link the crate-private `load_concept`, `save` or `refused` (`RUSTDOCFLAGS="-D warnings" cargo doc` fails on it), so `index`'s Errors section points at `stamp` instead.
 
 This task ports `okf.py`'s bookkeeping:
 - `log` (`cmd_log`, `okf.py:752`);
@@ -4188,8 +4189,9 @@ pub(crate) fn list_concept(
 /// index already links the concept.
 ///
 /// # Errors
-/// As [`load_concept`]; [`OkfError::Refused`] without a title, without a
-/// folder `index.md`, or for a missing `section` heading.
+/// As [`crate::okf::ops::stamp`] when loading the concept;
+/// [`OkfError::Refused`] without a title, without a folder `index.md`, or
+/// for a missing `section` heading.
 pub fn index(
     workspace: &dyn Workspace,
     _ctx: &OpContext<'_>,
@@ -4288,7 +4290,18 @@ pub fn ensure_index(
 }
 ```
 
-In `src/okf/ops/mod.rs`, add `pub mod log_index;` after `pub mod frontmatter;`, and replace the `pub use replay::ReplayOp;` line with:
+In `src/okf/ops/mod.rs`, add `pub mod log_index;` after `pub mod frontmatter;`. Add `OpOutcome::record` after `OpOutcome::touch` (Task 2 left it out because it had no caller there; Corrected, issue #91):
+
+```rust
+    /// Records that `path` was written by a replayable edit.
+    pub(crate) fn record(&mut self, path: &str, op: ReplayOp) {
+        self.touch(path);
+        // `entry(..).or_default()` is `dict.setdefault(key, [])`.
+        self.replay.entry(path.to_string()).or_default().push(op);
+    }
+```
+
+Then replace the `pub use replay::ReplayOp;` line with:
 
 ```rust
 pub use log_index::{ensure_index, index, log};

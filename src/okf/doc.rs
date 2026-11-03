@@ -378,6 +378,20 @@ impl Doc {
         }
     }
 
+    /// Removes the frontmatter lines in `range` (Python's `del fm[a:b]`):
+    /// one list item located by [`Doc::seq_items`].
+    ///
+    /// # Arguments
+    /// * `range` - indexes into the frontmatter lines, as a [`SeqItems`] span
+    ///   of this document gives them.
+    ///
+    /// # Panics
+    /// If `range` is out of bounds, which a span taken from this document's
+    /// current state never is (like slicing a Python list out of range).
+    pub fn remove_lines(&mut self, range: Range<usize>) {
+        self.splice_lines(range, Vec::new());
+    }
+
     /// Where a block-list key's items sit.
     ///
     /// Comment and blank lines are skipped, so a trailing comment after the
@@ -598,6 +612,16 @@ mod tests {
                 crate::okf::yaml::scalar(text, ScalarStyle::Quoted)
             )]
         }
+    }
+
+    #[test]
+    fn remove_lines_drops_one_item_and_keeps_the_rest() {
+        let mut d = doc("---\nk:\n  - a\n  - b\n  - c\n---\n");
+        let items = d.seq_items("k").unwrap();
+
+        d.remove_lines(items.spans[1].clone());
+
+        assert_eq!(d.render(), "---\nk:\n  - a\n  - c\n---\n");
     }
 
     #[test]

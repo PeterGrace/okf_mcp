@@ -22,6 +22,15 @@
 //! git on both sides. okf.py's lint and sprawl assume Python 3.12 or later
 //! (`sum()` of floats is compensated from 3.12 on; `src/okf/analysis/sprawl.rs`).
 //!
+//! The ops (`ops.json`) run `tests/parity/ops_script.json` through
+//! `okf_mcp::okf::ops` on an in-memory copy of the corpus and through
+//! okf.py's `cmd_*` functions on a temp copy, both with "now" frozen at
+//! [`FIXED_NOW`], and compare every step's output or error and every file
+//! that changed, byte for byte. The script's error steps are refusals the
+//! port words as okf.py does (`OkfError::Refused`); the variants it words
+//! differently (`NotFound`, `FrontmatterParse`, `Shape`) are unit-tested.
+//! The live test runs on the synthetic corpus only: the script names its paths.
+//!
 //! JSON is compared as parsed values, never as text: okf.py's `json.dumps`
 //! escapes non-ASCII (`\u2082`) where serde_json writes it raw, and the
 //! shim prints ASCII-only JSON either way. Numbers are compared as serde_json
@@ -38,7 +47,7 @@
 //!
 //! The real catalog is never copied into this repository: it is private.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -46,15 +55,19 @@ use std::process::{Command, Stdio};
 
 use chrono::{DateTime, FixedOffset, Utc};
 use okf_mcp::clock::format_timestamp;
+use okf_mcp::error::OkfError;
 use okf_mcp::okf::analysis::links::links_report;
 use okf_mcp::okf::analysis::lint::{lint, CommitTimes};
 use okf_mcp::okf::analysis::oldest::{oldest, OldestQuery};
 use okf_mcp::okf::analysis::sprawl::{sprawl, SprawlQuery};
 use okf_mcp::okf::doc::Doc;
 use okf_mcp::okf::markdown::{body_split, footnote_defs, headings};
+use okf_mcp::okf::ops::{
+    question, review, source, stamp, unquestion, OpContext, OpOutcome, SourceEntry,
+};
 use okf_mcp::okf::snapshot::Snapshot;
 use okf_mcp::okf::timestamp::parse_iso;
-use okf_mcp::okf::workspace::{DiskWorkspace, Workspace};
+use okf_mcp::okf::workspace::{DiskWorkspace, MemWorkspace, StoredFile, Workspace};
 use okf_mcp::okf::yaml::{block_item, flow_value, Value};
 use serde_json::{json, Value as Json};
 
@@ -65,6 +78,7 @@ const COMMIT_TIMES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/commit-times.json"
 );
+const OPS_SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/parity/ops_script.json");
 /// The frozen "now" of the analysis goldens.
 const FIXED_NOW: &str = "2026-10-27T12:00:00Z";
 
@@ -323,6 +337,129 @@ fn secrets_corpus() -> tempfile::TempDir {
     dir
 }
 
+/// The ops script, `{"setup": {path: text}, "steps": [...]}`.
+fn ops_script() -> Json {
+    let text = std::fs::read_to_string(OPS_SCRIPT).expect("read ops script");
+    serde_json::from_str(&text).expect("ops script is JSON")
+}
+
+/// The corpus as stored files, plus the script's setup files: the state
+/// both sides start from.
+fn ops_corpus(root: &Path, script: &Json) -> BTreeMap<String, StoredFile> {
+    let workspace = DiskWorkspace::new(root).expect("corpus root exists");
+    let mut files: BTreeMap<String, StoredFile> = workspace
+        .list_files()
+        .expect("list corpus")
+        .into_iter()
+        .map(|path| {
+            let content = std::fs::read(root.join(&path)).expect("read corpus file");
+            let file = StoredFile {
+                content,
+                executable: false,
+            };
+            (path, file)
+        })
+        .collect();
+    let setup = script["setup"].as_object().expect("setup is an object");
+    for (path, text) in setup {
+        let content = text
+            .as_str()
+            .expect("setup text is a string")
+            .as_bytes()
+            .to_vec();
+        let file = StoredFile {
+            content,
+            executable: false,
+        };
+        files.insert(path.clone(), file);
+    }
+    files
+}
+
+/// Runs one script step through `okf_mcp::okf::ops`. Missing fields fall
+/// back to the shim's `OPS_DEFAULTS` (`by` is "fixture").
+fn run_op(
+    workspace: &MemWorkspace,
+    now: DateTime<Utc>,
+    step: &Json,
+) -> Result<OpOutcome, OkfError> {
+    let text = |key: &str| {
+        step[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("step {step} needs a string {key}"))
+    };
+    let optional = |key: &str| step.get(key).and_then(Json::as_str);
+    let ctx = OpContext {
+        now,
+        by: optional("by").unwrap_or("fixture"),
+    };
+    match text("cmd") {
+        "stamp" => {
+            let field = serde_json::from_value(step["field"].clone()).expect("a stamp field");
+            stamp(workspace, &ctx, text("concept"), field)
+        }
+        "review" => {
+            let questions: Vec<String> = step
+                .get("question")
+                .map(|q| serde_json::from_value(q.clone()).expect("a list of questions"))
+                .unwrap_or_default();
+            review(
+                workspace,
+                &ctx,
+                text("concept"),
+                text("outcome"),
+                text("note"),
+                &questions,
+            )
+        }
+        "question" => question(workspace, &ctx, text("concept"), text("question")),
+        "unquestion" => unquestion(workspace, &ctx, text("concept"), text("question")),
+        "source" => {
+            let entry = SourceEntry {
+                id: text("id"),
+                resource: text("resource"),
+                title: optional("title"),
+                author: optional("author"),
+            };
+            source(workspace, &ctx, text("concept"), &entry)
+        }
+        other => panic!("unknown ops command {other}"),
+    }
+}
+
+/// The ops script's result, in `okf_shim.py ops`'s JSON shape.
+fn rust_ops(root: &Path, now: DateTime<Utc>, script: &Json) -> Json {
+    let before = ops_corpus(root, script);
+    let workspace = MemWorkspace::from_stored(before.clone()).expect("corpus loads");
+    let steps: Vec<Json> = script["steps"]
+        .as_array()
+        .expect("steps is a list")
+        .iter()
+        .map(|step| match run_op(&workspace, now, step) {
+            Ok(outcome) => {
+                let mut entry = json!({ "output": outcome.message });
+                if !outcome.notes.is_empty() {
+                    entry["notes"] = json!(outcome.notes);
+                }
+                entry
+            }
+            Err(error) => json!({ "error": error.to_string() }),
+        })
+        .collect();
+    let after = workspace.into_stored();
+    // Sorted by path (a `BTreeSet`), as the shim sorts.
+    let paths: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    let mut files = serde_json::Map::new();
+    for path in paths {
+        let (old, new) = (before.get(path), after.get(path));
+        if old.map(|f| &f.content) != new.map(|f| &f.content) {
+            let text = new.map(|f| String::from_utf8(f.content.clone()).expect("ops write UTF-8"));
+            files.insert(path.clone(), json!(text));
+        }
+    }
+    json!({ "steps": steps, "files": files })
+}
+
 // ---------------------------------------------------------------------------
 // Comparison helpers
 // ---------------------------------------------------------------------------
@@ -465,6 +602,15 @@ fn render_matches_golden() {
     );
 }
 
+#[test]
+fn ops_match_golden() {
+    assert_json_equal(
+        &rust_ops(Path::new(FIXTURES), instant(FIXED_NOW), &ops_script()),
+        &read_golden("ops.json"),
+        "ops",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Live tests against okf.py
 // ---------------------------------------------------------------------------
@@ -548,6 +694,13 @@ fn python_analysis(root: &Path, now: &str, commits: &str) -> Json {
             OsStr::new(commits),
         ],
         None,
+    )
+}
+
+fn python_ops(root: &Path, now: &str, script: &Json) -> Json {
+    shim(
+        &[OsStr::new("ops"), root.as_os_str(), OsStr::new(now)],
+        Some(script),
     )
 }
 
@@ -663,6 +816,18 @@ fn live_analysis_parity() {
     );
 }
 
+#[test]
+#[ignore = "needs python3 and okf.py; run with --ignored"]
+fn live_ops_parity() {
+    let fixtures = Path::new(FIXTURES);
+    let script = ops_script();
+    assert_json_equal(
+        &rust_ops(fixtures, instant(FIXED_NOW), &script),
+        &python_ops(fixtures, FIXED_NOW, &script),
+        "ops on the synthetic corpus",
+    );
+}
+
 /// Writes `contents` to `tests/golden/<name>` through the port's own atomic
 /// writer: a reader never sees half a file, an existing golden keeps its
 /// mode, and a new one gets the usual umask mode.
@@ -702,6 +867,10 @@ fn regenerate_goldens() {
         (
             "secrets.json",
             pretty(&python_analysis(secrets_corpus().path(), FIXED_NOW, "none")["lint"]),
+        ),
+        (
+            "ops.json",
+            pretty(&python_ops(root, FIXED_NOW, &ops_script())),
         ),
         ("SOURCE", source_record(&python_sha256())),
     ];
