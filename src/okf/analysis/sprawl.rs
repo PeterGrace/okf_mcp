@@ -23,6 +23,7 @@ use std::sync::LazyLock;
 
 use rayon::prelude::*;
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::error::OkfError;
@@ -40,7 +41,7 @@ pub const SPRAWL_WARN: f64 = 16.0;
 const EXEMPT_TYPES: [&str; 1] = ["backlog"];
 
 /// One heading's section, keys in `okf.py`'s order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SprawlSection {
     /// Heading text.
     pub heading: String,
@@ -55,7 +56,7 @@ pub struct SprawlSection {
 }
 
 /// A volatile heading or bold lead-in, keys in `okf.py`'s order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct VolatileItem {
     /// `heading` or `lead-in`.
     pub kind: &'static str,
@@ -68,7 +69,7 @@ pub struct VolatileItem {
 }
 
 /// One concept's sprawl report, keys in `okf.py`'s order.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct SprawlReport {
     /// `/`-prefixed path.
     pub path: String,
