@@ -9,10 +9,15 @@
 //! export through rmcp's client; `writes_on_a_real_catalog` (M5) imports the
 //! checkout into a throwaway catalog, creates a concept with a new folder
 //! index, stamps it, logs it and publishes, timing each write tool and the
-//! publish through rmcp's client.
+//! publish through rmcp's client; `restructuring_on_a_real_catalog` (M6)
+//! imports the checkout into a throwaway catalog, publishes a probe concept,
+//! then moves it, splits a section out of it, tries a delete that must be
+//! refused while linked, and publishes, timing each tool through rmcp's
+//! client (`rewrite_links` and the delete's link check walk the whole
+//! catalog).
 //!
-//! All four tests are `#[ignore]`d because they need a catalog checkout (and
-//! the storage, server and write tests need Docker). Run them in release mode, since the timings
+//! All five tests are `#[ignore]`d because they need a catalog checkout (and
+//! the storage, server, write and restructuring tests need Docker). Run them in release mode, since the timings
 //! are the point:
 //!
 //! `OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog cargo test --release --test smoke -- --ignored --nocapture`
@@ -400,5 +405,128 @@ async fn writes_on_a_real_catalog() {
             "/m5-smoke/probe.md"
         ],
         "the probe, its folder index, the root index and log.md"
+    );
+}
+
+/// Restructure a real catalog over HTTP and time each tool and the publish.
+///
+/// The checkout is imported into the test's own Postgres container, so the
+/// real catalog is never written. A probe concept is created and published
+/// first; then it is moved (which rewrites links across the whole catalog),
+/// a section is split out of it, and a delete of the split-out concept is
+/// refused because the probe's stub links it. Only sizes and timings are
+/// printed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a catalog checkout in OKF_PARITY_CATALOG and Docker"]
+async fn restructuring_on_a_real_catalog() {
+    use okf_mcp::archive::read_directory;
+    use okf_mcp::config::Config;
+    use okf_mcp::store::keys::Access;
+    use serde_json::json;
+    use support::server::{call, TestServer};
+
+    let root = std::env::var_os("OKF_PARITY_CATALOG").expect("set OKF_PARITY_CATALOG");
+    let files = read_directory(std::path::Path::new(&root), u64::MAX).unwrap();
+    let count = files.len();
+    let started = Instant::now();
+    let server = TestServer::start(vec![("pg", files)], Config::default()).await;
+    eprintln!(
+        "start Postgres, import {count} files and start the server: {:?}",
+        started.elapsed()
+    );
+    let key = server.key("smoke", Access::Write, &[], Some("pg")).await;
+    let client = server
+        .client_with(&key, &[("x-okf-changeset", "smoke")])
+        .await
+        .unwrap();
+
+    let calls = [
+        (
+            "create_concept",
+            json!({
+                "path": "/m6-smoke/probe.md",
+                "frontmatter": {
+                    "type": "Note",
+                    "title": "M6 smoke probe",
+                    "description": "Written by the M6 smoke test.",
+                },
+                "body": "# M6 smoke probe\n\n## Part one\n\nOne.\n\n## Part two\n\nTwo.\n",
+                "index_summary": "the M6 smoke test's probe",
+            }),
+        ),
+        ("publish", json!({"message": "M6 smoke test: probe"})),
+        (
+            "move_concept",
+            json!({"old": "/m6-smoke/probe", "new": "/m6-smoke/moved.md"}),
+        ),
+        (
+            "split_concept",
+            json!({
+                "path": "/m6-smoke/moved.md",
+                "section": "Part two",
+                "to": "/m6-smoke/part-two.md",
+                "description": "The second part.",
+            }),
+        ),
+        ("delete_concept", json!({"path": "/m6-smoke/part-two.md"})),
+        ("pending_changes", json!({})),
+        ("publish", json!({"message": "M6 smoke test: restructure"})),
+    ];
+    let mut failed = Vec::new();
+    let mut refusal = serde_json::Value::Null;
+    // `Value::Null` until the last publish answers; indexing a missing key
+    // of a `Value` gives `Null`, so the asserts below fail with a message.
+    let mut published = serde_json::Value::Null;
+    for (tool, arguments) in calls {
+        let started = Instant::now();
+        let result = call(&client, tool, arguments).await;
+        let elapsed = started.elapsed();
+        let bytes = result
+            .structured_content
+            .as_ref()
+            .map_or(0, |value| value.to_string().len());
+        eprintln!("{tool}: {bytes} bytes of JSON in {elapsed:?}");
+        // A tuple `match`: the tool name and whether it failed, together.
+        match (tool, result.is_error == Some(true)) {
+            // The one refusal the test expects; its JSON names paths and lines only.
+            ("delete_concept", true) => refusal = result.structured_content.unwrap_or_default(),
+            (_, true) => failed.push((tool, result.content)),
+            ("publish", false) => published = result.structured_content.unwrap_or_default(),
+            (_, false) => {}
+        }
+    }
+    client.cancel().await.unwrap();
+
+    assert!(failed.is_empty(), "these tools returned errors: {failed:?}");
+    assert_eq!(refusal["error"], "StillLinked");
+    assert_eq!(
+        refusal["links"],
+        json!([{"source": "m6-smoke/moved.md", "line": 15}]),
+        "the stub is the split-out concept's only link"
+    );
+    assert_eq!(published["published"], true);
+    let revisions = published["revisions"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    eprintln!(
+        "publish wrote {} revisions, replayed {}, {} warnings",
+        revisions.len(),
+        published["replayed"].as_array().map_or(0, Vec::len),
+        published["warnings"].as_array().map_or(0, Vec::len)
+    );
+    let mut paths: Vec<&str> = revisions
+        .iter()
+        .filter_map(|revision| revision["path"].as_str())
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            "/m6-smoke/index.md",
+            "/m6-smoke/moved.md",
+            "/m6-smoke/part-two.md",
+            "/m6-smoke/probe.md"
+        ],
+        "the folder index, the moved probe, the split-out part and the old path"
     );
 }

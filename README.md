@@ -5,7 +5,7 @@ way to becoming a shared MCP server (design:
 `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md`).
 
 Status: milestones 1 (core library), 2 (analysis), 3 (storage), 4
-(read-only server) and 5 (writes) are delivered. The library reads a catalog into an
+(read-only server), 5 (writes) and 6 (restructuring) are delivered. The library reads a catalog into an
 in-memory `Snapshot` and runs `okf.py`'s analyses on it with the same JSON
 output (compared as parsed values): `lint`, the links report, `oldest`,
 `sprawl` and the secret scan, plus ranked `search`, which `okf.py` does not
@@ -17,8 +17,8 @@ exports catalogs, and `okf-mcp serve` serves the catalogs over MCP
 streamable HTTP with bearer-key auth: every read tool, the export and import
 routes and `/healthz`, and the write tools: each connection's edits collect in a
 changeset held in the database, which reads through that connection see and which
-`publish` turns into published revisions (see "Writing"). Moving, splitting and
-deleting concepts arrive in milestone 6.
+`publish` turns into published revisions (see "Writing"). Concepts can also be
+moved, split and deleted, with every link and listing kept in step.
 
 ## Command line
 
@@ -240,6 +240,14 @@ Bookkeeping (`write`), ports of `okf.py`'s commands with its exact output:
 | `log` | `* **<kind>:** <text>` under today's date in `log.md`, the only way to write it (`kind`: `Update`, `Creation`, `Change`, `Import`) |
 | `index` | Lists a concept in its folder's `index.md` |
 
+Restructuring (`write`):
+
+| Tool | Does |
+|---|---|
+| `move_concept` | Moves or renames a concept (`old`, `new`), port of `okf.py mv`: its folder listing moves with it, and every link to it is rewritten, keeping each link's style and anchor |
+| `split_concept` | Carves a `section` out of a concept (`path`) into a new one (`to`), port of `okf.py split`: the parent keeps a stub linking to it, links to the section follow it, and it is listed in its folder (`type`, `title`, `description`, `stub`, `sources` as `okf.py`'s flags) |
+| `delete_concept` | Deletes a concept and its listing; refused with `StillLinked`, listing each link, while any other document links to it |
+
 Changesets:
 
 | Tool | Key | Does |
@@ -260,16 +268,19 @@ run one at a time against the current published state. With nothing to
 publish it answers `published: false`. Otherwise it checks each changed
 file's base revision against the one published now:
 
-- `log` and `index` entries (and `create_concept`'s listing) are replayed
-  onto newer text instead of conflicting, so concurrent agents logging to the
-  same `log.md` all get their lines in;
+- `log` and `index` entries (and `create_concept`'s listing), and the listing
+  changes and link rewrites that `move_concept`, `split_concept` and
+  `delete_concept` make in `index.md` and `log.md`, are replayed onto newer
+  text instead of conflicting, so concurrent agents logging to the same
+  `log.md` all get their lines in; a moved listing whose bullet someone
+  changed meanwhile refuses the publish rather than drop that change;
 - any other file that changed since the changeset first read it refuses the
   publish with `Conflict`, listing each file's base and current revision
   (`pending_changes` marks it `stale`). An entry keeps the base of its first
   edit, so `discard` the conflicting paths, re-read the published text, redo
   the edit and publish again;
 - a changed file with lint errors, or a link left pointing into a path the
-  changeset deletes, refuses it with `LintFailed`; lint errors elsewhere and
+  changeset deletes (or moves away from), refuses it with `LintFailed`; lint errors elsewhere and
   warnings come back as `warnings`.
 
 A refused publish leaves the changeset open and unchanged. A successful one
@@ -297,8 +308,9 @@ Every timestamp comes from the server's clock; no tool takes one. `by`
 - `src/okf/` - the document model (`yaml`, `doc`, `markdown`, `paths`,
   `workspace`, `timestamp`), the `snapshot`, `analysis::*` (`links`, `lint`,
   `oldest`, `sprawl`, `secrets`), `search`, the edit operations `ops`
-  (ported from `okf.py`, with the replay of `log` and `index` edits) and the
-  write `rules`.
+  (ported from `okf.py`: the bookkeeping, `mv`, `split` and its link
+  rewriting, with the replay of their `index.md` and `log.md` edits; and
+  `delete`) and the write `rules`.
 - `src/db.rs`, `migrations/` - the Postgres pool and the schema, embedded at
   compile time.
 - `src/store/` - async functions over the pool: `catalogs`, `keys`,
@@ -316,8 +328,8 @@ Every timestamp comes from the server's clock; no tool takes one. `by`
   applied), cached per changeset; `src/write.rs` - the one path every write
   tool takes into its changeset.
 - `src/mcp/` - the rmcp server handler, the tool context, the read tools, the
-  write tools (`writes`) and the changeset tools (`changesets`); `src/http/` -
-  the router, `/healthz`, the archive routes, the session-to-key binding
+  write tools (`writes`), the restructuring tools (`restructure`) and the
+  changeset tools (`changesets`); `src/http/` - the router, `/healthz`, the archive routes, the session-to-key binding
   (`sessions`) and `serve`.
 - `src/cli.rs`, `src/config.rs`, `src/main.rs` - the `okf-mcp` command line
   and its configuration file.
@@ -333,11 +345,15 @@ Every timestamp comes from the server's clock; no tool takes one. `by`
 - `tests/writes.rs` - end-to-end write tests over HTTP: create, link, index,
   log, publish and export; concurrent `log.md` publishes; a conflict; a
   changeset surviving a restart; labels.
+- `tests/restructure.rs` - end-to-end restructuring over HTTP: a move
+  published and exported; a conflict and a replay against other sessions; a
+  delete refused while linked.
 - `tests/smoke.rs` - every analysis and a search on a real catalog, the
   storage path (import, load, links, lint, export) through Postgres, and the
   server (every read tool and the export over HTTP) and the write path
   (create, stamp, log, lint pending and publish over HTTP, into a throwaway
-  copy), timed.
+  copy) and the restructuring tools (move, split, a refused delete and
+  publish), timed.
 - `tests/support/` - a throwaway Postgres container per test, and a test
   server on a free port with rmcp clients.
 - `docs/superpowers/` - the design and the per-milestone plans.
@@ -376,6 +392,7 @@ The report structs derive `serde::Serialize`; their JSON has `okf.py
 
     cargo test                                   # unit, doc, golden and database tests
     cargo test --test writes                     # just the end-to-end write tests
+    cargo test --test restructure                # just the end-to-end restructuring tests
     OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog \
         cargo test --test parity -- --ignored    # live parity against okf.py
     OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog \

@@ -2,7 +2,8 @@
 
 - **Date:** 2026-10-26; storage redesigned 2026-11-02 (see "Revision: Postgres storage")
 - **Status:** approved design. M1 (core library), M2 (analysis), M3 (storage), M4
-  (read-only server) and M5 (writes) are delivered; see "Milestones"
+  (read-only server), M5 (writes) and M6 (restructuring) are delivered; see
+  "Milestones"
 - **Catalog concept:** `/projects/okf-mcp-server.md` in `pg_knowledge_catalog`
 - **Replaces:** `tools/okf.py` in every OKF catalog (how the existing git catalogs hand
   over to the server is decided once the server is complete)
@@ -664,7 +665,7 @@ check keeps `okf.py`'s 2-minute slack. Revision times are written by the server
 | M3. Storage (delivered) | `config`, `db` and migrations, `store`, `archive`; `catalog` with snapshot swap and the cached mention matcher; import and export subcommands; `catalog` and `key` subcommands; revision-based commit times for lint. Export then import reproduces the real catalog's file contents and modes byte for byte ([plan](../plans/2026-11-02-okf-mcp-m3-storage.md); PRs #48, #49 and #51-#61) |
 | M4. Read-only server (delivered) | axum, rmcp, auth, `selection`, the read tools that need no changeset (including `history`), the import and export routes, `/healthz`, the poll loop, `okf-mcp serve`. Deployable and useful on its own ([plan](../plans/2026-11-02-okf-mcp-m4-read-only-server.md); PRs #76-#86) |
 | M5. Writes (delivered) | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` ([plan](../plans/2026-11-03-okf-mcp-m5-writes.md); PRs #104-#117) |
-| M6. Restructuring | `move_concept`, `split_concept`, `delete_concept` |
+| M6. Restructuring (delivered) | `move_concept`, `split_concept`, `delete_concept`; `ReplayOp::Unlist` and `ReplayOp::Relink`; byte parity with `okf.py`'s `mv` and `split` ([plan](../plans/2026-11-03-okf-mcp-m6-restructuring.md); PRs #129-#137) |
 | M7. Deployment | Dockerfile, k8s manifests, CNPG database, NTP check, operator docs |
 
 Per the project's `CLAUDE.md`, each iteration adds a dated note under `changelog/`.
@@ -966,6 +967,88 @@ Plan corrections (each a dated `Corrected` note in the plan):
   starting the new one.
 - **#103 (wrap-up):** the smoke test shipped as planned; `write::apply`'s doc says its
   `Busy` branch for a closed changeset is defensive.
+
+### What M6 shipped differently
+
+The M6 plan's "Decisions taken while planning", its "Simplifications and deviations
+relative to the design" and its dated `Corrected` notes have the full list; most are
+already written into the sections above.
+
+Deviations planned:
+
+- The listing changes are two new replay operations: `Unlist { target, bullet }`
+  removes the bullet listing a path, refusing (with `bullet`) a listing changed since,
+  and `Relink { redirect }` redirects the links into a moved document or section. A
+  move across folders is `Unlist` plus `ListBullet`.
+- Link rewrites in `log.md` replay like those in `index.md` (plan Decision 7); in
+  every other document they are free edits.
+- `delete_concept` refuses with a new error, `StillLinked { path, links }` (HTTP 409);
+  links from `log.md` and other `index.md` files count, the folder's own listing does
+  not; an emptied folder keeps its `index.md`.
+- `split_concept`'s `type` defaults to `Note`, and its `sources` is `okf.py`'s
+  `--source`.
+- `history` stays per path: a move ends the old path's history with `delete` and
+  starts the new one's with `create`.
+- No derived-column backfill: M6 does not change `Derived::of`.
+
+Found while building it:
+
+- **A split's folder listing must replay ahead of its link rewrite** (#123, review of
+  PR #133). `okf.py split` rewrites links before it lists the new concept, and the op
+  first recorded its `ListBullet` and `Relink` in that order. Replayed so, the
+  `Relink` made the index link the new concept first, `ListBullet`'s replay then
+  skipped an index that already linked it, and the listing was lost. The op now
+  records `ListBullet` ahead of `Relink` on the same index; the two edits commute on
+  the op's own text, so the result is unchanged there.
+- **A link to a split-out section keeps resolving** (#126, Brooke's review of PR #135).
+  The parent keeps the section's heading over the stub, so only links to the section's
+  subsection anchors break, and those are `broken-anchor` warnings at publish (plan
+  Decision 18, corrected; see "Publish", step 4).
+- **A bad stored `Relink` is an error, not a panic** (#121, review of PR #130). The
+  replay's empty workspace resolves links into `from` correctly only while `from` is a
+  concept; a stored op is read from the database, so a non-concept `from` returns
+  `Refused` in every build profile rather than a `debug_assert!`.
+- **Two more divergences from `okf.py`, where it crashes or writes a bad file:** an
+  `mv` target below an existing file is `InvalidPath` "a parent component is a file",
+  refused before anything is written (#122, review of PR #131; `okf.py`'s
+  `os.makedirs` raises); a blank `split_concept` `type` is refused, as
+  `create_concept` and `set_frontmatter` refuse one (#125, review of PR #134;
+  `okf.py split --type ""` writes `type: ""`); the planned ones (a frontmatter parse
+  error in `mv`, a list `status` in `split`, a missing root `index.md`) stand.
+- **A delete's emptied index keeps its blank line** (#124). `Unlist` removes only the
+  bullet's line, so `"# X\n\n* [A](a.md)\n"` becomes `"# X\n\n"`; trimming it in the
+  op alone would make the op and its replay disagree.
+- **Publish needed no change** (#126). Every publish test of moves, splits and deletes
+  passed against M5's publish, so there is no T7 -> T8 edge.
+
+Plan corrections (each a dated `Corrected` note in the plan):
+
+- **#120 (relink):** the module docs name only code that exists, each later task adding
+  its op; the `Relink` arm's concept check (review of PR #129).
+- **#121 (Unlist, Relink):** the `Relink` arm returns `Refused` on a non-concept `from`
+  instead of a `debug_assert!`; an `Unlist` with no file stays `NotFound`, as `Log` and
+  `ListBullet` do; three more tests (review of PR #130). `py_truthy_str` carried a
+  temporary `#[cfg_attr(not(test), expect(dead_code))]` until Tasks 3 and 4 gave it
+  callers and deleted it.
+- **#122 (move_concept):** `MemWorkspace::check_placement` (shared with `write_atomic`)
+  refuses an `mv` target below a file before anything is written, the third
+  documented divergence, with three more unit tests (review of PR #131); the shim's
+  git stub is a named, annotated function.
+- **#123 (split_concept):** `# Errors` names `load_concept`'s errors instead of linking
+  the crate-private function; the `ListBullet`-before-`Relink` order above, with a
+  seventh test; the parity fixture's `splits/index.md` links `parent.md#detail`, so
+  the golden checks a split's anchor rewrite in an `index.md` against `okf.py`
+  (review of PR #133).
+- **#124 (delete_concept):** the emptied index keeps `"# X\n\n"`; `links_into` drops
+  a redundant `#fragment` filter; nine tests (one more from the claims audit, two from
+  review of PR #132), and `# Errors` names `Io` for a non-UTF-8 markdown file.
+- **#125 (tools):** `split_concept` refuses a blank `type` in the op, through a shared
+  `okf::ops::blank_type()`, a deliberate divergence from `okf.py`; six tool tests
+  (review of PR #134).
+- **#126 (publish tests):** twelve tests, not eight; Decision 18 corrected as above;
+  a `tombstoned` helper (Brooke's reviews of PR #135).
+- **#127 (end-to-end):** shipped as planned.
+- **#128 (wrap-up):** shipped as planned.
 
 ### Questions M5 answered
 
