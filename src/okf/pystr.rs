@@ -211,6 +211,33 @@ pub fn py_truthy(value: Option<&Value>) -> bool {
     }
 }
 
+/// `str(value) if value else None` for a looked-up frontmatter value: how
+/// `okf.py` reads `d.get("title") or <fallback>` when it formats the result.
+///
+/// # Arguments
+/// * `value` - the looked-up value, `None` when the key is missing.
+///
+/// # Returns
+/// [`py_str`] of the value when it is truthy ([`py_truthy`]), else `None`.
+// `expect(dead_code)` silences the unused warning until Tasks 3 and 4 of the
+// M6 plan call this; once one does, the expectation is unfulfilled, which is
+// itself a warning, so that task must delete this attribute. `cfg_attr`
+// applies it outside test builds only, since the unit test below uses it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "first callers: move_concept and split_concept (M6)"
+    )
+)]
+pub fn py_truthy_str(value: Option<&Value>) -> Option<String> {
+    if py_truthy(value) {
+        value.map(py_str)
+    } else {
+        None
+    }
+}
+
 /// `re.escape(literal)` for use inside a `(?i:...)` group, matching what
 /// Python's `re.I` matches. The `regex` crate's case folding agrees with
 /// Python's except that Python lets `i`, `I`, U+0130 and U+0131 all match
@@ -285,6 +312,32 @@ mod tests {
     use super::*;
 
     use indexmap::IndexMap;
+
+    #[test]
+    fn py_truthy_str_is_str_of_a_truthy_value() {
+        let empty = Value::Str(String::new());
+        let text = Value::Str("x".to_string());
+        let list = Value::Seq(vec![Value::Str("a".to_string())]);
+
+        let results = [
+            py_truthy_str(None),
+            py_truthy_str(Some(&empty)),
+            py_truthy_str(Some(&Value::Seq(Vec::new()))),
+            py_truthy_str(Some(&text)),
+            py_truthy_str(Some(&list)),
+        ];
+
+        assert_eq!(
+            results,
+            [
+                None,
+                None,
+                None,
+                Some("x".to_string()),
+                Some("['a']".to_string())
+            ]
+        );
+    }
 
     #[test]
     fn repr_str_picks_quotes_and_escapes_like_python() {

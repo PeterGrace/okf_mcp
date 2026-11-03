@@ -1,6 +1,8 @@
 //! Link rewriting across a catalog: `okf.py`'s `rewrite_links` (`:1343`).
 //! `okf.py`'s `mv` and `split` use it to point every link into a moved
 //! document (or a moved section) at its new place; M6 ports both onto it.
+//! Publish replays its link rewrites in `index.md` and `log.md` through
+//! [`crate::okf::ops::ReplayOp::Relink`].
 //!
 //! A link keeps its style: in-page (`#x`), bundle-absolute (`/dir/x.md`) or
 //! relative (`x.md`). A document that has just been moved, or created from
@@ -123,7 +125,7 @@ pub fn rewrite_links(
 ///   enough only while `redirect.from` is a concept (not an `index.md`): no
 ///   directory link can point at a concept. `move_concept` and
 ///   `split_concept` only ever redirect a concept, and the replay
-///   `debug_assert!`s it. [`rewrite_links`] has the real workspace, so it
+///   refuses any other source with an error. [`rewrite_links`] has the real workspace, so it
 ///   also handles an `index.md` source, as `okf.py` does.
 /// * `path` - the file's catalog-relative path.
 /// * `base` - the path its links were written against (`path`, unless it
