@@ -451,7 +451,9 @@ at a time, each against the current published state.
    - any other entry whose base is stale is a conflict: roll back and return
      `Conflict { files }` with each file's base and current revision. That includes a
      deletion entry with a NULL base, which names a path published after the
-     changeset's first edit (a deletion is never replayed). The changeset stays open;
+     changeset's first edit (a deletion is never replayed), and a replayable entry
+     whose path was deleted since its base (replaying would silently re-create a file
+     someone else deleted). The changeset stays open;
      the agent re-reads, re-applies and publishes again.
 4. Build the overlay (the current snapshot plus the entries, replays applied) and run
    the checks on it:

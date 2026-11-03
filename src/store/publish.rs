@@ -306,8 +306,10 @@ fn merge(
 /// A stale entry's content redone on the current text.
 ///
 /// # Returns
-/// `None` when it cannot be replayed (a deletion, a free edit, unreadable
-/// operations, or current content that is not text): a conflict.
+/// `None` when it cannot be replayed: a conflict. That is a deletion, a
+/// free edit, unreadable operations, current content that is not text, or
+/// a path deleted since the entry's base (the edit was made on a document
+/// that is gone, so replaying would silently re-create it).
 ///
 /// # Errors
 /// The replay's own error (text it cannot place a bullet in).
@@ -321,9 +323,12 @@ fn replayed_text(entry: &EntryRow, live: Option<&CurrentRow>) -> Result<Option<S
     let Ok(ops) = serde_json::from_value::<Vec<ReplayOp>>(stored.clone()) else {
         return Ok(None);
     };
-    let current = match live {
-        None => None,
-        Some(row) => match std::str::from_utf8(&row.content) {
+    let current = match (live, entry.base_revision) {
+        // A new path (no base) that is still not live: replay onto nothing.
+        (None, None) => None,
+        // Deleted since the entry's base: a conflict, not a re-creation.
+        (None, Some(_)) => return Ok(None),
+        (Some(row), _) => match std::str::from_utf8(&row.content) {
             Ok(text) => Some(text),
             Err(_) => return Ok(None),
         },
@@ -576,6 +581,32 @@ mod tests {
                 path: "/log.md".to_string(),
                 base_revision: None,
                 current_revision: Some(1),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_replay_onto_a_path_deleted_since_its_base_conflicts() {
+        // A `log` entry made on log.md revision 1; log.md is a tombstone now.
+        let mut logged = entry("log.md", Some(1), Some("# Log\n\n## 2026-11-03\n\n* x\n"));
+        let op = ReplayOp::Log {
+            date: "2026-11-03".to_string(),
+            bullet: "* x".to_string(),
+        };
+        logged.replay = Some(serde_json::json!([op]));
+        let current = HashMap::from([("log.md".to_string(), row("", 2, false))]);
+
+        let error = merge(vec![logged], &current).unwrap_err();
+
+        let OkfError::Conflict { files } = error else {
+            panic!("not a conflict: {error:?}")
+        };
+        assert_eq!(
+            files,
+            [ConflictFile {
+                path: "/log.md".to_string(),
+                base_revision: Some(1),
+                current_revision: None,
             }]
         );
     }
