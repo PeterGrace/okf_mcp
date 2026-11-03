@@ -65,6 +65,7 @@ Each was checked against the source on 2026-11-02, and facts 1 to 10 also by a p
 3. **Protocol versions.** `ProtocolVersion::KNOWN_VERSIONS` is `2024-11-05` to `2026-07-28` (`R/rmcp-3.8.0/src/model.rs:202`); `LATEST` is `2026-07-28` (`:174`), `LATEST_WITH_INITIALIZE` `2025-11-25` (`:199`). `legacy_session_mode` "only applies to legacy protocol versions (< 2026-07-28) ... requests negotiating that version are always served statelessly" (`tower.rs:83-90`). rmcp's client negotiated `2025-11-25` and received an `Mcp-Session-Id` in the probe.
 4. **The request reaches the tool.** The service injects the request's `http::request::Parts` into each request's extensions (`tower.rs:1276-1330`, `:2066`), so a tool takes `Extension(parts): Extension<http::request::Parts>` (`rmcp::handler::server::tool::Extension`), and anything an axum middleware inserted into the request's extensions is in `parts.extensions`. The probe's auth middleware (`axum::middleware::from_fn_with_state`, `R/axum-0.8.9/src/middleware/from_fn.rs:164`, applied with `Router::route_layer`, `routing/mod.rs:321`) inserted a principal that the tool read, per request, in both session and stateless mode; a request without a key got 401 before rmcp saw it.
 5. **Tool results.** `#[tool_router(router = name, vis = "pub(crate)")]` on an `impl` block generates `fn name() -> ToolRouter<Self>` (`R/rmcp-macros-3.8.0/src/tool_router.rs:14-28`); routers from several `impl` blocks (in different modules) combine with `+` (`R/rmcp-3.8.0/src/handler/server/router/tool.rs:604`; probe). `#[tool_handler(router = self.tool_router)]` on `impl ServerHandler` serves a stored router; without `router` it calls `Self::tool_router()` on every request (`R/rmcp-macros-3.8.0/src/tool_handler.rs:21-22`). A tool returning `Result<Json<T>, CallToolResult>` (`T: Serialize + JsonSchema`) gets an output schema from `T`; `Ok` becomes `CallToolResult::structured(value)` (`R/rmcp-3.8.0/src/handler/server/wrapper/json.rs:30-42`), whose content is one text block holding the JSON plus `structuredContent` (`model.rs:4318`); `Err(CallToolResult::structured_error(value))` gives `isError: true` (`model.rs:4345`). Arguments that do not deserialize give an `isError: true` result with text `failed to deserialize parameters: ...` (probe), not a JSON-RPC error. Output schemas need not have an object root in 3.8 (`handler/server/common.rs:120`), but older clients expect one.
+   > **Corrected (issue #69), 2026-11-03.** The macro finds the output schema by matching `Json<T>` or `Result<Json<T>, E>` *in the written return type* (`R/rmcp-macros-3.8.0/src/tool.rs:8-40`). A type alias such as `ToolResult<T>` hides it, and the tool is listed with no output schema (Task 5's `the_server_lists_the_tool` caught it). Every `#[tool]` method writes `-> Result<Json<T>, CallToolResult>`; Tasks 7 to 10's code below is corrected to match.
 6. **Server identity.** `ServerHandler::get_info` returns `ServerConfig` (alias of `InitializeResult`; `ServerInfo` is deprecated, `model.rs:1341,1368`): `ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(Implementation::new(name, version)).with_instructions(text)` (`model.rs:1307,1313`). `Implementation::from_build_env()` (`model.rs:1719`) reads rmcp's own build environment (`env!("CARGO_CRATE_NAME")` is `rmcp` there), so the crate passes `env!("CARGO_PKG_NAME")` and `env!("CARGO_PKG_VERSION")` itself.
 7. **Sessions.** `LocalSessionManager::default()` has a public `session_config: SessionConfig` whose `keep_alive: Option<Duration>` (default 5 minutes) closes a session after that much inactivity (`R/rmcp-3.8.0/src/transport/streamable_http_server/session/local.rs:1220-1267`).
 8. **The client, for tests.** `StreamableHttpClientTransportConfig::with_uri(url)` (`R/rmcp-3.8.0/src/transport/streamable_http_client.rs:2138`), `.auth_header(key)` (sends `Authorization: Bearer key`, `:2168`), `.custom_headers(HashMap<HeaderName, HeaderValue>)` (`:2196`; `accept` and `mcp-session-id` are refused); `StreamableHttpClientTransport::from_config(config)` (`src/transport/common/reqwest/streamable_http_client.rs:441`); `().serve(transport).await` (`rmcp::ServiceExt`) gives a `RunningService<RoleClient, ()>` with `list_all_tools()` and `call_tool(CallToolRequestParams::new(name).with_arguments(map))` returning `CallToolResult` (`src/service/client.rs:1855,2061`; `model.rs:4441`), and `cancel().await` closes it. A client whose key is refused fails in `serve`.
@@ -2305,15 +2306,14 @@ Above the tests:
 
 use axum::http::request::Parts;
 use rmcp::handler::server::tool::Extension;
-use rmcp::{tool, tool_router};
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router, Json};
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use rmcp::Json;
-
 use crate::clock::format_timestamp;
 use crate::mcp::context::ToolContext;
-use crate::mcp::{OkfServer, ToolResult};
+use crate::mcp::OkfServer;
 
 /// One reachable catalog.
 // `JsonSchema` gives the tool its output schema; doc comments become the
@@ -2392,7 +2392,10 @@ impl OkfServer {
                        count, last change) and this connection's selection: the catalogs \
                        a call without a `catalog` argument reads, and the default write target."
     )]
-    async fn list_catalogs(&self, Extension(parts): Extension<Parts>) -> ToolResult<CatalogList> {
+    async fn list_catalogs(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<Json<CatalogList>, CallToolResult> {
         let ctx = self.context(&parts)?;
         Ok(Json(list(&ctx)))
     }
@@ -2476,7 +2479,9 @@ impl ServerHandler for OkfServer {
 }
 
 /// What every tool returns: a structured result, or an `isError` result.
-pub(crate) type ToolResult<T> = Result<Json<T>, CallToolResult>;
+/// A `#[tool]` method spells it out (`Result<Json<T>, CallToolResult>`):
+/// rmcp's macro finds the output schema only in a written `Json<...>`.
+pub type ToolResult<T> = Result<Json<T>, CallToolResult>;
 
 impl OkfServer {
     /// The context of the request rmcp handed a tool. The error is already a
@@ -2488,7 +2493,7 @@ impl OkfServer {
 
 /// An error as a tool result: `isError: true`, its JSON in the content.
 /// Internal errors are logged here, with their details.
-pub(crate) fn tool_error(error: &OkfError) -> CallToolResult {
+pub fn tool_error(error: &OkfError) -> CallToolResult {
     if error.is_internal() {
         tracing::error!(%error, "tool failed");
     }
@@ -2496,7 +2501,7 @@ pub(crate) fn tool_error(error: &OkfError) -> CallToolResult {
 }
 
 /// A tool function's outcome as a tool result.
-pub(crate) fn reply<T>(result: Result<T, OkfError>) -> ToolResult<T> {
+pub fn reply<T>(result: Result<T, OkfError>) -> ToolResult<T> {
     result.map(Json).map_err(|error| tool_error(&error))
 }
 
@@ -2515,10 +2520,31 @@ where
 
 Add `pub mod mcp;` to `src/lib.rs` and the crate doc.
 
+> **Corrected (issue #69), 2026-11-03.** The code above is what shipped, with these
+> changes. (1) **API for Tasks 7 to 10:** a `#[tool]` method's return type is written
+> `Result<Json<T>, CallToolResult>`, not `ToolResult<T>` (verified fact 5's note): with
+> the alias the tool has no output schema. Import `rmcp::model::CallToolResult` and
+> `rmcp::Json`; `ToolResult` stays as `reply`'s return type, which is the same type, so
+> `reply(...)` still ends a tool. Tasks 7 to 10's signatures and imports are corrected.
+> (2) `ToolResult`, `tool_error` and `reply` are `pub`, not `pub(crate)`: `reply` has no
+> caller until Task 7, and a `pub(crate)` item without one fails clippy's `-D warnings`
+> as dead code. (3) `ToolContext::read_set` and `one` pass the `catalog` argument as a
+> one-element slice (`std::slice::from_ref`); `one` takes the selection's first catalog
+> without building the whole read set. (4) `the_server_lists_the_tool` also asserts an
+> object output schema. (5) More tests than Step 5 lists: `mcp::context` has one
+> (`the_argument_wins_and_reports_use_the_first_selected_catalog`), and `mcp` three
+> (`reply_passes_values_and_turns_errors_into_error_results`,
+> `blocking_returns_the_work_and_re_raises_its_panic`,
+> `the_server_names_itself_and_needs_a_principal_on_the_request`). (6) `OkfServer::context`
+> and `reply` carry `#[allow(clippy::result_large_err)]`: `CallToolResult` is over 200
+> bytes, and rmcp fixes it as a tool's error type. A tool function that returns
+> `Result<_, CallToolResult>` itself needs the same (the `#[tool]` methods are not
+> flagged). Read `src/mcp/` for the shipped code.
+
 - [ ] **Step 8: Run the tests**
 
 Run: `cargo test --lib -- mcp:: error`
-Expected: 5 passed.
+Expected: the two `error` tests and the seven `mcp` tests pass.
 
 - [ ] **Step 9: Update the design**
 
@@ -3335,14 +3361,15 @@ use std::sync::Arc;
 use axum::http::request::Parts;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_router};
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router, Json};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::Loaded;
 use crate::error::OkfError;
 use crate::mcp::context::ToolContext;
-use crate::mcp::{blocking, reply, OkfServer, ToolResult};
+use crate::mcp::{blocking, reply, OkfServer};
 use crate::okf::search::{search_catalogs, CatalogHit, SearchQuery};
 use crate::okf::snapshot::Snapshot;
 
@@ -3432,7 +3459,7 @@ impl OkfServer {
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<SearchParams>,
-    ) -> ToolResult<SearchResult> {
+    ) -> Result<Json<SearchResult>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(run(&ctx, params).await)
     }
@@ -3624,13 +3651,14 @@ Above the tests:
 use axum::http::request::Parts;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_router};
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router, Json};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::OkfError;
 use crate::mcp::context::ToolContext;
-use crate::mcp::{reply, OkfServer, ToolResult};
+use crate::mcp::{reply, OkfServer};
 use crate::okf::paths::{basename, escapes_root, normpath};
 use crate::okf::snapshot::{Frontmatter, Snapshot, SnapshotDoc};
 use crate::okf::yaml::Value;
@@ -3864,7 +3892,7 @@ impl OkfServer {
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<GetConceptParams>,
-    ) -> ToolResult<Concept> {
+    ) -> Result<Json<Concept>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(get_concept(&ctx, params))
     }
@@ -3879,7 +3907,7 @@ impl OkfServer {
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<ReadDocumentParams>,
-    ) -> ToolResult<Document> {
+    ) -> Result<Json<Document>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(read_document(&ctx, params))
     }
@@ -4104,14 +4132,15 @@ Above the tests:
 use axum::http::request::Parts;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_router};
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router, Json};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::clock::format_timestamp;
 use crate::error::OkfError;
 use crate::mcp::context::ToolContext;
-use crate::mcp::{reply, OkfServer, ToolResult};
+use crate::mcp::{reply, OkfServer};
 use crate::okf::paths::{escapes_root, normpath};
 use crate::store::history::revisions;
 
@@ -4212,7 +4241,7 @@ impl OkfServer {
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<HistoryParams>,
-    ) -> ToolResult<History> {
+    ) -> Result<Json<History>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(history(&ctx, params).await)
     }
@@ -4358,13 +4387,14 @@ Above the tests:
 use axum::http::request::Parts;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{tool, tool_router};
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router, Json};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::OkfError;
 use crate::mcp::context::ToolContext;
-use crate::mcp::{blocking, reply, OkfServer, ToolResult};
+use crate::mcp::{blocking, reply, OkfServer};
 use crate::okf::analysis::links::{links_report, LinksReport};
 use crate::okf::analysis::lint::LintReport;
 use crate::okf::analysis::oldest::{oldest, OldestQuery, OldestRow};
@@ -4596,7 +4626,7 @@ impl OkfServer {
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<CatalogParam>,
-    ) -> ToolResult<OpenQuestions> {
+    ) -> Result<Json<OpenQuestions>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(open_questions(&ctx, params).await)
     }
@@ -4608,7 +4638,7 @@ impl OkfServer {
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<OldestParams>,
-    ) -> ToolResult<Oldest> {
+    ) -> Result<Json<Oldest>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(oldest_report(&ctx, params).await)
     }
@@ -4620,7 +4650,7 @@ impl OkfServer {
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<SprawlParams>,
-    ) -> ToolResult<Sprawl> {
+    ) -> Result<Json<Sprawl>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(sprawl_report(&ctx, params).await)
     }
@@ -4633,7 +4663,7 @@ impl OkfServer {
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<LinksParams>,
-    ) -> ToolResult<Links> {
+    ) -> Result<Json<Links>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(links(&ctx, params).await)
     }
@@ -4645,7 +4675,7 @@ impl OkfServer {
         &self,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<CatalogParam>,
-    ) -> ToolResult<Lint> {
+    ) -> Result<Json<Lint>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(lint_report(&ctx, params).await)
     }
