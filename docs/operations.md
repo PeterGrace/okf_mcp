@@ -182,7 +182,7 @@ put it in your GitOps repository. It assumes:
 - ingress-nginx is the ingress controller, and cert-manager issues
   certificates through a `ClusterIssuer` named `letsencrypt`;
 - a secret `okf-mcp-backup-creds` in the namespace holds the object store's
-  `ACCESS_KEY_ID` and `ACCESS_SECRET_KEY` (create it however your site
+  `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY` and `REGION` (create it however your site
   manages secrets).
 
 ```yaml
@@ -313,7 +313,6 @@ metadata:
 spec:
   selector:
     app: okf-mcp
-  ipFamilyPolicy: PreferDualStack
   ports:
     - name: http
       port: 8080
@@ -369,6 +368,12 @@ The objects for backups (`ObjectStore`, `ScheduledBackup`) are in section 9.
 - **No `RUST_LOG`:** the binary's default is the intended level (section 3).
 - The `kubectl cp` in section 6 needs `tar` in the container, which the image
   has.
+
+**The Service:** it sets no `ipFamilyPolicy`. On a dual-stack cluster the
+server listens on both families (`listen = "[::]:8080"`), so any policy works,
+and a cluster may enforce its own (one that makes every Service
+`RequireDualStack` leaves a manifest asking for `PreferDualStack` permanently
+out of sync in a GitOps tool). Leaving the field out lets the cluster decide.
 
 **The Ingress annotations, and why:**
 
@@ -550,7 +555,10 @@ spec:
         key: ACCESS_KEY_ID
       secretAccessKey:
         name: okf-mcp-backup-creds
-        key: ACCESS_SECRET_KEY
+        key: SECRET_ACCESS_KEY
+      region:
+        name: okf-mcp-backup-creds
+        key: REGION
     wal:
       compression: gzip
     data:
@@ -571,6 +579,14 @@ spec:
 ```
 
 The schedule has six fields, seconds first: this one runs at 03:30 every day.
+
+**Set the region.** barman-cloud signs its requests for a region, the AWS default
+when none is given. An S3-compatible store with a region of its own refuses
+requests signed for any other one, often with a bare `400 Bad Request` on the
+bucket check, and the cluster's `ContinuousArchiving` condition reports
+`ContinuousArchivingFailing`. `s3Credentials.region` takes the region from a
+secret key, as above; the value itself is not secret.
+
 Give the backup credentials access to this bucket only.
 
 **Check it works.** The cluster's `ContinuousArchiving` condition should be
@@ -579,10 +595,14 @@ Give the backup credentials access to this bucket only.
 and wait for it to reach `completed`:
 
 ```sh
-kubectl -n okf-mcp cnpg backup okf-mcp-db \
+kubectl cnpg backup okf-mcp-db -n okf-mcp \
     --method plugin --plugin-name barman-cloud.cloudnative-pg.io
 kubectl -n okf-mcp get backups
 ```
+
+kubectl refuses flags placed before a plugin's name (`kubectl -n okf-mcp cnpg
+...` fails with "flags cannot be placed before plugin name"), so they go after
+`cnpg backup`.
 
 Don't trust the schedule alone: check that a recent backup completed.
 

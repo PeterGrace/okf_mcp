@@ -1899,6 +1899,14 @@ This task changes other systems. Its PR in this repo carries only:
 
 **Every outward step waits for pgrace's go-ahead in the session** (Decision 4). Steps that create or handle secret values are run by pgrace, from commands you give (Decision 3). Take the site values (object store endpoint, Vault conventions, image mirror paths, cluster issuer) from the private catalog's infrastructure concepts, and never write them into this repo.
 
+> **Corrected (issue #146), 2026-11-03.** What the rollout did differently from Steps 1 to 10:
+> - **Config by environment:** the Deployment sets `OKF_MCP_CONFIG` instead of passing `--config` in `args` (as `docs/operations.md` does, #145), so commands run with `kubectl exec` read the same file without a flag.
+> - **Secret key names:** the object store's secret uses the AWS-style `SECRET_ACCESS_KEY`, not `ACCESS_SECRET_KEY`. The first sync asked for the other name. An `ExternalSecret` that can't sync in wave `-1` stops Argo CD from creating every later wave, so nothing else appeared until the name was fixed.
+> - **The object store's region:** the `ObjectStore` must name the store's region (`s3Credentials.region`, from a secret). Without it barman-cloud signed for the AWS default, the store answered `400 Bad Request`, and WAL archiving failed.
+> - **The Service's IP family:** the Service sets no `ipFamilyPolicy`. The cluster makes every Service `RequireDualStack`, so `PreferDualStack` kept the app out of sync.
+> - **`kubectl cnpg` flags:** flags go after the plugin's name (`kubectl cnpg backup NAME -n NS ...`), or kubectl refuses them.
+> - **Step 8's catalog was imported** with `okf-mcp import` inside the pod, as planned. pgrace connected claude.ai to the server the same evening.
+
 **Files (this repo):**
 - Create: `changelog/<ts>-m7-task-07-rollout.md`
 - Modify (if needed): `docs/operations.md`, this plan
@@ -1952,7 +1960,7 @@ This task changes other systems. Its PR in this repo carries only:
     - volumes: the ConfigMap, secret `okf-mcp-db-ca` (item `ca.crt`), and an `emptyDir` on `/tmp`;
     - the probes and `securityContext` of Decision 10 and `docs/operations.md`;
     - resources: requests `100m`/`256Mi`, limit `1Gi` memory.
-  - **`service.yaml`:** ClusterIP, port 8080, `ipFamilyPolicy: PreferDualStack`.
+  - **`service.yaml`:** ClusterIP, port 8080. No `ipFamilyPolicy`: the cluster forces `RequireDualStack`, and `PreferDualStack` kept the app out of sync (see the correction above).
   - **`ingress.yaml`:** class `nginx`, `cert-manager.io/cluster-issuer: letsencrypt-prod`, the annotations of Decision 11, host `okf-mcp.k.vsix.me`, TLS secret `okf-mcp-tls`.
   - **`app-okf-mcp.yaml`:** as `app-sish.yaml`, with name and path `okf-mcp` and sync-wave `"20"`. Add it to `kustomizations/kustomization.yaml`.
 
