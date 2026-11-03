@@ -81,6 +81,7 @@ impl AppError {
             OkfError::Refused { .. } => StatusCode::CONFLICT,
             OkfError::InvalidPath { .. }
             | OkfError::FrontmatterParse { .. }
+            | OkfError::SecretDetected { .. }
             | OkfError::Shape { .. }
             | OkfError::ImportRefused { .. } => StatusCode::BAD_REQUEST,
             OkfError::Io { .. }

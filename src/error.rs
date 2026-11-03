@@ -34,6 +34,21 @@ pub enum OkfError {
         message: String,
     },
 
+    /// A write was refused by the secret scan. Only the rule, the line and
+    /// the scan's message are kept; the message shows at most the value's
+    /// first four characters, so the secret itself is never returned or logged.
+    #[error("{path}: line {line}: write refused, {message} ({rule})")]
+    SecretDetected {
+        /// Catalog-relative path of the file.
+        path: String,
+        /// 1-based line of the first hit.
+        line: usize,
+        /// The scan rule, e.g. `secret:github-token`.
+        rule: String,
+        /// The scan's message, with the value masked.
+        message: String,
+    },
+
     /// A frontmatter key has a shape the edit can't handle (e.g. `sources` is a string).
     #[error("{path}: {key} has an unexpected shape; fix it by hand")]
     Shape {
@@ -122,6 +137,7 @@ impl OkfError {
             OkfError::NotFound { .. } => "NotFound",
             OkfError::InvalidPath { .. } => "InvalidPath",
             OkfError::FrontmatterParse { .. } => "FrontmatterParse",
+            OkfError::SecretDetected { .. } => "SecretDetected",
             OkfError::Shape { .. } => "Shape",
             OkfError::Io { .. } => "Io",
             OkfError::ImportRefused { .. } => "ImportRefused",
@@ -172,6 +188,13 @@ impl OkfError {
             | OkfError::FrontmatterParse { path, .. }
             | OkfError::Shape { path, .. }
             | OkfError::Io { path, .. } => body["path"] = path.as_str().into(),
+            OkfError::SecretDetected {
+                path, line, rule, ..
+            } => {
+                body["path"] = path.as_str().into();
+                body["line"] = (*line).into();
+                body["rule"] = rule.as_str().into();
+            }
             OkfError::CatalogNotSelected { catalog } => body["catalog"] = catalog.as_str().into(),
             OkfError::ImportRefused { problems } => body["problems"] = problems.as_slice().into(),
             OkfError::Database { .. }
@@ -215,6 +238,31 @@ mod tests {
         assert_eq!(unselected_body["error"], "CatalogNotSelected");
         assert_eq!(unselected_body["catalog"], "work");
         assert_eq!(refused_body["problems"], serde_json::json!(["a: bad"]));
+    }
+
+    #[test]
+    fn secret_detected_names_the_rule_and_line_but_not_the_value() {
+        let error = OkfError::SecretDetected {
+            path: "notes.md".to_string(),
+            line: 6,
+            rule: "secret:assignment".to_string(),
+            message: "possible secret: 'password' followed by a literal value Ab1A... \
+                      (value mixes letters and digits)"
+                .to_string(),
+        };
+
+        let body = error.to_json();
+
+        assert!(!error.is_internal());
+        assert_eq!(body["error"], "SecretDetected");
+        assert_eq!(body["path"], "notes.md");
+        assert_eq!(body["line"], 6);
+        assert_eq!(body["rule"], "secret:assignment");
+        assert_eq!(
+            body["message"],
+            "notes.md: line 6: write refused, possible secret: 'password' followed by a \
+             literal value Ab1A... (value mixes letters and digits) (secret:assignment)"
+        );
     }
 
     #[test]

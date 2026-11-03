@@ -5723,6 +5723,8 @@ Expected: compile errors (`rules` is not a module of `okf`).
 
 - [ ] **Step 4: Implement**
 
+> **Corrected (issue #92), 2026-11-03.** `is_machinery` takes the first component with one `split_once` instead of `split('/').next().unwrap_or_default()` plus a separate `contains('/')`; behaviour is unchanged. Step 7 also marks the design's "Open question for M5" about the machinery list as decided. The rest of this task's code compiled and passed as written.
+
 Add `pub mod rules;` to `src/okf/mod.rs` (alphabetical, after `pystr`). Put this above the tests in `src/okf/rules.rs`:
 
 ```rust
@@ -5773,9 +5775,13 @@ const TOOLS: &str = "tools";
 /// assert!(!is_machinery("infra/docs/notes.md"));
 /// ```
 pub fn is_machinery(path: &str) -> bool {
-    let first = path.split('/').next().unwrap_or_default();
-    let root_doc =
-        !path.contains('/') && NON_CONCEPTS.contains(&path) && !RESERVED.contains(&path);
+    // `split_once` is Python's `str.partition` without the separator: `None`
+    // when there is no `/`, i.e. a file at the catalog root.
+    let (first, nested) = match path.split_once('/') {
+        Some((first, _)) => (first, true),
+        None => (path, false),
+    };
+    let root_doc = !nested && NON_CONCEPTS.contains(&path) && !RESERVED.contains(&path);
     root_doc
         || first == TOOLS
         || SKIP_TOP.contains(&first)
