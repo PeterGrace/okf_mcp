@@ -643,12 +643,18 @@ spec:
   own `plugins` entry with a new `serverName` once it is up.
 - **The image:** if your cluster needs `imageName` on every `Cluster` (an
   image mirror, say), give the restored one the same `imageName` as the source.
-- **Before the backup,** pause publishing and record the live database's
-  numbers with the query below. These are the baseline.
+- **Before the backup,** hold every write: publishes, imports (the subcommand
+  and the route) and `catalog` changes. The simplest way is to scale the
+  Deployment to 0 for the window
+  (`kubectl -n okf-mcp scale deploy/okf-mcp --replicas=0`, then back to 1).
+  Then record the live database's numbers with the query below. These are the
+  baseline.
 - **Compare it** with the live database when it is ready, querying both at the
-  same moment with publishing still paused, so the two must be equal. Counts
-  catch missing rows, and one checksum over every document (catalog, path and
-  content) catches changed content:
+  same moment with writes still held, so the two must be equal. Counts catch
+  missing rows, and one checksum over every document (catalog, path and
+  content) catches changed content. It does not cover a file's execute bit,
+  revision rows' content or changesets; the counts and `last_revision` stand in
+  for those:
 
   ```sh
   kubectl -n okf-mcp exec -i <instance> -c postgres -- psql -d okf_mcp <<'SQL'
@@ -674,9 +680,11 @@ spec:
 - **Then** either point `DATABASE_URL` and `PGSSLROOTCERT` at its `-app` and
   `-ca` secrets, or delete it (`kubectl -n okf-mcp delete cluster
   okf-mcp-db-restore`; CloudNativePG removes its volumes).
-- **Tested:** this section was followed as written in milestone 7's restore
-  drill. A small catalog was ready about 3 minutes after the `Cluster` was
-  created, and matched the live database exactly.
+- **Tested:** the restore `Cluster` above was followed as written in milestone
+  7's restore drill. A small catalog was ready about 3 minutes after the
+  `Cluster` was created, and matched the live database exactly. The comparison
+  query was revised after the drill (the drill's version ordered by `path`
+  only), and the revised query was then run as written on the live database.
 
 ### An extra copy of each catalog
 

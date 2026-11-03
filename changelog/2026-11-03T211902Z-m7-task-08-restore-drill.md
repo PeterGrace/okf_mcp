@@ -47,3 +47,8 @@ a path, and it breaks on a backslash in a path. The documented query now:
 
 The section also adds a step to record the baseline before the backup, and says that
 the checksum only works while publishing is paused.
+
+A second review round reworded three things:
+- The "Tested" line says what was tested as written (the restore `Cluster`) and what was revised afterwards (the query, since run as written on the live database).
+- "Pause publishing" becomes "hold every write", which includes imports and `catalog` changes, done by scaling the Deployment to 0.
+- What the checksum does not cover is now spelled out.
