@@ -3,24 +3,33 @@
 //! and `adopt_changeset` (Task 12). Each task's tools are one
 //! `#[tool_router]` block with its own router, joined in `OkfServer::tools`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::request::Parts;
 use chrono::{DateTime, TimeDelta, Utc};
+use rayon::prelude::*;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router, Json};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use similar::TextDiff;
 
-use crate::catalog::CatalogState;
+use crate::catalog::{CatalogState, Loaded};
 use crate::clock::format_timestamp;
 use crate::error::OkfError;
 use crate::mcp::context::ToolContext;
-use crate::mcp::{reply, OkfServer};
+use crate::mcp::reports::CatalogParam;
+use crate::mcp::{blocking, reply, OkfServer};
+use crate::okf::ops::OpOutcome;
+use crate::okf::paths::{escapes_root, normpath};
+use crate::okf::rules;
+use crate::okf::workspace::Workspace;
 use crate::store::keys::Access;
+use crate::write::{apply, WriteReport};
 
 /// `stranded_sessions`' arguments.
 // `Deserialize` reads them from the call's JSON; `JsonSchema` gives the tool
@@ -336,7 +345,13 @@ async fn own_changeset(
         key_id: &principal.key_id,
         label: ctx.label(),
     };
-    let changeset = changesets::find_open(ctx.app().pool(), &key).await?;
+    // As in `ToolContext::view`: a key below `write` never has a changeset
+    // to read, so it skips the lookup.
+    let changeset = if principal.access < Access::Write {
+        None
+    } else {
+        changesets::find_open(ctx.app().pool(), &key).await?
+    };
     Ok(OwnChangeset { state, changeset })
 }
 
@@ -425,6 +440,433 @@ impl OkfServer {
     ) -> Result<Json<Published>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(publish(&ctx, params).await)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// discard, revert and pending_changes (Task 11)
+// ---------------------------------------------------------------------------
+
+/// `discard`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct DiscardParams {
+    /// The paths to drop, e.g. `["/infra/ntp.md"]` (default: every entry, which also closes the changeset).
+    pub paths: Option<Vec<String>>,
+    /// The catalog (default: this connection's write target).
+    pub catalog: Option<String>,
+}
+
+/// `discard`'s result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Discarded {
+    /// The catalog.
+    pub catalog: String,
+    /// This connection's changeset label.
+    pub label: String,
+    /// The changeset, if this connection had one open.
+    pub changeset: Option<i64>,
+    /// How many entries were dropped.
+    pub removed: u64,
+    /// Whether the changeset was closed (`discarded`): no `paths` given. The next write opens a new one.
+    pub closed: bool,
+}
+
+/// `revert`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct RevertParams {
+    /// The document as stored, with its extension, e.g. `/infra/ntp.md`.
+    pub path: String,
+    /// The revision to go back to, as `history` lists it; a `delete` revision means deleting the document.
+    pub revision: i32,
+    /// The catalog (default: this connection's write target).
+    pub catalog: Option<String>,
+}
+
+/// One file of `pending_changes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct PendingFile {
+    /// `/`-prefixed path.
+    pub path: String,
+    /// `create`, `update` or `delete`, against the published catalog now.
+    pub change: &'static str,
+    /// The published revision the entry was made on (null: the path had no live document).
+    pub base_revision: Option<i32>,
+    /// The path's published revision now (null: no live document).
+    pub current_revision: Option<i32>,
+    /// Whether the path was published since the entry was made (`base_revision` differs from `current_revision`). Publish replays a stale replayable entry and refuses any other with Conflict.
+    pub stale: bool,
+    /// Whether publish can replay the entry onto newer text (log.md and index.md bookkeeping only).
+    pub replayable: bool,
+    /// A unified diff against the published text (`/dev/null` for a new or deleted file). A deletion of a path deleted since (no published file), or a file equal to the published one, gets a one-line note instead.
+    pub diff: String,
+}
+
+/// `pending_changes`' result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct PendingChanges {
+    /// The catalog.
+    pub catalog: String,
+    /// This connection's changeset label.
+    pub label: String,
+    /// The open changeset, if any.
+    pub changeset: Option<i64>,
+    /// Its entries, in path order.
+    pub files: Vec<PendingFile>,
+}
+
+/// A path argument as stored: no leading `/`, normalized, inside the
+/// catalog. Unlike [`rules::check_path`] it allows machinery, so `discard`
+/// can drop any entry, even one a later rule would refuse.
+///
+/// # Arguments
+/// * `reference` - the path as the agent gave it.
+///
+/// # Returns
+/// The stored form.
+///
+/// # Errors
+/// [`OkfError::InvalidPath`] for a path outside the catalog or the root.
+fn stored_path(reference: &str) -> Result<String, OkfError> {
+    let path = normpath(reference.trim_start_matches('/'));
+    if escapes_root(&path) || path == "." {
+        return Err(OkfError::InvalidPath {
+            path: reference.to_string(),
+            reason: "not a path inside the catalog".to_string(),
+        });
+    }
+    Ok(path)
+}
+
+/// Drops entries from this connection's changeset; without `paths`, all
+/// of them, and the changeset is closed (`discarded`).
+///
+/// Takes publish's locks in publish's order: the catalog's in-process
+/// publish lock, then (in the transaction) the advisory lock, the catalog
+/// row and the changeset row. So a discard and a publish of one changeset
+/// run one after the other, and a write queued behind a closing discard
+/// opens a new changeset.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the paths and catalog.
+///
+/// # Returns
+/// How many entries went, and whether the changeset was closed.
+///
+/// # Errors
+/// As [`own_changeset`] (with `write`); [`OkfError::InvalidPath`] for a
+/// path outside the catalog; [`OkfError::Refused`] if a publish or another
+/// discard closed the changeset meanwhile; [`OkfError::Database`].
+pub(crate) async fn discard(
+    ctx: &ToolContext,
+    params: DiscardParams,
+) -> Result<Discarded, OkfError> {
+    use crate::store::catalogs;
+    use crate::store::changesets::{self, ChangesetState};
+
+    // `transpose` turns `Option<Result<..>>` into `Result<Option<..>>`, so
+    // `?` can raise a bad path while "no paths" stays `None`.
+    let paths = params
+        .paths
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|path| stored_path(path))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let OwnChangeset { state, changeset } =
+        own_changeset(ctx, params.catalog.as_deref(), Access::Write).await?;
+    let mut discarded = Discarded {
+        catalog: state.name().to_string(),
+        label: ctx.label().to_string(),
+        changeset: None,
+        removed: 0,
+        closed: false,
+    };
+    let Some(changeset) = changeset else {
+        return Ok(discarded);
+    };
+    // An empty list drops nothing: no lock, no version bump, and the cached
+    // overlay stays valid.
+    if paths.as_ref().is_some_and(Vec::is_empty) {
+        discarded.changeset = Some(changeset.id);
+        return Ok(discarded);
+    }
+    let app = ctx.app();
+    // The guard releases the mutex when it goes out of scope, after the
+    // overlay is forgotten.
+    let _closing = state.publish_lock().lock().await;
+    let now = app.clock().now();
+    // Dropping `tx` without `commit()` (any `?`) rolls back.
+    let mut tx = app.pool().begin().await?;
+    catalogs::lock(&mut tx, state.id()).await?;
+    changesets::lock_catalog(&mut tx, state.id()).await?;
+    changesets::lock(&mut tx, changeset.id)
+        .await?
+        .filter(|row| row.state == ChangesetState::Open)
+        .ok_or_else(|| OkfError::Refused {
+            reason: format!("changeset {} is no longer open", changeset.id),
+        })?;
+    discarded.removed =
+        changesets::remove_entries(&mut tx, changeset.id, paths.as_deref(), now).await?;
+    discarded.closed = paths.is_none();
+    if discarded.closed {
+        changesets::set_state(&mut tx, changeset.id, ChangesetState::Discarded, now).await?;
+    }
+    tx.commit().await?;
+    app.overlays().forget(changeset.id);
+    discarded.changeset = Some(changeset.id);
+    Ok(discarded)
+}
+
+/// Adds a document's content at `revision` (or its deletion, for a
+/// `delete` revision) to this connection's changeset, as a free edit.
+///
+/// It goes through [`apply`], so every write rule applies. Sending a path
+/// the changeset created (never published) back to "absent" leaves no
+/// entry for it, so the report's `touched` is empty.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the path, revision and catalog.
+///
+/// # Returns
+/// The write's report.
+///
+/// # Errors
+/// [`OkfError::InvalidPath`] for machinery or a path outside the catalog
+/// (before any history is read); a selection error;
+/// [`OkfError::Forbidden`] below `write`; [`OkfError::NotFound`] for a
+/// revision the path never had; [`OkfError::Refused`] for content that is
+/// not UTF-8, or a deletion of a path this changeset's view does not hold;
+/// as [`apply`].
+pub(crate) async fn revert(
+    ctx: &ToolContext,
+    params: RevertParams,
+) -> Result<WriteReport, OkfError> {
+    use crate::store::history;
+
+    let RevertParams {
+        path,
+        revision,
+        catalog,
+    } = params;
+    // The write rules refuse machinery here, before the history is read;
+    // `apply` checks the touched path again.
+    let path = rules::check_path(&path)?;
+    let state = ctx.one(catalog.as_deref())?;
+    ctx.principal().require(Access::Write, state.name())?;
+    let stored = history::content_at(ctx.app().pool(), state.id(), &path, revision)
+        .await?
+        .ok_or_else(|| OkfError::NotFound {
+            path: format!("/{path} (revision {revision})"),
+        })?;
+    // `transpose` again: `Option<Result<String, _>>` to `Result<Option<..>>`.
+    let content = stored
+        .content
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|_| OkfError::Refused {
+            reason: format!(
+                "/{path} revision {revision} is not text; only text documents can be reverted"
+            ),
+        })?;
+    // `move` hands `path` and `content` to the closure, which `apply` runs
+    // on a blocking thread.
+    apply(ctx, Some(state.name()), None, move |ws, _| {
+        match &content {
+            Some(text) => ws.write_atomic(&path, text)?,
+            None if !ws.remove(&path)? => {
+                return Err(OkfError::Refused {
+                    reason: format!("/{path} is already absent in this changeset's view"),
+                });
+            }
+            None => {}
+        }
+        let message = format!("{path}: reverted to revision {revision}");
+        // No replay: a revert is a free edit, which conflicts on a stale
+        // base. `path` moves into the outcome (no copy).
+        Ok(OpOutcome {
+            touched: vec![path],
+            replay: BTreeMap::new(),
+            message,
+            notes: Vec::new(),
+        })
+    })
+    .await
+}
+
+/// This connection's changeset in a catalog, as diffs against the published
+/// text.
+///
+/// It sees what [`ToolContext::view`] would: a key below `write` has no
+/// changeset (the list is empty), else the open changeset of this key and
+/// label. It reads the entries and the published state rather than
+/// building the overlay, so a changeset whose overlay no longer applies
+/// can still be listed, and then discarded.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the catalog.
+///
+/// # Returns
+/// The changed paths and their diffs; empty without an open changeset.
+///
+/// # Errors
+/// As [`own_changeset`] (any key that reaches the catalog may ask).
+pub(crate) async fn pending_changes(
+    ctx: &ToolContext,
+    params: CatalogParam,
+) -> Result<PendingChanges, OkfError> {
+    use crate::store::changesets;
+
+    let OwnChangeset { state, changeset } =
+        own_changeset(ctx, params.catalog.as_deref(), Access::Read).await?;
+    let files = match &changeset {
+        None => Vec::new(),
+        Some(row) => {
+            let entries = changesets::entries(ctx.app().pool(), row.id).await?;
+            let loaded = state.current();
+            blocking(move || pending_files(&loaded, &entries)).await
+        }
+    };
+    Ok(PendingChanges {
+        catalog: state.name().to_string(),
+        label: ctx.label().to_string(),
+        changeset: changeset.map(|row| row.id),
+        files,
+    })
+}
+
+/// Each entry against the published file (on a blocking thread).
+///
+/// # Arguments
+/// * `loaded` - the published state.
+/// * `entries` - the changeset's entries, in path order.
+///
+/// # Returns
+/// One [`PendingFile`] per entry, in the same order.
+fn pending_files(
+    loaded: &Loaded,
+    entries: &[crate::store::changesets::EntryRow],
+) -> Vec<PendingFile> {
+    // The diffs are independent: rayon's `par_iter` spreads them over the
+    // CPU pool, and `collect` keeps the entries' (path) order.
+    entries
+        .par_iter()
+        .map(|entry| {
+            let published = loaded.workspace().stored(&entry.path);
+            let change = match (&published, &entry.content) {
+                (_, None) => "delete",
+                (None, Some(_)) => "create",
+                (Some(_), Some(_)) => "update",
+            };
+            let current_revision = loaded.revision(&entry.path);
+            let old = published.as_ref().map(|file| file.content.as_slice());
+            PendingFile {
+                path: format!("/{}", entry.path),
+                change,
+                base_revision: entry.base_revision,
+                current_revision,
+                stale: entry.base_revision != current_revision,
+                replayable: entry.replay.is_some(),
+                diff: unified_diff(&entry.path, old, entry.content.as_deref()),
+            }
+        })
+        .collect()
+}
+
+/// A unified diff (3 lines of context) between the published and the
+/// pending file. A missing side is `/dev/null`, as `git diff` writes it.
+///
+/// # Arguments
+/// * `path` - catalog-relative path.
+/// * `published` - the published bytes, if the file is published.
+/// * `pending` - the pending bytes, or `None` for a deletion.
+///
+/// # Returns
+/// The diff text; a one-line "Binary files ... differ" when either side is
+/// not UTF-8; a one-line note for a deletion of a path that is not
+/// published now (deleted by someone else since the entry was made), or for
+/// pending bytes equal to the published ones.
+fn unified_diff(path: &str, published: Option<&[u8]>, pending: Option<&[u8]>) -> String {
+    if published.is_none() && pending.is_none() {
+        return format!(
+            "No published {path} to delete: it was deleted after this entry was made\n"
+        );
+    }
+    // Byte for byte the published file (a revert to the revision published
+    // now, say): a diff would be empty, so say why.
+    if published.is_some() && published == pending {
+        return "No change from the published text\n".to_string();
+    }
+    // A missing side diffs as empty text. A nested `fn`, not a closure:
+    // its signature ties the `&str` it returns to the bytes it borrows,
+    // which closure inference cannot express.
+    fn as_text(bytes: Option<&[u8]>) -> Result<&str, std::str::Utf8Error> {
+        bytes.map_or(Ok(""), std::str::from_utf8)
+    }
+    let (Ok(old), Ok(new)) = (as_text(published), as_text(pending)) else {
+        return format!("Binary files a/{path} and b/{path} differ\n");
+    };
+    let old_header = published.map_or_else(|| "/dev/null".to_string(), |_| format!("a/{path}"));
+    let new_header = pending.map_or_else(|| "/dev/null".to_string(), |_| format!("b/{path}"));
+    TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(&old_header, &new_header)
+        .to_string()
+}
+
+#[tool_router(router = changes_router, vis = "pub(crate)")]
+impl OkfServer {
+    /// The `discard` tool.
+    #[tool(
+        description = "Drop entries from this connection's changeset in a catalog: the named \
+                       `paths`, or every entry (which also closes the changeset; the next write \
+                       opens a new one). Published documents are not touched. Write access."
+    )]
+    async fn discard(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<DiscardParams>,
+    ) -> Result<Json<Discarded>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(discard(&ctx, params).await)
+    }
+
+    /// The `revert` tool.
+    #[tool(
+        description = "Add a document's content at an earlier revision (from `history`), or its \
+                       deletion for a `delete` revision, to this connection's changeset, for \
+                       review and publish like any other edit. Every write rule applies, so \
+                       machinery cannot be reverted. Reverting a file this changeset created to \
+                       a `delete` revision drops it from the changeset. Write access."
+    )]
+    async fn revert(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<RevertParams>,
+    ) -> Result<Json<WriteReport>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(revert(&ctx, params).await)
+    }
+
+    /// The `pending_changes` tool.
+    #[tool(
+        description = "This connection's unpublished changeset in a catalog: each changed path \
+                       (create, update or delete), the revision it was based on and the one \
+                       published now, whether that base is stale, whether publish can replay \
+                       it, and a unified diff against the published text."
+    )]
+    async fn pending_changes(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<CatalogParam>,
+    ) -> Result<Json<PendingChanges>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(pending_changes(&ctx, params).await)
     }
 }
 
@@ -1299,5 +1741,519 @@ mod publish_tests {
         let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(paths, ["infra/y.md"]);
         assert_eq!(published_text(&test, "infra/y.md"), Y);
+    }
+}
+
+#[cfg(test)]
+mod changes_tests {
+    use super::*;
+    use std::time::Duration;
+
+    use chrono::Utc;
+
+    use crate::config::Config;
+    use crate::mcp::testing::{
+        app_with, context, files, pending_entry, principal, principal_as, writer, PendingEdit,
+        TestApp,
+    };
+    use crate::mcp::writes::{
+        create_concept, replace_body, CreateConceptParams, ReplaceBodyParams,
+    };
+    use crate::store::changesets::{self, ChangesetState};
+    use crate::store::import::{import, ImportOptions};
+
+    const NOTE: &str = "---\ntype: Note\ntitle: A\ndescription: A note.\n---\n# A\n";
+    const NOTE_B: &str = "---\ntype: Note\ntitle: B\ndescription: B note.\n---\n# B\n";
+
+    async fn pg() -> TestApp {
+        let files: &[(&str, &str)] = &[
+            ("a.md", NOTE),
+            ("b.md", NOTE_B),
+            ("AGENTS.md", "# Agents\n"),
+        ];
+        app_with(&[("pg", files)], Config::default()).await
+    }
+
+    /// Replaces the published catalog with `entries` (an import standing in
+    /// for other sessions' publishes), and lets the server notice.
+    async fn republish(test: &TestApp, entries: &[(&str, &str)]) {
+        let options = ImportOptions {
+            replace: true,
+            actor: "tester",
+            now: Utc::now(),
+        };
+        import(test.app.pool(), "pg", files(entries), &options)
+            .await
+            .unwrap();
+        test.app
+            .catalog("pg")
+            .unwrap()
+            .refresh(test.app.pool())
+            .await
+            .unwrap();
+    }
+
+    async fn body(ctx: &ToolContext, path: &str, text: &str) -> WriteReport {
+        let params = ReplaceBodyParams {
+            path: path.to_string(),
+            body: text.to_string(),
+            catalog: None,
+        };
+        replace_body(ctx, params).await.unwrap()
+    }
+
+    async fn new_note(ctx: &ToolContext, path: &str) -> WriteReport {
+        let frontmatter =
+            serde_json::json!({"type": "Note", "title": "New", "description": "New."});
+        let params = CreateConceptParams {
+            path: path.to_string(),
+            frontmatter: frontmatter.as_object().unwrap().clone(),
+            body: "# New\n".to_string(),
+            index_summary: None,
+            index_section: None,
+            by: None,
+            catalog: None,
+        };
+        create_concept(ctx, params).await.unwrap()
+    }
+
+    fn revert_to(path: &str, revision: i32) -> RevertParams {
+        RevertParams {
+            path: path.to_string(),
+            revision,
+            catalog: None,
+        }
+    }
+
+    fn discard_paths(paths: Option<&[&str]>) -> DiscardParams {
+        let paths = paths.map(|paths| paths.iter().map(|path| path.to_string()).collect());
+        DiscardParams {
+            paths,
+            catalog: None,
+        }
+    }
+
+    async fn pending(ctx: &ToolContext) -> PendingChanges {
+        pending_changes(ctx, CatalogParam { catalog: None })
+            .await
+            .unwrap()
+    }
+
+    async fn state_of(test: &TestApp, changeset: i64) -> ChangesetState {
+        changesets::by_id(test.app.pool(), changeset)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
+    /// Waits until `count` backends wait on a lock (as `publish_tests` does).
+    async fn lock_waiters(test: &TestApp, count: i64) {
+        for _ in 0..500 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(test.app.pool())
+            .await
+            .unwrap();
+            if waiting >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{count} lock waiter(s) never appeared");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discard_drops_named_paths_or_closes_the_whole_changeset() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let written = body(&ctx, "/a.md", "One.\n").await;
+        body(&ctx, "/b.md", "Two.\n").await;
+        let version = |test: &TestApp| {
+            let pool = test.app.pool().clone();
+            async move {
+                changesets::by_id(&pool, written.changeset)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version
+            }
+        };
+        let before = version(&test).await;
+
+        let empty = discard(&ctx, discard_paths(Some(&[]))).await.unwrap();
+        let unchanged = version(&test).await;
+        let some = discard(&ctx, discard_paths(Some(&["/a.md", "/c.md"])))
+            .await
+            .unwrap();
+        let left = pending(&ctx).await;
+        let all = discard(&ctx, discard_paths(None)).await.unwrap();
+        let after = pending(&ctx).await;
+        let nothing = discard(&ctx, discard_paths(None)).await.unwrap();
+        let outside = discard(&ctx, discard_paths(Some(&["/../x.md"])))
+            .await
+            .unwrap_err();
+        let again = body(&ctx, "/a.md", "Three.\n").await;
+
+        // An empty list drops nothing and leaves the version alone.
+        assert_eq!(
+            (empty.changeset, empty.removed, empty.closed),
+            (Some(written.changeset), 0, false)
+        );
+        assert_eq!(unchanged, before);
+        assert_eq!(
+            (some.changeset, some.removed, some.closed),
+            (Some(written.changeset), 1, false)
+        );
+        let paths: Vec<&str> = left.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["/b.md"]);
+        assert_eq!((all.removed, all.closed), (1, true));
+        assert_eq!(
+            state_of(&test, written.changeset).await,
+            ChangesetState::Discarded
+        );
+        assert_eq!((after.changeset, after.files.len()), (None, 0));
+        assert_eq!(
+            (nothing.changeset, nothing.removed, nothing.closed),
+            (None, 0, false)
+        );
+        assert_eq!(outside.kind(), "InvalidPath");
+        assert_ne!(
+            again.changeset, written.changeset,
+            "a write after a discard opens a new changeset"
+        );
+        // The published documents are untouched.
+        let loaded = test.app.catalog("pg").unwrap().current();
+        assert_eq!(
+            loaded.snapshot().get("a.md").map(|doc| doc.text()),
+            Some(NOTE)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discard_needs_write_access() {
+        let test = pg().await;
+        let reader = context(&test, principal(&[], Some("pg")), None);
+
+        let refused = discard(&reader, discard_paths(None)).await.unwrap_err();
+
+        assert_eq!(refused.kind(), "Forbidden");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_queued_behind_a_discard_lands_in_a_new_changeset() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let state = test.app.catalog("pg").unwrap();
+        let opened = body(&ctx, "/a.md", "First.\n").await;
+        // Hold the changeset's row lock, so the discard and then the write
+        // queue on it in that order.
+        let mut holder = test.app.pool().begin().await.unwrap();
+        changesets::lock_catalog(&mut holder, state.id())
+            .await
+            .unwrap();
+        changesets::lock(&mut holder, opened.changeset)
+            .await
+            .unwrap();
+        // Two connections of one key and label, each with its own context
+        // (`ToolContext` is not `Clone`); `move` gives each task its own.
+        let same_key = || {
+            context(
+                &test,
+                principal_as("writer-a", Access::Write, &[], Some("pg")),
+                None,
+            )
+        };
+        let discarder = same_key();
+        let discarding =
+            tokio::spawn(async move { discard(&discarder, discard_paths(None)).await });
+        lock_waiters(&test, 1).await;
+        let late = same_key();
+        let writing = tokio::spawn(async move { body(&late, "/b.md", "Late.\n").await });
+        lock_waiters(&test, 2).await;
+
+        holder.rollback().await.unwrap();
+        let discarded = discarding.await.unwrap().unwrap();
+        let written = writing.await.unwrap();
+
+        // The discard took the lock first and closed the changeset. The
+        // write's `get_or_create` re-checks `state = 'open'` once the lock is
+        // granted, finds none, and opens a new changeset: never `Busy`.
+        assert_eq!(
+            (discarded.changeset, discarded.removed, discarded.closed),
+            (Some(opened.changeset), 1, true)
+        );
+        assert_eq!(
+            state_of(&test, opened.changeset).await,
+            ChangesetState::Discarded
+        );
+        assert_ne!(written.changeset, opened.changeset);
+        assert_eq!(
+            state_of(&test, written.changeset).await,
+            ChangesetState::Open
+        );
+        let entries = changesets::entries(test.app.pool(), written.changeset)
+            .await
+            .unwrap();
+        let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, ["b.md"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revert_writes_an_old_revision_as_a_free_edit() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        republish(
+            &test,
+            &[
+                ("a.md", "# Two\n"),
+                ("b.md", NOTE_B),
+                ("AGENTS.md", "# Agents\n"),
+            ],
+        )
+        .await;
+
+        let reverted = revert(&ctx, revert_to("/a.md", 1)).await.unwrap();
+        let shown = pending(&ctx).await;
+        republish(
+            &test,
+            &[
+                ("a.md", "# Three\n"),
+                ("b.md", NOTE_B),
+                ("AGENTS.md", "# Agents\n"),
+            ],
+        )
+        .await;
+        let stale = pending(&ctx).await;
+
+        assert_eq!(reverted.touched, ["/a.md"]);
+        assert_eq!(reverted.message, "a.md: reverted to revision 1");
+        let entries = changesets::entries(test.app.pool(), reverted.changeset)
+            .await
+            .unwrap();
+        assert_eq!(entries[0].content.as_deref(), Some(NOTE.as_bytes()));
+        // Based on what is published now (revision 2), with no replay.
+        assert_eq!(
+            (entries[0].base_revision, entries[0].replay.as_ref()),
+            (Some(2), None)
+        );
+        let file = &shown.files[0];
+        assert_eq!(
+            (file.change, file.base_revision, file.current_revision),
+            ("update", Some(2), Some(2))
+        );
+        assert!(!file.stale && !file.replayable);
+        assert!(
+            file.diff.starts_with("--- a/a.md\n+++ b/a.md\n"),
+            "{}",
+            file.diff
+        );
+        assert!(file.diff.contains("-# Two\n+---\n"), "{}", file.diff);
+        // Published again since: the base is stale, and the diff is against revision 3.
+        let file = &stale.files[0];
+        assert_eq!(
+            (file.base_revision, file.current_revision, file.stale),
+            (Some(2), Some(3), true)
+        );
+        assert!(file.diff.contains("-# Three\n"), "{}", file.diff);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revert_to_a_delete_revision_deletes_and_machinery_stays_refused() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        // b.md: 1 imported, 2 deleted, 3 imported again.
+        republish(&test, &[("a.md", NOTE), ("AGENTS.md", "# Agents\n")]).await;
+        republish(
+            &test,
+            &[
+                ("a.md", NOTE),
+                ("b.md", NOTE_B),
+                ("AGENTS.md", "# Agents\n"),
+            ],
+        )
+        .await;
+
+        let deleted = revert(&ctx, revert_to("/b.md", 2)).await.unwrap();
+        let twice = revert(&ctx, revert_to("/b.md", 2)).await.unwrap_err();
+        let machinery = revert(&ctx, revert_to("/AGENTS.md", 1)).await.unwrap_err();
+        let no_such = revert(&ctx, revert_to("/a.md", 9)).await.unwrap_err();
+        // A revision whose bytes are not UTF-8 (no write tool stores one).
+        sqlx::query("UPDATE revisions SET content = '\\xff'::bytea WHERE path = 'a.md'")
+            .execute(test.app.pool())
+            .await
+            .unwrap();
+        let binary = revert(&ctx, revert_to("/a.md", 1)).await.unwrap_err();
+        let reader = context(&test, principal(&[], Some("pg")), None);
+        let read_only = revert(&reader, revert_to("/a.md", 1)).await.unwrap_err();
+
+        assert_eq!(deleted.touched, ["/b.md"]);
+        let entries = changesets::entries(test.app.pool(), deleted.changeset)
+            .await
+            .unwrap();
+        assert_eq!(
+            (entries[0].path.as_str(), entries[0].content.as_ref()),
+            ("b.md", None)
+        );
+        assert_eq!(entries[0].base_revision, Some(3));
+        let shown = pending(&ctx).await;
+        assert_eq!(shown.files[0].change, "delete");
+        assert!(
+            shown.files[0]
+                .diff
+                .starts_with("--- a/b.md\n+++ /dev/null\n"),
+            "{}",
+            shown.files[0].diff
+        );
+        assert_eq!(twice.kind(), "Refused");
+        assert_eq!(machinery.kind(), "InvalidPath");
+        assert_eq!(no_such.kind(), "NotFound");
+        assert_eq!(binary.kind(), "Refused");
+        assert_eq!(read_only.kind(), "Forbidden");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reverting_a_created_file_to_absent_leaves_no_entry() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        // b.md: 1 imported, 2 deleted. The changeset then creates it anew.
+        republish(&test, &[("a.md", NOTE), ("AGENTS.md", "# Agents\n")]).await;
+        let created = new_note(&ctx, "/b.md").await;
+
+        let reverted = revert(&ctx, revert_to("/b.md", 2)).await.unwrap();
+
+        assert_eq!(created.touched, ["/b.md"]);
+        // Never published as the changeset made it and not published now: the
+        // changeset's own entry goes, so nothing is left to list.
+        assert!(reverted.touched.is_empty(), "{:?}", reverted.touched);
+        assert_eq!(reverted.changeset, created.changeset);
+        assert!(changesets::entries(test.app.pool(), created.changeset)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(pending(&ctx).await.files.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_changes_diffs_a_new_file_against_dev_null_and_needs_only_read() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        new_note(&ctx, "/new.md").await;
+
+        let shown = pending(&ctx).await;
+        let reader = pending(&context(&test, principal(&[], Some("pg")), None)).await;
+
+        assert_eq!(
+            (shown.catalog.as_str(), shown.label.as_str()),
+            ("pg", "default")
+        );
+        let file = &shown.files[0];
+        assert_eq!(
+            (file.path.as_str(), file.change, file.base_revision),
+            ("/new.md", "create", None)
+        );
+        assert_eq!((file.current_revision, file.stale), (None, false));
+        assert!(
+            file.diff
+                .starts_with("--- /dev/null\n+++ b/new.md\n@@ -0,0 +1,"),
+            "{}",
+            file.diff
+        );
+        assert!(file.diff.contains("+# New\n"));
+        assert!(reader.files.is_empty() && reader.changeset.is_none());
+        assert_eq!(reader.catalog, "pg");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changeset_whose_overlay_no_longer_applies_can_be_listed_and_discarded() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let state = test.app.catalog("pg").unwrap();
+        // `a.md` is a published file, so an entry under it can never apply
+        // (no write tool stores one; a publish made after the edit can).
+        let edit = PendingEdit {
+            catalog: "pg",
+            path: "a.md/x.md",
+            text: Some("# X\n"),
+            at: Utc::now(),
+        };
+        pending_entry(&test, &ctx, &edit).await;
+
+        let broken = ctx.view(&state).await.err();
+        let shown = pending(&ctx).await;
+        let dropped = discard(&ctx, discard_paths(Some(&["/a.md/x.md"])))
+            .await
+            .unwrap();
+        let fixed = ctx.view(&state).await;
+
+        assert!(
+            matches!(broken, Some(OkfError::InvalidPath { .. })),
+            "{broken:?}"
+        );
+        let paths: Vec<&str> = shown.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["/a.md/x.md"]);
+        assert_eq!(dropped.removed, 1);
+        assert!(
+            fixed.is_ok(),
+            "the overlay applies again once the entry is gone"
+        );
+    }
+
+    #[test]
+    fn a_file_equal_to_the_published_one_is_a_one_line_note() {
+        let text = Some(&b"# A\n"[..]);
+
+        let same = unified_diff("a.md", text, text);
+        let binary = unified_diff("logo.png", Some(b"\x89PNG\xff"), Some(b"\x89PNG\xff"));
+
+        assert_eq!(same, "No change from the published text\n");
+        assert_eq!(binary, "No change from the published text\n");
+    }
+
+    #[test]
+    fn deleting_a_path_deleted_since_is_a_one_line_note() {
+        let diff = unified_diff("a.md", None, None);
+
+        assert_eq!(
+            diff,
+            "No published a.md to delete: it was deleted after this entry was made\n"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_text_is_reported_as_binary() {
+        let diff = unified_diff("logo.png", Some(b"\x89PNG\xff"), Some(b"\x89PNG\xfe"));
+
+        assert_eq!(diff, "Binary files a/logo.png and b/logo.png differ\n");
+    }
+
+    #[test]
+    fn a_stored_path_is_normalized_and_stays_inside() {
+        assert_eq!(stored_path("/infra/./ntp.md").unwrap(), "infra/ntp.md");
+        assert_eq!(stored_path("AGENTS.md").unwrap(), "AGENTS.md");
+        assert!(matches!(
+            stored_path("/"),
+            Err(OkfError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            stored_path("a/../../x.md"),
+            Err(OkfError::InvalidPath { .. })
+        ));
+    }
+
+    #[test]
+    fn the_three_tools_are_listed_with_object_output_schemas() {
+        let tools = OkfServer::tools().list_all();
+
+        for name in ["discard", "revert", "pending_changes"] {
+            let listed = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            let schema = listed.output_schema.as_ref().expect("an output schema");
+            assert_eq!(schema["type"], "object", "{name}");
+        }
     }
 }

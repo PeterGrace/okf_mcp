@@ -311,7 +311,7 @@ first selected catalog.
 | `links_report` | `mentions?` (default true) | Port of `links --json` |
 | `lint` | `pending?` | Port of `lint --json`, on the published catalog or (with `pending`) on this connection's overlay, with a `pending` flag saying which |
 | `history` | `path`, `limit?` (default 20, at most 200) | The document's revisions, newest first: revision, op, actor, message, time |
-| `pending_changes` | none | This session's changeset in the catalog: changed paths and a unified diff against the published text |
+| `pending_changes` | `catalog?` | This connection's changeset in the catalog: each changed path (`create`, `update`, `delete`), its base revision and the revision published now, whether the base is stale, whether it is replayable, and a unified diff against the published text (`/dev/null` for a new or deleted file; non-text files as `Binary files ... differ`; a deletion of a path deleted since, or a file equal to the published one, as a one-line note). Needs only `read`; a key below `write` has no changeset, as for every read (`ToolContext::view`). It reads the entries rather than the overlay, so a changeset whose overlay no longer applies can still be listed and discarded |
 | `stranded_sessions` | `catalog?` | Open changesets holding edits that nobody changed within `session_idle_timeout`: the key's own (other labels than this connection's), or for an `admin` key every one in the catalogs it reaches: id, catalog, label, key, actor, creation and last-change times, changed paths |
 
 Lint's `generated-after-commit` check reads each document's last revision time where
@@ -340,8 +340,8 @@ Nothing is visible to other sessions until `publish`.
 | `split_concept` | `path`, `section`, `to`, `type?`, `title?`, `description?`, `stub?`, `sources?`, `by?` | Port of `split`; returns touched files and notes |
 | `delete_concept` | `path` | Removes the concept and its listing in its folder's `index.md`. Refuses while any other document links to it, and lists those links |
 | `publish` | `message` | See "Publish" below |
-| `discard` | `paths?` | Drops this session's changeset entries (all, or the named paths) |
-| `revert` | `path`, `revision` | Adds the document's content at `revision` (or its deletion) to this session's changeset, for review and publish like any other edit. Subject to every write rule, so machinery cannot be reverted |
+| `discard` | `paths?` | Drops this connection's changeset entries: the named paths, or all of them, which also marks the changeset `discarded` (the next write opens a new one). Takes publish's locks in publish's order, so a write queued behind a closing discard lands in a new changeset |
+| `revert` | `path`, `revision` | Adds the document's content at `revision` (or its deletion) to this session's changeset, for review and publish like any other edit. Subject to every write rule, so machinery cannot be reverted. A revert is a free edit (no replay); a revision whose content is not UTF-8 is refused, and a revived file is not executable (scripts are machinery, which revert refuses anyway). Sending a file the changeset created back to absent leaves no entry for it |
 | `adopt_changeset` | `id` | Moves an open changeset to this connection's key and label. The key's own needs `write`; another key's needs `admin` on its catalog. Refused while this connection has another open changeset in that catalog; an unknown id, a closed changeset and one in a catalog the key does not reach are refused alike |
 
 `by` defaults to the key's `actor`. A call may override it (for example `human:pgrace`

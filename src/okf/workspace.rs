@@ -633,6 +633,33 @@ impl MemWorkspace {
         self.files().get(&rel).cloned()
     }
 
+    /// Removes a file. Directories exist only as prefixes of file paths,
+    /// so an emptied directory is gone too.
+    ///
+    /// Not part of [`Workspace`]: only the server's changesets delete, and
+    /// they always work on a `MemWorkspace` (the write path's copy of an
+    /// overlay).
+    ///
+    /// # Arguments
+    /// * `path` - Catalog-relative path (a leading `/` means the root).
+    ///
+    /// # Returns
+    /// `true` if a file was there (now removed), `false` if none was.
+    ///
+    /// # Errors
+    /// [`OkfError::InvalidPath`] if the path escapes the catalog or is the root.
+    pub fn remove(&self, path: &str) -> Result<bool, OkfError> {
+        let rel = checked_file(path)?;
+        // `remove` gives back the old value, if any: `is_some` says whether
+        // there was a file.
+        Ok(self
+            .files
+            .write()
+            .expect("MemWorkspace lock poisoned")
+            .remove(&rel)
+            .is_some())
+    }
+
     /// Every file, consuming the workspace (no copy).
     ///
     /// # Returns
@@ -852,6 +879,20 @@ mod tests {
             ("a/b.md".to_string(), stored(b"", false)),
         ]);
         assert!(matches!(refused, Err(OkfError::InvalidPath { path, .. }) if path == "a"));
+    }
+
+    #[test]
+    fn remove_deletes_a_file_and_says_whether_there_was_one() {
+        let workspace = MemWorkspace::from_files([("a/b.md", "x"), ("c.md", "y")]);
+
+        let removed = workspace.remove("/a/b.md").unwrap();
+        let again = workspace.remove("a/b.md").unwrap();
+        let outside = workspace.remove("../x.md");
+
+        assert!(removed && !again);
+        assert!(!workspace.is_file("a/b.md") && !workspace.is_dir("a"));
+        assert!(workspace.is_file("c.md"));
+        assert!(matches!(outside, Err(OkfError::InvalidPath { .. })));
     }
 
     #[test]
