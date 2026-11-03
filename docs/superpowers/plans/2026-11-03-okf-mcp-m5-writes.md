@@ -9791,6 +9791,14 @@ It runs under the catalog's publish lock: the in-process `CatalogState::publish_
 > - **Merged beside Task 12** (PR #110 created `src/mcp/changesets.rs` first): Task 12's module doc and imports are kept. Store imports sit inside the functions, as Task 12's do (`own_changeset` imports `changesets::{self, ChangesetKey}`, `publish` imports `store::publish::{self as publishing, PublishReport}`), and struct fields name `crate::store::...` types by full path. `OkfServer::tools()` joins `lifecycle_router` then `publish_router`.
 > - The design's "Publish" paragraph after the steps no longer says the overlay "re-reads only the changed ones". The overlay is a full snapshot (Decision 6). It also says what happens to a write queued behind a publish.
 >
+> - **After review of PR #114 (2026-11-03):**
+>   - A replayable entry whose path was deleted since its base (`base_revision: Some`, no live document now) is a `Conflict`, not a replay onto nothing. Replaying would silently re-create a `log.md` someone deleted, or surface the replay's own error instead of naming the file. A pure test, `a_replay_onto_a_path_deleted_since_its_base_conflicts`, covers it, and the design's "Publish" step 3 says so.
+>   - `Published::changeset`'s doc says that with `published: false` the changeset was not published and stays open.
+>   - Two more database tests:
+>     - `a_publish_creates_deletes_and_continues_a_tombstone_s_number`: ops `create` and `delete`, the tombstone row, NULL revision content, then revision 3 on the tombstone;
+>     - `a_revision_written_meanwhile_is_a_conflict_not_a_database_error`: the unique-violation backstop.
+>   - That makes 12 tests in `publish_tests` and 4 in `store::publish`.
+>
 > No signature in the Interfaces block changed.
 
 **Files:**
@@ -11047,7 +11055,7 @@ impl OkfServer {
 In `src/mcp/mod.rs`: `mod changesets;` and `+ Self::publish_router()`.
 
 Run: `cargo test --lib -- mcp::changesets store::`
-Expected: all pass (10 in `publish_tests`).
+Expected: all pass (12 in `publish_tests`).
 
 - [ ] **Step 7: The design**
 
