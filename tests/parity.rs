@@ -63,7 +63,8 @@ use okf_mcp::okf::analysis::sprawl::{sprawl, SprawlQuery};
 use okf_mcp::okf::doc::Doc;
 use okf_mcp::okf::markdown::{body_split, footnote_defs, headings};
 use okf_mcp::okf::ops::{
-    question, review, source, stamp, unquestion, OpContext, OpOutcome, SourceEntry,
+    ensure_index, index, log, question, review, source, stamp, unquestion, LogKind, OpContext,
+    OpOutcome, SourceEntry,
 };
 use okf_mcp::okf::snapshot::Snapshot;
 use okf_mcp::okf::timestamp::parse_iso;
@@ -422,6 +423,27 @@ fn run_op(
                 author: optional("author"),
             };
             source(workspace, &ctx, text("concept"), &entry)
+        }
+        "log" => {
+            let kind = step.get("kind").map_or(LogKind::Update, |k| {
+                serde_json::from_value(k.clone()).expect("a log kind")
+            });
+            log(workspace, &ctx, kind, text("text"))
+        }
+        "index" => index(
+            workspace,
+            &ctx,
+            text("concept"),
+            text("summary"),
+            optional("section"),
+            optional("title"),
+        ),
+        "ensure_index" => {
+            let mut outcome = OpOutcome::default();
+            ensure_index(workspace, text("folder"), &mut outcome)?;
+            // The shim prints the files ensure_index wrote, in order.
+            outcome.message = outcome.touched.join("\n");
+            Ok(outcome)
         }
         other => panic!("unknown ops command {other}"),
     }

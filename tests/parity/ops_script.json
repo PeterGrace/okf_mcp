@@ -1,6 +1,15 @@
 {
   "setup": {
-    "ops/flow.md": "---\ntype: Note\ntitle: Flow shapes\nverified: { by: x, at: 2026-01-01T00:00:00Z }\nopen_questions: [one, \"two, three\", { k: v }]\n---\nBody.\n"
+    "ops/flow.md": "---\ntype: Note\ntitle: Flow shapes\nverified: { by: x, at: 2026-01-01T00:00:00Z }\nopen_questions: [one, \"two, three\", { k: v }]\n---\nBody.\n",
+    "ops/index.md": "# Ops\n\nNo bullets yet.\n",
+    "ops/bracket-title.md": "---\ntype: Note\ntitle: \"NTP [pool] notes\"\n---\n",
+    "ops/second.md": "---\ntype: Note\ntitle: Second\n---\n",
+    "people/index.md": "# People\n\n# Sections\n\n* [Teams](teams/) - groups\n",
+    "people/pgrace.md": "---\ntype: Person\ntitle: Pete\n---\n",
+    "people/other.md": "---\ntype: Person\ntitle: Other\n---\n",
+    "infra/ntp.md": "---\ntype: Service\ntitle: NTP\n---\n",
+    "root-note.md": "---\ntype: Note\ntitle: Root note\n---\n",
+    "nowhere/thing.md": "---\ntype: Note\ntitle: Thing\n---\n"
   },
   "steps": [
     {"cmd": "stamp", "concept": "infra/time-server.md", "field": "generated", "by": "claude-code/claude-opus-5-5"},
@@ -28,6 +37,22 @@
     {"cmd": "source", "concept": "analysis/lead.md", "id": "s1", "resource": "again"},
     {"cmd": "source", "concept": "analysis/hub.md", "id": "web", "resource": "https://example.com/x", "title": ""},
     {"cmd": "source", "concept": "analysis/stamps.md", "id": "d", "resource": "r"},
-    {"cmd": "source", "concept": "yaml/same-indent-lists.md", "id": "q", "resource": "r: s"}
+    {"cmd": "source", "concept": "yaml/same-indent-lists.md", "id": "q", "resource": "r: s"},
+    {"cmd": "log", "text": "Ran   the\n ops  script.", "kind": "Update"},
+    {"cmd": "log", "text": "Second entry.", "kind": "Change"},
+    {"cmd": "log", "text": "Ran the ops script.", "kind": "Update"},
+    {"cmd": "index", "concept": "ops/bracket-title.md", "summary": "  brackets   escaped "},
+    {"cmd": "index", "concept": "ops/second.md", "summary": "after the first"},
+    {"cmd": "index", "concept": "people/pgrace.md", "summary": "me"},
+    {"cmd": "index", "concept": "infra/ntp.md", "summary": "pool", "section": "concepts"},
+    {"cmd": "index", "concept": "root-note.md", "summary": "at the root"},
+    {"cmd": "index", "concept": "analysis/stamps.md", "summary": "s", "title": "T", "section": "Extras"},
+    {"cmd": "index", "concept": "people/other.md", "summary": "x", "section": "Nowhere"},
+    {"cmd": "index", "concept": "markdown/slugs.md", "summary": "slugs", "title": "Slugs"},
+    {"cmd": "index", "concept": "nowhere/thing.md", "summary": "t"},
+    {"cmd": "ensure_index", "folder": "ops/deep/er"},
+    {"cmd": "ensure_index", "folder": "analysis/new-stuff"},
+    {"cmd": "ensure_index", "folder": "brand-new"},
+    {"cmd": "ensure_index", "folder": "ops"}
   ]
 }
