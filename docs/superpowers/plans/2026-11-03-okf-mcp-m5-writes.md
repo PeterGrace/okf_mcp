@@ -11464,6 +11464,8 @@ git commit -m "feat: discard, revert and pending_changes (M5.11)" \
 
 ### Task 12: `stranded_sessions`, `adopt_changeset` and the prune
 
+> **Corrected (issue #97), 2026-11-03.** The code compiled and passed as written apart from `rustfmt` reflows, with one addition: `adopt_changeset` reads the changeset (and checks access) before its transaction, so after `changesets::adopt` it checks `adopted.version == row.version + 1` and answers `OkfError::Busy` ("changeset N changed while it was being adopted; try again") otherwise, rolling back. Without it, a write key could take back its old changeset that an `admin` adopted between the read and the relabel. Step 3 below has the check; no interface changes. Task 1's `adopt` already refuses a (key, label) clash on its unique index, so the explicit `find_open` check here only gives the message the changeset id.
+
 > Interfaces note: (1) The code lives in `src/mcp/changesets.rs` in its own `#[tool_router(router = lifecycle_router, vis = "pub(crate)")]` block, its own test module (`lifecycle_tests`, not `tests`), and function-local `use` lines for the store, so it merges with Tasks 10 and 11 in either order: whichever of Tasks 10, 11 and 12 lands first creates the file, adds `mod changesets;` to `src/mcp/mod.rs`, and the others add their block and router line. (2) `stranded_sessions` takes an optional `catalog` to narrow the list, and leaves out the calling connection's own changeset (same key and label), which is not stranded for it. (3) `adopt_changeset` answers an unknown id, a closed changeset, or one in a catalog the key does not reach with the same `Refused` ("no open changeset N in a catalog this key reaches"), so a key cannot probe other catalogs; a reachable changeset of another key without `admin` is `Forbidden`. It does not call `App::overlays().forget` (Task 7 is not a dependency): adoption bumps `version`, which already invalidates any cached overlay. (4) The changeset's `actor` stays the opener's; Task 10's `publish` should record the publishing key's actor on revisions. (5) `App::poll` prunes with the clock's `now` and a 24-hour cutoff on `updated_at` (the changeset's last change), and logs a failure instead of returning it, like the key reload.
 
 Design "Session lifecycle" as Task 1 rewrote it. `stranded_sessions` lists open changesets that hold edits and that no one has changed within `session_idle_timeout`: the key's own, or for an `admin` key every one in the catalogs it reaches. `adopt_changeset(id)` moves one to the calling connection's key and label, after which every read and write of this connection sees and extends it: `write` access adopts the key's own, `admin` another key's, and a connection that already has an open changeset in that catalog is refused (publish or discard it first, or connect with another label). The poll loop discards empty changesets whose last change is more than 24 hours old.
@@ -12017,6 +12019,12 @@ pub(crate) async fn adopt_changeset(
         }
     }
     let adopted = changesets::adopt(&mut tx, id, &principal.key_id, ctx.label(), now).await?;
+    if adopted.version != row.version + 1 {
+        // Returning drops `tx` uncommitted, which rolls the relabel back.
+        return Err(OkfError::Busy {
+            reason: format!("changeset {id} changed while it was being adopted; try again"),
+        });
+    }
     let entries = changesets::entries(&mut *tx, id).await?;
     tx.commit().await?;
     Ok(Adopted {
