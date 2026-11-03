@@ -224,9 +224,9 @@ pub struct OpOutcome {
     pub message: String,                               // okf.py's printed line, e.g. "infra/x.md: generated { by: a, at: ... }"
     pub notes: Vec<String>,                            // okf.py's stderr notes (non-kebab name, created index)
 }
-pub enum StampField { Generated, Verified }
+pub enum StampField { Generated, Verified }                     // Deserialize ("generated" | "verified") + JsonSchema (Task 9)
 pub struct SourceEntry<'a> { pub id: &'a str, pub resource: &'a str, pub title: Option<&'a str>, pub author: Option<&'a str> }
-pub enum LogKind { Update, Creation, Change, Import }  // rendered "Update" etc.
+pub enum LogKind { Update, Creation, Change, Import }  // rendered "Update" etc.; Deserialize + JsonSchema + Default (Update) (Task 9)
 pub struct NewConcept<'a> {
     pub path: &'a str, pub frontmatter: &'a serde_json::Map<String, serde_json::Value>, pub body: &'a str,
     pub index_summary: Option<&'a str>, pub index_section: Option<&'a str>,
@@ -9146,6 +9146,15 @@ git commit -m "feat: the write path and the content write tools (M5.08)" \
 
 The ports of `okf.py`'s concept commands and its `log` and `index` (design "Write tools"): `stamp`, `review`, `question`, `unquestion`, `add_source`, `log` and `index`. Each calls its `okf::ops` function (Tasks 2 and 3) through `write::apply`. The replay operations an op returns for `log.md` and `index.md` then land in the entry's `replay`, and publish can redo them on newer text (Task 10).
 
+> **Corrected (issue #99), 2026-11-03.** What shipped differs from the code below in these ways (read `src/mcp/writes.rs` for the shipped text):
+> - **No mirror enums.** `okf::ops::StampField` and `okf::ops::LogKind` already derive `Deserialize` with `okf.py`'s spellings, so they now also derive `JsonSchema` (and `LogKind` derives `Default`, `#[default] Update`). `StampParams::field` is a `StampField` and `LogParams::kind` an `Option<LogKind>`; `StampFieldParam`, `LogKindParam` and their `From` impls are not added. The Interfaces block says so.
+> - The concept test reviews with `outcome: "verified"`: the plan's `"current"` is not one of `OUTCOMES`, so `review` refused it.
+> - The params' `path` docs give the concept-reference form (`.md` optional), as Task 8's `replace_body` does; `review`'s `outcome` doc lists the four outcomes; `index`'s `section` doc names its default (`Concepts`).
+> - After review of PR #113: a sixth test, `a_refused_op_is_a_tool_error_and_stores_nothing` (a bad `outcome`, an unlistable root concept and an empty `unquestion` each fail with `Refused` and leave no changeset).
+> - A fifth test, `unquestion_takes_a_number_or_text_and_log_takes_okf_py_kinds`, pins `QuestionRef`'s two JSON forms and that `kind` is case-sensitive like argparse's `choices`. The listing test also checks there are exactly seven tools, that each output schema is an object, and that no tool takes an `at` or `now`.
+>
+> No later task uses the removed names: Tasks 10 and 13 build `LogParams { text, kind: None, catalog: None }` and `IndexParams` as before, and Task 13/14's JSON calls (`"kind": "Creation"`, `"field": "verified"`) deserialize unchanged.
+
 **Router:** a second block, `bookkeeping_router`, in `src/mcp/writes.rs`, below Task 8's `writes_router`, and not an extension of it. Task 8's block stays untouched, so this task's diff is one new section plus one line in `OkfServer::tools()`. The two groups also match the design's split between content edits and `okf.py` ports. `OkfServer` already has one `#[tool_router]` block per module; two in one file work the same way, each producing its own `fn ..._router()`.
 
 **Files:**
@@ -9737,7 +9746,7 @@ Expected: all pass (3 in `tests`, 4 in `bookkeeping_tests`).
 
 - [ ] **Step 3: Changelog, gates, commit**
 
-Write `changelog/<ts>-m5-task-09-bookkeeping-tools.md`. It needs Added (the seven tools, `StampFieldParam`, `LogKindParam`, `QuestionRef`, `bookkeeping_router`, the four tests), Changed (`OkfServer::tools`) and Notes. The Notes say:
+Write `changelog/<ts>-m5-task-09-bookkeeping-tools.md`. It needs Added (the seven tools, their params, `QuestionRef`, `bookkeeping_router`, the five tests), Changed (`OkfServer::tools`; `StampField` and `LogKind` derive `JsonSchema`, `LogKind` also `Default`; Corrected, issue #99) and Notes. The Notes say:
 - why it is a separate router;
 - that `unquestion` takes a number or text (`untagged`);
 - that the frontmatter commands store no replay, so they conflict on a stale base like any free edit.
