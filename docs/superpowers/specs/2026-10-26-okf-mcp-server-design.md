@@ -1,9 +1,9 @@
 # OKF MCP server: design
 
 - **Date:** 2026-10-26; storage redesigned 2026-11-02 (see "Revision: Postgres storage")
-- **Status:** approved design. M1 (core library), M2 (analysis), M3 (storage), M4
-  (read-only server), M5 (writes) and M6 (restructuring) are delivered; see
-  "Milestones"
+- **Status:** approved design, every milestone delivered: M1 (core library), M2
+  (analysis), M3 (storage), M4 (read-only server), M5 (writes), M6 (restructuring) and
+  M7 (deployment); see "Milestones"
 - **Catalog concept:** `/projects/okf-mcp-server.md` in `pg_knowledge_catalog`
 - **Replaces:** `tools/okf.py` in every OKF catalog (how the existing git catalogs hand
   over to the server is decided once the server is complete)
@@ -149,7 +149,7 @@ listen = "0.0.0.0:8080"
 allowed_hosts = ["okf-mcp.example"]
 default_catalog = "pg"
 session_idle_timeout = "2h"
-time_server = "mosaic-x5-3819907.internal"
+time_server = "time.example.com"
 poll_interval = "10s"
 max_import_bytes = "64MiB"   # uncompressed total of an import
 ```
@@ -657,14 +657,37 @@ service. Lint's future-timestamp check keeps `okf.py`'s 2-minute slack. Revision
 
 ## Deployment
 
-- Multi-stage Dockerfile: Rust build stage, then a slim runtime image with CA
-  certificates (no git). Pushed to Harbor (`r.gfpd.us`), as the cluster's Kyverno policy
-  expects.
-- Manifests in Argo CD's source repository (`infrastructure/argo2025`): one-replica
-  Deployment, a CNPG database (a new cluster or a database in an existing one, chosen at
-  deployment), ConfigMap, the CNPG-generated Secret for `DATABASE_URL`, Service, and an
-  ingress-nginx Ingress with a cert-manager certificate. No PVC.
-- Backups are CNPG's.
+The server runs at `https://okf-mcp.k.vsix.me`, behind bearer keys (every route but
+`/healthz`). `docs/operations.md` is the generic operator guide; this section says what
+the deployment is.
+
+- **Image:** a multi-stage `Dockerfile`: a Rust build stage, then `debian:bookworm-slim`
+  with CA certificates only (no git; the binary links no OpenSSL), running as a non-root
+  user. `.github/workflows/image.yml` builds it on a `v*` tag and pushes
+  `ghcr.io/petergrace/okf-mcp:<version>` and `:sha-<short>` with the workflow's own
+  token (a manual dispatch pushes only `:sha-<short>`); there is no `latest`, so a deployment pins a version. The workflow runs no
+  gates. The cluster pulls the image through the site's registry mirror, and the
+  Deployment names the mirror's path for it.
+- **Manifests:** only in the site's private Argo CD source repository, because this
+  repository is public and the manifests name internal addresses and secret paths. They
+  hold a one-replica Deployment (strategy `Recreate`; a startup probe, readiness on
+  `/healthz`, liveness on TCP only, listening on `[::]:8080`), a ConfigMap, a Service
+  and an ingress-nginx Ingress with a cert-manager certificate (buffering off and long
+  timeouts for `/mcp` streams, a body limit above `max_import_bytes`). No PVC. A tag
+  bump in that repository is the deploy step.
+- **Database:** a 3-instance CloudNativePG cluster of its own. `DATABASE_URL` is its
+  generated app secret's `uri`.
+- **TLS to Postgres:** `verify-full`, set by `PGSSLMODE` and `PGSSLROOTCERT` (the
+  cluster's CA certificate, mounted as a file), never by the URL (see "Configuration").
+- **Backups:** plugin-barman-cloud archives the WAL continuously and a daily
+  `ScheduledBackup` takes a base backup, both to an S3-compatible object store, with a
+  key allowed only on its own bucket, from the site's secret store through an
+  `ExternalSecret`. The `ObjectStore` must name the store's region, or barman-cloud
+  signs for the AWS default and the store refuses it. A restore drill was done: a
+  backup restored into a scratch cluster matched the live database document for
+  document (`docs/operations.md`, "Restore", is the tested procedure).
+- **Clock check:** `time_server` names the site's NTP server; `/healthz` reports the last
+  check (see "Time").
 
 ## Milestones
 
@@ -676,7 +699,7 @@ service. Lint's future-timestamp check keeps `okf.py`'s 2-minute slack. Revision
 | M4. Read-only server (delivered) | axum, rmcp, auth, `selection`, the read tools that need no changeset (including `history`), the import and export routes, `/healthz`, the poll loop, `okf-mcp serve`. Deployable and useful on its own ([plan](../plans/2026-11-02-okf-mcp-m4-read-only-server.md); PRs #76-#86) |
 | M5. Writes (delivered) | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` ([plan](../plans/2026-11-03-okf-mcp-m5-writes.md); PRs #104-#117) |
 | M6. Restructuring (delivered) | `move_concept`, `split_concept`, `delete_concept`; `ReplayOp::Unlist` and `ReplayOp::Relink`; byte parity with `okf.py`'s `mv` and `split` ([plan](../plans/2026-11-03-okf-mcp-m6-restructuring.md); PRs #129-#137) |
-| M7. Deployment | Dockerfile, k8s manifests, CNPG database, NTP check, operator docs |
+| M7. Deployment (delivered) | Dockerfile and the GHCR image workflow, k8s manifests (in the site's Argo CD repository), CNPG database with backups and a restore drill, NTP check, TLS to Postgres, operator docs ([plan](../plans/2026-11-03-okf-mcp-m7-deployment.md); PRs #149-#157) |
 
 Per the project's `CLAUDE.md`, each iteration adds a dated note under `changelog/`.
 
@@ -1059,6 +1082,100 @@ Plan corrections (each a dated `Corrected` note in the plan):
   a `tombstoned` helper (Brooke's reviews of PR #135).
 - **#127 (end-to-end):** shipped as planned.
 - **#128 (wrap-up):** shipped as planned.
+
+### What M7 shipped differently
+
+The M7 plan's "Decisions taken while planning", its "Simplifications and deviations
+relative to the design" and its dated `Corrected` notes have the full list; most are
+already written into the sections above.
+
+Deviations planned:
+
+- **The manifests live only in the private Argo CD source repository** (plan Decision
+  5). This repository is public and the manifests name internal addresses, secret paths
+  and bucket names, so it carries generic operator docs (`docs/operations.md`, with
+  `example.com` names) instead.
+- **The image is on GHCR, built by GitHub Actions on tags** (Decision 6), not pushed to
+  a site registry: `ghcr.io/petergrace/okf-mcp`, `<version>` and `sha-<short>`, no
+  `latest`, actions pinned to commit SHAs, and the built-in token, so no credential
+  lives on a workstation. The workflow is not CI: it runs no gates. The cluster pulls
+  through the site's registry mirror, and the Deployment requests the mirror's path
+  itself.
+- **The NTP check is a hand-written SNTPv4 client** (`src/ntp.rs`, Decision 7), with no
+  new dependency, and **`/healthz` reports it without depending on it**: the status
+  never changes with the clock, and `clock` carries only `ok`, `checked_at`,
+  `offset_ms` and `stratum`, since the route is public (see "Time").
+- **TLS to Postgres is configured by the environment** (Decision 8): sqlx's
+  `tls-rustls-ring-webpki` feature and libpq's `PGSSLMODE`/`PGSSLROOTCERT`, so
+  `db::connect` did not change (see "Configuration").
+- **The pod listens on `[::]:8080`** (Decision 9): the cluster is IPv6-primary and the
+  kubelet's probes reach the pod's IPv6 address. `DEFAULT_LISTEN` stays `0.0.0.0:8080`
+  for local runs.
+- **`StillLinked`'s paths gained their leading `/`** (Decision 12, the M6 follow-up),
+  matching tool results and `Conflict` (see "Errors"). Other `OkfError` variants'
+  paths keep no leading `/`.
+
+Found while building it:
+
+- **sqlx reports a rustls certificate refusal as `Io`, not `Tls`** (#143). The TLS
+  test's refusal case must therefore read the error's message for `UnknownIssuer`; a
+  bare `is_err()` would pass for a connection refused for any reason.
+- **A TLS backend changes connections that set no mode** (#143, Brooke's review of PR
+  #150). With rustls compiled in, sqlx's default `sslmode=prefer` tries TLS, unverified,
+  on every connection that names no mode; and a URL's `sslmode` overrides `PGSSLMODE`,
+  so the deployment's URL must name none (the CNPG app secret's `uri` has no query
+  parameters).
+- **The image is not OpenSSL-free** (#143, #144). The binary links no OpenSSL, but the
+  runtime image's `ca-certificates` pulls in Debian's `openssl` package.
+- **An NTP name can resolve to an unreachable address first** (#141, Brooke's review of
+  PR #149). The client tries every resolved address in turn within the one timeout,
+  and clamps a leap second's nanoseconds so the 32-bit fraction cannot overflow.
+- **A padded `time_server` would fail every check silently** (#142, Brooke's review of
+  PR #153), seen only as a `warn` every 15 minutes, so it is refused at load.
+- **A restore must name its database and owner** (#145, Brooke's review of PR #154).
+  CloudNativePG defaults `bootstrap.recovery`'s `database` and `owner` to `app`, so a
+  restored cluster's app secret would name a database holding none of the data.
+- **The rollout** (#146):
+  - the object store's secret key is the AWS-style `SECRET_ACCESS_KEY`, and an
+    `ExternalSecret` that cannot sync in an early Argo CD wave holds back every later
+    wave;
+  - barman-cloud must be given the store's region, or the store answers
+    `400 Bad Request` and WAL archiving fails;
+  - a cluster that forces every Service to `RequireDualStack` keeps an app with
+    `PreferDualStack` out of sync, so the Service sets no `ipFamilyPolicy`;
+  - `kubectl cnpg` takes its flags after the plugin's name.
+- **The restore drill's checksum** (#147, Brooke's review of PR #156) orders by
+  `catalog_id, path`, includes `catalog_id` and uses `convert_to(..., 'UTF8')`, so it is
+  deterministic across catalogs and survives a backslash in a path; it holds only while
+  every write is held.
+
+Plan corrections (each a dated `Corrected` note in the plan):
+
+- **#140 (StillLinked slash):** "every path a tool returns" narrowed to "as tool
+  results (`touched`, `message`) and `Conflict` write them"; the other variants' paths
+  are recorded, unchanged, as a follow-up (Brooke's review of PR #152).
+- **#141 (ntp):** the plan's code is the merged file; the module doc names `from_ntp`
+  in plain backticks, since a public doc linking a private item fails `cargo doc`
+  with `-D warnings`; every resolved address is tried, a leap second is clamped, and
+  three more tests (12) (Brooke's review of PR #149).
+- **#142 (clock check):** an existing healthz test's body gains `"clock": null`; the
+  config test's unknown key becomes `a_later_key`; module docs name the clock check;
+  then a padded `time_server` is refused and `a_failed_check_records_why` is renamed
+  `a_failed_check_records_no_offset` (Brooke's review of PR #153).
+- **#143 (TLS):** the refusal test requires `UnknownIssuer`; the `Cargo.toml` comment
+  and Decision 8 say the binary, not the image, has no OpenSSL, and that `prefer` now
+  tries TLS; a URL's `sslmode` overrides `PGSSLMODE`, and the rollout's TLS check
+  confirms the `uri` names none (Brooke's review of PR #150).
+- **#144 (image):** the Dockerfile's comment no longer says "no OpenSSL".
+- **#145 (operator docs):** the Deployment sets `OKF_MCP_CONFIG` instead of passing
+  `--config`, so `kubectl exec`'d subcommands read the same file; the restore drill's
+  recovery gains `database` and `owner` (Brooke's review of PR #154).
+- **#146 (rollout):** the config by environment, the secret key name, the region, the
+  Service's IP family and the plugin's flag order, as above.
+- **#147 (restore drill):** no `Corrected` note: the drill followed Task 8 as #145
+  corrected it, and the checksum above went into `docs/operations.md`, not the plan.
+- **#148 (wrap-up):** shipped as planned; the design's example `time_server` is now
+  `time.example.com`.
 
 ### Questions M5 answered
 

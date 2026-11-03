@@ -1,24 +1,33 @@
 # okf_mcp
 
-A Rust port of `tools/okf.py`, the Open Knowledge Format catalog CLI, on its
-way to becoming a shared MCP server (design:
+A Rust port of `tools/okf.py`, the Open Knowledge Format catalog CLI, as a
+shared MCP server (design:
 `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md`).
 
-Status: milestones 1 (core library), 2 (analysis), 3 (storage), 4 (read-only
-server), 5 (writes) and 6 (restructuring) are delivered. The library reads a
-catalog into an in-memory `Snapshot` and runs `okf.py`'s analyses on it with
-the same JSON output (compared as parsed values): `lint`, the links report,
-`oldest`, `sprawl` and the secret scan, plus ranked `search`, which `okf.py`
-does not have. Catalogs live in Postgres: every file is a row holding its
-exact bytes and execute bit, with an append-only revision history, and each
-catalog's snapshot is built from its rows and swapped when the catalog
-changes. The `okf-mcp` command line administers catalogs and API keys and
-imports and exports catalogs, and `okf-mcp serve` serves the catalogs over MCP
-streamable HTTP with bearer-key auth: every read tool, the export and import
-routes and `/healthz`, and the write tools: each connection's edits collect in
-a changeset held in the database, which reads through that connection see and
-which `publish` turns into published revisions (see "Writing"). Concepts can
-also be moved, split and deleted, with every link and listing kept in step.
+Status: every milestone of the design is delivered: 1 (core library), 2
+(analysis), 3 (storage), 4 (read-only server), 5 (writes), 6 (restructuring)
+and 7 (deployment).
+
+Deployed: `https://okf-mcp.k.vsix.me` (every route but `/healthz` needs a
+bearer key), from the image `ghcr.io/petergrace/okf-mcp`, with its database
+backed up continuously and a restore drill done.
+
+The library reads a catalog into an in-memory `Snapshot` and runs `okf.py`'s
+analyses on it with the same JSON output (compared as parsed values): `lint`,
+the links report, `oldest`, `sprawl` and the secret scan, plus ranked
+`search`, which `okf.py` does not have. Catalogs live in Postgres: every file
+is a row holding its exact bytes and execute bit, with an append-only revision
+history, and each catalog's snapshot is built from its rows and swapped when
+the catalog changes. The `okf-mcp` command line administers catalogs and API
+keys and imports and exports catalogs, and `okf-mcp serve` serves the catalogs
+over MCP streamable HTTP with bearer-key auth: every read tool, the export and
+import routes and `/healthz`, and the write tools: each connection's edits
+collect in a changeset held in the database, which reads through that
+connection see and which `publish` turns into published revisions (see
+"Writing"). Concepts can also be moved, split and deleted, with every link and
+listing kept in step. The server checks its clock against an NTP server and
+reports the offset on `/healthz`, and connects to Postgres over verified TLS
+when the environment asks for it.
 
 ## Running it
 
@@ -346,6 +355,8 @@ key's actor.
 - `src/cli.rs`, `src/config.rs`, `src/main.rs` - the `okf-mcp` command line
   and its configuration file.
 - `src/clock.rs`, `src/error.rs` - the time source and the error type.
+- `src/ntp.rs` - a minimal SNTPv4 client; `src/clock_check.rs` - the clock
+  check at startup and every 15 minutes, and the status `/healthz` shows.
 - `tests/parity.rs` - differential tests against `okf.py`: goldens for the
   synthetic corpus in `tests/fixtures/catalog`, and live tests that run
   `okf.py` itself.
@@ -360,6 +371,8 @@ key's actor.
 - `tests/restructure.rs` - end-to-end restructuring over HTTP: a move
   published and exported; a conflict and a replay against other sessions; a
   delete refused while linked.
+- `tests/tls.rs` - `verify-full` TLS to a Postgres with test certificates:
+  one signed by the trusted CA connects, one signed by another is refused.
 - `tests/smoke.rs` - every analysis and a search on a real catalog, the
   storage path (import, load, links, lint, export) through Postgres, and the
   server (every read tool and the export over HTTP) and the write path
@@ -368,6 +381,9 @@ key's actor.
   publish), timed.
 - `tests/support/` - a throwaway Postgres container per test, and a test
   server on a free port with rmcp clients.
+- `Dockerfile`, `.github/workflows/image.yml` - the container image, built and
+  pushed to GHCR on a `v*` tag.
+- `docs/operations.md` - the operator guide.
 - `docs/superpowers/` - the design and the per-milestone plans.
 - `changelog/` - one dated note per change.
 
@@ -405,6 +421,7 @@ The report structs derive `serde::Serialize`; their JSON has `okf.py
     cargo test                                   # unit, doc, golden and database tests
     cargo test --test writes                     # just the end-to-end write tests
     cargo test --test restructure                # just the end-to-end restructuring tests
+    cargo test --test tls                        # just the TLS-to-Postgres tests
     OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog \
         cargo test --test parity -- --ignored    # live parity against okf.py
     OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog \
