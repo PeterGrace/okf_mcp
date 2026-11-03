@@ -184,7 +184,8 @@ pub enum OkfError {
     )]
     StillLinked {
         /// The concept's path, catalog-relative with a leading `/`
-        /// (`/infra/x.md`), as every path a tool returns.
+        /// (`/infra/x.md`), as tool results (`touched`, `message`) and
+        /// `Conflict` write them.
         path: String,
         /// Each link into it, in walk order, then line order.
         links: Vec<LinkSource>,
@@ -208,7 +209,8 @@ pub struct ConflictFile {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct LinkSource {
     /// The linking document's path, catalog-relative with a leading `/`
-    /// (`/hub.md`), as every path a tool returns.
+    /// (`/hub.md`), as tool results (`touched`, `message`) and `Conflict`
+    /// write them.
     pub source: String,
     /// The 1-based line of the link (frontmatter lines count, as in lint).
     pub line: usize,

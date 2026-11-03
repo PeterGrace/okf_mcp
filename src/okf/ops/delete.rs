@@ -58,7 +58,8 @@ pub fn delete_concept(workspace: &MemWorkspace, reference: &str) -> Result<OpOut
         .and_then(|text| listing_line(workspace, text, &index, &path));
     let links = links_into(workspace, &path, &index, listing)?;
     if !links.is_empty() {
-        // Catalog-relative with a leading `/`, as every path a tool returns.
+        // Catalog-relative with a leading `/`, as tool results (`touched`,
+        // `message`) and `Conflict` write them.
         return Err(OkfError::StillLinked {
             path: format!("/{path}"),
             links,
@@ -90,7 +91,8 @@ pub fn delete_concept(workspace: &MemWorkspace, reference: &str) -> Result<OpOut
 
 /// Every link into `path` from another document, except the folder
 /// listing's line (`listing`, a 0-based line of `index`). Each source is
-/// written with a leading `/` (`/hub.md`), as every path a tool returns.
+/// written with a leading `/` (`/hub.md`), as tool results (`touched`,
+/// `message`) and `Conflict` write them.
 ///
 /// # Errors
 /// The workspace's read error.

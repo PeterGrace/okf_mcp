@@ -8,7 +8,8 @@ Issue #140, Task 1 of `docs/superpowers/plans/2026-11-03-okf-mcp-m7-deployment.m
 
 - `delete_concept`'s `StillLinked` error writes its `path` and each
   `links[].source` catalog-relative with a leading `/` (`/infra/x.md`,
-  `/hub.md`), like every other path a tool returns, so an agent can feed them
+  `/hub.md`), as tool results (`touched`, `message`) and `Conflict` write
+  them, so an agent can feed them
   back into a tool unchanged. The error's message starts with the same
   `/`-prefixed path (`/infra/x.md: still linked from ...`).
 - `src/error.rs`: the docs of `StillLinked::path` and `LinkSource::source` say
@@ -25,7 +26,9 @@ Issue #140, Task 1 of `docs/superpowers/plans/2026-11-03-okf-mcp-m7-deployment.m
 ## Notes
 
 The other `OkfError` variants that carry a path, and how each writes it
-today. This records the facts; none of them changes here.
+today. This records the facts; none of them changes here. Their slashless
+paths are left as they are; the coordinator records that inconsistency as a
+follow-up.
 
 | Variant | Field | How it is written |
 |---------|-------|-------------------|
