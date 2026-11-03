@@ -900,7 +900,7 @@ Expected: 5 passed.
 
 - [ ] **Step 6: Update the design**
 
-In "Configuration", replace "incoming keys are hashed and compared in constant time" with "incoming keys are hashed and looked up by hash (a timing difference in the lookup reveals nothing about a key, so there is no constant-time scan)".
+In "Configuration", replace "incoming keys are hashed and compared in constant time" with "incoming keys are hashed and looked up by hash. A timing difference in the lookup can at most hint at how a guess's *hash* compares with stored hashes, which does not help recover a key (SHA-256 is preimage-resistant, and `std`'s `HashMap` hasher is randomly keyed), so there is no constant-time scan."
 
 - [ ] **Step 7: Changelog, gates, commit**
 
