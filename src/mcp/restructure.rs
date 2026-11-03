@@ -39,7 +39,7 @@ pub struct SplitConceptParams {
     pub section: String,
     /// The new concept's path, `.md` optional; it must not exist.
     pub to: String,
-    /// The new concept's `type` (default: Note).
+    /// The new concept's `type` (default: Note); a blank one is refused, as `create_concept` and `set_frontmatter` refuse it.
     // `rename`: the JSON name is `type`, a Rust keyword, so the field is `kind`.
     #[serde(rename = "type")]
     pub kind: Option<String>,
@@ -364,6 +364,39 @@ mod tests {
             listing.replay.expect("a listing replays")[0]["op"],
             "list_bullet"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blank_type_is_refused_and_nothing_is_stored() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+
+        let refused = split_concept(
+            &ctx,
+            SplitConceptParams {
+                path: "/infra/time".to_string(),
+                section: "Ports".to_string(),
+                to: "/infra/ports.md".to_string(),
+                kind: Some("  ".to_string()),
+                title: None,
+                description: None,
+                stub: None,
+                sources: None,
+                by: None,
+                catalog: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let body = refused.to_json();
+        assert_eq!(body["error"], "Refused");
+        assert_eq!(
+            refused.to_string(),
+            crate::okf::ops::blank_type().to_string()
+        );
+        let state = ctx.app().catalog("pg").unwrap();
+        assert!(!ctx.view(&state).await.unwrap().pending());
     }
 
     #[tokio::test(flavor = "multi_thread")]

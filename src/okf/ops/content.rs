@@ -11,7 +11,8 @@ use crate::okf::doc::{is_top_key, Doc, KEY_ORDER};
 use crate::okf::ops::log_index::{list_concept, Listing};
 use crate::okf::ops::replay::{insert_index_bullet_text, missing_heading, new_index_text};
 use crate::okf::ops::{
-    ensure_index, load_concept, refused, save, stamp_value, LoadedConcept, OpContext, OpOutcome,
+    blank_type, ensure_index, load_concept, refused, save, stamp_value, LoadedConcept, OpContext,
+    OpOutcome,
 };
 use crate::okf::paths::{basename, dirname, is_concept, join, new_concept_path, resolve_concept};
 use crate::okf::pystr::{py_repr_str, py_strip};
@@ -467,11 +468,7 @@ pub fn set_frontmatter(
                     "type cannot be deleted; every concept needs one".to_string(),
                 ))
             }
-            Some(kind) if non_blank(Some(kind)).is_none() => {
-                return Err(refused(
-                    "type must be a non-blank string; every concept needs one".to_string(),
-                ))
-            }
+            Some(kind) if non_blank(Some(kind)).is_none() => return Err(blank_type()),
             Some(_) => {}
         }
     }

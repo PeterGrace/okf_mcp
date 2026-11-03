@@ -10,7 +10,13 @@
 //! of every `index.md` and `log.md` whose links changed. The parent, the
 //! new concept and every other file whose links changed are free edits.
 //!
-//! Divergences from `okf.py` (each where `okf.py` crashes):
+//! Divergences from `okf.py`:
+//! - a blank `kind` (`--type ""`, or whitespace only) is refused with
+//!   `set_frontmatter`'s [`OkfError::Refused`], before anything is read;
+//!   `okf.py` writes `type: ""` (or the blank quoted), a concept without a
+//!   usable type, which `create_concept` and `set_frontmatter` refuse;
+//!
+//! and where `okf.py` crashes:
 //! - a parent `status` that is a list or mapping is written as Python's
 //!   `str()` of it, where `okf.py`'s `scalar` raises `TypeError`;
 //! - a new concept at the root of a catalog without a root `index.md` is
@@ -30,7 +36,8 @@ use crate::okf::ops::log_index::collapse_whitespace;
 use crate::okf::ops::relink::{rewrite_links, Moved, Redirect};
 use crate::okf::ops::replay::{insert_index_bullet_text, ReplayOp};
 use crate::okf::ops::{
-    ensure_index, load_concept, refused, stamp_value, LoadedConcept, OpContext, OpOutcome,
+    blank_type, ensure_index, load_concept, refused, stamp_value, LoadedConcept, OpContext,
+    OpOutcome,
 };
 use crate::okf::paths::{basename, dirname, join, new_concept_path};
 use crate::okf::pystr::{py_repr_str, py_rstrip, py_str, py_strip, py_truthy_str};
@@ -50,7 +57,8 @@ pub struct Split<'a> {
     pub section: &'a str,
     /// The new concept's path, with or without `.md` and a leading `/`.
     pub to: &'a str,
-    /// The new concept's `type` (`--type`, default [`DEFAULT_SPLIT_TYPE`]).
+    /// The new concept's `type` (`--type`, default [`DEFAULT_SPLIT_TYPE`]);
+    /// not blank.
     pub kind: &'a str,
     /// Its title; `None` or empty for the heading, backticks dropped.
     pub title: Option<&'a str>,
@@ -90,6 +98,8 @@ struct Header<'a> {
 /// the message, and its notes.
 ///
 /// # Errors
+/// - [`OkfError::Refused`] for a blank `kind`, first (a divergence: see the
+///   module doc).
 /// - For the parent, as `okf.py`'s `load_concept`: [`OkfError::NotFound`] or
 ///   [`OkfError::InvalidPath`] from
 ///   [`resolve_concept`](crate::okf::paths::resolve_concept),
@@ -111,6 +121,9 @@ pub fn split_concept(
     ctx: &OpContext<'_>,
     split: &Split<'_>,
 ) -> Result<OpOutcome, OkfError> {
+    if py_strip(split.kind).is_empty() {
+        return Err(blank_type());
+    }
     let LoadedConcept {
         path: parent, data, ..
     } = load_concept(workspace, split.concept)?;
@@ -782,6 +795,27 @@ mod tests {
         );
         assert!(text(&workspace, "splits/parent.md")
             .contains("## Last bit\n\nSee [Last bit](/splits/deeper/last.md).\n\n[^n0]: Zero.\n"));
+    }
+
+    #[test]
+    fn a_blank_type_is_refused_before_anything_is_read_or_written() {
+        let workspace = MemWorkspace::from_files(FILES);
+
+        // `map` runs the op once per blank kind, keeping each error's text.
+        let refusals = ["", " ", "\t\n"].map(|kind| {
+            let args = Split {
+                kind,
+                ..split("Background", "splits/background.md")
+            };
+            split_concept(&workspace, &ctx(), &args)
+                .unwrap_err()
+                .to_string()
+        });
+
+        // `set_frontmatter`'s refusal, word for word.
+        assert_eq!(refusals, [(); 3].map(|()| blank_type().to_string()));
+        assert!(!workspace.exists("splits/background.md"));
+        assert_eq!(text(&workspace, "splits/parent.md"), PARENT);
     }
 
     #[test]
