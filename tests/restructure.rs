@@ -153,10 +153,23 @@ async fn a_concurrent_edit_of_a_linking_file_conflicts() {
         body["files"],
         json!([{"path": "/hub.md", "base_revision": 1, "current_revision": 2}])
     );
-    // The move is still pending, its hub entry marked stale.
-    let hub = pending["files"]
-        .as_array()
-        .unwrap()
+    // The whole move is still pending, its hub entry marked stale.
+    let pending_files = pending["files"].as_array().unwrap();
+    let mut pending_paths: Vec<&str> = pending_files
+        .iter()
+        .map(|file| file["path"].as_str().expect("a string path"))
+        .collect();
+    pending_paths.sort_unstable();
+    assert_eq!(
+        pending_paths,
+        [
+            "/hub.md",
+            "/infra/clock.md",
+            "/infra/index.md",
+            "/infra/time.md"
+        ]
+    );
+    let hub = pending_files
         .iter()
         .find(|file| file["path"] == "/hub.md")
         .expect("the hub is still pending");
