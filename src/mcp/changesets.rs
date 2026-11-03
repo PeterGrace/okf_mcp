@@ -297,7 +297,7 @@ mod lifecycle_tests {
     use crate::mcp::testing::{
         app_with, context, pending_entry, principal_as, store_key, PendingEdit, TestApp,
     };
-    use crate::store::changesets::{self, ChangesetKey};
+    use crate::store::changesets::{self, ChangesetKey, ChangesetState};
     use crate::store::keys::Access;
 
     /// `pg` and `work`, and the keys `alice`, `bob` and `root`.
@@ -513,9 +513,24 @@ mod lifecycle_tests {
         .await;
         let here = connection(&test, "alice", Access::Write, &[], "default");
         edit_hours_ago(&test, &here, 0).await;
+        let closed_id = edit_hours_ago(
+            &test,
+            &connection(&test, "alice", Access::Write, &[], "closed"),
+            3,
+        )
+        .await;
+        let pg_id = test.app.catalog("pg").unwrap().id();
+        let mut tx = test.app.pool().begin().await.unwrap();
+        changesets::lock_catalog(&mut tx, pg_id).await.unwrap();
+        changesets::set_state(&mut tx, closed_id, ChangesetState::Discarded, Utc::now())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
 
         let busy = adopt_changeset(&here, AdoptParams { id: stranded_id }).await;
         let unknown = adopt_changeset(&here, AdoptParams { id: i64::MAX }).await;
+        let elsewhere = connection(&test, "alice", Access::Write, &[], "elsewhere");
+        let closed = adopt_changeset(&elsewhere, AdoptParams { id: closed_id }).await;
         let unreachable = adopt_changeset(
             &connection(&test, "alice", Access::Write, &["work"], "default"),
             AdoptParams { id: stranded_id },
@@ -526,7 +541,7 @@ mod lifecycle_tests {
             matches!(&busy, Err(OkfError::Refused { reason }) if reason.contains("already has")),
             "{busy:?}"
         );
-        for refused in [unknown, unreachable] {
+        for refused in [unknown, closed, unreachable] {
             assert!(
                 matches!(&refused, Err(OkfError::Refused { reason }) if reason.contains("no open changeset")),
                 "{refused:?}"
