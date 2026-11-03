@@ -269,7 +269,7 @@ first selected catalog.
 | `sprawl` | `path?`, `n?` (default 5) | Port of `sprawl --json` |
 | `links_report` | `mentions?` (default true) | Port of `links --json` |
 | `lint` | `pending?` | Port of `lint --json`, on the published catalog or (with `pending`) on this session's overlay |
-| `history` | `path`, `limit?` (default 20) | The document's revisions, newest first: revision, op, actor, message, time |
+| `history` | `path`, `limit?` (default 20, at most 200) | The document's revisions, newest first: revision, op, actor, message, time |
 | `pending_changes` | none | This session's changeset in the catalog: changed paths and a unified diff against the published text |
 | `stranded_sessions` | none | Open changesets whose MCP session has ended: id, catalog, actor, last change, changed paths |
 

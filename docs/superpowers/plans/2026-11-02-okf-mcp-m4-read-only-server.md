@@ -4328,10 +4328,30 @@ impl OkfServer {
 
 In `src/mcp/mod.rs`, add `mod history;` and `+ Self::history_router()`.
 
+> **Corrected (issue #72), 2026-11-03.** The public API above shipped as written
+> (`store::history::{revisions, RevisionRow}`, `HistoryParams`, `Revision`, `History`,
+> `history`, `history_router`); Task 12's smoke call (`{"path": "/log.md"}`) needs no
+> change. Differences: (1) `limit` is capped at 200 (`MAX_LIMIT`, as `search`'s, so one
+> response stays a reasonable size), through a private `revision_limit` that clamps to
+> 1..=200 (`DEFAULT_LIMIT` is a `u32`); the parameter and tool descriptions say so, and the
+> design's `history` row says "at most 200". (2) The store test uses the shared test
+> helper `files` instead of its own copy; after review (PR #84) it lives in `archive`
+> (`#[cfg(test)] pub(crate) fn files`, beside `Files`), so store tests don't reach into
+> `mcp`, and `mcp::testing` re-exports it. (3) More tests:
+> `mcp::history` adds `the_limit_defaults_to_20_counts_0_as_1_and_is_capped_at_200`,
+> `candidates_add_md_and_drop_paths_that_leave_the_catalog` and
+> `the_server_lists_history_with_an_object_output_schema` (verified fact 5's note), and
+> the read-set test also checks the actor, the `Z` timestamp, and that a `catalog`
+> argument naming a catalog without the path gives `NotFound`. So Step 5 runs 5 tests.
+> The tool description also says `log.md`, indexes and other files have a history.
+> `candidates`' doc comment says that a bare `notes` means the extensionless file when
+> both `notes` and `notes.md` exist (review of PR #84).
+> Read `src/store/history.rs` and `src/mcp/history.rs` for the shipped code.
+
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --lib -- history`
-Expected: 2 passed.
+Expected: 5 passed (2 in the original plan).
 
 - [ ] **Step 6: Changelog, gates, commit**
 
