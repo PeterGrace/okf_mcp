@@ -1,5 +1,7 @@
 //! The crate's error type.
 
+use crate::okf::analysis::Finding;
+
 /// Errors from reading, parsing or editing an OKF catalog.
 ///
 /// Later milestones add variants (auth, lint, publish); variants that
@@ -146,6 +148,44 @@ pub enum OkfError {
         /// What was aborted.
         reason: String,
     },
+
+    /// Publish was refused: lint errors in the files the changeset changes,
+    /// or links from other documents into paths it deletes.
+    #[error(
+        "publish refused: {} error(s) in the changed files; fix them and publish again",
+        .errors.len()
+    )]
+    LintFailed {
+        /// The refusing findings (`file` is catalog-relative, no leading `/`).
+        errors: Vec<Finding>,
+        /// Advice: errors in files the changeset does not change, and
+        /// warnings in those it does.
+        warnings: Vec<Finding>,
+    },
+
+    /// Publish found documents changed since the changeset read them.
+    #[error(
+        "publish conflict: {} file(s) changed since this changeset read them; re-read, \
+         re-apply and publish again",
+        .files.len()
+    )]
+    Conflict {
+        /// Each conflicting file, with the revision its entry was based on
+        /// and the published one.
+        files: Vec<ConflictFile>,
+    },
+}
+
+/// One file of an [`OkfError::Conflict`] (a record, so its fields are public).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct ConflictFile {
+    /// `/`-prefixed path.
+    pub path: String,
+    /// The published revision the changeset's entry was made on (`None`: the
+    /// path had no live document then).
+    pub base_revision: Option<i32>,
+    /// The published revision now (`None`: no live document).
+    pub current_revision: Option<i32>,
 }
 
 impl OkfError {
@@ -172,6 +212,8 @@ impl OkfError {
             OkfError::Forbidden { .. } => "Forbidden",
             OkfError::Refused { .. } => "Refused",
             OkfError::Busy { .. } => "Busy",
+            OkfError::LintFailed { .. } => "LintFailed",
+            OkfError::Conflict { .. } => "Conflict",
         }
     }
 
@@ -227,6 +269,11 @@ impl OkfError {
             }
             OkfError::CatalogNotSelected { catalog } => body["catalog"] = catalog.as_str().into(),
             OkfError::ImportRefused { problems } => body["problems"] = problems.as_slice().into(),
+            OkfError::LintFailed { errors, warnings } => {
+                body["errors"] = json_list(errors);
+                body["warnings"] = json_list(warnings);
+            }
+            OkfError::Conflict { files } => body["files"] = json_list(files),
             OkfError::Database { .. }
             | OkfError::Migrate { .. }
             | OkfError::Config { .. }
@@ -236,6 +283,13 @@ impl OkfError {
         }
         body
     }
+}
+
+/// A list as JSON, for an error body. `Finding` and `ConflictFile` are plain
+/// records that always serialize; the `Null` fallback only keeps this free
+/// of `unwrap`.
+fn json_list<T: serde::Serialize>(items: &[T]) -> serde_json::Value {
+    serde_json::to_value(items).unwrap_or_default()
 }
 
 /// SQLSTATEs that mean "Postgres aborted this transaction so others could go
@@ -360,6 +414,44 @@ mod tests {
                 "path": "a.md",
             })
         );
+    }
+
+    #[test]
+    fn publish_refusals_carry_their_findings_and_files() {
+        let finding = |file: &str, rule: &str| Finding {
+            file: file.to_string(),
+            line: 3,
+            rule: rule.to_string(),
+            message: "m".to_string(),
+        };
+        let lint = OkfError::LintFailed {
+            errors: vec![finding("a.md", "broken-link")],
+            warnings: vec![finding("b.md", "orphan")],
+        };
+        let conflict = OkfError::Conflict {
+            files: vec![ConflictFile {
+                path: "/a.md".to_string(),
+                base_revision: Some(1),
+                current_revision: Some(2),
+            }],
+        };
+
+        let lint_body = lint.to_json();
+        let conflict_body = conflict.to_json();
+
+        assert!(!lint.is_internal() && !conflict.is_internal());
+        assert_eq!(lint_body["error"], "LintFailed");
+        assert_eq!(lint_body["errors"][0]["rule"], "broken-link");
+        assert_eq!(lint_body["warnings"][0]["file"], "b.md");
+        assert_eq!(conflict_body["error"], "Conflict");
+        assert_eq!(
+            conflict_body["files"],
+            serde_json::json!([{"path": "/a.md", "base_revision": 1, "current_revision": 2}])
+        );
+        assert!(conflict_body["message"]
+            .as_str()
+            .unwrap()
+            .contains("re-apply"));
     }
 
     #[test]

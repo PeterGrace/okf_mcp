@@ -71,9 +71,10 @@ impl AppError {
     ///
     /// # Returns
     /// 404 for a path or catalog that is not there (or not reachable), 403
-    /// for an access level that is not enough, 409 for a refused request, 400
-    /// for a bad input, 500 for the server's own failures, 503 for a request
-    /// the database aborted (retry it).
+    /// for an access level that is not enough, 409 for a refused request or a
+    /// publish conflict, 422 for a publish whose result fails lint, 400 for a
+    /// bad input, 500 for the server's own failures, 503 for a request the
+    /// database aborted (retry it).
     pub fn status(&self) -> StatusCode {
         // No `_` arm: a new variant fails to compile here until it has a status.
         match &self.0 {
@@ -81,7 +82,8 @@ impl AppError {
                 StatusCode::NOT_FOUND
             }
             OkfError::Forbidden { .. } => StatusCode::FORBIDDEN,
-            OkfError::Refused { .. } => StatusCode::CONFLICT,
+            OkfError::Refused { .. } | OkfError::Conflict { .. } => StatusCode::CONFLICT,
+            OkfError::LintFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             OkfError::Busy { .. } => StatusCode::SERVICE_UNAVAILABLE,
             OkfError::InvalidPath { .. }
             | OkfError::FrontmatterParse { .. }
@@ -336,6 +338,18 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"], "Busy");
         assert!(body["message"].as_str().unwrap().ends_with("retry"));
+    }
+
+    #[test]
+    fn publish_refusals_have_their_statuses() {
+        let conflict = AppError(OkfError::Conflict { files: Vec::new() });
+        let lint = AppError(OkfError::LintFailed {
+            errors: Vec::new(),
+            warnings: Vec::new(),
+        });
+
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(lint.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]

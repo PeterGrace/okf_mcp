@@ -9782,6 +9782,29 @@ It runs under the catalog's publish lock: the in-process `CatalogState::publish_
 
 > **Note from Task 8 (issue #98, review of PR #112), 2026-11-03.** `write::apply`'s `Busy` branch (the changeset closed while a write waited on its row lock) has no test in Task 8. This task and Task 11 drive it: close the changeset with a concurrent `publish` (here) or `discard` (Task 11) while a write waits on the row lock, then assert the write fails with `Busy` and stores nothing.
 
+> **Corrected (issue #100), 2026-11-03.** What shipped differs from the code below in these ways (read `src/store/publish.rs` and `src/mcp/changesets.rs` for the shipped text):
+> - **`write::apply`'s `Busy` branch cannot be reached by a concurrent publish (or discard).** The Task 8 note above assumed a write waiting on the changeset's row lock would find it closed in `changesets::lock`. It waits earlier, in `get_or_create`'s `SELECT ... FOR UPDATE`, which already holds the row lock for the rest of the write. When the closing transaction commits, Postgres re-checks the `WHERE` (`state = 'open'`) against the updated row (read committed), finds no open changeset, and `get_or_create` loops and opens a new one. So the queued write succeeds in a **new** changeset and no edit is lost. The test is `a_write_queued_behind_a_publish_lands_in_a_new_changeset`: a test transaction holds the row lock, a publish and then a write queue behind it (the test polls `pg_stat_activity` for the waiters), and the publish wins. `apply`'s `Busy` branch stays as a defensive check. Task 11's `discard` closes a changeset the same way, so its version of this test should expect a new changeset, not `Busy`.
+> - **A deletion entry is never replayed** (`replayed_text` needs `content`). A deletion with `base_revision: None` names a path published after the changeset's first edit (Task 8's Corrected note), so it is always a `Conflict`. Pure tests in `store::publish` cover it, a tombstone counting as no live document, and the unique-violation backstop passing other errors through.
+> - `review` is named `split_lint`. `in_changed` compares `Finding::file` as it is, because lint never writes a leading `/`. `own_changeset` returns `OwnChangeset`; the plan said `Target`.
+> - **The tests write log and index entries through `write::apply`**, with `ops::log` and `ops::index`, not Task 9's `log` and `index` tools. Task 9 ran in parallel and had not merged. The helpers are `log_entry` and `list` in `publish_tests`.
+> - **Extra tests:** `a_publish_checks_against_an_import_the_snapshot_has_not_seen` (step 2: a CLI import's new link into a deleted path is caught after the rebuild), and `a_write_queued_behind_a_publish_lands_in_a_new_changeset` (above). The first test also checks `updated_by` and the swapped snapshot's generation, and the nothing-to-publish test checks that the generation did not move. That makes 10 tests in `publish_tests`.
+> - **Merged beside Task 12** (PR #110 created `src/mcp/changesets.rs` first): Task 12's module doc and imports are kept. Store imports sit inside the functions, as Task 12's do (`own_changeset` imports `changesets::{self, ChangesetKey}`, `publish` imports `store::publish::{self as publishing, PublishReport}`), and struct fields name `crate::store::...` types by full path. `OkfServer::tools()` joins `lifecycle_router` then `publish_router`.
+> - The design's "Publish" paragraph after the steps no longer says the overlay "re-reads only the changed ones". The overlay is a full snapshot (Decision 6). It also says what happens to a write queued behind a publish.
+>
+> - **After review of PR #114 (2026-11-03):**
+>   - A replayable entry whose path was deleted since its base (`base_revision: Some`, no live document now) is a `Conflict`, not a replay onto nothing. Replaying would silently re-create a `log.md` someone deleted, or surface the replay's own error instead of naming the file. A pure test, `a_replay_onto_a_path_deleted_since_its_base_conflicts`, covers it, and the design's "Publish" step 3 says so.
+>   - `Published::changeset`'s doc says that with `published: false` the changeset was not published and stays open.
+>   - Two more database tests:
+>     - `a_publish_creates_deletes_and_continues_a_tombstone_s_number`: ops `create` and `delete`, the tombstone row, NULL revision content, then revision 3 on the tombstone;
+>     - `a_revision_written_meanwhile_is_a_conflict_not_a_database_error`: the unique-violation backstop.
+>   - That makes 12 tests in `publish_tests` and 4 in `store::publish`.
+> - **After the second review of PR #114 (2026-11-03):**
+>   - The backstop's `Conflict` is no longer returned with `current_revision: None` meaning "unknown". `publish` rolls back, then re-reads each conflicting path's live revision on the pool (`with_current_revisions`), so `None` keeps meaning "no live document".
+>   - `current_base` has a comment, and the design's "Publish" section a note: refreshing a stale snapshot takes a second pooled connection while the publish holds one. That is safe per catalog (the mutex), and only many catalogs publishing at once on the 8-connection pool could exhaust it. This is accepted, as for Task 8's queued writers.
+>   - The `publish` tool's description now covers a no-op publish: every edit already matches the published text, so the result is `published: true` with no revisions, and the changeset is closed.
+>
+> No signature in the Interfaces block changed.
+
 **Files:**
 - Modify: `src/error.rs` (`LintFailed`, `Conflict`, `ConflictFile`)
 - Modify: `src/http/mod.rs` (their statuses)
@@ -10687,7 +10710,9 @@ fn merge(entries: Vec<EntryRow>, current: &HashMap<String, CurrentRow>) -> Resul
 /// # Errors
 /// The replay's own error (text it cannot place a bullet in).
 fn replayed_text(entry: &EntryRow, live: Option<&CurrentRow>) -> Result<Option<String>, OkfError> {
-    let Some(stored) = &entry.replay else {
+    // A deletion is never replayed: whatever was published since is
+    // something the changeset did not see.
+    let (Some(_), Some(stored)) = (&entry.content, &entry.replay) else {
         return Ok(None);
     };
     // `write::apply` stored these; anything unreadable conflicts instead.
@@ -10728,7 +10753,7 @@ async fn check(
     let entries = blocking(move || check_contents(entries)).await?;
     let overlay = build_overlay(base, changeset, entries).await?;
     let (overlay, findings) = blocking(move || {
-        let findings = review(&overlay, &changed, &deleted, now);
+        let findings = split_lint(&overlay, &changed, &deleted, now);
         (overlay, findings)
     })
     .await;
@@ -10762,20 +10787,20 @@ fn check_contents(entries: Vec<EntryRow>) -> Result<Vec<EntryRow>, OkfError> {
 /// as do links from unchanged documents into deleted paths. Errors
 /// elsewhere become advice, beside the warnings in changed files. Warnings
 /// elsewhere are left out: they predate this publish.
-fn review(
+fn split_lint(
     overlay: &Overlay,
     changed: &BTreeSet<String>,
     deleted: &BTreeSet<String>,
     now: DateTime<Utc>,
 ) -> LintReport {
     let report = overlay.lint(now);
-    // `Finding::file` has no leading `/`; `trim_start_matches` makes sure.
-    let in_changed = |finding: &Finding| changed.contains(finding.file.trim_start_matches('/'));
+    // `Finding::file` has no leading `/`.
+    let in_changed = |finding: &Finding| changed.contains(&finding.file);
     // `partition` splits one list in two by the predicate, in one pass.
     let (mut errors, mut warnings): (Vec<Finding>, Vec<Finding>) =
-        report.errors.into_iter().partition(&in_changed);
+        report.errors.into_iter().partition(in_changed);
     errors.extend(links_into_deleted(overlay.snapshot(), changed, deleted));
-    warnings.extend(report.warnings.into_iter().filter(&in_changed));
+    warnings.extend(report.warnings.into_iter().filter(in_changed));
     LintReport { errors, warnings }
 }
 
@@ -10937,7 +10962,7 @@ struct OwnChangeset {
 /// # Errors
 /// A selection error; [`OkfError::Forbidden`] below `access`;
 /// [`OkfError::Database`].
-async fn own_changeset(ctx: &ToolContext, catalog: Option<&str>, access: Access) -> Result<Target, OkfError> {
+async fn own_changeset(ctx: &ToolContext, catalog: Option<&str>, access: Access) -> Result<OwnChangeset, OkfError> {
     let state = ctx.one(catalog)?;
     let principal = ctx.principal();
     principal.require(access, state.name())?;
@@ -10987,7 +11012,7 @@ pub struct Published {
 /// The report; `published: false` without an open, non-empty changeset.
 ///
 /// # Errors
-/// [`OkfError::Refused`] for a blank message; as [`target`]; as
+/// [`OkfError::Refused`] for a blank message; as [`own_changeset`]; as
 /// [`publishing::publish`].
 pub(crate) async fn publish(ctx: &ToolContext, params: PublishParams) -> Result<Published, OkfError> {
     let message = params.message.trim();
@@ -11034,7 +11059,7 @@ impl OkfServer {
 In `src/mcp/mod.rs`: `mod changesets;` and `+ Self::publish_router()`.
 
 Run: `cargo test --lib -- mcp::changesets store::`
-Expected: all pass (8 in `publish_tests`).
+Expected: all pass (12 in `publish_tests`).
 
 - [ ] **Step 7: The design**
 
