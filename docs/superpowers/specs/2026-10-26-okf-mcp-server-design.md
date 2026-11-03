@@ -59,7 +59,7 @@ script. pgrace replaced it for M8 ([plan](../plans/2026-11-03-okf-mcp-m8-changes
   and `adopt_changeset`.
 - The label header, the query parameter and the `label` column go.
 
-Until M8's Task 6, the sections below still describe labels.
+Until M8's Task 5, the sections below still describe labels.
 
 ## Decisions
 
