@@ -149,7 +149,7 @@ Decisions 1, 2 and 5 are pgrace's or M5's. Decisions 3 and 4 were given by pgrac
     Each module's doc lists its divergences.
 15. **The new folder's listing is inserted without a "lists already" check, as `okf.py` does** (decided by Claude). The `ListBullet` replay op it records skips an index that already links the new path. The two differ only for an index holding a link to a path that does not exist yet.
 16. **`history` does not follow renames** (decided by Claude). Each path has its own history. After a move, the old path's newest revision is `delete`, and the new path's history starts with `create`; both carry the publish message. That is the existing revisions table, with no schema change.
-17. **A move or delete is several entries, and `discard` may drop some of them** (decided by Claude). There is no grouping. If an agent drops part of a move, publish's lint finds what is left broken: `broken-link` errors in changed files, or `link-into-deleted`. `revert` of a moved-away path to its last revision puts it back beside the new one. Task 6 tests both.
+17. **A move or delete is several entries, and `discard` may drop some of them** (decided by Claude). There is no grouping. If an agent drops part of a move, publish's lint finds what is left broken: `broken-link` errors in changed files, or `link-into-deleted`. `revert` of a moved-away path to its last revision puts it back beside the new one. Task 6 tests `revert` and a whole-changeset `discard`. Task 7 tests a partial one: discarding only a linking file's rewrite gets a `link-into-deleted` refusal. Discarding only the deletion entry breaks nothing, because the old path stays published beside the new one.
 18. **A link to a split-out section, published meanwhile, is not refused** (decided by Claude). Split moves no path. Such a link is a `broken-anchor` finding in a file the publish does not change, which publish returns as a warning, as for any lint error elsewhere (`split_lint`). A new check would be new publish semantics, so M6 adds none.
 19. **Moving into or out of machinery is refused by the write rules** (decided by Claude):
     - `new_concept_path` refuses a machinery or dot-directory target;
@@ -182,7 +182,7 @@ Each was checked on 2026-11-03 against the source on `main` at `299b2ea`, or by 
      `OpOutcome` is built with a struct literal in `mcp::changesets::revert` (`src/mcp/changesets.rs:688-694`), so M6 adds no field to it.
    - **Replay** (`src/okf/ops/replay.rs`):
      - `ReplayOp` (`:30`) and `replay` (`:87`), which replays onto an empty `MemWorkspace` (`no_dirs`, `:90`);
-     - the crate-private `present` (`:127`), `missing_heading` (`:134`), `lists_target` (`:145`), `new_index_text` (`:181`) and `is_bullet` (`:252`);
+     - the module-private `present` (`:127`) and `is_bullet` (`:252`), usable only inside `replay.rs` (so `listing_line`, which uses `is_bullet`, lives there), and the crate-private `missing_heading` (`:134`), `lists_target` (`:145`) and `new_index_text` (`:181`);
      - `insert_index_bullet_text(text, bullet, section, create_section) -> Option<String>` (`:291`), which is always `Some` when `section` is `None`.
    - **Bookkeeping** (`src/okf/ops/log_index.rs`):
      - `collapse_whitespace` (`:34`, private) is `" ".join(text.split())`;
@@ -4382,7 +4382,7 @@ git commit -m "feat: move_concept, split_concept and delete_concept tools (M6.06
 Publish has no new code (Decision 1): `replayed_text` replays the new ops, a stale free edit is already a `Conflict`, and `links_into_deleted` already reads deletion entries. This task proves it with database tests in a new module, `restructure_publish_tests`, in `src/mcp/changesets.rs` (beside M5's `publish_tests`, whose helpers it mirrors). They cover:
 - **a move:** `delete` and `create` revisions, a tombstone, and a history per path (Decision 16);
 - **replays onto a concurrent change:** a move's `Relink` onto a concurrent `index` of the same folder and onto a concurrent `log`; a delete's `Unlist` onto a concurrent listing;
-- **refusals:** the `Conflict` on a concurrent edit of a linking file, `link-into-deleted` for a link to the old path published meanwhile, and a cross-folder move's `Unlist` refusing a listing changed meanwhile;
+- **refusals:** the `Conflict` on a concurrent edit of a linking file, `link-into-deleted` for a link to the old path published meanwhile or left by a partial `discard` of the move (Decision 17), and a cross-folder move's `Unlist` refusing a listing changed meanwhile;
 - **a split:** the parent, the new concept and the listing.
 
 The ops run through `write::apply` directly, as M5's Task 10 tests did, so this task does not wait for Task 6.
@@ -4648,6 +4648,31 @@ mod restructure_publish_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_partial_discard_of_a_move_leaves_a_link_publish_refuses() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        moved(&ctx, "infra/x.md", "infra/z.md").await;
+        // Drop only hub.md's rewrite: the published hub.md still links the old path.
+        let params = DiscardParams {
+            paths: Some(vec!["/hub.md".to_string()]),
+            catalog: None,
+        };
+        discard(&ctx, params).await.unwrap();
+
+        let error = publish_as(&ctx, "rename x").await.unwrap_err();
+
+        let OkfError::LintFailed { errors, .. } = error else {
+            panic!("expected LintFailed, got {error:?}");
+        };
+        assert!(
+            errors
+                .iter()
+                .any(|finding| finding.file == "hub.md" && finding.rule == "link-into-deleted"),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_listing_changed_since_a_move_to_another_folder_refuses_the_publish() {
         let test = pg().await;
         let mover = writer(&test, "writer-a", "pg").await;
@@ -4759,11 +4784,12 @@ Task 7 of `docs/superpowers/plans/2026-11-03-okf-mcp-m6-restructuring.md` (miles
 
 ## Added
 
-- `src/mcp/changesets.rs`, `restructure_publish_tests`: 8 database tests:
+- `src/mcp/changesets.rs`, `restructure_publish_tests`: 9 database tests:
   - a move's revisions, tombstone and per-path histories;
   - its `Relink` replayed onto a concurrent `index` and onto a concurrent `log`;
   - the `Conflict` on a concurrent edit of a linking file;
   - `link-into-deleted` for a link to the old path published meanwhile;
+  - `link-into-deleted` for the link a partial `discard` of the move leaves;
   - a cross-folder move refused when its old listing changed meanwhile;
   - a delete's tombstone and `Unlist` replayed onto a concurrent listing;
   - a split's three revisions.
