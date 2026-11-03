@@ -9745,7 +9745,7 @@ Expected: all pass (3 in `tests`, 4 in `bookkeeping_tests`).
 
 - [ ] **Step 3: Changelog, gates, commit**
 
-Write `changelog/<ts>-m5-task-09-bookkeeping-tools.md`. It needs Added (the seven tools, `StampFieldParam`, `LogKindParam`, `QuestionRef`, `bookkeeping_router`, the four tests), Changed (`OkfServer::tools`) and Notes. The Notes say:
+Write `changelog/<ts>-m5-task-09-bookkeeping-tools.md`. It needs Added (the seven tools, their params, `QuestionRef`, `bookkeeping_router`, the five tests), Changed (`OkfServer::tools`; `StampField` and `LogKind` derive `JsonSchema`, `LogKind` also `Default`; Corrected, issue #99) and Notes. The Notes say:
 - why it is a separate router;
 - that `unquestion` takes a number or text (`untagged`);
 - that the frontmatter commands store no replay, so they conflict on a stale base like any free edit.
