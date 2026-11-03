@@ -151,7 +151,9 @@ Decisions 1, 2 and 5 are pgrace's or M5's. Decisions 3 and 4 were given by pgrac
 15. **The new folder's listing is inserted without a "lists already" check, as `okf.py` does** (decided by Claude). The `ListBullet` replay op it records skips an index that already links the new path. The two differ only for an index holding a link to a path that does not exist yet.
 16. **`history` does not follow renames** (decided by Claude). Each path has its own history. After a move, the old path's newest revision is `delete`, and the new path's history starts with `create`; both carry the publish message. That is the existing revisions table, with no schema change.
 17. **A move or delete is several entries, and `discard` may drop some of them** (decided by Claude). There is no grouping. If an agent drops part of a move, publish's lint finds what is left broken: `broken-link` errors in changed files, or `link-into-deleted`. `revert` of a moved-away path to its last revision puts it back beside the new one. Task 6 tests `revert` and a whole-changeset `discard`. Task 7 tests a partial one: discarding only a linking file's rewrite gets a `link-into-deleted` refusal. Discarding only the deletion entry breaks nothing, because the old path stays published beside the new one.
-18. **A link to a split-out section, published meanwhile, is not refused** (decided by Claude). Split moves no path. Such a link is a `broken-anchor` finding in a file the publish does not change, which publish returns as a warning, as for any lint error elsewhere (`split_lint`). A new check would be new publish semantics, so M6 adds none.
+18. **A link into a split-out section, published meanwhile, is not refused** (decided by Claude). Split moves no path, and the parent keeps the section's heading with a stub linking the new concept (`src/okf/ops/split.rs`, as `cmd_split` does), so a link to the section's own anchor keeps resolving and has no finding. A link to one of the section's subsection anchors, which moved to the new concept, is a `broken-anchor` finding in a file the publish does not change, which publish returns as a warning, as for any lint error elsewhere (`split_lint`); the publish goes through. A new check would be new publish semantics, so M6 adds none.
+
+    > **Corrected (issue #126, Brooke's review of PR #135), 2026-11-03.** This decision said any link to the split-out section became a `broken-anchor` warning. A test showed that a link to the section's own anchor still resolves, because the parent keeps the heading; only subsection anchors break. Task 7's `links_into_a_split_section_published_meanwhile_resolve_or_only_warn` pins both cases, and the design's "Publish" step 4 says the same.
 19. **Moving into or out of machinery is refused by the write rules** (decided by Claude):
     - `new_concept_path` refuses a machinery or dot-directory target;
     - an old path in machinery is refused by `write::apply`'s `rules::check_path` on the touched paths. Nothing is stored, since the op runs on a scratch copy.
@@ -4482,9 +4484,9 @@ git commit -m "feat: move_concept, split_concept and delete_concept tools (M6.06
 
 Publish has no new code (Decision 1): `replayed_text` replays the new ops, a stale free edit is already a `Conflict`, and `links_into_deleted` already reads deletion entries. This task proves it with database tests in a new module, `restructure_publish_tests`, in `src/mcp/changesets.rs` (beside M5's `publish_tests`, whose helpers it mirrors). They cover:
 - **a move:** `delete` and `create` revisions, a tombstone, and a history per path (Decision 16);
-- **replays onto a concurrent change:** a move's `Relink` onto a concurrent `index` of the same folder and onto a concurrent `log`; a delete's `Unlist` onto a concurrent listing;
-- **refusals:** the `Conflict` on a concurrent edit of a linking file, `link-into-deleted` for a link to the old path published meanwhile or left by a partial `discard` of the move (Decision 17), and a cross-folder move's `Unlist` refusing a listing changed meanwhile;
-- **a split:** the parent, the new concept and the listing.
+- **replays onto a concurrent change:** a move's `Relink` onto a concurrent `index` of the same folder and onto a concurrent `log`; a delete's `Unlist` onto a concurrent listing, and onto its own listing reworded meanwhile (`bullet: None`, Decision 6);
+- **refusals:** the `Conflict` on a concurrent edit of a linking file or of a split's parent, `link-into-deleted` for a link to the old path published meanwhile or left by a partial `discard` of the move (Decision 17), and a cross-folder move's `Unlist` refusing a listing changed meanwhile;
+- **a split:** the parent, the new concept and the listing; and links published meanwhile into the split section (Decision 18): the section's own anchor still resolves, a subsection's is a `broken-anchor` warning.
 
 The ops run through `write::apply` directly, as M5's Task 10 tests did, so this task does not wait for Task 6.
 
@@ -4518,7 +4520,7 @@ mod restructure_publish_tests {
     const X: &str = "---\ntype: Note\ntitle: X\ndescription: X.\n---\n# X\n";
     const Y: &str = "---\ntype: Note\ntitle: Y\ndescription: Y.\n---\n# Y\n";
     const BIG: &str = "---\ntype: Note\ntitle: Big\ndescription: Big.\n---\n# Big\n\n\
-                       ## Part\n\nPart text.\n\n## Rest\n\nRest text.\n";
+                       ## Part\n\nPart text.\n\n### Deep\n\nDeep text.\n\n## Rest\n\nRest text.\n";
     const HUB: &str = "---\ntype: Note\ntitle: Hub\ndescription: Links.\n---\n\
                        See [X](/infra/x.md) and [the part](/infra/big.md#part).\n";
 
@@ -4547,9 +4549,11 @@ mod restructure_publish_tests {
     /// A `move_concept` write, through the write path as Task 6's tool makes it.
     async fn moved(ctx: &ToolContext, old: &str, new: &str) -> WriteReport {
         let (old, new) = (old.to_string(), new.to_string());
-        apply(ctx, None, None, move |ws, _| ops::move_concept(ws, &old, &new))
-            .await
-            .unwrap()
+        apply(ctx, None, None, move |ws, _| {
+            ops::move_concept(ws, &old, &new)
+        })
+        .await
+        .unwrap()
     }
 
     /// A `delete_concept` write.
@@ -4563,9 +4567,31 @@ mod restructure_publish_tests {
     /// A `log` write.
     async fn logged(ctx: &ToolContext, text: &str) -> WriteReport {
         let text = text.to_string();
-        apply(ctx, None, None, move |ws, op| ops::log(ws, op, LogKind::Update, &text))
-            .await
-            .unwrap()
+        apply(ctx, None, None, move |ws, op| {
+            ops::log(ws, op, LogKind::Update, &text)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A `split_concept` write: `## Part` of `infra/big.md` (with its
+    /// `### Deep`) to `infra/part.md`.
+    async fn split_part(ctx: &ToolContext) -> WriteReport {
+        apply(ctx, None, None, |ws, op| {
+            let split = Split {
+                concept: "infra/big.md",
+                section: "Part",
+                to: "infra/part.md",
+                kind: DEFAULT_SPLIT_TYPE,
+                title: None,
+                description: Some("The part."),
+                stub: None,
+                sources: &[],
+            };
+            ops::split_concept(ws, op, &split)
+        })
+        .await
+        .unwrap()
     }
 
     /// A new concept `Q` at `path` with `body`; listed in its folder when `listed`.
@@ -4599,6 +4625,16 @@ mod restructure_publish_tests {
             .get(path)
             .map(|doc| doc.text().to_string())
             .unwrap_or_default()
+    }
+
+    /// Whether `path`'s `documents` row is a tombstone (`deleted_at` set).
+    async fn tombstoned(test: &TestApp, path: &str) -> bool {
+        // `$1` is a bind parameter; `documents` stores paths without the `/`.
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM documents WHERE path = $1")
+            .bind(path)
+            .fetch_one(test.app.pool())
+            .await
+            .unwrap()
     }
 
     /// The publish's revisions as sorted `(path, op, revision)`.
@@ -4643,13 +4679,7 @@ mod restructure_publish_tests {
         assert_eq!((old.len(), old[0].op.as_str()), (2, "delete"));
         assert_eq!(old[0].message, "move x");
         assert_eq!((new.len(), new[0].op.as_str()), (1, "create"));
-        let tombstone: bool = sqlx::query_scalar(
-            "SELECT deleted_at IS NOT NULL FROM documents WHERE path = 'infra/x.md'",
-        )
-        .fetch_one(test.app.pool())
-        .await
-        .unwrap();
-        assert!(tombstone);
+        assert!(tombstoned(&test, "infra/x.md").await);
         assert_eq!(published_text(&test, "infra/z.md"), X);
         assert!(published_text(&test, "hub.md").contains("[X](/infra/z.md)"));
         assert!(published_text(&test, "infra/index.md").contains("* [X](z.md) - x"));
@@ -4683,7 +4713,7 @@ mod restructure_publish_tests {
 
         let published = publish_as(&mover, "move x").await.unwrap();
 
-        assert!(published.report.replayed.contains(&"/log.md".to_string()));
+        assert_eq!(published.report.replayed, ["/log.md"]);
         let log = published_text(&test, "log.md");
         assert!(log.contains("* **Update:** from b"), "{log}");
         assert!(log.contains("Added [X](/infra/z.md)."), "{log}");
@@ -4729,7 +4759,7 @@ mod restructure_publish_tests {
         let test = pg().await;
         let mover = writer(&test, "writer-a", "pg").await;
         let other = writer(&test, "writer-b", "pg").await;
-        moved(&mover, "infra/y.md", "infra/w.md").await;
+        let report = moved(&mover, "infra/y.md", "infra/w.md").await;
         created(&other, "/b.md", "See [y](/infra/y.md).\n", false).await;
         publish_as(&other, "add b").await.unwrap();
 
@@ -4746,13 +4776,18 @@ mod restructure_publish_tests {
                 .any(|finding| finding.file == "b.md" && finding.rule == "link-into-deleted"),
             "{errors:?}"
         );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_partial_discard_of_a_move_leaves_a_link_publish_refuses() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
-        moved(&ctx, "infra/x.md", "infra/z.md").await;
+        let report = moved(&ctx, "infra/x.md", "infra/z.md").await;
         // Drop only hub.md's rewrite: the published hub.md still links the old path.
         let params = DiscardParams {
             paths: Some(vec!["/hub.md".to_string()]),
@@ -4771,6 +4806,11 @@ mod restructure_publish_tests {
                 .any(|finding| finding.file == "hub.md" && finding.rule == "link-into-deleted"),
             "{errors:?}"
         );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4817,31 +4857,24 @@ mod restructure_publish_tests {
         assert_eq!(published.report.replayed, ["/infra/index.md"]);
         assert_eq!(
             revisions(&published),
-            [("/infra/index.md", "update", 3), ("/infra/y.md", "delete", 2)]
+            [
+                ("/infra/index.md", "update", 3),
+                ("/infra/y.md", "delete", 2)
+            ]
         );
         let index = published_text(&test, "infra/index.md");
-        assert!(!index.contains("[Y](y.md)") && index.contains("[Q](q.md)"), "{index}");
+        assert!(
+            !index.contains("[Y](y.md)") && index.contains("[Q](q.md)"),
+            "{index}"
+        );
+        assert!(tombstoned(&test, "infra/y.md").await);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_published_split_writes_the_parent_the_new_concept_and_its_listing() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
-        apply(&ctx, None, None, |ws, op| {
-            let split = Split {
-                concept: "infra/big.md",
-                section: "Part",
-                to: "infra/part.md",
-                kind: DEFAULT_SPLIT_TYPE,
-                title: None,
-                description: Some("The part."),
-                stub: None,
-                sources: &[],
-            };
-            ops::split_concept(ws, op, &split)
-        })
-        .await
-        .unwrap();
+        split_part(&ctx).await;
 
         let published = publish_as(&ctx, "split big").await.unwrap();
 
@@ -4860,19 +4893,135 @@ mod restructure_publish_tests {
         assert!(published_text(&test, "hub.md").contains("[the part](/infra/part.md)"));
         assert!(published_text(&test, "infra/index.md").contains("* [Part](part.md) - The part."));
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn links_into_a_split_section_published_meanwhile_resolve_or_only_warn() {
+        let test = pg().await;
+        let splitter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        split_part(&splitter).await;
+        created(&other, "/b.md", "See [deep](/infra/big.md#deep).\n", false).await;
+        created(
+            &other,
+            "/c.md",
+            "See [the part](/infra/big.md#part).\n",
+            false,
+        )
+        .await;
+        publish_as(&other, "add b and c").await.unwrap();
+
+        let published = publish_as(&splitter, "split big").await.unwrap();
+
+        // Plan Decision 18: split moves no path. `### Deep` moved to part.md,
+        // so b.md's anchor is broken, in a file this publish does not change:
+        // a warning. The parent keeps `## Part` (with its stub), so c.md's
+        // link still resolves and has no finding at all.
+        assert!(published.report.published);
+        let warnings = &published.report.warnings;
+        let broken: Vec<&str> = warnings
+            .iter()
+            .filter(|finding| finding.rule == "broken-anchor")
+            .map(|finding| finding.file.as_str())
+            .collect();
+        assert_eq!(broken, ["b.md"], "{warnings:?}");
+        assert!(
+            !warnings.iter().any(|finding| finding.file == "c.md"),
+            "{warnings:?}"
+        );
+        assert!(published_text(&test, "infra/big.md").contains("## Part\n"));
+        assert!(published_text(&test, "infra/part.md").contains("Deep text."));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_unlists_a_listing_reworded_meanwhile() {
+        let test = pg().await;
+        let deleter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        deleted(&deleter, "infra/y.md").await;
+        let edit = EditDocumentParams {
+            path: "/infra/index.md".to_string(),
+            old_str: "* [Y](y.md) - y".to_string(),
+            new_str: "* [Y](y.md) - why".to_string(),
+            replace_all: false,
+            catalog: None,
+        };
+        edit_document(&other, edit).await.unwrap();
+        publish_as(&other, "reword y").await.unwrap();
+
+        let published = publish_as(&deleter, "drop y").await.unwrap();
+
+        // `delete_concept` records `Unlist { bullet: None }` (plan Decision 6):
+        // the bullet goes whatever it reads now, unlike a move's `Some`.
+        assert_eq!(published.report.replayed, ["/infra/index.md"]);
+        assert_eq!(
+            revisions(&published),
+            [
+                ("/infra/index.md", "update", 3),
+                ("/infra/y.md", "delete", 2)
+            ]
+        );
+        let index = published_text(&test, "infra/index.md");
+        assert!(!index.contains("y.md"), "{index}");
+        assert!(index.contains("* [X](x.md) - x"), "{index}");
+        assert!(tombstoned(&test, "infra/y.md").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_split_conflicts_with_a_concurrent_edit_of_its_parent() {
+        let test = pg().await;
+        let splitter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        let report = split_part(&splitter).await;
+        let edit = EditDocumentParams {
+            path: "/infra/big.md".to_string(),
+            old_str: "Rest text.".to_string(),
+            new_str: "Rest text, edited.".to_string(),
+            replace_all: false,
+            catalog: None,
+        };
+        edit_document(&other, edit).await.unwrap();
+        publish_as(&other, "edit big").await.unwrap();
+
+        let error = publish_as(&splitter, "split big").await.unwrap_err();
+
+        // The parent is a free edit (plan Decision 1), so a stale base conflicts.
+        assert!(
+            matches!(
+                error,
+                OkfError::Conflict { ref files } if files == &[ConflictFile {
+                    path: "/infra/big.md".to_string(),
+                    base_revision: Some(1),
+                    current_revision: Some(2),
+                }]
+            ),
+            "{error:?}"
+        );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
+    }
 }
 ```
+
+> **Corrected (issue #126), 2026-11-03.** The module has 12 tests, not 8. The 9 tests the plan listed (the plan's count missed `a_partial_discard_of_a_move_leaves_a_link_publish_refuses`, which a review added) compiled and passed as written: publish needed no code change, so there is no T7 -> T8 edge. The move test's inline tombstone query became a helper, `tombstoned`, which the delete test now also asserts, since its name promises a tombstone it did not check. Brooke's reviews on PR #135 added the rest:
+> - exact `replayed` in the log test, and `Open` after the refusal in both `link-into-deleted` tests;
+> - `links_into_a_split_section_published_meanwhile_resolve_or_only_warn`, with a `### Deep` subsection in `BIG` and a shared `split_part` helper. This test failed as first written, against the old Decision 18, and corrected it (see that note);
+> - `a_delete_unlists_a_listing_reworded_meanwhile` (the `None` side of Decision 6's `Unlist`) and `a_split_conflicts_with_a_concurrent_edit_of_its_parent` (Decision 1). Both passed as written.
+>
+> The code above is the shipped module, in rustfmt's layout.
 
 - [ ] **Step 2: Run them**
 
 Run: `cargo test --lib -- restructure_publish_tests --test-threads=6`
-Expected: 8 passed. The tests target code Tasks 2-5 already merged; if one fails, the bug is in that code or in publish. Fix it in this PR and record a dated `Corrected` note in the task whose code changed.
+Expected: 12 passed. The tests target code Tasks 2-5 already merged; if one fails, the bug is in that code or in publish. Fix it in this PR and record a dated `Corrected` note in the task whose code changed.
 
 - [ ] **Step 3: Update the design**
 
 In "Data flow", "Publish", step 4, after the "links into deleted or moved paths" bullet's last sentence ("This catches a link another session published after this changeset's `delete_concept` check ran."), add:
 
-"A move's old path is a deletion entry, so the same check covers moves. A split moves no path: a link to the split-out section published meanwhile is a `broken-anchor` finding in a file this publish does not change, returned as a warning. A move to another folder replays its old listing's removal (`Unlist`) only while that bullet still reads as it did; if it changed meanwhile, publish is refused (`Refused`), so the change is not dropped."
+"A move's old path is a deletion entry, so the same check covers moves. A split moves no path, and the parent keeps the section's heading with a stub linking the new concept (`src/okf/ops/split.rs`), so a link to the section's own anchor keeps resolving. A link published meanwhile to one of the section's subsection anchors, which moved to the new concept, is a `broken-anchor` finding in a file this publish does not change: it is returned as a warning and the publish goes through. A move to another folder replays its old listing's removal (`Unlist`) only while that bullet still reads as it did; if it changed meanwhile, publish is refused (`Refused`), so the change is not dropped."
 
 - [ ] **Step 4: Changelog, gates, commit**
 
@@ -4885,7 +5034,7 @@ Task 7 of `docs/superpowers/plans/2026-11-03-okf-mcp-m6-restructuring.md` (miles
 
 ## Added
 
-- `src/mcp/changesets.rs`, `restructure_publish_tests`: 9 database tests:
+- `src/mcp/changesets.rs`, `restructure_publish_tests`: 12 database tests:
   - a move's revisions, tombstone and per-path histories;
   - its `Relink` replayed onto a concurrent `index` and onto a concurrent `log`;
   - the `Conflict` on a concurrent edit of a linking file;
@@ -4893,7 +5042,12 @@ Task 7 of `docs/superpowers/plans/2026-11-03-okf-mcp-m6-restructuring.md` (miles
   - `link-into-deleted` for the link a partial `discard` of the move leaves;
   - a cross-folder move refused when its old listing changed meanwhile;
   - a delete's tombstone and `Unlist` replayed onto a concurrent listing;
-  - a split's three revisions.
+  - a split's four revisions (the parent, the new concept, the folder index
+    and a linking file);
+  - links published meanwhile into the split section: the section's anchor
+    still resolves, a subsection's is a `broken-anchor` warning;
+  - a delete's `Unlist` onto its listing reworded meanwhile;
+  - the `Conflict` on a concurrent edit of a split's parent.
 
 ## Changed
 

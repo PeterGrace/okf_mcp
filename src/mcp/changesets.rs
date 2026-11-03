@@ -2257,3 +2257,505 @@ mod changes_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod restructure_publish_tests {
+    use super::*;
+
+    use crate::config::Config;
+    use crate::error::ConflictFile;
+    use crate::mcp::testing::{app_with, writer, TestApp};
+    use crate::mcp::writes::{
+        create_concept, edit_document, replace_body, CreateConceptParams, EditDocumentParams,
+        ReplaceBodyParams,
+    };
+    use crate::okf::ops::{self, LogKind, Split, DEFAULT_SPLIT_TYPE};
+    use crate::store::changesets::{self, ChangesetState};
+    use crate::store::history;
+
+    const X: &str = "---\ntype: Note\ntitle: X\ndescription: X.\n---\n# X\n";
+    const Y: &str = "---\ntype: Note\ntitle: Y\ndescription: Y.\n---\n# Y\n";
+    const BIG: &str = "---\ntype: Note\ntitle: Big\ndescription: Big.\n---\n# Big\n\n\
+                       ## Part\n\nPart text.\n\n### Deep\n\nDeep text.\n\n## Rest\n\nRest text.\n";
+    const HUB: &str = "---\ntype: Note\ntitle: Hub\ndescription: Links.\n---\n\
+                       See [X](/infra/x.md) and [the part](/infra/big.md#part).\n";
+
+    async fn pg() -> TestApp {
+        let files: &[(&str, &str)] = &[
+            (
+                "index.md",
+                "# PG\n\n# Sections\n\n* [Infra](/infra/index.md) - systems\n",
+            ),
+            (
+                "infra/index.md",
+                "# Infra\n\n# Concepts\n\n* [X](x.md) - x\n* [Y](y.md) - y\n* [Big](big.md) - big\n",
+            ),
+            ("infra/x.md", X),
+            ("infra/y.md", Y),
+            ("infra/big.md", BIG),
+            ("hub.md", HUB),
+            (
+                "log.md",
+                "# Log\n\n## 2026-11-01\n\n* **Update:** Added [X](/infra/x.md).\n",
+            ),
+        ];
+        app_with(&[("pg", files)], Config::default()).await
+    }
+
+    /// A `move_concept` write, through the write path as Task 6's tool makes it.
+    async fn moved(ctx: &ToolContext, old: &str, new: &str) -> WriteReport {
+        let (old, new) = (old.to_string(), new.to_string());
+        apply(ctx, None, None, move |ws, _| {
+            ops::move_concept(ws, &old, &new)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A `delete_concept` write.
+    async fn deleted(ctx: &ToolContext, path: &str) -> WriteReport {
+        let path = path.to_string();
+        apply(ctx, None, None, move |ws, _| ops::delete_concept(ws, &path))
+            .await
+            .unwrap()
+    }
+
+    /// A `log` write.
+    async fn logged(ctx: &ToolContext, text: &str) -> WriteReport {
+        let text = text.to_string();
+        apply(ctx, None, None, move |ws, op| {
+            ops::log(ws, op, LogKind::Update, &text)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A `split_concept` write: `## Part` of `infra/big.md` (with its
+    /// `### Deep`) to `infra/part.md`.
+    async fn split_part(ctx: &ToolContext) -> WriteReport {
+        apply(ctx, None, None, |ws, op| {
+            let split = Split {
+                concept: "infra/big.md",
+                section: "Part",
+                to: "infra/part.md",
+                kind: DEFAULT_SPLIT_TYPE,
+                title: None,
+                description: Some("The part."),
+                stub: None,
+                sources: &[],
+            };
+            ops::split_concept(ws, op, &split)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A new concept `Q` at `path` with `body`; listed in its folder when `listed`.
+    async fn created(ctx: &ToolContext, path: &str, body: &str, listed: bool) -> WriteReport {
+        let frontmatter = serde_json::json!({"type": "Note", "title": "Q", "description": "Q."});
+        let params = CreateConceptParams {
+            path: path.to_string(),
+            frontmatter: frontmatter.as_object().cloned().unwrap_or_default(),
+            body: body.to_string(),
+            // `bool::then`: `Some(..)` when true, like `x if cond else None`.
+            index_summary: listed.then(|| "q".to_string()),
+            index_section: None,
+            by: None,
+            catalog: None,
+        };
+        create_concept(ctx, params).await.unwrap()
+    }
+
+    async fn publish_as(ctx: &ToolContext, message: &str) -> Result<Published, OkfError> {
+        let params = PublishParams {
+            message: message.to_string(),
+            catalog: None,
+        };
+        publish(ctx, params).await
+    }
+
+    fn published_text(test: &TestApp, path: &str) -> String {
+        let loaded = test.app.catalog("pg").unwrap().current();
+        loaded
+            .snapshot()
+            .get(path)
+            .map(|doc| doc.text().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Whether `path`'s `documents` row is a tombstone (`deleted_at` set).
+    async fn tombstoned(test: &TestApp, path: &str) -> bool {
+        // `$1` is a bind parameter; `documents` stores paths without the `/`.
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM documents WHERE path = $1")
+            .bind(path)
+            .fetch_one(test.app.pool())
+            .await
+            .unwrap()
+    }
+
+    /// The publish's revisions as sorted `(path, op, revision)`.
+    fn revisions(published: &Published) -> Vec<(&str, &str, i32)> {
+        let mut rows: Vec<(&str, &str, i32)> = published
+            .report
+            .revisions
+            .iter()
+            .map(|row| (row.path.as_str(), row.op, row.revision))
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_published_move_deletes_the_old_path_and_creates_the_new_one() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let state = test.app.catalog("pg").unwrap();
+        moved(&ctx, "infra/x.md", "infra/z.md").await;
+
+        let published = publish_as(&ctx, "move x").await.unwrap();
+
+        assert_eq!(
+            revisions(&published),
+            [
+                ("/hub.md", "update", 2),
+                ("/infra/index.md", "update", 2),
+                ("/infra/x.md", "delete", 2),
+                ("/infra/z.md", "create", 1),
+                ("/log.md", "update", 2),
+            ]
+        );
+        assert!(published.report.replayed.is_empty());
+        let old = history::revisions(test.app.pool(), state.id(), "infra/x.md", 5)
+            .await
+            .unwrap();
+        let new = history::revisions(test.app.pool(), state.id(), "infra/z.md", 5)
+            .await
+            .unwrap();
+        // Each path keeps its own history (plan Decision 16).
+        assert_eq!((old.len(), old[0].op.as_str()), (2, "delete"));
+        assert_eq!(old[0].message, "move x");
+        assert_eq!((new.len(), new[0].op.as_str()), (1, "create"));
+        assert!(tombstoned(&test, "infra/x.md").await);
+        assert_eq!(published_text(&test, "infra/z.md"), X);
+        assert!(published_text(&test, "hub.md").contains("[X](/infra/z.md)"));
+        assert!(published_text(&test, "infra/index.md").contains("* [X](z.md) - x"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_replays_its_listing_onto_a_concurrent_index_of_the_folder() {
+        let test = pg().await;
+        let mover = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        moved(&mover, "infra/y.md", "infra/w.md").await;
+        created(&other, "/infra/q.md", "# Q\n", true).await;
+        publish_as(&other, "add q").await.unwrap();
+
+        let published = publish_as(&mover, "rename y").await.unwrap();
+
+        assert_eq!(published.report.replayed, ["/infra/index.md"]);
+        let index = published_text(&test, "infra/index.md");
+        assert!(index.contains("* [Y](w.md) - y"), "{index}");
+        assert!(index.contains("* [Q](q.md) - q"), "{index}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_relinks_log_md_onto_a_concurrent_log() {
+        let test = pg().await;
+        let mover = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        moved(&mover, "infra/x.md", "infra/z.md").await;
+        logged(&other, "from b").await;
+        publish_as(&other, "log b").await.unwrap();
+
+        let published = publish_as(&mover, "move x").await.unwrap();
+
+        assert_eq!(published.report.replayed, ["/log.md"]);
+        let log = published_text(&test, "log.md");
+        assert!(log.contains("* **Update:** from b"), "{log}");
+        assert!(log.contains("Added [X](/infra/z.md)."), "{log}");
+        assert!(!log.contains("/infra/x.md"), "{log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_conflicts_with_a_concurrent_edit_of_a_linking_file() {
+        let test = pg().await;
+        let mover = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        let report = moved(&mover, "infra/x.md", "infra/z.md").await;
+        let body = ReplaceBodyParams {
+            path: "/hub.md".to_string(),
+            body: "Nothing linked.\n".to_string(),
+            catalog: None,
+        };
+        replace_body(&other, body).await.unwrap();
+        publish_as(&other, "edit hub").await.unwrap();
+
+        let error = publish_as(&mover, "move x").await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                OkfError::Conflict { ref files } if files == &[ConflictFile {
+                    path: "/hub.md".to_string(),
+                    base_revision: Some(1),
+                    current_revision: Some(2),
+                }]
+            ),
+            "{error:?}"
+        );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_to_the_old_path_published_meanwhile_refuses_the_move() {
+        let test = pg().await;
+        let mover = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        let report = moved(&mover, "infra/y.md", "infra/w.md").await;
+        created(&other, "/b.md", "See [y](/infra/y.md).\n", false).await;
+        publish_as(&other, "add b").await.unwrap();
+
+        let error = publish_as(&mover, "rename y").await.unwrap_err();
+
+        // `links_into_deleted` (store/publish.rs): b.md is not in the mover's
+        // changeset and links to the path it deletes.
+        let OkfError::LintFailed { errors, .. } = error else {
+            panic!("expected LintFailed, got {error:?}");
+        };
+        assert!(
+            errors
+                .iter()
+                .any(|finding| finding.file == "b.md" && finding.rule == "link-into-deleted"),
+            "{errors:?}"
+        );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_partial_discard_of_a_move_leaves_a_link_publish_refuses() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let report = moved(&ctx, "infra/x.md", "infra/z.md").await;
+        // Drop only hub.md's rewrite: the published hub.md still links the old path.
+        let params = DiscardParams {
+            paths: Some(vec!["/hub.md".to_string()]),
+            catalog: None,
+        };
+        discard(&ctx, params).await.unwrap();
+
+        let error = publish_as(&ctx, "rename x").await.unwrap_err();
+
+        let OkfError::LintFailed { errors, .. } = error else {
+            panic!("expected LintFailed, got {error:?}");
+        };
+        assert!(
+            errors
+                .iter()
+                .any(|finding| finding.file == "hub.md" && finding.rule == "link-into-deleted"),
+            "{errors:?}"
+        );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listing_changed_since_a_move_to_another_folder_refuses_the_publish() {
+        let test = pg().await;
+        let mover = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        let report = moved(&mover, "infra/y.md", "ops/y.md").await;
+        let edit = EditDocumentParams {
+            path: "/infra/index.md".to_string(),
+            old_str: "* [Y](y.md) - y".to_string(),
+            new_str: "* [Y](y.md) - why".to_string(),
+            replace_all: false,
+            catalog: None,
+        };
+        edit_document(&other, edit).await.unwrap();
+        publish_as(&other, "reword y").await.unwrap();
+
+        let error = publish_as(&mover, "move y").await.unwrap_err();
+
+        assert!(
+            matches!(error, OkfError::Refused { ref reason } if reason.contains("changed since")),
+            "{error:?}"
+        );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_published_delete_leaves_a_tombstone_and_unlists_onto_newer_text() {
+        let test = pg().await;
+        let deleter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        let report = deleted(&deleter, "infra/y.md").await;
+        created(&other, "/infra/q.md", "# Q\n", true).await;
+        publish_as(&other, "add q").await.unwrap();
+
+        let published = publish_as(&deleter, "drop y").await.unwrap();
+
+        assert_eq!(report.touched, ["/infra/y.md", "/infra/index.md"]);
+        assert_eq!(published.report.replayed, ["/infra/index.md"]);
+        assert_eq!(
+            revisions(&published),
+            [
+                ("/infra/index.md", "update", 3),
+                ("/infra/y.md", "delete", 2)
+            ]
+        );
+        let index = published_text(&test, "infra/index.md");
+        assert!(
+            !index.contains("[Y](y.md)") && index.contains("[Q](q.md)"),
+            "{index}"
+        );
+        assert!(tombstoned(&test, "infra/y.md").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_published_split_writes_the_parent_the_new_concept_and_its_listing() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        split_part(&ctx).await;
+
+        let published = publish_as(&ctx, "split big").await.unwrap();
+
+        assert_eq!(
+            revisions(&published),
+            [
+                ("/hub.md", "update", 2),
+                ("/infra/big.md", "update", 2),
+                ("/infra/index.md", "update", 2),
+                ("/infra/part.md", "create", 1),
+            ]
+        );
+        assert!(published_text(&test, "infra/part.md").contains("Part text."));
+        assert!(published_text(&test, "infra/big.md")
+            .contains("## Part\n\n[Part](/infra/part.md): The part.\n"));
+        assert!(published_text(&test, "hub.md").contains("[the part](/infra/part.md)"));
+        assert!(published_text(&test, "infra/index.md").contains("* [Part](part.md) - The part."));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn links_into_a_split_section_published_meanwhile_resolve_or_only_warn() {
+        let test = pg().await;
+        let splitter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        split_part(&splitter).await;
+        created(&other, "/b.md", "See [deep](/infra/big.md#deep).\n", false).await;
+        created(
+            &other,
+            "/c.md",
+            "See [the part](/infra/big.md#part).\n",
+            false,
+        )
+        .await;
+        publish_as(&other, "add b and c").await.unwrap();
+
+        let published = publish_as(&splitter, "split big").await.unwrap();
+
+        // Plan Decision 18: split moves no path. `### Deep` moved to part.md,
+        // so b.md's anchor is broken, in a file this publish does not change:
+        // a warning. The parent keeps `## Part` (with its stub), so c.md's
+        // link still resolves and has no finding at all.
+        assert!(published.report.published);
+        let warnings = &published.report.warnings;
+        let broken: Vec<&str> = warnings
+            .iter()
+            .filter(|finding| finding.rule == "broken-anchor")
+            .map(|finding| finding.file.as_str())
+            .collect();
+        assert_eq!(broken, ["b.md"], "{warnings:?}");
+        assert!(
+            !warnings.iter().any(|finding| finding.file == "c.md"),
+            "{warnings:?}"
+        );
+        assert!(published_text(&test, "infra/big.md").contains("## Part\n"));
+        assert!(published_text(&test, "infra/part.md").contains("Deep text."));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_unlists_a_listing_reworded_meanwhile() {
+        let test = pg().await;
+        let deleter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        deleted(&deleter, "infra/y.md").await;
+        let edit = EditDocumentParams {
+            path: "/infra/index.md".to_string(),
+            old_str: "* [Y](y.md) - y".to_string(),
+            new_str: "* [Y](y.md) - why".to_string(),
+            replace_all: false,
+            catalog: None,
+        };
+        edit_document(&other, edit).await.unwrap();
+        publish_as(&other, "reword y").await.unwrap();
+
+        let published = publish_as(&deleter, "drop y").await.unwrap();
+
+        // `delete_concept` records `Unlist { bullet: None }` (plan Decision 6):
+        // the bullet goes whatever it reads now, unlike a move's `Some`.
+        assert_eq!(published.report.replayed, ["/infra/index.md"]);
+        assert_eq!(
+            revisions(&published),
+            [
+                ("/infra/index.md", "update", 3),
+                ("/infra/y.md", "delete", 2)
+            ]
+        );
+        let index = published_text(&test, "infra/index.md");
+        assert!(!index.contains("y.md"), "{index}");
+        assert!(index.contains("* [X](x.md) - x"), "{index}");
+        assert!(tombstoned(&test, "infra/y.md").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_split_conflicts_with_a_concurrent_edit_of_its_parent() {
+        let test = pg().await;
+        let splitter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        let report = split_part(&splitter).await;
+        let edit = EditDocumentParams {
+            path: "/infra/big.md".to_string(),
+            old_str: "Rest text.".to_string(),
+            new_str: "Rest text, edited.".to_string(),
+            replace_all: false,
+            catalog: None,
+        };
+        edit_document(&other, edit).await.unwrap();
+        publish_as(&other, "edit big").await.unwrap();
+
+        let error = publish_as(&splitter, "split big").await.unwrap_err();
+
+        // The parent is a free edit (plan Decision 1), so a stale base conflicts.
+        assert!(
+            matches!(
+                error,
+                OkfError::Conflict { ref files } if files == &[ConflictFile {
+                    path: "/infra/big.md".to_string(),
+                    base_revision: Some(1),
+                    current_revision: Some(2),
+                }]
+            ),
+            "{error:?}"
+        );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
+    }
+}
