@@ -4,10 +4,12 @@
 //! `storage_round_trip_on_a_real_catalog` (M3) imports the checkout into a
 //! throwaway Postgres, loads the snapshot from the rows, runs the links report
 //! twice (the second with the cached mention matcher) and lint with revision
-//! times, and exports the catalog again.
+//! times, and exports the catalog again; `server_on_a_real_catalog` (M4)
+//! serves the imported checkout over HTTP and times each read tool and an
+//! export through rmcp's client.
 //!
-//! Both tests are `#[ignore]`d because they need a catalog checkout (and the
-//! storage test needs Docker). Run them in release mode, since the timings
+//! All three tests are `#[ignore]`d because they need a catalog checkout (and
+//! the storage and server tests need Docker). Run them in release mode, since the timings
 //! are the point:
 //!
 //! `OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog cargo test --release --test smoke -- --ignored --nocapture`
@@ -188,4 +190,98 @@ async fn storage_round_trip_on_a_real_catalog() {
     let started = Instant::now();
     let tarball = export::export(&db.pool, "pg", Vec::new()).await.unwrap();
     eprintln!("export: {} bytes in {:?}", tarball.len(), started.elapsed());
+}
+
+/// Serve a real catalog over HTTP and time every read tool and the export.
+///
+/// The tools go through rmcp's client and the real router, so each timing
+/// includes the HTTP round trip, the auth layer, catalog selection and the
+/// JSON encoding, not just the analysis. Only sizes and timings are printed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a catalog checkout in OKF_PARITY_CATALOG and Docker"]
+async fn server_on_a_real_catalog() {
+    use okf_mcp::archive::read_directory;
+    use okf_mcp::config::Config;
+    use okf_mcp::store::keys::Access;
+    use serde_json::json;
+    use support::server::{call, structured, TestServer};
+
+    let root = std::env::var_os("OKF_PARITY_CATALOG").expect("set OKF_PARITY_CATALOG");
+    let files = read_directory(std::path::Path::new(&root), u64::MAX).unwrap();
+    let count = files.len();
+    let started = Instant::now();
+    // `vec![(name, files)]`: one catalog, `pg`, imported before the server
+    // starts. The time includes starting the Postgres container.
+    let server = TestServer::start(vec![("pg", files)], Config::default()).await;
+    eprintln!(
+        "start Postgres, import {count} files and start the server: {:?}",
+        started.elapsed()
+    );
+    let key = server.key("smoke", Access::Read, &[], Some("pg")).await;
+    let client = server.client(&key, None).await.unwrap();
+
+    let started = Instant::now();
+    let found = call(&client, "search", json!({"query": "time server"})).await;
+    let search_time = started.elapsed();
+    let hits = &structured(&found)["hits"];
+    eprintln!(
+        "search: {} hits in {search_time:?}",
+        hits.as_array().map_or(0, Vec::len)
+    );
+    // The best hit's path, so `get_concept` times a real concept.
+    let first = hits[0]["path"]
+        .as_str()
+        .expect("the search finds a concept")
+        .to_string();
+
+    // `links_report` runs twice: the second call reuses the snapshot's cached
+    // mention matcher (M3, #33).
+    let calls = [
+        ("list_catalogs", json!({})),
+        ("get_concept", json!({"path": first, "links": true})),
+        ("read_document", json!({})),
+        ("history", json!({"path": "/log.md"})),
+        ("open_questions", json!({})),
+        ("oldest", json!({})),
+        ("sprawl", json!({})),
+        ("links_report", json!({})),
+        ("links_report", json!({})),
+        ("lint", json!({})),
+    ];
+    let mut failed = Vec::new();
+    for (tool, arguments) in calls {
+        let started = Instant::now();
+        let result = call(&client, tool, arguments).await;
+        let elapsed = started.elapsed();
+        // The size of the structured JSON, not its content.
+        let bytes = result
+            .structured_content
+            .as_ref()
+            .map_or(0, |value| value.to_string().len());
+        eprintln!("{tool}: {bytes} bytes of JSON in {elapsed:?}");
+        if result.is_error == Some(true) {
+            failed.push(tool);
+        }
+    }
+
+    let started = Instant::now();
+    let response = reqwest::Client::new()
+        .get(format!("{}/catalogs/pg/export", server.base))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let export = response.bytes().await.unwrap();
+    eprintln!(
+        "export route: {} bytes in {:?}",
+        export.len(),
+        started.elapsed()
+    );
+    client.cancel().await.unwrap();
+
+    assert!(failed.is_empty(), "these tools returned errors: {failed:?}");
+    assert_eq!(status, reqwest::StatusCode::OK);
+    // Every gzip stream starts with the bytes 0x1f 0x8b.
+    assert!(export.starts_with(&[0x1f, 0x8b]), "the export is gzip");
 }

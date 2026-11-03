@@ -5213,6 +5213,19 @@ async fn server_on_a_real_catalog() {
 
 `links_report` runs twice: the second call reuses the snapshot's cached mention matcher (M3, #33).
 
+> **Corrected (issue #75), 2026-11-03.** The test above ran against the harness as
+> shipped (`TestServer::{start, key, client}`, `call`, `structured`) with these changes,
+> none to any API: it reads the checkout with `u64::MAX` as the other smoke test does
+> (no 64 MiB cap to trip); it prints each tool's structured JSON size and time, never
+> its content, and gathers the tools that returned errors, asserting none did after the
+> calls (Arrange-Act-Assert) instead of printing an error flag; it asserts the export is
+> 200 and gzip (`1f 8b`); it closes the client with `cancel()`. The first timing
+> includes starting the Postgres container. The real catalog's export is about 450 KB,
+> not 1 MB. The design's "Process and routes" also had to change beyond Step 3's list:
+> the `/mcp` row (stateless on `2026-07-28`), the archive rows (#74's headers, statuses
+> and check order) and the timeout paragraph (the import is not behind
+> `timeout_layer()`).
+
 Run: `OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog cargo test --release --test smoke -- --ignored --nocapture`
 Expected: three tests pass; paste the timings into the milestone changelog.
 
