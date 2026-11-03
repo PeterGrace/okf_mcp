@@ -9798,6 +9798,10 @@ It runs under the catalog's publish lock: the in-process `CatalogState::publish_
 >     - `a_publish_creates_deletes_and_continues_a_tombstone_s_number`: ops `create` and `delete`, the tombstone row, NULL revision content, then revision 3 on the tombstone;
 >     - `a_revision_written_meanwhile_is_a_conflict_not_a_database_error`: the unique-violation backstop.
 >   - That makes 12 tests in `publish_tests` and 4 in `store::publish`.
+> - **After the second review of PR #114 (2026-11-03):**
+>   - The backstop's `Conflict` is no longer returned with `current_revision: None` meaning "unknown". `publish` rolls back, then re-reads each conflicting path's live revision on the pool (`with_current_revisions`), so `None` keeps meaning "no live document".
+>   - `current_base` has a comment, and the design's "Publish" section a note: refreshing a stale snapshot takes a second pooled connection while the publish holds one. That is safe per catalog (the mutex), and only many catalogs publishing at once on the 8-connection pool could exhaust it. This is accepted, as for Task 8's queued writers.
+>   - The `publish` tool's description now covers a no-op publish: every edit already matches the published text, so the result is `published: true` with no revisions, and the changeset is closed.
 >
 > No signature in the Interfaces block changed.
 
