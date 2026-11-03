@@ -17,7 +17,8 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 use crate::app::App;
 use crate::auth::require_key;
@@ -176,7 +177,14 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     Router::new()
         .merge(health)
         .merge(keyed)
-        .layer(TraceLayer::new_for_http())
+        // One `info` line per response (status, latency) in a span naming the
+        // method and URI. The default span records no headers, so a bearer key
+        // never reaches the log.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
         // Hands `app` to every handler that asks for `State<Arc<App>>`.
         .with_state(app)
 }
