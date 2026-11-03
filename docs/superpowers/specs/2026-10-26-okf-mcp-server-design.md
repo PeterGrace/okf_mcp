@@ -240,8 +240,8 @@ and its base state, so overlay memory is about the number of active changesets t
 catalog's size, bounded by evicting overlays unused for `session_idle_timeout` (checked
 on every read). There is no cap on the number of cached overlays; one is deferred
 until a deployment sets a long `session_idle_timeout` with many writers. An overlay whose
-entries no longer apply over the published files (a file and a directory at one path)
-is never replaced by the published state, which would hide the agent's own pending
+entries no longer apply over the published files (a file and a directory at one path,
+or a pending `.md` that is not UTF-8) is never replaced by the published state, which would hide the agent's own pending
 edits. Its error names the changeset and how to recover (discard the clashing path or
 the changeset):
 - a report on that catalog fails with it;

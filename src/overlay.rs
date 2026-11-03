@@ -93,9 +93,10 @@ impl Overlay {
 ///
 /// # Errors
 /// [`OkfError::InvalidPath`] if the entries do not form a tree with the
-/// published files, its reason naming the changeset (every read through
+/// published files, or if the snapshot cannot read a pending file (a `.md`
+/// that is not UTF-8), its reason naming the changeset (every read through
 /// this overlay fails until the changeset is fixed, so the error says where
-/// to look); a snapshot error, as for a published catalog.
+/// to look); any other snapshot error, as for a published catalog.
 pub async fn build_overlay(
     base: Arc<Loaded>,
     changeset: &ChangesetRow,
@@ -119,7 +120,11 @@ pub async fn build_overlay(
             .workspace()
             .with_changes(changes)
             .map_err(|error| in_changeset(error, changeset_id))?;
-        let snapshot = Snapshot::build(&workspace)?;
+        // The published files built into the base snapshot, so a failure
+        // here comes from the pending entries (a `.md` whose bytes are not
+        // UTF-8): named as theirs, like a clash.
+        let snapshot =
+            Snapshot::build(&workspace).map_err(|error| in_changeset(error, changeset_id))?;
         let commit_times = base.commit_times().with_dirty(dirty.iter().cloned());
         Ok(Overlay {
             base,
@@ -134,29 +139,40 @@ pub async fn build_overlay(
     .await
 }
 
-/// Names the pending changeset in an [`OkfError::InvalidPath`] its entries
-/// caused; any other error is returned as it is.
+/// Turns an error that applying a changeset's entries caused into an
+/// [`OkfError::InvalidPath`] that names the changeset and how to recover, so
+/// it is not masked as internal and a read can tell it from a database
+/// failure ([`crate::mcp::context::is_broken_overlay`]).
 ///
 /// # Arguments
-/// * `error` - the error from applying the entries.
+/// * `error` - the error from applying the entries or building the
+///   snapshot of the result.
 /// * `changeset_id` - the changeset whose entries were applied.
 ///
 /// # Returns
-/// The error, with the changeset in an `InvalidPath`'s reason.
+/// An `InvalidPath` (a clash) or an `Io` (a pending file the snapshot cannot
+/// read) as an `InvalidPath` with the changeset in its reason; any other
+/// error as it is.
 fn in_changeset(error: OkfError, changeset_id: i64) -> OkfError {
-    // `if let` destructures the one variant to rewrite; any other variant
-    // falls through to `else` unchanged.
-    if let OkfError::InvalidPath { path, reason } = error {
+    // Each `format!` runs before the struct is built, because building it
+    // moves `path` into the struct.
+    match error {
         // The clash is reported at the file's path, which is either the
         // pending file or a published one with pending paths under it.
-        // Built before the struct below, which moves `path` into itself.
-        let reason = format!(
-            "{reason}, in pending changeset {changeset_id}; discard the clashing path \
-             ({path} or the paths under it) or the changeset"
-        );
-        OkfError::InvalidPath { path, reason }
-    } else {
-        error
+        OkfError::InvalidPath { path, reason } => {
+            let reason = format!(
+                "{reason}, in pending changeset {changeset_id}; discard the clashing path \
+                 ({path} or the paths under it) or the changeset"
+            );
+            OkfError::InvalidPath { path, reason }
+        }
+        OkfError::Io { path, source } => {
+            let reason = format!(
+                "{source}, in pending changeset {changeset_id}; discard {path} or the changeset"
+            );
+            OkfError::InvalidPath { path, reason }
+        }
+        other => other,
     }
 }
 
@@ -515,5 +531,32 @@ mod tests {
         assert!(stale_dropped, "an out-of-date entry is dropped on lookup");
         assert!(after_idle.is_none());
         assert!(overlays.lock().is_empty(), "a lookup drops idle entries");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_md_that_is_not_utf8_names_the_changeset() {
+        let test = app_with(&[("pg", &[("a.md", "# A\n")])], Config::default()).await;
+        let base = test.app.catalog("pg").unwrap().current();
+        let garbled = EntryRow {
+            path: "bad.md".to_string(),
+            base_revision: None,
+            content: Some(b"# \xff\xfe\n".to_vec()),
+            executable: false,
+            replay: None,
+        };
+
+        let result = build_overlay(base, &changeset(4, 1), vec![garbled]).await;
+
+        let Err(error) = result else {
+            panic!("expected an error, got {result:?}");
+        };
+        // Not masked as internal, so `search` can skip it.
+        assert!(crate::mcp::context::is_broken_overlay(&error));
+        let message = error.to_string();
+        assert!(message.starts_with("bad.md: "), "{message}");
+        assert!(
+            message.ends_with("in pending changeset 4; discard bad.md or the changeset"),
+            "{message}"
+        );
     }
 }

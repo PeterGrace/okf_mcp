@@ -226,8 +226,8 @@ fn concept(
 /// [`OkfError::InvalidPath`] if no selected catalog has it as a concept and
 /// one holds a document at that path that is not a concept; the first
 /// catalog's overlay error ([`is_broken_overlay`]) if no catalog resolves
-/// it and one's pending changeset does not apply; [`OkfError::Database`] or
-/// [`OkfError::Busy`] from [`ToolContext::view`], at once.
+/// it and one's pending changeset does not apply; any other error from
+/// [`ToolContext::view`] (a database error, `Busy`), at once.
 pub(crate) async fn get_concept(
     ctx: &ToolContext,
     params: GetConceptParams,
@@ -274,8 +274,8 @@ pub(crate) async fn get_concept(
 /// The view, or `None` to skip the catalog.
 ///
 /// # Errors
-/// [`OkfError::Database`] or [`OkfError::Busy`] from [`ToolContext::view`]:
-/// not a broken overlay, so the call fails at once.
+/// Any error from [`ToolContext::view`] but a broken overlay (a database
+/// error, `Busy`): the call fails at once.
 async fn view_or_note(
     ctx: &ToolContext,
     state: &CatalogState,
@@ -317,8 +317,8 @@ fn readable(path: &str) -> bool {
 /// A selection error; [`OkfError::InvalidPath`] for any other path or one
 /// outside the catalog; [`OkfError::NotFound`] if no selected catalog has it,
 /// or the first catalog's overlay error if one's pending changeset does not
-/// apply ([`is_broken_overlay`]); [`OkfError::Database`] or
-/// [`OkfError::Busy`] from [`ToolContext::view`], at once.
+/// apply ([`is_broken_overlay`]); any other error from
+/// [`ToolContext::view`] (a database error, `Busy`), at once.
 pub(crate) async fn read_document(
     ctx: &ToolContext,
     params: ReadDocumentParams,

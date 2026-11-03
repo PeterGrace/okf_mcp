@@ -17,12 +17,15 @@ use crate::store::changesets::{self, ChangesetKey};
 use crate::store::keys::Access;
 
 /// Is this [`ToolContext::view`] error the connection's overlay failing to
-/// apply (its entries clash with the published files), rather than the
-/// database failing?
+/// apply, rather than the database failing?
 ///
-/// A read across several catalogs leaves such a catalog out and carries on;
-/// a database error (internal) or [`OkfError::Busy`] fails the call, so the
-/// agent is told to retry instead of seeing fewer results.
+/// Only [`crate::overlay::build_overlay`] reports one, always as an
+/// [`OkfError::InvalidPath`] naming the changeset: a clash with the
+/// published files, or a pending file the snapshot cannot read. The match is
+/// positive, so any other error a later change lets `view` return is not
+/// mistaken for one. A read across several catalogs leaves such a catalog
+/// out and carries on; any other error (a database error, `Busy`) fails the
+/// call, so the agent is told to retry instead of seeing fewer results.
 ///
 /// # Arguments
 /// * `error` - the error `view` returned.
@@ -30,7 +33,7 @@ use crate::store::keys::Access;
 /// # Returns
 /// `true` for an overlay that does not apply.
 pub fn is_broken_overlay(error: &OkfError) -> bool {
-    !error.is_internal() && !matches!(error, OkfError::Busy { .. })
+    matches!(error, OkfError::InvalidPath { .. })
 }
 
 /// One tool call's context.

@@ -87,8 +87,9 @@ pub struct SkippedCatalog {
 /// The merged hits.
 ///
 /// # Errors
-/// A selection error ([`ToolContext::states`]); [`OkfError::Database`] or
-/// [`OkfError::Busy`] from [`ToolContext::view`]. A catalog whose overlay
+/// A selection error ([`ToolContext::states`]); any error from
+/// [`ToolContext::view`] (a database error, `Busy`) but a broken overlay. A
+/// catalog whose overlay
 /// does not apply ([`is_broken_overlay`]) is not an error: it is left out
 /// and listed in [`SearchResult::skipped`], so one broken changeset does not
 /// fail a search across every catalog.
@@ -119,8 +120,9 @@ pub(crate) async fn run(ctx: &ToolContext, params: SearchParams) -> Result<Searc
                     error: error.to_json(),
                 });
             }
-            // A database failure or `Busy`: the call fails (and `tool_error`
-            // logs an internal error with its details), so the agent retries.
+            // Anything else (a database failure, `Busy`): the call fails (and
+            // `tool_error` logs an internal error with its details), so the
+            // agent retries.
             Err(error) => return Err(error),
         }
     }
