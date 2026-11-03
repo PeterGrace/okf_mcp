@@ -1,8 +1,8 @@
 # OKF MCP server: design
 
 - **Date:** 2026-10-26; storage redesigned 2026-11-02 (see "Revision: Postgres storage")
-- **Status:** approved design. M1 (core library), M2 (analysis) and M3 (storage) are
-  delivered; see "Milestones"
+- **Status:** approved design. M1 (core library), M2 (analysis), M3 (storage) and M4
+  (read-only server) are delivered; see "Milestones"
 - **Catalog concept:** `/projects/okf-mcp-server.md` in `pg_knowledge_catalog`
 - **Replaces:** `tools/okf.py` in every OKF catalog (how the existing git catalogs hand
   over to the server is decided once the server is complete)
@@ -101,9 +101,9 @@ One binary, `okf-mcp`, on tokio with an axum router:
 
 | Route | Access | Purpose |
 |---|---|---|
-| `POST/GET/DELETE /mcp` | any key | rmcp `StreamableHttpService` in stateful mode (`Mcp-Session-Id`) |
-| `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as a `.tar.gz`, built on request from the published documents |
-| `POST /catalogs/{name}/import` | `admin` on the catalog | Replaces or fills an existing catalog from an uploaded `.tar.gz` (see "Import"). Creating and deleting catalogs is subcommand-only |
+| `POST/GET/DELETE /mcp` | any key | rmcp `StreamableHttpService`: stateful (`Mcp-Session-Id`) for a client on a protocol version before `2026-07-28`, stateless for one on `2026-07-28` (see "Open questions for M5") |
+| `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as `application/gzip` with `Content-Disposition: attachment; filename="<name>.tar.gz"`, built in memory on request from the published documents |
+| `POST /catalogs/{name}/import[?replace=true]` | `admin` on the catalog | Replaces or fills an existing catalog from an uploaded `.tar.gz` (see "Import") and answers with the import report once the new snapshot is swapped in. The key is checked before the body is read; then the tarball is read and checked (400 with every problem), then the catalog is looked up (404), so a key granted every catalog that posts a bad archive to an unknown one gets 400. A non-empty catalog without `?replace=true` is 409, its message naming `?replace=true`. A body over `max_import_bytes` plus 0.1% and 64 KiB of gzip slack is 413, axum's plain-text rejection rather than the error JSON. Creating and deleting catalogs is subcommand-only |
 | `GET /healthz` | none | Liveness and readiness: `{"database": "ok"\|"unreachable", "catalogs": <count>}` (a count, no names: it needs no key), 200 while the database answers within 2 seconds (a pool connection included), else 503. The clock offset joins it in M7 |
 
 `tower` middleware: request tracing, timeouts, and the auth layer on every route but
@@ -111,9 +111,14 @@ One binary, `okf-mcp`, on tokio with an axum router:
 only) is configured from `allowed_hosts` in the config, so the server works behind the
 ingress.
 
-`tower-http` traces every request (one `info` line each, by default); every route but
-`/mcp` has a 120-second timeout, answered with 503 (`/mcp`'s `GET` is a long-lived event
-stream, bounded by rmcp's keep-alive and `session_idle_timeout` instead). SIGINT or SIGTERM cancels one token that ends rmcp's
+`tower-http` traces every request (one `info` line each, by default). `/healthz` and the
+export have a 120-second timeout (`timeout_layer()`), answered with 503. The import is
+not behind it: only reading and checking its upload is bounded by the same 120 seconds,
+answered with 503 and `{"error": "Timeout", "message": ...}` with nothing imported; the
+import and the snapshot refresh after it have no deadline, so a committed import is never
+answered with a timeout (a retry would get 409). `/mcp` has no timeout: its `GET` is a
+long-lived event stream, bounded by rmcp's keep-alive and `session_idle_timeout`, and
+every M4 tool reads an in-memory snapshot. SIGINT or SIGTERM cancels one token that ends rmcp's
 sessions, the poll loop and the listener.
 
 Subcommands:
@@ -532,12 +537,17 @@ check keeps `okf.py`'s 2-minute slack. Revision times are written by the server
 | M1. Core library (delivered) | `okf::yaml`, `okf::doc`, `okf::markdown`, `okf::workspace`, `clock`; the parity test harness ([plan](../plans/2026-10-26-okf-mcp-m1-core-library.md)) |
 | M2. Analysis (delivered) | `lint`, links report, `oldest`, `sprawl`, secret scan; snapshot and search; `okf::timestamp` ([plan](../plans/2026-10-27-okf-mcp-m2-analysis.md); PRs #17-#30) |
 | M3. Storage (delivered) | `config`, `db` and migrations, `store`, `archive`; `catalog` with snapshot swap and the cached mention matcher; import and export subcommands; `catalog` and `key` subcommands; revision-based commit times for lint. Export then import reproduces the real catalog's file contents and modes byte for byte ([plan](../plans/2026-11-02-okf-mcp-m3-storage.md); PRs #48, #49 and #51-#61) |
-| M4. Read-only server | axum, rmcp, auth, `selection`, the read tools that need no changeset (including `history`), the import and export routes, `/healthz`. Deployable and useful on its own |
+| M4. Read-only server (delivered) | axum, rmcp, auth, `selection`, the read tools that need no changeset (including `history`), the import and export routes, `/healthz`, the poll loop, `okf-mcp serve`. Deployable and useful on its own ([plan](../plans/2026-11-02-okf-mcp-m4-read-only-server.md); PRs #76-#86) |
 | M5. Writes | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` |
 | M6. Restructuring | `move_concept`, `split_concept`, `delete_concept` |
 | M7. Deployment | Dockerfile, k8s manifests, CNPG database, NTP check, operator docs |
 
 Per the project's `CLAUDE.md`, each iteration adds a dated note under `changelog/`.
+
+CI is deferred (pgrace, 2026-11-03): the gates (`cargo fmt --check`, `cargo clippy
+--all-targets -- -D warnings`, `cargo test`, `cargo doc` with `-D warnings`, live parity,
+the real-catalog round trip and, at a milestone's end, the release smoke test) run
+locally before each merge.
 
 ### What M2 shipped differently
 
@@ -633,6 +643,105 @@ already written into the sections above):
   `new_concept_path` already refuses a concept there; whether every write tool treats
   them as read-only machinery is decided with the write path.
 
+### What M4 shipped differently
+
+The M4 plan's "Simplifications and deviations relative to the design" and its dated
+`Corrected` notes have the full list; most are already written into the sections above.
+
+Deviations planned:
+
+- Keys are looked up by their SHA-256 in a `HashMap`, not compared in constant time
+  (see "Configuration"); `keys::matches` stays for callers comparing one stored hash.
+- A tool result's text block is the JSON itself (rmcp's `Json<T>`), not a hand-written
+  summary (see "Tools").
+- Report tools wrap `okf.py`'s JSON lists in an object (`oldest` gives `{"rows": [...]}`,
+  `sprawl` `{"reports": [...]}`), so every output schema has an object root; the rows are
+  unchanged.
+- `open_questions` reuses `oldest` with `open_questions_only`, numbering each concept's
+  questions; concepts come stalest first.
+- The export is built in memory and returned with a `Content-Length`, not streamed (the
+  real catalog's is about 450 KB, 39 ms through the route).
+- The import route's body cap is `max_import_bytes` plus 0.1% and 64 KiB of gzip slack;
+  the exact limit is enforced on the decompressed stream.
+- The poll loop reads `admin_generation` and the catalog list (`id`, `name`,
+  `generation`) every tick, so a new, deleted or re-created catalog shows up whether or
+  not `admin_generation` moved; a moved `generation` triggers `CatalogState::refresh`.
+  Passes are serialized: each `poll` (the loop's or a test's) holds one async mutex.
+- A catalog that does not exist or that the key does not reach is 404 on the routes and
+  `CatalogNotSelected` in tools, never 403, so a key cannot probe which catalogs exist;
+  403 is only for a reachable catalog the key's level does not allow.
+- No timeout on `/mcp` (see "Process and routes").
+
+Plan corrections (each a dated `Corrected` note in the plan):
+
+- **#65 (config):** `max_import_bytes`' doc names the route's cap with slack;
+  `allowed_hosts` defaults through `Vec::from`; a blank `allowed_hosts` entry is refused
+  at load (review of PR #76).
+- **#66 (auth):** the code shipped as planned; its tests also cover a stored hash that is
+  not 32 bytes, a revoked key, a `Basic` header, `WWW-Authenticate: Bearer` on every
+  401, and a failed `reload` keeping the old cache.
+- **#67 (selection):** an empty connection list counts as unset, so no `Selection` is
+  empty; a header naming nothing falls back to `?catalogs=`; repeated headers and
+  parameters are one list; a non-ASCII header is decoded as UTF-8 so a garbled name
+  fails by name instead of silently falling back; the `Refused` message names
+  `?catalogs=`.
+- **#68 (app and poll loop):** a failed key reload or `admin_generation` read is logged
+  and the catalog half of the pass goes on, so `poll` fails only on reading the catalog
+  list; a generation whose stored data fails to build is remembered as broken and not
+  rebuilt every tick (the old snapshot stays, or a never-loaded catalog stays out) until
+  the generation moves, while database errors are retried; five more tests.
+- **#69 (mcp core):** a `#[tool]` method must write `Result<Json<T>, CallToolResult>`,
+  since rmcp's macro finds the output schema in the written return type and a type alias
+  hides it; `ToolResult`, `tool_error` and `reply` are `pub`; `read_set` and `one` take
+  the `catalog` argument as a one-element slice; `clippy::result_large_err` is allowed
+  where a function returns `CallToolResult` as its error.
+- **#70 (http and serve):** `AppError::status()` is public; a timed-out request gets 503,
+  not 408, through `http::timeout_layer()`; every 500 (`is_internal` now covers `Io` and
+  `Config`) is logged with its details and redacted in the body; Ctrl-C that cannot be
+  registered no longer shuts the server down at once; requests are logged at INFO by
+  default (`DEFAULT_LOG_FILTER`); `serve` cancels the shutdown token and awaits the poll
+  loop on every return; `/healthz` has its own 2-second deadline around `SELECT 1` (pool
+  acquire included). The crate is Unix-only (`tokio::signal::unix`).
+- **#34 (search):** doc-comment line breaks stay in schemars descriptions, so
+  `tags`' comment keeps "whole tags only" on one line; the merge sorts unstably on a total
+  order; `limit` is capped at 200 (the `search` row above says so).
+- **#71 (get_concept, read_document):** shipped as planned, with `Doc::body`'s doc test
+  and more assertions (first catalog wins, refusals do not stop the search, a
+  duplicate-key frontmatter gives null `frontmatter` with `frontmatter_error`), and a test
+  that both tools list object output schemas.
+- **#72 (history):** `limit` is capped at 200 and 0 counts as 1; the shared test helper
+  `files` lives in `archive` (test-only); the tool description says `log.md`, indexes
+  and other files have a history too.
+- **#73 (reports):** shipped as planned; doc comments gained Arguments and Returns, and a
+  test calls the `#[tool]` methods with request `Parts` to cover selection and path
+  errors.
+- **#74 (archive routes):** the routes shipped as planned, then review of PR #86 changed
+  the import: the key is checked before the body is read (a key that may not import
+  cannot make the server buffer an upload), the import is not behind `timeout_layer()`,
+  only its upload is bounded (503 with the `Timeout` error JSON, nothing imported), and
+  the import and refresh have no deadline. The export answers with
+  `Content-Disposition: attachment; filename="<name>.tar.gz"`. A refresh that fails
+  after a committed import is logged and the report still returned.
+
+### Open questions for M5
+
+- **Changeset identity without sessions.** MCP `2026-07-28` removes sessions; rmcp 3.8
+  serves a client on that version statelessly, with no `Mcp-Session-Id`. "One changeset
+  per (MCP session, catalog)" needs a different identity for such clients (for example
+  per key and a client-chosen name); M5 decides (M4 plan, Decision 2).
+- **Binding it to a key.** Whatever the identity, M5 binds it to the key that created it.
+  In M4 each request is authorized by its own key, but a session's streams are not bound
+  to the key that opened it: another valid key that learned an `Mcp-Session-Id` (a random
+  UUID) could attach to the session's `GET /mcp` stream, or resume it with
+  `Last-Event-ID`, and receive messages meant for the first key. M5 records the creating
+  key with the session and refuses any other, before changesets depend on sessions.
+- **Carried from M3** (see "What M3 shipped differently"): the deadlock rule for writes
+  beside `catalogs::delete` (take `catalogs::lock` first, or touch the catalog row or
+  create the changeset before writing entries, or retry on SQLSTATE `40P01`); whether
+  `install/` and the root `docs/` and `tests/` are read-only machinery for the write
+  tools; and a backfill of the derived columns whenever `Derived::of` changes, since an
+  import skips files whose bytes are unchanged.
+
 ### Carried into M3 and later
 
 Raised in M2 reviews and filed as issues (label `milestone-3`):
@@ -647,12 +756,14 @@ Raised in M2 reviews and filed as issues (label `milestone-3`):
   `RwLock<Arc<Loaded>>`, rebuilt by `refresh` when the catalog's `generation` moves.
 - **#33 Mention matcher cache** per snapshot (done in M3, PR #52):
   `Snapshot::mention_matcher` builds it once, lazily.
-- **#34 `search` tool description** (PR #24): the `tags` filter matches whole tags only,
-  while free text matches tags by substring. M4, with the tool; the issue stays open.
+- **#34 `search` tool description** (done in M4, PR #81): the `tags` filter matches whole
+  tags only, while free text matches tags by substring; the tool and parameter
+  descriptions say so, and a test checks them.
 - **#35 `test-util` for integration tests** (done in M3, PR #48): the in-memory
   workspace is production code and the feature is gone.
-- From the M2 plan's "Deliberately deferred" table: cross-catalog search merge (M4);
-  secret refusal on write, the no-frontmatter `set_block` error (M5). The per-session
+- From the M2 plan's "Deliberately deferred" table: cross-catalog search merge (done in
+  M4, PR #81: `okf::search::search_catalogs`, best tier first, then catalog order, then
+  path); secret refusal on write, the no-frontmatter `set_block` error (M5). The per-session
   write lock, `core.symlinks=false` clones and `.okf-*.tmp` handling before `git add -A`
   no longer apply: there is no git and no on-disk worktree.
 
