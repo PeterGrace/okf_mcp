@@ -29,6 +29,16 @@ use crate::mcp::OkfServer;
 /// timeout bound instead.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The timeout layer for every route but `/mcp`: [`REQUEST_TIMEOUT`], then
+/// 503. Not 408, which says the *client* was slow to send its request (and
+/// which some clients and proxies retry on their own).
+///
+/// # Returns
+/// The layer, for `Router::layer`.
+pub fn timeout_layer() -> TimeoutLayer {
+    TimeoutLayer::with_status_code(StatusCode::SERVICE_UNAVAILABLE, REQUEST_TIMEOUT)
+}
+
 /// An [`OkfError`] as an HTTP response: a status and the error's JSON.
 // A newtype (a one-field tuple struct) so this crate can implement axum's
 // `IntoResponse` for it: Rust only lets a crate implement a foreign trait
@@ -160,13 +170,9 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     let keyed = Router::new()
         .route_service("/mcp", mcp_service(&app, shutdown))
         .route_layer(middleware::from_fn_with_state(keys, require_key));
-    let health =
-        Router::new()
-            .route("/healthz", get(healthz))
-            .layer(TimeoutLayer::with_status_code(
-                StatusCode::REQUEST_TIMEOUT,
-                REQUEST_TIMEOUT,
-            ));
+    let health = Router::new()
+        .route("/healthz", get(healthz))
+        .layer(timeout_layer());
     Router::new()
         .merge(health)
         .merge(keyed)
@@ -273,6 +279,26 @@ mod tests {
                 "message": "internal error; the server log has the details",
             })
         );
+    }
+
+    // `start_paused`: tokio's clock jumps ahead whenever every task is
+    // waiting on a timer, so the 120-second timeout passes at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_past_the_timeout_gets_503() {
+        let slow = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(REQUEST_TIMEOUT * 2).await;
+                    "too late"
+                }),
+            )
+            .layer(timeout_layer());
+
+        let request = Request::get("/slow").body(Body::empty()).expect("request");
+        let response = slow.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test(flavor = "multi_thread")]

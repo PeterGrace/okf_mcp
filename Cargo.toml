@@ -86,5 +86,8 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 # Throwaway Postgres containers for the database tests (needs Docker). Only
 # the modules crate: it re-exports the testcontainers version it supports.
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+# `test-util`: paused time (`start_paused`), so a test of the 120-second
+# request timeout runs at once.
+tokio = { version = "1.54", features = ["test-util"] }
 # `ServiceExt::oneshot`, to call an axum router in tests without a socket.
 tower = { version = "0.5.3", features = ["util"] }
