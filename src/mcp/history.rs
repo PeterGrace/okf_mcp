@@ -195,6 +195,18 @@ mod tests {
         assert!(escaping.is_empty());
     }
 
+    #[test]
+    fn the_server_lists_history_with_an_object_output_schema() {
+        let tools = OkfServer::tools().list_all();
+
+        let listed = tools.iter().find(|tool| tool.name == "history");
+
+        let schema = listed
+            .and_then(|tool| tool.output_schema.as_ref())
+            .expect("history is registered with an output schema");
+        assert_eq!(schema["type"], "object");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn history_finds_the_path_in_the_read_set_and_spells_paths_like_get_concept() {
         let test = app_with(
