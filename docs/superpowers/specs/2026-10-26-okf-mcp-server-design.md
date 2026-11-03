@@ -973,7 +973,8 @@ Raised in M2 reviews and filed as issues (label `milestone-3`):
 
 - **#31 Commit times for lint** (done in M3, PR #61): `Loaded::lint` fills
   `CommitTimes` from each document's last revision time; marking the session's
-  changeset paths dirty stays for M5 (done in M5 Task 7, PR #111: `CommitTimes::with_dirty`). The doc comments that described the git plan
+  changeset paths dirty stays for M5 (done in M5 Task 7, PR #111:
+  `CommitTimes::with_dirty`). The doc comments that described the git plan
   (`src/okf/analysis/lint.rs` module docs and `CommitTimes::new`,
   `src/okf/workspace.rs`, `src/okf/mod.rs`) no longer describe it; `CommitTimes::new`
   names both sources (`okf.py`'s git, the server's revisions).
