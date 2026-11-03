@@ -1740,7 +1740,10 @@ mod changes_tests {
     use chrono::Utc;
 
     use crate::config::Config;
-    use crate::mcp::testing::{app_with, context, files, principal, principal_as, writer, TestApp};
+    use crate::mcp::testing::{
+        app_with, context, files, pending_entry, principal, principal_as, writer, PendingEdit,
+        TestApp,
+    };
     use crate::mcp::writes::{
         create_concept, replace_body, CreateConceptParams, ReplaceBodyParams,
     };
@@ -2149,6 +2152,41 @@ mod changes_tests {
         assert!(file.diff.contains("+# New\n"));
         assert!(reader.files.is_empty() && reader.changeset.is_none());
         assert_eq!(reader.catalog, "pg");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changeset_whose_overlay_no_longer_applies_can_be_listed_and_discarded() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let state = test.app.catalog("pg").unwrap();
+        // `a.md` is a published file, so an entry under it can never apply
+        // (no write tool stores one; a publish made after the edit can).
+        let edit = PendingEdit {
+            catalog: "pg",
+            path: "a.md/x.md",
+            text: Some("# X\n"),
+            at: Utc::now(),
+        };
+        pending_entry(&test, &ctx, &edit).await;
+
+        let broken = ctx.view(&state).await.err();
+        let shown = pending(&ctx).await;
+        let dropped = discard(&ctx, discard_paths(Some(&["/a.md/x.md"])))
+            .await
+            .unwrap();
+        let fixed = ctx.view(&state).await;
+
+        assert!(
+            matches!(broken, Some(OkfError::InvalidPath { .. })),
+            "{broken:?}"
+        );
+        let paths: Vec<&str> = shown.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["/a.md/x.md"]);
+        assert_eq!(dropped.removed, 1);
+        assert!(
+            fixed.is_ok(),
+            "the overlay applies again once the entry is gone"
+        );
     }
 
     #[test]
