@@ -235,7 +235,15 @@ changeset's entries applied, and a full snapshot of it, built on a blocking thre
 cached per changeset while the changeset's `version` and the catalog's `generation` are
 unchanged. Each read looks the changeset up (one index lookup; `read` keys, which cannot
 write, skip it), so an agent sees its own pending edits and no one else's. `history` and
-`list_catalogs` report the published state.
+`list_catalogs` report the published state. Each cached overlay pins a copy of the workspace, a snapshot
+and its base state, so overlay memory is about the number of active changesets times the
+catalog's size, bounded by evicting overlays unused for `session_idle_timeout` (checked
+on every read). An overlay whose entries no longer apply over the published files (a
+file and a directory at one path) fails that connection's reads of the catalog with an
+error naming the changeset and how to recover (discard the clashing path or the
+changeset); they do not fall back to the published state, which would hide the agent's
+own pending edits. `search` leaves such a catalog out, lists it in `skipped`, and still
+answers from the others.
 
 The server runs one replica. It notices changes made outside it (a CLI import) through
 the catalog's `generation` counter (see "Publish"). A second replica would need the same
@@ -286,7 +294,7 @@ first selected catalog.
 | Tool | Parameters | Result |
 |---|---|---|
 | `list_catalogs` | none | Catalogs the key can reach (name, description, file count, last change); this connection's selection and default write target, or why there is none |
-| `search` | `query`, `catalogs?`, `type?`, `tags?`, `status?`, `limit?` (default 20, at most 200) | Ranked hits across catalogs: catalog, path, title, description, snippet. Every whitespace-separated term must occur (case-insensitive substring) in some field; the tier is the best field holding the whole query, else the best holding a term (fields, best first: title/alias, tag, description, body); deprecated concepts last; ties by catalog order, then path. The `tags` filter matches whole tags only, while free text matches tags by substring: the tool description must say so |
+| `search` | `query`, `catalogs?`, `type?`, `tags?`, `status?`, `limit?` (default 20, at most 200) | Ranked hits across catalogs: catalog, path, title, description, snippet. A catalog whose overlay cannot be built is listed in `skipped` (catalog and error) and the others still answer. Every whitespace-separated term must occur (case-insensitive substring) in some field; the tier is the best field holding the whole query, else the best holding a term (fields, best first: title/alias, tag, description, body); deprecated concepts last; ties by catalog order, then path. The `tags` filter matches whole tags only, while free text matches tags by substring: the tool description must say so |
 | `get_concept` | `path`, `links?`, `raw?` | Frontmatter as JSON and the body; with `links`, resolved outbound links (path, title, description, broken flag) and inbound backlinks; with `raw`, the file verbatim |
 | `read_document` | `path?` (default `/index.md`) | Raw text of an `index.md`, `log.md` or `AGENTS.md` |
 | `open_questions` | none | Every queued `open_questions` entry, grouped by concept, 1-based |

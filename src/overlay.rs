@@ -147,10 +147,14 @@ fn in_changeset(error: OkfError, changeset_id: i64) -> OkfError {
     // `if let` destructures the one variant to rewrite; any other variant
     // falls through to `else` unchanged.
     if let OkfError::InvalidPath { path, reason } = error {
-        OkfError::InvalidPath {
-            path,
-            reason: format!("{reason}, in pending changeset {changeset_id}"),
-        }
+        // The clash is reported at the file's path, which is either the
+        // pending file or a published one with pending paths under it.
+        // Built before the struct below, which moves `path` into itself.
+        let reason = format!(
+            "{reason}, in pending changeset {changeset_id}; discard the clashing path \
+             ({path} or the paths under it) or the changeset"
+        );
+        OkfError::InvalidPath { path, reason }
     } else {
         error
     }
@@ -218,6 +222,9 @@ impl Overlays {
         if let Some(overlay) = self.lookup(changeset, base.generation(), now) {
             return Ok(overlay);
         }
+        // Read after the caller's `find_open`, so the entries may be newer
+        // than `changeset.version`; harmless: the overlay is labelled with the
+        // older version, and the next read at the newer one rebuilds it.
         let entries = changesets::entries(pool, changeset.id).await?;
         let overlay = Arc::new(build_overlay(base, changeset, entries).await?);
         self.store(Arc::clone(&overlay), now);
@@ -460,7 +467,13 @@ mod tests {
         let Err(OkfError::InvalidPath { reason, .. }) = result else {
             panic!("expected InvalidPath, got {result:?}");
         };
-        assert!(reason.ends_with("in pending changeset 9"), "{reason}");
+        assert!(
+            reason.ends_with(
+                "in pending changeset 9; discard the clashing path (a.md or the paths under \
+                 it) or the changeset"
+            ),
+            "{reason}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

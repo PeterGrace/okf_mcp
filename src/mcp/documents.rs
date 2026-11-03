@@ -586,4 +586,40 @@ mod tests {
         assert_eq!(other_label.frontmatter["description"], "The hub.");
         assert_eq!(other_key.frontmatter["description"], "The hub.");
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_broken_overlay_is_reported_not_hidden_behind_the_published_state() {
+        let test = app_with(&[("pg", &[("hub.md", HUB)])], Config::default()).await;
+        store_key(&test, "alice").await;
+        let alice = || {
+            context(
+                &test,
+                principal_as("alice", Access::Write, &[], Some("pg")),
+                None,
+            )
+        };
+        // `hub.md` is a published file, so a pending `hub.md/x.md` cannot be
+        // applied over it.
+        let clash = PendingEdit {
+            catalog: "pg",
+            path: "hub.md/x.md",
+            text: Some("# X\n"),
+            at: Utc::now(),
+        };
+        let changeset = pending_entry(&test, &alice(), &clash).await;
+
+        let error = get_concept(&alice(), concept_params("hub"))
+            .await
+            .unwrap_err();
+
+        // Falling back to the published `hub.md` would hide alice's own
+        // pending edits; the error says which changeset to fix, and how.
+        let message = error.to_string();
+        assert_eq!(error.kind(), "InvalidPath");
+        assert!(
+            message.contains(&format!("in pending changeset {}", changeset.id)),
+            "{message}"
+        );
+        assert!(message.contains("discard the clashing path"), "{message}");
+    }
 }
