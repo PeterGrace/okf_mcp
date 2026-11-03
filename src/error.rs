@@ -137,9 +137,16 @@ impl OkfError {
     /// Is this the server's fault, with details for the log only?
     ///
     /// # Returns
-    /// `true` for database and migration failures.
+    /// `true` for database, migration, filesystem and configuration failures:
+    /// the errors the HTTP routes answer with 500.
     pub fn is_internal(&self) -> bool {
-        matches!(self, OkfError::Database { .. } | OkfError::Migrate { .. })
+        matches!(
+            self,
+            OkfError::Database { .. }
+                | OkfError::Migrate { .. }
+                | OkfError::Io { .. }
+                | OkfError::Config { .. }
+        )
     }
 
     /// The error as clients see it: `{"error": kind, "message": text}`, plus
@@ -222,5 +229,25 @@ mod tests {
         assert_eq!(body["error"], "Database");
         assert!(!body["message"].as_str().unwrap().contains("pool"));
         assert_eq!(body.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn filesystem_errors_are_internal_and_keep_only_their_path() {
+        let error = OkfError::Io {
+            path: "a.md".to_string(),
+            source: std::io::Error::other("disk on fire"),
+        };
+
+        let body = error.to_json();
+
+        assert!(error.is_internal());
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "Io",
+                "message": "internal error; the server log has the details",
+                "path": "a.md",
+            })
+        );
     }
 }

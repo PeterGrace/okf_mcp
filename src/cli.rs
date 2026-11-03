@@ -1,5 +1,6 @@
 //! The `okf-mcp` command line: administration directly against the
-//! database (design "Process and routes"). `serve`, the default, arrives in M4.
+//! database (design "Process and routes"), and `serve`, the default, which
+//! runs the MCP server.
 //!
 //! Every subcommand that touches the database runs the embedded migrations
 //! first (idempotent), so a fresh database needs no separate step.
@@ -7,17 +8,22 @@
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // `Context` adds a message to an error (anyhow's `.context(..)`), like
 // `raise X from e` with a better message.
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use sqlx::PgPool;
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
+use crate::app::App;
 use crate::archive::{self, Files};
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::db;
+use crate::http;
 use crate::store::catalogs;
 use crate::store::export;
 use crate::store::import::{self, ImportOptions};
@@ -46,8 +52,8 @@ pub struct Cli {
 /// The subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Serve MCP over HTTP (arrives in milestone 4).
-    Serve,
+    /// Serve MCP over HTTP.
+    Serve(ServeArgs),
     /// Apply the schema migrations and exit.
     Migrate,
     /// Create, list or delete catalogs.
@@ -77,6 +83,15 @@ pub enum Command {
         /// The file to write, or `-` for stdout.
         output: PathBuf,
     },
+}
+
+/// `okf-mcp serve`'s options.
+// `Default`: no flags, which is what `okf-mcp` alone means.
+#[derive(Debug, Default, Args)]
+pub struct ServeArgs {
+    /// The address to listen on, overriding the config's `listen`.
+    #[arg(long, env = "OKF_MCP_LISTEN")]
+    pub listen: Option<std::net::SocketAddr>,
 }
 
 /// `okf-mcp catalog ...`.
@@ -164,17 +179,40 @@ pub struct KeyCreateArgs {
 ///
 /// # Arguments
 /// * `cli` - the parsed command line.
-/// * `clock` - the source of every timestamp written (`&dyn Clock`: any
-///   clock, real or fixed).
+/// * `clock` - the source of every timestamp written (`Arc<dyn Clock>`: any
+///   clock, real or fixed, behind a shared handle the server can keep).
 ///
 /// # Errors
 /// Any failure, with context, for `main` to print.
-pub async fn run(cli: Cli, clock: &dyn Clock) -> anyhow::Result<()> {
+pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
     // Read first so a bad file fails every command, not only `import`.
     let config = Config::load(cli.config.as_deref())?;
-    match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => {
-            anyhow::bail!("the MCP server arrives in milestone 4; see `okf-mcp --help`")
+    // `unwrap_or_else` builds the default only when no subcommand was given.
+    match cli
+        .command
+        .unwrap_or_else(|| Command::Serve(ServeArgs::default()))
+    {
+        Command::Serve(args) => {
+            let pool = connect(cli.database_url.as_deref()).await?;
+            // `mut`: the flag may override the file.
+            let mut config = config;
+            if let Some(listen) = args.listen {
+                config.listen = listen;
+            }
+            let listen = config.listen;
+            let app = App::load(pool, config, clock)
+                .await
+                .context("load the catalogs")?;
+            let listener = TcpListener::bind(listen)
+                .await
+                .with_context(|| format!("listen on {listen}"))?;
+            tracing::info!(%listen, "serving");
+            let shutdown = CancellationToken::new();
+            // A background task; it cancels `shutdown` on the first signal.
+            tokio::spawn(cancel_on_signal(shutdown.clone()));
+            http::serve(app, listener, shutdown)
+                .await
+                .context("serve")?;
         }
         Command::Migrate => {
             connect(cli.database_url.as_deref()).await?;
@@ -182,11 +220,11 @@ pub async fn run(cli: Cli, clock: &dyn Clock) -> anyhow::Result<()> {
         }
         Command::Catalog(command) => {
             let pool = connect(cli.database_url.as_deref()).await?;
-            run_catalog(&pool, command, clock).await?;
+            run_catalog(&pool, command, clock.as_ref()).await?;
         }
         Command::Key(command) => {
             let pool = connect(cli.database_url.as_deref()).await?;
-            run_key(&pool, command, clock).await?;
+            run_key(&pool, command, clock.as_ref()).await?;
         }
         Command::Import {
             catalog,
@@ -224,6 +262,43 @@ pub async fn run(cli: Cli, clock: &dyn Clock) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Cancels `shutdown` on SIGINT (Ctrl-C) or SIGTERM (what Kubernetes sends).
+///
+/// # Arguments
+/// * `shutdown` - the server's token.
+async fn cancel_on_signal(shutdown: CancellationToken) {
+    // `ctrl_c()` resolves at once with an error if the handler cannot be
+    // registered; waiting forever then keeps that from reading as a signal.
+    let interrupt = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "cannot listen for SIGINT");
+            // Wait forever: SIGTERM still works.
+            std::future::pending::<()>().await;
+        }
+    };
+    // `tokio::signal::unix` exists only on Unix, the only platform this
+    // server runs on.
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "cannot listen for SIGTERM");
+                // Wait forever: Ctrl-C still works.
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    // Whichever signal comes first; the other future is dropped.
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutting down");
+    shutdown.cancel();
 }
 
 /// Reads an import's files: a directory, a `.tar.gz` file, or (`-`) a
@@ -416,6 +491,11 @@ mod tests {
     use super::*;
     use crate::clock::FixedClock;
 
+    /// A fixed clock at the current instant, as `run` takes it.
+    fn fixed_now() -> Arc<dyn Clock> {
+        Arc::new(FixedClock(chrono::Utc::now()))
+    }
+
     fn cli(database_url: Option<String>, command: Command) -> Cli {
         Cli {
             database_url,
@@ -425,27 +505,39 @@ mod tests {
     }
 
     #[test]
-    fn no_subcommand_means_serve() {
-        let parsed = Cli::try_parse_from(["okf-mcp"]).unwrap();
-        assert!(parsed.command.is_none());
-        let parsed = Cli::try_parse_from(["okf-mcp", "migrate"]).unwrap();
-        assert!(matches!(parsed.command, Some(Command::Migrate)));
+    fn serve_is_the_default_and_takes_listen() {
+        let default = Cli::try_parse_from(["okf-mcp"]).unwrap();
+        let flagged =
+            Cli::try_parse_from(["okf-mcp", "serve", "--listen", "127.0.0.1:9000"]).unwrap();
+        let migrate = Cli::try_parse_from(["okf-mcp", "migrate"]).unwrap();
+
+        assert!(default.command.is_none());
+        assert!(matches!(
+            flagged.command,
+            Some(Command::Serve(ServeArgs { listen: Some(addr) })) if addr.port() == 9000
+        ));
+        assert!(matches!(migrate.command, Some(Command::Migrate)));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn migrate_applies_the_schema() {
         let db = crate::db::pg_support::TestDb::start().await;
+        let clock = fixed_now();
 
-        let clock = FixedClock(chrono::Utc::now());
-
-        run(cli(Some(db.url.clone()), Command::Migrate), &clock)
-            .await
-            .unwrap();
+        run(
+            cli(Some(db.url.clone()), Command::Migrate),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
         // A second run finds nothing to apply: every later subcommand
         // migrates on connect, so this must be a no-op.
-        run(cli(Some(db.url.clone()), Command::Migrate), &clock)
-            .await
-            .unwrap();
+        run(
+            cli(Some(db.url.clone()), Command::Migrate),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
 
         let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
             .fetch_one(&db.pool)
@@ -482,7 +574,7 @@ mod tests {
 
         run(
             cli(Some(db.url.clone()), Command::Catalog(create)),
-            &FixedClock(chrono::Utc::now()),
+            fixed_now(),
         )
         .await
         .unwrap();
@@ -544,7 +636,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn key_subcommands_run_against_the_database() {
         let db = crate::db::pg_support::TestDb::start().await;
-        let clock = FixedClock(chrono::Utc::now());
+        let clock = fixed_now();
         let url = Some(db.url.clone());
         let create = KeyCommand::Create(KeyCreateArgs {
             id: "k".to_string(),
@@ -555,16 +647,21 @@ mod tests {
             actor: None,
         });
 
-        run(cli(url.clone(), Command::Key(create)), &clock)
+        run(cli(url.clone(), Command::Key(create)), Arc::clone(&clock))
             .await
             .unwrap();
-        run(cli(url.clone(), Command::Key(KeyCommand::List)), &clock)
-            .await
-            .unwrap();
+        run(
+            cli(url.clone(), Command::Key(KeyCommand::List)),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
         let revoke = KeyCommand::Revoke {
             id: "k".to_string(),
         };
-        run(cli(url, Command::Key(revoke)), &clock).await.unwrap();
+        run(cli(url, Command::Key(revoke)), Arc::clone(&clock))
+            .await
+            .unwrap();
 
         let rows: Vec<(String, bool, bool)> =
             sqlx::query_as("SELECT actor, all_catalogs, revoked_at IS NOT NULL FROM api_keys")
@@ -589,14 +686,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn import_reads_a_directory() {
         let db = crate::db::pg_support::TestDb::start().await;
-        let clock = FixedClock(chrono::Utc::now());
+        let clock = fixed_now();
         let create = CatalogCommand::Create {
             name: "pg".to_string(),
             description: String::new(),
         };
-        run(cli(Some(db.url.clone()), Command::Catalog(create)), &clock)
-            .await
-            .unwrap();
+        run(
+            cli(Some(db.url.clone()), Command::Catalog(create)),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.md"), "# Index\n").unwrap();
         let import = Command::Import {
@@ -606,7 +706,7 @@ mod tests {
             actor: "test".to_string(),
         };
 
-        run(cli(Some(db.url.clone()), import), &clock)
+        run(cli(Some(db.url.clone()), import), Arc::clone(&clock))
             .await
             .unwrap();
 
@@ -620,21 +720,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn import_reads_a_tarball_file_and_explains_a_missing_one() {
         let db = crate::db::pg_support::TestDb::start().await;
-        let clock = FixedClock(chrono::Utc::now());
+        let clock = fixed_now();
         let create = CatalogCommand::Create {
             name: "pg".to_string(),
             description: String::new(),
         };
-        run(cli(Some(db.url.clone()), Command::Catalog(create)), &clock)
-            .await
-            .unwrap();
+        run(
+            cli(Some(db.url.clone()), Command::Catalog(create)),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let tarball = dir.path().join("pg.tar.gz");
         let script = archive::ExportFile {
             path: "tools/run.sh",
             content: b"#!/bin/sh\n",
             executable: true,
-            modified: clock.0,
+            modified: clock.now(),
         };
         archive::write_tarball(File::create(&tarball).unwrap(), &[script]).unwrap();
         let import = |source: PathBuf| Command::Import {
@@ -644,13 +747,19 @@ mod tests {
             actor: "test".to_string(),
         };
 
-        run(cli(Some(db.url.clone()), import(tarball)), &clock)
-            .await
-            .unwrap();
+        run(
+            cli(Some(db.url.clone()), import(tarball)),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
         let missing = dir.path().join("missing.tar.gz");
-        let error = run(cli(Some(db.url.clone()), import(missing.clone())), &clock)
-            .await
-            .unwrap_err();
+        let error = run(
+            cli(Some(db.url.clone()), import(missing.clone())),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap_err();
 
         let rows: Vec<(String, bool)> = sqlx::query_as("SELECT path, executable FROM documents")
             .fetch_all(&db.pool)
@@ -672,9 +781,7 @@ mod tests {
             actor: "test".to_string(),
         };
 
-        let error = run(cli(None, import), &FixedClock(chrono::Utc::now()))
-            .await
-            .unwrap_err();
+        let error = run(cli(None, import), fixed_now()).await.unwrap_err();
 
         assert!(error.to_string().contains("DATABASE_URL"));
     }
@@ -693,14 +800,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn export_writes_a_tarball_file_and_none_for_an_unknown_catalog() {
         let db = crate::db::pg_support::TestDb::start().await;
-        let clock = FixedClock(chrono::Utc::now());
+        let clock = fixed_now();
         let create = CatalogCommand::Create {
             name: "pg".to_string(),
             description: String::new(),
         };
-        run(cli(Some(db.url.clone()), Command::Catalog(create)), &clock)
-            .await
-            .unwrap();
+        run(
+            cli(Some(db.url.clone()), Command::Catalog(create)),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.md"), "# Index\n").unwrap();
         let import = Command::Import {
@@ -709,7 +819,7 @@ mod tests {
             replace: false,
             actor: "test".to_string(),
         };
-        run(cli(Some(db.url.clone()), import), &clock)
+        run(cli(Some(db.url.clone()), import), Arc::clone(&clock))
             .await
             .unwrap();
         let export = |catalog: &str, output: PathBuf| Command::Export {
@@ -721,13 +831,13 @@ mod tests {
 
         run(
             cli(Some(db.url.clone()), export("pg", written.clone())),
-            &clock,
+            Arc::clone(&clock),
         )
         .await
         .unwrap();
         let unknown = run(
             cli(Some(db.url.clone()), export("nope", unwritten.clone())),
-            &clock,
+            Arc::clone(&clock),
         )
         .await;
 
@@ -747,17 +857,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_database_url_is_explained() {
-        let error = run(cli(None, Command::Migrate), &FixedClock(chrono::Utc::now()))
+        let error = run(cli(None, Command::Migrate), fixed_now())
             .await
             .unwrap_err();
         assert!(error.to_string().contains("DATABASE_URL"));
     }
 
     #[tokio::test]
-    async fn serve_is_not_there_yet() {
-        let error = run(cli(None, Command::Serve), &FixedClock(chrono::Utc::now()))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("milestone 4"));
+    async fn serve_without_a_database_is_explained() {
+        let serve = Command::Serve(ServeArgs::default());
+
+        let error = run(cli(None, serve), fixed_now()).await.unwrap_err();
+
+        assert!(error.to_string().contains("DATABASE_URL"));
     }
 }

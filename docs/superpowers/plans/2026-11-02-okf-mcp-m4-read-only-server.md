@@ -2680,9 +2680,15 @@ struct Health {
     catalogs: usize,
 }
 
-/// `GET /healthz`: 200 while the database answers, else 503.
+/// How long `/healthz` waits for the database (a pool connection included)
+/// before it answers "unreachable".
+pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `GET /healthz`: 200 while the database answers within
+/// [`HEALTH_TIMEOUT`], else 503.
 async fn healthz(State(app): State<Arc<App>>) -> Response {
-    let reachable = sqlx::query("SELECT 1").execute(app.pool()).await.is_ok();
+    let probe = sqlx::query("SELECT 1").execute(app.pool());
+    let reachable = matches!(tokio::time::timeout(HEALTH_TIMEOUT, probe).await, Ok(Ok(_)));
     let health = Health {
         database: if reachable { "ok" } else { "unreachable" },
         catalogs: app.catalogs().len(),
@@ -2723,7 +2729,7 @@ fn mcp_service(
 /// * `shutdown` - cancelling it ends every MCP session.
 ///
 /// # Returns
-/// The router, ready for [`axum::serve`].
+/// The router, ready for [`axum::serve()`] (which [`serve`] calls).
 pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     let keys = Arc::clone(app.keys());
     // `route_layer` applies to the routes added before it, so every keyed
@@ -2771,6 +2777,49 @@ pub async fn serve(
 ```
 
 Add `pub mod http;` to `src/lib.rs` and the crate doc.
+
+> **Corrected (issue #70), 2026-11-03.** The public API above shipped as written
+> (`AppError`, `REQUEST_TIMEOUT`, `router`, `serve`, the `route_layer` placement; and in
+> Step 4 `TestServer::{start, key, client, mcp_url}`, `call`, `structured`, `files`,
+> `Client`), so Tasks 11 and 12 need no change. Differences: (1) the status match moved
+> into a public `AppError::status()`, which `into_response` calls; `into_response` also
+> logs a non-internal error at debug level by kind only, as `mcp::tool_error` does.
+> (2) Two unit tests in `src/http/mod.rs`: `app_errors_have_a_status_and_the_error_json`
+> (an internal error's body hides the driver message) and
+> `healthz_reports_an_unreachable_database_as_503` (a closed pool). (3) In `src/cli.rs`
+> the old `no_subcommand_means_serve` test became `serve_is_the_default_and_takes_listen`
+> (it still checks `migrate` parses), `serve_is_not_there_yet` became
+> `serve_without_a_database_is_explained`, and the tests pass a `fixed_now()`
+> `Arc<dyn Clock>` (cloned with `Arc::clone` where a test calls `run` twice).
+> (4) `tests/server.rs`'s selection test gathers its four answers before asserting
+> (Arrange-Act-Assert). (5) The `serve` row in the design also names `OKF_MCP_LISTEN`.
+> (6) `router`'s doc links `axum::serve()` with parentheses: `axum::serve` is both a
+> function and a module, an ambiguous link `cargo doc -D warnings` refuses (fixed above).
+> Review of PR #83 changed five things. (7) **API for Task 11:** a timed-out request
+> gets 503, not 408 (which says the *client* was slow, and is retried by some clients
+> and proxies), through a public `http::timeout_layer()`; Task 11's archive routes call
+> it (`use crate::http::{timeout_layer, AppError};`, `.layer(timeout_layer())`; its code
+> below is corrected) instead of building `TimeoutLayer` from `REQUEST_TIMEOUT`, which
+> stays public. A paused-time test, `a_request_past_the_timeout_gets_503`, needs tokio's
+> `test-util` feature as a dev feature. (8) `OkfError::is_internal` also covers `Io` and
+> `Config`, the other variants `AppError::status` answers with 500, so every 500 is
+> logged at error level with its details and its body is redacted (tool results too);
+> `error::tests::filesystem_errors_are_internal_and_keep_only_their_path` checks it.
+> (9) `cancel_on_signal` waits forever, logging, when Ctrl-C cannot be registered,
+> instead of reading the registration error as a signal and shutting down at once.
+> (10) `TraceLayer` makes its span and response line at INFO, and `main.rs`'s default
+> filter is `DEFAULT_LOG_FILTER = "warn,okf_mcp=info,tower_http=info"`, so requests are
+> logged by default (the default span records no headers). (11) `serve` cancels
+> `shutdown` and awaits the poll loop on every return, an `axum::serve` error included.
+> A second review of PR #83 added (12): `/healthz` has its own deadline, `HEALTH_TIMEOUT`
+> (2 s), around the `SELECT 1`, pool acquire included; a timeout counts as unreachable
+> (503). Without it, a saturated pool or a hung Postgres held the probe for sqlx's
+> 30-second acquire timeout, past a probe's own timeout (the code above is corrected).
+> `healthz_gives_up_after_its_own_deadline` holds every pool connection and checks the
+> 503 arrives at the deadline. The crate is Unix-only: `cancel_on_signal` uses
+> `tokio::signal::unix` without `#[cfg(unix)]`, as intended.
+> Step 7 also held an SSE `GET /mcp` stream open across SIGTERM: the server exited in
+> 0.05 s and the stream ended.
 
 - [ ] **Step 3: `serve` on the command line**
 
@@ -4914,13 +4963,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
-use tower_http::timeout::TimeoutLayer;
 
 use crate::app::App;
 use crate::archive::read_tarball;
 use crate::auth::Principal;
 use crate::error::OkfError;
-use crate::http::{AppError, REQUEST_TIMEOUT};
+use crate::http::{timeout_layer, AppError};
 use crate::mcp::blocking;
 use crate::store::export::export;
 use crate::store::import::{import, ImportOptions, ImportReport};
@@ -4941,7 +4989,8 @@ pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
             "/catalogs/{name}/import",
             post(import_catalog).layer(DefaultBodyLimit::max(limit)),
         )
-        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, REQUEST_TIMEOUT))
+        // The same timeout as `/healthz` (503 after `REQUEST_TIMEOUT`).
+        .layer(timeout_layer())
 }
 
 /// The request-body cap for an import whose decompressed tar stream may be
@@ -5167,4 +5216,4 @@ git commit -m "docs: M4 smoke test, README, design update and changelog (M4.12)"
 
 - **Design coverage (M4 row).** axum: T6. rmcp: T5, T6. auth: T2 (401), T11 (403). `selection`: T3, wired in T5. Read tools needing no changeset: `list_catalogs` (T5), `search` (T7), `get_concept` and `read_document` (T8), `history` (T9), `open_questions`, `oldest`, `sprawl`, `links_report`, `lint` (T10). `pending_changes` and `stranded_sessions` need changesets and go to M5 (Scope). Import and export routes: T11. `/healthz`: T6. The poll loop ("Noticing changes made outside the server"): T4. Configuration fields: T1. End-to-end tests (missing, wrong and read-only keys; catalog precedence; export): T6, T11; the full write cycle is M5's. #34: T7.
 - **Placeholders.** None; every step that changes code shows it, and every fact a test pins was checked against M1 to M3's code (the closing `---` is the tail's first line in `Doc`; import writes `import` revisions; sprawl paths are `/`-prefixed).
-- **Names across tasks.** `Principal`, `Reach`, `KeyCache`, `Keys::{new, load, reload, find}`, `bearer`, `require_key` (T2) are used by T3, T4, T5, T6, T11. `Selection::{catalogs, write_target}`, `Sources`, `resolve`, `connection_catalogs` (T3) by T5. `App::{load, pool, config, clock, keys, catalogs, catalog, poll, poll_until}` (passes serialized by `polling`) and `Catalogs` (T4) by T5, T6, T11. `CatalogState::description`, `Loaded::{files, last_change}` (T4) by T5. `ToolContext::{new, from_parts, app, principal, catalogs, select, states, read_set, one}`, `OkfServer::{new, tools, context}`, `ToolResult`, `reply`, `tool_error`, `blocking` (T5) by T7 to T11. `OkfError::{Forbidden, kind, is_internal, to_json}` (T2, T5) by T5, T6. `AppError`, `REQUEST_TIMEOUT`, `router`, `serve` (T6) by T11 and the tests. `TestServer::{start, key, client, mcp_url}`, `call`, `structured`, `files`, `Client` (T6) by T11, T12.
+- **Names across tasks.** `Principal`, `Reach`, `KeyCache`, `Keys::{new, load, reload, find}`, `bearer`, `require_key` (T2) are used by T3, T4, T5, T6, T11. `Selection::{catalogs, write_target}`, `Sources`, `resolve`, `connection_catalogs` (T3) by T5. `App::{load, pool, config, clock, keys, catalogs, catalog, poll, poll_until}` (passes serialized by `polling`) and `Catalogs` (T4) by T5, T6, T11. `CatalogState::description`, `Loaded::{files, last_change}` (T4) by T5. `ToolContext::{new, from_parts, app, principal, catalogs, select, states, read_set, one}`, `OkfServer::{new, tools, context}`, `ToolResult`, `reply`, `tool_error`, `blocking` (T5) by T7 to T11. `OkfError::{Forbidden, kind, is_internal, to_json}` (T2, T5) by T5, T6. `AppError`, `REQUEST_TIMEOUT`, `timeout_layer`, `router`, `serve` (T6) by T11 and the tests. `TestServer::{start, key, client, mcp_url}`, `call`, `structured`, `files`, `Client` (T6) by T11, T12.
