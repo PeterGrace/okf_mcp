@@ -8,7 +8,10 @@
 //!   Python's `capitalize` title-cases it; they differ only for the few
 //!   digraph letters such as `ǆ`;
 //! - `ensure_index` needs no existing directory (`okf.py` expects `mv` to
-//!   have created it): a workspace creates parents on write.
+//!   have created it): a workspace creates parents on write;
+//! - `index` refuses a list or mapping `title` with "has no title", where
+//!   `okf.py` crashes (`AttributeError` on `.replace`). Scalar titles such as
+//!   `2026` or `true` are strings in both parsers, so they list alike.
 
 use crate::error::OkfError;
 use crate::okf::ops::replay::{
@@ -162,7 +165,8 @@ pub fn index(
     title: Option<&str>,
 ) -> Result<OpOutcome, OkfError> {
     let loaded = load_concept(workspace, concept)?;
-    // `a.title or data.get("title")`: an empty string counts as absent.
+    // `a.title or data.get("title")`: an empty string counts as absent. Every
+    // YAML scalar is a `Value::Str`, so only a list or mapping is dropped here.
     let frontmatter_title = loaded.data.get("title").and_then(Value::as_str);
     let title = title
         .filter(|t| !t.is_empty())
@@ -382,6 +386,25 @@ mod tests {
             "no heading 'Nowhere' in infra/index.md"
         );
         assert_eq!(ws.read_to_string("infra/index.md").unwrap(), INFRA_INDEX);
+    }
+
+    #[test]
+    fn index_lists_a_scalar_title_and_refuses_a_list_title() {
+        let ws = MemWorkspace::from_files([
+            ("infra/index.md", INFRA_INDEX),
+            ("infra/year.md", "---\ntype: Note\ntitle: 2026\n---\n"),
+            ("infra/listed.md", "---\ntype: Note\ntitle: [a, b]\n---\n"),
+        ]);
+
+        let year = index(&ws, &ctx(), "infra/year", "y", None, None).unwrap();
+        let listed = index(&ws, &ctx(), "infra/listed", "l", None, None).unwrap_err();
+
+        // okf.py writes the same bullet for `title: 2026`, and crashes on the list.
+        assert_eq!(year.message, "infra/index.md: * [2026](year.md) - y");
+        assert_eq!(
+            refusal(listed),
+            "infra/listed.md has no title; pass --title"
+        );
     }
 
     #[test]
