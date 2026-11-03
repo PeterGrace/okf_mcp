@@ -176,9 +176,11 @@ impl App {
     }
 
     /// One pass of the poll loop: reloads the key cache if `admin_generation`
-    /// moved, and brings the catalogs in line with the catalog list. It also
-    /// discards empty changesets unchanged for 24 hours (design "Session
-    /// lifecycle"); a failure there is logged and retried at the next pass.
+    /// moved, and brings the catalogs in line with the catalog list. Between
+    /// the two, it discards empty changesets unchanged for 24 hours (design
+    /// "Session lifecycle"), so that runs on every pass, even one whose
+    /// catalog list then fails; a prune failure is logged and retried at the
+    /// next pass.
     ///
     /// A catalog that fails to load or refresh, or a key reload (or the
     /// `admin_generation` read before it) that fails, is logged and the rest
@@ -204,6 +206,8 @@ impl App {
         // broken catalogs.
         let mut broken = self.polling.lock().await;
         self.reload_keys_if_changed().await;
+        // Before the catalog list, whose `?` would skip it on a failure.
+        self.prune_empty_changesets().await;
         let current = self.catalogs();
         let mut next = Catalogs::new();
         // Rebuilt each pass, so a deleted catalog's entry goes with it.
@@ -243,7 +247,6 @@ impl App {
         }
         *self.catalogs.write().expect("catalog map lock poisoned") = Arc::new(next);
         *broken = still_broken;
-        self.prune_empty_changesets().await;
         Ok(())
     }
 
