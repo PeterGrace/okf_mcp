@@ -17,8 +17,8 @@
 //! catalog).
 //!
 //! All five tests are `#[ignore]`d because they need a catalog checkout (and
-//! the storage, server, write and restructuring tests need Docker). Run them in release mode, since the timings
-//! are the point:
+//! the storage, server, write and restructuring tests need Docker). Run them
+//! in release mode, since the timings are the point:
 //!
 //! `OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog cargo test --release --test smoke -- --ignored --nocapture`
 //!

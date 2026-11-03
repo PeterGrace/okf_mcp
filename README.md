@@ -4,21 +4,21 @@ A Rust port of `tools/okf.py`, the Open Knowledge Format catalog CLI, on its
 way to becoming a shared MCP server (design:
 `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md`).
 
-Status: milestones 1 (core library), 2 (analysis), 3 (storage), 4
-(read-only server), 5 (writes) and 6 (restructuring) are delivered. The library reads a catalog into an
-in-memory `Snapshot` and runs `okf.py`'s analyses on it with the same JSON
-output (compared as parsed values): `lint`, the links report, `oldest`,
-`sprawl` and the secret scan, plus ranked `search`, which `okf.py` does not
-have. Catalogs live in Postgres: every file is a row holding its exact bytes
-and execute bit, with an append-only revision history, and each catalog's
-snapshot is built from its rows and swapped when the catalog changes. The
-`okf-mcp` command line administers catalogs and API keys and imports and
-exports catalogs, and `okf-mcp serve` serves the catalogs over MCP
+Status: milestones 1 (core library), 2 (analysis), 3 (storage), 4 (read-only
+server), 5 (writes) and 6 (restructuring) are delivered. The library reads a
+catalog into an in-memory `Snapshot` and runs `okf.py`'s analyses on it with
+the same JSON output (compared as parsed values): `lint`, the links report,
+`oldest`, `sprawl` and the secret scan, plus ranked `search`, which `okf.py`
+does not have. Catalogs live in Postgres: every file is a row holding its
+exact bytes and execute bit, with an append-only revision history, and each
+catalog's snapshot is built from its rows and swapped when the catalog
+changes. The `okf-mcp` command line administers catalogs and API keys and
+imports and exports catalogs, and `okf-mcp serve` serves the catalogs over MCP
 streamable HTTP with bearer-key auth: every read tool, the export and import
-routes and `/healthz`, and the write tools: each connection's edits collect in a
-changeset held in the database, which reads through that connection see and which
-`publish` turns into published revisions (see "Writing"). Concepts can also be
-moved, split and deleted, with every link and listing kept in step.
+routes and `/healthz`, and the write tools: each connection's edits collect in
+a changeset held in the database, which reads through that connection see and
+which `publish` turns into published revisions (see "Writing"). Concepts can
+also be moved, split and deleted, with every link and listing kept in step.
 
 ## Command line
 
@@ -280,8 +280,8 @@ file's base revision against the one published now:
   edit, so `discard` the conflicting paths, re-read the published text, redo
   the edit and publish again;
 - a changed file with lint errors, or a link left pointing into a path the
-  changeset deletes (or moves away from), refuses it with `LintFailed`; lint errors elsewhere and
-  warnings come back as `warnings`.
+  changeset deletes (or moves away from), refuses it with `LintFailed`; lint
+  errors elsewhere and warnings come back as `warnings`.
 
 A refused publish leaves the changeset open and unchanged. A successful one
 writes a revision per changed file, carrying the message and the key's actor,
@@ -330,8 +330,8 @@ key's actor.
   tool takes into its changeset.
 - `src/mcp/` - the rmcp server handler, the tool context, the read tools, the
   write tools (`writes`), the restructuring tools (`restructure`) and the
-  changeset tools (`changesets`); `src/http/` - the router, `/healthz`, the archive routes, the session-to-key binding
-  (`sessions`) and `serve`.
+  changeset tools (`changesets`); `src/http/` - the router, `/healthz`, the
+  archive routes, the session-to-key binding (`sessions`) and `serve`.
 - `src/cli.rs`, `src/config.rs`, `src/main.rs` - the `okf-mcp` command line
   and its configuration file.
 - `src/clock.rs`, `src/error.rs` - the time source and the error type.
