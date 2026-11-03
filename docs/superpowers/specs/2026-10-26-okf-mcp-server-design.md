@@ -49,7 +49,7 @@ work unchanged over an in-memory workspace loaded from the database.
 | Transport | MCP streamable HTTP via `rmcp` 3.8, mounted in an `axum` 0.8 router, stateful sessions |
 | Storage | Postgres (a CNPG cluster), via `sqlx` with embedded migrations. Postgres is the source of truth |
 | Document form | Each file's exact text; type, title, status and tags are derived columns. Nothing is re-rendered |
-| Auth | Bearer API keys stored as SHA-256 hashes in the database; per-key catalog grants and `read`/`write`/`admin` access, each level including the ones before it and always limited to the key's granted catalogs |
+| Auth | Bearer API keys stored as SHA-256 hashes in the database; per-key catalog grants and `read`/`write`/`admin` access, each level including the ones before it and always limited to the key's granted catalogs; an MCP session answers only the key that opened it |
 | Scope | Full read-write: every `okf.py` command plus content editing, search and concept retrieval |
 | Implementation | Port everything to Rust. No Python at runtime |
 | Write grouping | One changeset per (catalog, key, label), created on first write and kept in the database until published or discarded; explicit `publish`. The label is the connection's `X-OKF-Changeset` header, else `?changeset=`, else `default` (never the MCP session id, which changes on every reconnect) |
@@ -101,13 +101,13 @@ One binary, `okf-mcp`, on tokio with an axum router:
 
 | Route | Access | Purpose |
 |---|---|---|
-| `POST/GET/DELETE /mcp` | any key | rmcp `StreamableHttpService`: stateful (`Mcp-Session-Id`) for a client on a protocol version before `2026-07-28`, stateless for one on `2026-07-28` (see "Open questions for M5") |
+| `POST/GET/DELETE /mcp` | any key | rmcp `StreamableHttpService`: stateful (`Mcp-Session-Id`) for a client on a protocol version before `2026-07-28`, stateless for one on `2026-07-28` (see "Open questions for M5"). Each `Mcp-Session-Id` is bound to the key whose request opened it; a request naming it with another key, or naming a session with no binding (idle past `session_idle_timeout`, or never issued), gets 404, rmcp's answer for an unknown session |
 | `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as `application/gzip` with `Content-Disposition: attachment; filename="<name>.tar.gz"`, built in memory on request from the published documents |
 | `POST /catalogs/{name}/import[?replace=true]` | `admin` on the catalog | Replaces or fills an existing catalog from an uploaded `.tar.gz` (see "Import") and answers with the import report once the new snapshot is swapped in. The key is checked before the body is read; then the tarball is read and checked (400 with every problem), then the catalog is looked up (404), so a key granted every catalog that posts a bad archive to an unknown one gets 400. A non-empty catalog without `?replace=true` is 409, its message naming `?replace=true`. A body over `max_import_bytes` plus 0.1% and 64 KiB of gzip slack is 413, axum's plain-text rejection rather than the error JSON. Creating and deleting catalogs is subcommand-only |
 | `GET /healthz` | none | Liveness and readiness: `{"database": "ok"\|"unreachable", "catalogs": <count>}` (a count, no names: it needs no key), 200 while the database answers within 2 seconds (a pool connection included), else 503. The clock offset joins it in M7 |
 
 `tower` middleware: request tracing, timeouts, and the auth layer on every route but
-`/healthz`. rmcp's DNS-rebinding check (`allowed_hosts`, which defaults to localhost
+`/healthz`. `/mcp` also has the session binding, inside the auth layer. rmcp's DNS-rebinding check (`allowed_hosts`, which defaults to localhost
 only) is configured from `allowed_hosts` in the config, so the server works behind the
 ingress.
 
@@ -758,12 +758,6 @@ Plan corrections (each a dated `Corrected` note in the plan):
 
 ### Open questions for M5
 
-- **Binding it to a key.** Whatever the identity, M5 binds it to the key that created it.
-  In M4 each request is authorized by its own key, but a session's streams are not bound
-  to the key that opened it: another valid key that learned an `Mcp-Session-Id` (a random
-  UUID) could attach to the session's `GET /mcp` stream, or resume it with
-  `Last-Event-ID`, and receive messages meant for the first key. M5 records the creating
-  key with the session and refuses any other, before changesets depend on sessions.
 - **Carried from M3** (see "What M3 shipped differently"): whether
   `install/` and the root `docs/` and `tests/` are read-only machinery for the write
   tools; and a backfill of the derived columns whenever `Derived::of` changes, since an

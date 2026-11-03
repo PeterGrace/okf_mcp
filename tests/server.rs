@@ -1,6 +1,6 @@
 //! End-to-end tests of the HTTP server (design "Testing"): keys, hosts,
-//! `/healthz`, catalog selection and the archive routes, over real HTTP with
-//! rmcp's client and `reqwest`.
+//! `/healthz`, catalog selection, the session binding and the archive
+//! routes, over real HTTP with rmcp's client and `reqwest`.
 
 mod support;
 
@@ -261,4 +261,84 @@ async fn an_import_larger_than_max_import_bytes_is_refused() {
         .status();
 
     assert_eq!(status, 413);
+}
+
+const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+
+/// Opens an MCP session with `key`.
+///
+/// # Returns
+/// The `Mcp-Session-Id` the server issued.
+async fn open_session(server: &TestServer, key: &str) -> String {
+    let response = reqwest::Client::new()
+        .post(server.mcp_url())
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .bearer_auth(key)
+        .body(INITIALIZE)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response
+        .headers()
+        .get("mcp-session-id")
+        .expect("a session id")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Posts `notifications/initialized` on `session` with `key`.
+///
+/// # Returns
+/// The status: 202 when rmcp accepts it.
+async fn notify_on(server: &TestServer, key: &str, session: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .post(server.mcp_url())
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session)
+        .header("mcp-protocol-version", "2025-11-25")
+        .bearer_auth(key)
+        .body(INITIALIZED)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Opens `session`'s event stream (`GET /mcp`) with `key`.
+///
+/// # Returns
+/// The status (the body, a stream, is never read).
+async fn stream_on(server: &TestServer, key: &str, session: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .get(server.mcp_url())
+        .header("accept", "text/event-stream")
+        .header("mcp-session-id", session)
+        .header("mcp-protocol-version", "2025-11-25")
+        .bearer_auth(key)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_answers_only_the_key_that_opened_it() {
+    let server = TestServer::start(pg(), Config::default()).await;
+    let owner = server.key("owner", Access::Read, &[], Some("pg")).await;
+    let intruder = server.key("intruder", Access::Read, &[], Some("pg")).await;
+    let session = open_session(&server, &owner).await;
+
+    let foreign_post = notify_on(&server, &intruder, &session).await;
+    let foreign_stream = stream_on(&server, &intruder, &session).await;
+    let unknown = notify_on(&server, &owner, "not-a-session").await;
+    let own = notify_on(&server, &owner, &session).await;
+
+    assert_eq!(foreign_post, 404);
+    assert_eq!(foreign_stream, 404);
+    assert_eq!(unknown, 404);
+    assert_eq!(own, 202);
 }
