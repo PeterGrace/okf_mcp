@@ -9771,6 +9771,8 @@ It runs under the catalog's publish lock: the in-process `CatalogState::publish_
 > - **`publish` takes `actor: &str`** (`publish(app, state, changeset, actor, message)`): the publishing key's actor goes on every document and revision. Task 12's `adopt` keeps a changeset's original `actor`, so `ChangesetRow::actor` would credit the opener rather than the key that published.
 > - **Publish's database tests live in `src/mcp/changesets.rs`** (`publish_tests`), not in `src/store/publish.rs`. They need an `App` and write tools to make entries, which `mcp::testing` provides, and store tests do not reach into `mcp` (PR #84 review).
 
+> **Note from Task 8 (issue #98, review of PR #112), 2026-11-03.** `write::apply`'s `Busy` branch (the changeset closed while a write waited on its row lock) has no test in Task 8. This task and Task 11 drive it: close the changeset with a concurrent `publish` (here) or `discard` (Task 11) while a write waits on the row lock, then assert the write fails with `Busy` and stores nothing.
+
 **Files:**
 - Modify: `src/error.rs` (`LintFailed`, `Conflict`, `ConflictFile`)
 - Modify: `src/http/mod.rs` (their statuses)
@@ -12464,6 +12466,8 @@ The write path over real HTTP, with rmcp clients, as an agent sees it (design "T
 > **Interfaces note (Task 13), 2026-11-03.** M4's `TestServer` has no restart and sets only `X-OKF-Catalogs`. This task adds two methods, and every M4 caller keeps working:
 > - **`TestServer::client_with(key, headers)`** sets any headers. `client(key, catalogs)` becomes a wrapper over it.
 > - **`TestServer::restart(&mut self, config)`** stops the server and starts a new `App` and listener on the same `TestDb`, so the database (and its changesets) outlive the process, as across a pod restart. `TestServer` implements `Drop`, so its fields cannot be moved out. `restart` takes `&mut self` and replaces `base`, `app` and `shutdown` in place, and `start` and `restart` share one private `serve_app`.
+
+> **Note from Task 8 (issue #98, review of PR #112), 2026-11-03.** Every write rebuilds the connection's overlay (about 10 ms on the real catalog) while it holds the changeset's row lock, because the previous write `forget`s it. This is accepted for M5. This task's concurrency work decides whether the write path should stop storing the overlays it builds, or should reuse them.
 
 **Files:**
 - Modify: `tests/support/server.rs` (`client_with`, `restart`, `serve_app`)
