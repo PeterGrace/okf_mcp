@@ -336,9 +336,13 @@ async fn a_session_answers_only_the_key_that_opened_it() {
     let foreign_stream = stream_on(&server, &intruder, &session).await;
     let unknown = notify_on(&server, &owner, "not-a-session").await;
     let own = notify_on(&server, &owner, &session).await;
+    // The owner's stream is admitted, so the refusal above is the binding's,
+    // not a refusal of every `GET` that names a session.
+    let own_stream = stream_on(&server, &owner, &session).await;
 
     assert_eq!(foreign_post, 404);
     assert_eq!(foreign_stream, 404);
     assert_eq!(unknown, 404);
     assert_eq!(own, 202);
+    assert_eq!(own_stream, 200);
 }
