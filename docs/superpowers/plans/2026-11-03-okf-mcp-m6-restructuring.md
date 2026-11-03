@@ -78,7 +78,7 @@ Deliberately deferred:
 
 ## Decisions taken while planning (2026-11-03)
 
-Decisions 1, 2 and 5 are pgrace's or M5's. Decisions 3 and 4 were given by pgrace with their details left to Claude. The rest are Claude's, each marked **(decided by Claude)**: pgrace asked for the most conservative option wherever the design leaves a question open, decided without stopping to ask.
+Decisions 1, 2 and 5 are pgrace's or M5's. Decisions 3 and 4 were given by pgrace with their details left to Claude. The rest are Claude's, each marked **(decided by Claude)**; pgrace has since confirmed Decision 7: pgrace asked for the most conservative option wherever the design leaves a question open, decided without stopping to ask.
 
 1. **Publish semantics: hybrid (pgrace, 2026-11-03).**
    - **New replay ops.** Index-listing changes made by move, split and delete become new `ReplayOp` variants that rebase at publish like M5's `ListBullet`:
@@ -120,7 +120,7 @@ Decisions 1, 2 and 5 are pgrace's or M5's. Decisions 3 and 4 were given by pgrac
    - **The listing goes through a replay op.** It removes the folder's listing bullet with `ReplayOp::Unlist { target, bullet: None }`. `None` means "whatever the bullet reads now", since the bullet is deleted either way.
    - **The concept goes through `MemWorkspace::remove`.** It removes the concept with `MemWorkspace::remove` and reports it as touched, so `write::apply` stores a deletion entry under M5's rule: a published path, or one published at the entry's base, becomes a deletion; a path the changeset created and never published leaves no entry.
    - **It never deletes an `index.md`, even an emptied one.** When the folder holds nothing but its `index.md` afterwards, it adds the note `note: /<folder>/ now holds only its index.md, which stays; delete_concept never deletes an index`.
-   - **It refuses machinery and non-concepts.** `index.md`, `log.md`, `AGENTS.md`, `CLAUDE.md` and `README.md` get `InvalidPath` "is not a concept document" from `resolve_concept`. A concept-named file in machinery (`install/x.md`) gets `InvalidPath` from `rules::check_path`, which the op calls before anything else.
+   - **It refuses machinery and non-concepts.** `index.md`, `log.md`, `AGENTS.md`, `CLAUDE.md` and `README.md` get `InvalidPath` "is not a concept document" from `resolve_concept`. A concept-named file in machinery (`install/x.md`) gets `InvalidPath` from `rules::check_path`, which the op calls on the path `resolve_concept` returns, before it reads or changes anything. A machinery reference that names no file is `NotFound`, as for any missing concept.
 5. **No `reindex` (M5 Decision 5 still holds).** M6 does not change `Derived::of` (`src/store/documents.rs:106`) or what it reads. Publish computes the derived columns of every document it writes (`write_all`, `src/store/publish.rs:476`), the moved and split-out concepts included. Verified: no task's file list includes `src/store/documents.rs` or `src/okf/snapshot.rs`.
 6. **The shapes of the two replay ops.** (decided by Claude)
    - **`Relink { redirect: Redirect }`.** `Redirect { from, to, anchors }` is `rewrite_links`' `fn` as data:
@@ -130,7 +130,7 @@ Decisions 1, 2 and 5 are pgrace's or M5's. Decisions 3 and 4 were given by pgrac
      The op and the replay call the same per-file function (`relink::rewrite_text`), so they cannot drift apart. That is M5's rule for `log_text` and `insert_index_bullet_text`.
    - **`Unlist { target, bullet: Option<String> }`.** It removes the first bullet (`* ` or `- `) linking `target`, as `cmd_mv` takes it. When `bullet` is `Some`, the replay refuses with `Refused` if the bullet listing `target` now reads otherwise. `move_concept` records `Some`, because it carries the old bullet's text to the new folder: if another session changed that bullet meanwhile (its summary, say), dropping it silently would lose that change. Refusing is the conservative option, and the agent re-reads and moves again. `delete_concept` records `None`.
    - **Replay is idempotent:** a missing listing is left alone, and a text with no link into `from` is left alone.
-7. **Link rewrites in `log.md` are `Relink` replay ops too, like those in any `index.md`.** (decided by Claude) `rewrite_links` rewrites `log.md` (only the root's `AGENTS.md`, `CLAUDE.md` and `README.md` are skipped, `okf.py:1356`). A free edit to `log.md` would make every concurrent `log` call by another session a `Conflict` for the mover. `log.md` is bookkeeping whose entries already replay, and `Relink` replays idempotently on top of the `Log` ops (Task 2 tests the pair). This reads Decision 1's "link rewrites in other documents ... are free edits" as "other than `index.md` and `log.md`"; pgrace may prefer the literal reading, which is a one-line change in `is_bookkeeping` (Task 2).
+7. **Link rewrites in `log.md` are `Relink` replay ops too, like those in any `index.md`.** (decided by Claude; confirmed by pgrace) `rewrite_links` rewrites `log.md` (only the root's `AGENTS.md`, `CLAUDE.md` and `README.md` are skipped, `okf.py:1356`). A free edit to `log.md` would make every concurrent `log` call by another session a `Conflict` for the mover. `log.md` is bookkeeping whose entries already replay, and `Relink` replays idempotently on top of the `Log` ops (Task 2 tests the pair). This reads Decision 1's "link rewrites in other documents ... are free edits" as "other than `index.md` and `log.md`". **Confirmed by pgrace, 2026-11-03** ("keep the log.md replay").
 8. **`delete_concept`'s refusal is a new error variant, `StillLinked { path, links: Vec<LinkSource> }`, HTTP 409** (decided by Claude), so an agent gets the links as data rather than inside a message. It is not internal. `kind`, `to_json` (`path`, `links`) and `AppError::status` gain arms (Task 5).
 9. **Ops take `&MemWorkspace` or `&dyn Workspace`, not `&mut MemWorkspace`.** (decided by Claude) The workspace has interior mutability: `write_atomic` and M5's `remove` take `&self`, and `write::apply` hands an op `&MemWorkspace`. `move_concept` and `delete_concept` need `MemWorkspace` (`rename`, `remove`); `split_concept` needs only `&dyn Workspace`, like `create_concept`.
 10. **`MemWorkspace::rename` keeps the file's bytes and execute bit** (decided by Claude), as `git mv` keeps the mode. It refuses a taken target, a target that is a directory and a target below a file, with `write_atomic`'s reasons, through one shared helper.
@@ -1258,7 +1258,7 @@ Expected: compile errors, `no variant named Unlist`, `Relink`, `cannot find func
 
 In `src/okf/ops/replay.rs`:
 
-Update the module doc's first paragraph to end: "...so an edit and its replay cannot drift apart. M6 adds [`ReplayOp::Unlist`] (a listing taken out of a folder index) and [`ReplayOp::Relink`] (links redirected by a move or split), whose edits are `unlist_text` and `relink::rewrite_text` (both crate-internal: a public doc may not link them, or `cargo doc -D warnings` fails)."
+Update the module doc's first paragraph to end: "...so an edit and its replay cannot drift apart. M6 adds [`ReplayOp::Unlist`] (a listing taken out of a folder index) and [`ReplayOp::Relink`] (links redirected by a move or split), whose edits are `unlist_text` and `relink::rewrite_text` (both crate-internal: a public doc may not link them, or `cargo doc -D warnings` fails). `Unlist` works on universal-newline text, so a CRLF `index.md` comes out with `\n` endings, while `Relink` keeps bytes as they are. Both match `okf.py`: `cmd_mv` reads and writes the old index in text mode (`okf.py:1538`), and `rewrite_links` opens files with `newline=''` (`okf.py:1359`). This is not a parity bug."
 
 Add the import:
 
@@ -1368,7 +1368,9 @@ fn changed_listing(index: &str, target: &str) -> OkfError {
     OkfError::Refused {
         reason: format!(
             "{index}: the listing of /{target} changed since this changeset moved it; \
-             discard the move and move the concept again"
+             discard every path of the move together (pending_changes lists them: \
+             both concept paths, both folder indexes and the files whose links it \
+             rewrote), or the whole changeset, then move the concept again"
         ),
     }
 }
