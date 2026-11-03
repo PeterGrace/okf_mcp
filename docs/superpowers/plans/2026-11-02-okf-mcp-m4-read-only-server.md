@@ -240,11 +240,23 @@ mod tests {
             ("poll_interval = \"0s\"\n", "poll_interval"),
             ("session_idle_timeout = \"0s\"\n", "session_idle_timeout"),
             ("allowed_hosts = []\n", "allowed_hosts"),
+            (
+                "allowed_hosts = [\"\"]\n",
+                "allowed_hosts has a blank entry",
+            ),
+            (
+                "allowed_hosts = [\"localhost\", \"  \"]\n",
+                "allowed_hosts has a blank entry",
+            ),
         ] {
             std::fs::write(&path, text).unwrap();
 
             let error = Config::load(Some(&path)).unwrap_err();
 
+            assert!(
+                matches!(&error, OkfError::Config { path: p, .. } if p.ends_with("okf.toml")),
+                "{text}: {error:?}"
+            );
             assert!(error.to_string().contains(needle), "{text}: {error}");
         }
     }
@@ -307,8 +319,7 @@ pub struct Config {
     /// The largest uncompressed total an import may expand to (`"64MiB"`, or
     /// a number of bytes). `MiB` is binary; `MB` and `M` are decimal. For a
     /// tarball it counts the whole decompressed tar stream (headers and
-    /// 512-byte padding included); for a directory, the files' contents. The
-    /// import route also caps the request body at this size.
+    /// 512-byte padding included); for a directory, the files' contents.
     pub max_import_bytes: ByteSize,
     /// The address `serve` listens on (`"0.0.0.0:8080"`); `--listen` overrides it.
     pub listen: SocketAddr,
@@ -335,7 +346,7 @@ impl Default for Config {
         Self {
             max_import_bytes: ByteSize::b(DEFAULT_MAX_IMPORT_BYTES),
             listen: DEFAULT_LISTEN,
-            allowed_hosts: DEFAULT_ALLOWED_HOSTS.map(String::from).to_vec(),
+            allowed_hosts: Vec::from(DEFAULT_ALLOWED_HOSTS.map(String::from)),
             default_catalog: None,
             poll_interval: DEFAULT_POLL_INTERVAL,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
@@ -344,7 +355,17 @@ impl Default for Config {
 }
 ```
 
-Keep `from_toml` as it is. Add `validate` after it and call it from `load`:
+> **Corrected (issue #65), 2026-11-02.** Two changes to the code above. (1) The
+> `max_import_bytes` doc comment no longer ends "The import route also caps the request
+> body at this size": the route does not exist until Task 11, and its cap is
+> `max_import_bytes` plus slack (`body_limit`), not this size. Task 11 adds a sentence
+> saying so. (2) `allowed_hosts` is built with `Vec::from(array)`, which moves the
+> mapped array into the `Vec`, instead of `.to_vec()`, which copies it.
+> Review of PR #76 added a third: `validate` also refuses a blank `allowed_hosts` entry
+> (`""` or whitespace), which would otherwise reject every request with no hint why;
+> the code below and Step 2's refusal test include it.
+
+Keep `from_toml`'s code as it is, but start its doc comment with "Parses a configuration file's text. It does not call [`Config::validate`]; [`Config::load`] does, so a caller that parses text itself must validate the result before serving with it." (added in review of PR #76). Add `validate` after it and call it from `load`:
 
 ```rust
     /// Checks the values serde cannot: ones that would break the server.
@@ -354,8 +375,9 @@ Keep `from_toml` as it is. Add `validate` after it and call it from `load`:
     ///
     /// # Errors
     /// A zero `poll_interval` (tokio's interval panics on zero) or
-    /// `session_idle_timeout`, or an empty `allowed_hosts` (which rmcp reads
-    /// as "accept any `Host`").
+    /// `session_idle_timeout`, an empty `allowed_hosts` (which rmcp reads as
+    /// "accept any `Host`"), or a blank entry in it (which no `Host` matches,
+    /// so every request would get 403 with no hint why).
     pub fn validate(&self) -> Result<(), String> {
         if self.poll_interval.is_zero() {
             return Err("poll_interval must be more than zero".to_string());
@@ -367,6 +389,11 @@ Keep `from_toml` as it is. Add `validate` after it and call it from `load`:
             return Err(
                 "allowed_hosts is empty; list the host names clients connect to".to_string(),
             );
+        }
+        // `trim` returns a borrowed slice (`&str`) without the surrounding
+        // whitespace, so the check allocates nothing.
+        if self.allowed_hosts.iter().any(|host| host.trim().is_empty()) {
+            return Err("allowed_hosts has a blank entry; remove it or name a host".to_string());
         }
         Ok(())
     }
@@ -407,7 +434,7 @@ Expected: 6 passed.
 
 - [ ] **Step 6: Update the design**
 
-In "Configuration", after "Each milestone reads only its own fields (M3: `max_import_bytes`)", make it read: "Each milestone reads only its own fields (M3: `max_import_bytes`; M4: the rest except `time_server`, which M7's clock check reads); unknown keys are ignored, so one file serves every version. A zero `poll_interval` or `session_idle_timeout`, or an empty `allowed_hosts` (which rmcp would read as "accept any host"), is refused at load."
+In "Configuration", after "Each milestone reads only its own fields (M3: `max_import_bytes`)", make it read: "Each milestone reads only its own fields (M3: `max_import_bytes`; M4: the rest except `time_server`, which M7's clock check reads); unknown keys are ignored, so one file serves every version. A zero `poll_interval` or `session_idle_timeout`, or an empty `allowed_hosts` (which rmcp would read as "accept any host") or a blank entry in it, is refused at load."
 
 - [ ] **Step 7: Changelog, gates, commit**
 
@@ -4598,6 +4625,11 @@ git commit -m "feat: open_questions, oldest, sprawl, links_report and lint tools
 ### Task 11: the archive routes: export and import over HTTP
 
 `GET /catalogs/{name}/export` returns the catalog as a `.tar.gz` (M3's `store::export`) to a key with `read` on it. `POST /catalogs/{name}/import[?replace=true]` imports an uploaded `.tar.gz` (M3's `archive::read_tarball` and `store::import`) for a key with `admin` on it, as the key's actor, caps the body at `max_import_bytes` (413 beyond it), and swaps the new snapshot in before answering, so the next read sees it. A catalog that does not exist or that the key does not reach is 404; a reachable catalog the key's level does not allow is 403; a refused archive is 400 with every problem; importing into a non-empty catalog without `replace` is 409. Creating and deleting catalogs stays subcommand-only (design).
+
+> **Corrected (issue #65), 2026-11-02.** Task 1 left the import route out of
+> `Config::max_import_bytes`'s doc comment. When the route lands, add to it: "The import
+> route caps the request body at this size plus a little slack for gzip (`body_limit`)."
+> and list `src/config.rs` under this task's files.
 
 **Files:**
 - Create: `src/http/archives.rs`
