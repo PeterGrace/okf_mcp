@@ -349,9 +349,13 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
    come from bookkeeping are also recorded as operations in the entry's `replay`:
    `log` adds a log entry; `index`, `create_concept` (with `index_summary`) and the
    listing changes of `move_concept`, `split_concept` and `delete_concept` add, rename
-   or remove an `index.md` bullet. A free-text edit of an `index.md` (`edit_document`)
-   clears the entry's `replay`, so that entry conflicts like any other on a stale
-   base.
+   or remove an `index.md` bullet. The operations are `Log { date, bullet }`,
+   `ListBullet { target, bullet, section, create_section }` and `CreateIndex { folder }`
+   (`okf::ops::ReplayOp`). They are stored as JSON with an `op` tag and re-applied by
+   `okf::ops::replay`, which shares its text edits with the ops themselves. Text that
+   no operation changes keeps its bytes; changed text gets `\n` line endings, as
+   `okf.py` writes. A free-text edit of an `index.md` (`edit_document`) clears the
+   entry's `replay`, so that entry conflicts like any other on a stale base.
 4. The session's overlay is marked stale.
 
 ### Publish

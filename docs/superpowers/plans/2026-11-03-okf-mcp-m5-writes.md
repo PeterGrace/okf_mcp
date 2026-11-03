@@ -3126,6 +3126,8 @@ git commit -m "feat: okf::ops frontmatter ops, ported from okf.py with byte pari
 
 > **Corrected (issue #91), 2026-11-03.** Two changes from Task 2's implementation: Task 3 adds `OpOutcome::record` (Step 3), which Task 2 left out because nothing there called it; and a public item's doc comment may not link the crate-private `load_concept`, `save` or `refused` (`RUSTDOCFLAGS="-D warnings" cargo doc` fails on it), so `index`'s Errors section points at `stamp` instead.
 
+> **Corrected (issue #93), 2026-11-03.** Three mechanical fixes, made inline below: the two Hegel properties are `#[hegel::test(derandomize = true)]`, so every run draws the same cases (the seed comes from the test name; both stay bounded at 6 and 4 `log` calls per case); `log_index.rs`'s module doc links [`mod@super::replay`], because `super::replay` is both a module and a function and rustdoc refuses the ambiguous link; and okf.py's `no log.md at <root>` is in backticks, since rustdoc reads a bare `<root>` as an unclosed HTML tag. `cargo fmt` also rewraps a few test lines; the code is otherwise what shipped.
+
 This task ports `okf.py`'s bookkeeping:
 - `log` (`cmd_log`, `okf.py:752`);
 - `index` (`cmd_index`, `:795`), through `insert_index_bullet` (`:1410`);
@@ -3399,7 +3401,7 @@ mod tests {
         }
     }
 
-    #[hegel::test]
+    #[hegel::test(derandomize = true)]
     fn log_replay_redoes_the_ops_and_is_idempotent(tc: hegel::TestCase) {
         use hegel::generators;
         let bases = vec![
@@ -3429,7 +3431,7 @@ mod tests {
         assert_eq!(twice, once);
     }
 
-    #[hegel::test]
+    #[hegel::test(derandomize = true)]
     fn replaying_a_branch_onto_another_keeps_every_bullet(tc: hegel::TestCase) {
         use hegel::generators;
         let left = MemWorkspace::from_files([("log.md", FIXTURE_LOG)]);
@@ -4077,10 +4079,10 @@ Put this above the tests in `src/okf/ops/log_index.rs`:
 ```rust
 //! The bookkeeping ops `log` and `index` (`okf.py:752-820`) and
 //! `ensure_index` (`:1471`). Each writes through the workspace and records
-//! the [`ReplayOp`]s that redo its edit at publish (see [`super::replay`]).
+//! the [`ReplayOp`]s that redo its edit at publish (see [`mod@super::replay`]).
 //!
 //! Divergences from `okf.py`:
-//! - a missing `log.md` is [`OkfError::NotFound`] (okf.py: "no log.md at <root>");
+//! - a missing `log.md` is [`OkfError::NotFound`] (okf.py: `no log.md at <root>`);
 //! - `ensure_index` upper-cases a folder name's first character where
 //!   Python's `capitalize` title-cases it; they differ only for the few
 //!   digraph letters such as `ǆ`;

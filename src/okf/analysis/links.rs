@@ -201,8 +201,9 @@ pub fn links_report(snapshot: &Snapshot, mentions: bool) -> LinksReport {
     report
 }
 
-/// `^#+\s` (Python `\s`).
-static INDEX_HEADING: LazyLock<Regex> =
+/// `^#+\s` (Python `\s`): an index heading. Also used by
+/// `okf::ops::replay::insert_index_bullet_text`.
+pub(crate) static INDEX_HEADING: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^#+[\s\x1c-\x1f]").expect("INDEX_HEADING regex is valid"));
 
 /// Every concept listed by its folder's `index.md`, every folder index by

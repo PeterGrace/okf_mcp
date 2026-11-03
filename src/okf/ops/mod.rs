@@ -29,12 +29,17 @@ use crate::okf::workspace::Workspace;
 use crate::okf::yaml::Value;
 
 pub mod frontmatter;
+pub mod log_index;
 pub mod replay;
 
 // `pub use` re-exports names from the submodules, so callers write
 // `okf::ops::stamp` (like a package `__init__.py` importing from its modules).
 pub use frontmatter::{question, review, source, stamp, unquestion, OUTCOMES};
-pub use replay::ReplayOp;
+pub use log_index::{ensure_index, index, log};
+// `replay` names both the module and its main function: Rust keeps modules
+// and functions in separate namespaces, so `ops::replay(...)` and
+// `ops::replay::ReplayOp` both work.
+pub use replay::{insert_index_bullet_text, log_text, replay, ReplayOp};
 
 /// What an op needs from its caller besides the catalog.
 ///
@@ -79,6 +84,13 @@ impl OpOutcome {
         if !self.touched.iter().any(|p| p == path) {
             self.touched.push(path.to_string());
         }
+    }
+
+    /// Records that `path` was written by a replayable edit.
+    pub(crate) fn record(&mut self, path: &str, op: ReplayOp) {
+        self.touch(path);
+        // `entry(..).or_default()` is `dict.setdefault(key, [])`.
+        self.replay.entry(path.to_string()).or_default().push(op);
     }
 }
 

@@ -77,16 +77,84 @@
     },
     {
       "output": "yaml/same-indent-lists.md: added source q"
+    },
+    {
+      "output": "log.md: ## 2026-10-27: * **Update:** Ran the ops script."
+    },
+    {
+      "output": "log.md: ## 2026-10-27: * **Change:** Second entry."
+    },
+    {
+      "output": "log.md: already logged under 2026-10-27"
+    },
+    {
+      "output": "ops/index.md: * [NTP \\[pool\\] notes](bracket-title.md) - brackets escaped"
+    },
+    {
+      "output": "ops/index.md: * [Second](second.md) - after the first"
+    },
+    {
+      "output": "people/index.md: * [Pete](pgrace.md) - me"
+    },
+    {
+      "output": "infra/index.md: * [NTP](ntp.md) - pool"
+    },
+    {
+      "output": "index.md: * [Root note](root-note.md) - at the root"
+    },
+    {
+      "output": "analysis/index.md: already lists analysis/stamps.md"
+    },
+    {
+      "error": "no heading 'Nowhere' in people/index.md"
+    },
+    {
+      "error": "markdown/slugs.md has no frontmatter; add it with your editor first"
+    },
+    {
+      "error": "no index.md in /nowhere; create it first"
+    },
+    {
+      "output": "ops/deep/er/index.md\nops/deep/index.md\nops/index.md",
+      "notes": [
+        "created /ops/deep/index.md; replace its TODO lines (and the parent's listing)",
+        "created /ops/deep/er/index.md; replace its TODO lines (and the parent's listing)"
+      ]
+    },
+    {
+      "output": "analysis/new-stuff/index.md\nanalysis/index.md",
+      "notes": [
+        "created /analysis/new-stuff/index.md; replace its TODO lines (and the parent's listing)"
+      ]
+    },
+    {
+      "output": "brand-new/index.md\nindex.md",
+      "notes": [
+        "created /brand-new/index.md; replace its TODO lines (and the parent's listing)"
+      ]
+    },
+    {
+      "output": ""
     }
   ],
   "files": {
     "analysis/hub.md": "---\ntype: Hub\ntitle: Analysis Hub\ndescription: Links of every kind.\naliases: [the hub]\ntags: [analysis, links]\ngenerated: { by: fixture, at: 2026-10-20T00:00:00Z }\nverified:\n  - { by: fixture, at: 2026-10-27T12:00:00Z }\nreviewed:\n  by: fixture\n  at: 2026-10-27T12:00:00Z\n  outcome: partial\n  note: \"Links checked; anchors not.\"\nopen_questions:\n  - \"Is the hub still needed?\"\nsources:\n  - id: web\n    resource: https://example.com/x\n---\n# Links\n\n- [lead](/analysis/lead.md) and [its history](/analysis/lead.md#history)\n- [a missing anchor](/analysis/lead.md#no-such-heading)\n- [an encoded anchor](/analysis/lead.md#Open%20items) and [a good one](/analysis/lead.md#open-items)\n- [relative](stamps.md), [missing](/analysis/missing.md), [folder](/analysis/sub/)\n- [up and out](../../outside.md), [in page](#links), [bad in page](#nowhere)\n- [external](https://example.com/x) and ![an image](/analysis/missing.png)\n- [a text file](/analysis/diagram.txt) and [hidden](/analysis/.hidden/notes.md#hidden-heading)\n\nThe Offsets concept explains non-UTC stamps; `Offsets` in code and\nhttps://example.com/Offsets in a URL do not count.\n\n```\nOffsets inside a fence do not count either.\n```\n\n[^1]: Offsets in a footnote do not count.\n",
+    "analysis/index.md": "# Analysis\n\n# Concepts\n\n* [Hub](/analysis/hub.md) - links out\n* [Lead](/analysis/lead.md) - a sprawling concept\n* [Stamps](/analysis/stamps.md) - timestamp cases\n* [Backlog](/analysis/backlog.md) - exempt from sprawl\n* [Offsets](/analysis/offsets.md) - non-UTC stamps\n\n# Sections\n\n* [Sub](/analysis/sub/) - a folder\n* [Hub again](/analysis/hub.md) - a concept misfiled under Sections\n* [New stuff](/analysis/new-stuff/) - TODO: describe this folder\n",
     "analysis/lead.md": "---\ntype: Service\ntitle: Lead Concept\nstatus: draft\nopen_questions:\n  - \"Does it need splitting?\"\nsources:\n  - { id: s1, resource: a }\n  - { id: s2, resource: b }\n  - { id: s3, resource: c }\n  - { id: s4, resource: d }\n  - { id: s5, resource: e }\n  - id: s6\n    resource: f\n    title: Six\n    author: human:pgrace\n---\n# Lead\n\n**As of 2026-10-20** the service runs on two hosts.\n**Owner** is the fixture.\n\nOverview line 1.\nOverview line 2.\nOverview line 3.\nOverview line 4.\nOverview line 5.\nOverview line 6.\nOverview line 7.\nOverview line 8.\nOverview line 9.\nOverview line 10.\nOverview line 11.\nOverview line 12.\nOverview line 13.\nOverview line 14.\nOverview line 15.\nOverview line 16.\nOverview line 17.\nOverview line 18.\nOverview line 19.\nOverview line 20.\nOverview line 21.\nOverview line 22.\nOverview line 23.\nOverview line 24.\nOverview line 25.\nOverview line 26.\nOverview line 27.\nOverview line 28.\nOverview line 29.\nOverview line 30.\nOverview line 31.\nOverview line 32.\nOverview line 33.\nOverview line 34.\nOverview line 35.\nOverview line 36.\nOverview line 37.\nOverview line 38.\nOverview line 39.\nOverview line 40.\n\n## History\n\nIn 2026-02-11 something happened (1).\nIn 2026-03-12 something happened (2).\nIn 2026-04-13 something happened (3).\nIn 2026-05-14 something happened (4).\nIn 2026-06-15 something happened (5).\nIn 2026-07-16 something happened (6).\nIn 2026-08-17 something happened (7).\nIn 2026-09-18 something happened (8).\nIn 2026-01-19 something happened (9).\nIn 2026-02-10 something happened (10).\nIn 2026-03-11 something happened (11).\nIn 2026-04-12 something happened (12).\nIn 2026-05-13 something happened (13).\nIn 2026-06-14 something happened (14).\nIn 2026-07-15 something happened (15).\nIn 2026-08-16 something happened (16).\nIn 2026-09-17 something happened (17).\nIn 2026-01-18 something happened (18).\nIn 2026-02-19 something happened (19).\nIn 2026-03-10 something happened (20).\nIn 2026-04-11 something happened (21).\nIn 2026-05-12 something happened (22).\nIn 2026-06-13 something happened (23).\nIn 2026-07-14 something happened (24).\nIn 2026-08-15 something happened (25).\nIn 2026-09-16 something happened (26).\nIn 2026-01-17 something happened (27).\nIn 2026-02-18 something happened (28).\nIn 2026-03-19 something happened (29).\nIn 2026-04-10 something happened (30).\n\n## Open items\n\n- item 1\n- item 2\n- item 3\n- item 4\n- item 5\n- item 6\n- item 7\n- item 8\n- item 9\n- item 10\n\n## Incident on Oct 5, 2026\n\nStep 1 of the incident.\nStep 2 of the incident.\nStep 3 of the incident.\nStep 4 of the incident.\nStep 5 of the incident.\nStep 6 of the incident.\nStep 7 of the incident.\nStep 8 of the incident.\nStep 9 of the incident.\nStep 10 of the incident.\nStep 11 of the incident.\nStep 12 of the incident.\nStep 13 of the incident.\nStep 14 of the incident.\nStep 15 of the incident.\nStep 16 of the incident.\nStep 17 of the incident.\nStep 18 of the incident.\nStep 19 of the incident.\nStep 20 of the incident.\n\n```\n2025-01-01 inside a fence\n```\n\n## Ports\n\n- 22\n- 443\n",
+    "analysis/new-stuff/index.md": "# New stuff\n\nTODO: say what this folder holds.\n",
     "analysis/offsets.md": "---\ntype: Note\ntitle: Offsets\ndescription: Non-UTC and fractional stamps.\ngenerated: { by: fixture, at: \"2026-10-26T10:00:00.5+05:30\" }\nreviewed:\n  by: fixture\n  at: 2026-10-27T12:00:00Z\n  outcome: updated\n  note: \"x: y\"\nstale_after: 2026-11-01T00:00:00Z\n---\nBack to [the hub](/analysis/hub.md).\n",
     "analysis/stamps.md": "---\ntype: Note\ntitle: Stamp Rules\nstatus: bogus\ngenerated: { by: fixture, at: 2027-01-01T00:00:00Z }\nverified:\n  - { by: fixture, at: \"2026-10-01T10:00:00-04:00\" }\n  - plain\n  - { by: fixture, at: 2026-10-27T12:00:00Z }\nreviewed: { by: fixture, at: 2026-10-02T00:00:00Z, outcome: maybe }\nstale_after: 2026-01-01T00:00:00Z\nopen_questions:\n  - Is the clock right?\nsources:\n  - { id: a }\n  - { id: b, resource: r, last_modified: 2026-13-01T00:00:00Z }\n  - { id: c, resource: r, last_modified: \"2026-10-01T00:00:00+00:00\" }\n  - id: d\n    resource: r\n---\nTimestamps of every shape. See [the hub](/analysis/hub.md).\n",
+    "brand-new/index.md": "# Brand new\n\nTODO: say what this folder holds.\n",
+    "index.md": "---\nokf_version: \"0.2\"\n---\n\n# Fixture catalog\n\n* [Infra](infra/) - systems\n* [Analysis](analysis/) - analysis cases\n* [Root note](root-note.md) - at the root\n\n# Sections\n\n* [Brand new](brand-new/) - TODO: describe this folder\n",
     "infra/hosts/crlf-host.md": "---\r\ntype: Host\r\ntitle: CRLF host\r\ngenerated: { by: fixture, at: 2026-10-27T12:00:00Z }\r\n...\r\nBody with CRLF.\r\n",
+    "infra/index.md": "# Infra\n\n# Concepts\n\n* [Time server](time-server.md) - GPS clock\n* [NTP](ntp.md) - pool\n",
     "infra/time-server.md": "---\ntype: Service\ntitle: Time server # trailing comment\ndescription: \"GPS stratum 1: the network's clock\"\nresource: ntp://mosaic.internal\naliases: [mosaic, 'gps clock', \"the \\\"clock\\\"\"]\ntags:\n  - time\n  - gps\nstatus: stable\ngenerated: { by: claude-code/claude-opus-5-5, at: 2026-10-27T12:00:00Z }\nverified:\n  - { by: \"human:pgrace\", at: 2026-10-25T10:00:00Z }\n  - by: claude-code/claude-opus-5-5\n    at: 2026-10-26T01:02:03Z\n  - { by: human:pgrace, at: 2026-10-27T12:00:00Z }\nreviewed:\n  by: human:pgrace\n  at: 2026-10-27T12:00:00Z\n  outcome: verified\n  note: \"Re-checked\"\nsources:\n  - id: chrony\n    resource: chronyc tracking\n    title: Live check\n  - id: empty-title\n    resource: x\n    title:\ncustom_null: ~\ncustom_block: |\n  line one\n    indented\n\n  last\ncustom_folded: >\n  folded\n  text\ncustom_flow_multi: [a,\n  b, c]\nescapes: \"tab\\thereé\\x41 \\\\ end\"\nsingle: 'it''s'\nurl: https://example.com/a:b\n---\n\n# Overview\n\nThe [clock](/infra/time-server.md#overview) feeds [hosts](/infra/hosts/).\nSee [the root](../index.md) and ![a diagram](d.png).\n\n## Overview\n\n```\n# not a heading\n```\n\n### Plan: CLI first, MCP later\n\n<a name=\"custom-anchor\"></a>\n\nFootnoted claim.[^chrony]\n\n[^chrony]: chronyc tracking\n    continued here\n",
+    "log.md": "# Log\n\n## 2026-10-27\n\n* **Change:** Second entry.\n* **Update:** Ran the ops script.\n\n## 2026-10-26\n\n* **Creation:** Added fixtures.\n",
+    "ops/deep/er/index.md": "# Er\n\nTODO: say what this folder holds.\n",
+    "ops/deep/index.md": "# Deep\n\nTODO: say what this folder holds.\n\n# Sections\n\n* [Er](er/) - TODO: describe this folder\n",
     "ops/flow.md": "---\ntype: Note\ntitle: Flow shapes\nverified:\n  - { by: x, at: 2026-01-01T00:00:00Z }\n  - { by: fixture, at: 2026-10-27T12:00:00Z }\nreviewed:\n  by: fixture\n  at: 2026-10-27T12:00:00Z\n  outcome: verified\n  note: \"n\"\nopen_questions:\n  - \"one\"\n  - \"two, three\"\n  - \"four\"\n  - \"five\"\n---\nBody.\n",
+    "ops/index.md": "# Ops\n\nNo bullets yet.\n\n# Concepts\n\n* [NTP \\[pool\\] notes](bracket-title.md) - brackets escaped\n* [Second](second.md) - after the first\n\n# Sections\n\n* [Deep](deep/) - TODO: describe this folder\n",
+    "people/index.md": "# People\n\n# Concepts\n\n* [Pete](pgrace.md) - me\n\n# Sections\n\n* [Teams](teams/) - groups\n",
     "yaml/same-indent-lists.md": "---\ntype: Note\ntags:\n- a\n- b\nsources:\n- id: x\n  resource: y\n- id: z\n  resource: w\n- id: q\n  resource: \"r: s\"\nnested:\n  list:\n  - p\n  - q\n  after: r\n---\n"
   }
 }
