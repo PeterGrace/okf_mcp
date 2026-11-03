@@ -655,6 +655,8 @@ mod tests {
             changeset_ids.push(task.await.unwrap().unwrap().changeset);
         }
 
+        // `dedup` drops only adjacent repeats, so sort first.
+        changeset_ids.sort_unstable();
         changeset_ids.dedup();
         assert_eq!(
             changeset_ids.len(),
