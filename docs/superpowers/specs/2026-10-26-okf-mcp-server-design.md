@@ -324,7 +324,10 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
   `tests/` (the template's own development docs and tests); `.claude/`, `install/` (the
   template's setup machinery) and `.git` at any depth, and any other `.git*` component. Only
   import writes them. (`install/`, `docs/` and `tests/`: M5 Decision 4, matching `okf.py`,
-  which skips them as non-catalog content since 481357b.)
+  which skips them as non-catalog content since 481357b.) Names match case-sensitively, as
+  in `okf.py` and on the case-sensitive store: `agents.md` or `.GIT/` is not machinery. An
+  export unpacked onto a case-insensitive filesystem (macOS, Windows) could let such a file
+  collide with the real `AGENTS.md`; the server itself never sees that collision.
 - **Timestamps come from the server clock** and no tool accepts one.
 
 ## Data flow
