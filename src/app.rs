@@ -148,8 +148,9 @@ impl App {
     /// One pass of the poll loop: reloads the key cache if `admin_generation`
     /// moved, and brings the catalogs in line with the catalog list.
     ///
-    /// A catalog that fails to load or refresh, or a key reload that fails,
-    /// is logged and the rest of the pass goes ahead. A key reload, or a
+    /// A catalog that fails to load or refresh, or a key reload (or the
+    /// `admin_generation` read before it) that fails, is logged and the rest
+    /// of the pass goes ahead. A key reload, or a
     /// catalog that failed on a database error, is retried at the next pass.
     /// A catalog whose stored data would not build is retried only once its
     /// `generation` moves (an import or publish), since the same data would
@@ -164,13 +165,13 @@ impl App {
     /// `Ok(())` once the pass is done.
     ///
     /// # Errors
-    /// [`OkfError::Database`] reading the counter or the catalog list.
+    /// [`OkfError::Database`] reading the catalog list.
     pub async fn poll(&self) -> Result<(), OkfError> {
         // The guard releases the mutex when the function returns; through
         // it (`*broken`, like a reference) the pass reads and replaces the
         // broken catalogs.
         let mut broken = self.polling.lock().await;
-        self.reload_keys_if_changed().await?;
+        self.reload_keys_if_changed().await;
         let current = self.catalogs();
         let mut next = Catalogs::new();
         // Rebuilt each pass, so a deleted catalog's entry goes with it.
@@ -216,14 +217,19 @@ impl App {
     /// Reloads the key cache if `admin_generation` moved since it was loaded.
     /// Called only under `polling`.
     ///
-    /// # Errors
-    /// [`OkfError::Database`] reading the counter. A failed reload is logged,
-    /// not returned: it leaves the stored counter alone, so the next pass
-    /// retries it, and the caller's catalog changes go ahead regardless.
-    async fn reload_keys_if_changed(&self) -> Result<(), OkfError> {
-        let admin_generation = catalogs::admin_generation(&self.pool).await?;
+    /// Failing to read the counter or to reload is logged, not returned: the
+    /// stored counter stays as it was, so the next pass tries again, and the
+    /// caller's catalog changes go ahead regardless.
+    async fn reload_keys_if_changed(&self) {
+        let admin_generation = match catalogs::admin_generation(&self.pool).await {
+            Ok(admin_generation) => admin_generation,
+            Err(error) => {
+                tracing::error!(%error, "reading admin_generation failed; retrying at the next poll");
+                return;
+            }
+        };
         if admin_generation == self.admin_generation.load(Ordering::Relaxed) {
-            return Ok(());
+            return;
         }
         match self.keys.reload(&self.pool).await {
             Ok(()) => self
@@ -233,7 +239,6 @@ impl App {
                 tracing::error!(%error, "key reload failed; retrying at the next poll");
             }
         }
-        Ok(())
     }
 
     /// Runs [`App::poll`] every `poll_interval` until `shutdown` is cancelled.
@@ -566,6 +571,24 @@ mod tests {
         app.poll().await.unwrap();
 
         assert!(app.keys().find(&key).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_admin_generation_read_does_not_stop_the_pass() {
+        let db = test_db().await;
+        let app = app(&db.pool).await;
+        catalogs::create(&db.pool, "work", "", Utc::now())
+            .await
+            .unwrap();
+        // With the counter's table out of the way, reading it fails.
+        sqlx::query("ALTER TABLE server_state RENAME TO server_state_away")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        app.poll().await.unwrap();
+
+        assert_eq!(names(&app), ["work"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
