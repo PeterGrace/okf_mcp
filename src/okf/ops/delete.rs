@@ -266,6 +266,48 @@ mod tests {
     }
 
     #[test]
+    fn a_root_level_concept_is_unlisted_from_the_root_index_with_no_note() {
+        let workspace = MemWorkspace::from_files([
+            (
+                "index.md",
+                "# Root\n\n* [Top](top.md) - t\n* [Other](other.md) - o\n",
+            ),
+            ("top.md", "---\ntype: Note\ntitle: Top\n---\n# Top\n"),
+            ("other.md", "---\ntype: Note\ntitle: Other\n---\n# Other\n"),
+        ]);
+
+        let outcome = delete_concept(&workspace, "top").unwrap();
+
+        // `folder` is "", so the listing is the root `index.md`, and the
+        // emptied-folder note never applies to the root.
+        assert_eq!(outcome.touched, ["top.md", "index.md"]);
+        assert!(outcome.notes.is_empty());
+        assert_eq!(
+            workspace.read_to_string("index.md").unwrap(),
+            "# Root\n\n* [Other](other.md) - o\n"
+        );
+    }
+
+    #[test]
+    fn a_crlf_index_is_unlisted_with_newline_endings_like_its_replay() {
+        let crlf = "# Infra\r\n\r\n* [W](w.md) - w\r\n* [Y](y.md) - y\r\n";
+        let workspace = MemWorkspace::from_files([
+            ("infra/index.md", crlf),
+            ("infra/w.md", "---\ntype: Note\ntitle: W\n---\n# W\n"),
+            ("infra/y.md", "---\ntype: Note\ntitle: Y\n---\n# Y\n"),
+        ]);
+
+        let outcome = delete_concept(&workspace, "infra/w.md").unwrap();
+
+        // `Unlist` works on universal-newline text (plan Task 2), so the
+        // op and its replay both write `\n` endings.
+        let listed = workspace.read_to_string("infra/index.md").unwrap();
+        assert_eq!(listed, "# Infra\n\n* [Y](y.md) - y\n");
+        let ops = &outcome.replay["infra/index.md"];
+        assert_eq!(replay("infra/index.md", Some(crlf), ops).unwrap(), listed);
+    }
+
+    #[test]
     fn an_emptied_folder_keeps_its_index_and_says_so() {
         let workspace = MemWorkspace::from_files(FILES);
 
