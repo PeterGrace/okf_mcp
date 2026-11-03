@@ -66,8 +66,8 @@ use okf_mcp::okf::analysis::sprawl::{sprawl, SprawlQuery};
 use okf_mcp::okf::doc::Doc;
 use okf_mcp::okf::markdown::{body_split, footnote_defs, headings};
 use okf_mcp::okf::ops::{
-    ensure_index, index, log, move_concept, question, review, source, stamp, unquestion, LogKind,
-    OpContext, OpOutcome, SourceEntry,
+    ensure_index, index, log, move_concept, question, review, source, split_concept, stamp,
+    unquestion, LogKind, OpContext, OpOutcome, SourceEntry, Split, DEFAULT_SPLIT_TYPE,
 };
 use okf_mcp::okf::snapshot::Snapshot;
 use okf_mcp::okf::timestamp::parse_iso;
@@ -468,6 +468,25 @@ fn run_op(
             Ok(outcome)
         }
         "mv" => move_concept(workspace, text("old"), text("new")).map(with_touched),
+        "split" => {
+            // `source` is okf.py's repeatable `--source`: null or a list of ids.
+            let sources: Vec<String> = step
+                .get("source")
+                .filter(|ids| !ids.is_null())
+                .map(|ids| serde_json::from_value(ids.clone()).expect("a list of source ids"))
+                .unwrap_or_default();
+            let split = Split {
+                concept: text("concept"),
+                section: text("section"),
+                to: text("to"),
+                kind: optional("type").unwrap_or(DEFAULT_SPLIT_TYPE),
+                title: optional("title"),
+                description: optional("description"),
+                stub: optional("stub"),
+                sources: &sources,
+            };
+            split_concept(workspace, &ctx, &split).map(with_touched)
+        }
         other => panic!("unknown ops command {other}"),
     }
 }

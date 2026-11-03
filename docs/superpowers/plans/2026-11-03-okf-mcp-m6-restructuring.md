@@ -2730,6 +2730,10 @@ Expected: compile errors, `cannot find type Split`, `cannot find function split_
 
 > **Corrected (issue #121), 2026-11-03.** `split_concept` is `py_truthy_str`'s first caller (with Task 3's `move_concept`). In `src/okf/pystr.rs`, delete the `#[cfg_attr(not(test), expect(dead_code, ...))]` attribute and the four-line comment above it on `py_truthy_str` (Task 2 added them until a caller existed). With this caller the expectation is unfulfilled, and `clippy -D warnings` fails until they go. If Task 3 or 4 has already merged and deleted them, there is nothing to do.
 
+> **Corrected (issue #123), 2026-11-03.** `split_concept`'s `# Errors` no longer links ``[`load_concept`]``: it is `pub(crate)`, so `cargo doc` with `-D warnings` refused the public item's link (`rustdoc::private_intra_doc_links`). The section below now names `load_concept`'s errors itself. The rest of the code compiled and passed as written.
+
+> **Corrected (issue #123, review of PR #133), 2026-11-03.** The code below now records the folder index's `ListBullet` *ahead of* the `Relink` that `record_rewrites` gives the same index (`listing_at` and `rotate_right(1)`). `okf.py` rewrites links before it inserts the bullet. But replayed in that order, the `Relink` first makes the index link the new concept, and `ListBullet`'s replay then skips it (Decision 15), so the listing is lost. The two edits commute on the op's own text. A seventh unit test, `links_from_an_index_and_a_log_into_the_section_replay_as_relink`, covers this, and `parent_footnotes`' doc now says that an orphan definition inside the section moves to the parent's end, as `cmd_split` does.
+
 Put this above the test module in `src/okf/ops/split.rs`:
 
 ```rust
@@ -2825,15 +2829,22 @@ struct Header<'a> {
 /// the message, and its notes.
 ///
 /// # Errors
-/// - As [`load_concept`] for the parent, as [`new_concept_path`] for `to`.
+/// - For the parent, as `okf.py`'s `load_concept`: [`OkfError::NotFound`] or
+///   [`OkfError::InvalidPath`] from
+///   [`resolve_concept`](crate::okf::paths::resolve_concept),
+///   [`OkfError::Refused`] without frontmatter, [`OkfError::FrontmatterParse`].
+///   For `to`, as [`new_concept_path`].
 /// - [`OkfError::Refused`] with `okf.py`'s words: no such heading (listing
 ///   the headings), several matches (listing their slugs), a section with
 ///   no content, an unknown `--source` id, or generated frontmatter that
 ///   would not parse.
-/// - The workspace's read or write error.
+/// - The workspace's read or write error, including [`OkfError::NotFound`]
+///   for a new concept at the catalog root when there is no root `index.md`.
 ///
-/// Every refusal comes before anything is written. Run the op on a scratch
-/// copy, as the write path does, and drop the copy on an I/O error.
+/// Every [`OkfError::Refused`] comes before anything is written, but later
+/// errors do not: that `NotFound` and any read or write error after the
+/// parent and the new concept are written leave them in place. Run the op
+/// on a scratch copy, as the write path does, and drop the copy on any error.
 pub fn split_concept(
     workspace: &dyn Workspace,
     ctx: &OpContext<'_>,
@@ -2989,9 +3000,12 @@ pub fn split_concept(
         path: &new,
         written_at: &parent,
     };
+    let index_path = join(folder, "index.md");
+    // How many replay ops the folder index holds before this op's rewrite
+    // (`ensure_index`'s `CreateIndex`, or none): the listing goes there.
+    let listing_at = outcome.replay.get(&index_path).map_or(0, Vec::len);
     let changed = rewrite_links(workspace, &redirect, Some(moved_file))?;
     outcome.record_rewrites(&changed, &redirect);
-    let index_path = join(folder, "index.md");
     // `okf.py` lists the title as it is (no bracket escaping) and inserts
     // without checking the index lists it already (plan Decision 15).
     let bullet = format!(
@@ -3009,6 +3023,17 @@ pub fn split_concept(
         create_section: false,
     };
     outcome.record(&index_path, op);
+    // `okf.py` rewrites the links before it inserts the bullet, but the
+    // replay must list first: once the index's `Relink` has run, a link it
+    // redirected already reaches the new concept, and `ListBullet`'s replay
+    // skips an index that links its target (plan Decision 15), losing the
+    // bullet. The two commute on the op's own text (a `Relink` changes link
+    // targets inside lines, never which lines are headings or bullets), so
+    // the bullet moves ahead of the `Relink`. `rotate_right(1)` on the tail
+    // slice moves its last item (the bullet) to its front.
+    if let Some(ops) = outcome.replay.get_mut(&index_path) {
+        ops[listing_at..].rotate_right(1);
+    }
 
     let ids = chosen
         .iter()
@@ -3241,9 +3266,14 @@ fn frontmatter_lines(header: &Header<'_>, ctx: &OpContext<'_>, sources: &[&Value
 }
 
 /// Which footnote definitions leave the parent, and which are re-added at
-/// its end. A label only the section cites goes with it; a definition that
-/// sat inside the section but is still cited elsewhere stays in the parent,
-/// moved to its end. Orphans stay put.
+/// its end, as `cmd_split`'s `drop`/`keep_defs` loop decides:
+/// - a label the section cites and the rest of the parent does not goes
+///   with the section (it is dropped here; [`carried_footnotes`] copies it);
+/// - any other definition whose lines all sat inside the section stays in
+///   the parent, moved to its end. That covers a definition still cited
+///   elsewhere and an orphan (cited nowhere) inside the section alike;
+/// - every other definition, orphans outside the section included, stays
+///   where it is.
 fn parent_footnotes<'b>(
     defs: &IndexMap<String, Vec<usize>>,
     used_moved: &BTreeSet<String>,
@@ -3291,7 +3321,7 @@ In `src/okf/ops/mod.rs`, add `pub use split::{split_concept, Split, DEFAULT_SPLI
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --lib -- okf::ops::split markdown`
-Expected: the 6 split tests and every markdown test pass.
+Expected: the 7 split tests (6 originally; see the Corrected note in Step 5) and every markdown test pass.
 
 - [ ] **Step 7: Parity: shim, script and the Rust side**
 
@@ -3305,10 +3335,12 @@ In `tests/parity/okf_shim.py`, add to `OPS_DEFAULTS` (after `"mv"` if Task 3 mer
 In `tests/parity/ops_script.json`, add to `"setup"`:
 
 ```json
-    "splits/index.md": "# Splits\n\n# Concepts\n\n* [Parent](parent.md) - the parent\n",
+    "splits/index.md": "# Splits\n\nStart at [the detail](parent.md#detail).\n\n# Concepts\n\n* [Parent](parent.md) - the parent\n",
     "splits/parent.md": "---\ntype: Note\ntitle: Parent\nstatus: draft\nsources:\n  - id: s1\n    resource: r1\n    title: One\n  - id: s2\n    resource: https://example.com/two\n---\n# Intro\n\nOpening.[^n0]\n\n## Background\n\nWhy it exists.[^s1]\n\n### Detail\n\nFine print, see [intro](#intro).\n\n## Other\n\nUnrelated.[^n2]\n\n## Last bit\n\nThe end.[^s1]\n\n[^n0]: Zero.\n[^s1]: From s1.\n[^n2]: Two.\n",
     "splits/user.md": "---\ntype: Note\ntitle: User\n---\nSee [bg](/splits/parent.md#background), [detail](parent.md#Detail), [other](/splits/parent.md#other) and [whole](/splits/parent.md).\n"
 ```
+
+> **Corrected (issue #123, review of PR #133), 2026-11-03.** `splits/index.md` now links `parent.md#detail`. The first split step therefore rewrites an `index.md` through split's anchor map, and the golden checks that against okf.py. The step, error and file counts in Step 8 are unchanged. That step's touched list becomes `splits/parent.md`, `splits/background.md`, `splits/index.md`, `splits/user.md` (walk order).
 
 and append to `"steps"` (after Task 3's, if merged):
 
@@ -3376,7 +3408,8 @@ Task 4 of `docs/superpowers/plans/2026-11-03-okf-mcp-m6-restructuring.md` (miles
   of okf.py's `cmd_split` and `find_section`: sources chosen as okf.py chooses them,
   headings re-levelled, footnotes carried or kept, the parent's stub, links to the
   section and its subsections redirected (`Redirect` with anchors), the new concept
-  listed (`ListBullet`); 6 unit tests whose expected texts were produced by okf.py.
+  listed (`ListBullet`); 6 unit tests whose expected texts the plan probed from okf.py
+  (three of them are also parity steps).
 - `markdown::footnote_refs` (FOOTREF_RE, its lookahead done by hand) and the
   crate-internal `atx_heading`; 2 unit tests and a doc example.
 - Parity: 3 setup files and 5 split steps (two refused); `ops.json` regenerated.

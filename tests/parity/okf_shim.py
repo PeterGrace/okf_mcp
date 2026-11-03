@@ -144,6 +144,8 @@ OPS_DEFAULTS: dict[str, dict[str, Json]] = {
     "index": {"title": None, "section": None},
     "ensure_index": {},
     "mv": {},
+    "split": {"title": None, "type": "Note", "description": None, "stub": None,
+              "source": None, "by": "fixture"},
 }
 
 
