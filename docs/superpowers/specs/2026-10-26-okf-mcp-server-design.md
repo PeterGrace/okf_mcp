@@ -326,12 +326,20 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
 ### Rules enforced on every write, before anything is stored
 
 - **Secret scan** (port of `SECRET_RULES`, `ASSIGN_RE`, `_literal_secret`) on the new
-  file content; any hit refuses the write and reports the rule and line with the value
-  masked.
+  file content; any hit refuses the write and reports the rule and line, with the scan's
+  message, which shows the value masked to its first four characters. The scan reads the
+  text with universal newlines, as `lint` does, so both report the same line.
 - **Frontmatter still parses** after the edit (as `Doc.save` checks).
 - **Paths stay inside the catalog**: normalized, no `..`, no absolute paths.
-- **Machinery is read-only** through every tool, `revert` included: `AGENTS.md`,
-  `CLAUDE.md`, `README.md`, `tools/`, `.claude/`, `.git*`. Only import writes them.
+- **Machinery is read-only** through every tool, `revert` included (`okf::rules::is_machinery`):
+  `AGENTS.md`, `CLAUDE.md` and `README.md` at the root; the root's `tools/`, `docs/` and
+  `tests/` (the template's own development docs and tests); `.claude/`, `install/` (the
+  template's setup machinery) and `.git` at any depth, and any other `.git*` component. Only
+  import writes them. (`install/`, `docs/` and `tests/`: M5 Decision 4, matching `okf.py`,
+  which skips them as non-catalog content since 481357b.) Names match case-sensitively, as
+  in `okf.py` and on the case-sensitive store: `agents.md` or `.GIT/` is not machinery. An
+  export unpacked onto a case-insensitive filesystem (macOS, Windows) could let such a file
+  collide with the real `AGENTS.md`; the server itself never sees that collision.
 - **Timestamps come from the server clock** and no tool accepts one.
 
 ## Data flow
@@ -487,7 +495,7 @@ One `thiserror` enum, `OkfError`:
 | `CatalogNotSelected { catalog }` | Named catalog does not exist or is not granted |
 | `InvalidPath { path, reason }` | Outside the catalog, reserved, machinery, already exists |
 | `FrontmatterParse { path, line, message }` | Existing or edited frontmatter does not parse |
-| `SecretDetected { path, line, rule, masked }` | Write refused by the secret scan |
+| `SecretDetected { path, line, rule, message }` | Write refused by the secret scan; `message` shows the value masked |
 | `EditMismatch { path, matches }` | `old_str` found 0 or more than 1 times |
 | `LintFailed { errors, warnings }` | Publish refused; findings as structured lists |
 | `Conflict { files }` | Publish found documents changed since this session read them |
@@ -662,7 +670,8 @@ already written into the sections above):
   write" (`AGENTS.md`, `CLAUDE.md`, `README.md`, `tools/`, `.claude/`, `.git*`) does not
   include `install/` or the root `docs/` and `tests/`, which `okf.py` now skips (#50).
   `new_concept_path` already refuses a concept there; whether every write tool treats
-  them as read-only machinery is decided with the write path.
+  them as read-only machinery is decided with the write path. Decided in M5 (Decision 4):
+  they are machinery, at the depths given in "Rules enforced on every write".
 
 ### What M4 shipped differently
 
