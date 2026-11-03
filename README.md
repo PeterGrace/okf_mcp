@@ -20,6 +20,15 @@ a changeset held in the database, which reads through that connection see and
 which `publish` turns into published revisions (see "Writing"). Concepts can
 also be moved, split and deleted, with every link and listing kept in step.
 
+## Running it
+
+`docs/operations.md` is the operator guide: the container image
+(`ghcr.io/petergrace/okf-mcp:<version>`), every configuration key and
+environment variable, TLS to Postgres, a complete Kubernetes example with
+CloudNativePG and an ingress, the first catalog and keys, `/healthz` and the
+clock check, upgrades, backup and restore, and troubleshooting. The sections
+below cover local use.
+
 ## Command line
 
     okf-mcp migrate
@@ -68,10 +77,12 @@ poll_interval = "10s"              # how often to look for CLI changes
 session_idle_timeout = "2h"        # an idle MCP session is closed after this; also
                                    # when an untouched changeset counts as stranded
 max_import_bytes = "64MiB"         # uncompressed total of an import
+time_server = "time.example.com"   # NTP server for the clock check (default: none)
 ```
 
 A zero `poll_interval` or `session_idle_timeout`, an empty `allowed_hosts`
-or a blank entry in it is refused at load. Behind an ingress,
+or a blank entry in it, or a blank or padded `time_server`, is refused at
+load. Behind an ingress,
 `allowed_hosts` must name the public hostname (rmcp's DNS-rebinding check
 answers any other `Host` on `/mcp` with 403).
 
@@ -144,7 +155,7 @@ only).
 
 | Route | Key | Does |
 |---|---|---|
-| `GET /healthz` | none | `{"database": "ok", "catalogs": N}`: 200, or 503 when the database does not answer within 2 s |
+| `GET /healthz` | none | `{"database": "ok", "catalogs": N, "clock": ...}`: 200, or 503 when the database does not answer within 2 s; `clock` is the last clock check (`docs/operations.md`, "Health and time") |
 | `POST/GET/DELETE /mcp` | any | MCP streamable HTTP |
 | `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as `application/gzip`, `Content-Disposition: attachment; filename="<name>.tar.gz"` |
 | `POST /catalogs/{name}/import[?replace=true]` | `admin` on the catalog | Imports the uploaded `.tar.gz` and answers with the import report |
