@@ -12,7 +12,7 @@ use crate::okf::analysis::lint::{lint, LintReport};
 use crate::okf::snapshot::Snapshot;
 use crate::okf::workspace::{MemWorkspace, StoredFile};
 use crate::store::catalogs;
-use crate::store::documents::Derived;
+use crate::store::documents::{self, Derived, DocumentWrite, RevisionRecord};
 
 /// How to import.
 // `<'a>` is a lifetime parameter: the options borrow `actor` from the caller
@@ -150,14 +150,15 @@ pub async fn import(
         // A tombstone keeps its revision, so a recreated path continues it.
         let revision = previous.map_or(1, |row| row.revision + 1);
         let derived = Derived::of(snapshot.get(path));
-        let write = Write {
+        let write = DocumentWrite {
             catalog_id: found.id,
             path,
             revision,
-            options,
+            actor: options.actor,
+            now,
         };
-        write_document(&mut tx, &write, file, &derived).await?;
-        record_revision(&mut tx, &write, Some(file)).await?;
+        documents::write_document(&mut tx, &write, file, &derived).await?;
+        documents::record_revision(&mut tx, &write, &RevisionRecord::import(Some(file))).await?;
         if previous.is_some_and(ExistingRow::is_live) {
             report.updated += 1;
         } else {
@@ -168,14 +169,15 @@ pub async fn import(
         .values()
         .filter(|row| row.is_live() && !files.contains_key(&row.path));
     for row in missing {
-        let write = Write {
+        let write = DocumentWrite {
             catalog_id: found.id,
             path: &row.path,
             revision: row.revision + 1,
-            options,
+            actor: options.actor,
+            now,
         };
-        delete_document(&mut tx, &write).await?;
-        record_revision(&mut tx, &write, None).await?;
+        documents::delete_document(&mut tx, &write).await?;
+        documents::record_revision(&mut tx, &write, &RevisionRecord::import(None)).await?;
         report.deleted += 1;
     }
     if report.added + report.updated + report.deleted > 0 {
@@ -236,93 +238,6 @@ async fn existing_rows(
         .into_iter()
         .map(|row| (row.path.clone(), row))
         .collect())
-}
-
-/// Which document one write touches, at which revision, by whom and when.
-struct Write<'a> {
-    catalog_id: i64,
-    path: &'a str,
-    revision: i32,
-    options: &'a ImportOptions<'a>,
-}
-
-/// Inserts or overwrites a document (reviving a tombstone).
-async fn write_document(
-    conn: &mut PgConnection,
-    write: &Write<'_>,
-    file: &StoredFile,
-    derived: &Derived,
-) -> Result<(), OkfError> {
-    sqlx::query(
-        "INSERT INTO documents (catalog_id, path, content, executable, revision, deleted_at, \
-                                updated_at, updated_by, kind, concept_type, title, status, tags) \
-         VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, $11, $12) \
-         ON CONFLICT (catalog_id, path) DO UPDATE SET \
-             content = EXCLUDED.content, executable = EXCLUDED.executable, \
-             revision = EXCLUDED.revision, deleted_at = NULL, \
-             updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by, \
-             kind = EXCLUDED.kind, concept_type = EXCLUDED.concept_type, \
-             title = EXCLUDED.title, status = EXCLUDED.status, tags = EXCLUDED.tags",
-    )
-    .bind(write.catalog_id)
-    .bind(write.path)
-    .bind(&file.content)
-    .bind(file.executable)
-    .bind(write.revision)
-    .bind(write.options.now)
-    .bind(write.options.actor)
-    .bind(derived.kind)
-    .bind(&derived.concept_type)
-    .bind(&derived.title)
-    .bind(&derived.status)
-    .bind(&derived.tags)
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
-}
-
-/// Turns a live document into a tombstone (empty content, no derived columns).
-async fn delete_document(conn: &mut PgConnection, write: &Write<'_>) -> Result<(), OkfError> {
-    sqlx::query(
-        "UPDATE documents SET content = ''::bytea, executable = false, revision = $3, \
-             deleted_at = $4, updated_at = $4, updated_by = $5, kind = NULL, \
-             concept_type = NULL, title = NULL, status = NULL, tags = '{}' \
-         WHERE catalog_id = $1 AND path = $2",
-    )
-    .bind(write.catalog_id)
-    .bind(write.path)
-    .bind(write.revision)
-    .bind(write.options.now)
-    .bind(write.options.actor)
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
-}
-
-/// Appends a history row: an `import` with the content, or a `delete`
-/// (`file` is `None`, content `NULL`); both with the message `import`.
-async fn record_revision(
-    conn: &mut PgConnection,
-    write: &Write<'_>,
-    file: Option<&StoredFile>,
-) -> Result<(), OkfError> {
-    let op = if file.is_some() { "import" } else { "delete" };
-    sqlx::query(
-        "INSERT INTO revisions (catalog_id, path, revision, op, content, executable, actor, \
-                                message, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'import', $8)",
-    )
-    .bind(write.catalog_id)
-    .bind(write.path)
-    .bind(write.revision)
-    .bind(op)
-    .bind(file.map(|file| &file.content))
-    .bind(file.is_some_and(|file| file.executable))
-    .bind(write.options.actor)
-    .bind(write.options.now)
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
 }
 
 #[cfg(test)]

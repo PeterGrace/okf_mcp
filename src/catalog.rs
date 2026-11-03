@@ -108,6 +108,12 @@ pub struct CatalogState {
     // `Mutex`, unlike `std`'s, may be held across an `.await`: waiting for it
     // suspends the task instead of blocking the thread.
     rebuilding: tokio::sync::Mutex<()>,
+    // The in-process half of the publish lock (design "Publish"): one
+    // publish of this catalog at a time in this server, held through the
+    // snapshot refresh after commit, so the next publish checks against the
+    // new snapshot. The other half is the advisory lock in the publish
+    // transaction, which also serializes against a CLI import.
+    publishing: tokio::sync::Mutex<()>,
 }
 
 impl CatalogState {
@@ -133,6 +139,7 @@ impl CatalogState {
             description: catalog.description,
             current: RwLock::new(Arc::new(loaded)),
             rebuilding: tokio::sync::Mutex::new(()),
+            publishing: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -157,6 +164,15 @@ impl CatalogState {
         // `read()` fails only if a thread panicked while holding the lock
         // ("poisoned"); nothing here can panic with it held.
         Arc::clone(&self.current.read().expect("catalog state lock poisoned"))
+    }
+
+    /// The in-process publish lock (design "Publish"). `store::publish`
+    /// holds it for a whole publish, refresh included.
+    ///
+    /// # Returns
+    /// The mutex; lock it with `.lock().await`.
+    pub fn publish_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.publishing
     }
 
     /// Rebuilds and swaps in the snapshot if the catalog changed since it was

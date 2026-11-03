@@ -1,14 +1,15 @@
-//! Document rows: the columns derived from content, and a catalog's
-//! published documents.
+//! Document rows: the columns derived from content, a catalog's published
+//! documents, and the writers import and publish share.
 
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
-use sqlx::PgExecutor;
+use sqlx::{PgConnection, PgExecutor};
 
 use crate::error::OkfError;
 use crate::okf::analysis::lint::CommitTimes;
 use crate::okf::snapshot::{DocKind, SnapshotDoc};
+use crate::okf::workspace::StoredFile;
 use crate::okf::yaml::Value;
 
 /// A live (published, not deleted) document.
@@ -133,6 +134,192 @@ impl Derived {
     }
 }
 
+/// Which document one write touches, at which revision, by whom and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentWrite<'a> {
+    /// The catalog.
+    pub catalog_id: i64,
+    /// Catalog-relative path, as stored.
+    pub path: &'a str,
+    /// The new revision (the old one + 1, tombstones included; 1 for a new path).
+    pub revision: i32,
+    /// Recorded as `updated_by` and the revision's `actor`.
+    pub actor: &'a str,
+    /// Recorded as `updated_at` (and `deleted_at`) and the revision's `created_at`.
+    pub now: DateTime<Utc>,
+}
+
+/// A revision's operation (the schema's `CHECK` list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionOp {
+    /// A publish wrote a path that had no live document.
+    Create,
+    /// A publish changed a live document.
+    Update,
+    /// A publish or an import removed a live document.
+    Delete,
+    /// An import added or changed a document.
+    Import,
+}
+
+impl RevisionOp {
+    /// The spelling stored in `revisions.op`.
+    ///
+    /// # Returns
+    /// `"create"`, `"update"`, `"delete"` or `"import"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RevisionOp::Create => "create",
+            RevisionOp::Update => "update",
+            RevisionOp::Delete => "delete",
+            RevisionOp::Import => "import",
+        }
+    }
+}
+
+/// What a `revisions` row records besides the document's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevisionRecord<'a> {
+    /// The operation.
+    pub op: RevisionOp,
+    /// The content written (`None` for a delete: the row's content is NULL).
+    pub file: Option<&'a StoredFile>,
+    /// The changeset published (`None` for an import).
+    pub changeset_id: Option<i64>,
+    /// The publish message (`import` for an import).
+    pub message: &'a str,
+}
+
+impl<'a> RevisionRecord<'a> {
+    /// An import's record: `import` with the content, or `delete` without.
+    ///
+    /// # Arguments
+    /// * `file` - the imported file, or `None` for a file the import drops.
+    ///
+    /// # Returns
+    /// The record, with the message `import` and no changeset.
+    pub fn import(file: Option<&'a StoredFile>) -> Self {
+        Self {
+            op: if file.is_some() {
+                RevisionOp::Import
+            } else {
+                RevisionOp::Delete
+            },
+            file,
+            changeset_id: None,
+            message: "import",
+        }
+    }
+}
+
+/// Inserts or overwrites a document (reviving a tombstone), with its
+/// derived columns.
+///
+/// # Arguments
+/// * `conn` - the transaction's connection (pass `&mut tx`).
+/// * `write` - path, revision, actor and time.
+/// * `file` - the content and execute bit.
+/// * `derived` - [`Derived::of`] the content's snapshot document.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn write_document(
+    conn: &mut PgConnection,
+    write: &DocumentWrite<'_>,
+    file: &StoredFile,
+    derived: &Derived,
+) -> Result<(), OkfError> {
+    sqlx::query(
+        "INSERT INTO documents (catalog_id, path, content, executable, revision, deleted_at, \
+                                updated_at, updated_by, kind, concept_type, title, status, tags) \
+         VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, $11, $12) \
+         ON CONFLICT (catalog_id, path) DO UPDATE SET \
+             content = EXCLUDED.content, executable = EXCLUDED.executable, \
+             revision = EXCLUDED.revision, deleted_at = NULL, \
+             updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by, \
+             kind = EXCLUDED.kind, concept_type = EXCLUDED.concept_type, \
+             title = EXCLUDED.title, status = EXCLUDED.status, tags = EXCLUDED.tags",
+    )
+    .bind(write.catalog_id)
+    .bind(write.path)
+    .bind(&file.content)
+    .bind(file.executable)
+    .bind(write.revision)
+    .bind(write.now)
+    .bind(write.actor)
+    .bind(derived.kind)
+    .bind(&derived.concept_type)
+    .bind(&derived.title)
+    .bind(&derived.status)
+    .bind(&derived.tags)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Turns a live document into a tombstone (empty content, no derived columns).
+///
+/// # Arguments
+/// * `conn` - the transaction's connection.
+/// * `write` - path, revision, actor and time (also `deleted_at`).
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn delete_document(
+    conn: &mut PgConnection,
+    write: &DocumentWrite<'_>,
+) -> Result<(), OkfError> {
+    sqlx::query(
+        "UPDATE documents SET content = ''::bytea, executable = false, revision = $3, \
+             deleted_at = $4, updated_at = $4, updated_by = $5, kind = NULL, \
+             concept_type = NULL, title = NULL, status = NULL, tags = '{}' \
+         WHERE catalog_id = $1 AND path = $2",
+    )
+    .bind(write.catalog_id)
+    .bind(write.path)
+    .bind(write.revision)
+    .bind(write.now)
+    .bind(write.actor)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Appends a history row.
+///
+/// # Arguments
+/// * `conn` - the transaction's connection.
+/// * `write` - path, revision, actor and time.
+/// * `record` - op, content, changeset and message.
+///
+/// # Errors
+/// [`OkfError::Database`]: a unique violation if the revision already
+/// exists (which the publish lock rules out; publish maps it to a conflict).
+pub async fn record_revision(
+    conn: &mut PgConnection,
+    write: &DocumentWrite<'_>,
+    record: &RevisionRecord<'_>,
+) -> Result<(), OkfError> {
+    sqlx::query(
+        "INSERT INTO revisions (catalog_id, path, revision, op, content, executable, actor, \
+                                changeset_id, message, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(write.catalog_id)
+    .bind(write.path)
+    .bind(write.revision)
+    .bind(record.op.as_str())
+    .bind(record.file.map(|file| &file.content))
+    .bind(record.file.is_some_and(|file| file.executable))
+    .bind(write.actor)
+    .bind(record.changeset_id)
+    .bind(record.message)
+    .bind(write.now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// The spelling stored in `documents.kind` (the schema's `CHECK` list).
 fn kind_name(kind: DocKind) -> &'static str {
     match kind {
@@ -210,6 +397,24 @@ mod tests {
             Some("machinery")
         );
         assert_eq!(Derived::of(None), Derived::default());
+    }
+
+    #[test]
+    fn an_import_record_is_import_or_delete_with_the_message_import() {
+        let file = StoredFile {
+            content: b"x".to_vec(),
+            executable: false,
+        };
+
+        let added = RevisionRecord::import(Some(&file));
+        let dropped = RevisionRecord::import(None);
+
+        assert_eq!(
+            (added.op.as_str(), added.message, added.changeset_id),
+            ("import", "import", None)
+        );
+        assert_eq!(dropped.op, RevisionOp::Delete);
+        assert_eq!(dropped.file, None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

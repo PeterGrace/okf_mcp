@@ -433,38 +433,52 @@ Every write to a catalog's published state (publish, import) runs under that cat
 running beside the server is serialized too. Publishes to one catalog therefore run one
 at a time, each against the current published state.
 
-1. Nothing changed: return "nothing to publish".
-2. Take the publish lock and begin the transaction. If the catalog's `generation` (a
-   counter bumped by every publish and import) differs from the in-memory snapshot's,
-   rebuild the snapshot first, so the checks below see the current state.
-3. Check each entry against the current document:
+1. Nothing changed (no open changeset, or no entries): return `published: false`. A
+   blank `message` is refused.
+2. Take the in-process mutex, begin the transaction, take the advisory lock, then the
+   catalog row (`FOR KEY SHARE`) and the changeset row (`FOR UPDATE`), and check that
+   the changeset is still open. If the catalog's `generation` (bumped by every publish
+   and import) is newer than the in-memory snapshot's, rebuild the snapshot first, so
+   the checks below see the current state.
+3. Read the changed paths' rows from `documents` and check each entry's base against
+   the current live revision:
    - an entry with a `replay` whose base is stale (the base revision is not the current
      one, or the base is NULL and the path now has a live document, such as a new
      folder's `index.md` that another session created first) has its operations
      re-applied to the current content, as git's `union` merge did for concurrent
      `log.md` lines. The operations are idempotent where that matters (creating a
      folder index that exists, listing a concept already listed);
-   - any other entry whose base is stale (including a NULL base on a path that now has
-     a live document) is a conflict: roll back and return `Conflict { files }` with
-     each file's base and current revision. The changeset stays open; the agent
-     re-reads, re-applies and publishes again.
+   - any other entry whose base is stale is a conflict: roll back and return
+     `Conflict { files }` with each file's base and current revision. That includes a
+     deletion entry with a NULL base, which names a path published after the
+     changeset's first edit (a deletion is never replayed). The changeset stays open;
+     the agent re-reads, re-applies and publishes again.
 4. Build the overlay (the current snapshot plus the entries, replays applied) and run
    the checks on it:
-   - the write rules (secret scan, frontmatter parses) on every replayed result;
-   - lint: refuse if any **changed** file has errors; errors elsewhere are returned as
-     warnings (as `okf.py publish` does);
-   - links into deleted or moved paths: refuse if any document outside the changeset
-     still links to a path this changeset deletes or moves away from. This catches a
-     link another session published after this session's `delete_concept` check ran.
+   - the content rules (secret scan, frontmatter parses) on every changed text file,
+     replayed or not (an entry may predate a rule);
+   - lint: refuse with `LintFailed` if any **changed** file has errors; errors elsewhere
+     and warnings in changed files are returned as warnings (as `okf.py publish` does);
+   - links into deleted or moved paths: a document outside the changeset that still
+     links to a path this changeset deletes or moves away from is a `link-into-deleted`
+     error in `LintFailed`. This catches a link another session published after this
+     session's `delete_concept` check ran.
    A failure rolls back and is returned like any other refusal.
-5. Write each document (revision + 1), a `revisions` row carrying the message and actor,
-   bump `generation`, mark the changeset `published`, and commit.
-6. Still holding the in-process lock (the advisory lock ended with the transaction),
-   rebuild and swap the catalog snapshot. Return the new revisions and changed paths.
+5. Write each changed document (revision + 1, a tombstone's number continued) with its
+   derived columns, and a `revisions` row (`create`, `update` or `delete`, the
+   publishing key's actor, the changeset id, the message); a file whose result equals the
+   published one gets no revision. Bump `generation` if anything was written, mark
+   the changeset `published`, and commit.
+6. Still holding the in-process mutex (the advisory lock ended with the transaction),
+   rebuild and swap the catalog snapshot, and drop the changeset's cached overlay.
+   Return the new revisions, the warnings and the replayed paths. A failed rebuild is
+   logged; the publish stands and the poll loop rebuilds.
 
-The checks run while the lock is held, so they stay small: the overlay shares the
-current snapshot's documents and re-reads only the changed ones (about 10 ms for a full
+The checks run while the lock is held, so they stay small: one query reads the changed
+paths' rows, and the overlay is a full snapshot of the result (about 10 ms for a full
 snapshot plus lint of the real catalog in M2's smoke test). Reads never take the lock.
+A write that queued on the changeset's row lock behind a publish finds the changeset
+closed when the lock is granted and opens a new one, so its edit is kept, not lost.
 The unique constraints are a backstop: a violation still maps to `Conflict`, never to
 the opaque `Database` error.
 
@@ -548,8 +562,8 @@ One `thiserror` enum, `OkfError`:
 | `FrontmatterParse { path, line, message }` | Existing or edited frontmatter does not parse |
 | `SecretDetected { path, line, rule, message }` | Write refused by the secret scan; `message` shows the value masked |
 | `EditMismatch { path, matches }` | `old_str` found 0 or more than 1 times |
-| `LintFailed { errors, warnings }` | Publish refused; findings as structured lists |
-| `Conflict { files }` | Publish found documents changed since this session read them |
+| `LintFailed { errors, warnings }` | Publish refused: lint errors in changed files or links into deleted paths (`errors`), with the rest as `warnings`; HTTP 422 |
+| `Conflict { files }` | Publish found documents changed since this changeset read them; `files` lists each path with its base and current revision; HTTP 409 |
 | `Busy` | The database aborted the request to resolve a lock conflict, or the changeset closed under a write; nothing was stored; retry (HTTP 503) |
 | `Database` | Any database failure (details logged, not returned) |
 | `Io` | Filesystem errors (import, export) |

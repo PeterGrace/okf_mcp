@@ -4,6 +4,7 @@
 //! plain function, which the module's tests call directly.
 
 mod catalogs;
+mod changesets;
 mod documents;
 // `pub` (not `pub(crate)`): the context's helpers, like `ToolResult`,
 // `tool_error` and `reply` below, are used by later tool modules, and a
@@ -67,6 +68,7 @@ impl OkfServer {
             + Self::history_router()
             + Self::reports_router()
             + Self::writes_router()
+            + Self::publish_router()
     }
 
     /// The context of the request rmcp handed a tool. The error is already a
