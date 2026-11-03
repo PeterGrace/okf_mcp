@@ -12,6 +12,7 @@ mod documents;
 pub mod context;
 mod history;
 mod reports;
+mod restructure;
 mod search;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -72,6 +73,7 @@ impl OkfServer {
             + Self::lifecycle_router()
             + Self::publish_router()
             + Self::changes_router()
+            + Self::restructure_router()
     }
 
     /// The context of the request rmcp handed a tool. The error is already a
