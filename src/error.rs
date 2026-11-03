@@ -95,6 +95,13 @@ pub enum OkfError {
         catalog: String,
     },
 
+    /// The key reaches the catalog but its access level does not allow this.
+    #[error("forbidden: {reason}")]
+    Forbidden {
+        /// What was refused, and the access it needs.
+        reason: String,
+    },
+
     /// An administrative request was refused; the reason says why and what to do.
     #[error("{reason}")]
     Refused {

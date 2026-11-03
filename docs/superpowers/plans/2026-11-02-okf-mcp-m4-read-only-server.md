@@ -640,6 +640,8 @@ mod tests {
 }
 ```
 
+> **Corrected (issue #66), 2026-11-02.** The implementation code below shipped as written. The shipped tests (`src/auth.rs`) extend three of these five so they cover what the doc comments promise: `the_cache_finds_live_keys_only` also leaves out a record whose stored hash is not 32 bytes; the middleware test also refuses a revoked key and a `Basic` header, and checks `WWW-Authenticate: Bearer` on every 401 (`status_and_body` returns that header too); the database test also shows that a `reload` on a closed pool fails and keeps the old cache. Still five tests; no public symbol changed.
+
 - [ ] **Step 3: Run them to see them fail**
 
 Run: `cargo test --lib -- auth`
@@ -925,7 +927,7 @@ Expected: 5 passed.
 
 - [ ] **Step 6: Update the design**
 
-In "Configuration", replace "incoming keys are hashed and compared in constant time" with "incoming keys are hashed and looked up by hash (a timing difference in the lookup reveals nothing about a key, so there is no constant-time scan)".
+In "Configuration", replace "incoming keys are hashed and compared in constant time" with "incoming keys are hashed and looked up by hash. A timing difference in the lookup can at most hint at how a guess's *hash* compares with stored hashes, which does not help recover a key (SHA-256 is preimage-resistant, and `std`'s `HashMap` hasher is randomly keyed), so there is no constant-time scan."
 
 - [ ] **Step 7: Changelog, gates, commit**
 

@@ -13,6 +13,8 @@ name = "okf-mcp"
 path = "src/main.rs"
 
 [dependencies]
+# The HTTP server: routes, the auth middleware, extractors.
+axum = "0.8.9"
 # Application-level errors in the command line (the library uses OkfError).
 anyhow = "1.0.104"
 # API keys are 32 random bytes in unpadded base64url (`keys::generate`).
@@ -66,6 +68,8 @@ hegeltest = "0.50.3"
 # Throwaway Postgres containers for the database tests (needs Docker). Only
 # the modules crate: it re-exports the testcontainers version it supports.
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+# `ServiceExt::oneshot`, to call an axum router in tests without a socket.
+tower = { version = "0.5.3", features = ["util"] }
 # The store's concurrency tests poll `pg_locks` with `tokio::time::sleep`;
 # `time` is named here rather than relied on through another crate's features.
 tokio = { version = "1.54", features = ["time"] }
