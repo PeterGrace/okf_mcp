@@ -7,6 +7,7 @@
 //! changeset, valid while the changeset's `version` and the published
 //! `generation` stay the same; no incremental snapshot.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -92,7 +93,9 @@ impl Overlay {
 ///
 /// # Errors
 /// [`OkfError::InvalidPath`] if the entries do not form a tree with the
-/// published files; a snapshot error, as for a published catalog.
+/// published files, its reason naming the changeset (every read through
+/// this overlay fails until the changeset is fixed, so the error says where
+/// to look); a snapshot error, as for a published catalog.
 pub async fn build_overlay(
     base: Arc<Loaded>,
     changeset: &ChangesetRow,
@@ -112,7 +115,10 @@ pub async fn build_overlay(
             });
             (entry.path, file)
         });
-        let workspace = base.workspace().with_changes(changes)?;
+        let workspace = base
+            .workspace()
+            .with_changes(changes)
+            .map_err(|error| in_changeset(error, changeset_id))?;
         let snapshot = Snapshot::build(&workspace)?;
         let commit_times = base.commit_times().with_dirty(dirty.iter().cloned());
         Ok(Overlay {
@@ -126,6 +132,35 @@ pub async fn build_overlay(
         })
     })
     .await
+}
+
+/// Names the pending changeset in an [`OkfError::InvalidPath`] its entries
+/// caused; any other error is returned as it is.
+///
+/// # Arguments
+/// * `error` - the error from applying the entries.
+/// * `changeset_id` - the changeset whose entries were applied.
+///
+/// # Returns
+/// The error, with the changeset in an `InvalidPath`'s reason.
+fn in_changeset(error: OkfError, changeset_id: i64) -> OkfError {
+    // `if let` destructures the one variant to rewrite; any other variant
+    // falls through to `else` unchanged.
+    if let OkfError::InvalidPath { path, reason } = error {
+        OkfError::InvalidPath {
+            path,
+            reason: format!("{reason}, in pending changeset {changeset_id}"),
+        }
+    } else {
+        error
+    }
+}
+
+/// What an overlay was built at: the base `generation`, then the changeset
+/// `version`. Tuples compare field by field, like Python's, so a later
+/// generation always counts as newer.
+fn built_at(overlay: &Overlay) -> (i64, i64) {
+    (overlay.base.generation(), overlay.version)
 }
 
 /// A cached overlay and when it was last used.
@@ -198,6 +233,12 @@ impl Overlays {
     }
 
     /// The cached overlay, if it is current; marks it used.
+    ///
+    /// Every read comes through here, so it is also where the cache stays
+    /// bounded: it first drops every idle entry, and it drops this
+    /// changeset's entry if it is older than the one asked for (each entry
+    /// pins its base `Loaded`, so a stale one would keep an old generation in
+    /// memory). A newer entry stays, for the callers that read the newer row.
     fn lookup(
         &self,
         changeset: &ChangesetRow,
@@ -205,29 +246,39 @@ impl Overlays {
         now: Instant,
     ) -> Option<Arc<Overlay>> {
         let mut cached = self.lock();
+        self.drop_idle(&mut cached, now);
         let entry = cached.get_mut(&changeset.id)?;
-        let current = entry.overlay.version == changeset.version
-            && entry.overlay.base.generation() == generation;
-        if !current {
-            return None;
+        let wanted = (generation, changeset.version);
+        // `cmp` on tuples compares field by field, like Python's.
+        match built_at(&entry.overlay).cmp(&wanted) {
+            Ordering::Equal => {
+                entry.used = now;
+                Some(Arc::clone(&entry.overlay))
+            }
+            Ordering::Less => {
+                cached.remove(&changeset.id);
+                None
+            }
+            Ordering::Greater => None,
         }
-        entry.used = now;
-        Some(Arc::clone(&entry.overlay))
     }
 
     /// Caches `overlay`, unless a newer one for the same changeset is there
     /// (a slower build finishing last), first dropping every idle entry.
     fn store(&self, overlay: Arc<Overlay>, now: Instant) {
         let mut cached = self.lock();
-        cached.retain(|_, entry| now.saturating_duration_since(entry.used) <= self.idle);
-        // Tuples compare field by field, like Python's: generation first.
-        let built_at = |overlay: &Overlay| (overlay.base.generation(), overlay.version);
+        self.drop_idle(&mut cached, now);
         let newer_cached = cached
             .get(&overlay.changeset_id)
             .is_some_and(|entry| built_at(&entry.overlay) > built_at(&overlay));
         if !newer_cached {
             cached.insert(overlay.changeset_id, Cached { overlay, used: now });
         }
+    }
+
+    /// Drops every entry unused for longer than `idle`.
+    fn drop_idle(&self, cached: &mut HashMap<i64, Cached>, now: Instant) {
+        cached.retain(|_, entry| now.saturating_duration_since(entry.used) <= self.idle);
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<i64, Cached>> {
@@ -297,6 +348,21 @@ mod tests {
         }
     }
 
+    /// An open changeset row, never stored: for overlays built directly.
+    fn changeset(id: i64, version: i64) -> ChangesetRow {
+        ChangesetRow {
+            id,
+            catalog_id: 1,
+            label: "default".to_string(),
+            key_id: None,
+            actor: "t".to_string(),
+            state: ChangesetState::Open,
+            version,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn an_overlay_shows_the_entries_over_the_published_files() {
         let test = app_with(
@@ -305,17 +371,7 @@ mod tests {
         )
         .await;
         let base = test.app.catalog("pg").unwrap().current();
-        let changeset = ChangesetRow {
-            id: 7,
-            catalog_id: 1,
-            label: "default".to_string(),
-            key_id: None,
-            actor: "t".to_string(),
-            state: ChangesetState::Open,
-            version: 3,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
+        let changeset = changeset(7, 3);
         let entries = vec![
             entry("a.md", Some("# New\n")),
             entry("b.md", None),
@@ -391,5 +447,60 @@ mod tests {
             "# Two\n"
         );
         assert!(!Arc::ptr_eq(&after_import, &after_forget));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clashing_entry_names_the_pending_changeset() {
+        let test = app_with(&[("pg", &[("a.md", "# A\n")])], Config::default()).await;
+        let base = test.app.catalog("pg").unwrap().current();
+
+        let result =
+            build_overlay(base, &changeset(9, 1), vec![entry("a.md/b.md", Some("x"))]).await;
+
+        let Err(OkfError::InvalidPath { reason, .. }) = result else {
+            panic!("expected InvalidPath, got {result:?}");
+        };
+        assert!(reason.ends_with("in pending changeset 9"), "{reason}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cache_drops_idle_and_stale_entries_and_keeps_the_newer_build() {
+        let test = app_with(&[("pg", &[("a.md", "# A\n")])], Config::default()).await;
+        let base = test.app.catalog("pg").unwrap().current();
+        let generation = base.generation();
+        let build = |id, version| {
+            let base = Arc::clone(&base);
+            async move {
+                let built = build_overlay(base, &changeset(id, version), Vec::new()).await;
+                Arc::new(built.unwrap())
+            }
+        };
+        let (newer, older, other) = (build(1, 2).await, build(1, 1).await, build(2, 1).await);
+        let overlays = Overlays::new(Duration::from_secs(60));
+        let start = Instant::now();
+        let later = start + Duration::from_secs(61);
+
+        overlays.store(Arc::clone(&newer), start);
+        overlays.store(Arc::clone(&older), start);
+        let behind = overlays.lookup(&changeset(1, 1), generation, start);
+        let kept = overlays.lookup(&changeset(1, 2), generation, start);
+        overlays.store(Arc::clone(&other), start);
+        let stale = overlays.lookup(&changeset(2, 5), generation, start);
+        let stale_dropped = !overlays.lock().contains_key(&2);
+        overlays.store(Arc::clone(&other), start);
+        let after_idle = overlays.lookup(&changeset(3, 1), generation, later);
+
+        assert!(
+            kept.is_some_and(|kept| Arc::ptr_eq(&kept, &newer)),
+            "an older build never replaces a newer one"
+        );
+        assert!(
+            behind.is_none(),
+            "an older row does not get the newer build"
+        );
+        assert!(stale.is_none());
+        assert!(stale_dropped, "an out-of-date entry is dropped on lookup");
+        assert!(after_idle.is_none());
+        assert!(overlays.lock().is_empty(), "a lookup drops idle entries");
     }
 }
