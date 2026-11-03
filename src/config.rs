@@ -233,6 +233,10 @@ mod tests {
 
             let error = Config::load(Some(&path)).unwrap_err();
 
+            assert!(
+                matches!(&error, OkfError::Config { path: p, .. } if p.ends_with("okf.toml")),
+                "{text}: {error:?}"
+            );
             assert!(error.to_string().contains(needle), "{text}: {error}");
         }
     }
