@@ -96,12 +96,18 @@ struct Reply {
 /// * `clock` - our clock; read just before sending and just after receiving.
 /// * `timeout` - the limit for the whole exchange, DNS included.
 ///
+/// When the name resolves to several addresses (A and AAAA records), each is
+/// tried in the resolver's order until one gives a usable reply, all within
+/// `timeout`. A family with no route fails at once and the next is tried; a
+/// silent address uses up the rest of the time.
+///
 /// # Returns
 /// The offset, the round trip and the server's stratum.
 ///
 /// # Errors
-/// [`NtpError`]: the name doesn't resolve, the socket fails, no reply in
-/// time, or a reply that isn't a synchronized server's answer to this request.
+/// [`NtpError`]: the name doesn't resolve, no reply in time, or, when every
+/// address failed, the last address's error (a socket failure, or a reply
+/// that isn't a synchronized server's answer to this request).
 pub async fn query(
     server: &str,
     clock: &dyn Clock,
@@ -117,8 +123,43 @@ pub async fn query(
         })?
 }
 
-/// One request and its reply, without a deadline (see [`query`]).
+/// Resolves `server` and asks its addresses, without a deadline (see [`query`]).
 async fn exchange(server: &str, clock: &dyn Clock) -> Result<Reading, NtpError> {
+    // A named binding: the returned iterator borrows the string, so a
+    // temporary (freed at the end of the statement) would not live long enough.
+    let target = with_port(server);
+    let addresses = lookup_host(target.as_str())
+        .await
+        .map_err(|source| NtpError::Resolve {
+            server: server.to_string(),
+            source,
+        })?;
+    ask_each(server, addresses, clock).await
+}
+
+/// Asks each address in turn; the first usable reply wins.
+///
+/// # Errors
+/// [`NtpError::NoAddress`] for no addresses, else the last address's error.
+async fn ask_each(
+    server: &str,
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    clock: &dyn Clock,
+) -> Result<Reading, NtpError> {
+    let mut last_error = NtpError::NoAddress {
+        server: server.to_string(),
+    };
+    for address in addresses {
+        match ask(server, address, clock).await {
+            Ok(reading) => return Ok(reading),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+/// One request to `address` and its reply.
+async fn ask(server: &str, address: SocketAddr, clock: &dyn Clock) -> Result<Reading, NtpError> {
     // Closures that wrap an error with the server's name. They borrow
     // `server` (a `&str`, which is `Copy`), so they can be used repeatedly.
     let io = |source: std::io::Error| NtpError::Io {
@@ -129,16 +170,6 @@ async fn exchange(server: &str, clock: &dyn Clock) -> Result<Reading, NtpError> 
         server: server.to_string(),
         reason,
     };
-    let address = lookup_host(with_port(server).as_str())
-        .await
-        .map_err(|source| NtpError::Resolve {
-            server: server.to_string(),
-            source,
-        })?
-        .next()
-        .ok_or_else(|| NtpError::NoAddress {
-            server: server.to_string(),
-        })?;
     // Bind the family the server's address has, on any port.
     let local = if address.is_ipv4() {
         SocketAddr::from(([0, 0, 0, 0], 0))
@@ -249,9 +280,11 @@ fn to_ntp(instant: DateTime<Utc>) -> u64 {
     let seconds = (instant.timestamp() + NTP_UNIX_OFFSET) as u32;
     // Rounded to the nearest 2^-32 s, not down: with rounding both ways a
     // nanosecond survives the round trip exactly (the fraction is finer).
-    // The largest result, for 999_999_999 ns, is still below 2^32.
-    let fraction =
-        ((u64::from(instant.timestamp_subsec_nanos()) << 32) + 500_000_000) / 1_000_000_000;
+    // The largest result, for 999_999_999 ns, is still below 2^32. chrono
+    // gives 10^9 ns or more inside a leap second; the clamp keeps those in
+    // the fraction instead of letting them spill into the seconds bits.
+    let nanos = instant.timestamp_subsec_nanos().min(999_999_999);
+    let fraction = ((u64::from(nanos) << 32) + 500_000_000) / 1_000_000_000;
     (u64::from(seconds) << 32) | fraction
 }
 
@@ -377,6 +410,18 @@ mod tests {
     }
 
     #[test]
+    fn a_leap_second_instant_stays_in_its_second() {
+        let leap = chrono::NaiveDate::from_ymd_opt(2016, 12, 31)
+            .and_then(|day| day.and_hms_nano_opt(23, 59, 59, 1_500_000_000))
+            .unwrap()
+            .and_utc();
+        let last_nanosecond = Utc.with_ymd_and_hms(2016, 12, 31, 23, 59, 59).unwrap()
+            + TimeDelta::nanoseconds(999_999_999);
+
+        assert_eq!(to_ntp(leap), to_ntp(last_nanosecond));
+    }
+
+    #[test]
     fn a_request_is_a_version_4_client_packet_with_its_transmit_time() {
         let packet = request(0x0123_4567_89AB_CDEF);
         assert_eq!(packet[0], 0x23);
@@ -467,6 +512,39 @@ mod tests {
                 round_trip: TimeDelta::milliseconds(80),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_address_falls_through_to_the_next() {
+        // A port nobody listens on: the kernel answers the request with ICMP
+        // port unreachable, which the connected socket reports as an error.
+        let closed = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let server = fake_server(Some((at(5040), at(5060))), 1).await;
+        let clock = StepClock::new([at(0), at(0), at(100)]);
+
+        let reading = ask_each("time.example", [closed, server], &clock)
+            .await
+            .unwrap();
+
+        assert_eq!(reading.offset, TimeDelta::seconds(5));
+    }
+
+    #[tokio::test]
+    async fn every_address_failing_gives_the_last_error() {
+        let refusing = fake_server(Some((at(5040), at(5060))), 16).await;
+        let clock = StepClock::new([at(0), at(100)]);
+
+        let none = ask_each("time.example", [], &clock).await.unwrap_err();
+        let error = ask_each("time.example", [refusing], &clock)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(none, NtpError::NoAddress { .. }), "{none:?}");
+        assert!(matches!(error, NtpError::BadReply { .. }), "{error:?}");
     }
 
     #[tokio::test]
