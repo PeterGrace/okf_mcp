@@ -1,5 +1,6 @@
 //! End-to-end tests of the HTTP server (design "Testing"): keys, hosts,
-//! `/healthz` and catalog selection, over real HTTP with rmcp's client.
+//! `/healthz`, catalog selection and the archive routes, over real HTTP with
+//! rmcp's client and `reqwest`.
 
 mod support;
 
@@ -127,4 +128,137 @@ async fn selection_takes_the_header_then_the_key_default_then_the_server_default
     assert_eq!(key_default, serde_json::json!(["work"]));
     assert_eq!(server_default, serde_json::json!(["home"]));
     assert_eq!(structured(&listed)["catalogs"].as_array().unwrap().len(), 1);
+}
+
+/// `GET /catalogs/{catalog}/export` with a bearer key.
+async fn get_export(server: &TestServer, catalog: &str, key: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{}/catalogs/{catalog}/export", server.base))
+        .bearer_auth(key)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// `POST /catalogs/{catalog}/import<query>` with a bearer key and `body`.
+async fn post_import(
+    server: &TestServer,
+    catalog: &str,
+    key: &str,
+    query: &str,
+    body: Vec<u8>,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/catalogs/{catalog}/import{query}", server.base))
+        .bearer_auth(key)
+        .header("content-type", "application/gzip")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// `pg` with two documents, and an empty `work`.
+fn two_catalogs() -> Vec<(&'static str, okf_mcp::archive::Files)> {
+    vec![
+        (
+            "pg",
+            files(&[
+                ("a.md", "---\ntype: Note\ntitle: A\n---\n# A\n"),
+                ("index.md", "# Index\n"),
+            ]),
+        ),
+        ("work", files(&[])),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_gives_a_reachable_catalog_as_a_tarball() {
+    let server = TestServer::start(two_catalogs(), Config::default()).await;
+    let reader = server.key("reader", Access::Read, &["pg"], None).await;
+
+    let response = get_export(&server, "pg", &reader).await;
+    let elsewhere = get_export(&server, "work", &reader).await.status();
+    let unknown = get_export(&server, "nope", &reader).await.status();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "application/gzip");
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"pg.tar.gz\""
+    );
+    let bytes = response.bytes().await.unwrap();
+    let exported = okf_mcp::archive::read_tarball(&bytes[..], 1 << 20).unwrap();
+    assert_eq!(exported.keys().collect::<Vec<_>>(), ["a.md", "index.md"]);
+    assert_eq!(elsewhere, 404);
+    assert_eq!(unknown, 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn import_needs_admin_refuses_a_full_catalog_without_replace_and_is_read_at_once() {
+    let server = TestServer::start(two_catalogs(), Config::default()).await;
+    let reader = server.key("reader", Access::Read, &[], None).await;
+    let admin = server.key("admin", Access::Admin, &[], Some("work")).await;
+    let tarball = get_export(&server, "pg", &admin)
+        .await
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
+
+    let as_reader = post_import(&server, "work", &reader, "", tarball.clone())
+        .await
+        .status();
+    let unknown = post_import(&server, "nope", &admin, "", tarball.clone())
+        .await
+        .status();
+    let first = post_import(&server, "work", &admin, "", tarball.clone()).await;
+    let first_status = first.status();
+    let report: serde_json::Value = first.json().await.unwrap();
+    let again = post_import(&server, "work", &admin, "", tarball.clone()).await;
+    let again_status = again.status();
+    let conflict: serde_json::Value = again.json().await.unwrap();
+    let replaced: serde_json::Value =
+        post_import(&server, "work", &admin, "?replace=true", tarball)
+            .await
+            .json()
+            .await
+            .unwrap();
+    let garbage = post_import(&server, "work", &admin, "", b"not a tarball".to_vec()).await;
+    let garbage_status = garbage.status();
+    let refusal: serde_json::Value = garbage.json().await.unwrap();
+    // No poll in between: the route swapped the snapshot in itself.
+    let client = server.client(&admin, None).await.unwrap();
+    let concept = call(&client, "get_concept", serde_json::json!({"path": "a"})).await;
+
+    assert_eq!(as_reader, 403);
+    assert_eq!(unknown, 404);
+    assert_eq!(first_status, 200);
+    assert_eq!(report["added"], 2);
+    assert_eq!(again_status, 409);
+    assert!(conflict["message"]
+        .as_str()
+        .unwrap()
+        .contains("?replace=true"));
+    assert_eq!(replaced["unchanged"], 2);
+    assert_eq!(garbage_status, 400);
+    assert_eq!(refusal["error"], "ImportRefused");
+    assert_eq!(structured(&concept)["catalog"], "work");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_import_larger_than_max_import_bytes_is_refused() {
+    let config = Config {
+        max_import_bytes: bytesize::ByteSize::b(1024),
+        ..Config::default()
+    };
+    let server = TestServer::start(two_catalogs(), config).await;
+    let admin = server.key("admin", Access::Admin, &[], None).await;
+
+    // Over the limit plus its 64 KiB of gzip slack.
+    let status = post_import(&server, "work", &admin, "", vec![0u8; 128 * 1024])
+        .await
+        .status();
+
+    assert_eq!(status, 413);
 }

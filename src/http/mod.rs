@@ -1,6 +1,8 @@
 //! The HTTP server (design "Process and routes"): `/healthz`, `/mcp`, and
-//! the archive routes (`archives`, Task 11), with request tracing, timeouts
-//! and the key layer.
+//! the archive routes (`archives`), with request tracing, timeouts and the
+//! key layer.
+
+mod archives;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -177,9 +179,10 @@ fn mcp_service(
 pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     let keys = Arc::clone(app.keys());
     // `route_layer` applies to the routes added before it, so every keyed
-    // route goes above it (Task 11 merges the archive routes here).
+    // route goes above it.
     let keyed = Router::new()
         .route_service("/mcp", mcp_service(&app, shutdown))
+        .merge(archives::routes(&app))
         .route_layer(middleware::from_fn_with_state(keys, require_key));
     let health = Router::new()
         .route("/healthz", get(healthz))

@@ -4841,6 +4841,7 @@ git commit -m "feat: open_questions, oldest, sprawl, links_report and lint tools
 - Create: `src/http/archives.rs`
 - Modify: `src/http/mod.rs` (`mod archives;`, and `.merge(archives::routes(&app))` above `route_layer`)
 - Modify: `tests/server.rs`
+- Modify: `src/config.rs` (`max_import_bytes`' doc comment names the import route's cap)
 - Create: `changelog/<ts>-m4-task-11-archive-routes.md`
 
 - [ ] **Step 1: Write the failing tests**
@@ -5098,6 +5099,20 @@ mod tests {
 ```
 
 In `src/http/mod.rs`, add `mod archives;` and put `.merge(archives::routes(&app))` after `.route_service("/mcp", ...)` and before `.route_layer(...)`, replacing the comment that said Task 11 would.
+
+> **Corrected (issue #74), 2026-11-03.** The routes above shipped as written (rustfmt
+> layout aside), using `timeout_layer()` as #70 corrected; the `StatusCode` import is
+> gone (nothing in `archives.rs` names a status). Differences: (1) both handlers carry
+> doc comments with Arguments, Returns and Errors (the status each error maps to).
+> (2) `max_import_bytes`' doc comment in `src/config.rs` ends "The import route caps
+> the request body at this size plus a little slack for gzip (`body_limit`)." (3) The
+> tests are rustfmt-wrapped and gather every answer before asserting (Arrange-Act-Assert);
+> the export test also checks `content-disposition` (`attachment; filename="pg.tar.gz"`),
+> and the import test also checks that an admin importing into an unknown catalog gets
+> 404. The unit test binds its three results before asserting. (4) `src/http/mod.rs`'s
+> module doc no longer says "Task 11". A refresh that fails after a committed import is
+> logged and the report still returned, as written; no test forces that failure (the
+> refresh and the import share one pool).
 
 - [ ] **Step 3: Run the tests**
 
