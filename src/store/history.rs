@@ -1,0 +1,108 @@
+//! A document's history: its rows in `revisions`, newest first.
+
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+
+use crate::error::OkfError;
+
+/// One revision of a document (its content left out).
+// `sqlx::FromRow` derives the code that builds this struct from a result
+// row, matching columns to fields by name.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RevisionRow {
+    /// The revision number, 1 for the first.
+    pub revision: i32,
+    /// `create`, `update`, `delete` or `import`.
+    pub op: String,
+    /// Who made it.
+    pub actor: String,
+    /// The publish message (`import` for an import).
+    pub message: String,
+    /// When (server clock).
+    pub created_at: DateTime<Utc>,
+}
+
+/// The newest `limit` revisions of one path.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `catalog_id` - the catalog.
+/// * `path` - catalog-relative path, as stored (no leading `/`).
+/// * `limit` - at most this many rows.
+///
+/// # Returns
+/// The rows, newest first; empty if the path never existed.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn revisions(
+    pool: &PgPool,
+    catalog_id: i64,
+    path: &str,
+    limit: i64,
+) -> Result<Vec<RevisionRow>, OkfError> {
+    // The primary key (catalog_id, path, revision), read backwards, serves
+    // both the filter and the order, so the query reads `limit` index entries.
+    let rows = sqlx::query_as::<_, RevisionRow>(
+        "SELECT revision, op, actor, message, created_at FROM revisions \
+         WHERE catalog_id = $1 AND path = $2 ORDER BY revision DESC LIMIT $3",
+    )
+    .bind(catalog_id)
+    .bind(path)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::files;
+    use crate::db::test_db;
+    use crate::store::catalogs;
+    use crate::store::import::{import, ImportOptions};
+    use chrono::Utc;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revisions_come_newest_first_and_outlive_a_delete() {
+        let db = test_db().await;
+        let catalog = catalogs::create(&db.pool, "pg", "", Utc::now())
+            .await
+            .unwrap();
+        for (version, replace) in [("one", false), ("two", true)] {
+            let options = ImportOptions {
+                replace,
+                actor: "tester",
+                now: Utc::now(),
+            };
+            let text = format!("# {version}\n");
+            let entries = files(&[("a.md", &text), ("b.md", "# B\n")]);
+            import(&db.pool, "pg", entries, &options).await.unwrap();
+        }
+        let options = ImportOptions {
+            replace: true,
+            actor: "tester",
+            now: Utc::now(),
+        };
+        import(&db.pool, "pg", files(&[("b.md", "# B\n")]), &options)
+            .await
+            .unwrap();
+
+        let all = revisions(&db.pool, catalog.id, "a.md", 20).await.unwrap();
+        let one = revisions(&db.pool, catalog.id, "a.md", 1).await.unwrap();
+        let none = revisions(&db.pool, catalog.id, "c.md", 20).await.unwrap();
+
+        let numbers: Vec<i32> = all.iter().map(|row| row.revision).collect();
+        assert_eq!(numbers, [3, 2, 1]);
+        // Import writes `import` for every added or changed file (M3,
+        // `src/store/import.rs`) and `delete` for a file it drops, both
+        // with the message `import`.
+        assert_eq!(all[0].op, "delete");
+        assert_eq!(all[1].op, "import");
+        assert_eq!(all[0].message, "import");
+        assert_eq!(all[2].actor, "tester");
+        assert_eq!(one, all[..1]);
+        assert!(none.is_empty());
+    }
+}
