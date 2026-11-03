@@ -419,7 +419,7 @@ Decision 1's identity and Decision 3's lock order, in the database. Migration `0
 - Modify: `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md` ("Decisions", "Storage", "Session lifecycle", "Errors", "Open questions for M5")
 - Create: `changelog/<ts>-m5-task-01-changesets.md`
 
-> **Corrected (issue #90), 2026-11-03.** `cli::tests::migrate_applies_the_schema` asserted exactly one row in `_sqlx_migrations`, so the second migration failed it. It now compares against `crate::db::MIGRATOR.iter().count()`, so later migrations need no change there. The rest of this task's code shipped as written (`rustfmt` of Step 6 plus Step 2 equals `src/store/changesets.rs`).
+> **Corrected (issue #90), 2026-11-03.** `cli::tests::migrate_applies_the_schema` asserted exactly one row in `_sqlx_migrations`, so the second migration failed it. It now compares against `crate::db::MIGRATOR.iter().count()`, so later migrations need no change there. The rest of this task's code shipped as written (`rustfmt` of Step 6 plus Step 2 equals `src/store/changesets.rs`). Review of PR #106 added three things, none of which changes an interface: `From<sqlx::Error>` logs a retryable driver error at `warn` before answering `Busy` (the variant drops it); a 12th test, `the_prune_passes_by_a_changeset_get_or_create_found_and_holds`, pins the conflict path's `FOR UPDATE` against the prune's `SKIP LOCKED`; and the design's "Lock order" paragraph covers key deletes.
 
 - [ ] **Step 1: The dependency**
 

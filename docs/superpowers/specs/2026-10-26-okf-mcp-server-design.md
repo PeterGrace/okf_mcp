@@ -197,7 +197,10 @@ order; publish (M5 Task 10) takes the in-process mutex, the same advisory lock, 
 catalog row and the changeset. Plain writes never take the advisory lock, so no order is
 reversed: writes and deletes wait for each other instead of deadlocking; a write that
 waited finds the catalog gone and writes nothing. The 24-hour prune takes no catalog lock
-and skips changesets other transactions hold (`SKIP LOCKED`). A deadlock or
+and skips changesets other transactions hold (`SKIP LOCKED`). Deleting a key sets its
+changesets' `key_id` to NULL without touching the catalog row; writes never change
+`key_id`, and the insert's `ON CONFLICT DO NOTHING` fires no foreign-key check, so this
+forms no cycle either. A deadlock or
 serialization failure Postgres still reports (`40P01`, `40001`) is the `Busy` error,
 which says to retry.
 
