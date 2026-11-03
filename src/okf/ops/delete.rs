@@ -58,7 +58,11 @@ pub fn delete_concept(workspace: &MemWorkspace, reference: &str) -> Result<OpOut
         .and_then(|text| listing_line(workspace, text, &index, &path));
     let links = links_into(workspace, &path, &index, listing)?;
     if !links.is_empty() {
-        return Err(OkfError::StillLinked { path, links });
+        // Catalog-relative with a leading `/`, as every path a tool returns.
+        return Err(OkfError::StillLinked {
+            path: format!("/{path}"),
+            links,
+        });
     }
     let unlisted = index_text
         .as_deref()
@@ -85,7 +89,8 @@ pub fn delete_concept(workspace: &MemWorkspace, reference: &str) -> Result<OpOut
 }
 
 /// Every link into `path` from another document, except the folder
-/// listing's line (`listing`, a 0-based line of `index`).
+/// listing's line (`listing`, a 0-based line of `index`). Each source is
+/// written with a leading `/` (`/hub.md`), as every path a tool returns.
 ///
 /// # Errors
 /// The workspace's read error.
@@ -117,7 +122,7 @@ fn links_into(
             // `repeat_with(..).take(n)`: one entry per link on the line.
             links.extend(
                 std::iter::repeat_with(|| LinkSource {
-                    source: source.clone(),
+                    source: format!("/{source}"),
                     line: number + 1,
                 })
                 .take(hits),
@@ -190,7 +195,8 @@ mod tests {
 
     fn link(source: &str, line: usize) -> LinkSource {
         LinkSource {
-            source: source.to_string(),
+            // Tools return `/`-prefixed paths, `StillLinked`'s included.
+            source: format!("/{source}"),
             line,
         }
     }
@@ -206,7 +212,7 @@ mod tests {
         assert!(
             matches!(
                 error,
-                OkfError::StillLinked { ref path, ref links } if path == "infra/x.md" && links == &[
+                OkfError::StillLinked { ref path, ref links } if path == "/infra/x.md" && links == &[
                     link("hub.md", 5),
                     link("log.md", 5),
                     link("infra/index.md", 7),

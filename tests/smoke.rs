@@ -508,7 +508,7 @@ async fn restructuring_on_a_real_catalog() {
     // (plan Decision 4), so the stub is the only one.
     assert_eq!(
         refusal["links"],
-        json!([{"source": "m6-smoke/moved.md", "line": 15}]),
+        json!([{"source": "/m6-smoke/moved.md", "line": 15}]),
         "the stub is the split-out concept's only link"
     );
     assert_eq!(published["published"], true);
