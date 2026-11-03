@@ -143,8 +143,11 @@ poll_interval = "10s"
 max_import_bytes = "64MiB"   # uncompressed total of an import
 ```
 
-Each milestone reads only its own fields (M3: `max_import_bytes`); unknown keys are
-ignored, so one file serves every version.
+Each milestone reads only its own fields (M3: `max_import_bytes`; M4: the rest except
+`time_server`, which M7's clock check reads); unknown keys are ignored, so one file
+serves every version. A zero `poll_interval` or `session_idle_timeout`, or an empty
+`allowed_hosts` (which rmcp would read as "accept any host") or a blank entry in it, is
+refused at load.
 
 Catalogs and keys are not in the config; they are rows. The only secret is
 `DATABASE_URL`, from an environment variable backed by a k8s Secret (CNPG generates
