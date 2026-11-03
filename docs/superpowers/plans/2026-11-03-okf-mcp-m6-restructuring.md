@@ -4484,8 +4484,8 @@ git commit -m "feat: move_concept, split_concept and delete_concept tools (M6.06
 
 Publish has no new code (Decision 1): `replayed_text` replays the new ops, a stale free edit is already a `Conflict`, and `links_into_deleted` already reads deletion entries. This task proves it with database tests in a new module, `restructure_publish_tests`, in `src/mcp/changesets.rs` (beside M5's `publish_tests`, whose helpers it mirrors). They cover:
 - **a move:** `delete` and `create` revisions, a tombstone, and a history per path (Decision 16);
-- **replays onto a concurrent change:** a move's `Relink` onto a concurrent `index` of the same folder and onto a concurrent `log`; a delete's `Unlist` onto a concurrent listing;
-- **refusals:** the `Conflict` on a concurrent edit of a linking file, `link-into-deleted` for a link to the old path published meanwhile or left by a partial `discard` of the move (Decision 17), and a cross-folder move's `Unlist` refusing a listing changed meanwhile;
+- **replays onto a concurrent change:** a move's `Relink` onto a concurrent `index` of the same folder and onto a concurrent `log`; a delete's `Unlist` onto a concurrent listing, and onto its own listing reworded meanwhile (`bullet: None`, Decision 6);
+- **refusals:** the `Conflict` on a concurrent edit of a linking file or of a split's parent, `link-into-deleted` for a link to the old path published meanwhile or left by a partial `discard` of the move (Decision 17), and a cross-folder move's `Unlist` refusing a listing changed meanwhile;
 - **a split:** the parent, the new concept and the listing; and links published meanwhile into the split section (Decision 18): the section's own anchor still resolves, a subsection's is a `broken-anchor` warning.
 
 The ops run through `write::apply` directly, as M5's Task 10 tests did, so this task does not wait for Task 6.
@@ -4787,7 +4787,7 @@ mod restructure_publish_tests {
     async fn a_partial_discard_of_a_move_leaves_a_link_publish_refuses() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
-        moved(&ctx, "infra/x.md", "infra/z.md").await;
+        let report = moved(&ctx, "infra/x.md", "infra/z.md").await;
         // Drop only hub.md's rewrite: the published hub.md still links the old path.
         let params = DiscardParams {
             paths: Some(vec!["/hub.md".to_string()]),
@@ -4806,6 +4806,11 @@ mod restructure_publish_tests {
                 .any(|finding| finding.file == "hub.md" && finding.rule == "link-into-deleted"),
             "{errors:?}"
         );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4926,15 +4931,91 @@ mod restructure_publish_tests {
         assert!(published_text(&test, "infra/big.md").contains("## Part\n"));
         assert!(published_text(&test, "infra/part.md").contains("Deep text."));
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_unlists_a_listing_reworded_meanwhile() {
+        let test = pg().await;
+        let deleter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        deleted(&deleter, "infra/y.md").await;
+        let edit = EditDocumentParams {
+            path: "/infra/index.md".to_string(),
+            old_str: "* [Y](y.md) - y".to_string(),
+            new_str: "* [Y](y.md) - why".to_string(),
+            replace_all: false,
+            catalog: None,
+        };
+        edit_document(&other, edit).await.unwrap();
+        publish_as(&other, "reword y").await.unwrap();
+
+        let published = publish_as(&deleter, "drop y").await.unwrap();
+
+        // `delete_concept` records `Unlist { bullet: None }` (plan Decision 6):
+        // the bullet goes whatever it reads now, unlike a move's `Some`.
+        assert_eq!(published.report.replayed, ["/infra/index.md"]);
+        assert_eq!(
+            revisions(&published),
+            [
+                ("/infra/index.md", "update", 3),
+                ("/infra/y.md", "delete", 2)
+            ]
+        );
+        let index = published_text(&test, "infra/index.md");
+        assert!(!index.contains("y.md"), "{index}");
+        assert!(index.contains("* [X](x.md) - x"), "{index}");
+        assert!(tombstoned(&test, "infra/y.md").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_split_conflicts_with_a_concurrent_edit_of_its_parent() {
+        let test = pg().await;
+        let splitter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        let report = split_part(&splitter).await;
+        let edit = EditDocumentParams {
+            path: "/infra/big.md".to_string(),
+            old_str: "Rest text.".to_string(),
+            new_str: "Rest text, edited.".to_string(),
+            replace_all: false,
+            catalog: None,
+        };
+        edit_document(&other, edit).await.unwrap();
+        publish_as(&other, "edit big").await.unwrap();
+
+        let error = publish_as(&splitter, "split big").await.unwrap_err();
+
+        // The parent is a free edit (plan Decision 1), so a stale base conflicts.
+        assert!(
+            matches!(
+                error,
+                OkfError::Conflict { ref files } if files == &[ConflictFile {
+                    path: "/infra/big.md".to_string(),
+                    base_revision: Some(1),
+                    current_revision: Some(2),
+                }]
+            ),
+            "{error:?}"
+        );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
+    }
 }
 ```
 
-> **Corrected (issue #126), 2026-11-03.** The tests compiled and passed as written: publish needed no code change, so there is no T7 -> T8 edge. Two changes: the count is 9, not 8 (a review added `a_partial_discard_of_a_move_leaves_a_link_publish_refuses`), and the move test's inline tombstone query became a helper, `tombstoned`, which the delete test now also asserts, since its name promises a tombstone it did not check. Review on PR #135 made the log test's `replayed` check exact, has the `link-into-deleted` test assert that the changeset stays `Open`, and added a tenth test, `links_into_a_split_section_published_meanwhile_resolve_or_only_warn`, with a `### Deep` subsection in `BIG` and a shared `split_part` helper. That test corrected Decision 18 (see its note). The code above is the shipped module, in rustfmt's layout.
+> **Corrected (issue #126), 2026-11-03.** The module has 12 tests, not 8. The 9 tests the plan listed (the plan's count missed `a_partial_discard_of_a_move_leaves_a_link_publish_refuses`, which a review added) compiled and passed as written: publish needed no code change, so there is no T7 -> T8 edge. The move test's inline tombstone query became a helper, `tombstoned`, which the delete test now also asserts, since its name promises a tombstone it did not check. Brooke's reviews on PR #135 added the rest:
+> - exact `replayed` in the log test, and `Open` after the refusal in both `link-into-deleted` tests;
+> - `links_into_a_split_section_published_meanwhile_resolve_or_only_warn`, with a `### Deep` subsection in `BIG` and a shared `split_part` helper. This test failed as first written, against the old Decision 18, and corrected it (see that note);
+> - `a_delete_unlists_a_listing_reworded_meanwhile` (the `None` side of Decision 6's `Unlist`) and `a_split_conflicts_with_a_concurrent_edit_of_its_parent` (Decision 1). Both passed as written.
+>
+> The code above is the shipped module, in rustfmt's layout.
 
 - [ ] **Step 2: Run them**
 
 Run: `cargo test --lib -- restructure_publish_tests --test-threads=6`
-Expected: 10 passed. The tests target code Tasks 2-5 already merged; if one fails, the bug is in that code or in publish. Fix it in this PR and record a dated `Corrected` note in the task whose code changed.
+Expected: 12 passed. The tests target code Tasks 2-5 already merged; if one fails, the bug is in that code or in publish. Fix it in this PR and record a dated `Corrected` note in the task whose code changed.
 
 - [ ] **Step 3: Update the design**
 
@@ -4953,7 +5034,7 @@ Task 7 of `docs/superpowers/plans/2026-11-03-okf-mcp-m6-restructuring.md` (miles
 
 ## Added
 
-- `src/mcp/changesets.rs`, `restructure_publish_tests`: 10 database tests:
+- `src/mcp/changesets.rs`, `restructure_publish_tests`: 12 database tests:
   - a move's revisions, tombstone and per-path histories;
   - its `Relink` replayed onto a concurrent `index` and onto a concurrent `log`;
   - the `Conflict` on a concurrent edit of a linking file;
@@ -4964,7 +5045,9 @@ Task 7 of `docs/superpowers/plans/2026-11-03-okf-mcp-m6-restructuring.md` (miles
   - a split's four revisions (the parent, the new concept, the folder index
     and a linking file);
   - links published meanwhile into the split section: the section's anchor
-    still resolves, a subsection's is a `broken-anchor` warning.
+    still resolves, a subsection's is a `broken-anchor` warning;
+  - a delete's `Unlist` onto its listing reworded meanwhile;
+  - the `Conflict` on a concurrent edit of a split's parent.
 
 ## Changed
 

@@ -2543,7 +2543,7 @@ mod restructure_publish_tests {
     async fn a_partial_discard_of_a_move_leaves_a_link_publish_refuses() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
-        moved(&ctx, "infra/x.md", "infra/z.md").await;
+        let report = moved(&ctx, "infra/x.md", "infra/z.md").await;
         // Drop only hub.md's rewrite: the published hub.md still links the old path.
         let params = DiscardParams {
             paths: Some(vec!["/hub.md".to_string()]),
@@ -2562,6 +2562,11 @@ mod restructure_publish_tests {
                 .any(|finding| finding.file == "hub.md" && finding.rule == "link-into-deleted"),
             "{errors:?}"
         );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2681,5 +2686,76 @@ mod restructure_publish_tests {
         );
         assert!(published_text(&test, "infra/big.md").contains("## Part\n"));
         assert!(published_text(&test, "infra/part.md").contains("Deep text."));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_unlists_a_listing_reworded_meanwhile() {
+        let test = pg().await;
+        let deleter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        deleted(&deleter, "infra/y.md").await;
+        let edit = EditDocumentParams {
+            path: "/infra/index.md".to_string(),
+            old_str: "* [Y](y.md) - y".to_string(),
+            new_str: "* [Y](y.md) - why".to_string(),
+            replace_all: false,
+            catalog: None,
+        };
+        edit_document(&other, edit).await.unwrap();
+        publish_as(&other, "reword y").await.unwrap();
+
+        let published = publish_as(&deleter, "drop y").await.unwrap();
+
+        // `delete_concept` records `Unlist { bullet: None }` (plan Decision 6):
+        // the bullet goes whatever it reads now, unlike a move's `Some`.
+        assert_eq!(published.report.replayed, ["/infra/index.md"]);
+        assert_eq!(
+            revisions(&published),
+            [
+                ("/infra/index.md", "update", 3),
+                ("/infra/y.md", "delete", 2)
+            ]
+        );
+        let index = published_text(&test, "infra/index.md");
+        assert!(!index.contains("y.md"), "{index}");
+        assert!(index.contains("* [X](x.md) - x"), "{index}");
+        assert!(tombstoned(&test, "infra/y.md").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_split_conflicts_with_a_concurrent_edit_of_its_parent() {
+        let test = pg().await;
+        let splitter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        let report = split_part(&splitter).await;
+        let edit = EditDocumentParams {
+            path: "/infra/big.md".to_string(),
+            old_str: "Rest text.".to_string(),
+            new_str: "Rest text, edited.".to_string(),
+            replace_all: false,
+            catalog: None,
+        };
+        edit_document(&other, edit).await.unwrap();
+        publish_as(&other, "edit big").await.unwrap();
+
+        let error = publish_as(&splitter, "split big").await.unwrap_err();
+
+        // The parent is a free edit (plan Decision 1), so a stale base conflicts.
+        assert!(
+            matches!(
+                error,
+                OkfError::Conflict { ref files } if files == &[ConflictFile {
+                    path: "/infra/big.md".to_string(),
+                    base_revision: Some(1),
+                    current_revision: Some(2),
+                }]
+            ),
+            "{error:?}"
+        );
+        let row = changesets::by_id(test.app.pool(), report.changeset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, ChangesetState::Open);
     }
 }
