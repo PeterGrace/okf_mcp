@@ -37,7 +37,11 @@ use crate::okf::workspace::{MemWorkspace, Workspace};
 ///   for `index.md`, `log.md` and the root readmes).
 /// - [`OkfError::InvalidPath`] for a concept in machinery ([`check_path`]).
 /// - [`OkfError::StillLinked`] while another document links to it.
-/// - The workspace's read or write error.
+/// - The workspace's read or write error. Every walked markdown file is read,
+///   so one that is not UTF-8, anywhere in the catalog, is [`OkfError::Io`],
+///   as it is for `Snapshot::build` (and so for publish). A stored catalog
+///   holds none: import refuses such a file and the write tools write only
+///   UTF-8.
 pub fn delete_concept(workspace: &MemWorkspace, reference: &str) -> Result<OpOutcome, OkfError> {
     let path = check_path(&resolve_concept(workspace, reference)?)?;
     let folder = dirname(&path);
