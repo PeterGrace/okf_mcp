@@ -651,10 +651,10 @@ spec:
   baseline.
 - **Compare it** with the live database when it is ready, querying both at the
   same moment with writes still held, so the two must be equal. Counts catch
-  missing rows, and one checksum over every document (catalog, path and
-  content) catches changed content. It does not cover a file's execute bit,
-  revision rows' content or changesets; the counts and `last_revision` stand in
-  for those:
+  missing rows, and one checksum over every document (catalog, path, revision,
+  execute bit and content) catches changed documents. It does not cover the
+  revision history's content or changesets; the counts and `last_revision`
+  stand in for those:
 
   ```sh
   kubectl -n okf-mcp exec -i <instance> -c postgres -- psql -d okf_mcp <<'SQL'
@@ -663,7 +663,8 @@ spec:
          (SELECT count(*) FROM revisions) AS revisions,
          (SELECT max(created_at) FROM revisions) AS last_revision,
          (SELECT encode(sha256(convert_to(string_agg(
-                    catalog_id || '/' || path || ':' || encode(sha256(content), 'hex'),
+                    catalog_id || '/' || path || '@' || revision || ':' || executable
+                      || ':' || encode(sha256(content), 'hex'),
                     ',' ORDER BY catalog_id, path), 'UTF8')), 'hex')
             FROM documents) AS content_checksum;
   SQL
@@ -676,7 +677,10 @@ spec:
 - **If the live database moved anyway,** the checksum can no longer match.
   Require each count to be at least the baseline and at most the live value,
   and compare one document you know didn't change by its own
-  `encode(sha256(content), 'hex')`.
+  `encode(sha256(content), 'hex')`. The bound assumes rows only grow: a
+  catalog deleted in the window (which cascades through `documents` and
+  `revisions`) breaks it even on a good restore, so a window that may include a
+  deletion needs writes held, not bounds.
 - **Then** either point `DATABASE_URL` and `PGSSLROOTCERT` at its `-app` and
   `-ca` secrets, or delete it (`kubectl -n okf-mcp delete cluster
   okf-mcp-db-restore`; CloudNativePG removes its volumes).
