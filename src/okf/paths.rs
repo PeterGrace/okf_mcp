@@ -174,8 +174,9 @@ pub fn relpath(path: &str, start: &str) -> String {
 
 /// Is `path` a root `AGENTS.md`, `CLAUDE.md` or `README.md`? `okf.py`'s
 /// link analysis and `rewrite_links` skip exactly these
-/// (`NON_CONCEPTS - RESERVED` at the root), as does
-/// [`crate::okf::snapshot::SnapshotDoc::in_link_graph`].
+/// (`NON_CONCEPTS - RESERVED` at the root).
+/// [`crate::okf::snapshot::SnapshotDoc::in_link_graph`] is defined as its
+/// negation, so the two cannot drift apart.
 ///
 /// # Arguments
 /// * `path` - catalog-relative path.

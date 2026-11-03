@@ -40,7 +40,7 @@ use crate::okf::analysis::secrets::{scan_secrets, OKF_PY_PATH};
 use crate::okf::analysis::Finding;
 use crate::okf::doc::Doc;
 use crate::okf::markdown::{anchors_in, find_links, resolve_link, split_frontmatter};
-use crate::okf::paths::{basename, escapes_root, is_concept, normpath};
+use crate::okf::paths::{basename, escapes_root, is_concept, normpath, outside_link_graph};
 use crate::okf::pystr::{py_strip, universal_newlines};
 use crate::okf::search::SearchFields;
 use crate::okf::workspace::Workspace;
@@ -213,9 +213,10 @@ impl SnapshotDoc {
     ///
     /// # Returns
     /// `true` for everything except the root `AGENTS.md`, `CLAUDE.md` and
-    /// `README.md` (`build_docs` skips them).
+    /// `README.md` (`build_docs` skips them): the negation of
+    /// [`outside_link_graph`], so the snapshot and `rewrite_links` share one rule.
     pub fn in_link_graph(&self) -> bool {
-        !(self.kind == DocKind::Machinery && !self.path.contains('/'))
+        !outside_link_graph(&self.path)
     }
 }
 
