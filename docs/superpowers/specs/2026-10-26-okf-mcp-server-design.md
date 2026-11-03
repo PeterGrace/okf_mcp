@@ -495,6 +495,11 @@ One `thiserror` enum, `OkfError`:
 | `Database` | Any database failure (details logged, not returned) |
 | `Io` | Filesystem errors (import, export) |
 
+The ported `okf.py` commands (`stamp`, `review`, `question`, `unquestion`, `add_source`,
+`log`, `index`) refuse with `okf.py`'s own words: its `die(msg)` is `Refused { reason: msg }`,
+except where a variant above already names the problem (`NotFound`, `InvalidPath`,
+`FrontmatterParse`, and `Shape` for an `open_questions` or `sources` that is not a list).
+
 Mapping:
 
 - Auth failures are HTTP 401 or 403 before MCP is involved.
