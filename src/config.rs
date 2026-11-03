@@ -77,7 +77,9 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Parses a configuration file's text.
+    /// Parses a configuration file's text. It does not call
+    /// [`Config::validate`]; [`Config::load`] does, so a caller that parses
+    /// text itself must validate the result before serving with it.
     ///
     /// # Arguments
     /// * `text` - the file's contents.

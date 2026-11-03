@@ -361,7 +361,7 @@ impl Default for Config {
 > (`""` or whitespace), which would otherwise reject every request with no hint why;
 > the code below and Step 2's refusal test include it.
 
-Keep `from_toml` as it is. Add `validate` after it and call it from `load`:
+Keep `from_toml`'s code as it is, but start its doc comment with "Parses a configuration file's text. It does not call [`Config::validate`]; [`Config::load`] does, so a caller that parses text itself must validate the result before serving with it." (added in review of PR #76). Add `validate` after it and call it from `load`:
 
 ```rust
     /// Checks the values serde cannot: ones that would break the server.
