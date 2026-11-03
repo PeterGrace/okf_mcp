@@ -238,14 +238,23 @@ nor disk in tests.
 ## Tools
 
 All tools take an optional `catalog` (`search` takes `catalogs`). Results are structured
-JSON (rmcp `Json<T>`, `schemars` schemas) plus a short text summary. Concept paths accept
+JSON (rmcp `Json<T>`, `schemars` schemas). Concept paths accept
 `/infra/time-server.md`, `infra/time-server` or `/infra/time-server`, as `okf.py` does.
+
+Each result's `structuredContent` is the JSON, and its one text block holds the same JSON
+(rmcp's `Json<T>`), rather than a hand-written summary. Errors are results with
+`isError: true` and a body `{"error": <variant>, "message": <text>}` plus the `path`,
+`catalog` or `problems` they concern; a database error says only that the log has the
+details. Without a `catalog` argument, `get_concept`, `read_document` and `history` look
+through the selected catalogs in order and answer from the first that has the path, naming
+it; the reports (`open_questions`, `oldest`, `sprawl`, `links_report`, `lint`) run on the
+first selected catalog.
 
 ### Read tools (need `read`)
 
 | Tool | Parameters | Result |
 |---|---|---|
-| `list_catalogs` | none | Catalogs the key can reach; this connection's selection; default write target; document count and last publish time per catalog |
+| `list_catalogs` | none | Catalogs the key can reach (name, description, file count, last change); this connection's selection and default write target, or why there is none |
 | `search` | `query`, `catalogs?`, `type?`, `tags?`, `status?`, `limit?` (default 20) | Ranked hits across catalogs: catalog, path, title, description, snippet. Every whitespace-separated term must occur (case-insensitive substring) in some field; the tier is the best field holding the whole query, else the best holding a term (fields, best first: title/alias, tag, description, body); deprecated concepts last; ties by catalog order, then path. The `tags` filter matches whole tags only, while free text matches tags by substring: the tool description must say so |
 | `get_concept` | `path`, `links?`, `raw?` | Frontmatter as JSON and the body; with `links`, resolved outbound links (path, title, description, broken flag) and inbound backlinks; with `raw`, the file verbatim |
 | `read_document` | `path?` (default `/index.md`) | Raw text of an `index.md`, `log.md` or `AGENTS.md` |

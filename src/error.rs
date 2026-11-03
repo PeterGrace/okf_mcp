@@ -109,3 +109,118 @@ pub enum OkfError {
         reason: String,
     },
 }
+
+impl OkfError {
+    /// The variant's name, as clients see it in a tool error's `error` field.
+    ///
+    /// # Returns
+    /// The name, e.g. `"NotFound"`.
+    pub fn kind(&self) -> &'static str {
+        // `{ .. }` matches a variant whatever its fields hold. No `_` arm:
+        // a new variant fails to compile here until it is given a name.
+        match self {
+            OkfError::NotFound { .. } => "NotFound",
+            OkfError::InvalidPath { .. } => "InvalidPath",
+            OkfError::FrontmatterParse { .. } => "FrontmatterParse",
+            OkfError::Shape { .. } => "Shape",
+            OkfError::Io { .. } => "Io",
+            OkfError::ImportRefused { .. } => "ImportRefused",
+            OkfError::Database { .. } => "Database",
+            OkfError::Migrate { .. } => "Migrate",
+            OkfError::Config { .. } => "Config",
+            OkfError::CatalogNotSelected { .. } => "CatalogNotSelected",
+            OkfError::Forbidden { .. } => "Forbidden",
+            OkfError::Refused { .. } => "Refused",
+        }
+    }
+
+    /// Is this the server's fault, with details for the log only?
+    ///
+    /// # Returns
+    /// `true` for database and migration failures.
+    pub fn is_internal(&self) -> bool {
+        matches!(self, OkfError::Database { .. } | OkfError::Migrate { .. })
+    }
+
+    /// The error as clients see it: `{"error": kind, "message": text}`, plus
+    /// the `path`, `catalog` or `problems` it concerns.
+    ///
+    /// # Returns
+    /// The JSON body. An internal error's message says only that the server
+    /// log has the details, so a driver message never reaches a client.
+    pub fn to_json(&self) -> serde_json::Value {
+        let message = if self.is_internal() {
+            "internal error; the server log has the details".to_string()
+        } else {
+            // `to_string` comes from the `#[error(...)]` text (thiserror
+            // implements `Display`), like Python's `str(exc)`.
+            self.to_string()
+        };
+        let mut body = serde_json::json!({ "error": self.kind(), "message": message });
+        // One arm can bind `path` from several variants (`|`) because each
+        // has a field of that name and type.
+        match self {
+            OkfError::NotFound { path }
+            | OkfError::InvalidPath { path, .. }
+            | OkfError::FrontmatterParse { path, .. }
+            | OkfError::Shape { path, .. }
+            | OkfError::Io { path, .. } => body["path"] = path.as_str().into(),
+            OkfError::CatalogNotSelected { catalog } => body["catalog"] = catalog.as_str().into(),
+            OkfError::ImportRefused { problems } => body["problems"] = problems.as_slice().into(),
+            OkfError::Database { .. }
+            | OkfError::Migrate { .. }
+            | OkfError::Config { .. }
+            | OkfError::Forbidden { .. }
+            | OkfError::Refused { .. } => {}
+        }
+        body
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_json_names_the_kind_and_what_to_act_on() {
+        let not_found = OkfError::NotFound {
+            path: "/x.md".to_string(),
+        };
+        let unselected = OkfError::CatalogNotSelected {
+            catalog: "work".to_string(),
+        };
+        let refused = OkfError::ImportRefused {
+            problems: vec!["a: bad".to_string()],
+        };
+
+        let not_found_body = not_found.to_json();
+        let unselected_body = unselected.to_json();
+        let refused_body = refused.to_json();
+
+        assert_eq!(
+            not_found_body,
+            serde_json::json!({
+                "error": "NotFound",
+                "message": "/x.md: no such concept or document",
+                "path": "/x.md",
+            })
+        );
+        assert_eq!(unselected_body["error"], "CatalogNotSelected");
+        assert_eq!(unselected_body["catalog"], "work");
+        assert_eq!(refused_body["problems"], serde_json::json!(["a: bad"]));
+    }
+
+    #[test]
+    fn internal_errors_hide_their_details() {
+        let error = OkfError::Database {
+            source: sqlx::Error::PoolTimedOut,
+        };
+
+        let body = error.to_json();
+
+        assert!(error.is_internal());
+        assert_eq!(body["error"], "Database");
+        assert!(!body["message"].as_str().unwrap().contains("pool"));
+        assert_eq!(body.as_object().unwrap().len(), 2);
+    }
+}
