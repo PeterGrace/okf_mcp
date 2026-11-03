@@ -1,7 +1,6 @@
 //! The configuration file (TOML; the design's "Configuration"). Each
-//! milestone reads the fields it uses (M4: everything but `time_server`,
-//! which the M7 clock check reads). Unknown keys are ignored, so one file
-//! serves every version of the server.
+//! milestone reads the fields it uses (M7 added `time_server`). Unknown keys
+//! are ignored, so one file serves every version of the server.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
@@ -61,6 +60,9 @@ pub struct Config {
     /// How long an MCP session may be idle before it is closed (`"2h"`).
     #[serde(with = "humantime_serde")]
     pub session_idle_timeout: Duration,
+    /// The NTP server the clock check measures against (`host`, `host:port`
+    /// or an address); none means no check (design "Time").
+    pub time_server: Option<String>,
 }
 
 impl Default for Config {
@@ -74,6 +76,7 @@ impl Default for Config {
             default_catalog: None,
             poll_interval: DEFAULT_POLL_INTERVAL,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
+            time_server: None,
         }
     }
 }
@@ -105,7 +108,9 @@ impl Config {
     /// A zero `poll_interval` (tokio's interval panics on zero) or
     /// `session_idle_timeout`, an empty `allowed_hosts` (which rmcp reads as
     /// "accept any `Host`"), or a blank entry in it (which no `Host` matches,
-    /// so every request would get 403 with no hint why).
+    /// so every request would get 403 with no hint why), or a blank
+    /// `time_server` or one with surrounding whitespace (which the lookup
+    /// would fail on every check, seen only as a `warn`).
     pub fn validate(&self) -> Result<(), String> {
         if self.poll_interval.is_zero() {
             return Err("poll_interval must be more than zero".to_string());
@@ -122,6 +127,17 @@ impl Config {
         // whitespace, so the check allocates nothing.
         if self.allowed_hosts.iter().any(|host| host.trim().is_empty()) {
             return Err("allowed_hosts has a blank entry; remove it or name a host".to_string());
+        }
+        // `if let Some(x) = ...`: Python's `if (x := ...) is not None`.
+        // `as_deref` turns `&Option<String>` into `Option<&str>`.
+        if let Some(server) = self.time_server.as_deref() {
+            let trimmed = server.trim();
+            if trimmed.is_empty() {
+                return Err("time_server is blank; name the NTP server or leave it out".to_string());
+            }
+            if trimmed != server {
+                return Err("time_server has surrounding whitespace; remove it".to_string());
+            }
         }
         Ok(())
     }
@@ -185,7 +201,8 @@ mod tests {
                     default_catalog = \"pg\"\n\
                     poll_interval = \"90s\"\n\
                     session_idle_timeout = \"30m\"\n\
-                    time_server = \"ntp.example\"\n";
+                    time_server = \"ntp.example\"\n\
+                    a_later_key = true\n";
 
         let config = Config::from_toml(text).unwrap();
 
@@ -195,6 +212,27 @@ mod tests {
         assert_eq!(config.default_catalog.as_deref(), Some("pg"));
         assert_eq!(config.poll_interval, Duration::from_secs(90));
         assert_eq!(config.session_idle_timeout, Duration::from_secs(30 * 60));
+        assert_eq!(config.time_server.as_deref(), Some("ntp.example"));
+    }
+
+    #[test]
+    fn time_server_is_optional_and_never_blank() {
+        let none = Config::from_toml("").unwrap();
+        let named = Config::from_toml("time_server = \"time.example\"\n").unwrap();
+        let blank = Config::from_toml("time_server = \"  \"\n").unwrap();
+        let padded = Config::from_toml("time_server = \" time.example\\t\"\n").unwrap();
+
+        assert_eq!(none.time_server, None);
+        assert_eq!(named.time_server.as_deref(), Some("time.example"));
+        assert_eq!(named.validate(), Ok(()));
+        assert_eq!(
+            blank.validate(),
+            Err("time_server is blank; name the NTP server or leave it out".to_string())
+        );
+        assert_eq!(
+            padded.validate(),
+            Err("time_server has surrounding whitespace; remove it".to_string())
+        );
     }
 
     #[test]

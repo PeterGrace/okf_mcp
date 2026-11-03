@@ -7,8 +7,9 @@
 //! (`auth`), which catalogs a call acts on (`selection`), the catalog store
 //! (`store`), the write path every write tool goes through (`write`), the
 //! configuration file (`config`), the server's shared state and poll loop
-//! (`app`), the MCP handler and its tools (`mcp`), the SNTP client the
-//! clock check uses (`ntp`), the HTTP router and server (`http`), the
+//! (`app`), the MCP handler and its tools (`mcp`), the SNTP client (`ntp`)
+//! and the clock check that uses it (`clock_check`), the HTTP router and
+//! server (`http`), the
 //! command line (`cli`), errors, and the clock.
 //! `main.rs` only starts it.
 
@@ -18,6 +19,7 @@ pub mod auth;
 pub mod catalog;
 pub mod cli;
 pub mod clock;
+pub mod clock_check;
 pub mod config;
 pub mod db;
 pub mod error;

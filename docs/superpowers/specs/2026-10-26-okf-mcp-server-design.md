@@ -105,7 +105,7 @@ One binary, `okf-mcp`, on tokio with an axum router:
 | `POST/GET/DELETE /mcp` | any key | rmcp `StreamableHttpService`: stateful (`Mcp-Session-Id`) for a client on a protocol version before `2026-07-28`, stateless for one on `2026-07-28` (see "Questions M5 answered"). Each `Mcp-Session-Id` is bound to the key whose request opened it; a request naming it with another key, or naming a session with no binding (idle past `session_idle_timeout`, or never issued), gets 404, rmcp's answer for an unknown session |
 | `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as `application/gzip` with `Content-Disposition: attachment; filename="<name>.tar.gz"`, built in memory on request from the published documents |
 | `POST /catalogs/{name}/import[?replace=true]` | `admin` on the catalog | Replaces or fills an existing catalog from an uploaded `.tar.gz` (see "Import") and answers with the import report once the new snapshot is swapped in. The key is checked before the body is read; then the tarball is read and checked (400 with every problem), then the catalog is looked up (404), so a key granted every catalog that posts a bad archive to an unknown one gets 400. A non-empty catalog without `?replace=true` is 409, its message naming `?replace=true`. A body over `max_import_bytes` plus 0.1% and 64 KiB of gzip slack is 413, axum's plain-text rejection rather than the error JSON. Creating and deleting catalogs is subcommand-only |
-| `GET /healthz` | none | Liveness and readiness: `{"database": "ok"\|"unreachable", "catalogs": <count>}` (a count, no names: it needs no key), 200 while the database answers within 2 seconds (a pool connection included), else 503. The clock offset joins it in M7 |
+| `GET /healthz` | none | Liveness and readiness: `{"database": "ok"\|"unreachable", "catalogs": <count>}` (a count, no names: it needs no key), 200 while the database answers within 2 seconds (a pool connection included), else 503; plus `clock`, the last clock check (see "Time"), which does not affect the status |
 
 `tower` middleware: request tracing, timeouts, and the auth layer on every route but
 `/healthz`. `/mcp` also has the session binding, inside the auth layer. rmcp's DNS-rebinding check (`allowed_hosts`, which defaults to localhost
@@ -155,10 +155,11 @@ max_import_bytes = "64MiB"   # uncompressed total of an import
 ```
 
 Each milestone reads only its own fields (M3: `max_import_bytes`; M4: the rest except
-`time_server`, which M7's clock check reads); unknown keys are ignored, so one file
-serves every version. A zero `poll_interval` or `session_idle_timeout`, or an empty
-`allowed_hosts` (which rmcp would read as "accept any host") or a blank entry in it, is
-refused at load.
+`time_server`; M7: `time_server`, optional: without it there is no clock check); unknown
+keys are ignored, so one file serves every version. A zero `poll_interval` or
+`session_idle_timeout`, an empty `allowed_hosts` (which rmcp would read as "accept any
+host") or a blank entry in it, or a `time_server` that is blank or has surrounding
+whitespace, is refused at load.
 
 Catalogs and keys are not in the config; they are rows. The only secret is
 `DATABASE_URL`, from an environment variable backed by a k8s Secret (CNPG generates
@@ -624,8 +625,12 @@ Logging uses `tracing`. Never logged: API keys, `DATABASE_URL`, or matched secre
 All timestamps come from `chrono::Utc::now()` through the `clock` module (formatted
 `%Y-%m-%dT%H:%M:%SZ`). At startup and every 15 minutes, the server queries the GPS
 stratum 1 time server (`time_server` in config) over NTP and logs at `error` if the
-offset exceeds 2 seconds. `/healthz` reports the last offset. Lint's future-timestamp
-check keeps `okf.py`'s 2-minute slack. Revision times are written by the server
+offset exceeds 2 seconds (and at `warn` when the query fails; the query times out after
+5 seconds, DNS included). `/healthz` reports the last check (`clock`: `ok`, `checked_at`,
+and `offset_ms` and `stratum` when it succeeded; `null` without a `time_server`). The
+server's name and any error go only to the logs, since `/healthz` is public. It never
+changes `/healthz`'s status: a time-server outage must not take the server out of
+service. Lint's future-timestamp check keeps `okf.py`'s 2-minute slack. Revision times are written by the server
 (`Utc::now()`), not by Postgres's `now()`, so they follow the same clock.
 
 ## Testing
