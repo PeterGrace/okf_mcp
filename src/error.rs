@@ -58,6 +58,19 @@ pub enum OkfError {
         key: String,
     },
 
+    /// `edit_document`'s old text does not occur exactly once (or, with
+    /// `replace_all`, not at all).
+    #[error(
+        "{path}: the old text occurs {matches} times; it must occur exactly once, \
+         or at least once with replace_all"
+    )]
+    EditMismatch {
+        /// Catalog-relative path of the document.
+        path: String,
+        /// How many times the old text occurs.
+        matches: usize,
+    },
+
     /// A filesystem operation failed.
     #[error("{path}: {source}")]
     Io {
@@ -149,6 +162,7 @@ impl OkfError {
             OkfError::FrontmatterParse { .. } => "FrontmatterParse",
             OkfError::SecretDetected { .. } => "SecretDetected",
             OkfError::Shape { .. } => "Shape",
+            OkfError::EditMismatch { .. } => "EditMismatch",
             OkfError::Io { .. } => "Io",
             OkfError::ImportRefused { .. } => "ImportRefused",
             OkfError::Database { .. } => "Database",
@@ -205,6 +219,11 @@ impl OkfError {
                 body["path"] = path.as_str().into();
                 body["line"] = (*line).into();
                 body["rule"] = rule.as_str().into();
+            }
+            OkfError::EditMismatch { path, matches } => {
+                body["path"] = path.as_str().into();
+                // `*matches` copies the `usize` out of the borrowed field.
+                body["matches"] = (*matches).into();
             }
             OkfError::CatalogNotSelected { catalog } => body["catalog"] = catalog.as_str().into(),
             OkfError::ImportRefused { problems } => body["problems"] = problems.as_slice().into(),
@@ -339,6 +358,28 @@ mod tests {
                 "error": "Io",
                 "message": "internal error; the server log has the details",
                 "path": "a.md",
+            })
+        );
+    }
+
+    #[test]
+    fn edit_mismatch_names_the_path_and_the_count() {
+        let error = OkfError::EditMismatch {
+            path: "a.md".to_string(),
+            matches: 2,
+        };
+
+        let body = error.to_json();
+
+        assert!(!error.is_internal());
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "EditMismatch",
+                "message": "a.md: the old text occurs 2 times; it must occur exactly once, \
+                            or at least once with replace_all",
+                "path": "a.md",
+                "matches": 2,
             })
         );
     }

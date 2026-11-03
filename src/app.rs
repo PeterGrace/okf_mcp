@@ -18,6 +18,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::error::OkfError;
 use crate::http::sessions::SessionKeys;
+use crate::overlay::Overlays;
 use crate::store::{catalogs, changesets};
 
 /// Every loaded catalog, by name (a `BTreeMap`, so iteration is in name
@@ -45,6 +46,8 @@ pub struct App {
     keys: Arc<Keys>,
     // Which key opened each MCP session (M5 Decision 2).
     sessions: SessionKeys,
+    // Each open changeset's overlay, cached (M5 Decision 6).
+    overlays: Overlays,
     // As in `CatalogState`: the lock is held only to clone or swap the `Arc`.
     catalogs: RwLock<Arc<Catalogs>>,
     // The `admin_generation` the key cache was loaded at. Written only under
@@ -105,12 +108,14 @@ impl App {
             }
         }
         let sessions = SessionKeys::new(config.session_idle_timeout);
+        let overlays = Overlays::new(config.session_idle_timeout);
         Ok(Arc::new(Self {
             pool,
             config,
             clock,
             keys,
             sessions,
+            overlays,
             catalogs: RwLock::new(Arc::new(loaded)),
             admin_generation: AtomicI64::new(admin_generation),
             polling: tokio::sync::Mutex::new(broken),
@@ -143,6 +148,14 @@ impl App {
     /// The bindings, shared by every `/mcp` request.
     pub fn sessions(&self) -> &SessionKeys {
         &self.sessions
+    }
+
+    /// The overlay cache (M5 Decision 6).
+    ///
+    /// # Returns
+    /// Every open changeset's cached overlay, shared by every tool call.
+    pub fn overlays(&self) -> &Overlays {
+        &self.overlays
     }
 
     /// Every loaded catalog, as of now. Cheap (an `Arc` clone); one call

@@ -1,4 +1,4 @@
-//! The MCP server (design "Tools"): the rmcp handler and the read tools,
+//! The MCP server (design "Tools"): the rmcp handler and the tools,
 //! one module per group. Each `#[tool]` method builds a
 //! [`context::ToolContext`] from the HTTP request rmcp hands it and calls a
 //! plain function, which the module's tests call directly.
@@ -15,6 +15,7 @@ mod reports;
 mod search;
 #[cfg(test)]
 pub(crate) mod testing;
+mod writes;
 
 use std::sync::Arc;
 
@@ -32,7 +33,8 @@ pub const INSTRUCTIONS: &str = "Open Knowledge Format catalogs: concepts (markdo
     frontmatter) about systems, projects, people and decisions. Start with `search`, then \
     `get_concept`. Paths look like /infra/time-server.md (the leading slash and .md are \
     optional). Without a `catalog` argument, tools use this connection's catalogs \
-    (`list_catalogs` shows them).";
+    (`list_catalogs` shows them). Write tools edit this connection's changeset in one catalog; \
+    nothing is visible to others until `publish`.";
 
 /// The MCP handler: one per session (rmcp's factory makes it).
 pub struct OkfServer {
@@ -65,6 +67,7 @@ impl OkfServer {
             + Self::documents_router()
             + Self::history_router()
             + Self::reports_router()
+            + Self::writes_router()
             + Self::lifecycle_router()
     }
 

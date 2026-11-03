@@ -229,9 +229,29 @@ to a non-text file resolves, reading such a file as text fails as it does on dis
 a write through the workspace keeps an existing file's execute bit (a new file is not
 executable).
 
-A session with an open changeset for a catalog reads that catalog through an overlay:
-the published snapshot plus its changeset entries, rebuilt lazily after the session's
-writes, so an agent sees its own pending edits.
+A connection with an open changeset in a catalog (its key and label, see "Write
+grouping") reads that catalog through an overlay: the published workspace with the
+changeset's entries applied, and a full snapshot of it, built on a blocking thread and
+cached per changeset while the changeset's `version` and the catalog's `generation` are
+unchanged. Each read looks the changeset up (one index lookup; `read` keys, which cannot
+write, skip it), so an agent sees its own pending edits and no one else's. `history` and
+`list_catalogs` report the published state. Each cached overlay pins a copy of the workspace, a snapshot
+and its base state, so overlay memory is about the number of active changesets times the
+catalog's size, bounded by evicting overlays unused for `session_idle_timeout` (checked
+on every read). There is no cap on the number of cached overlays; one is deferred
+until a deployment sets a long `session_idle_timeout` with many writers. An overlay whose
+entries no longer apply over the published files (a file and a directory at one path,
+or a pending `.md` that is not UTF-8) is never replaced by the published state, which would hide the agent's own pending
+edits. Its error names the changeset and how to recover (discard the clashing path or
+the changeset):
+- a report on that catalog fails with it;
+- `search` leaves the catalog out, lists it in `skipped`, and still answers from the
+  others;
+- `get_concept` and `read_document` go on to the next catalog of the read set, and
+  return the error only if none resolves the path.
+
+A database error or `Busy` while looking the changeset up fails the call, so the agent
+retries.
 
 The server runs one replica. It notices changes made outside it (a CLI import) through
 the catalog's `generation` counter (see "Publish"). A second replica would need the same
@@ -248,7 +268,8 @@ A library crate with a thin `main.rs`:
 | `store` | Catalog store over `db`: load a catalog's documents, publish a changeset in one transaction, record revisions, import, export |
 | `auth` | Bearer-key middleware; inserts a `Principal { key_id, catalogs, access, default_catalog, actor }` into request extensions |
 | `selection` | Resolve the catalog set and write target from tool argument, header/query, key default, server default |
-| `catalog` | Per-catalog state: the `RwLock<Arc<Snapshot>>`, rebuilds, session overlays, commit times for lint |
+| `catalog` | Per-catalog state: the `RwLock<Arc<Snapshot>>` (with the published workspace and each path's revision), rebuilds, commit times for lint |
+| `overlay` | Each open changeset's overlay (the published workspace with its entries applied, and its snapshot), cached per changeset; the `View` a read tool takes |
 | `okf::yaml`, `okf::doc`, `okf::markdown`, `okf::paths`, `okf::pystr`, `okf::timestamp` | M1 and M2: the document model, unchanged |
 | `okf::ops` | `stamp`, `review`, `question`, `unquestion`, `source`, `log`, `index`, `create`, `edit`, `replace_body`, `set_frontmatter`, `mv`, `split`, `delete`, as pure functions over a `Workspace` |
 | `okf::snapshot`, `okf::analysis`, `okf::search` | M2: the snapshot, links report, `oldest`, `sprawl`, `lint`, secret scan, search |
@@ -281,20 +302,20 @@ first selected catalog.
 | Tool | Parameters | Result |
 |---|---|---|
 | `list_catalogs` | none | Catalogs the key can reach (name, description, file count, last change); this connection's selection and default write target, or why there is none |
-| `search` | `query`, `catalogs?`, `type?`, `tags?`, `status?`, `limit?` (default 20, at most 200) | Ranked hits across catalogs: catalog, path, title, description, snippet. Every whitespace-separated term must occur (case-insensitive substring) in some field; the tier is the best field holding the whole query, else the best holding a term (fields, best first: title/alias, tag, description, body); deprecated concepts last; ties by catalog order, then path. The `tags` filter matches whole tags only, while free text matches tags by substring: the tool description must say so |
+| `search` | `query`, `catalogs?`, `type?`, `tags?`, `status?`, `limit?` (default 20, at most 200) | Ranked hits across catalogs: catalog, path, title, description, snippet. A catalog whose overlay cannot be built is listed in `skipped` (catalog and error) and the others still answer. Every whitespace-separated term must occur (case-insensitive substring) in some field; the tier is the best field holding the whole query, else the best holding a term (fields, best first: title/alias, tag, description, body); deprecated concepts last; ties by catalog order, then path. The `tags` filter matches whole tags only, while free text matches tags by substring: the tool description must say so |
 | `get_concept` | `path`, `links?`, `raw?` | Frontmatter as JSON and the body; with `links`, resolved outbound links (path, title, description, broken flag) and inbound backlinks; with `raw`, the file verbatim |
 | `read_document` | `path?` (default `/index.md`) | Raw text of an `index.md`, `log.md` or `AGENTS.md` |
 | `open_questions` | none | Every queued `open_questions` entry, grouped by concept, 1-based |
 | `oldest` | `n?` (default 5), `open_questions_only?` | Port of `oldest --json` |
 | `sprawl` | `path?`, `n?` (default 5) | Port of `sprawl --json` |
 | `links_report` | `mentions?` (default true) | Port of `links --json` |
-| `lint` | `pending?` | Port of `lint --json`, on the published catalog or (with `pending`) on this session's overlay |
+| `lint` | `pending?` | Port of `lint --json`, on the published catalog or (with `pending`) on this connection's overlay, with a `pending` flag saying which |
 | `history` | `path`, `limit?` (default 20, at most 200) | The document's revisions, newest first: revision, op, actor, message, time |
 | `pending_changes` | none | This session's changeset in the catalog: changed paths and a unified diff against the published text |
 | `stranded_sessions` | `catalog?` | Open changesets holding edits that nobody changed within `session_idle_timeout`: the key's own (other labels than this connection's), or for an `admin` key every one in the catalogs it reaches: id, catalog, label, key, actor, creation and last-change times, changed paths |
 
 Lint's `generated-after-commit` check reads each document's last revision time where
-`okf.py` reads its last git commit time; paths in the session's changeset count as
+`okf.py` reads its last git commit time; paths in the connection's changeset count as
 uncommitted.
 
 ### Write tools (need `write`)
@@ -304,10 +325,10 @@ Nothing is visible to other sessions until `publish`.
 
 | Tool | Parameters | Behavior |
 |---|---|---|
-| `create_concept` | `path`, `frontmatter` (object), `body`, `index_summary?`, `index_section?`, `by?` | Validates the path (`new_concept_path` rules: inside the catalog, not reserved, not machinery, must not exist; warns on a non-kebab-case name). Requires `type`. Writes `generated: { by, at: now }` itself and rejects `generated`, `verified`, `reviewed` in `frontmatter`. Renders frontmatter in `KEY_ORDER`. With `index_summary`, lists it in the folder's `index.md`, creating folder indexes and parent listings as `ensure_index` does |
-| `edit_document` | `path`, `old_str`, `new_str`, `replace_all?` | Exact replacement in a concept body or an `index.md`. Without `replace_all`, `old_str` must occur exactly once. Refuses a match that touches frontmatter. Refuses `log.md` and machinery |
-| `replace_body` | `path`, `body` | Replaces a concept's body; frontmatter unchanged byte for byte |
-| `set_frontmatter` | `path`, `key`, `value` (JSON, or null to delete) | Sets or deletes a descriptive key with a textual edit. Refuses `generated`, `verified`, `reviewed`, `open_questions`, `sources` (dedicated tools) and refuses deleting `type` |
+| `create_concept` | `path`, `frontmatter` (object), `body`, `index_summary?`, `index_section?`, `by?` | Validates the path (`new_concept_path` rules: inside the catalog, not reserved, not machinery, must not exist; warns on a non-kebab-case name). Requires `type`. Writes `generated: { by, at: now }` itself and rejects `generated`, `verified`, `reviewed` in `frontmatter`. Renders frontmatter in `KEY_ORDER`. Other keys follow in the caller's order. Strings are quoted only when they must be; mappings and lists of scalars are written in flow style, lists of collections as block lists; JSON numbers and booleans are stored as their text. With `index_summary`, lists it in the folder's `index.md`, creating folder indexes and parent listings as `ensure_index` does, and lists it with its `title`; a summary without a non-blank title, and `index_section` without `index_summary`, are refused. The listing (folder index and `index_section`) is checked before anything is written. Index edits are recorded as replay operations, the concept itself as a free edit |
+| `edit_document` | `path`, `old_str`, `new_str`, `replace_all?` | Exact replacement in a concept body or an `index.md`. Without `replace_all`, `old_str` must occur exactly once (`EditMismatch` gives the count); an empty `old_str` is refused. Refuses a match that touches frontmatter, and any result whose frontmatter differs from the original's (none may be added to a document without it, `index.md` included). Refuses `log.md` and machinery |
+| `replace_body` | `path`, `body` | Replaces a concept's body; frontmatter unchanged byte for byte; a body that would add frontmatter to a document without it is refused |
+| `set_frontmatter` | `path`, `key`, `value` (JSON, or null to delete) | Sets or deletes a descriptive key with a textual edit. Refuses `generated`, `verified`, `reviewed`, `open_questions`, `sources` (dedicated tools) and refuses deleting `type` or setting it to anything but a non-blank string. Values render as in `create_concept`. A document without frontmatter is refused with `okf.py`'s 'has no frontmatter; add it with your editor first' |
 | `stamp` | `path`, `field` (`generated` or `verified`), `by?` | Port of `stamp` |
 | `review` | `path`, `outcome`, `note`, `questions?`, `by?` | Port of `review` |
 | `question` | `path`, `question` | Port of `question` |
@@ -357,29 +378,52 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
    auth layer added, into every tool call's request context (verified against rmcp
    3.8.0 while planning M3).
 3. `selection` resolves the catalog set.
-4. For each catalog, the handler takes an `Arc` of the current snapshot, or of the
-   session's overlay if it has an open changeset.
+4. For each catalog, the handler takes an `Arc` of the current snapshot, or of this
+   connection's overlay if its key and label have an open changeset there.
 5. The work runs in memory (search uses `rayon` across documents, then merges and ranks
    across catalogs).
 
 ### Write
 
-1. Auth, `write` access check, single target catalog.
-2. `store` gets or creates the open changeset for (session, catalog).
-3. The `okf::ops` function reads through the overlay `Workspace`, computes the new
-   content, runs the write rules, and the changed files become changeset entries, each
-   with the published revision it was based on. Edits to `log.md` and `index.md` that
-   come from bookkeeping are also recorded as operations in the entry's `replay`:
-   `log` adds a log entry; `index`, `create_concept` (with `index_summary`) and the
-   listing changes of `move_concept`, `split_concept` and `delete_concept` add, rename
-   or remove an `index.md` bullet. The operations are `Log { date, bullet }`,
-   `ListBullet { target, bullet, section, create_section }` and `CreateIndex { folder }`
-   (`okf::ops::ReplayOp`). They are stored as JSON with an `op` tag and re-applied by
-   `okf::ops::replay`, which shares its text edits with the ops themselves. Text that
-   no operation changes keeps its bytes; changed text gets `\n` line endings, as
-   `okf.py` writes. A free-text edit of an `index.md` (`edit_document`) clears the
-   entry's `replay`, so that entry conflicts like any other on a stale base.
-4. The session's overlay is marked stale.
+`write::apply` carries every write tool's call into the database:
+
+1. Auth, then `write` access on a single target catalog: the `catalog` argument, else
+   the connection's write target.
+2. One transaction takes the catalog row (`FOR KEY SHARE`), gets or creates the open
+   changeset for (catalog, key, label), and locks its row (`FOR UPDATE`,
+   `store::changesets::lock`), so writes to one changeset, its publish and its discard
+   run one at a time. Every changeset transaction takes these locks in that order;
+   `catalogs::delete` takes the row `FOR UPDATE` first, so neither side can deadlock the
+   other. The overlay is read under that lock, in the same transaction: its cached
+   `version` is a cache label, never a concurrency token. Each write holds one pooled
+   connection for its whole transaction, so writers queued on one changeset's row lock
+   each hold one while they wait; with the pool's 8 connections, enough of them can
+   leave reads waiting for a connection. This is accepted for now: one agent's
+   writes to one changeset are rarely that concurrent.
+3. On a blocking thread, the `okf::ops` function runs on a copy of the connection's
+   overlay workspace (the published files plus the changeset's entries). Every path it
+   touched then passes the write rules: inside the catalog, not machinery, secret scan,
+   frontmatter parses. A touched path the op removed is a deletion if it is published,
+   or was at the entry's base revision; otherwise the changeset keeps no entry for it
+   (a file it created, then removed), so every deletion entry names something
+   published.
+4. Each touched path becomes an entry (insert or replace):
+   - **base revision:** the existing entry's base (the first edit's), else the live
+     revision in the overlay's published snapshot (NULL if there is none);
+   - **replay:** edits to `log.md` and `index.md` that come from bookkeeping are also
+     recorded as operations: `log` adds a log entry; `index`, `create_concept` (with
+     `index_summary`) and the listing changes of `move_concept`, `split_concept` and
+     `delete_concept` add, rename or remove an `index.md` bullet. The operations are
+     `Log { date, bullet }`, `ListBullet { target, bullet, section, create_section }`
+     and `CreateIndex { folder }` (`okf::ops::ReplayOp`). They are stored as JSON with
+     an `op` tag and re-applied by `okf::ops::replay`, which shares its text edits with
+     the ops themselves. Text that no operation changes keeps its bytes; changed text
+     gets `\n` line endings, as `okf.py` writes. The entry keeps the existing replay
+     plus the new operations while every edit to it came from one. Any other edit (an
+     `edit_document` of an `index.md`, say) clears it for good, so that entry conflicts
+     like any other on a stale base.
+5. Commit, and drop the connection's cached overlay; its next read rebuilds it. A
+   refused edit stores nothing.
 
 ### Publish
 
@@ -789,7 +833,7 @@ Raised in M2 reviews and filed as issues (label `milestone-3`):
   workspace is production code and the feature is gone.
 - From the M2 plan's "Deliberately deferred" table: cross-catalog search merge (done in
   M4, PR #81: `okf::search::search_catalogs`, best tier first, then catalog order, then
-  path); secret refusal on write, the no-frontmatter `set_block` error (M5). The per-session
+  path); secret refusal on write (M5 Task 5); the no-frontmatter `set_block` error (done in M5 Task 4: `set_frontmatter` refuses such a document). The per-session
   write lock, `core.symlinks=false` clones and `.okf-*.tmp` handling before `git add -A`
   no longer apply: there is no git and no on-disk worktree.
 

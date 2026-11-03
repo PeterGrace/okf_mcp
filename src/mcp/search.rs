@@ -10,12 +10,13 @@ use rmcp::{tool, tool_router, Json};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{CatalogState, Loaded};
+use crate::catalog::CatalogState;
 use crate::error::OkfError;
-use crate::mcp::context::ToolContext;
+use crate::mcp::context::{is_broken_overlay, ToolContext};
 use crate::mcp::{blocking, reply, OkfServer};
 use crate::okf::search::{search_catalogs, CatalogHit, SearchQuery};
 use crate::okf::snapshot::Snapshot;
+use crate::overlay::View;
 
 /// The design's default `limit`.
 const DEFAULT_LIMIT: usize = 20;
@@ -60,6 +61,20 @@ pub struct SearchResult {
     /// Best first: concepts holding the whole query in a better field
     /// first, deprecated concepts last, then catalog order, then path.
     pub hits: Vec<CatalogHit>,
+    /// Catalogs left out because this connection's pending changeset in
+    /// them does not apply over the published files; every other catalog
+    /// still answered. Empty when every catalog was searched.
+    pub skipped: Vec<SkippedCatalog>,
+}
+
+/// A catalog `search` left out, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct SkippedCatalog {
+    /// The catalog.
+    pub catalog: String,
+    /// The error, as a failed call would report it (`error`, `message`
+    /// and what it concerns).
+    pub error: serde_json::Value,
 }
 
 /// Runs a search.
@@ -72,7 +87,12 @@ pub struct SearchResult {
 /// The merged hits.
 ///
 /// # Errors
-/// A selection error ([`ToolContext::states`]).
+/// A selection error ([`ToolContext::states`]); any error from
+/// [`ToolContext::view`] (a database error, `Busy`) but a broken overlay. A
+/// catalog whose overlay
+/// does not apply ([`is_broken_overlay`]) is not an error: it is left out
+/// and listed in [`SearchResult::skipped`], so one broken changeset does not
+/// fail a search across every catalog.
 pub(crate) async fn run(ctx: &ToolContext, params: SearchParams) -> Result<SearchResult, OkfError> {
     let states = ctx.states(params.catalogs.as_deref())?;
     let query = SearchQuery {
@@ -82,27 +102,41 @@ pub(crate) async fn run(ctx: &ToolContext, params: SearchParams) -> Result<Searc
         status: params.status,
         limit: hit_limit(params.limit),
     };
-    // Each catalog's current snapshot, taken once here. The pairs are `Arc`
-    // handles (reference-counted pointers, cheap to copy), so the blocking
-    // thread can own them; nothing is cloned but the counts.
-    let loaded: Vec<(Arc<CatalogState>, Arc<Loaded>)> = states
-        .into_iter()
-        .map(|state| {
-            let current = state.current();
-            (state, current)
-        })
-        .collect();
-    // `move` hands `loaded` and `query` to the closure, which runs on
+    // Each catalog's view (published, or this connection's overlay), taken
+    // once here. Both hold `Arc`s (reference-counted pointers, cheap to
+    // copy), so the blocking thread can own them.
+    let mut views: Vec<(Arc<CatalogState>, View)> = Vec::with_capacity(states.len());
+    let mut skipped = Vec::new();
+    for state in states {
+        match ctx.view(&state).await {
+            Ok(view) => views.push((state, view)),
+            // `if` on a match arm is a guard: the arm applies only when it
+            // holds. A broken overlay is never internal, so the kind is
+            // enough for the log; the caller gets the full error.
+            Err(error) if is_broken_overlay(&error) => {
+                tracing::warn!(catalog = %state.name(), kind = error.kind(), "search skipped a catalog");
+                skipped.push(SkippedCatalog {
+                    catalog: state.name().to_string(),
+                    error: error.to_json(),
+                });
+            }
+            // Anything else (a database failure, `Busy`): the call fails (and
+            // `tool_error` logs an internal error with its details), so the
+            // agent retries.
+            Err(error) => return Err(error),
+        }
+    }
+    // `move` hands `views` and `query` to the closure, which runs on
     // another thread; the borrows below live only inside it.
     let hits = blocking(move || {
-        let catalogs: Vec<(&str, &Snapshot)> = loaded
+        let catalogs: Vec<(&str, &Snapshot)> = views
             .iter()
-            .map(|(state, current)| (state.name(), current.snapshot()))
+            .map(|(state, view)| (state.name(), view.snapshot()))
             .collect();
         search_catalogs(&catalogs, &query)
     })
     .await;
-    Ok(SearchResult { hits })
+    Ok(SearchResult { hits, skipped })
 }
 
 /// The number of hits a call returns at most.
@@ -132,7 +166,8 @@ impl OkfServer {
                        Every term of `query` must occur, as a case-insensitive substring, in \
                        a concept's title or aliases, tags, description or body; free text \
                        matches tags by substring. The `tags` filter matches whole tags only. \
-                       Returns catalog, path, title, description and a snippet, best first."
+                       Returns catalog, path, title, description and a snippet, best first; a \
+                       catalog whose pending changes cannot be applied is listed in `skipped`."
     )]
     async fn search(
         &self,
@@ -147,8 +182,13 @@ impl OkfServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
     use crate::config::Config;
-    use crate::mcp::testing::{app_with, context, principal};
+    use crate::mcp::testing::{
+        app_with, context, pending_entry, principal, principal_as, store_key, PendingEdit,
+    };
+    use crate::store::keys::Access;
 
     const TAGGED: &str =
         "---\ntype: Service\ntitle: Router\ntags: [infrastructure]\n---\nRoutes.\n";
@@ -202,6 +242,62 @@ mod tests {
         assert_eq!(names(&found), ["work", "pg"]);
         // The `catalogs` argument wins over the connection's catalogs.
         assert_eq!(names(&found_in_pg), ["pg"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catalog_whose_overlay_fails_is_skipped_and_the_others_answer() {
+        let test = app_with(
+            &[
+                ("pg", &[("router.md", TAGGED)]),
+                ("work", &[("switch.md", TAGGED)]),
+            ],
+            Config::default(),
+        )
+        .await;
+        store_key(&test, "writer").await;
+        let ctx = context(
+            &test,
+            principal_as("writer", Access::Write, &[], None),
+            Some(&["pg", "work"]),
+        );
+        // `router.md` is a published file, so a pending `router.md/x.md`
+        // cannot be applied over it.
+        let clash = PendingEdit {
+            catalog: "pg",
+            path: "router.md/x.md",
+            text: Some("# X\n"),
+            at: Utc::now(),
+        };
+        let changeset = pending_entry(&test, &ctx, &clash).await;
+
+        let found = run(&ctx, params("routes", &[])).await.unwrap();
+
+        let catalogs: Vec<&str> = found.hits.iter().map(|hit| hit.catalog.as_str()).collect();
+        assert_eq!(catalogs, ["work"]);
+        assert_eq!(found.skipped.len(), 1);
+        assert_eq!(found.skipped[0].catalog, "pg");
+        assert_eq!(found.skipped[0].error["error"], "InvalidPath");
+        let message = found.skipped[0].error["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("pending changeset {}", changeset.id)),
+            "{message}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_database_failure_fails_the_search_instead_of_skipping() {
+        let test = app_with(&[("pg", &[("router.md", TAGGED)])], Config::default()).await;
+        let ctx = context(
+            &test,
+            principal_as("writer", Access::Write, &[], Some("pg")),
+            None,
+        );
+        // A closed pool fails the changeset lookup, as an outage would.
+        test.app.pool().close().await;
+
+        let result = run(&ctx, params("routes", &[])).await;
+
+        assert_eq!(result.unwrap_err().kind(), "Database");
     }
 
     #[test]
