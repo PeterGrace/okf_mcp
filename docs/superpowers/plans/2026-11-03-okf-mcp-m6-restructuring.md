@@ -775,9 +775,8 @@ Put this above the test module in `src/okf/ops/relink.rs`:
 
 ```rust
 //! Link rewriting across a catalog: `okf.py`'s `rewrite_links` (`:1343`).
-//! `move_concept` and `split_concept` use it to point every link into a
-//! moved document (or a moved section) at its new place, and publish
-//! replays it on `index.md` and `log.md` (`ReplayOp::Relink`, M6 Task 2).
+//! `okf.py`'s `mv` and `split` use it to point every link into a moved
+//! document (or a moved section) at its new place; M6 ports both onto it.
 //!
 //! A link keeps its style: in-page (`#x`), bundle-absolute (`/dir/x.md`) or
 //! relative (`x.md`). A document that has just been moved, or created from
@@ -786,7 +785,7 @@ Put this above the test module in `src/okf/ops/relink.rs`:
 //! Files are read byte for byte (`okf.py` opens them with `newline=""`) and
 //! split on `\n` only, so a `\r\n` file keeps its line endings: only link
 //! targets change. `rewrite_text` (crate-internal) is one file's rewrite,
-//! shared by [`rewrite_links`] and the replay, so the two cannot drift apart.
+//! pure over its text, so a replay can share it with [`rewrite_links`].
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -898,9 +897,14 @@ pub fn rewrite_links(
 /// One file's rewrite: `rewrite_links`' loop body.
 ///
 /// # Arguments
-/// * `workspace` - resolves links (directory links need to know which
-///   paths are directories; the replay passes an empty workspace, which is
-///   enough because a redirect's `from` is never a directory).
+/// * `workspace` - resolves links. A directory link written without a
+///   trailing slash (`[x](../a)`) reaches its `index.md` only through
+///   [`Workspace::is_dir`]. The replay passes an empty workspace, which is
+///   enough only while `redirect.from` is a concept (not an `index.md`): no
+///   directory link can point at a concept. `move_concept` and
+///   `split_concept` only ever redirect a concept, and the replay
+///   `debug_assert!`s it. [`rewrite_links`] has the real workspace, so it
+///   also handles an `index.md` source, as `okf.py` does.
 /// * `path` - the file's catalog-relative path.
 /// * `base` - the path its links were written against (`path`, unless it
 ///   was just moved).
@@ -1026,7 +1030,9 @@ fn redirected_target(
 In `src/okf/ops/mod.rs`:
 - add `pub mod relink;` between `pub mod log_index;` and `pub mod replay;`;
 - add `pub use relink::{rewrite_links, Moved, Redirect};` after the `log_index` re-export;
-- extend the module doc's first paragraph to say: "...and the server's content edits (`create_concept`, `edit_document`, `replace_body`, `set_frontmatter`), and the restructuring edits (M6): `rewrite_links` (`relink`), `move_concept`, `split_concept` and `delete_concept`."
+- extend the module doc's first paragraph to say: "...and the server's content edits (`create_concept`, `edit_document`, `replace_body`, `set_frontmatter`), and the restructuring edits (M6): `rewrite_links` (`relink`)."
+
+> **Corrected (issue #120), 2026-11-03.** The docs name only code that exists. The `ops` module doc lists `rewrite_links` alone; Tasks 3, 4 and 5 each add their op's name to that list (`move_concept`, `split_concept`, `delete_concept`) in the step that adds its `pub use`. The `relink` module doc no longer names `ReplayOp::Relink`; Task 2 adds it there. Review on PR #129.
 
 - [ ] **Step 8: Run the tests**
 
@@ -1256,6 +1262,8 @@ Expected: compile errors, `no variant named Unlist`, `Relink`, `cannot find func
 
 - [ ] **Step 3: The variants and their edits**
 
+In `src/okf/ops/relink.rs`, add to the module doc's first paragraph: "Publish replays its link rewrites in `index.md` and `log.md` through [`crate::okf::ops::ReplayOp::Relink`]." (Corrected (issue #120), 2026-11-03: Task 1 left this out, so the doc did not name a variant before it existed.)
+
 In `src/okf/ops/replay.rs`:
 
 Update the module doc's first paragraph to end: "...so an edit and its replay cannot drift apart. M6 adds [`ReplayOp::Unlist`] (a listing taken out of a folder index) and [`ReplayOp::Relink`] (links redirected by a move or split), whose edits are `unlist_text` and `relink::rewrite_text` (both crate-internal: a public doc may not link them, or `cargo doc -D warnings` fails). `Unlist` works on universal-newline text, so a CRLF `index.md` comes out with `\n` endings, while `Relink` keeps bytes as they are. Both match `okf.py`: `cmd_mv` reads and writes the old index in text mode (`okf.py:1538`), and `rewrite_links` opens files with `newline=''` (`okf.py:1359`). This is not a parity bug."
@@ -1265,6 +1273,10 @@ Add the import:
 ```rust
 use crate::okf::ops::relink::{rewrite_text, Redirect};
 ```
+
+and extend the `paths` import to `use crate::okf::paths::{basename, is_concept};` (for the `Relink` arm's `debug_assert!`).
+
+> **Corrected (issue #120), 2026-11-03.** The replay's empty workspace resolves every link into `from` only while `from` is a concept, so the `Relink` arm `debug_assert!`s `is_concept(&redirect.from)`. Task 1's `rewrite_text` doc states the invariant. Review on PR #129.
 
 Add two variants to `ReplayOp`, after `CreateIndex`:
 
@@ -1305,6 +1317,13 @@ In `replay`, add two arms to the `match op` (after the `ListBullet` arm):
             }
             // Byte for byte, as the op itself rewrote the file.
             ReplayOp::Relink { redirect } => {
+                // `no_dirs` cannot tell a directory link (`[x](../a)`) from a file
+                // link, which only matters when `from` is an `index.md`. Moves and
+                // splits only redirect concepts (see `rewrite_text`'s doc).
+                debug_assert!(
+                    is_concept(&redirect.from),
+                    "a Relink redirects a concept, never an index.md or log.md"
+                );
                 rewrite_text(&no_dirs, path, path, present(path, &text)?, redirect)
             }
 ```
@@ -2055,7 +2074,7 @@ fn frontmatter_bullet(workspace: &dyn Workspace, new: &str) -> Result<String, Ok
 }
 ```
 
-In `src/okf/ops/mod.rs`, add `pub use moves::move_concept;` after the `log_index` re-export.
+In `src/okf/ops/mod.rs`, add `pub use moves::move_concept;` after the `log_index` re-export, and append `move_concept` to the module doc's list of restructuring edits ("...the restructuring edits (M6): `rewrite_links` (`relink`), `move_concept`..."). Keep both sides when Task 4 adds `split_concept` to the same list.
 
 - [ ] **Step 7: Run the tests**
 
@@ -3224,7 +3243,7 @@ fn moved_anchors(
 }
 ```
 
-In `src/okf/ops/mod.rs`, add `pub use split::{split_concept, Split, DEFAULT_SPLIT_TYPE};`.
+In `src/okf/ops/mod.rs`, add `pub use split::{split_concept, Split, DEFAULT_SPLIT_TYPE};`, and append `split_concept` to the module doc's list of restructuring edits. Keep both sides when Task 3 adds `move_concept` to the same list.
 
 - [ ] **Step 6: Run the tests**
 
@@ -3752,7 +3771,7 @@ fn only_the_index_is_left(
 }
 ```
 
-In `src/okf/ops/mod.rs`, add `pub use delete::delete_concept;`.
+In `src/okf/ops/mod.rs`, add `pub use delete::delete_concept;`, and append `delete_concept` to the module doc's list of restructuring edits. Tasks 3, 4 and 5 run in parallel and all extend that list: keep every side, so that it ends up reading "...`rewrite_links` (`relink`), `move_concept`, `split_concept` and `delete_concept`."
 
 - [ ] **Step 6: Run the tests**
 

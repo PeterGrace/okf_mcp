@@ -1,7 +1,8 @@
 //! Edit operations on a catalog: Rust ports of `okf.py`'s concept commands
 //! (`stamp`, `review`, `question`, `unquestion`, `source`), its bookkeeping
-//! (`log`, `index`, Task 3) and the server's content edits (`create_concept`,
-//! `edit_document`, `replace_body`, `set_frontmatter`).
+//! (`log`, `index`, Task 3), the server's content edits (`create_concept`,
+//! `edit_document`, `replace_body`, `set_frontmatter`), and the restructuring
+//! edits (M6): `rewrite_links` (`relink`).
 //!
 //! Every op is a pure function over a [`Workspace`]: it reads through it,
 //! writes the files it changes with [`Workspace::write_atomic`], and returns
@@ -33,6 +34,7 @@ use crate::okf::yaml::Value;
 pub mod content;
 pub mod frontmatter;
 pub mod log_index;
+pub mod relink;
 pub mod replay;
 
 // `pub use` re-exports names from the submodules, so callers write
@@ -40,6 +42,7 @@ pub mod replay;
 pub use content::{create_concept, edit_document, replace_body, set_frontmatter, NewConcept};
 pub use frontmatter::{question, review, source, stamp, unquestion, OUTCOMES};
 pub use log_index::{ensure_index, index, log};
+pub use relink::{rewrite_links, Moved, Redirect};
 // `replay` names both the module and its main function: Rust keeps modules
 // and functions in separate namespaces, so `ops::replay(...)` and
 // `ops::replay::ReplayOp` both work.
