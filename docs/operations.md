@@ -641,11 +641,54 @@ spec:
   source's path (`serverName: okf-mcp-db`), or it would write over the
   backups it came from. If it is to become the live database, give it its
   own `plugins` entry with a new `serverName` once it is up.
-- When it is ready, compare it with what you expect (for example
-  `SELECT count(*) FROM documents` on both), then either point `DATABASE_URL`
-  and `PGSSLROOTCERT` at its `-app` and `-ca` secrets, or delete it
-  (`kubectl -n okf-mcp delete cluster okf-mcp-db-restore`; CloudNativePG
-  removes its volumes).
+- **The image:** if your cluster needs `imageName` on every `Cluster` (an
+  image mirror, say), give the restored one the same `imageName` as the source.
+- **Before the backup,** hold every write: publishes, imports (the subcommand
+  and the route) and `catalog` changes. The simplest way is to scale the
+  Deployment to 0 for the window
+  (`kubectl -n okf-mcp scale deploy/okf-mcp --replicas=0`, then back to 1).
+  Then record the live database's numbers with the query below. These are the
+  baseline.
+- **Compare it** with the live database when it is ready, querying both at the
+  same moment with writes still held, so the two must be equal. Counts catch
+  missing rows, and one checksum over every document (catalog, path, revision,
+  execute bit and content) catches changed documents. It does not cover the
+  revision history's content or changesets; the counts and `last_revision`
+  stand in for those:
+
+  ```sh
+  kubectl -n okf-mcp exec -i <instance> -c postgres -- psql -d okf_mcp <<'SQL'
+  SELECT (SELECT count(*) FROM catalogs) AS catalogs,
+         (SELECT count(*) FROM documents) AS documents,
+         (SELECT count(*) FROM revisions) AS revisions,
+         (SELECT max(created_at) FROM revisions) AS last_revision,
+         (SELECT encode(sha256(convert_to(string_agg(
+                    catalog_id || '/' || path || '@' || revision || ':' || executable
+                      || ':' || encode(sha256(content), 'hex'),
+                    ',' ORDER BY catalog_id, path), 'UTF8')), 'hex')
+            FROM documents) AS content_checksum;
+  SQL
+  ```
+
+  Run it on each cluster's primary. `catalog_id` is kept by a physical
+  restore, so the checksum compares like with like, even for catalogs that share
+  a path. `convert_to` keeps backslashes in paths from being read as `bytea`
+  escapes.
+- **If the live database moved anyway,** the checksum can no longer match.
+  Require each count to be at least the baseline and at most the live value,
+  and compare one document you know didn't change by its own
+  `encode(sha256(content), 'hex')`. The bound assumes rows only grow: a
+  catalog deleted in the window (which cascades through `documents` and
+  `revisions`) breaks it even on a good restore, so a window that may include a
+  deletion needs writes held, not bounds.
+- **Then** either point `DATABASE_URL` and `PGSSLROOTCERT` at its `-app` and
+  `-ca` secrets, or delete it (`kubectl -n okf-mcp delete cluster
+  okf-mcp-db-restore`; CloudNativePG removes its volumes).
+- **Tested:** the restore `Cluster` above was followed as written in milestone
+  7's restore drill. A small catalog was ready about 3 minutes after the
+  `Cluster` was created, and matched the live database exactly. The comparison
+  query was revised after the drill (the drill's version ordered by `path`
+  only), and the revised query was then run as written on the live database.
 
 ### An extra copy of each catalog
 
