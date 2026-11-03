@@ -72,9 +72,10 @@ pub struct SetFrontmatterParams {
     pub path: String,
     /// A descriptive key such as `title`, `status` or `tags`; the stamps, `open_questions` and `sources` have their own tools.
     pub key: String,
-    /// The new value as JSON; null deletes the key (`type` cannot be deleted, and must be a non-blank string).
-    // `default`: an absent `value` is JSON null, a delete.
-    #[serde(default)]
+    /// The new value as JSON; required, and an explicit null deletes the key (`type` cannot be deleted, and must be a non-blank string).
+    // No `#[serde(default)]`: a missing `value` is a parameter error, so
+    // forgetting the argument can never delete the key. `serde_json::Value`
+    // is not an `Option`, so serde treats the field as required.
     pub value: serde_json::Value,
     /// The catalog (default: this connection's write target).
     pub catalog: Option<String>,
@@ -414,6 +415,26 @@ mod tests {
 
         assert_eq!(log.kind(), "InvalidPath");
         assert_eq!(bare.kind(), "InvalidPath");
+    }
+
+    #[test]
+    fn set_frontmatter_requires_value_and_only_an_explicit_null_deletes() {
+        let missing = serde_json::json!({"path": "/a", "key": "status"});
+        let null = serde_json::json!({"path": "/a", "key": "status", "value": null});
+
+        let refused = serde_json::from_value::<SetFrontmatterParams>(missing);
+        let delete = serde_json::from_value::<SetFrontmatterParams>(null).unwrap();
+        let tools = OkfServer::writes_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "set_frontmatter")
+            .unwrap();
+
+        let error = refused.unwrap_err().to_string();
+        assert!(error.contains("missing field `value`"), "{error}");
+        assert_eq!(delete.value, serde_json::Value::Null);
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|name| name == "value"), "{required:?}");
     }
 
     #[test]
