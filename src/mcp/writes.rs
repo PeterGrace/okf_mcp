@@ -1113,6 +1113,58 @@ mod bookkeeping_tests {
         assert_eq!(entry(&test, last.changeset, "a.md").await.replay, None);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_op_is_a_tool_error_and_stores_nothing() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+
+        let outcome = review(
+            &ctx,
+            ReviewParams {
+                path: "/a.md".to_string(),
+                outcome: "current".to_string(),
+                note: "checked".to_string(),
+                questions: None,
+                by: None,
+                catalog: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        // The fixture has no root index.md, so a root concept cannot be listed.
+        let unlisted = index(
+            &ctx,
+            IndexParams {
+                path: "/a.md".to_string(),
+                summary: "a note".to_string(),
+                section: None,
+                title: None,
+                catalog: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        // `a.md` has no open_questions, so any number is refused.
+        let none_queued = unquestion(
+            &ctx,
+            UnquestionParams {
+                path: "/a.md".to_string(),
+                question: QuestionRef::Number(3),
+                catalog: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(outcome.kind(), "Refused", "{outcome}");
+        assert_eq!(unlisted.kind(), "Refused", "{unlisted}");
+        assert_eq!(none_queued.kind(), "Refused", "{none_queued}");
+        // `apply` rolls back on an op error, so not even the changeset exists:
+        // the connection still reads the published state.
+        let state = ctx.app().catalog("pg").unwrap();
+        assert!(!ctx.view(&state).await.unwrap().pending());
+    }
+
     #[test]
     fn unquestion_takes_a_number_or_text_and_log_takes_okf_py_kinds() {
         let number = serde_json::json!({"path": "/a", "question": 2});
