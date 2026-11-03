@@ -351,6 +351,42 @@ pub async fn by_id<'e>(
     Ok(row.map(ChangesetRow::from))
 }
 
+/// Locks one changeset's row for the rest of the transaction, then reads it
+/// again.
+///
+/// Every transaction that changes a changeset's entries or state takes this
+/// lock after [`lock_catalog`], so writes to one changeset, its publish and
+/// its discard run one at a time. The row is read *after* the lock is
+/// granted: under Postgres' default isolation (read committed) each statement
+/// sees everything committed before it started, so the `version` and
+/// `state` returned are those the previous holder committed.
+///
+/// # Arguments
+/// * `conn` - the transaction's connection (pass `&mut tx`).
+/// * `id` - the changeset's id.
+///
+/// # Returns
+/// The row as it is now, or `None` if it no longer exists (its catalog was
+/// deleted).
+///
+/// # Errors
+/// [`OkfError::Database`] (a deadlock maps to [`OkfError::Busy`], as for
+/// every query here).
+pub async fn lock(conn: &mut PgConnection, id: i64) -> Result<Option<ChangesetRow>, OkfError> {
+    // `fetch_optional` gives `None` when no row matched, so a vanished
+    // changeset is not an error here; the caller decides.
+    let locked: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM changesets WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if locked.is_none() {
+        return Ok(None);
+    }
+    // `&mut *conn` reborrows the connection for one more query.
+    by_id(&mut *conn, id).await
+}
+
 /// A changeset's entries.
 ///
 /// # Arguments
@@ -1089,5 +1125,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lock_waits_for_the_holder_and_reads_its_commit() {
+        let db = test_db().await;
+        let catalog = catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
+        // `changesets.key_id` is a foreign key: the key needs a row.
+        let new_key = NewKey {
+            id: "writer",
+            access: Access::Write,
+            grants: Grants::All,
+            default_catalog: None,
+            actor: "writer",
+        };
+        key_rows::create(&db.pool, &new_key, now()).await.unwrap();
+        let key = ChangesetKey {
+            catalog_id: catalog.id,
+            key_id: "writer",
+            label: "default",
+        };
+        let mut first = db.pool.begin().await.unwrap();
+        lock_catalog(&mut first, catalog.id).await.unwrap();
+        let row = get_or_create(&mut first, &key, "writer", now())
+            .await
+            .unwrap();
+        first.commit().await.unwrap();
+        let mut holder = db.pool.begin().await.unwrap();
+        lock(&mut holder, row.id).await.unwrap();
+        let pool = db.pool.clone();
+        // The second locker blocks until `holder` commits.
+        let waiting = tokio::spawn(async move {
+            let mut tx = pool.begin().await.unwrap();
+            let seen = lock(&mut tx, row.id).await.unwrap();
+            tx.commit().await.unwrap();
+            seen
+        });
+        until_a_lock_is_awaited(&db.pool).await;
+
+        set_state(&mut holder, row.id, ChangesetState::Discarded, now())
+            .await
+            .unwrap();
+        holder.commit().await.unwrap();
+        let seen = tokio::time::timeout(PATIENCE, waiting)
+            .await
+            .expect("the second locker gets the lock")
+            .unwrap()
+            .expect("the row still exists");
+
+        assert_eq!(seen.state, ChangesetState::Discarded);
+        let mut tx = db.pool.begin().await.unwrap();
+        assert!(lock(&mut tx, i64::MAX).await.unwrap().is_none());
     }
 }

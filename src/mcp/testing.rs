@@ -158,6 +158,30 @@ pub(crate) async fn store_key(test: &TestApp, key_id: &str) {
         .expect("store the test key");
 }
 
+/// A tool context for a `write` key reaching every catalog: the key's row
+/// is stored first (a changeset's `key_id` is a foreign key), and the
+/// connection has the label `default`.
+///
+/// # Arguments
+/// * `test` - the app.
+/// * `key_id` - the key's id, also its actor (call once per key and test).
+/// * `default` - its default catalog.
+///
+/// # Returns
+/// The context a write tool would build for that key. A second label on
+/// the same key is `context(test, principal_as(...), None).with_label(..)`.
+///
+/// # Panics
+/// If the key row cannot be stored (already stored in this test, say).
+pub(crate) async fn writer(test: &TestApp, key_id: &str, default: &str) -> ToolContext {
+    store_key(test, key_id).await;
+    context(
+        test,
+        principal_as(key_id, Access::Write, &[], Some(default)),
+        None,
+    )
+}
+
 /// One pending edit, for [`pending_entry`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingEdit<'a> {

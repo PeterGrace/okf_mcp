@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::PgExecutor;
 
 use crate::catalog::{CatalogState, Loaded};
 use crate::error::OkfError;
@@ -218,7 +218,9 @@ impl Overlays {
     /// else a new one (its entries read now).
     ///
     /// # Arguments
-    /// * `pool` - the database, for the entries.
+    /// * `executor` - where to read the entries: the pool for a read, the
+    ///   write's own transaction for a write (`&mut *tx`), so a write that
+    ///   holds the changeset's row lock needs no second connection.
     /// * `state` - the changeset's catalog.
     /// * `changeset` - an open changeset, as just read.
     ///
@@ -227,9 +229,12 @@ impl Overlays {
     ///
     /// # Errors
     /// [`OkfError::Database`] reading the entries; as [`build_overlay`].
+    // `impl PgExecutor<'_>` takes a `&PgPool` or a `&mut PgConnection`
+    // alike (a pool, a connection or a transaction), like a duck-typed
+    // "anything with execute()" argument in Python, checked at compile time.
     pub async fn get(
         &self,
-        pool: &PgPool,
+        executor: impl PgExecutor<'_>,
         state: &CatalogState,
         changeset: &ChangesetRow,
     ) -> Result<Arc<Overlay>, OkfError> {
@@ -241,7 +246,7 @@ impl Overlays {
         // Read after the caller's `find_open`, so the entries may be newer
         // than `changeset.version`; harmless: the overlay is labelled with the
         // older version, and the next read at the newer one rebuilds it.
-        let entries = changesets::entries(pool, changeset.id).await?;
+        let entries = changesets::entries(executor, changeset.id).await?;
         let overlay = Arc::new(build_overlay(base, changeset, entries).await?);
         self.store(Arc::clone(&overlay), now);
         Ok(overlay)
