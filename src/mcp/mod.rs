@@ -100,7 +100,8 @@ impl ServerHandler for OkfServer {
 pub type ToolResult<T> = Result<Json<T>, CallToolResult>;
 
 /// An error as a tool result: `isError: true`, its JSON in the content.
-/// Internal errors are logged here, with their details.
+/// Internal errors are logged here, with their details; the others at debug
+/// level, by kind only (their messages can name paths from the catalog).
 ///
 /// # Arguments
 /// * `error` - what went wrong.
@@ -111,6 +112,8 @@ pub fn tool_error(error: &OkfError) -> CallToolResult {
     if error.is_internal() {
         // `%error` logs it with `Display`; it never holds a key or a document.
         tracing::error!(%error, "tool failed");
+    } else {
+        tracing::debug!(kind = error.kind(), "tool error");
     }
     CallToolResult::structured_error(error.to_json())
 }
