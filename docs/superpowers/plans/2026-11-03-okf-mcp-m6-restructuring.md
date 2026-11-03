@@ -4545,9 +4545,11 @@ mod restructure_publish_tests {
     /// A `move_concept` write, through the write path as Task 6's tool makes it.
     async fn moved(ctx: &ToolContext, old: &str, new: &str) -> WriteReport {
         let (old, new) = (old.to_string(), new.to_string());
-        apply(ctx, None, None, move |ws, _| ops::move_concept(ws, &old, &new))
-            .await
-            .unwrap()
+        apply(ctx, None, None, move |ws, _| {
+            ops::move_concept(ws, &old, &new)
+        })
+        .await
+        .unwrap()
     }
 
     /// A `delete_concept` write.
@@ -4561,9 +4563,11 @@ mod restructure_publish_tests {
     /// A `log` write.
     async fn logged(ctx: &ToolContext, text: &str) -> WriteReport {
         let text = text.to_string();
-        apply(ctx, None, None, move |ws, op| ops::log(ws, op, LogKind::Update, &text))
-            .await
-            .unwrap()
+        apply(ctx, None, None, move |ws, op| {
+            ops::log(ws, op, LogKind::Update, &text)
+        })
+        .await
+        .unwrap()
     }
 
     /// A new concept `Q` at `path` with `body`; listed in its folder when `listed`.
@@ -4597,6 +4601,16 @@ mod restructure_publish_tests {
             .get(path)
             .map(|doc| doc.text().to_string())
             .unwrap_or_default()
+    }
+
+    /// Whether `path`'s `documents` row is a tombstone (`deleted_at` set).
+    async fn tombstoned(test: &TestApp, path: &str) -> bool {
+        // `$1` is a bind parameter; `documents` stores paths without the `/`.
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM documents WHERE path = $1")
+            .bind(path)
+            .fetch_one(test.app.pool())
+            .await
+            .unwrap()
     }
 
     /// The publish's revisions as sorted `(path, op, revision)`.
@@ -4641,13 +4655,7 @@ mod restructure_publish_tests {
         assert_eq!((old.len(), old[0].op.as_str()), (2, "delete"));
         assert_eq!(old[0].message, "move x");
         assert_eq!((new.len(), new[0].op.as_str()), (1, "create"));
-        let tombstone: bool = sqlx::query_scalar(
-            "SELECT deleted_at IS NOT NULL FROM documents WHERE path = 'infra/x.md'",
-        )
-        .fetch_one(test.app.pool())
-        .await
-        .unwrap();
-        assert!(tombstone);
+        assert!(tombstoned(&test, "infra/x.md").await);
         assert_eq!(published_text(&test, "infra/z.md"), X);
         assert!(published_text(&test, "hub.md").contains("[X](/infra/z.md)"));
         assert!(published_text(&test, "infra/index.md").contains("* [X](z.md) - x"));
@@ -4815,10 +4823,17 @@ mod restructure_publish_tests {
         assert_eq!(published.report.replayed, ["/infra/index.md"]);
         assert_eq!(
             revisions(&published),
-            [("/infra/index.md", "update", 3), ("/infra/y.md", "delete", 2)]
+            [
+                ("/infra/index.md", "update", 3),
+                ("/infra/y.md", "delete", 2)
+            ]
         );
         let index = published_text(&test, "infra/index.md");
-        assert!(!index.contains("[Y](y.md)") && index.contains("[Q](q.md)"), "{index}");
+        assert!(
+            !index.contains("[Y](y.md)") && index.contains("[Q](q.md)"),
+            "{index}"
+        );
+        assert!(tombstoned(&test, "infra/y.md").await);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4861,10 +4876,12 @@ mod restructure_publish_tests {
 }
 ```
 
+> **Corrected (issue #126), 2026-11-03.** The tests compiled and passed as written: publish needed no code change, so there is no T7 -> T8 edge. Two changes: the count is 9, not 8 (a review added `a_partial_discard_of_a_move_leaves_a_link_publish_refuses`), and the move test's inline tombstone query became a helper, `tombstoned`, which the delete test now also asserts, since its name promises a tombstone it did not check. The code above is the shipped module, in rustfmt's layout.
+
 - [ ] **Step 2: Run them**
 
 Run: `cargo test --lib -- restructure_publish_tests --test-threads=6`
-Expected: 8 passed. The tests target code Tasks 2-5 already merged; if one fails, the bug is in that code or in publish. Fix it in this PR and record a dated `Corrected` note in the task whose code changed.
+Expected: 9 passed. The tests target code Tasks 2-5 already merged; if one fails, the bug is in that code or in publish. Fix it in this PR and record a dated `Corrected` note in the task whose code changed.
 
 - [ ] **Step 3: Update the design**
 
@@ -4891,7 +4908,8 @@ Task 7 of `docs/superpowers/plans/2026-11-03-okf-mcp-m6-restructuring.md` (miles
   - `link-into-deleted` for the link a partial `discard` of the move leaves;
   - a cross-folder move refused when its old listing changed meanwhile;
   - a delete's tombstone and `Unlist` replayed onto a concurrent listing;
-  - a split's three revisions.
+  - a split's four revisions (the parent, the new concept, the folder index
+    and a linking file).
 
 ## Changed
 

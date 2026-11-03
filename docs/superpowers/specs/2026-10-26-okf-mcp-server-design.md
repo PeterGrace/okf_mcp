@@ -477,7 +477,12 @@ at a time, each against the current published state.
    - links into deleted or moved paths: a document outside the changeset that still
      links to a path this changeset deletes or moves away from is a `link-into-deleted`
      error in `LintFailed`. This catches a link another session published after this
-     changeset's `delete_concept` check ran.
+     changeset's `delete_concept` check ran. A move's old path is a deletion entry, so
+     the same check covers moves. A split moves no path: a link to the split-out
+     section published meanwhile is a `broken-anchor` finding in a file this publish
+     does not change, returned as a warning. A move to another folder replays its old
+     listing's removal (`Unlist`) only while that bullet still reads as it did; if it
+     changed meanwhile, publish is refused (`Refused`), so the change is not dropped.
    A failure rolls back and is returned like any other refusal.
 5. Write each changed document (revision + 1, a tombstone's number continued) with its
    derived columns, and a `revisions` row (`create`, `update` or `delete`, the
