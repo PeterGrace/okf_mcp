@@ -204,7 +204,6 @@ pub struct EntryRow {
 }
 pub struct ChangesetKey<'a> { pub catalog_id: i64, pub key_id: &'a str, pub label: &'a str }
 pub async fn lock_catalog(conn: &mut PgConnection, catalog_id: i64) -> Result<(), OkfError>;   // FOR KEY SHARE (Decision 3)
-pub async fn lock(conn: &mut PgConnection, changeset_id: i64) -> Result<ChangesetRow, OkfError>; // FOR UPDATE, re-read; taken by write::apply before reading the overlay (Task 8 adds it)
 pub async fn find_open<'e>(ex: impl PgExecutor<'e>, key: &ChangesetKey<'_>) -> Result<Option<ChangesetRow>, OkfError>;
 pub async fn get_or_create(conn: &mut PgConnection, key: &ChangesetKey<'_>, actor: &str, now: DateTime<Utc>) -> Result<ChangesetRow, OkfError>;
 pub async fn by_id<'e>(ex: impl PgExecutor<'e>, id: i64) -> Result<Option<ChangesetRow>, OkfError>;
@@ -298,7 +297,8 @@ pub enum View { Published(Arc<Loaded>), Pending(Arc<Overlay>) }
 impl View { pub fn snapshot(&self) -> &Snapshot; pub fn lint(&self, now: DateTime<Utc>) -> LintReport; pub fn pending(&self) -> bool; }
 impl ToolContext { pub async fn view(&self, state: &CatalogState) -> Result<View, OkfError>; }   // Pending iff this key+label has an open changeset there
 
-// Task 8: src/write.rs
+// Task 8: src/write.rs, and src/store/changesets.rs (adds `lock`)
+pub async fn lock(conn: &mut PgConnection, changeset_id: i64) -> Result<ChangesetRow, OkfError>; // store::changesets: FOR UPDATE, re-read; write::apply takes it before reading the overlay
 pub struct WriteReport { pub catalog: String, pub changeset: i64, pub label: String, pub touched: Vec<String>, pub message: String, pub notes: Vec<String> }
 #[derive(Serialize, JsonSchema)] (paths in WriteReport start with "/")
 pub async fn apply<F>(ctx: &ToolContext, catalog: Option<&str>, by: Option<&str>, op: F) -> Result<WriteReport, OkfError>
@@ -1640,7 +1640,7 @@ In `src/db.rs`, `constraints_hold`: the unique index now includes `key_id`, and 
         assert_eq!(second.constraint(), Some("changesets_one_open_per_label"));
 ```
 
-Grep for anything left: `grep -rn "session_id\|one_open_per_session" src tests` must print nothing.
+Grep for anything left: `grep -rnw session_id src tests; grep -rn one_open_per_session src tests` must print nothing (`-w` matches the whole word, so `session_idle_timeout` in `src/config.rs` and `src/http/mod.rs` does not count).
 
 - [ ] **Step 8: Run the tests**
 
@@ -1654,7 +1654,7 @@ In `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md`:
 1. "Decisions", the "Write grouping" row: "One changeset per (catalog, key, label), created on first write and kept in the database until published or discarded; explicit `publish`. The label is the connection's `X-OKF-Changeset` header, else `?changeset=`, else `default` (never the MCP session id, which changes on every reconnect)".
 2. "Storage", the `changesets` row: "One open per (catalog, key, label): `id`, `catalog_id`, `label`, `key_id`, `actor`, `state` (`open`, `published`, `discarded`), `version` (bumped by every change to it or its entries; overlay caches key on it), `created_at`, `updated_at`". In the constraints paragraph: "`changesets` has a partial unique index on `(catalog_id, key_id, label) WHERE state = 'open'`, so a racing get-or-create cannot open two changesets for one identity". Add a paragraph after it:
 
-   > **Lock order.** Every transaction that writes changesets or entries takes the catalog row `FOR KEY SHARE` first, then the changeset row (the `UPDATE` that bumps `version`), then entries. `catalog delete` takes the catalog row `FOR UPDATE`, then the open changesets in id order, so writes and deletes wait for each other instead of deadlocking; a write that waited finds the catalog gone and writes nothing. The 24-hour prune takes no catalog lock and skips changesets other transactions hold (`SKIP LOCKED`). A deadlock or serialization failure Postgres still reports (`40P01`, `40001`) is the `Busy` error, which says to retry.
+   > **Lock order.** Every transaction that writes changesets or entries takes the catalog row `FOR KEY SHARE` first, then the changeset row (the `UPDATE` that bumps `version`), then entries. `catalog delete` takes the catalog's advisory publish lock (`catalogs::lock`), then the catalog row `FOR UPDATE`, then the open changesets in id order; publish (M5 Task 10) takes the in-process mutex, the same advisory lock, then the catalog row and the changeset. Plain writes never take the advisory lock, so no order is reversed: writes and deletes wait for each other instead of deadlocking; a write that waited finds the catalog gone and writes nothing. The 24-hour prune takes no catalog lock and skips changesets other transactions hold (`SKIP LOCKED`). A deadlock or serialization failure Postgres still reports (`40P01`, `40001`) is the `Busy` error, which says to retry.
 
 3. "Session lifecycle": replace the three bullets with:
 
