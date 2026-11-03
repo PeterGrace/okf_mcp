@@ -67,6 +67,7 @@ impl OkfServer {
             + Self::history_router()
             + Self::reports_router()
             + Self::writes_router()
+            + Self::bookkeeping_router()
     }
 
     /// The context of the request rmcp handed a tool. The error is already a

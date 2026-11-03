@@ -224,9 +224,9 @@ pub struct OpOutcome {
     pub message: String,                               // okf.py's printed line, e.g. "infra/x.md: generated { by: a, at: ... }"
     pub notes: Vec<String>,                            // okf.py's stderr notes (non-kebab name, created index)
 }
-pub enum StampField { Generated, Verified }
+pub enum StampField { Generated, Verified }                     // Deserialize ("generated" | "verified") + JsonSchema (Task 9)
 pub struct SourceEntry<'a> { pub id: &'a str, pub resource: &'a str, pub title: Option<&'a str>, pub author: Option<&'a str> }
-pub enum LogKind { Update, Creation, Change, Import }  // rendered "Update" etc.
+pub enum LogKind { Update, Creation, Change, Import }  // rendered "Update" etc.; Deserialize + JsonSchema + Default (Update) (Task 9)
 pub struct NewConcept<'a> {
     pub path: &'a str, pub frontmatter: &'a serde_json::Map<String, serde_json::Value>, pub body: &'a str,
     pub index_summary: Option<&'a str>, pub index_section: Option<&'a str>,
@@ -9145,6 +9145,14 @@ git commit -m "feat: the write path and the content write tools (M5.08)" \
 ### Task 9: the bookkeeping write tools
 
 The ports of `okf.py`'s concept commands and its `log` and `index` (design "Write tools"): `stamp`, `review`, `question`, `unquestion`, `add_source`, `log` and `index`. Each calls its `okf::ops` function (Tasks 2 and 3) through `write::apply`. The replay operations an op returns for `log.md` and `index.md` then land in the entry's `replay`, and publish can redo them on newer text (Task 10).
+
+> **Corrected (issue #99), 2026-11-03.** What shipped differs from the code below in these ways (read `src/mcp/writes.rs` for the shipped text):
+> - **No mirror enums.** `okf::ops::StampField` and `okf::ops::LogKind` already derive `Deserialize` with `okf.py`'s spellings, so they now also derive `JsonSchema` (and `LogKind` derives `Default`, `#[default] Update`). `StampParams::field` is a `StampField` and `LogParams::kind` an `Option<LogKind>`; `StampFieldParam`, `LogKindParam` and their `From` impls are not added. The Interfaces block says so.
+> - The concept test reviews with `outcome: "verified"`: the plan's `"current"` is not one of `OUTCOMES`, so `review` refused it.
+> - The params' `path` docs give the concept-reference form (`.md` optional), as Task 8's `replace_body` does; `review`'s `outcome` doc lists the four outcomes; `index`'s `section` doc names its default (`Concepts`).
+> - A fifth test, `unquestion_takes_a_number_or_text_and_log_takes_okf_py_kinds`, pins `QuestionRef`'s two JSON forms and that `kind` is case-sensitive like argparse's `choices`. The listing test also checks there are exactly seven tools, that each output schema is an object, and that no tool takes an `at` or `now`.
+>
+> No later task uses the removed names: Tasks 10 and 13 build `LogParams { text, kind: None, catalog: None }` and `IndexParams` as before, and Task 13/14's JSON calls (`"kind": "Creation"`, `"field": "verified"`) deserialize unchanged.
 
 **Router:** a second block, `bookkeeping_router`, in `src/mcp/writes.rs`, below Task 8's `writes_router`, and not an extension of it. Task 8's block stays untouched, so this task's diff is one new section plus one line in `OkfServer::tools()`. The two groups also match the design's split between content edits and `okf.py` ports. `OkfServer` already has one `#[tool_router]` block per module; two in one file work the same way, each producing its own `fn ..._router()`.
 

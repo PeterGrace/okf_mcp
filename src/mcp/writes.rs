@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::error::OkfError;
 use crate::mcp::context::ToolContext;
 use crate::mcp::{reply, OkfServer};
-use crate::okf::ops::{self, NewConcept};
+use crate::okf::ops::{self, LogKind, NewConcept, SourceEntry, StampField};
 use crate::write::{apply, WriteReport};
 
 /// `create_concept`'s arguments. Doc comments are the parameters'
@@ -278,6 +278,451 @@ impl OkfServer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The bookkeeping tools (Task 9): ports of okf.py's concept commands, `log`
+// and `index`. A block of its own (`bookkeeping_router`), so the content
+// tools above and these `okf.py` ports stay two groups, as in the design.
+// ---------------------------------------------------------------------------
+
+/// A queued question, by 1-based position or by its exact text.
+// `untagged`: serde tries each variant in order, so `2` is a number and
+// `"Who owns it?"` is text, with no wrapper object in the JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum QuestionRef {
+    /// Its 1-based position, as `open_questions` numbers it.
+    Number(u64),
+    /// Its exact text (a string of digits is read as a position, as `okf.py` does).
+    Text(String),
+}
+
+impl QuestionRef {
+    /// The argument `okf.py unquestion` takes: a number as its digits, or the
+    /// text.
+    ///
+    /// # Returns
+    /// The string the op parses (digits are a 1-based position).
+    fn into_argument(self) -> String {
+        match self {
+            QuestionRef::Number(number) => number.to_string(),
+            QuestionRef::Text(text) => text,
+        }
+    }
+}
+
+/// `stamp`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct StampParams {
+    /// The concept, with or without `.md`, e.g. `/infra/ntp` or `/infra/ntp.md`.
+    pub path: String,
+    /// `generated` (content written) or `verified` (checked against the real system).
+    pub field: StampField,
+    /// Who did it (default: the key's actor); say `human:<name>` only when a person really did.
+    pub by: Option<String>,
+    /// The catalog (default: this connection's write target).
+    pub catalog: Option<String>,
+}
+
+/// `review`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct ReviewParams {
+    /// The concept, with or without `.md`, e.g. `/infra/ntp` or `/infra/ntp.md`.
+    pub path: String,
+    /// The outcome: verified, updated, partial or unverifiable.
+    pub outcome: String,
+    /// What was and wasn't checked.
+    pub note: String,
+    /// Questions to queue in `open_questions` (exact duplicates are skipped).
+    pub questions: Option<Vec<String>>,
+    /// Who reviewed (default: the key's actor).
+    pub by: Option<String>,
+    /// The catalog (default: this connection's write target).
+    pub catalog: Option<String>,
+}
+
+/// `question`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct QuestionParams {
+    /// The concept, with or without `.md`, e.g. `/infra/ntp` or `/infra/ntp.md`.
+    pub path: String,
+    /// The self-contained question to queue in `open_questions`.
+    pub question: String,
+    /// The catalog (default: this connection's write target).
+    pub catalog: Option<String>,
+}
+
+/// `unquestion`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct UnquestionParams {
+    /// The concept, with or without `.md`, e.g. `/infra/ntp` or `/infra/ntp.md`.
+    pub path: String,
+    /// The question to remove: its 1-based number in `open_questions`, or its exact text.
+    pub question: QuestionRef,
+    /// The catalog (default: this connection's write target).
+    pub catalog: Option<String>,
+}
+
+/// `add_source`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct AddSourceParams {
+    /// The concept, with or without `.md`, e.g. `/infra/ntp` or `/infra/ntp.md`.
+    pub path: String,
+    /// The entry's id; an entry with this id must not exist.
+    pub id: String,
+    /// What was consulted: a URI, a path or a description.
+    pub resource: String,
+    /// Its title.
+    pub title: Option<String>,
+    /// Its author, e.g. `human:pgrace`.
+    pub author: Option<String>,
+    /// The catalog (default: this connection's write target).
+    pub catalog: Option<String>,
+}
+
+/// `log`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct LogParams {
+    /// The entry; runs of whitespace become single spaces.
+    pub text: String,
+    /// Update, Creation, Change or Import (default Update).
+    pub kind: Option<LogKind>,
+    /// The catalog (default: this connection's write target).
+    pub catalog: Option<String>,
+}
+
+/// `index`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct IndexParams {
+    /// The concept to list, with or without `.md`, e.g. `/infra/ntp`; its folder's index.md must exist.
+    pub path: String,
+    /// The text after the link's ` - `.
+    pub summary: String,
+    /// The heading to list it under, e.g. `Build infrastructure` (default: `Concepts`).
+    pub section: Option<String>,
+    /// The link text (default: the concept's frontmatter title).
+    pub title: Option<String>,
+    /// The catalog (default: this connection's write target).
+    pub catalog: Option<String>,
+}
+
+/// `okf.py stamp`: sets `generated`, or appends to `verified`, with
+/// `{ by, at: now }`.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the concept, the field and `by`.
+///
+/// # Returns
+/// The write's report.
+///
+/// # Errors
+/// As [`apply`]; the op's [`OkfError::NotFound`] or
+/// [`OkfError::InvalidPath`] for the reference, [`OkfError::Refused`] for a
+/// concept without frontmatter, [`OkfError::FrontmatterParse`] or
+/// [`OkfError::Shape`].
+pub(crate) async fn stamp(ctx: &ToolContext, params: StampParams) -> Result<WriteReport, OkfError> {
+    let StampParams {
+        path,
+        field,
+        by,
+        catalog,
+    } = params;
+    apply(ctx, catalog.as_deref(), by.as_deref(), move |ws, op_ctx| {
+        ops::stamp(ws, op_ctx, &path, field)
+    })
+    .await
+}
+
+/// `okf.py review`: replaces `reviewed` and queues any questions.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the concept, outcome, note, questions and `by`.
+///
+/// # Returns
+/// The write's report.
+///
+/// # Errors
+/// As [`stamp`]; [`OkfError::Refused`] for an unknown outcome.
+pub(crate) async fn review(
+    ctx: &ToolContext,
+    params: ReviewParams,
+) -> Result<WriteReport, OkfError> {
+    let ReviewParams {
+        path,
+        outcome,
+        note,
+        questions,
+        by,
+        catalog,
+    } = params;
+    apply(ctx, catalog.as_deref(), by.as_deref(), move |ws, op_ctx| {
+        // `unwrap_or_default` gives an empty list when no questions were sent.
+        let questions = questions.unwrap_or_default();
+        ops::review(ws, op_ctx, &path, &outcome, &note, &questions)
+    })
+    .await
+}
+
+/// `okf.py question`: queues a question in `open_questions`.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the concept and the question.
+///
+/// # Returns
+/// The write's report; nothing touched if the question is already queued.
+///
+/// # Errors
+/// As [`stamp`].
+pub(crate) async fn question(
+    ctx: &ToolContext,
+    params: QuestionParams,
+) -> Result<WriteReport, OkfError> {
+    let QuestionParams {
+        path,
+        question,
+        catalog,
+    } = params;
+    apply(ctx, catalog.as_deref(), None, move |ws, op_ctx| {
+        ops::question(ws, op_ctx, &path, &question)
+    })
+    .await
+}
+
+/// `okf.py unquestion`: removes a queued question by number or text,
+/// deleting `open_questions` when none are left.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the concept and the question.
+///
+/// # Returns
+/// The write's report.
+///
+/// # Errors
+/// As [`stamp`]; [`OkfError::Refused`] when there is no such question.
+pub(crate) async fn unquestion(
+    ctx: &ToolContext,
+    params: UnquestionParams,
+) -> Result<WriteReport, OkfError> {
+    let UnquestionParams {
+        path,
+        question,
+        catalog,
+    } = params;
+    let question = question.into_argument();
+    apply(ctx, catalog.as_deref(), None, move |ws, op_ctx| {
+        ops::unquestion(ws, op_ctx, &path, &question)
+    })
+    .await
+}
+
+/// `okf.py source`: appends an entry to `sources`.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the concept and the entry.
+///
+/// # Returns
+/// The write's report.
+///
+/// # Errors
+/// As [`stamp`]; [`OkfError::Refused`] for a duplicate id.
+pub(crate) async fn add_source(
+    ctx: &ToolContext,
+    params: AddSourceParams,
+) -> Result<WriteReport, OkfError> {
+    let AddSourceParams {
+        path,
+        id,
+        resource,
+        title,
+        author,
+        catalog,
+    } = params;
+    apply(ctx, catalog.as_deref(), None, move |ws, op_ctx| {
+        let entry = SourceEntry {
+            id: &id,
+            resource: &resource,
+            title: title.as_deref(),
+            author: author.as_deref(),
+        };
+        ops::source(ws, op_ctx, &path, &entry)
+    })
+    .await
+}
+
+/// `okf.py log`: adds a bullet under today's (UTC) heading in `log.md`.
+/// Its replay op is stored on the `log.md` entry.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the text and kind (default [`LogKind::Update`]).
+///
+/// # Returns
+/// The write's report; nothing touched if the bullet is already there today.
+///
+/// # Errors
+/// As [`apply`]; [`OkfError::NotFound`] for a catalog without `log.md`.
+pub(crate) async fn log(ctx: &ToolContext, params: LogParams) -> Result<WriteReport, OkfError> {
+    let LogParams {
+        text,
+        kind,
+        catalog,
+    } = params;
+    let kind = kind.unwrap_or_default();
+    apply(ctx, catalog.as_deref(), None, move |ws, op_ctx| {
+        ops::log(ws, op_ctx, kind, &text)
+    })
+    .await
+}
+
+/// `okf.py index`: lists a concept in its folder's `index.md`. Its replay
+/// op is stored on the `index.md` entry.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the concept, summary, section and title.
+///
+/// # Returns
+/// The write's report; nothing touched if the index already links it.
+///
+/// # Errors
+/// As [`stamp`]; [`OkfError::Refused`] for a folder without `index.md`, a
+/// concept without a title or a missing `section` heading.
+pub(crate) async fn index(ctx: &ToolContext, params: IndexParams) -> Result<WriteReport, OkfError> {
+    let IndexParams {
+        path,
+        summary,
+        section,
+        title,
+        catalog,
+    } = params;
+    apply(ctx, catalog.as_deref(), None, move |ws, op_ctx| {
+        ops::index(
+            ws,
+            op_ctx,
+            &path,
+            &summary,
+            section.as_deref(),
+            title.as_deref(),
+        )
+    })
+    .await
+}
+
+// The bookkeeping tools; `OkfServer::tools` joins `bookkeeping_router()`.
+#[tool_router(router = bookkeeping_router, vis = "pub(crate)")]
+impl OkfServer {
+    /// The `stamp` tool.
+    #[tool(
+        description = "okf.py stamp: set a concept's `generated` (content written) or append to \
+                       its `verified` (checked against the real system) with { by, at: now }, in \
+                       this connection's changeset. `by` defaults to the key's actor. Write access."
+    )]
+    async fn stamp(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<StampParams>,
+    ) -> Result<Json<WriteReport>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(stamp(&ctx, params).await)
+    }
+
+    /// The `review` tool.
+    #[tool(
+        description = "okf.py review: replace a concept's `reviewed` with { by, at: now, outcome, \
+                       note } and queue any `questions` in open_questions, in this connection's \
+                       changeset. `by` defaults to the key's actor. Write access."
+    )]
+    async fn review(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<ReviewParams>,
+    ) -> Result<Json<WriteReport>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(review(&ctx, params).await)
+    }
+
+    /// The `question` tool.
+    #[tool(
+        description = "okf.py question: queue one question in a concept's open_questions without \
+                       recording a review, in this connection's changeset. Write access."
+    )]
+    async fn question(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<QuestionParams>,
+    ) -> Result<Json<WriteReport>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(question(&ctx, params).await)
+    }
+
+    /// The `unquestion` tool.
+    #[tool(
+        description = "okf.py unquestion: remove one queued question, by its 1-based number in \
+                       open_questions or its exact text, deleting the key when none are left, in \
+                       this connection's changeset. Write access."
+    )]
+    async fn unquestion(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<UnquestionParams>,
+    ) -> Result<Json<WriteReport>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(unquestion(&ctx, params).await)
+    }
+
+    /// The `add_source` tool.
+    #[tool(
+        description = "okf.py source: append an entry (id, resource, title, author) to a \
+                       concept's `sources`, refusing a duplicate id, in this connection's \
+                       changeset. Write access."
+    )]
+    async fn add_source(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<AddSourceParams>,
+    ) -> Result<Json<WriteReport>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(add_source(&ctx, params).await)
+    }
+
+    /// The `log` tool.
+    #[tool(
+        description = "okf.py log: add `* **<kind>:** <text>` under today's UTC date in log.md, \
+                       the only way to write log.md, in this connection's changeset. Replayed at \
+                       publish onto a log.md that changed meanwhile, so concurrent entries never \
+                       conflict. Write access."
+    )]
+    async fn log(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<LogParams>,
+    ) -> Result<Json<WriteReport>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(log(&ctx, params).await)
+    }
+
+    /// The `index` tool.
+    #[tool(
+        description = "okf.py index: list a concept in its folder's index.md as \
+                       `* [Title](name.md) - summary`, in this connection's changeset; nothing \
+                       happens if it is already linked. Replayed at publish onto an index.md \
+                       that changed meanwhile, unless a free edit of that index.md follows. \
+                       Write access."
+    )]
+    async fn index(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<IndexParams>,
+    ) -> Result<Json<WriteReport>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(index(&ctx, params).await)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +908,266 @@ mod tests {
             .unwrap();
         // The phrase sits on one doc-comment line (schemars keeps line breaks).
         assert!(by.contains("default: the key's actor"), "{by}");
+    }
+}
+
+#[cfg(test)]
+mod bookkeeping_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::mcp::testing::{app_with, writer, TestApp};
+    use crate::store::changesets::{self, EntryRow};
+
+    const NOTE: &str = "---\ntype: Note\ntitle: A\ndescription: A note.\n---\n# A\n";
+    const NTP: &str = "---\ntype: System\ntitle: NTP\ndescription: Hosts sync.\n---\n# NTP\n";
+
+    async fn pg() -> TestApp {
+        app_with(
+            &[(
+                "pg",
+                &[
+                    ("a.md", NOTE),
+                    (
+                        "infra/index.md",
+                        "# Infra\n\n* [Time server](time.md) - the GPS clock\n",
+                    ),
+                    ("infra/time.md", NOTE),
+                    ("infra/ntp.md", NTP),
+                    ("log.md", "# Log\n"),
+                ],
+            )],
+            Config::default(),
+        )
+        .await
+    }
+
+    /// The changeset's entry for `path`.
+    async fn entry(test: &TestApp, changeset: i64, path: &str) -> EntryRow {
+        changesets::entries(test.app.pool(), changeset)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.path == path)
+            .unwrap_or_else(|| panic!("no entry for {path}"))
+    }
+
+    /// The text of `path` as this connection sees it (its overlay).
+    async fn seen(ctx: &ToolContext, path: &str) -> String {
+        let state = ctx.app().catalog("pg").unwrap();
+        let view = ctx.view(&state).await.unwrap();
+        view.snapshot()
+            .get(path)
+            .map(|doc| doc.text().to_string())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn log_records_its_replay_on_the_log_md_entry() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+
+        let report = log(
+            &ctx,
+            LogParams {
+                text: "hello   world".to_string(),
+                kind: None,
+                catalog: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.touched, ["/log.md"]);
+        let stored = entry(&test, report.changeset, "log.md").await;
+        let replay = stored.replay.expect("a log entry is replayable");
+        // `kind` defaulted to Update; okf.py collapses the whitespace.
+        assert_eq!(replay[0]["op"], "log");
+        assert_eq!(replay[0]["bullet"], "* **Update:** hello world");
+        assert!(seen(&ctx, "log.md")
+            .await
+            .contains("* **Update:** hello world"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_free_edit_of_an_index_after_index_clears_its_replay() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+
+        let listed = index(
+            &ctx,
+            IndexParams {
+                path: "/infra/ntp.md".to_string(),
+                summary: "how hosts sync".to_string(),
+                section: None,
+                title: None,
+                catalog: None,
+            },
+        )
+        .await
+        .unwrap();
+        let after_index = entry(&test, listed.changeset, "infra/index.md").await;
+        edit_document(
+            &ctx,
+            EditDocumentParams {
+                path: "/infra/index.md".to_string(),
+                old_str: "the GPS clock".to_string(),
+                new_str: "the GPS stratum 1 clock".to_string(),
+                replace_all: false,
+                catalog: None,
+            },
+        )
+        .await
+        .unwrap();
+        let after_edit = entry(&test, listed.changeset, "infra/index.md").await;
+
+        assert_eq!(
+            after_index.replay.expect("index is replayable")[0]["op"],
+            "list_bullet"
+        );
+        assert_eq!(after_edit.replay, None);
+        let text = seen(&ctx, "infra/index.md").await;
+        assert!(
+            text.contains("[NTP](ntp.md) - how hosts sync") && text.contains("stratum 1"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_concept_commands_edit_frontmatter_as_free_edits() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let path = || "/a.md".to_string();
+        let ask = |question: &str| QuestionParams {
+            path: path(),
+            question: question.to_string(),
+            catalog: None,
+        };
+
+        stamp(
+            &ctx,
+            StampParams {
+                path: path(),
+                field: StampField::Verified,
+                by: Some("human:pgrace".to_string()),
+                catalog: None,
+            },
+        )
+        .await
+        .unwrap();
+        question(&ctx, ask("Who owns it?")).await.unwrap();
+        question(&ctx, ask("Is it backed up?")).await.unwrap();
+        // A number is the question's 1-based position, as `open_questions` numbers it.
+        unquestion(
+            &ctx,
+            UnquestionParams {
+                path: path(),
+                question: QuestionRef::Number(1),
+                catalog: None,
+            },
+        )
+        .await
+        .unwrap();
+        review(
+            &ctx,
+            ReviewParams {
+                path: path(),
+                outcome: "verified".to_string(),
+                note: "checked".to_string(),
+                questions: None,
+                by: None,
+                catalog: None,
+            },
+        )
+        .await
+        .unwrap();
+        let last = add_source(
+            &ctx,
+            AddSourceParams {
+                path: path(),
+                id: "runbook".to_string(),
+                resource: "https://example.com/runbook".to_string(),
+                title: Some("Runbook".to_string()),
+                author: None,
+                catalog: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let text = seen(&ctx, "a.md").await;
+        assert!(
+            text.contains("verified:") && text.contains("human:pgrace"),
+            "{text}"
+        );
+        assert!(
+            text.contains("reviewed:") && text.contains("writer-a"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Is it backed up?") && !text.contains("Who owns it?"),
+            "{text}"
+        );
+        assert!(text.contains("https://example.com/runbook"), "{text}");
+        // Frontmatter edits carry no replay: they conflict on a stale base.
+        assert_eq!(last.touched, ["/a.md"]);
+        assert_eq!(entry(&test, last.changeset, "a.md").await.replay, None);
+    }
+
+    #[test]
+    fn unquestion_takes_a_number_or_text_and_log_takes_okf_py_kinds() {
+        let number = serde_json::json!({"path": "/a", "question": 2});
+        let text = serde_json::json!({"path": "/a", "question": "Who owns it?"});
+        let lower = serde_json::json!({"text": "x", "kind": "update"});
+
+        let number = serde_json::from_value::<UnquestionParams>(number).unwrap();
+        let text = serde_json::from_value::<UnquestionParams>(text).unwrap();
+        let change = serde_json::from_value::<LogParams>(serde_json::json!({
+            "text": "x",
+            "kind": "Change"
+        }))
+        .unwrap();
+        let refused = serde_json::from_value::<LogParams>(lower);
+
+        assert_eq!(number.question.into_argument(), "2");
+        assert_eq!(text.question.into_argument(), "Who owns it?");
+        assert_eq!(change.kind, Some(LogKind::Change));
+        // okf.py's argparse `choices` are case-sensitive, and so is this.
+        assert!(refused.is_err());
+    }
+
+    #[test]
+    fn the_bookkeeping_tools_are_listed_with_their_defaults() {
+        let tools = OkfServer::bookkeeping_router().list_all();
+        // `&*` borrows the name (a `Cow<str>`) as a plain `&str`.
+        let names: Vec<&str> = tools.iter().map(|tool| &*tool.name).collect();
+        let log = tools.iter().find(|tool| tool.name == "log").unwrap();
+        let kind = log.input_schema["properties"]["kind"]["description"]
+            .as_str()
+            .unwrap();
+
+        for name in [
+            "stamp",
+            "review",
+            "question",
+            "unquestion",
+            "add_source",
+            "log",
+            "index",
+        ] {
+            assert!(names.contains(&name), "{name} is registered");
+        }
+        assert_eq!(names.len(), 7, "{names:?}");
+        assert!(kind.contains("default Update"), "{kind}");
+        for tool in &tools {
+            let output = tool.output_schema.as_ref().expect("an output schema");
+            assert_eq!(output["type"], "object", "{}", tool.name);
+            // No tool takes a timestamp: every one comes from the server clock.
+            let properties = tool.input_schema["properties"].as_object().unwrap();
+            assert!(
+                !properties.keys().any(|key| key == "at" || key == "now"),
+                "{}",
+                tool.name
+            );
+        }
     }
 }
