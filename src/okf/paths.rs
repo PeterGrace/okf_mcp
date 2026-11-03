@@ -131,6 +131,61 @@ pub fn join(dir: &str, path: &str) -> String {
     }
 }
 
+/// Python's `os.path.relpath(path, start)` for two catalog-relative paths.
+///
+/// Python makes both paths absolute first. For two paths inside one root
+/// that only drops empty and `.` components, so the result is computed on
+/// the components alone.
+///
+/// # Arguments
+/// * `path` - the target, normalized and inside the catalog (`""` is the root).
+/// * `start` - the directory the result is relative to, likewise.
+///
+/// # Returns
+/// The relative path; `.` when the two are the same.
+///
+/// # Examples
+/// ```
+/// use okf_mcp::okf::paths::relpath;
+/// assert_eq!(relpath("ops/net/ntp.md", "infra"), "../ops/net/ntp.md");
+/// assert_eq!(relpath("infra/clock.md", "infra"), "clock.md");
+/// assert_eq!(relpath("infra", "infra"), ".");
+/// ```
+pub fn relpath(path: &str, start: &str) -> String {
+    // A nested `fn` (not a closure) so the returned slices can borrow from
+    // the argument: the signature ties their lifetime to `p`'s.
+    fn parts(p: &str) -> Vec<&str> {
+        p.split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect()
+    }
+    let (path, start) = (parts(path), parts(start));
+    // How many leading components the two share (`commonprefix`).
+    let common = path.iter().zip(&start).take_while(|(a, b)| a == b).count();
+    // `vec![x; n]` is `[x] * n`; then the rest of `path` follows.
+    let mut relative = vec![".."; start.len() - common];
+    relative.extend(&path[common..]);
+    if relative.is_empty() {
+        ".".to_string()
+    } else {
+        relative.join("/")
+    }
+}
+
+/// Is `path` a root `AGENTS.md`, `CLAUDE.md` or `README.md`? `okf.py`'s
+/// link analysis and `rewrite_links` skip exactly these
+/// (`NON_CONCEPTS - RESERVED` at the root), as does
+/// [`crate::okf::snapshot::SnapshotDoc::in_link_graph`].
+///
+/// # Arguments
+/// * `path` - catalog-relative path.
+///
+/// # Returns
+/// `true` for those three files at the root, `false` for every other path.
+pub fn outside_link_graph(path: &str) -> bool {
+    !path.contains('/') && NON_CONCEPTS.contains(&path) && !RESERVED.contains(&path)
+}
+
 /// Is this markdown file a concept (not `index.md`, `log.md` or machinery docs)?
 ///
 /// # Arguments
@@ -269,6 +324,39 @@ pub fn new_concept_path(
 mod tests {
     use super::*;
     use crate::okf::workspace::MemWorkspace;
+
+    #[test]
+    fn relpath_matches_os_path_relpath_for_catalog_paths() {
+        let cases = [
+            (("infra/clock.md", "infra"), "clock.md"),
+            (("ops/net/ntp.md", "infra"), "../ops/net/ntp.md"),
+            (("b", "c"), "../b"),
+            (("infra", "infra"), "."),
+            (("x.md", ""), "x.md"),
+            (("", "a/b"), "../.."),
+        ];
+
+        // `map` over an array of tuples; each `((path, start), _)` destructures
+        // one case, like Python's `for (path, start), _ in cases`.
+        let results = cases.map(|((path, start), _)| relpath(path, start));
+
+        assert_eq!(results, cases.map(|(_, expected)| expected.to_string()));
+    }
+
+    #[test]
+    fn only_the_root_readmes_are_outside_the_link_graph() {
+        let outside = ["AGENTS.md", "CLAUDE.md", "README.md"];
+        let inside = [
+            "index.md",
+            "log.md",
+            "infra/README.md",
+            "infra/x.md",
+            "a.md",
+        ];
+
+        assert!(outside.iter().all(|path| outside_link_graph(path)));
+        assert!(!inside.iter().any(|path| outside_link_graph(path)));
+    }
 
     fn workspace() -> MemWorkspace {
         MemWorkspace::from_files([
