@@ -93,7 +93,7 @@ Decisions 1 to 6 are pgrace's answers on 2026-11-03. The rest are Claude's, each
      - leap indicator not 3;
      - stratum 1 to 15 (0 is a kiss-o'-death);
      - our originate timestamp;
-     - a non-zero transmit timestamp.
+     - non-zero receive and transmit timestamps (a zero would read as 2036 and log a 10-year offset).
 
      Offset is `((t2 - t1) + (t3 - t4)) / 2`, round trip `(t4 - t1) - (t3 - t2)` (RFC 4330 section 5). Timestamps follow the 2036 era rule of RFC 4330 section 3.
    - **When it runs:** a query times out after 5 seconds, DNS included. It runs at startup and every 15 minutes, and logs at `error` past 2 seconds of offset and at `warn` on a failed query.
@@ -245,7 +245,7 @@ pub const DEFAULT_PORT: u16 = 123;
 pub struct Reading { pub stratum: u8, pub offset: chrono::TimeDelta, pub round_trip: chrono::TimeDelta }
 pub enum NtpError { Resolve { .. }, NoAddress { .. }, Io { .. }, Timeout { .. }, BadReply { .. } }
 pub async fn query(server: &str, clock: &dyn Clock, timeout: std::time::Duration) -> Result<Reading, NtpError>;
-#[cfg(test)] pub(crate) mod testing { pub(crate) struct StepClock; pub(crate) async fn fake_server(..) -> SocketAddr; }
+#[cfg(test)] pub(crate) mod testing { pub(crate) struct StepClock; pub(crate) async fn fake_server(times: Option<(DateTime<Utc>, DateTime<Utc>)>, stratum: u8) -> SocketAddr; }
 
 // src/clock_check.rs (Task 3)
 pub const CHECK_INTERVAL: Duration;   // 15 minutes
@@ -647,13 +647,17 @@ fn parse_reply(packet: &[u8], sent: u64) -> Result<Reply, &'static str> {
     if word(24) != sent {
         return Err("its originate time is not this request's");
     }
+    let receive = word(32);
+    if receive == 0 {
+        return Err("it has no receive time");
+    }
     let transmit = word(40);
     if transmit == 0 {
         return Err("it has no transmit time");
     }
     Ok(Reply {
         stratum,
-        receive: word(32),
+        receive,
         transmit,
     })
 }
@@ -736,13 +740,17 @@ pub(crate) mod testing {
         }
     }
 
-    /// A server that answers one request on `127.0.0.1` with these times.
+    /// A server that answers one request on `127.0.0.1`.
+    ///
+    /// # Arguments
+    /// * `times` - its (receive, transmit) times; `None` stamps both with
+    ///   the system clock when the request arrives, like a real server.
+    /// * `stratum` - the stratum it reports.
     ///
     /// # Returns
     /// Its address, for `query`.
     pub(crate) async fn fake_server(
-        receive: DateTime<Utc>,
-        transmit: DateTime<Utc>,
+        times: Option<(DateTime<Utc>, DateTime<Utc>)>,
         stratum: u8,
     ) -> SocketAddr {
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind a fake NTP server");
@@ -750,6 +758,11 @@ pub(crate) mod testing {
         tokio::spawn(async move {
             let mut request = [0u8; PACKET_LEN];
             if let Ok((_, client)) = socket.recv_from(&mut request).await {
+                // `unwrap_or_else` reads the clock only for `None`.
+                let (receive, transmit) = times.unwrap_or_else(|| {
+                    let now = Utc::now();
+                    (now, now)
+                });
                 let mut reply = [0u8; PACKET_LEN];
                 reply[0] = 0b00_100_100; // leap 0, version 4, mode 4 (server)
                 reply[1] = stratum;
@@ -809,9 +822,12 @@ mod tests {
             packet[0] = first;
             packet[1] = stratum;
             packet[24..32].copy_from_slice(&originate.to_be_bytes());
+            packet[32..40].copy_from_slice(&5_u64.to_be_bytes());
             packet[40..48].copy_from_slice(&transmit.to_be_bytes());
             packet
         };
+        let mut no_receive = reply(0x24, 1, sent, 7);
+        no_receive[32..40].fill(0);
         let good = reply(0x24, 1, sent, 7);
 
         assert_eq!(parse_reply(&good, sent).map(|r| r.stratum), Ok(1));
@@ -827,6 +843,7 @@ mod tests {
             Err("the server is not synchronized (stratum above 15)")
         );
         assert_eq!(parse_reply(&reply(0x24, 1, 43, 7), sent), Err("its originate time is not this request's"));
+        assert_eq!(parse_reply(&no_receive, sent), Err("it has no receive time"));
         assert_eq!(parse_reply(&reply(0x24, 1, sent, 0), sent), Err("it has no transmit time"));
     }
 
@@ -850,7 +867,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_query_measures_the_offset_against_a_server() {
-        let server = fake_server(at(5040), at(5060), 1).await;
+        let server = fake_server(Some((at(5040), at(5060))), 1).await;
         let clock = StepClock::new([at(0), at(100)]);
 
         let reading = query(&server.to_string(), &clock, Duration::from_secs(5))
@@ -884,7 +901,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unsynchronized_server_is_refused() {
-        let server = fake_server(at(5040), at(5060), 16).await;
+        let server = fake_server(Some((at(5040), at(5060))), 16).await;
         let clock = StepClock::new([at(0), at(100)]);
 
         let error = query(&server.to_string(), &clock, Duration::from_secs(5))
@@ -1073,7 +1090,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_check_records_the_offset_and_stratum() {
-        let server = fake_server(at(5040), at(5060), 1).await.to_string();
+        let server = fake_server(Some((at(5040), at(5060))), 1).await.to_string();
         // The check's own time, then both ends of the exchange.
         let clock = StepClock::new([at(0), at(0), at(100)]);
 
@@ -1195,8 +1212,9 @@ Tests in `src/app.rs`'s test module (use `crate::mcp::testing::app_with`, as the
 ```rust
     #[tokio::test(flavor = "multi_thread")]
     async fn the_clock_check_runs_at_startup_and_stops_with_the_server() {
-        let now = Utc::now();
-        let server = crate::ntp::testing::fake_server(now, now, 1).await;
+        // `None`: the server stamps its reply when the request arrives, after
+        // `app_with` has started its database (several seconds).
+        let server = crate::ntp::testing::fake_server(None, 1).await;
         let config = Config {
             time_server: Some(server.to_string()),
             ..Config::default()
