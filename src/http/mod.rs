@@ -40,6 +40,11 @@ pub fn timeout_layer() -> TimeoutLayer {
     TimeoutLayer::with_status_code(StatusCode::SERVICE_UNAVAILABLE, REQUEST_TIMEOUT)
 }
 
+/// How long `/healthz` waits for the database (a pool connection included)
+/// before it answers "unreachable": well inside a probe's own timeout, and a
+/// bound on how long an anonymous caller can hold a pool slot.
+pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// An [`OkfError`] as an HTTP response: a status and the error's JSON.
 // A newtype (a one-field tuple struct) so this crate can implement axum's
 // `IntoResponse` for it: Rust only lets a crate implement a foreign trait
@@ -104,7 +109,8 @@ struct Health {
     catalogs: usize,
 }
 
-/// `GET /healthz`: 200 while the database answers, else 503.
+/// `GET /healthz`: 200 while the database answers within
+/// [`HEALTH_TIMEOUT`], else 503.
 ///
 /// # Arguments
 /// * `app` - the shared state (axum's `State` extractor hands it over).
@@ -112,7 +118,11 @@ struct Health {
 /// # Returns
 /// The status and a [`Health`] body.
 async fn healthz(State(app): State<Arc<App>>) -> Response {
-    let reachable = sqlx::query("SELECT 1").execute(app.pool()).await.is_ok();
+    let probe = sqlx::query("SELECT 1").execute(app.pool());
+    // `timeout` gives `Err` if the deadline passes first (waiting for a pool
+    // connection included), else the query's own `Result`; only `Ok(Ok(_))`
+    // means the database answered in time.
+    let reachable = matches!(tokio::time::timeout(HEALTH_TIMEOUT, probe).await, Ok(Ok(_)));
     let health = Health {
         database: if reachable { "ok" } else { "unreachable" },
         catalogs: app.catalogs().len(),
@@ -311,6 +321,37 @@ mod tests {
         let response = slow.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn healthz_gives_up_after_its_own_deadline() {
+        let test = app_with(&[("pg", &[])], Config::default()).await;
+        let router = router(Arc::clone(&test.app), &CancellationToken::new());
+        // Hold every pool connection, so the probe waits for one (sqlx's own
+        // acquire timeout is 30 s).
+        let size = test.app.pool().options().get_max_connections();
+        let mut held = Vec::new();
+        for _ in 0..size {
+            held.push(test.app.pool().acquire().await.unwrap());
+        }
+
+        let started = std::time::Instant::now();
+        let request = Request::get("/healthz")
+            .body(Body::empty())
+            .expect("request");
+        let response = router.oneshot(request).await.unwrap();
+        let waited = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            waited >= HEALTH_TIMEOUT,
+            "answered before the deadline: {waited:?}"
+        );
+        assert!(
+            waited < HEALTH_TIMEOUT * 5,
+            "waited past the deadline: {waited:?}"
+        );
+        drop(held);
     }
 
     #[tokio::test(flavor = "multi_thread")]
