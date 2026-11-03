@@ -6,7 +6,7 @@
 - `pending_changes`: each entry with its change (`create`, `update`, `delete`), base and current revision, a `stale` flag, `replayable`, and a unified diff against the published text (`/dev/null` for a missing side, `Binary files ... differ` for non-UTF-8).
 - `changes_router` in `src/mcp/changesets.rs`, joined in `OkfServer::tools()` (ten routers).
 - `MemWorkspace::remove`; `store::history::{content_at, RevisionContent}`; the `similar` 2.7.0 dependency.
-- Tests: `remove_deletes_a_file_and_says_whether_there_was_one`, `content_at_reads_one_revision_or_its_deletion`, and 11 in `changes_tests`, among them `a_write_queued_behind_a_discard_lands_in_a_new_changeset` and `reverting_a_created_file_to_absent_leaves_no_entry`.
+- Tests: `remove_deletes_a_file_and_says_whether_there_was_one`, `content_at_reads_one_revision_or_its_deletion`, and 10 in `changes_tests`, among them `a_write_queued_behind_a_discard_lands_in_a_new_changeset` and `reverting_a_created_file_to_absent_leaves_no_entry`.
 
 ## Changed
 - `own_changeset` skips the open-changeset lookup for a key below `write`, as `ToolContext::view` does.

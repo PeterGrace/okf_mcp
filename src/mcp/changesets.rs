@@ -2040,6 +2040,12 @@ mod changes_tests {
         let twice = revert(&ctx, revert_to("/b.md", 2)).await.unwrap_err();
         let machinery = revert(&ctx, revert_to("/AGENTS.md", 1)).await.unwrap_err();
         let no_such = revert(&ctx, revert_to("/a.md", 9)).await.unwrap_err();
+        // A revision whose bytes are not UTF-8 (no write tool stores one).
+        sqlx::query("UPDATE revisions SET content = '\\xff'::bytea WHERE path = 'a.md'")
+            .execute(test.app.pool())
+            .await
+            .unwrap();
+        let binary = revert(&ctx, revert_to("/a.md", 1)).await.unwrap_err();
         let reader = context(&test, principal(&[], Some("pg")), None);
         let read_only = revert(&reader, revert_to("/a.md", 1)).await.unwrap_err();
 
@@ -2064,6 +2070,7 @@ mod changes_tests {
         assert_eq!(twice.kind(), "Refused");
         assert_eq!(machinery.kind(), "InvalidPath");
         assert_eq!(no_such.kind(), "NotFound");
+        assert_eq!(binary.kind(), "Refused");
         assert_eq!(read_only.kind(), "Forbidden");
     }
 
