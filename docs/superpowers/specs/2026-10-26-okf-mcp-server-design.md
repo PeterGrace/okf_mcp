@@ -385,22 +385,45 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
 
 ### Write
 
-1. Auth, `write` access check, single target catalog.
-2. `store` gets or creates the open changeset for (session, catalog).
-3. The `okf::ops` function reads through the overlay `Workspace`, computes the new
-   content, runs the write rules, and the changed files become changeset entries, each
-   with the published revision it was based on. Edits to `log.md` and `index.md` that
-   come from bookkeeping are also recorded as operations in the entry's `replay`:
-   `log` adds a log entry; `index`, `create_concept` (with `index_summary`) and the
-   listing changes of `move_concept`, `split_concept` and `delete_concept` add, rename
-   or remove an `index.md` bullet. The operations are `Log { date, bullet }`,
-   `ListBullet { target, bullet, section, create_section }` and `CreateIndex { folder }`
-   (`okf::ops::ReplayOp`). They are stored as JSON with an `op` tag and re-applied by
-   `okf::ops::replay`, which shares its text edits with the ops themselves. Text that
-   no operation changes keeps its bytes; changed text gets `\n` line endings, as
-   `okf.py` writes. A free-text edit of an `index.md` (`edit_document`) clears the
-   entry's `replay`, so that entry conflicts like any other on a stale base.
-4. The session's overlay is marked stale.
+`write::apply` carries every write tool's call into the database:
+
+1. Auth, then `write` access on a single target catalog: the `catalog` argument, else
+   the connection's write target.
+2. One transaction takes the catalog row (`FOR KEY SHARE`), gets or creates the open
+   changeset for (catalog, key, label), and locks its row (`FOR UPDATE`,
+   `store::changesets::lock`), so writes to one changeset, its publish and its discard
+   run one at a time. Every changeset transaction takes these locks in that order;
+   `catalogs::delete` takes the row `FOR UPDATE` first, so neither side can deadlock the
+   other. The overlay is read under that lock, in the same transaction: its cached
+   `version` is a cache label, never a concurrency token. Each write holds one pooled
+   connection for its whole transaction, so writers queued on one changeset's row lock
+   each hold one while they wait; with the pool's 8 connections, enough of them can
+   leave reads waiting for a connection. This is accepted for now: one agent's
+   writes to one changeset are rarely that concurrent.
+3. On a blocking thread, the `okf::ops` function runs on a copy of the connection's
+   overlay workspace (the published files plus the changeset's entries). Every path it
+   touched then passes the write rules: inside the catalog, not machinery, secret scan,
+   frontmatter parses. A touched path the op removed is a deletion if it is published,
+   or was at the entry's base revision; otherwise the changeset keeps no entry for it
+   (a file it created, then removed), so every deletion entry names something
+   published.
+4. Each touched path becomes an entry (insert or replace):
+   - **base revision:** the existing entry's base (the first edit's), else the live
+     revision in the overlay's published snapshot (NULL if there is none);
+   - **replay:** edits to `log.md` and `index.md` that come from bookkeeping are also
+     recorded as operations: `log` adds a log entry; `index`, `create_concept` (with
+     `index_summary`) and the listing changes of `move_concept`, `split_concept` and
+     `delete_concept` add, rename or remove an `index.md` bullet. The operations are
+     `Log { date, bullet }`, `ListBullet { target, bullet, section, create_section }`
+     and `CreateIndex { folder }` (`okf::ops::ReplayOp`). They are stored as JSON with
+     an `op` tag and re-applied by `okf::ops::replay`, which shares its text edits with
+     the ops themselves. Text that no operation changes keeps its bytes; changed text
+     gets `\n` line endings, as `okf.py` writes. The entry keeps the existing replay
+     plus the new operations while every edit to it came from one. Any other edit (an
+     `edit_document` of an `index.md`, say) clears it for good, so that entry conflicts
+     like any other on a stale base.
+5. Commit, and drop the connection's cached overlay; its next read rebuilds it. A
+   refused edit stores nothing.
 
 ### Publish
 

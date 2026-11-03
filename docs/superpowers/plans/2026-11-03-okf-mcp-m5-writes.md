@@ -291,24 +291,26 @@ impl Overlay {
 }
 pub async fn build_overlay(base: Arc<Loaded>, changeset: &ChangesetRow, entries: Vec<EntryRow>) -> Result<Overlay, OkfError>;
 pub struct Overlays { /* Mutex<HashMap<i64, Arc<Overlay>>> */ }
-impl Overlays { pub fn new(idle: Duration) -> Self; pub async fn get(&self, pool: &PgPool, state: &CatalogState, changeset: &ChangesetRow) -> Result<Arc<Overlay>, OkfError>; pub fn forget(&self, changeset_id: i64); }
+impl Overlays { pub fn new(idle: Duration) -> Self; pub async fn get(&self, executor: impl PgExecutor<'_>, state: &CatalogState, changeset: &ChangesetRow) -> Result<Arc<Overlay>, OkfError>; pub fn forget(&self, changeset_id: i64); } // executor: the pool for a read, the write's `&mut *tx` (Task 8)
 impl App { pub fn overlays(&self) -> &Overlays; }
 pub enum View { Published(Arc<Loaded>), Pending(Arc<Overlay>) }
 impl View { pub fn snapshot(&self) -> &Snapshot; pub fn lint(&self, now: DateTime<Utc>) -> LintReport; pub fn pending(&self) -> bool; }
 impl ToolContext { pub async fn view(&self, state: &CatalogState) -> Result<View, OkfError>; }   // Pending iff this key+label has an open changeset there
 
 // Task 8: src/write.rs, and src/store/changesets.rs (adds `lock`)
-pub async fn lock(conn: &mut PgConnection, changeset_id: i64) -> Result<ChangesetRow, OkfError>; // store::changesets: FOR UPDATE, re-read; write::apply takes it before reading the overlay
-pub struct WriteReport { pub catalog: String, pub changeset: i64, pub label: String, pub touched: Vec<String>, pub message: String, pub notes: Vec<String> }
+pub async fn lock(conn: &mut PgConnection, changeset_id: i64) -> Result<Option<ChangesetRow>, OkfError>; // store::changesets: FOR UPDATE, re-read (None: gone); write::apply takes it before reading the overlay
+pub struct WriteReport { pub catalog: String, pub changeset: i64, pub label: String, pub touched: Vec<String>, pub message: String, pub notes: Vec<String> } // touched: paths with an entry after the write
 #[derive(Serialize, JsonSchema)] (paths in WriteReport start with "/")
 pub async fn apply<F>(ctx: &ToolContext, catalog: Option<&str>, by: Option<&str>, op: F) -> Result<WriteReport, OkfError>
 where F: FnOnce(&MemWorkspace, &OpContext<'_>) -> Result<OpOutcome, OkfError> + Send + 'static;
-// a touched path that is no longer a file after the op is stored as a deletion entry (revert; M6's delete)
+// a touched path that is no longer a file after the op is stored as a deletion entry (revert; M6's delete),
+// unless it has no base revision and is not published now: then no entry is kept (an existing one is removed)
 impl MemWorkspace { pub fn remove(&self, path: &str) -> Result<bool, OkfError>; }    // Task 11
 // target = catalog arg or selection write target; require Access::Write; tx: lock_catalog, get_or_create, changesets::lock;
 // op runs (blocking) on a clone of the overlay workspace; each touched path: rules::check_path + check_content;
 // base_revision = existing entry's base, else Loaded::revision(path); replay = existing entry's replay ++ new ops when
 // both are Some (or the entry is new and the path has ops), else None; upsert_entry; commit; overlays.forget(id).
+// the overlay is read with overlays().get(&mut *tx, ...), in the write's transaction under the row lock.
 
 // Task 10: src/store/publish.rs
 #[derive(Serialize, JsonSchema)]
@@ -8081,6 +8083,17 @@ The four content tools (`create_concept`, `edit_document`, `replace_body`, `set_
 >
 > Task 1's `lock_catalog` answers a deleted catalog with `Refused` (`CATALOG_GONE`). Its `upsert_entry` bumps `version` (so a cached overlay is stale at once; `forget` just frees it early) and answers a closed changeset with `Busy`.
 
+> **Corrected (issue #98), 2026-11-03.** What shipped differs from the code below in these ways (read `src/write.rs` and `src/mcp/writes.rs` for the shipped text):
+> - **`Overlays::get` takes `executor: impl PgExecutor<'_>`, not `pool: &PgPool`** (Task 7's signature; the Interfaces block is updated). `apply` passes `&mut *tx`, so the overlay's entries are read in the write's own transaction, under the changeset's row lock. With `pool`, every write on a cache miss (every write after the first, since each write `forget`s the overlay) held one pooled connection and needed a second; with the pool's 8 connections and 8 writers queued on one changeset's row lock, the holder could not get its second connection, and every writer would wait for sqlx's acquire timeout. Reads still pass `app.pool()`; no other caller changed.
+> - **`get_or_create` already holds the row `FOR UPDATE`** (Task 1: both its insert and its conflict read lock the row), so in `apply` `changesets::lock` re-takes a lock the transaction holds and re-reads the row. It stays: it is the one entry point publish and discard share, and the `filter` on `Open` is cheap. A test (`concurrent_writes_to_one_changeset_lose_no_edit`, six tasks appending to one file at once, also racing to open the changeset) pins that no edit is lost; it cannot tell the two locks apart.
+> - `apply`'s loop builds each entry in a helper, `new_entry`, and takes each previous entry out of the map (`HashMap::remove`) instead of borrowing it; `merged_replay` allocates the merged array once at its final size. `Touched` derives `Debug`.
+> - `set_frontmatter` passes `Some(&value)` as it is: Task 4's op already reads a JSON null as a delete.
+> - `WriteReport::label`'s doc no longer names the MCP session (Decision 1: a session id is never a label).
+> - The params and tool descriptions state the path forms (the note above) and Task 4's review refusals: `edit_document` and `replace_body` refuse adding or changing frontmatter, `index_section` needs `index_summary`, `type` must be a non-blank string.
+> - After review of PR #112 (2026-11-03): a gone path with no base revision that is not published now is not stored; the changeset's own entry for it (a file it created, then removed) is dropped with `remove_entries`. So every deletion entry names something published, at its base or since, and publish (Task 10) either deletes it or reports a conflict; it never sees a delete of a path that was never published. `new_entry` takes the published revision and the path's ops and returns `Err(path)` for "nothing to store". `Busy`'s reason no longer ends in "; retry" (its `Display` adds it). The test `a_deleted_path_is_stored_as_a_deletion_entry` became `a_gone_path_is_a_deletion_only_if_something_is_published`, plus the pure `a_gone_published_path_keeps_its_first_base_revision`.
+> - After the second review of PR #112 (2026-11-03): `WriteReport.touched` lists only the paths that have an entry after the write (written, or a deletion); a gone, never-published path is left out. `SetFrontmatterParams::value` is required (no `#[serde(default)]`): a missing `value` is a parameter error, and only an explicit null deletes (test `set_frontmatter_requires_value_and_only_an_explicit_null_deletes`). The design's Write step 2 notes that writers queued on one changeset's row lock each hold a pooled connection (8 in the pool), which is accepted for now.
+> - Tests beyond Step 3 and Step 5: `a_deleted_path_is_stored_as_a_deletion_entry` (renamed after review, above), `concurrent_writes_to_one_changeset_lose_no_edit`; `edit_document_refuses_log_md` also refuses `/a` (no `.md`); `replay_operations_accumulate_until_a_free_edit` checks the appended array's contents. The tool tests' catalog has a root `index.md`.
+
 **Files:**
 - Create: `src/write.rs`; modify `src/lib.rs` (`pub mod write;` and the module list in its doc)
 - Modify: `src/store/changesets.rs` (add `lock`)
@@ -8527,7 +8540,7 @@ where
             ),
         })?;
     // Read after the lock, so the overlay holds every committed entry.
-    let overlay = app.overlays().get(app.pool(), &state, &changeset).await?;
+    let overlay = app.overlays().get(&mut *tx, &state, &changeset).await?;
     let existing: HashMap<String, EntryRow> = changesets::entries(&mut *tx, changeset.id)
         .await?
         .into_iter()
@@ -9757,6 +9770,8 @@ It runs under the catalog's publish lock: the in-process `CatalogState::publish_
 > - **`store::documents` gains `DocumentWrite`, `RevisionOp`, `RevisionRecord`, `write_document`, `delete_document` and `record_revision`.** They are moved out of `store::import`, which now uses them. The refactor is clean: import's private `Write` struct carried the same fields plus `&ImportOptions`, and only the revision's op, message and `changeset_id` differ between the two callers.
 > - **`publish` takes `actor: &str`** (`publish(app, state, changeset, actor, message)`): the publishing key's actor goes on every document and revision. Task 12's `adopt` keeps a changeset's original `actor`, so `ChangesetRow::actor` would credit the opener rather than the key that published.
 > - **Publish's database tests live in `src/mcp/changesets.rs`** (`publish_tests`), not in `src/store/publish.rs`. They need an `App` and write tools to make entries, which `mcp::testing` provides, and store tests do not reach into `mcp` (PR #84 review).
+
+> **Note from Task 8 (issue #98, review of PR #112), 2026-11-03.** `write::apply`'s `Busy` branch (the changeset closed while a write waited on its row lock) has no test in Task 8. This task and Task 11 drive it: close the changeset with a concurrent `publish` (here) or `discard` (Task 11) while a write waits on the row lock, then assert the write fails with `Busy` and stores nothing.
 
 **Files:**
 - Modify: `src/error.rs` (`LintFailed`, `Conflict`, `ConflictFile`)
@@ -12451,6 +12466,8 @@ The write path over real HTTP, with rmcp clients, as an agent sees it (design "T
 > **Interfaces note (Task 13), 2026-11-03.** M4's `TestServer` has no restart and sets only `X-OKF-Catalogs`. This task adds two methods, and every M4 caller keeps working:
 > - **`TestServer::client_with(key, headers)`** sets any headers. `client(key, catalogs)` becomes a wrapper over it.
 > - **`TestServer::restart(&mut self, config)`** stops the server and starts a new `App` and listener on the same `TestDb`, so the database (and its changesets) outlive the process, as across a pod restart. `TestServer` implements `Drop`, so its fields cannot be moved out. `restart` takes `&mut self` and replaces `base`, `app` and `shutdown` in place, and `start` and `restart` share one private `serve_app`.
+
+> **Note from Task 8 (issue #98, review of PR #112), 2026-11-03.** Every write rebuilds the connection's overlay (about 10 ms on the real catalog) while it holds the changeset's row lock, because the previous write `forget`s it. This is accepted for M5. This task's concurrency work decides whether the write path should stop storing the overlays it builds, or should reuse them.
 
 **Files:**
 - Modify: `tests/support/server.rs` (`client_with`, `restart`, `serve_app`)
