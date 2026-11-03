@@ -269,7 +269,15 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
 /// # Arguments
 /// * `shutdown` - the server's token.
 async fn cancel_on_signal(shutdown: CancellationToken) {
-    let interrupt = tokio::signal::ctrl_c();
+    // `ctrl_c()` resolves at once with an error if the handler cannot be
+    // registered; waiting forever then keeps that from reading as a signal.
+    let interrupt = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "cannot listen for SIGINT");
+            // Wait forever: SIGTERM still works.
+            std::future::pending::<()>().await;
+        }
+    };
     // `tokio::signal::unix` exists only on Unix, the only platform this
     // server runs on.
     let terminate = async {
@@ -286,7 +294,7 @@ async fn cancel_on_signal(shutdown: CancellationToken) {
     };
     // Whichever signal comes first; the other future is dropped.
     tokio::select! {
-        _ = interrupt => {}
+        () = interrupt => {}
         () = terminate => {}
     }
     tracing::info!("shutting down");
