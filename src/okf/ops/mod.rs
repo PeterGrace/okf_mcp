@@ -2,7 +2,7 @@
 //! (`stamp`, `review`, `question`, `unquestion`, `source`), its bookkeeping
 //! (`log`, `index`, Task 3), the server's content edits (`create_concept`,
 //! `edit_document`, `replace_body`, `set_frontmatter`), and the restructuring
-//! edits (M6): `rewrite_links` (`relink`).
+//! edits (M6): `rewrite_links` (`relink`) and `split_concept`.
 //!
 //! Every op is a pure function over a [`Workspace`]: it reads through it,
 //! writes the files it changes with [`Workspace::write_atomic`], and returns
@@ -36,6 +36,7 @@ pub mod frontmatter;
 pub mod log_index;
 pub mod relink;
 pub mod replay;
+pub mod split;
 
 // `pub use` re-exports names from the submodules, so callers write
 // `okf::ops::stamp` (like a package `__init__.py` importing from its modules).
@@ -47,6 +48,7 @@ pub use relink::{rewrite_links, Moved, Redirect};
 // and functions in separate namespaces, so `ops::replay(...)` and
 // `ops::replay::ReplayOp` both work.
 pub use replay::{insert_index_bullet_text, log_text, replay, ReplayOp};
+pub use split::{split_concept, Split, DEFAULT_SPLIT_TYPE};
 
 /// What an op needs from its caller besides the catalog.
 ///

@@ -55,6 +55,10 @@ static FENCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[\s\x1c-\x1f]{0,3}(```|~~~)").expect("FENCE regex is valid"));
 static FOOTNOTE_DEF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[\^([^\]]+)\]:").expect("FOOTNOTE_DEF regex is valid"));
+/// A footnote reference `[^label]` (`okf.py`'s `FOOTREF_RE` without its
+/// `(?!:)` lookahead, which [`footnote_refs`] applies by hand).
+static FOOTNOTE_REF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\^([^\]]+)\]").expect("FOOTNOTE_REF regex is valid"));
 static HTML_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)<a[\s\x1c-\x1f][^>]*(?:name|[i\u{130}\u{131}]d)=["']([^"']+)["']"#)
         .expect("HTML_ANCHOR regex is valid")
@@ -207,6 +211,23 @@ pub struct Heading {
     pub slug: String,
 }
 
+/// An ATX heading line's level and its text as written: `HEADING_RE`'s
+/// groups 1 and 2, the text not stripped (`cmd_split` re-levels with it).
+///
+/// # Arguments
+/// * `line` - one line, without its `\n`.
+///
+/// # Returns
+/// `(number of #, text)` (`""` for a bare `#`), or `None` for any other line.
+/// It does not know about fences: [`headings`] skips fenced code itself.
+pub(crate) fn atx_heading(line: &str) -> Option<(usize, &str)> {
+    // `?` on an `Option`: a line that is not a heading returns `None` here.
+    let caps = HEADING.captures(line)?;
+    // Indexing is safe: group 1 (the `#`s) is mandatory in HEADING. Group 2
+    // is absent for a bare `#`, so it is read with `get`, which cannot panic.
+    Some((caps[1].len(), caps.get(2).map_or("", |text| text.as_str())))
+}
+
 /// The ATX headings in `lines`, skipping fenced code, with their anchor slugs.
 pub fn headings(lines: &[&str]) -> Vec<Heading> {
     let mut found = Vec::new();
@@ -219,15 +240,11 @@ pub fn headings(lines: &[&str]) -> Vec<Heading> {
         if fence.is_some() {
             continue;
         }
-        if let Some(caps) = HEADING.captures(line) {
-            // Indexing is safe: group 1 (the `#`s) is mandatory in HEADING; indexing a
-            // group that did not participate would panic.
-            let level = caps[1].len();
-            let text = caps.get(2).map_or("", |m| py_strip(m.as_str())).to_string();
+        if let Some((level, text)) = atx_heading(line) {
             found.push(Heading {
                 index,
                 level,
-                text,
+                text: py_strip(text).to_string(),
                 slug: String::new(),
             });
         }
@@ -341,6 +358,37 @@ pub fn footnote_defs(lines: &[&str]) -> IndexMap<String, Vec<usize>> {
     defs
 }
 
+/// The footnote labels `text` cites: `set(FOOTREF_RE.findall(text))`,
+/// every `[^label]` that is not followed by `:` (which makes it a
+/// definition).
+///
+/// # Arguments
+/// * `text` - any markdown (several lines joined with `\n` is fine).
+///
+/// # Returns
+/// The labels, sorted (a `BTreeSet`, so callers iterate deterministically).
+///
+/// # Examples
+/// ```
+/// use okf_mcp::okf::markdown::footnote_refs;
+/// let refs = footnote_refs("Cited.[^a]\n\n[^a]: The definition.");
+/// assert_eq!(refs.into_iter().collect::<Vec<_>>(), ["a"]);
+/// ```
+pub fn footnote_refs(text: &str) -> BTreeSet<String> {
+    // Python's `(?!:)` rejects a match followed by `:`, and Python then tries
+    // every later start inside it. Each of those ends at the same `]` (a
+    // label holds no `]`), so each is rejected too: skipping the whole match,
+    // as `captures_iter` does, finds the same labels.
+    FOOTNOTE_REF
+        .captures_iter(text)
+        .filter(|caps| {
+            let end = caps.get(0).map_or(text.len(), |whole| whole.end());
+            !text[end..].starts_with(':')
+        })
+        .map(|caps| caps[1].to_string())
+        .collect()
+}
+
 /// Where a link points inside the bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLink {
@@ -383,6 +431,28 @@ pub fn resolve_link(workspace: &dyn Workspace, link: &str, source: &str) -> Opti
 mod tests {
     use super::*;
     use crate::okf::workspace::MemWorkspace;
+
+    #[test]
+    fn footnote_refs_skip_definitions() {
+        let text = "A[^a] and [^b c]. [^d]: def\n[^a]: again [^e]";
+
+        let refs = footnote_refs(text);
+
+        let expected = BTreeSet::from(["a".to_string(), "b c".to_string(), "e".to_string()]);
+        assert_eq!(refs, expected);
+    }
+
+    #[test]
+    fn atx_heading_keeps_the_text_as_written() {
+        let cases = [
+            atx_heading("### Detail ##"),
+            atx_heading("#"),
+            atx_heading("#nospace"),
+            atx_heading("####### seven"),
+        ];
+
+        assert_eq!(cases, [Some((3, "Detail")), Some((1, "")), None, None]);
+    }
 
     #[test]
     fn crlf_text_read_for_analysis_matches_okf_py() {

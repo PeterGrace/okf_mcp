@@ -141,6 +141,8 @@ OPS_DEFAULTS: dict[str, dict[str, Json]] = {
     "log": {"kind": "Update"},
     "index": {"title": None, "section": None},
     "ensure_index": {},
+    "split": {"title": None, "type": "Note", "description": None, "stub": None,
+              "source": None, "by": "fixture"},
 }
 
 

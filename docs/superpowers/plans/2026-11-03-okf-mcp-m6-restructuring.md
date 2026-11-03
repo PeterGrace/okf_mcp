@@ -2716,6 +2716,8 @@ Expected: compile errors, `cannot find type Split`, `cannot find function split_
 
 > **Corrected (issue #121), 2026-11-03.** `split_concept` is `py_truthy_str`'s first caller (with Task 3's `move_concept`). In `src/okf/pystr.rs`, delete the `#[cfg_attr(not(test), expect(dead_code, ...))]` attribute and the four-line comment above it on `py_truthy_str` (Task 2 added them until a caller existed). With this caller the expectation is unfulfilled, and `clippy -D warnings` fails until they go. If Task 3 or 4 has already merged and deleted them, there is nothing to do.
 
+> **Corrected (issue #123), 2026-11-03.** `split_concept`'s `# Errors` no longer links ``[`load_concept`]``: it is `pub(crate)`, so `cargo doc` with `-D warnings` refused the public item's link (`rustdoc::private_intra_doc_links`). The section below now names `load_concept`'s errors itself. The rest of the code compiled and passed as written.
+
 Put this above the test module in `src/okf/ops/split.rs`:
 
 ```rust
@@ -2811,7 +2813,11 @@ struct Header<'a> {
 /// the message, and its notes.
 ///
 /// # Errors
-/// - As [`load_concept`] for the parent, as [`new_concept_path`] for `to`.
+/// - For the parent, as `okf.py`'s `load_concept`: [`OkfError::NotFound`] or
+///   [`OkfError::InvalidPath`] from
+///   [`resolve_concept`](crate::okf::paths::resolve_concept),
+///   [`OkfError::Refused`] without frontmatter, [`OkfError::FrontmatterParse`].
+///   For `to`, as [`new_concept_path`].
 /// - [`OkfError::Refused`] with `okf.py`'s words: no such heading (listing
 ///   the headings), several matches (listing their slugs), a section with
 ///   no content, an unknown `--source` id, or generated frontmatter that

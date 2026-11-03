@@ -9,7 +9,10 @@
     "people/other.md": "---\ntype: Person\ntitle: Other\n---\n",
     "infra/ntp.md": "---\ntype: Service\ntitle: NTP\n---\n",
     "root-note.md": "---\ntype: Note\ntitle: Root note\n---\n",
-    "nowhere/thing.md": "---\ntype: Note\ntitle: Thing\n---\n"
+    "nowhere/thing.md": "---\ntype: Note\ntitle: Thing\n---\n",
+    "splits/index.md": "# Splits\n\n# Concepts\n\n* [Parent](parent.md) - the parent\n",
+    "splits/parent.md": "---\ntype: Note\ntitle: Parent\nstatus: draft\nsources:\n  - id: s1\n    resource: r1\n    title: One\n  - id: s2\n    resource: https://example.com/two\n---\n# Intro\n\nOpening.[^n0]\n\n## Background\n\nWhy it exists.[^s1]\n\n### Detail\n\nFine print, see [intro](#intro).\n\n## Other\n\nUnrelated.[^n2]\n\n## Last bit\n\nThe end.[^s1]\n\n[^n0]: Zero.\n[^s1]: From s1.\n[^n2]: Two.\n",
+    "splits/user.md": "---\ntype: Note\ntitle: User\n---\nSee [bg](/splits/parent.md#background), [detail](parent.md#Detail), [other](/splits/parent.md#other) and [whole](/splits/parent.md).\n"
   },
   "steps": [
     {"cmd": "stamp", "concept": "infra/time-server.md", "field": "generated", "by": "claude-code/claude-opus-5-5"},
@@ -53,6 +56,11 @@
     {"cmd": "ensure_index", "folder": "ops/deep/er"},
     {"cmd": "ensure_index", "folder": "analysis/new-stuff"},
     {"cmd": "ensure_index", "folder": "brand-new"},
-    {"cmd": "ensure_index", "folder": "ops"}
+    {"cmd": "ensure_index", "folder": "ops"},
+    {"cmd": "split", "concept": "splits/parent.md", "section": "Background", "to": "splits/background.md", "description": "Why the parent exists."},
+    {"cmd": "split", "concept": "splits/parent.md", "section": "last-bit", "to": "/splits/deeper/last.md", "source": ["s2"]},
+    {"cmd": "split", "concept": "splits/parent.md", "section": "Nope", "to": "splits/nope.md"},
+    {"cmd": "split", "concept": "splits/parent.md", "section": "Other", "to": "splits/other.md", "source": ["zz"]},
+    {"cmd": "split", "concept": "splits/parent.md", "section": "Other", "to": "splits/other.md", "stub": "Moved away.", "title": "Other [things]", "type": "Topic"}
   ]
 }
