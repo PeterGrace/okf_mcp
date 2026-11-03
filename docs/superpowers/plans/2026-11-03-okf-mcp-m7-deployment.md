@@ -429,6 +429,16 @@ A minimal client for the design's clock check (Decision 7). It resolves `time_se
 
 Create `src/ntp.rs`, with the tests below and the items as `todo!()` stubs. Then fill the stubs in Step 3.
 
+> **Corrected (issue #141), 2026-11-03.** The code below is `src/ntp.rs` as merged: rustfmt-formatted,
+> and the module doc names `from_ntp` in plain backticks rather than as an intra-doc link, because
+> `RUSTDOCFLAGS="-D warnings" cargo doc` refuses a public module doc that links to a private item
+> (`rustdoc::private_intra_doc_links`).
+>
+> After Brooke's review of PR #149, the code also tries every resolved address in turn within the
+> one timeout (`ask_each`, `ask`), reporting the last error when all fail, and `to_ntp` clamps a
+> leap second's nanoseconds to 999_999_999. Three tests were added (12 in all). The public interface
+> and `testing` are unchanged.
+
 ```rust
 //! A minimal SNTP client (RFC 4330, NTP version 4): one request, one reply,
 //! the clock offset. The server's clock check (design "Time", `clock_check`)
@@ -437,7 +447,7 @@ Create `src/ntp.rs`, with the tests below and the items as `todo!()` stubs. Then
 //! No crate: the protocol is one 48-byte packet each way. Timestamps are
 //! 64-bit NTP fixed point: seconds since 1900 in the high 32 bits, a binary
 //! fraction of a second in the low 32. Seconds wrap in February 2036 (era 1);
-//! [`from_ntp`] reads a timestamp whose top bit is clear as era 1, as RFC 4330
+//! `from_ntp` reads a timestamp whose top bit is clear as era 1, as RFC 4330
 //! section 3 says.
 
 use std::net::SocketAddr;
@@ -528,12 +538,18 @@ struct Reply {
 /// * `clock` - our clock; read just before sending and just after receiving.
 /// * `timeout` - the limit for the whole exchange, DNS included.
 ///
+/// When the name resolves to several addresses (A and AAAA records), each is
+/// tried in the resolver's order until one gives a usable reply, all within
+/// `timeout`. A family with no route fails at once and the next is tried; a
+/// silent address uses up the rest of the time.
+///
 /// # Returns
 /// The offset, the round trip and the server's stratum.
 ///
 /// # Errors
-/// [`NtpError`]: the name doesn't resolve, the socket fails, no reply in
-/// time, or a reply that isn't a synchronized server's answer to this request.
+/// [`NtpError`]: the name doesn't resolve, no reply in time, or, when every
+/// address failed, the last address's error (a socket failure, or a reply
+/// that isn't a synchronized server's answer to this request).
 pub async fn query(
     server: &str,
     clock: &dyn Clock,
@@ -549,8 +565,43 @@ pub async fn query(
         })?
 }
 
-/// One request and its reply, without a deadline (see [`query`]).
+/// Resolves `server` and asks its addresses, without a deadline (see [`query`]).
 async fn exchange(server: &str, clock: &dyn Clock) -> Result<Reading, NtpError> {
+    // A named binding: the returned iterator borrows the string, so a
+    // temporary (freed at the end of the statement) would not live long enough.
+    let target = with_port(server);
+    let addresses = lookup_host(target.as_str())
+        .await
+        .map_err(|source| NtpError::Resolve {
+            server: server.to_string(),
+            source,
+        })?;
+    ask_each(server, addresses, clock).await
+}
+
+/// Asks each address in turn; the first usable reply wins.
+///
+/// # Errors
+/// [`NtpError::NoAddress`] for no addresses, else the last address's error.
+async fn ask_each(
+    server: &str,
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    clock: &dyn Clock,
+) -> Result<Reading, NtpError> {
+    let mut last_error = NtpError::NoAddress {
+        server: server.to_string(),
+    };
+    for address in addresses {
+        match ask(server, address, clock).await {
+            Ok(reading) => return Ok(reading),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+/// One request to `address` and its reply.
+async fn ask(server: &str, address: SocketAddr, clock: &dyn Clock) -> Result<Reading, NtpError> {
     // Closures that wrap an error with the server's name. They borrow
     // `server` (a `&str`, which is `Copy`), so they can be used repeatedly.
     let io = |source: std::io::Error| NtpError::Io {
@@ -561,16 +612,6 @@ async fn exchange(server: &str, clock: &dyn Clock) -> Result<Reading, NtpError> 
         server: server.to_string(),
         reason,
     };
-    let address = lookup_host(with_port(server).as_str())
-        .await
-        .map_err(|source| NtpError::Resolve {
-            server: server.to_string(),
-            source,
-        })?
-        .next()
-        .ok_or_else(|| NtpError::NoAddress {
-            server: server.to_string(),
-        })?;
     // Bind the family the server's address has, on any port.
     let local = if address.is_ipv4() {
         SocketAddr::from(([0, 0, 0, 0], 0))
@@ -588,7 +629,8 @@ async fn exchange(server: &str, clock: &dyn Clock) -> Result<Reading, NtpError> 
     let received_at = clock.now();
     let reply = parse_reply(&buffer[..length], sent).map_err(bad)?;
     let receive = from_ntp(reply.receive).ok_or_else(|| bad("its receive time is out of range"))?;
-    let transmit = from_ntp(reply.transmit).ok_or_else(|| bad("its transmit time is out of range"))?;
+    let transmit =
+        from_ntp(reply.transmit).ok_or_else(|| bad("its transmit time is out of range"))?;
     let (offset, round_trip) = offset_and_round_trip(sent_at, receive, transmit, received_at);
     Ok(Reading {
         stratum: reply.stratum,
@@ -641,9 +683,8 @@ fn parse_reply(packet: &[u8], sent: u64) -> Result<Reply, &'static str> {
         return Err("the server is not synchronized (stratum above 15)");
     }
     // `try_into` turns the 8-byte slice into an array; the length is fixed.
-    let word = |at: usize| {
-        u64::from_be_bytes(packet[at..at + 8].try_into().expect("an 8-byte field"))
-    };
+    let word =
+        |at: usize| u64::from_be_bytes(packet[at..at + 8].try_into().expect("an 8-byte field"));
     if word(24) != sent {
         return Err("its originate time is not this request's");
     }
@@ -681,9 +722,11 @@ fn to_ntp(instant: DateTime<Utc>) -> u64 {
     let seconds = (instant.timestamp() + NTP_UNIX_OFFSET) as u32;
     // Rounded to the nearest 2^-32 s, not down: with rounding both ways a
     // nanosecond survives the round trip exactly (the fraction is finer).
-    // The largest result, for 999_999_999 ns, is still below 2^32.
-    let fraction = ((u64::from(instant.timestamp_subsec_nanos()) << 32) + 500_000_000)
-        / 1_000_000_000;
+    // The largest result, for 999_999_999 ns, is still below 2^32. chrono
+    // gives 10^9 ns or more inside a leap second; the clamp keeps those in
+    // the fraction instead of letting them spill into the seconds bits.
+    let nanos = instant.timestamp_subsec_nanos().min(999_999_999);
+    let fraction = ((u64::from(nanos) << 32) + 500_000_000) / 1_000_000_000;
     (u64::from(seconds) << 32) | fraction
 }
 
@@ -753,7 +796,9 @@ pub(crate) mod testing {
         times: Option<(DateTime<Utc>, DateTime<Utc>)>,
         stratum: u8,
     ) -> SocketAddr {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind a fake NTP server");
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind a fake NTP server");
         let address = socket.local_addr().expect("its address");
         tokio::spawn(async move {
             let mut request = [0u8; PACKET_LEN];
@@ -807,6 +852,18 @@ mod tests {
     }
 
     #[test]
+    fn a_leap_second_instant_stays_in_its_second() {
+        let leap = chrono::NaiveDate::from_ymd_opt(2016, 12, 31)
+            .and_then(|day| day.and_hms_nano_opt(23, 59, 59, 1_500_000_000))
+            .unwrap()
+            .and_utc();
+        let last_nanosecond = Utc.with_ymd_and_hms(2016, 12, 31, 23, 59, 59).unwrap()
+            + TimeDelta::nanoseconds(999_999_999);
+
+        assert_eq!(to_ntp(leap), to_ntp(last_nanosecond));
+    }
+
+    #[test]
     fn a_request_is_a_version_4_client_packet_with_its_transmit_time() {
         let packet = request(0x0123_4567_89AB_CDEF);
         assert_eq!(packet[0], 0x23);
@@ -832,19 +889,34 @@ mod tests {
 
         assert_eq!(parse_reply(&good, sent).map(|r| r.stratum), Ok(1));
         assert_eq!(parse_reply(&good[..47], sent), Err("shorter than 48 bytes"));
-        assert_eq!(parse_reply(&reply(0x23, 1, sent, 7), sent), Err("not a server reply (mode 4)"));
+        assert_eq!(
+            parse_reply(&reply(0x23, 1, sent, 7), sent),
+            Err("not a server reply (mode 4)")
+        );
         assert_eq!(
             parse_reply(&reply(0xE4, 1, sent, 7), sent),
             Err("the server is not synchronized (leap indicator 3)")
         );
-        assert_eq!(parse_reply(&reply(0x24, 0, sent, 7), sent), Err("a kiss-o'-death reply (stratum 0)"));
+        assert_eq!(
+            parse_reply(&reply(0x24, 0, sent, 7), sent),
+            Err("a kiss-o'-death reply (stratum 0)")
+        );
         assert_eq!(
             parse_reply(&reply(0x24, 16, sent, 7), sent),
             Err("the server is not synchronized (stratum above 15)")
         );
-        assert_eq!(parse_reply(&reply(0x24, 1, 43, 7), sent), Err("its originate time is not this request's"));
-        assert_eq!(parse_reply(&no_receive, sent), Err("it has no receive time"));
-        assert_eq!(parse_reply(&reply(0x24, 1, sent, 0), sent), Err("it has no transmit time"));
+        assert_eq!(
+            parse_reply(&reply(0x24, 1, 43, 7), sent),
+            Err("its originate time is not this request's")
+        );
+        assert_eq!(
+            parse_reply(&no_receive, sent),
+            Err("it has no receive time")
+        );
+        assert_eq!(
+            parse_reply(&reply(0x24, 1, sent, 0), sent),
+            Err("it has no transmit time")
+        );
     }
 
     #[test]
@@ -885,6 +957,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_address_falls_through_to_the_next() {
+        // A port nobody listens on: the kernel answers the request with ICMP
+        // port unreachable, which the connected socket reports as an error.
+        let closed = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let server = fake_server(Some((at(5040), at(5060))), 1).await;
+        let clock = StepClock::new([at(0), at(0), at(100)]);
+
+        let reading = ask_each("time.example", [closed, server], &clock)
+            .await
+            .unwrap();
+
+        assert_eq!(reading.offset, TimeDelta::seconds(5));
+    }
+
+    #[tokio::test]
+    async fn every_address_failing_gives_the_last_error() {
+        let refusing = fake_server(Some((at(5040), at(5060))), 16).await;
+        let clock = StepClock::new([at(0), at(100)]);
+
+        let none = ask_each("time.example", [], &clock).await.unwrap_err();
+        let error = ask_each("time.example", [refusing], &clock)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(none, NtpError::NoAddress { .. }), "{none:?}");
+        assert!(matches!(error, NtpError::BadReply { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
     async fn a_silent_server_times_out() {
         // Bound but never read: the request is dropped unanswered.
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -922,7 +1027,7 @@ Expected: before Step 2 the module isn't declared, so nothing compiles; after St
 
 - [ ] **Step 3: The implementation**
 
-The code above is the implementation; replace the stubs with it. Run `cargo test --lib -- ntp`. Expected: 9 passed.
+The code above is the implementation; replace the stubs with it. Run `cargo test --lib -- ntp`. Expected: 12 passed.
 
 - [ ] **Step 4: Gates, changelog, commit**
 
