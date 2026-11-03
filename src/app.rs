@@ -154,7 +154,10 @@ impl App {
     /// A catalog whose stored data would not build is retried only once its
     /// `generation` moves (an import or publish), since the same data would
     /// fail the same way: until then a refresh keeps the old snapshot, and a
-    /// catalog never loaded stays out. Passes never overlap: a call made while another runs waits for
+    /// catalog never loaded stays out. A catalog deleted and created again
+    /// under the same name counts as never loaded: if the new one fails to
+    /// load, the name is missing until it does, since the old content no
+    /// longer exists to serve. Passes never overlap: a call made while another runs waits for
     /// it, then makes its own pass.
     ///
     /// # Returns
@@ -511,6 +514,28 @@ mod tests {
 
         let loaded = app.catalog("pg").unwrap().current();
         assert_eq!((loaded.generation(), loaded.files()), (3, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_re_created_catalog_that_fails_to_load_drops_the_old_one() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "pg", "", Utc::now())
+            .await
+            .unwrap();
+        import_files(&db.pool, "pg", &[("a.md", "# A\n")], false).await;
+        let app = app(&db.pool).await;
+        catalogs::delete(&db.pool, "pg", false).await.unwrap();
+        let again = catalogs::create(&db.pool, "pg", "", Utc::now())
+            .await
+            .unwrap();
+        break_catalog(&db.pool, again.id).await;
+
+        app.poll().await.unwrap();
+
+        assert!(
+            app.catalog("pg").is_none(),
+            "the deleted catalog is not served"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
