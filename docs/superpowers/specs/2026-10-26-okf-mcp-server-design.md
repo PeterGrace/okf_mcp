@@ -600,7 +600,7 @@ One `thiserror` enum, `OkfError`:
 | `EditMismatch { path, matches }` | `old_str` found 0 or more than 1 times |
 | `LintFailed { errors, warnings }` | Publish refused: lint errors in changed files or links into deleted paths (`errors`), with the rest as `warnings`; HTTP 422 |
 | `Conflict { files }` | Publish found documents changed since this changeset read them; `files` lists each path with its base and current revision; HTTP 409 |
-| `StillLinked { path, links }` | `delete_concept` refused: other documents link to the concept; `links` lists each (source, line). Not counted: its folder's own listing bullet, its links to itself, the root `AGENTS.md`, `CLAUDE.md` and `README.md` (as publish's link check); `log.md` and other `index.md` files count; HTTP 409 |
+| `StillLinked { path, links }` | `delete_concept` refused: other documents link to the concept; `path` and each `links[].source` are catalog-relative with a leading `/` (`/infra/x.md`, `/hub.md`), as tool results (`touched`, `message`) and `Conflict` write them (other errors' paths have no leading `/`); `links` lists each (source, line). Not counted: its folder's own listing bullet, its links to itself, the root `AGENTS.md`, `CLAUDE.md` and `README.md` (as publish's link check); `log.md` and other `index.md` files count; HTTP 409 |
 | `Busy` | The database aborted the request to resolve a lock conflict (`40P01`, `40001`); nothing was stored; retry (HTTP 503). `write::apply` also answers it if the changeset it locked is no longer open, a defensive check: a write queued behind a publish or discard opens a new changeset instead (see "Publish") |
 | `Database` | Any database failure (details logged, not returned) |
 | `Io` | Filesystem errors (import, export) |

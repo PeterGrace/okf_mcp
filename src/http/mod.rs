@@ -267,6 +267,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::Config;
+    use crate::error::LinkSource;
     use crate::mcp::testing::app_with;
 
     /// A response's body as JSON.
@@ -357,8 +358,11 @@ mod tests {
     #[test]
     fn a_delete_refused_while_linked_is_a_conflict() {
         let still_linked = AppError(OkfError::StillLinked {
-            path: "x.md".to_string(),
-            links: Vec::new(),
+            path: "/x.md".to_string(),
+            links: vec![LinkSource {
+                source: "/hub.md".to_string(),
+                line: 5,
+            }],
         });
 
         assert_eq!(still_linked.status(), StatusCode::CONFLICT);

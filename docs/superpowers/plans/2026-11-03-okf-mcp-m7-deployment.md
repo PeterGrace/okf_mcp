@@ -115,9 +115,12 @@ Decisions 1 to 6 are pgrace's answers on 2026-11-03. The rest are Claude's, each
     - `nginx.ingress.kubernetes.io/proxy-buffering: "off"` and `proxy-read-timeout`/`proxy-send-timeout` `"3600"`, as the autobots API sets them, for `/mcp`'s event streams;
     - `proxy-body-size: "80m"`, because nginx's default 1 MiB would refuse the import route, whose limit is `max_import_bytes` (64 MiB) plus gzip slack.
 12. **`StillLinked`'s paths gain their leading slash** (decided by Claude; the M6 follow-up from Brooke's review of PR #137).
-    - **The change:** `path` and every `links[].source` are written `/a/b.md`, like every other path a tool returns. They stay catalog-relative.
+    - **The change:** `path` and every `links[].source` are written `/a/b.md`, as tool results (`touched`, `message`) and `Conflict` write them. They stay catalog-relative.
     - **Why now:** before the API is reachable by other harnesses.
     - **Not changed:** other `OkfError` variants' `path` fields, which the task lists in its changelog.
+
+    > **Corrected (issue #140), 2026-11-03.** "Every path a tool returns" was too broad: most other `OkfError` variants (`NotFound`, `InvalidPath`, `LintFailed`, ...) write paths with no leading `/`. The wording is narrowed to "as tool results (`touched`, `message`) and `Conflict` write them" here, in the code's docs and comments, and in the design's Errors row. The other variants are left as they are (the task's changelog lists each); that inconsistency is a recorded follow-up (Brooke's review of PR #152).
+
 13. **Version 0.7.0** (decided by Claude). `Cargo.toml` goes from `0.1.0` to `0.7.0` (milestone 7); `okf-mcp --version` prints it. The release tag is `v0.7.0`, and the image tags are `0.7.0` and `sha-<short>`, with no `:latest` (`flavor: latest=false`; deployments pin a version).
 14. **The first catalog** (decided by Claude).
     - **Catalog and import:** after the server is up, Claude creates catalog `pg` with `kubectl exec ... okf-mcp catalog create pg`, then imports the private catalog's tracked files. It copies `git archive` of `HEAD` into the pod's `/tmp` and runs `okf-mcp import pg /tmp/pg.tar.gz` there. The subcommands use `DATABASE_URL`, so no API key is involved.
@@ -314,7 +317,9 @@ Notes:
 
 ### Task 1: `StillLinked` paths with a leading slash
 
-M6's `delete_concept` reports `StillLinked { path: "infra/x.md", links: [{source: "hub.md", line}] }`, while every other path a tool returns starts with `/`. Agents feed these paths back into tools, so they should read alike (Brooke's review of PR #137; Decision 12). Only `StillLinked` changes. The task lists, in its changelog, which other `OkfError` variants carry a `path` and how each is written, without changing them.
+> **Corrected (issue #140), 2026-11-03.** "Every path a tool returns" was too broad: most other `OkfError` variants (`NotFound`, `InvalidPath`, `LintFailed`, ...) write paths with no leading `/`. The wording is narrowed to "as tool results (`touched`, `message`) and `Conflict` write them" here, in the code's docs and comments, and in the design's Errors row. The other variants are left as they are (the task's changelog lists each); that inconsistency is a recorded follow-up (Brooke's review of PR #152).
+
+M6's `delete_concept` reports `StillLinked { path: "infra/x.md", links: [{source: "hub.md", line}] }`, while tool results (`touched`, `message`) and `Conflict` write paths with a leading `/`. Agents feed these paths back into tools, so they should read alike (Brooke's review of PR #137; Decision 12). Only `StillLinked` changes. The task lists, in its changelog, which other `OkfError` variants carry a `path` and how each is written, without changing them.
 
 **Files:**
 - Modify: `src/okf/ops/delete.rs` (the error's `path` and each `LinkSource.source`; tests)
@@ -376,7 +381,8 @@ In `delete_concept`:
 ```rust
     let links = links_into(workspace, &path, &index, listing)?;
     if !links.is_empty() {
-        // Catalog-relative with a leading `/`, as every path a tool returns.
+        // Catalog-relative with a leading `/`, as tool results (`touched`,
+        // `message`) and `Conflict` write them.
         return Err(OkfError::StillLinked {
             path: format!("/{path}"),
             links,
@@ -396,7 +402,7 @@ In `links_into`, where each `LinkSource` is built:
             );
 ```
 
-In `src/error.rs`, `LinkSource::source`'s doc becomes "The linking document's path, catalog-relative with a leading `/` (`/hub.md`), as every path a tool returns." The `StillLinked` variant's doc says the same of `path`.
+In `src/error.rs`, `LinkSource::source`'s doc becomes "The linking document's path, catalog-relative with a leading `/` (`/hub.md`), as tool results (`touched`, `message`) and `Conflict` write them." The `StillLinked` variant's doc says the same of `path`.
 
 - [ ] **Step 4: Run them to see them pass**
 
@@ -411,7 +417,7 @@ Run every gate. Commit:
 
 ```bash
 git add src/okf/ops/delete.rs src/error.rs src/http/mod.rs src/mcp/restructure.rs tests/smoke.rs tests/restructure.rs docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md changelog/
-git commit -m "fix: StillLinked paths start with a slash, like every other tool path (M7.01)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "fix: StillLinked paths start with a slash, like tool results' paths (M7.01)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---

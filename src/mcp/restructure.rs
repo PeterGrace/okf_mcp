@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(body["error"], "StillLinked");
         assert_eq!(
             body["links"],
-            serde_json::json!([{"source": "hub.md", "line": 6}])
+            serde_json::json!([{"source": "/hub.md", "line": 6}])
         );
         assert!(nothing_stored, "a refused delete stores nothing");
         assert_eq!(deleted.touched, ["/infra/time.md", "/infra/index.md"]);
