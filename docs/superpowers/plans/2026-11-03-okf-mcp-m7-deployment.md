@@ -429,6 +429,11 @@ A minimal client for the design's clock check (Decision 7). It resolves `time_se
 
 Create `src/ntp.rs`, with the tests below and the items as `todo!()` stubs. Then fill the stubs in Step 3.
 
+> **Corrected (issue #141), 2026-11-03.** The code below is `src/ntp.rs` as merged: rustfmt-formatted,
+> and the module doc names `from_ntp` in plain backticks rather than as an intra-doc link, because
+> `RUSTDOCFLAGS="-D warnings" cargo doc` refuses a public module doc that links to a private item
+> (`rustdoc::private_intra_doc_links`). Behaviour, the public interface and `testing` are unchanged.
+
 ```rust
 //! A minimal SNTP client (RFC 4330, NTP version 4): one request, one reply,
 //! the clock offset. The server's clock check (design "Time", `clock_check`)
@@ -437,7 +442,7 @@ Create `src/ntp.rs`, with the tests below and the items as `todo!()` stubs. Then
 //! No crate: the protocol is one 48-byte packet each way. Timestamps are
 //! 64-bit NTP fixed point: seconds since 1900 in the high 32 bits, a binary
 //! fraction of a second in the low 32. Seconds wrap in February 2036 (era 1);
-//! [`from_ntp`] reads a timestamp whose top bit is clear as era 1, as RFC 4330
+//! `from_ntp` reads a timestamp whose top bit is clear as era 1, as RFC 4330
 //! section 3 says.
 
 use std::net::SocketAddr;
@@ -588,7 +593,8 @@ async fn exchange(server: &str, clock: &dyn Clock) -> Result<Reading, NtpError> 
     let received_at = clock.now();
     let reply = parse_reply(&buffer[..length], sent).map_err(bad)?;
     let receive = from_ntp(reply.receive).ok_or_else(|| bad("its receive time is out of range"))?;
-    let transmit = from_ntp(reply.transmit).ok_or_else(|| bad("its transmit time is out of range"))?;
+    let transmit =
+        from_ntp(reply.transmit).ok_or_else(|| bad("its transmit time is out of range"))?;
     let (offset, round_trip) = offset_and_round_trip(sent_at, receive, transmit, received_at);
     Ok(Reading {
         stratum: reply.stratum,
@@ -641,9 +647,8 @@ fn parse_reply(packet: &[u8], sent: u64) -> Result<Reply, &'static str> {
         return Err("the server is not synchronized (stratum above 15)");
     }
     // `try_into` turns the 8-byte slice into an array; the length is fixed.
-    let word = |at: usize| {
-        u64::from_be_bytes(packet[at..at + 8].try_into().expect("an 8-byte field"))
-    };
+    let word =
+        |at: usize| u64::from_be_bytes(packet[at..at + 8].try_into().expect("an 8-byte field"));
     if word(24) != sent {
         return Err("its originate time is not this request's");
     }
@@ -682,8 +687,8 @@ fn to_ntp(instant: DateTime<Utc>) -> u64 {
     // Rounded to the nearest 2^-32 s, not down: with rounding both ways a
     // nanosecond survives the round trip exactly (the fraction is finer).
     // The largest result, for 999_999_999 ns, is still below 2^32.
-    let fraction = ((u64::from(instant.timestamp_subsec_nanos()) << 32) + 500_000_000)
-        / 1_000_000_000;
+    let fraction =
+        ((u64::from(instant.timestamp_subsec_nanos()) << 32) + 500_000_000) / 1_000_000_000;
     (u64::from(seconds) << 32) | fraction
 }
 
@@ -753,7 +758,9 @@ pub(crate) mod testing {
         times: Option<(DateTime<Utc>, DateTime<Utc>)>,
         stratum: u8,
     ) -> SocketAddr {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind a fake NTP server");
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind a fake NTP server");
         let address = socket.local_addr().expect("its address");
         tokio::spawn(async move {
             let mut request = [0u8; PACKET_LEN];
@@ -832,19 +839,34 @@ mod tests {
 
         assert_eq!(parse_reply(&good, sent).map(|r| r.stratum), Ok(1));
         assert_eq!(parse_reply(&good[..47], sent), Err("shorter than 48 bytes"));
-        assert_eq!(parse_reply(&reply(0x23, 1, sent, 7), sent), Err("not a server reply (mode 4)"));
+        assert_eq!(
+            parse_reply(&reply(0x23, 1, sent, 7), sent),
+            Err("not a server reply (mode 4)")
+        );
         assert_eq!(
             parse_reply(&reply(0xE4, 1, sent, 7), sent),
             Err("the server is not synchronized (leap indicator 3)")
         );
-        assert_eq!(parse_reply(&reply(0x24, 0, sent, 7), sent), Err("a kiss-o'-death reply (stratum 0)"));
+        assert_eq!(
+            parse_reply(&reply(0x24, 0, sent, 7), sent),
+            Err("a kiss-o'-death reply (stratum 0)")
+        );
         assert_eq!(
             parse_reply(&reply(0x24, 16, sent, 7), sent),
             Err("the server is not synchronized (stratum above 15)")
         );
-        assert_eq!(parse_reply(&reply(0x24, 1, 43, 7), sent), Err("its originate time is not this request's"));
-        assert_eq!(parse_reply(&no_receive, sent), Err("it has no receive time"));
-        assert_eq!(parse_reply(&reply(0x24, 1, sent, 0), sent), Err("it has no transmit time"));
+        assert_eq!(
+            parse_reply(&reply(0x24, 1, 43, 7), sent),
+            Err("its originate time is not this request's")
+        );
+        assert_eq!(
+            parse_reply(&no_receive, sent),
+            Err("it has no receive time")
+        );
+        assert_eq!(
+            parse_reply(&reply(0x24, 1, sent, 0), sent),
+            Err("it has no transmit time")
+        );
     }
 
     #[test]
