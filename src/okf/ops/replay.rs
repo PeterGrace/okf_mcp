@@ -101,10 +101,14 @@ pub enum ReplayOp {
 /// The text after the operations.
 ///
 /// # Errors
-/// [`OkfError::NotFound`] when a `Log` or `ListBullet` (or nothing) finds
-/// no file (as do `Unlist` and `Relink`); [`OkfError::Refused`] when a
-/// listing's section heading is gone, or when a move's `Unlist` finds its
-/// listing changed since the move.
+/// [`OkfError::NotFound`] when a `Log`, `ListBullet`, `Unlist` or `Relink`
+/// (or nothing) finds no file. For `Unlist` this is deliberate, not "already
+/// gone": publish never replays onto a file deleted since the entry's base
+/// (`replayed_text` makes that a conflict), so a missing file here means the
+/// ops themselves are wrong. [`OkfError::Refused`] when a listing's section
+/// heading is gone, when a move's `Unlist` finds its listing changed since
+/// the move, or when a `Relink` redirects a non-concept (`index.md`,
+/// `log.md`), which only a corrupt stored op can hold.
 ///
 /// # Examples
 /// ```
@@ -159,11 +163,12 @@ pub fn replay(path: &str, current: Option<&str>, ops: &[ReplayOp]) -> Result<Str
             ReplayOp::Relink { redirect } => {
                 // `no_dirs` cannot tell a directory link (`[x](../a)`) from a file
                 // link, which only matters when `from` is an `index.md`. Moves and
-                // splits only redirect concepts (see `rewrite_text`'s doc).
-                debug_assert!(
-                    is_concept(&redirect.from),
-                    "a Relink redirects a concept, never an index.md or log.md"
-                );
+                // splits only redirect concepts (see `rewrite_text`'s doc). The op
+                // comes from the database, so a bad one is an error in every build
+                // profile, never a panic or a silently wrong rewrite.
+                if !is_concept(&redirect.from) {
+                    return Err(non_concept_relink(path, &redirect.from));
+                }
                 rewrite_text(&no_dirs, path, path, present(path, &text)?, redirect)
             }
         };
@@ -257,6 +262,18 @@ pub(crate) fn unlist_text(
     // `Vec::remove(at)` takes the line out, like Python's `lines.pop(at)`.
     let bullet = lines.remove(at).to_string();
     Some((lines.join("\n"), bullet))
+}
+
+/// The refusal of a stored `Relink` whose source is not a concept: the
+/// replay's empty workspace cannot resolve directory links into it.
+fn non_concept_relink(path: &str, from: &str) -> OkfError {
+    OkfError::Refused {
+        reason: format!(
+            "{path}: a stored relink redirects /{from}, which is not a concept; \
+             only moves and splits of concepts record one, so discard this path \
+             and redo the operation"
+        ),
+    }
 }
 
 /// The refusal of a move's `Unlist` whose listing changed since the move.
@@ -897,6 +914,49 @@ mod tests {
         );
         // A delete removes the listing whatever it reads now.
         assert_eq!(deleted.unwrap(), once);
+    }
+
+    #[test]
+    fn unlist_writes_newline_endings_like_cmd_mv() {
+        let crlf = INFRA.replace('\n', "\r\n");
+
+        let replayed = replay(
+            "infra/index.md",
+            Some(&crlf),
+            &[unlist("infra/ntp.md", None)],
+        );
+
+        // `cmd_mv` reads and writes the old index in text mode.
+        assert_eq!(
+            replayed.unwrap(),
+            "# Infra\n\n# Concepts\n\n* [Time](time.md) - the clock\n"
+        );
+    }
+
+    #[test]
+    fn unlist_of_a_missing_index_is_not_found() {
+        let missing = replay("infra/index.md", None, &[unlist("infra/ntp.md", None)]);
+
+        assert!(
+            matches!(missing, Err(OkfError::NotFound { ref path }) if path == "infra/index.md"),
+            "{missing:?}"
+        );
+    }
+
+    #[test]
+    fn relink_of_a_non_concept_is_refused_not_a_panic() {
+        let ops = [relink("infra/index.md", "hosts/index.md")];
+
+        let refused = replay("index.md", Some("* [Infra](infra/) - x\n"), &ops);
+
+        assert!(
+            matches!(
+                refused,
+                Err(OkfError::Refused { ref reason })
+                    if reason.contains("/infra/index.md, which is not a concept")
+            ),
+            "{refused:?}"
+        );
     }
 
     #[test]

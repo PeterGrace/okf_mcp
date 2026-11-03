@@ -125,7 +125,7 @@ pub fn rewrite_links(
 ///   enough only while `redirect.from` is a concept (not an `index.md`): no
 ///   directory link can point at a concept. `move_concept` and
 ///   `split_concept` only ever redirect a concept, and the replay
-///   `debug_assert!`s it. [`rewrite_links`] has the real workspace, so it
+///   refuses any other source with an error. [`rewrite_links`] has the real workspace, so it
 ///   also handles an `index.md` source, as `okf.py` does.
 /// * `path` - the file's catalog-relative path.
 /// * `base` - the path its links were written against (`path`, unless it

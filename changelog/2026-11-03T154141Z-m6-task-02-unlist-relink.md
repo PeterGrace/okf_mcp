@@ -9,10 +9,13 @@ Task 2 of `docs/superpowers/plans/2026-11-03-okf-mcp-m6-restructuring.md` (miles
   move carries that text to the new folder).
 - `ReplayOp::Relink { redirect }`: re-runs a move's or split's link rewrite on an
   `index.md` or `log.md`, byte for byte, through `relink::rewrite_text`. The arm
-  `debug_assert!`s that `redirect.from` is a concept, which the replay's empty
-  workspace relies on.
+  refuses (`Refused`) a `redirect.from` that is not a concept, which the replay's
+  empty workspace relies on. It is an error rather than a `debug_assert!`
+  because the op is read from the database (review on PR #130).
 - `replay::{listing_line, unlist_text}` (crate-internal) and
-  `OpOutcome::record_rewrites`; 6 unit tests.
+  `OpOutcome::record_rewrites`; 9 unit tests, including an `Unlist` of a CRLF
+  index (it writes `\n`, as `cmd_mv` does) and of a missing one (`NotFound`, by
+  design: publish never replays onto a file deleted since the entry's base).
 
 ## Changed
 

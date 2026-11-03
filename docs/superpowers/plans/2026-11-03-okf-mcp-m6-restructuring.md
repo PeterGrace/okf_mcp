@@ -903,7 +903,7 @@ pub fn rewrite_links(
 ///   enough only while `redirect.from` is a concept (not an `index.md`): no
 ///   directory link can point at a concept. `move_concept` and
 ///   `split_concept` only ever redirect a concept, and the replay
-///   `debug_assert!`s it. [`rewrite_links`] has the real workspace, so it
+///   refuses any other source with an error. [`rewrite_links`] has the real workspace, so it
 ///   also handles an `index.md` source, as `okf.py` does.
 /// * `path` - the file's catalog-relative path.
 /// * `base` - the path its links were written against (`path`, unless it
@@ -1274,9 +1274,11 @@ Add the import:
 use crate::okf::ops::relink::{rewrite_text, Redirect};
 ```
 
-and extend the `paths` import to `use crate::okf::paths::{basename, is_concept};` (for the `Relink` arm's `debug_assert!`).
+and extend the `paths` import to `use crate::okf::paths::{basename, is_concept};` (for the `Relink` arm's concept check).
 
 > **Corrected (issue #120), 2026-11-03.** The replay's empty workspace resolves every link into `from` only while `from` is a concept, so the `Relink` arm `debug_assert!`s `is_concept(&redirect.from)`. Task 1's `rewrite_text` doc states the invariant. Review on PR #129.
+
+> **Corrected (issue #121), 2026-11-03.** The `debug_assert!` became a check that returns `OkfError::Refused` (`non_concept_relink`, below). The op is deserialized from the database at publish, so a bad stored op must be an error in both build profiles: the assert would have panicked in debug builds and been skipped in release builds, which then resolved against `no_dirs` wrongly without any error. There is no `OkfError::Internal`, and adding a variant would touch `src/error.rs` and `src/http/mod.rs`, which Task 5 also extends. `Refused` is the error publish already returns for a replay it cannot place (a missing heading), so the changeset stays open. Review on PR #130. The same review added three tests: `unlist_writes_newline_endings_like_cmd_mv`, `unlist_of_a_missing_index_is_not_found` and `relink_of_a_non_concept_is_refused_not_a_panic`. An `Unlist` with no file keeps `NotFound`, as `Log` and `ListBullet` do, and `replay`'s doc says why. Publish never replays onto a file deleted since the entry's base (`replayed_text` makes that a conflict), so a missing file means the stored ops are wrong, not that the listing is already gone.
 
 Add two variants to `ReplayOp`, after `CreateIndex`:
 
@@ -1319,16 +1321,17 @@ In `replay`, add two arms to the `match op` (after the `ListBullet` arm):
             ReplayOp::Relink { redirect } => {
                 // `no_dirs` cannot tell a directory link (`[x](../a)`) from a file
                 // link, which only matters when `from` is an `index.md`. Moves and
-                // splits only redirect concepts (see `rewrite_text`'s doc).
-                debug_assert!(
-                    is_concept(&redirect.from),
-                    "a Relink redirects a concept, never an index.md or log.md"
-                );
+                // splits only redirect concepts (see `rewrite_text`'s doc). The op
+                // comes from the database, so a bad one is an error in every build
+                // profile, never a panic or a silently wrong rewrite.
+                if !is_concept(&redirect.from) {
+                    return Err(non_concept_relink(path, &redirect.from));
+                }
                 rewrite_text(&no_dirs, path, path, present(path, &text)?, redirect)
             }
 ```
 
-Extend `replay`'s doc: in the idempotence paragraph add "an `Unlist` whose listing is gone, a `Relink` with no link left into its source"; in "# Errors" add "[`OkfError::Refused`] when a move's `Unlist` finds its listing changed since the move".
+Extend `replay`'s doc: in the idempotence paragraph add "an `Unlist` whose listing is gone, a `Relink` with no link left into its source"; in "# Errors" add "[`OkfError::Refused`] when a move's `Unlist` finds its listing changed since the move, or when a `Relink` redirects a non-concept", and say that `Unlist`'s `NotFound` for a missing file is deliberate (see the Corrected note above).
 
 Add after `lists_target`:
 
@@ -1380,6 +1383,18 @@ pub(crate) fn unlist_text(
     // `Vec::remove(at)` takes the line out, like Python's `lines.pop(at)`.
     let bullet = lines.remove(at).to_string();
     Some((lines.join("\n"), bullet))
+}
+
+/// The refusal of a stored `Relink` whose source is not a concept: the
+/// replay's empty workspace cannot resolve directory links into it.
+fn non_concept_relink(path: &str, from: &str) -> OkfError {
+    OkfError::Refused {
+        reason: format!(
+            "{path}: a stored relink redirects /{from}, which is not a concept; \
+             only moves and splits of concepts record one, so discard this path \
+             and redo the operation"
+        ),
+    }
 }
 
 /// The refusal of a move's `Unlist` whose listing changed since the move.
@@ -1494,7 +1509,7 @@ In `src/write.rs`, `merged_replay`'s `expect` text becomes `"a ReplayOp (strings
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --lib -- okf::ops okf::pystr`
-Expected: every test passes, including the 5 new replay tests, `py_truthy_str_is_str_of_a_truthy_value` and `rewrites_of_bookkeeping_files_replay_and_the_others_are_free`.
+Expected: every test passes, including the 5 new replay tests (8 with the three PR #130 added), `py_truthy_str_is_str_of_a_truthy_value` and `rewrites_of_bookkeeping_files_replay_and_the_others_are_free`.
 
 - [ ] **Step 6: Update the design**
 
