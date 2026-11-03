@@ -61,8 +61,8 @@ pub enum OkfError {
     /// `edit_document`'s old text does not occur exactly once (or, with
     /// `replace_all`, not at all).
     #[error(
-        "{path}: the old text occurs {matches} times; it must occur exactly once \
-         (or pass replace_all)"
+        "{path}: the old text occurs {matches} times; it must occur exactly once, \
+         or at least once with replace_all"
     )]
     EditMismatch {
         /// Catalog-relative path of the document.
@@ -376,8 +376,8 @@ mod tests {
             body,
             serde_json::json!({
                 "error": "EditMismatch",
-                "message": "a.md: the old text occurs 2 times; it must occur exactly once \
-                            (or pass replace_all)",
+                "message": "a.md: the old text occurs 2 times; it must occur exactly once, \
+                            or at least once with replace_all",
                 "path": "a.md",
                 "matches": 2,
             })

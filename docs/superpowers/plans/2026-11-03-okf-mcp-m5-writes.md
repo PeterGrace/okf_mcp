@@ -4584,6 +4584,8 @@ git commit -m "feat: okf::ops log, index, ensure_index and idempotent replay (M5
 > - `editable_path` starts from Task 5's `rules::check_path` (normalize, inside the catalog, not machinery, which calls `is_machinery`) instead of repeating those checks, so a machinery refusal carries `check_path`'s reason; `normpath` and `escapes_root` are no longer imported here.
 > - `set_frontmatter` compares the key's current lines as a borrowed slice instead of copying them.
 >
+> - After review of PR #109 (2026-11-03): `EditMismatch` reads "it must occur exactly once, or at least once with replace_all" (Step 1); a shared `non_blank` check makes `create_concept` refuse a blank `title` for a listing and makes `set_frontmatter` refuse a `type` that is not a non-blank string (`type must be a non-blank string; every concept needs one`); `create_concept` refuses `index_section` without `index_summary`; its doc says the concept and new folder indexes stay written when the listing is refused, so it runs on a scratch copy. A 14th test, `create_concept_lists_it_under_the_named_section`, covers `index_section`, and the edit test pins `check_path`'s machinery reason.
+>
 > No interface changed: `NewConcept` and the four op signatures are as in "Interfaces shared across tasks".
 
 The four content tools of the design's "Write tools" table. `okf.py` has none of them, so there is no parity golden. They reuse M1's path rules (`new_concept_path`), renderers (`okf::yaml`) and textual frontmatter edits (`Doc`), plus Task 3's `ensure_index` and listing.
@@ -4634,8 +4636,8 @@ In `src/error.rs`, add this test to the `tests` module:
             body,
             serde_json::json!({
                 "error": "EditMismatch",
-                "message": "a.md: the old text occurs 2 times; it must occur exactly once \
-                            (or pass replace_all)",
+                "message": "a.md: the old text occurs 2 times; it must occur exactly once, \
+                            or at least once with replace_all",
                 "path": "a.md",
                 "matches": 2,
             })
@@ -4652,8 +4654,8 @@ Add the variant after `Shape`:
     /// `edit_document`'s old text does not occur exactly once (or, with
     /// `replace_all`, not at all).
     #[error(
-        "{path}: the old text occurs {matches} times; it must occur exactly once \
-         (or pass replace_all)"
+        "{path}: the old text occurs {matches} times; it must occur exactly once, \
+         or at least once with replace_all"
     )]
     EditMismatch {
         /// Catalog-relative path of the document.
@@ -4857,6 +4859,38 @@ mod tests {
     }
 
     #[test]
+    fn create_concept_lists_it_under_the_named_section() {
+        let infra = "# Infra\n\n# Concepts\n\n# Hosts\n\n* [A](a.md) - a\n";
+        let ws = MemWorkspace::from_files([("index.md", ROOT_INDEX), ("infra/index.md", infra)]);
+        let frontmatter = object(json!({ "type": "Host", "title": "B" }));
+        let listed = |path, section| NewConcept {
+            index_summary: Some("b"),
+            index_section: Some(section),
+            ..concept(path, &frontmatter, "")
+        };
+
+        let outcome = create_concept(&ws, &ctx(), &listed("infra/b", "Hosts")).unwrap();
+        let missing = create_concept(&ws, &ctx(), &listed("infra/c", "Nope")).unwrap_err();
+
+        assert_eq!(
+            read(&ws, "infra/index.md"),
+            "# Infra\n\n# Concepts\n\n# Hosts\n\n* [A](a.md) - a\n* [B](b.md) - b\n"
+        );
+        assert_eq!(
+            outcome.replay["infra/index.md"],
+            [ReplayOp::ListBullet {
+                target: "infra/b.md".to_string(),
+                bullet: "* [B](b.md) - b".to_string(),
+                section: Some("Hosts".to_string()),
+                create_section: false,
+            }]
+        );
+        assert!(matches!(missing, OkfError::Refused { .. }), "{missing:?}");
+        // The listing is refused after the concept is written (see the doc).
+        assert!(ws.exists("infra/c.md"));
+    }
+
+    #[test]
     fn create_concept_notes_a_name_that_is_not_kebab_case() {
         let ws = MemWorkspace::from_files([("index.md", ROOT_INDEX)]);
         let frontmatter = object(json!({ "type": "Note" }));
@@ -4887,6 +4921,21 @@ mod tests {
             ..concept("a", &untitled, "")
         };
         let no_title = create_concept(&ws, &ctx(), &listed).unwrap_err();
+        let blank = object(json!({ "type": "Note", "title": " " }));
+        let blank_title = create_concept(
+            &ws,
+            &ctx(),
+            &NewConcept {
+                frontmatter: &blank,
+                ..listed
+            },
+        )
+        .unwrap_err();
+        let unlisted = NewConcept {
+            index_section: Some("Concepts"),
+            ..concept("a", &untitled, "")
+        };
+        let section_only = create_concept(&ws, &ctx(), &unlisted).unwrap_err();
         let taken = create_concept(&ws, &ctx(), &concept("infra/x", &untitled, "")).unwrap_err();
         let machinery =
             create_concept(&ws, &ctx(), &concept("tools/x", &untitled, "")).unwrap_err();
@@ -4902,6 +4951,14 @@ mod tests {
         assert_eq!(
             refusal(no_title),
             "a.md has no title to list it by; add one or leave out index_summary"
+        );
+        assert_eq!(
+            refusal(blank_title),
+            "a.md has no title to list it by; add one or leave out index_summary"
+        );
+        assert_eq!(
+            refusal(section_only),
+            "a.md: index_section needs index_summary"
         );
         assert!(!ws.exists("a.md"));
         assert!(matches!(taken, OkfError::InvalidPath { .. }));
@@ -5005,6 +5062,12 @@ mod tests {
             &refused[0],
             OkfError::InvalidPath { reason, .. } if reason == "is written by the log tool only"
         ));
+        // Machinery is refused by `rules::check_path`, with its reason.
+        assert!(matches!(
+            &refused[2],
+            OkfError::InvalidPath { path, reason }
+                if path == "tools/notes.md" && reason.starts_with("is repository machinery")
+        ));
         assert!(matches!(missing, OkfError::NotFound { .. }));
     }
 
@@ -5105,6 +5168,8 @@ mod tests {
         let no_type = set_frontmatter(&ws, "s", "type", None).unwrap_err();
         let bad_key = set_frontmatter(&ws, "s", "bad key", Some(&json!("x"))).unwrap_err();
         let bare = set_frontmatter(&ws, "n", "title", Some(&json!("x"))).unwrap_err();
+        let bad_types = [json!(""), json!(" "), json!(["a"]), json!(2)]
+            .map(|kind| refusal(set_frontmatter(&ws, "s", "type", Some(&kind)).unwrap_err()));
 
         for key in MANAGED_KEYS {
             let error = set_frontmatter(&ws, "s", key, Some(&json!("x"))).unwrap_err();
@@ -5119,6 +5184,10 @@ mod tests {
         assert_eq!(
             refusal(no_type),
             "type cannot be deleted; every concept needs one"
+        );
+        assert_eq!(
+            bad_types,
+            ["type must be a non-blank string; every concept needs one"; 4].map(String::from)
         );
         assert_eq!(refusal(bad_key), "'bad key' is not a valid frontmatter key");
         assert_eq!(
@@ -5182,7 +5251,8 @@ pub struct NewConcept<'a> {
     pub body: &'a str,
     /// With a summary, the concept is listed in its folder's `index.md`.
     pub index_summary: Option<&'a str>,
-    /// The heading to list it under (`index`'s `section`).
+    /// The heading to list it under (`index`'s `section`); refused without
+    /// `index_summary`.
     pub index_section: Option<&'a str>,
 }
 
@@ -5225,6 +5295,18 @@ pub(crate) fn key_lines(key: &str, value: &Value) -> Vec<String> {
     }
 }
 
+/// `value` as a string that is not blank (Python's `str.strip()`), the
+/// rule for a concept's `type` and for the `title` a listing uses.
+///
+/// # Returns
+/// The string, or `None` for a missing, non-string or blank value.
+fn non_blank(value: Option<&Json>) -> Option<&str> {
+    // `and_then` chains two `Option` steps, like `x and f(x)` in Python.
+    value
+        .and_then(Json::as_str)
+        .filter(|text| !py_strip(text).is_empty())
+}
+
 /// Refuses a key `Doc` could not find again.
 fn checked_key(key: &str) -> Result<(), OkfError> {
     if is_top_key(key) {
@@ -5252,32 +5334,40 @@ fn checked_key(key: &str) -> Result<(), OkfError> {
 ///
 /// # Errors
 /// [`OkfError::InvalidPath`] from [`new_concept_path`] (outside the catalog,
-/// reserved, machinery, taken); [`OkfError::Refused`] without a `type`, for
-/// a stamp key, an invalid key, or a listing without a `title`;
+/// reserved, machinery, taken); [`OkfError::Refused`] without a non-blank
+/// string `type`, for a stamp key, an invalid key, for `index_section`
+/// without `index_summary`, or a listing without a non-blank `title`;
 /// [`OkfError::FrontmatterParse`] if the rendered frontmatter would not
-/// parse; the listing's refusals (see `index`).
+/// parse (a guard: the renderers always write parseable YAML); the
+/// listing's refusals (see `index`).
+///
+/// Every refusal above comes before anything is written, except the
+/// listing's: the concept and any new folder indexes are written before
+/// the listing runs, and stay written when it is refused (a `section` that
+/// is not a heading of the index). As for [`ensure_index`], run the op on a
+/// scratch copy, as the write path does, and drop the copy on error.
 pub fn create_concept(
     workspace: &dyn Workspace,
     ctx: &OpContext<'_>,
     new: &NewConcept<'_>,
 ) -> Result<OpOutcome, OkfError> {
     let (path, note) = new_concept_path(workspace, new.path)?;
-    let has_type = new
-        .frontmatter
-        .get("type")
-        .and_then(Json::as_str)
-        .is_some_and(|kind| !py_strip(kind).is_empty());
-    if !has_type {
+    if non_blank(new.frontmatter.get("type")).is_none() {
         return Err(refused(format!("{path}: frontmatter needs a type")));
     }
-    let title = new.frontmatter.get("title").and_then(Json::as_str);
-    let listed_title = match (new.index_summary, title.filter(|t| !t.is_empty())) {
-        (Some(_), None) => {
+    let title = non_blank(new.frontmatter.get("title"));
+    let listed_title = match (new.index_summary, new.index_section, title) {
+        (None, Some(_), _) => {
+            return Err(refused(format!(
+                "{path}: index_section needs index_summary"
+            )))
+        }
+        (Some(_), _, None) => {
             return Err(refused(format!(
                 "{path} has no title to list it by; add one or leave out index_summary"
             )))
         }
-        (_, title) => title,
+        (_, _, title) => title,
     };
     let mut entries: Vec<(&str, Value)> = Vec::with_capacity(new.frontmatter.len() + 1);
     for (key, value) in new.frontmatter {
@@ -5483,7 +5573,7 @@ pub fn replace_body(
 ///
 /// # Errors
 /// [`OkfError::Refused`] for a key a dedicated tool owns, for deleting
-/// `type`, for an invalid key, and for a document without frontmatter;
+/// `type` or setting it to anything but a non-blank string, for an invalid key, and for a document without frontmatter;
 /// [`OkfError::FrontmatterParse`] when the frontmatter does not parse, before
 /// or after the edit; as [`resolve_concept`] otherwise.
 pub fn set_frontmatter(
@@ -5500,10 +5590,21 @@ pub fn set_frontmatter(
         )));
     }
     let value = value.filter(|v| !v.is_null());
-    if value.is_none() && key == "type" {
-        return Err(refused(
-            "type cannot be deleted; every concept needs one".to_string(),
-        ));
+    if key == "type" {
+        // `create_concept`'s rule: `type` stays a non-blank string.
+        match value {
+            None => {
+                return Err(refused(
+                    "type cannot be deleted; every concept needs one".to_string(),
+                ))
+            }
+            Some(kind) if non_blank(Some(kind)).is_none() => {
+                return Err(refused(
+                    "type must be a non-blank string; every concept needs one".to_string(),
+                ))
+            }
+            Some(_) => {}
+        }
     }
     let LoadedConcept { path, mut doc, .. } = load_concept(workspace, concept)?;
     // The key's current lines, borrowed from the document (no copy).
@@ -5545,7 +5646,7 @@ In the module docs, change "the server's content edits (Task 4)" to "the server'
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --lib -- okf::ops okf::doc error http`
-Expected: the 13 new `okf::ops::content` tests pass, along with `top_keys_follow_the_block_pattern`, `edit_mismatch_names_the_path_and_the_count` and every earlier test.
+Expected: the 14 new `okf::ops::content` tests pass, along with `top_keys_follow_the_block_pattern`, `edit_mismatch_names_the_path_and_the_count` and every earlier test.
 
 - [ ] **Step 7: Update the design**
 
@@ -5573,7 +5674,7 @@ Task 4 of `docs/superpowers/plans/2026-11-03-okf-mcp-m5-writes.md` (milestone 5)
   `index`'s listing, recorded as replay ops), `edit_document` (exact replacement,
   `EditMismatch`, frontmatter and `log.md`/machinery refused), `replace_body`
   (frontmatter kept byte for byte) and `set_frontmatter` (textual `set_block` /
-  `delete_block`, managed keys refused); `NewConcept`; 13 unit tests.
+  `delete_block`, managed keys refused); `NewConcept`; 14 unit tests.
 - `OkfError::EditMismatch { path, matches }`, 400 over HTTP, with `path` and `matches`
   in its JSON.
 - `doc::is_top_key`.
