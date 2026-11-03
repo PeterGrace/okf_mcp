@@ -104,18 +104,23 @@ One binary, `okf-mcp`, on tokio with an axum router:
 | `POST/GET/DELETE /mcp` | any key | rmcp `StreamableHttpService` in stateful mode (`Mcp-Session-Id`) |
 | `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as a `.tar.gz`, built on request from the published documents |
 | `POST /catalogs/{name}/import` | `admin` on the catalog | Replaces or fills an existing catalog from an uploaded `.tar.gz` (see "Import"). Creating and deleting catalogs is subcommand-only |
-| `GET /healthz` | none | Liveness and readiness: database reachable, snapshots loaded, clock offset |
+| `GET /healthz` | none | Liveness and readiness: `{"database": "ok"\|"unreachable", "catalogs": <count>}` (a count, no names: it needs no key), 200 while the database answers, else 503. The clock offset joins it in M7 |
 
 `tower` middleware: request tracing, timeouts, and the auth layer on every route but
 `/healthz`. rmcp's DNS-rebinding check (`allowed_hosts`, which defaults to localhost
 only) is configured from `allowed_hosts` in the config, so the server works behind the
 ingress.
 
+`tower-http` traces every request; every route but `/mcp` has a 120-second timeout
+(`/mcp`'s `GET` is a long-lived event stream, bounded by rmcp's keep-alive and
+`session_idle_timeout` instead). SIGINT or SIGTERM cancels one token that ends rmcp's
+sessions, the poll loop and the listener.
+
 Subcommands:
 
 | Subcommand | Does |
 |---|---|
-| `serve` (default) | Runs migrations, loads snapshots, serves HTTP |
+| `serve [--listen ADDR]` (default) | Runs migrations, loads snapshots, starts the poll loop, serves HTTP (`--listen`, or `OKF_MCP_LISTEN`, overrides `listen`) |
 | `migrate` | Runs migrations and exits |
 | `catalog create NAME [--description D]`, `catalog list`, `catalog delete NAME [--force]` | Manage catalogs. Delete refuses while the catalog has a non-empty open changeset, unless `--force`; it then removes the catalog's documents, revisions, changesets and grants (cascading foreign keys) |
 | `import NAME PATH [--replace]` | Imports a directory or `.tar.gz` into a catalog (see "Import") |

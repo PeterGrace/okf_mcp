@@ -2723,7 +2723,7 @@ fn mcp_service(
 /// * `shutdown` - cancelling it ends every MCP session.
 ///
 /// # Returns
-/// The router, ready for [`axum::serve`].
+/// The router, ready for [`axum::serve()`] (which [`serve`] calls).
 pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     let keys = Arc::clone(app.keys());
     // `route_layer` applies to the routes added before it, so every keyed
@@ -2771,6 +2771,26 @@ pub async fn serve(
 ```
 
 Add `pub mod http;` to `src/lib.rs` and the crate doc.
+
+> **Corrected (issue #70), 2026-11-03.** The public API above shipped as written
+> (`AppError`, `REQUEST_TIMEOUT`, `router`, `serve`, the `route_layer` placement; and in
+> Step 4 `TestServer::{start, key, client, mcp_url}`, `call`, `structured`, `files`,
+> `Client`), so Tasks 11 and 12 need no change. Differences: (1) the status match moved
+> into a public `AppError::status()`, which `into_response` calls; `into_response` also
+> logs a non-internal error at debug level by kind only, as `mcp::tool_error` does.
+> (2) Two unit tests in `src/http/mod.rs`: `app_errors_have_a_status_and_the_error_json`
+> (an internal error's body hides the driver message) and
+> `healthz_reports_an_unreachable_database_as_503` (a closed pool). (3) In `src/cli.rs`
+> the old `no_subcommand_means_serve` test became `serve_is_the_default_and_takes_listen`
+> (it still checks `migrate` parses), `serve_is_not_there_yet` became
+> `serve_without_a_database_is_explained`, and the tests pass a `fixed_now()`
+> `Arc<dyn Clock>` (cloned with `Arc::clone` where a test calls `run` twice).
+> (4) `tests/server.rs`'s selection test gathers its four answers before asserting
+> (Arrange-Act-Assert). (5) The `serve` row in the design also names `OKF_MCP_LISTEN`.
+> (6) `router`'s doc links `axum::serve()` with parentheses: `axum::serve` is both a
+> function and a module, an ambiguous link `cargo doc -D warnings` refuses (fixed above).
+> Step 7 also held an SSE `GET /mcp` stream open across SIGTERM: the server exited in
+> 0.05 s and the stream ended.
 
 - [ ] **Step 3: `serve` on the command line**
 

@@ -62,19 +62,27 @@ tar = "0.4.46"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "migrate", "macros"] }
 thiserror = "2.0.6"
 # The async runtime sqlx runs on, and the CLI's entry point.
-# `time`: `tokio::time::interval` for the poll loop (and `sleep` in tests).
-tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# `time`: `tokio::time::interval` for the poll loop (and `sleep` in tests);
+# `net`: the server's TCP listener; `signal`: SIGINT and SIGTERM.
+tokio = { version = "1.54", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 # `CancellationToken`: one signal that stops the poll loop, rmcp's sessions
 # and the HTTP server together (rmcp's config takes this type).
 tokio-util = "0.7.20"
 # The configuration file.
 toml = "1.1"
+# HTTP middleware: request tracing and timeouts.
+tower-http = { version = "0.6.11", features = ["trace", "timeout"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
 # Property-based tests (Hypothesis-backed); the library is imported as `hegel`.
 hegeltest = "0.50.3"
+# The end-to-end tests talk to the server as a real MCP client would.
+rmcp = { version = "3.8.0", features = ["client", "transport-streamable-http-client-reqwest"] }
+# Plain HTTP requests in tests (401s, /healthz, the archive routes);
+# `json` for `Response::json`.
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 # Throwaway Postgres containers for the database tests (needs Docker). Only
 # the modules crate: it re-exports the testcontainers version it supports.
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
