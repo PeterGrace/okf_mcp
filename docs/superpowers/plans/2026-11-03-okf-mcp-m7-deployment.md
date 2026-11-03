@@ -1044,6 +1044,11 @@ git commit -m "feat: an SNTPv4 client for the clock check (M7.02)" -m "Co-Author
 
 The design's "Time", made real. `time_server` is read from the config, and is optional and non-blank. `check_once` measures the offset and logs. `App` keeps the last `ClockStatus`. `App::check_clock_until` runs a check at startup and every 15 minutes until shutdown, and `http::serve` spawns it beside the poll loop. `/healthz` adds `clock`, the last status or `null`, with coarse fields only. Its HTTP status still depends only on the database (Decision 7).
 
+> **Corrected (issue #142), 2026-11-03.** The code below compiled as written (rustfmt reflows a few lines). Three additions the steps missed:
+> - `src/http/mod.rs`'s existing `healthz_reports_an_unreachable_database_as_503` asserts the whole body too, so its expectation also gains `"clock": null`.
+> - `config.rs`'s `every_field_reads_from_the_file_and_unknown_keys_are_ignored` set `time_server` as its unknown key. Now that the field exists, the test's TOML gains `a_later_key = true` so its name stays true.
+> - The design's "Configuration" also lists a blank `time_server` among the values refused at load. `lib.rs`'s module doc, `app.rs`'s module doc and `serve`'s doc name the clock check.
+
 **Files:**
 - Create: `src/clock_check.rs`
 - Modify: `src/lib.rs` (`pub mod clock_check;`, after `pub mod clock;`)

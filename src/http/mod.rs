@@ -25,6 +25,7 @@ use tracing::Level;
 
 use crate::app::App;
 use crate::auth::require_key;
+use crate::clock_check::ClockStatus;
 use crate::error::OkfError;
 use crate::http::sessions::bind_session;
 use crate::mcp::OkfServer;
@@ -122,10 +123,14 @@ struct Health {
     database: &'static str,
     /// How many catalogs are loaded (no names: the route needs no key).
     catalogs: usize,
+    /// The last clock check (design "Time"); `null` without a `time_server`
+    /// or before the first check. It never changes the status.
+    clock: Option<ClockStatus>,
 }
 
 /// `GET /healthz`: 200 while the database answers within
-/// [`HEALTH_TIMEOUT`], else 503.
+/// [`HEALTH_TIMEOUT`], else 503, with the last clock check, which never
+/// changes the status.
 ///
 /// # Arguments
 /// * `app` - the shared state (axum's `State` extractor hands it over).
@@ -141,6 +146,7 @@ async fn healthz(State(app): State<Arc<App>>) -> Response {
     let health = Health {
         database: if reachable { "ok" } else { "unreachable" },
         catalogs: app.catalogs().len(),
+        clock: app.clock_status(),
     };
     let status = if reachable {
         StatusCode::OK
@@ -224,16 +230,18 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
         .with_state(app)
 }
 
-/// Serves until `shutdown` is cancelled, running the poll loop beside it.
+/// Serves until `shutdown` is cancelled, running the poll loop and the clock
+/// check beside it.
 ///
 /// # Arguments
 /// * `app` - the shared state.
 /// * `listener` - a bound socket.
-/// * `shutdown` - cancelled to stop: it ends the MCP sessions, the poll loop
-///   and the listener, and `serve` returns once open connections close.
+/// * `shutdown` - cancelled to stop: it ends the MCP sessions, the poll loop,
+///   the clock check and the listener, and `serve` returns once open
+///   connections close.
 ///
 /// # Errors
-/// The listener's I/O error, after the poll loop and the sessions are
+/// The listener's I/O error, after the loops and the sessions are
 /// stopped (`shutdown` is cancelled on every return).
 pub async fn serve(
     app: Arc<App>,
@@ -242,18 +250,22 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let router = router(Arc::clone(&app), &shutdown);
     let poller = tokio::spawn(Arc::clone(&app).poll_until(shutdown.clone()));
+    let clock_checker = tokio::spawn(Arc::clone(&app).check_clock_until(shutdown.clone()));
     let stop = shutdown.clone();
     // `async move { ... }` is a future that resolves once the token is
     // cancelled; axum then stops accepting and waits for open connections.
     let served = axum::serve(listener, router)
         .with_graceful_shutdown(async move { stop.cancelled().await })
         .await;
-    // On an error too, stop what this function started (the poll loop and
+    // On an error too, stop what this function started (the loops and
     // rmcp's sessions) before returning; cancelling twice is harmless.
     shutdown.cancel();
-    // The loop returns once `shutdown` is cancelled; a panic in it is logged.
+    // The loops return once `shutdown` is cancelled; a panic in one is logged.
     if let Err(error) = poller.await {
         tracing::error!(%error, "the poll loop panicked");
+    }
+    if let Err(error) = clock_checker.await {
+        tracing::error!(%error, "the clock check panicked");
     }
     served
 }
@@ -461,7 +473,43 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             json_body(response).await,
-            serde_json::json!({"database": "unreachable", "catalogs": 1})
+            serde_json::json!({"database": "unreachable", "catalogs": 1, "clock": null})
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn healthz_reports_the_last_clock_check_without_changing_its_status() {
+        let test = app_with(&[("pg", &[])], Config::default()).await;
+        let get = || {
+            Request::get("/healthz")
+                .body(Body::empty())
+                .expect("request")
+        };
+        let before = router(Arc::clone(&test.app), &CancellationToken::new())
+            .oneshot(get())
+            .await
+            .unwrap();
+        let before = json_body(before).await;
+        test.app.set_clock_status(ClockStatus {
+            ok: false,
+            checked_at: "2026-11-03T12:00:00Z".to_string(),
+            offset_ms: None,
+            stratum: None,
+        });
+
+        let after = router(Arc::clone(&test.app), &CancellationToken::new())
+            .oneshot(get())
+            .await
+            .unwrap();
+        let status = after.status();
+        let after = json_body(after).await;
+
+        assert_eq!(before["clock"], serde_json::Value::Null);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(after["database"], "ok");
+        assert_eq!(
+            after["clock"],
+            serde_json::json!({"ok": false, "checked_at": "2026-11-03T12:00:00Z"})
         );
     }
 }

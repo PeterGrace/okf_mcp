@@ -1,7 +1,8 @@
 //! The server's shared state (design "Architecture"): the database, the
 //! configuration, the clock, the key cache and every catalog held in
-//! memory, and the poll loop that notices changes made outside the server
-//! (design "Noticing changes made outside the server").
+//! memory, the poll loop that notices changes made outside the server
+//! (design "Noticing changes made outside the server"), and the clock check
+//! loop and its last result (design "Time").
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -15,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::Keys;
 use crate::catalog::CatalogState;
 use crate::clock::Clock;
+use crate::clock_check::{self, ClockStatus};
 use crate::config::Config;
 use crate::error::OkfError;
 use crate::http::sessions::SessionKeys;
@@ -61,6 +63,9 @@ pub struct App {
     // pass's own memory, the broken catalogs: a Rust mutex owns the data it
     // protects, which can only be reached through the lock.
     polling: tokio::sync::Mutex<Broken>,
+    // The last clock check (design "Time"); `None` until the first one, and
+    // always without a `time_server`. Written by the check loop only.
+    clock_status: RwLock<Option<ClockStatus>>,
 }
 
 impl App {
@@ -119,6 +124,7 @@ impl App {
             catalogs: RwLock::new(Arc::new(loaded)),
             admin_generation: AtomicI64::new(admin_generation),
             polling: tokio::sync::Mutex::new(broken),
+            clock_status: RwLock::new(None),
         }))
     }
 
@@ -156,6 +162,31 @@ impl App {
     /// Every open changeset's cached overlay, shared by every tool call.
     pub fn overlays(&self) -> &Overlays {
         &self.overlays
+    }
+
+    /// The last clock check, if any (`/healthz` shows it).
+    ///
+    /// # Returns
+    /// A copy of the status, or `None` without a `time_server` or before the
+    /// first check.
+    pub fn clock_status(&self) -> Option<ClockStatus> {
+        // A std lock is "poisoned" when a thread panicked while holding it;
+        // nothing here can panic under the lock, so that is an invariant.
+        self.clock_status
+            .read()
+            .expect("clock status lock poisoned")
+            .clone()
+    }
+
+    /// Records a clock check.
+    ///
+    /// # Arguments
+    /// * `status` - the check's outcome.
+    pub fn set_clock_status(&self, status: ClockStatus) {
+        *self
+            .clock_status
+            .write()
+            .expect("clock status lock poisoned") = Some(status);
     }
 
     /// Every loaded catalog, as of now. Cheap (an `Arc` clone); one call
@@ -321,6 +352,36 @@ impl App {
             }
         }
     }
+
+    /// Checks the clock at once and then every [`clock_check::CHECK_INTERVAL`]
+    /// until `shutdown` is cancelled. Returns at once without a `time_server`.
+    ///
+    /// # Arguments
+    /// * `shutdown` - cancelled when the server stops.
+    pub async fn check_clock_until(self: Arc<Self>, shutdown: CancellationToken) {
+        // `let ... else`: return when there is no server to ask.
+        let Some(server) = self.config.time_server.clone() else {
+            return;
+        };
+        let mut ticks = tokio::time::interval(clock_check::CHECK_INTERVAL);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            // The first tick completes at once: the startup check.
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                _ = ticks.tick() => {}
+            }
+            // An async call does nothing until awaited: `check` is the
+            // query, not yet started, for the `select!` below to drive.
+            let check = clock_check::check_once(&server, self.clock(), clock_check::QUERY_TIMEOUT);
+            // A stop during a query ends it at once instead of waiting up to
+            // `QUERY_TIMEOUT` (Brooke's review of PR #138).
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                status = check => self.set_clock_status(status),
+            }
+        }
+    }
 }
 
 /// Logs a catalog that failed to load or refresh and, if its stored data is
@@ -364,6 +425,7 @@ mod tests {
     use crate::archive::Files;
     use crate::clock::SystemClock;
     use crate::db::test_db;
+    use crate::mcp::testing::app_with;
     use crate::okf::workspace::StoredFile;
     use crate::store::changesets::{ChangesetKey, ChangesetState, EntryRow};
     use crate::store::import::{import, ImportOptions};
@@ -716,6 +778,59 @@ mod tests {
             .await
             .expect("poll_until returns after cancel")
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_clock_check_runs_at_startup_and_stops_with_the_server() {
+        // `None`: the server stamps its reply when the request arrives, after
+        // `app_with` has started its database (several seconds).
+        let server = crate::ntp::testing::fake_server(None, 1).await;
+        let config = Config {
+            time_server: Some(server.to_string()),
+            ..Config::default()
+        };
+        let test = app_with(&[("pg", &[])], config).await;
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(Arc::clone(&test.app).check_clock_until(shutdown.clone()));
+
+        // Wait for the startup check, but not forever.
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = test.app.clock_status() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a clock check within 10 s");
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop stops when cancelled")
+            .expect("the loop does not panic");
+
+        assert!(status.ok, "{status:?}");
+        // Both ends read the system clock: the offset is a few ms at most.
+        assert!(
+            status.offset_ms.is_some_and(|ms| ms.abs() < 1_000),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_time_server_there_is_no_check() {
+        let test = app_with(&[("pg", &[])], Config::default()).await;
+
+        // Returns at once, without a cancelled token.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&test.app).check_clock_until(CancellationToken::new()),
+        )
+        .await
+        .expect("returns at once without a time_server");
+
+        assert_eq!(test.app.clock_status(), None);
     }
 
     /// Opens `label`'s changeset for key `writer` at `at`, with an entry for

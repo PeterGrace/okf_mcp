@@ -51,7 +51,10 @@ async fn healthz_answers_without_a_key() {
 
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body, serde_json::json!({"database": "ok", "catalogs": 1}));
+    assert_eq!(
+        body,
+        serde_json::json!({"database": "ok", "catalogs": 1, "clock": null})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
