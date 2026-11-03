@@ -122,7 +122,14 @@ async fn a_move_is_published_and_exported() {
     assert_eq!(old_history["revisions"][0]["op"], "delete");
     assert_eq!(status, reqwest::StatusCode::OK);
     let exported = read_tarball(&tarball[..], u64::MAX).unwrap();
-    let text = |path: &str| String::from_utf8(exported[path].content.clone()).unwrap();
+    let text = |path: &str| {
+        // `get` returns an `Option` (like `dict.get`), so a missing entry
+        // fails with its path rather than a bare map-index panic.
+        let file = exported
+            .get(path)
+            .unwrap_or_else(|| panic!("{path} missing from the export"));
+        String::from_utf8(file.content.clone()).unwrap()
+    };
     assert!(!exported.contains_key("infra/time.md"));
     assert_eq!(text("infra/clock.md"), TIME);
     assert!(text("hub.md").contains("[time server](/infra/clock.md#ports)"));
@@ -143,6 +150,9 @@ async fn a_concurrent_edit_of_a_linking_file_conflicts() {
 
     let refused = call(&mover, "publish", json!({"message": "rename"})).await;
     let pending = ok(&mover, "pending_changes", json!({})).await;
+    // The editor has nothing pending, so it reads the published catalog.
+    let old = ok(&editor, "get_concept", json!({"path": "/infra/time.md"})).await;
+    let new = call(&editor, "get_concept", json!({"path": "/infra/clock.md"})).await;
     mover.cancel().await.unwrap();
     editor.cancel().await.unwrap();
 
@@ -174,6 +184,11 @@ async fn a_concurrent_edit_of_a_linking_file_conflicts() {
         .find(|file| file["path"] == "/hub.md")
         .expect("the hub is still pending");
     assert_eq!(hub["stale"], true);
+    // Nothing of the refused publish reached the published catalog.
+    assert_eq!(old["title"], "Time server");
+    assert_eq!(new.is_error, Some(true));
+    let new = new.structured_content.expect("the error's JSON");
+    assert_eq!(new["error"], "NotFound");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -200,6 +215,14 @@ async fn a_concurrent_index_of_the_same_folder_replays() {
 
     assert_eq!(published["published"], true);
     assert_eq!(published["replayed"], json!(["/infra/index.md"]));
+    let expected = [
+        ("/hub.md", "update"),
+        ("/infra/clock.md", "create"),
+        ("/infra/index.md", "update"),
+        ("/infra/time.md", "delete"),
+    ]
+    .map(|(path, op)| (path.to_string(), op.to_string()));
+    assert_eq!(revisions(&published), expected);
     let text = index["text"].as_str().unwrap();
     assert!(
         text.contains("* [Time server](clock.md) - the GPS clock"),

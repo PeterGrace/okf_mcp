@@ -12,10 +12,12 @@ Task 8 of `docs/superpowers/plans/2026-11-03-okf-mcp-m6-restructuring.md` (miles
     hub's anchored link and the folder listing follow the move.
   - `a_concurrent_edit_of_a_linking_file_conflicts`: another key republishes the hub
     the move relinked. The move's publish is refused with `Conflict` on `/hub.md`, and
-    all four of the move's entries stay pending, the hub's marked stale.
+    all four of the move's entries stay pending, the hub's marked stale,
+    and the published catalog is untouched: `/infra/time.md` still reads, and
+    `/infra/clock.md` is `NotFound`.
   - `a_concurrent_index_of_the_same_folder_replays`: another key lists a new concept
     in `/infra/index.md`. The move's publish replays its `Relink` onto that index,
-    and both bullets survive.
+    both bullets survive, and the publish's revisions are the move's four.
   - `a_delete_is_refused_while_linked_then_published`: `delete_concept` is refused
     with `StillLinked` (`hub.md`, line 6). Once `edit_document` removes the link, the
     delete is published, leaving the folder index as `"# Infra\n\n"`.
