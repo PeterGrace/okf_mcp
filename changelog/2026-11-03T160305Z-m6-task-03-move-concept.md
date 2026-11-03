@@ -8,8 +8,12 @@ issue #122.
 - `src/okf/ops/moves.rs`: `move_concept`, a port of okf.py's `cmd_mv`: the old
   listing is taken (`Unlist`, with the bullet it read), the file renamed, the
   listing added in the new folder (`ensure_index`, `ListBullet`), and every link
-  rewritten (`Relink` on index.md and log.md, free edits elsewhere); 5 unit tests.
-- `MemWorkspace::rename`, keeping bytes and the execute bit; 1 unit test.
+  rewritten (`Relink` on index.md and log.md, free edits elsewhere); 8 unit tests,
+  including its three divergences from okf.py (all where okf.py crashes).
+- `MemWorkspace::rename`, keeping bytes and the execute bit, and
+  `MemWorkspace::check_placement`, `write_atomic`'s placement check without a
+  write, which `move_concept` runs on its target before writing anything (so a
+  target below a file is refused under its own path); 2 unit tests.
 - Parity: 5 setup files and 5 steps (a log line and four moves, one refused); the
   shim stubs `okf.git` with `untracked_git` (the copy is never tracked, so
   `cmd_mv` renames); the Rust side appends okf.py's `print_touched` block;

@@ -15,6 +15,9 @@
 //!   raises `YamlError`);
 //! - a move into the root of a catalog without a root `index.md` is
 //!   [`OkfError::NotFound`] (`okf.py`: `FileNotFoundError`).
+//! - a target below an existing file is [`OkfError::InvalidPath`] "a parent
+//!   component is a file", before anything is written (`okf.py`'s
+//!   `os.makedirs` raises `FileExistsError`).
 //!
 //! `okf.py` runs `git mv` for a tracked file and `os.rename` otherwise;
 //! [`MemWorkspace::rename`] keeps the bytes and execute bit, as both do.
@@ -47,6 +50,7 @@ use crate::okf::workspace::{MemWorkspace, Workspace};
 /// - As [`resolve_concept`] for `old`.
 /// - As [`new_concept_path`] for `new` (outside the catalog, reserved,
 ///   machinery, taken).
+/// - As [`MemWorkspace::check_placement`] for `new` (below a file).
 /// - [`OkfError::FrontmatterParse`] for an unlisted concept whose
 ///   frontmatter does not parse.
 /// - The workspace's read or write error.
@@ -56,6 +60,9 @@ use crate::okf::workspace::{MemWorkspace, Workspace};
 pub fn move_concept(workspace: &MemWorkspace, old: &str, new: &str) -> Result<OpOutcome, OkfError> {
     let old = resolve_concept(workspace, old)?;
     let (new, note) = new_concept_path(workspace, new)?;
+    // `new_concept_path` does not check placement: refuse a target below a
+    // file here, naming it, before `ensure_index` writes anything.
+    workspace.check_placement(&new)?;
     let mut outcome = OpOutcome::default();
     // `Option` is iterable (zero or one item), so `extend` adds the note if any.
     outcome
@@ -375,5 +382,46 @@ mod tests {
         assert!(matches!(missing, OkfError::NotFound { .. }));
         assert_eq!(text(&workspace, "infra/index.md"), INFRA_INDEX);
         assert!(workspace.is_file("infra/time.md"));
+    }
+
+    #[test]
+    fn a_target_below_a_file_is_refused_with_its_own_path() {
+        let workspace = MemWorkspace::from_files(FILES);
+
+        let below = move_concept(&workspace, "infra/time.md", "infra/ntp.md/x.md").unwrap_err();
+
+        assert_eq!(
+            below.to_string(),
+            "infra/ntp.md/x.md: a parent component is a file"
+        );
+        assert_eq!(text(&workspace, "infra/index.md"), INFRA_INDEX);
+        assert!(workspace.is_file("infra/time.md"));
+    }
+
+    #[test]
+    fn an_unlisted_concept_with_bad_frontmatter_is_refused() {
+        let mut files = FILES.to_vec();
+        files.push(("infra/broken.md", "---\ntitle: [unclosed\n---\nBody.\n"));
+        let workspace = MemWorkspace::from_files(files);
+
+        let refused = move_concept(&workspace, "infra/broken.md", "people/broken.md").unwrap_err();
+
+        assert!(
+            matches!(refused, OkfError::FrontmatterParse { .. }),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_move_into_a_root_without_an_index_is_not_found() {
+        let files = FILES.into_iter().filter(|(path, _)| *path != "index.md");
+        let workspace = MemWorkspace::from_files(files);
+
+        let refused = move_concept(&workspace, "infra/time.md", "time.md").unwrap_err();
+
+        assert!(
+            matches!(refused, OkfError::NotFound { ref path } if path == "index.md"),
+            "{refused:?}"
+        );
     }
 }

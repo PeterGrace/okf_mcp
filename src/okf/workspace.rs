@@ -690,10 +690,33 @@ impl MemWorkspace {
     /// * `from` - the file's catalog-relative path.
     /// * `to` - its new path.
     ///
+    /// Checks that a new file could be written at `path` without writing
+    /// it: the check [`Workspace::write_atomic`] makes before it writes, so
+    /// an op can refuse a bad target before it writes anything else
+    /// (`move_concept`).
+    ///
+    /// # Arguments
+    /// * `path` - Catalog-relative path (a leading `/` means the root).
+    ///
+    /// # Errors
+    /// [`OkfError::InvalidPath`] if the path escapes the catalog or is the
+    /// root, is a directory, or sits below a file.
+    pub fn check_placement(&self, path: &str) -> Result<(), OkfError> {
+        let rel = checked_file(path)?;
+        // `map_or`: no conflict is `Ok`, a conflict becomes the error.
+        placement_conflict(&self.files(), &rel).map_or(Ok(()), |reason| {
+            Err(OkfError::InvalidPath {
+                path: path.to_string(),
+                reason: reason.to_string(),
+            })
+        })
+    }
+
     /// # Errors
     /// [`OkfError::InvalidPath`] if either path escapes the catalog or is
     /// the root, or `to` already exists, is a directory, or sits below a
-    /// file; [`OkfError::NotFound`] if there is no file at `from`.
+    /// file; [`OkfError::NotFound`] if there is no file at `from`. `to` is
+    /// checked first, so a missing `from` with a bad `to` is `InvalidPath`.
     pub fn rename(&self, from: &str, to: &str) -> Result<(), OkfError> {
         let (from_rel, to_rel) = (checked_file(from)?, checked_file(to)?);
         let mut files = self.files.write().expect("MemWorkspace lock poisoned");
@@ -872,6 +895,7 @@ mod tests {
         let taken = workspace.rename("c/y.md", "b.md").unwrap_err();
         let below_a_file = workspace.rename("c/y.md", "b.md/z.md").unwrap_err();
         let missing = workspace.rename("a/x.md", "d.md").unwrap_err();
+        let a_directory = workspace.rename("b.md", "c").unwrap_err();
 
         assert_eq!(workspace.stored("c/y.md"), Some(stored(b"x", true)));
         // Directories exist only as prefixes, so the emptied `a` is gone.
@@ -885,6 +909,30 @@ mod tests {
             OkfError::InvalidPath { ref reason, .. } if reason == "a parent component is a file"
         ));
         assert!(matches!(missing, OkfError::NotFound { .. }));
+        assert!(matches!(
+            a_directory,
+            OkfError::InvalidPath { ref reason, .. } if reason == "is a directory"
+        ));
+        assert_eq!(workspace.stored("b.md"), Some(stored(b"b", false)));
+    }
+
+    #[test]
+    fn check_placement_refuses_a_directory_or_a_path_below_a_file() {
+        let workspace = MemWorkspace::from_files([("a/x.md", "x")]);
+
+        let free = workspace.check_placement("a/y.md");
+        let taken_is_fine = workspace.check_placement("a/x.md");
+        let a_directory = workspace.check_placement("a").unwrap_err();
+        let below_a_file = workspace.check_placement("a/x.md/y.md").unwrap_err();
+
+        // `check_placement` asks only whether a file can sit there; a taken
+        // path is `rename`'s and `new_concept_path`'s concern.
+        assert!(free.is_ok() && taken_is_fine.is_ok());
+        assert_eq!(a_directory.to_string(), "a: is a directory");
+        assert_eq!(
+            below_a_file.to_string(),
+            "a/x.md/y.md: a parent component is a file"
+        );
     }
 
     #[test]
