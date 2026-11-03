@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_check_records_why() {
+    async fn a_failed_check_records_no_offset() {
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server = silent.local_addr().unwrap().to_string();
         let clock = StepClock::new([at(0), at(0), at(1)]);
