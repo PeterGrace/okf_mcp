@@ -85,9 +85,8 @@ impl App {
                 Ok(state) => {
                     loaded.insert(row.name, Arc::new(state));
                 }
-                // Deleted between the list and the load.
-                Err(OkfError::CatalogNotSelected { .. }) => {}
-                // Not in the map, so a later poll tries to load it again.
+                // Not in the map, so a later poll tries to load it again
+                // (unless it was deleted meanwhile).
                 Err(error) => note_failure(&mut broken, &row, "load", &error),
             }
         }
@@ -270,9 +269,12 @@ impl App {
     }
 }
 
-/// Logs a catalog that failed to load or refresh and, unless the failure was
-/// the database's (worth retrying at once), remembers its generation as
-/// broken.
+/// Logs a catalog that failed to load or refresh and, if its stored data is
+/// to blame, remembers its generation as broken.
+///
+/// A catalog deleted since this pass listed it is not a failure: it is gone
+/// from the next list, so it is only noted at debug level. A database error
+/// is logged but not remembered, so the next pass retries at once.
 ///
 /// # Arguments
 /// * `broken` - the broken catalogs, to add to.
@@ -280,12 +282,18 @@ impl App {
 /// * `action` - `"load"` or `"refresh"`, for the log line.
 /// * `error` - what went wrong.
 fn note_failure(broken: &mut Broken, row: &catalogs::Catalog, action: &str, error: &OkfError) {
-    // `matches!` is a one-pattern `match` that yields a `bool`.
-    let retry = if matches!(error, OkfError::Database { .. }) {
-        "at the next poll"
-    } else {
-        broken.insert(row.id, row.generation);
-        "when the catalog changes"
+    let retry = match error {
+        OkfError::CatalogNotSelected { .. } => {
+            tracing::debug!(catalog = %row.name, "{action} skipped: the catalog was deleted");
+            return;
+        }
+        OkfError::Database { .. } => "at the next poll",
+        // Every other error comes from the stored data, so the same
+        // generation would fail the same way. (`_` matches any variant.)
+        _ => {
+            broken.insert(row.id, row.generation);
+            "when the catalog changes"
+        }
     };
     tracing::error!(
         catalog = %row.name,
@@ -378,6 +386,35 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn only_data_failures_are_remembered_as_broken() {
+        let row = catalogs::Catalog {
+            id: 7,
+            name: "pg".to_string(),
+            description: String::new(),
+            generation: 3,
+            created_at: Utc::now(),
+        };
+        let deleted = OkfError::CatalogNotSelected {
+            catalog: "pg".to_string(),
+        };
+        let database = OkfError::Database {
+            source: sqlx::Error::PoolTimedOut,
+        };
+        let bad_data = OkfError::InvalidPath {
+            path: "../escape.md".to_string(),
+            reason: "escapes the catalog".to_string(),
+        };
+        let mut broken = Broken::new();
+
+        note_failure(&mut broken, &row, "load", &deleted);
+        note_failure(&mut broken, &row, "load", &database);
+        assert!(broken.is_empty());
+        note_failure(&mut broken, &row, "refresh", &bad_data);
+
+        assert_eq!(broken, Broken::from([(7, 3)]));
     }
 
     #[tokio::test(flavor = "multi_thread")]
