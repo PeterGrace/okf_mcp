@@ -259,8 +259,12 @@ async fn server_on_a_real_catalog() {
             .as_ref()
             .map_or(0, |value| value.to_string().len());
         eprintln!("{tool}: {bytes} bytes of JSON in {elapsed:?}");
+        // An error result's content is the `{error, message}` JSON (paths and
+        // catalog names, never document text), kept so a failure in this
+        // manual run says why without a rerun. `result` is owned, so its
+        // content moves into the list rather than being cloned.
         if result.is_error == Some(true) {
-            failed.push(tool);
+            failed.push((tool, result.content));
         }
     }
 
