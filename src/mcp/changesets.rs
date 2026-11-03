@@ -587,6 +587,12 @@ pub(crate) async fn discard(
     let Some(changeset) = changeset else {
         return Ok(discarded);
     };
+    // An empty list drops nothing: no lock, no version bump, and the cached
+    // overlay stays valid.
+    if paths.as_ref().is_some_and(Vec::is_empty) {
+        discarded.changeset = Some(changeset.id);
+        return Ok(discarded);
+    }
     let app = ctx.app();
     // The guard releases the mutex when it goes out of scope, after the
     // overlay is forgotten.
@@ -1850,7 +1856,20 @@ mod changes_tests {
         let ctx = writer(&test, "writer-a", "pg").await;
         let written = body(&ctx, "/a.md", "One.\n").await;
         body(&ctx, "/b.md", "Two.\n").await;
+        let version = |test: &TestApp| {
+            let pool = test.app.pool().clone();
+            async move {
+                changesets::by_id(&pool, written.changeset)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version
+            }
+        };
+        let before = version(&test).await;
 
+        let empty = discard(&ctx, discard_paths(Some(&[]))).await.unwrap();
+        let unchanged = version(&test).await;
         let some = discard(&ctx, discard_paths(Some(&["/a.md", "/c.md"])))
             .await
             .unwrap();
@@ -1863,6 +1882,12 @@ mod changes_tests {
             .unwrap_err();
         let again = body(&ctx, "/a.md", "Three.\n").await;
 
+        // An empty list drops nothing and leaves the version alone.
+        assert_eq!(
+            (empty.changeset, empty.removed, empty.closed),
+            (Some(written.changeset), 0, false)
+        );
+        assert_eq!(unchanged, before);
         assert_eq!(
             (some.changeset, some.removed, some.closed),
             (Some(written.changeset), 1, false)
