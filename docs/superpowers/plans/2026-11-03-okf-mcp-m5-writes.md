@@ -2575,7 +2575,9 @@ pub fn unquestion(
     } = load_concept(workspace, concept)?;
     let questions = match data.get(OPEN_QUESTIONS) {
         Some(Value::Seq(items)) if !items.is_empty() => items,
-        _ => return Err(refused(format!("{path} has no open_questions"))),
+        None | Some(Value::Null | Value::Str(_) | Value::Seq(_) | Value::Map(_)) => {
+            return Err(refused(format!("{path} has no open_questions")));
+        }
     };
     let index = question_index(&path, questions, question)?;
     let removed = py_str(&questions[index]);
