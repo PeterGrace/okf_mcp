@@ -3644,7 +3644,7 @@ mod tests {
 }
 ```
 
-> **Corrected (issue #124), 2026-11-03.** `an_emptied_folder_keeps_its_index_and_says_so` expected `"# Solo\n"`, but `unlist_text` removes only the bullet's line (as `cmd_mv` takes it, and as the `Unlist` replay does), so `"# Solo\n\n* [Only](only.md) - the only one\n"` becomes `"# Solo\n\n"`. The test now expects that. Trimming the blank line in the op alone would make the op and its replay disagree. The claims audit added two checks the plan did not have: `install/none.md` is `NotFound` (Decision 4) in `non_concepts_machinery_and_missing_paths_are_refused`, and a new test, `each_link_on_a_line_is_its_own_entry`, so the module has 7 tests.
+> **Corrected (issue #124), 2026-11-03.** `an_emptied_folder_keeps_its_index_and_says_so` expected `"# Solo\n"`, but `unlist_text` removes only the bullet's line (as `cmd_mv` takes it, and as the `Unlist` replay does), so `"# Solo\n\n* [Only](only.md) - the only one\n"` becomes `"# Solo\n\n"`. The test now expects that. Trimming the blank line in the op alone would make the op and its replay disagree. The claims audit added two checks the plan did not have: `install/none.md` is `NotFound` (Decision 4) in `non_concepts_machinery_and_missing_paths_are_refused`, and a new test, `each_link_on_a_line_is_its_own_entry`, so the module has 7 tests. Review on PR #132 added `a_root_level_concept_is_unlisted_from_the_root_index_with_no_note` and `a_crlf_index_is_unlisted_with_newline_endings_like_its_replay` (9 tests), and `delete_concept`'s `# Errors` now says a non-UTF-8 markdown file anywhere in the catalog is `Io`, as for `Snapshot::build`.
 
 - [ ] **Step 4: Run them to see them fail**
 
@@ -3809,7 +3809,7 @@ In `src/okf/ops/mod.rs`, add `pub use delete::delete_concept;`, and append `dele
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --lib -- okf::ops::delete error`
-Expected: the 7 delete tests and every error test pass.
+Expected: the 9 delete tests and every error test pass.
 
 - [ ] **Step 7: Update the design**
 

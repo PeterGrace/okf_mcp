@@ -9,9 +9,10 @@ issue #124.
   machinery (`rules::check_path` on the resolved path, before anything is read or changed)
   and a concept other documents link to (`StillLinked`, one entry per link); removes the
   concept and its listing (`Unlist`, any bullet); a note for an emptied folder;
-  7 unit tests.
+  9 unit tests (the plan's 6, plus one from the claims audit and two from review on
+  PR #132: a root-level concept and a CRLF `index.md`).
 - `OkfError::StillLinked { path, links }` and `LinkSource { source, line }`, HTTP 409;
-  1 unit test, and a 409 assertion in `http::tests::publish_refusals_have_their_statuses`.
+  1 unit test, and `http::tests::a_delete_refused_while_linked_is_a_conflict`.
 
 ## Changed
 
