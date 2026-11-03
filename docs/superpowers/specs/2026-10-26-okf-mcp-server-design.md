@@ -104,7 +104,7 @@ One binary, `okf-mcp`, on tokio with an axum router:
 | `POST/GET/DELETE /mcp` | any key | rmcp `StreamableHttpService` in stateful mode (`Mcp-Session-Id`) |
 | `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as a `.tar.gz`, built on request from the published documents |
 | `POST /catalogs/{name}/import` | `admin` on the catalog | Replaces or fills an existing catalog from an uploaded `.tar.gz` (see "Import"). Creating and deleting catalogs is subcommand-only |
-| `GET /healthz` | none | Liveness and readiness: `{"database": "ok"\|"unreachable", "catalogs": <count>}` (a count, no names: it needs no key), 200 while the database answers, else 503. The clock offset joins it in M7 |
+| `GET /healthz` | none | Liveness and readiness: `{"database": "ok"\|"unreachable", "catalogs": <count>}` (a count, no names: it needs no key), 200 while the database answers within 2 seconds (a pool connection included), else 503. The clock offset joins it in M7 |
 
 `tower` middleware: request tracing, timeouts, and the auth layer on every route but
 `/healthz`. rmcp's DNS-rebinding check (`allowed_hosts`, which defaults to localhost

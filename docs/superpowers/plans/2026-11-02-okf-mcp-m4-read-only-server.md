@@ -2680,9 +2680,15 @@ struct Health {
     catalogs: usize,
 }
 
-/// `GET /healthz`: 200 while the database answers, else 503.
+/// How long `/healthz` waits for the database (a pool connection included)
+/// before it answers "unreachable".
+pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `GET /healthz`: 200 while the database answers within
+/// [`HEALTH_TIMEOUT`], else 503.
 async fn healthz(State(app): State<Arc<App>>) -> Response {
-    let reachable = sqlx::query("SELECT 1").execute(app.pool()).await.is_ok();
+    let probe = sqlx::query("SELECT 1").execute(app.pool());
+    let reachable = matches!(tokio::time::timeout(HEALTH_TIMEOUT, probe).await, Ok(Ok(_)));
     let health = Health {
         database: if reachable { "ok" } else { "unreachable" },
         catalogs: app.catalogs().len(),
@@ -2805,6 +2811,13 @@ Add `pub mod http;` to `src/lib.rs` and the crate doc.
 > filter is `DEFAULT_LOG_FILTER = "warn,okf_mcp=info,tower_http=info"`, so requests are
 > logged by default (the default span records no headers). (11) `serve` cancels
 > `shutdown` and awaits the poll loop on every return, an `axum::serve` error included.
+> A second review of PR #83 added (12): `/healthz` has its own deadline, `HEALTH_TIMEOUT`
+> (2 s), around the `SELECT 1`, pool acquire included; a timeout counts as unreachable
+> (503). Without it, a saturated pool or a hung Postgres held the probe for sqlx's
+> 30-second acquire timeout, past a probe's own timeout (the code above is corrected).
+> `healthz_gives_up_after_its_own_deadline` holds every pool connection and checks the
+> 503 arrives at the deadline. The crate is Unix-only: `cancel_on_signal` uses
+> `tokio::signal::unix` without `#[cfg(unix)]`, as intended.
 > Step 7 also held an SSE `GET /mcp` stream open across SIGTERM: the server exited in
 > 0.05 s and the stream ended.
 
