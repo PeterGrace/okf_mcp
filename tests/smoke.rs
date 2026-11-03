@@ -375,13 +375,30 @@ async fn writes_on_a_real_catalog() {
 
     assert!(failed.is_empty(), "these tools returned errors: {failed:?}");
     assert_eq!(published["published"], true);
-    let revisions = published["revisions"].as_array().map_or(0, Vec::len);
+    // `as_array().map_or(&[][..], Vec::as_slice)`: the revisions as a slice,
+    // or an empty one if the field is missing, so the asserts below say what
+    // was published instead of panicking on the lookup.
+    let revisions = published["revisions"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
     eprintln!(
-        "publish wrote {revisions} revisions, {} warnings",
+        "publish wrote {} revisions, {} warnings",
+        revisions.len(),
         published["warnings"].as_array().map_or(0, Vec::len)
     );
-    assert!(
-        revisions >= 4,
+    let mut paths: Vec<&str> = revisions
+        .iter()
+        .filter_map(|revision| revision["path"].as_str())
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            "/index.md",
+            "/log.md",
+            "/m5-smoke/index.md",
+            "/m5-smoke/probe.md"
+        ],
         "the probe, its folder index, the root index and log.md"
     );
 }
