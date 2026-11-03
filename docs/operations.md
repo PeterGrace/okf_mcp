@@ -586,6 +586,7 @@ requests signed for any other one, often with a bare `400 Bad Request` on the
 bucket check, and the cluster's `ContinuousArchiving` condition reports
 `ContinuousArchivingFailing`. `s3Credentials.region` takes the region from a
 secret key, as above; the value itself is not secret.
+
 Give the backup credentials access to this bucket only.
 
 **Check it works.** The cluster's `ContinuousArchiving` condition should be

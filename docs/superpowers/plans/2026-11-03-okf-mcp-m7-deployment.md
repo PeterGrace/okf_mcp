@@ -1960,7 +1960,7 @@ This task changes other systems. Its PR in this repo carries only:
     - volumes: the ConfigMap, secret `okf-mcp-db-ca` (item `ca.crt`), and an `emptyDir` on `/tmp`;
     - the probes and `securityContext` of Decision 10 and `docs/operations.md`;
     - resources: requests `100m`/`256Mi`, limit `1Gi` memory.
-  - **`service.yaml`:** ClusterIP, port 8080, `ipFamilyPolicy: PreferDualStack`.
+  - **`service.yaml`:** ClusterIP, port 8080. No `ipFamilyPolicy`: the cluster forces `RequireDualStack`, and `PreferDualStack` kept the app out of sync (see the correction above).
   - **`ingress.yaml`:** class `nginx`, `cert-manager.io/cluster-issuer: letsencrypt-prod`, the annotations of Decision 11, host `okf-mcp.k.vsix.me`, TLS secret `okf-mcp-tls`.
   - **`app-okf-mcp.yaml`:** as `app-sish.yaml`, with name and path `okf-mcp` and sync-wave `"20"`. Add it to `kustomizations/kustomization.yaml`.
 
