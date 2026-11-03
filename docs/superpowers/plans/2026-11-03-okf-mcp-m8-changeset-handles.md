@@ -53,7 +53,7 @@ Deliberately deferred:
    - `path` of `NotFound`, `FrontmatterParse`, `Shape`, `SecretDetected` and `EditMismatch`;
    - `file` of each finding in `LintFailed`.
 
-   `InvalidPath` keeps the caller's reference as given, because it may not be a catalog path at all (`../x`). `Io` and `Config` are internal errors: their payload is the generic "internal error" message plus a path, and they keep that path as it is. `Io.path` is documented as catalog-relative, but it is also a filesystem path for a catalog root and an archive entry's name for import and export (M7 Task 1's table). `Config.path` is the configuration file's filesystem path.
+   `InvalidPath` keeps the caller's reference as given, because it may not be a catalog path at all (`../x`). `Io` is internal: its payload is the generic "internal error" message plus its `path`, which stays as it is. `Io.path` is documented as catalog-relative, but it is also a filesystem path for a catalog root and an archive entry's name for import and export (M7 Task 1's table). `Config` writes no `path` in its payload at all (its `to_json` arm is empty, `src/error.rs:310-315`), so there is nothing to change. Report results (`lint`, `oldest`, `sprawl`, `links_report`) keep `okf.py`'s unprefixed forms on purpose, for parity. So the same finding reads `/a.md` in a `LintFailed` error body and `a.md` in the `lint` tool's result. The README and the design say this explicitly (Task 1, Step 5).
 10. **Version 0.8.0.** This breaks the tool API, but no client uses the write tools yet: claude.ai is read-only (pgrace's instructions file), and no other client is connected with a write key. The read tools change only by adding an optional `changeset`. The release and its rollout follow M7's go-ahead rules (Task 6).
 11. **The header helper script goes** (pgrace). `~/.claude/okf-mcp-changeset.sh` was written on 2026-11-03 to give each Claude Code session its own label. It was tested only against a dummy server and never configured for a real client, which is consistent with Decision 10. It lives outside this repo, so Task 7 deletes it locally and records that in the catalog.
 
@@ -254,7 +254,7 @@ fn findings_json(findings: &[Finding]) -> serde_json::Value {
 
 - [ ] **Step 4: Update the expected payloads in other tests.** Run the full gates and fix each assertion on an error body's `path` or finding `file`. Assertions on `error.to_string()` (the message) don't change.
 
-- [ ] **Step 5: The design's "Errors" section.** Add one sentence: every catalog path in an error body (`path`, `files[].path`, `links[].source`, `errors[].file`, `warnings[].file`) is `/`-prefixed; `InvalidPath` echoes the reference as given.
+- [ ] **Step 5: The design's "Errors" section and the README.** Add: every catalog path in an error body (`path`, `files[].path`, `links[].source`, `errors[].file`, `warnings[].file`) is `/`-prefixed, and `InvalidPath` echoes the reference as given. Report results (`lint`, `oldest`, `sprawl`, `links_report`) keep `okf.py`'s unprefixed paths, so the same lint finding is `/a.md` in a `LintFailed` error and `a.md` in `lint`'s result, on purpose. The `Finding.file` doc comment (`src/okf/analysis/mod.rs:22`, "without a leading `/`") stays true for the struct; add that the error payload prefixes it.
 
 - [ ] **Step 6: Changelog, gates, commit:** `fix: error payloads write catalog paths with a leading slash`. In the PR body, list the variants that changed and the ones left as they are.
 
@@ -513,6 +513,7 @@ Every write tool, `publish`, `discard`, `revert` and `pending_changes` acts on t
   - `a_write_lands_in_the_named_changeset_only`: open two changesets with one key and write to each. Each changeset's entries hold only its own edit.
   - `a_write_to_a_closed_changeset_is_refused`: discard a changeset, then write to its handle. The result is `Refused` naming the handle, and nothing is stored. This replaces the untested defensive `Busy` branch (an M5 gap): `ctx.changeset` refuses a changeset that is already closed. A changeset that closes while the write waits for its row lock is refused the same way, after `lock`.
   - `another_key_cannot_write_to_a_handle`: `UnknownChangeset`.
+  - `a_write_waiting_on_a_changeset_that_closes_is_refused`: the race the new `prune_empty` comment relies on. A second transaction takes the changeset's row (`changesets::lock`), standing in for a prune or discard that holds it. Spawn a write (`tokio::spawn`). Wait until it is blocked on that row: poll `pg_locks` for a lock not granted on `changesets`, or `pg_stat_activity.wait_event_type = 'Lock'`, with a timeout. Then set the state to `discarded` in the second transaction and commit. The write returns `Refused` with "was published or discarded while this write waited", and the changeset has no entries. This is the post-`lock` branch, which was the untested defensive path.
 
   And in `tests/writes.rs`:
   - rename `x_okf_changeset_keeps_two_changesets_of_one_key_apart` to `two_handles_of_one_key_stay_apart`. Open two changesets on one connection, edit through both, and publish one. The other is still pending;
@@ -662,12 +663,26 @@ pub changeset: Option<String>,
 - [ ] **Step 2: Implement.** The store query: open changesets in the given catalogs, optionally only one key's, with their sorted paths. It follows the `stranded` query's shape, without its idle and non-empty filters, ordered by catalog then `updated_at`:
 
 ```rust
+/// An open changeset as `list_open` returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedRow {
+    /// The changeset (its handle, catalog id, key, actor, times).
+    pub changeset: ChangesetRow,
+    /// Its catalog's name (joined from `catalogs`).
+    pub catalog: String,
+    /// Its entries' paths, catalog-relative and sorted (`array_agg(path ORDER BY path)`,
+    /// empty for an empty changeset: `COALESCE(..., '{}')` over a `LEFT JOIN`).
+    pub paths: Vec<String>,
+}
+
 pub async fn list_open(
     pool: &PgPool,
     catalog_ids: &[i64],
     key_id: Option<&str>,
 ) -> Result<Vec<ListedRow>, OkfError>
 ```
+
+  It is `StrandedRow` renamed, with the same `#[sqlx(flatten)]` raw form. The tool adds the `/` to each path.
 
   The tool lists the catalogs the key reaches (or the one named). A non-admin key passes its own `key_id`, and an admin passes `None`. Each row is:
 
@@ -781,4 +796,4 @@ This task changes other systems. Its PR in this repo carries only its changelog,
   - Decision 10: release. Tasks 5, 6.
   - Decision 11: the helper script. Task 7.
 - **Placeholders.** The tests in Tasks 3 and 4 are named and specified by behaviour rather than written out in full, because they reuse each module's existing fixtures (`test_app`, `edit_hours_ago`, `writer`). Their assertions are stated exactly. The code for the new functions is given.
-- **Consistency.** `Pinned`, `ToolContext::changeset`, `pin`, `view(state, pinned)`, `changesets::open`, `by_handle`, `list_open`, `UnknownChangeset`, and `changeset: String` are used with the same names and types throughout.
+- **Consistency.** `Pinned`, `ToolContext::changeset`, `pin`, `view(state, pinned)`, `changesets::open`, `by_handle`, `list_open`, `ListedRow`, `ListedChangeset`, `UnknownChangeset`, and `changeset: String` are used with the same names and types throughout.
