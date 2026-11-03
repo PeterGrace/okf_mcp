@@ -3941,10 +3941,29 @@ Inside a method, a bare `get_concept(..)` is the module's free function: Rust re
 
 In `src/mcp/mod.rs`, add `mod documents;` and `+ Self::documents_router()` to `tools()`.
 
+> **Corrected (issue #71), 2026-11-03.** The code above shipped as written (rustfmt
+> rewraps some lines), and its public API (`GetConceptParams`, `Concept`,
+> `OutboundLink`, `InboundLink`, `ReadDocumentParams`, `Document`, `Doc::body`) and
+> result shapes are unchanged, so Task 11's `get_concept` call needs no change.
+> Differences: (1) `Doc::body`'s doc comment gained Returns and a doc test. (2) The
+> tests assert more than Step 2 lists: the first also checks `title`, an empty
+> `frontmatter_error`, the whole `body`, the links' and backlink's titles and the broken
+> link's missing description, and `HUB` gains an in-page link (`[Top](#hub)`) that must be
+> left out; the second also shows that the first catalog wins when
+> both have the path (`only-pg.md` in both), that a non-concept path (`index`) is
+> `InvalidPath`, that a refusal does not stop the search (`index.md` is refused in `pg`,
+> but `resolve_concept` also tries `index.md.md`, a concept in `work`), that a
+> duplicate-key frontmatter gives null `frontmatter` with `frontmatter_error`, and that
+> fields not asked for are absent from the JSON; the third checks the default's
+> `catalog` and `path`.
+> (3) A fourth test, `the_server_lists_both_tools_with_object_output_schemas`, guards
+> against the `ToolResult` alias problem (verified fact 5's note), so Step 4 runs 5
+> tests, not 4.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --lib -- mcp::documents body_is`
-Expected: 4 passed.
+Expected: 5 passed.
 
 - [ ] **Step 5: Changelog, gates, commit**
 
