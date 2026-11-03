@@ -9,10 +9,11 @@ use serde_json::{Map, Value as Json};
 use crate::error::OkfError;
 use crate::okf::doc::{is_top_key, Doc, KEY_ORDER};
 use crate::okf::ops::log_index::{list_concept, Listing};
+use crate::okf::ops::replay::{insert_index_bullet_text, missing_heading, new_index_text};
 use crate::okf::ops::{
     ensure_index, load_concept, refused, save, stamp_value, LoadedConcept, OpContext, OpOutcome,
 };
-use crate::okf::paths::{basename, dirname, is_concept, new_concept_path, resolve_concept};
+use crate::okf::paths::{basename, dirname, is_concept, join, new_concept_path, resolve_concept};
 use crate::okf::pystr::{py_repr_str, py_strip};
 use crate::okf::rules::check_path;
 use crate::okf::workspace::Workspace;
@@ -130,11 +131,13 @@ fn checked_key(key: &str) -> Result<(), OkfError> {
 /// parse (a guard: the renderers always write parseable YAML); the
 /// listing's refusals (see `index`).
 ///
-/// Every refusal above comes before anything is written, except the
-/// listing's: the concept and any new folder indexes are written before
-/// the listing runs, and stay written when it is refused (a `section` that
-/// is not a heading of the index). As for [`ensure_index`], run the op on a
-/// scratch copy, as the write path does, and drop the copy on error.
+/// Every refusal above comes before anything is written: the listing's
+/// folder index (or, when `ensure_index` will create it, the text it will
+/// have) is checked for `index_section` first. Only an error past that
+/// point leaves files written: a read or write failure, or `ensure_index`
+/// finding no root `index.md` to list a new folder in. As for
+/// [`ensure_index`], run the op on a scratch copy, as the write path does,
+/// and drop the copy on error.
 pub fn create_concept(
     workspace: &dyn Workspace,
     ctx: &OpContext<'_>,
@@ -188,6 +191,9 @@ pub fn create_concept(
     text.push_str("---\n");
     text.push_str(new.body);
     Doc::from_text(&path, &text).parse_checked()?;
+    if new.index_summary.is_some() {
+        check_listing(workspace, &path, new.index_section)?;
+    }
     workspace.write_atomic(&path, &text)?;
     let mut outcome = OpOutcome::default();
     outcome.touch(&path);
@@ -208,6 +214,69 @@ pub fn create_concept(
     }
     outcome.message = lines.join("\n");
     Ok(outcome)
+}
+
+/// Checks, before anything is written, that `list_concept` will find the
+/// folder's `index.md` and its `section`: the existing index, or the text
+/// `ensure_index` will write for a new folder.
+///
+/// # Errors
+/// [`OkfError::Refused`] with `list_concept`'s wording: no root `index.md`
+/// (the one folder `ensure_index` does not create), or a `section` that is
+/// not a heading of the index.
+fn check_listing(
+    workspace: &dyn Workspace,
+    concept: &str,
+    section: Option<&str>,
+) -> Result<(), OkfError> {
+    let folder = dirname(concept);
+    let index_path = join(folder, "index.md");
+    let text = if workspace.exists(&index_path) {
+        workspace.read_text(&index_path)?
+    } else if folder.is_empty() {
+        return Err(refused("no index.md in /; create it first".to_string()));
+    } else {
+        new_index_text(folder)
+    };
+    // The bullet is irrelevant here: `None` means only "no such heading".
+    match section {
+        Some(section) if insert_index_bullet_text(&text, "", Some(section), false).is_none() => {
+            Err(missing_heading(&index_path, section))
+        }
+        Some(_) | None => Ok(()),
+    }
+}
+
+/// Refuses an edit that changes the frontmatter: its presence, or any of
+/// its lines. Without this, text written into a document without
+/// frontmatter could become frontmatter (`---`, `generated: ...`, `---`),
+/// forging the stamps only `stamp` and `review` write.
+///
+/// # Arguments
+/// * `before` - the document as read.
+/// * `after` - the full text the edit would write.
+///
+/// # Errors
+/// [`OkfError::Refused`]: `okf.py`'s "has no frontmatter; add it with your
+/// editor first" when the document had none, else a pointer to
+/// `set_frontmatter` and the bookkeeping tools.
+fn keeps_frontmatter(before: &Doc, after: &str) -> Result<(), OkfError> {
+    let edited = Doc::from_text(before.path(), after);
+    // Comparing slices compares every line, like `==` on Python lists.
+    if edited.has_frontmatter() == before.has_frontmatter()
+        && edited.frontmatter() == before.frontmatter()
+    {
+        return Ok(());
+    }
+    let path = before.path();
+    Err(refused(if before.has_frontmatter() {
+        format!(
+            "{path}: the edit would change the frontmatter; \
+             use set_frontmatter or the bookkeeping tools"
+        )
+    } else {
+        format!("{path} has no frontmatter; add it with your editor first")
+    }))
 }
 
 /// An `InvalidPath` refusal of `path`.
@@ -255,8 +324,9 @@ fn editable_path(path: &str) -> Result<String, OkfError> {
 /// # Errors
 /// [`OkfError::InvalidPath`] for `log.md`, machinery, any other file, or a
 /// path outside the catalog; [`OkfError::NotFound`] for a missing file;
-/// [`OkfError::Refused`] for an empty `old` or a match that touches the
-/// frontmatter; [`OkfError::EditMismatch`] unless `old` occurs exactly once
+/// [`OkfError::Refused`] for an empty `old`, a match that touches the
+/// frontmatter, or a result whose frontmatter differs (one added to a
+/// document without it, say); [`OkfError::EditMismatch`] unless `old` occurs exactly once
 /// (at least once with `replace_all`).
 pub fn edit_document(
     workspace: &dyn Workspace,
@@ -281,7 +351,8 @@ pub fn edit_document(
         });
     }
     // The frontmatter, with both delimiters, is everything before the body.
-    let body_start = text.len() - Doc::from_text(&path, &text).body().len();
+    let doc = Doc::from_text(&path, &text);
+    let body_start = text.len() - doc.body().len();
     if let Some(&hit) = starts.iter().find(|&&start| start < body_start) {
         let line = text[..hit].matches('\n').count() + 1;
         return Err(refused(format!(
@@ -297,6 +368,7 @@ pub fn edit_document(
     if updated == text {
         return Ok(OpOutcome::unchanged(format!("{path}: no change")));
     }
+    keeps_frontmatter(&doc, &updated)?;
     workspace.write_atomic(&path, &updated)?;
     let mut outcome = OpOutcome {
         message: format!("{path}: replaced {} occurrence(s)", starts.len()),
@@ -319,7 +391,9 @@ pub fn edit_document(
 /// The outcome (a free edit); nothing is touched when the body is the same.
 ///
 /// # Errors
-/// As [`resolve_concept`]; the workspace's read or write error.
+/// As [`resolve_concept`]; [`OkfError::Refused`] when the new text would
+/// change the frontmatter (a body starting with a `---` block on a document
+/// without frontmatter); the workspace's read or write error.
 pub fn replace_body(
     workspace: &dyn Workspace,
     concept: &str,
@@ -337,6 +411,7 @@ pub fn replace_body(
     if updated == text {
         return Ok(OpOutcome::unchanged(format!("{path}: body unchanged")));
     }
+    keeps_frontmatter(&doc, &updated)?;
     workspace.write_atomic(&path, &updated)?;
     let mut outcome = OpOutcome {
         message: format!("{path}: body replaced"),
@@ -362,7 +437,8 @@ pub fn replace_body(
 ///
 /// # Errors
 /// [`OkfError::Refused`] for a key a dedicated tool owns, for deleting
-/// `type` or setting it to anything but a non-blank string, for an invalid key, and for a document without frontmatter;
+/// `type` or setting it to anything but a non-blank string, for an invalid
+/// key, and for a document without frontmatter;
 /// [`OkfError::FrontmatterParse`] when the frontmatter does not parse, before
 /// or after the edit; as [`resolve_concept`] otherwise.
 pub fn set_frontmatter(
@@ -581,6 +657,9 @@ mod tests {
 
         let outcome = create_concept(&ws, &ctx(), &listed("infra/b", "Hosts")).unwrap();
         let missing = create_concept(&ws, &ctx(), &listed("infra/c", "Nope")).unwrap_err();
+        let new_folder = create_concept(&ws, &ctx(), &listed("ops/c", "Hosts")).unwrap_err();
+        let rootless = MemWorkspace::from_files([("infra/index.md", infra)]);
+        let no_root = create_concept(&rootless, &ctx(), &listed("c", "Hosts")).unwrap_err();
 
         assert_eq!(
             read(&ws, "infra/index.md"),
@@ -595,9 +674,14 @@ mod tests {
                 create_section: false,
             }]
         );
-        assert!(matches!(missing, OkfError::Refused { .. }), "{missing:?}");
-        // The listing is refused after the concept is written (see the doc).
-        assert!(ws.exists("infra/c.md"));
+        // Each listing refusal comes before anything is written.
+        assert_eq!(refusal(missing), "no heading 'Nope' in infra/index.md");
+        assert_eq!(refusal(new_folder), "no heading 'Hosts' in ops/index.md");
+        assert_eq!(refusal(no_root), "no index.md in /; create it first");
+        assert!(!ws.exists("infra/c.md"));
+        assert!(!ws.exists("ops/c.md") && !ws.exists("ops/index.md"));
+        assert_eq!(read(&ws, "index.md"), ROOT_INDEX);
+        assert!(!rootless.exists("c.md"));
     }
 
     #[test]
@@ -779,6 +863,40 @@ mod tests {
                 if path == "tools/notes.md" && reason.starts_with("is repository machinery")
         ));
         assert!(matches!(missing, OkfError::NotFound { .. }));
+    }
+
+    #[test]
+    fn edit_and_replace_body_refuse_to_add_frontmatter() {
+        const PLAIN: &str = "Hello\n";
+        const INDEX: &str = "# Root\n";
+        let ws = MemWorkspace::from_files([("n.md", PLAIN), ("index.md", INDEX)]);
+        let forged = "---\ngenerated: { by: forged, at: 2026-01-01T00:00:00Z }\n---\nHello";
+
+        let edited = edit_document(&ws, "n.md", "Hello", forged, false).unwrap_err();
+        let replaced = replace_body(&ws, "n", &format!("{forged}\n")).unwrap_err();
+        let index = edit_document(
+            &ws,
+            "index.md",
+            "# Root",
+            "---\ntype: Note\n---\n# Root",
+            false,
+        )
+        .unwrap_err();
+        let index_body = replace_body(&ws, "index.md", forged).unwrap_err();
+
+        assert_eq!(
+            [edited, replaced].map(refusal),
+            ["n.md has no frontmatter; add it with your editor first"; 2].map(String::from)
+        );
+        assert_eq!(
+            refusal(index),
+            "index.md has no frontmatter; add it with your editor first"
+        );
+        assert!(matches!(index_body, OkfError::InvalidPath { .. }));
+        assert_eq!(
+            (read(&ws, "n.md"), read(&ws, "index.md")),
+            (PLAIN.into(), INDEX.into())
+        );
     }
 
     #[test]
