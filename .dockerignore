@@ -1,0 +1,8 @@
+target
+.git
+.worktrees
+.claude
+.github
+changelog
+docs
+tests
