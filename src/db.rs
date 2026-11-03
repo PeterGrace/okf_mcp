@@ -106,8 +106,20 @@ mod tests {
                 .unwrap_err();
         assert!(bad_name.as_database_error().unwrap().is_check_violation());
 
-        let open = "INSERT INTO changesets (catalog_id, session_id, actor, state, created_at, \
-                    updated_at) VALUES ($1, 's1', 'a', 'open', $2, $2)";
+        // The open-changeset index includes `key_id`, and NULLs never
+        // conflict, so the two changesets below need a key.
+        sqlx::query(
+            "INSERT INTO api_keys (id, sha256, access, all_catalogs, default_catalog_id, \
+             actor, created_at) VALUES ('k1', $1, 'read', false, $2, 'a', $3)",
+        )
+        .bind(vec![0u8; 32])
+        .bind(catalog)
+        .bind(chrono::Utc::now())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let open = "INSERT INTO changesets (catalog_id, label, key_id, actor, state, created_at, \
+                    updated_at) VALUES ($1, 's1', 'k1', 'a', 'open', $2, $2)";
         sqlx::query(open)
             .bind(catalog)
             .bind(chrono::Utc::now())
@@ -122,7 +134,7 @@ mod tests {
             .unwrap_err();
         let second = second.as_database_error().unwrap();
         assert!(second.is_unique_violation());
-        assert_eq!(second.constraint(), Some("changesets_one_open_per_session"));
+        assert_eq!(second.constraint(), Some("changesets_one_open_per_label"));
 
         let revision = "INSERT INTO revisions (catalog_id, path, revision, op, content, \
                         executable, actor, message, created_at) \
@@ -155,16 +167,6 @@ mod tests {
         )
         .bind(catalog)
         .bind(b"x".to_vec())
-        .bind(chrono::Utc::now())
-        .execute(&db.pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO api_keys (id, sha256, access, all_catalogs, default_catalog_id, \
-             actor, created_at) VALUES ('k1', $1, 'read', false, $2, 'a', $3)",
-        )
-        .bind(vec![0u8; 32])
-        .bind(catalog)
         .bind(chrono::Utc::now())
         .execute(&db.pool)
         .await
