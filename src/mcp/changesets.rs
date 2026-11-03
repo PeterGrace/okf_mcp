@@ -414,7 +414,9 @@ impl OkfServer {
                        with Conflict when a document changed since this changeset read it \
                        (log.md and index.md bookkeeping is replayed onto the new text instead), \
                        or with LintFailed when a changed file has lint errors; the changeset \
-                       then stays open. Lint errors elsewhere come back as warnings. Write access."
+                       then stays open. Lint errors elsewhere come back as warnings. When every \
+                       edit already matches the published text, the changeset is closed with \
+                       published: true and no revisions. Write access."
     )]
     async fn publish(
         &self,
@@ -1221,10 +1223,12 @@ mod publish_tests {
 
         assert!(matches!(
             error,
+            // The live revision, re-read after the rollback: the stray row
+            // never moved the document past 1.
             OkfError::Conflict { ref files } if files == &[ConflictFile {
                 path: "/a.md".to_string(),
                 base_revision: Some(1),
-                current_revision: None,
+                current_revision: Some(1),
             }]
         ));
         assert_eq!(

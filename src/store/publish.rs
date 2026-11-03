@@ -16,7 +16,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::Serialize;
-use sqlx::PgConnection;
+use sqlx::{PgConnection, PgPool};
 
 use crate::app::App;
 use crate::catalog::{CatalogState, Loaded};
@@ -162,7 +162,17 @@ pub async fn publish(
         message,
         now,
     };
-    let revisions = write_all(&mut tx, &publication, &overlay, &current, &paths).await?;
+    let revisions = match write_all(&mut tx, &publication, &overlay, &current, &paths).await {
+        Ok(revisions) => revisions,
+        // The backstop's conflict: roll back first, so the re-read below
+        // sees only what is committed, and report the revision there now.
+        Err(OkfError::Conflict { files }) => {
+            tx.rollback().await?;
+            let files = with_current_revisions(app.pool(), state.id(), files).await?;
+            return Err(OkfError::Conflict { files });
+        }
+        Err(error) => return Err(error),
+    };
     if !revisions.is_empty() {
         sqlx::query("UPDATE catalogs SET generation = generation + 1 WHERE id = $1")
             .bind(state.id())
@@ -209,6 +219,11 @@ async fn current_base(
         .await?;
     // The advisory lock keeps every other import and publish out, so the
     // refresh (on its own connection) builds exactly this generation.
+    // That is a second pooled connection while this transaction holds the
+    // first. Publishes of one catalog are serialized by the in-process
+    // mutex, so only many catalogs publishing at once on a small pool (8
+    // by default) could exhaust it, until sqlx's acquire timeout fails a
+    // publish (design "Publish").
     if state.current().generation() < generation {
         state.refresh(app.pool()).await?;
     }
@@ -531,12 +546,37 @@ fn as_conflict(error: OkfError, path: &str, expected: Option<i32>) -> OkfError {
             files: vec![ConflictFile {
                 path: format!("/{path}"),
                 base_revision: expected,
-                // Unknown: another writer got there first.
+                // Unknown here: `publish` re-reads it after the rollback
+                // (`with_current_revisions`).
                 current_revision: None,
             }],
         },
         other => other,
     }
+}
+
+/// Fills in each conflicting file's live revision as committed now, for the
+/// backstop's conflict (read on the pool, after the publish rolled back).
+///
+/// # Errors
+/// [`OkfError::Database`].
+async fn with_current_revisions(
+    pool: &PgPool,
+    catalog_id: i64,
+    mut files: Vec<ConflictFile>,
+) -> Result<Vec<ConflictFile>, OkfError> {
+    // `&mut files`: the loop edits each file in place (one for the backstop).
+    for file in &mut files {
+        file.current_revision = sqlx::query_scalar(
+            "SELECT revision FROM documents \
+             WHERE catalog_id = $1 AND path = $2 AND deleted_at IS NULL",
+        )
+        .bind(catalog_id)
+        .bind(file.path.trim_start_matches('/'))
+        .fetch_optional(pool)
+        .await?;
+    }
+    Ok(files)
 }
 
 #[cfg(test)]

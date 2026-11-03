@@ -481,8 +481,14 @@ paths' rows, and the overlay is a full snapshot of the result (about 10 ms for a
 snapshot plus lint of the real catalog in M2's smoke test). Reads never take the lock.
 A write that queued on the changeset's row lock behind a publish finds the changeset
 closed when the lock is granted and opens a new one, so its edit is kept, not lost.
+Like a queued writer (Write, step 2), a publish holds one pooled connection for its
+whole transaction, and refreshing a stale snapshot in step 2 needs a second. Publishes
+of one catalog are serialized by the mutex, so only many catalogs publishing at once on
+a small pool (8 connections) could exhaust it, until the pool's acquire timeout fails
+a publish. That is accepted for now, as for queued writers.
 The unique constraints are a backstop: a violation still maps to `Conflict`, never to
-the opaque `Database` error.
+the opaque `Database` error. After rolling back, publish reads each conflicting path's
+live revision again, so `current_revision` reports what is committed.
 
 ### Noticing changes made outside the server
 
