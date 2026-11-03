@@ -292,8 +292,12 @@ pub fn unquestion(
             Some(items) if items.spans.len() == questions.len() => {
                 doc.remove_lines(items.spans[index].clone());
             }
-            // A flow list (or a list `seq_items` can't map item by item) is
-            // rewritten as a block list of the remaining items.
+            // A flow list, on one line or several, is rewritten as a block
+            // list of the remaining items. okf.py takes this branch for any
+            // list `seq_items` can't map item by item; probing okf.py found
+            // no block list that parses and gets here (a continuation or
+            // indent `seq_items` refuses also fails to parse), so in practice
+            // it is flow lists only.
             _ => {
                 let mut lines = vec![format!("{OPEN_QUESTIONS}:")];
                 lines.extend(
@@ -582,6 +586,37 @@ mod tests {
         assert_eq!(
             read(&ws, "f.md"),
             "---\ntype: Note\nopen_questions:\n  - \"a\"\n  - \"b, c\"\n---\n"
+        );
+    }
+
+    #[test]
+    fn unquestion_matches_okf_py_on_a_multi_line_flow_list_and_a_mapping_item() {
+        // Expected text is okf.py's output for the same files and steps.
+        let ws = MemWorkspace::from_files([
+            ("m.md", "---\ntype: Note\nopen_questions: [a,\n  { k: v }, c]\n---\n"),
+            (
+                "b.md",
+                "---\ntype: Note\nopen_questions:\n  - k: v\n    j: w\n  # keep\n  - b\n  - c\n---\n",
+            ),
+        ]);
+
+        let flow = unquestion(&ws, &ctx(), "m", "3").unwrap();
+        let middle = unquestion(&ws, &ctx(), "b", "2").unwrap();
+        let mapping = unquestion(&ws, &ctx(), "b", "1").unwrap();
+
+        assert_eq!(flow.message, "m.md: removed open question: c");
+        assert_eq!(
+            read(&ws, "m.md"),
+            "---\ntype: Note\nopen_questions:\n  - \"a\"\n  - \"{'k': 'v'}\"\n---\n"
+        );
+        assert_eq!(middle.message, "b.md: removed open question: b");
+        assert_eq!(
+            mapping.message,
+            "b.md: removed open question: {'k': 'v', 'j': 'w'}"
+        );
+        assert_eq!(
+            read(&ws, "b.md"),
+            "---\ntype: Note\nopen_questions:\n  # keep\n  - c\n---\n"
         );
     }
 

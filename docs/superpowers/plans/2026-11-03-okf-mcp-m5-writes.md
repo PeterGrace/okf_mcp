@@ -1686,6 +1686,7 @@ EOF
 ### Task 2: `okf::ops`: the shared op types and the frontmatter ops
 
 > Interfaces note (written while planning, 2026-11-03):
+> - **Corrected (issue #91), 2026-11-03, review of PR #105:** `Doc::remove_lines` is `pub(crate)` (only `okf::ops` calls it, and it panics on a bad range), and a 14th frontmatter test, `unquestion_matches_okf_py_on_a_multi_line_flow_list_and_a_mapping_item`, pins `unquestion`'s two removal paths to okf.py's output.
 > - `src/okf/ops/replay.rs` is created here with the `ReplayOp` enum only, because `OpOutcome::replay` needs the type; Task 3 adds the functions to that file. Task 3 also extends this task's parity script and shim command, so **Task 3 starts after Task 2** (the graph gains T2 -> T3).
 > - `Doc::remove_lines(range)` is new in `src/okf/doc.rs`: `unquestion` must delete one list item's lines (`del doc.fm[s:e]` in `okf.py`), and `Doc::splice_lines` is private.
 > - `okf.py`'s `die(msg)` in these commands becomes `OkfError::Refused { reason: msg }`, keeping `okf.py`'s text, except where an M1 variant already names the problem: `NotFound` (no such concept), `InvalidPath` (not a concept document), `FrontmatterParse` (frontmatter does not parse) and `Shape` (`open_questions` or `sources` is not a list). No new variant.
@@ -1721,7 +1722,7 @@ In `src/okf/doc.rs`, add after `delete_block`:
     /// # Panics
     /// If `range` is out of bounds, which a span taken from this document's
     /// current state never is (like slicing a Python list out of range).
-    pub fn remove_lines(&mut self, range: Range<usize>) {
+    pub(crate) fn remove_lines(&mut self, range: Range<usize>) {
         self.splice_lines(range, Vec::new());
     }
 ```
@@ -1952,6 +1953,37 @@ mod tests {
         assert_eq!(
             read(&ws, "f.md"),
             "---\ntype: Note\nopen_questions:\n  - \"a\"\n  - \"b, c\"\n---\n"
+        );
+    }
+
+    #[test]
+    fn unquestion_matches_okf_py_on_a_multi_line_flow_list_and_a_mapping_item() {
+        // Expected text is okf.py's output for the same files and steps.
+        let ws = MemWorkspace::from_files([
+            ("m.md", "---\ntype: Note\nopen_questions: [a,\n  { k: v }, c]\n---\n"),
+            (
+                "b.md",
+                "---\ntype: Note\nopen_questions:\n  - k: v\n    j: w\n  # keep\n  - b\n  - c\n---\n",
+            ),
+        ]);
+
+        let flow = unquestion(&ws, &ctx(), "m", "3").unwrap();
+        let middle = unquestion(&ws, &ctx(), "b", "2").unwrap();
+        let mapping = unquestion(&ws, &ctx(), "b", "1").unwrap();
+
+        assert_eq!(flow.message, "m.md: removed open question: c");
+        assert_eq!(
+            read(&ws, "m.md"),
+            "---\ntype: Note\nopen_questions:\n  - \"a\"\n  - \"{'k': 'v'}\"\n---\n"
+        );
+        assert_eq!(middle.message, "b.md: removed open question: b");
+        assert_eq!(
+            mapping.message,
+            "b.md: removed open question: {'k': 'v', 'j': 'w'}"
+        );
+        assert_eq!(
+            read(&ws, "b.md"),
+            "---\ntype: Note\nopen_questions:\n  # keep\n  - c\n---\n"
         );
     }
 
@@ -2589,8 +2621,12 @@ pub fn unquestion(
             Some(items) if items.spans.len() == questions.len() => {
                 doc.remove_lines(items.spans[index].clone());
             }
-            // A flow list (or a list `seq_items` can't map item by item) is
-            // rewritten as a block list of the remaining items.
+            // A flow list, on one line or several, is rewritten as a block
+            // list of the remaining items. okf.py takes this branch for any
+            // list `seq_items` can't map item by item; probing okf.py found
+            // no block list that parses and gets here (a continuation or
+            // indent `seq_items` refuses also fails to parse), so in practice
+            // it is flow lists only.
             _ => {
                 let mut lines = vec![format!("{OPEN_QUESTIONS}:")];
                 lines.extend(
@@ -2666,7 +2702,7 @@ pub fn source(
 - [ ] **Step 5: Run the unit tests**
 
 Run: `cargo test --lib -- okf::ops okf::doc::tests::remove_lines`
-Expected: 14 passed (13 in `okf::ops::frontmatter`, 1 in `okf::doc`).
+Expected: 15 passed (14 in `okf::ops::frontmatter`, 1 in `okf::doc`).
 
 - [ ] **Step 6: The parity script and the shim's `ops` command**
 
@@ -3047,7 +3083,7 @@ Task 2 of `docs/superpowers/plans/2026-11-03-okf-mcp-m5-writes.md` (milestone 5)
   `notes`), `StampField`, `SourceEntry`, `LogKind`, and the crate-internal helpers
   `load_concept`, `save`, `stamp_value`, `refused`.
 - `src/okf/ops/frontmatter.rs`: `stamp`, `review`, `question`, `unquestion`, `source`,
-  `OUTCOMES`; ports of `okf.py:653-750`, with 13 unit tests on a `MemWorkspace` with a
+  `OUTCOMES`; ports of `okf.py:653-750`, with 14 unit tests on a `MemWorkspace` with a
   frozen clock.
 - `src/okf/ops/replay.rs`: the `ReplayOp` type (Task 3 adds its functions).
 - `Doc::remove_lines`, for `unquestion`'s single-item removal.
@@ -4316,7 +4352,7 @@ pub use replay::{insert_index_bullet_text, log_text, replay, ReplayOp};
 - [ ] **Step 4: Run the unit tests**
 
 Run: `cargo test --lib -- okf::ops okf::analysis::links`
-Expected: Task 2's 14 tests (13 in `okf::ops::frontmatter`, 1 in `okf::doc`), 14 new ones in `okf::ops::replay` (2 of them Hegel properties), 7 in `okf::ops::log_index`, and the links tests all pass. Run `cargo test --doc -- okf::ops` too: the `replay` and `log_text` examples pass.
+Expected: Task 2's 15 tests (14 in `okf::ops::frontmatter`, 1 in `okf::doc`), 14 new ones in `okf::ops::replay` (2 of them Hegel properties), 7 in `okf::ops::log_index`, and the links tests all pass. Run `cargo test --doc -- okf::ops` too: the `replay` and `log_text` examples pass.
 
 - [ ] **Step 5: Extend the parity script and shim**
 

@@ -388,7 +388,7 @@ impl Doc {
     /// # Panics
     /// If `range` is out of bounds, which a span taken from this document's
     /// current state never is (like slicing a Python list out of range).
-    pub fn remove_lines(&mut self, range: Range<usize>) {
+    pub(crate) fn remove_lines(&mut self, range: Range<usize>) {
         self.splice_lines(range, Vec::new());
     }
 

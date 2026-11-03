@@ -8,7 +8,7 @@ Task 2 of `docs/superpowers/plans/2026-11-03-okf-mcp-m5-writes.md` (milestone 5)
   `notes`), `StampField`, `SourceEntry`, `LogKind`, and the crate-internal helpers
   `load_concept`, `save`, `stamp_value`, `refused`.
 - `src/okf/ops/frontmatter.rs`: `stamp`, `review`, `question`, `unquestion`, `source`,
-  `OUTCOMES`; ports of `okf.py:653-750`, with 13 unit tests on a `MemWorkspace` with a
+  `OUTCOMES`; ports of `okf.py:653-750`, with 14 unit tests on a `MemWorkspace` with a
   frozen clock.
 - `src/okf/ops/replay.rs`: the `ReplayOp` type (Task 3 adds its functions).
 - `Doc::remove_lines`, for `unquestion`'s single-item removal (1 unit test).
@@ -37,3 +37,7 @@ Task 2 of `docs/superpowers/plans/2026-11-03-okf-mcp-m5-writes.md` (milestone 5)
   text, as okf.py does.
 - The unit tests' inputs were also run through okf.py (via the new shim command) while
   implementing: every expected file and message is okf.py's.
+- Review of PR #105: `Doc::remove_lines` is `pub(crate)`; `unquestion` matches
+  `open_questions` exhaustively; a 14th test pins `unquestion` on a multi-line flow list and
+  a multi-line mapping item to okf.py's output, and a comment names the shapes that reach
+  its rewrite fallback (flow lists; probing okf.py found no block list that does).
