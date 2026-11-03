@@ -613,6 +613,8 @@ mod tests {
 }
 ```
 
+> **Corrected (issue #66), 2026-11-02.** The implementation code below shipped as written. The shipped tests (`src/auth.rs`) extend three of these five so they cover what the doc comments promise: `the_cache_finds_live_keys_only` also leaves out a record whose stored hash is not 32 bytes; the middleware test also refuses a revoked key and a `Basic` header, and checks `WWW-Authenticate: Bearer` on every 401 (`status_and_body` returns that header too); the database test also shows that a `reload` on a closed pool fails and keeps the old cache. Still five tests; no public symbol changed.
+
 - [ ] **Step 3: Run them to see them fail**
 
 Run: `cargo test --lib -- auth`

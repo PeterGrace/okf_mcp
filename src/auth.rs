@@ -310,6 +310,10 @@ mod tests {
         let cache = KeyCache::from_records(vec![
             record("reader", "reader-key", false),
             record("old", "old-key", true),
+            KeyRecord {
+                sha256: vec![0; 5],
+                ..record("short", "short-key", false)
+            },
         ]);
 
         let found = cache.find("reader-key").expect("live key");
@@ -318,6 +322,9 @@ mod tests {
         assert_eq!(found.actor, "actor-reader");
         assert_eq!(found.default_catalog.as_deref(), Some("pg"));
         assert!(cache.find("old-key").is_none());
+        // A stored hash of the wrong length is left out, not a panic.
+        assert!(cache.find("short-key").is_none());
+        assert_eq!(cache.by_hash.len(), 1);
         assert!(cache.find("no-such-key").is_none());
     }
 
@@ -358,7 +365,11 @@ mod tests {
             .route_layer(axum::middleware::from_fn_with_state(keys, require_key))
     }
 
-    async fn status_and_body(router: Router, authorization: Option<&str>) -> (StatusCode, String) {
+    /// The response's status, its `WWW-Authenticate` header and its body.
+    async fn status_and_body(
+        router: Router,
+        authorization: Option<&str>,
+    ) -> (StatusCode, Option<String>, String) {
         let mut request = axum::http::Request::builder().uri("/");
         if let Some(value) = authorization {
             request = request.header(header::AUTHORIZATION, value);
@@ -368,23 +379,42 @@ mod tests {
             .await
             .unwrap();
         let status = response.status();
+        let challenge = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .map(|value| value.to_str().unwrap().to_string());
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
             .await
             .unwrap();
-        (status, String::from_utf8(bytes.to_vec()).unwrap())
+        (
+            status,
+            challenge,
+            String::from_utf8(bytes.to_vec()).unwrap(),
+        )
     }
 
     #[tokio::test]
     async fn the_middleware_admits_a_known_key_and_refuses_the_rest() {
-        let cache = || KeyCache::from_records(vec![record("reader", "reader-key", false)]);
+        let cache = || {
+            KeyCache::from_records(vec![
+                record("reader", "reader-key", false),
+                record("old", "old-key", true),
+            ])
+        };
 
         let admitted = status_and_body(app(cache()), Some("Bearer reader-key")).await;
-        let unknown = status_and_body(app(cache()), Some("Bearer other-key")).await;
-        let missing = status_and_body(app(cache()), None).await;
+        let refused = [
+            status_and_body(app(cache()), Some("Bearer other-key")).await,
+            status_and_body(app(cache()), Some("Bearer old-key")).await,
+            status_and_body(app(cache()), Some("Basic reader-key")).await,
+            status_and_body(app(cache()), None).await,
+        ];
 
-        assert_eq!(admitted, (StatusCode::OK, "reader".to_string()));
-        assert_eq!(unknown.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(missing.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(admitted, (StatusCode::OK, None, "reader".to_string()));
+        for (status, challenge, _) in refused {
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(challenge.as_deref(), Some("Bearer"));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -414,5 +444,17 @@ mod tests {
         loaded.reload(&db.pool).await.unwrap();
 
         assert!(loaded.find(&key).is_none());
+        // A reload that fails keeps the cache it had.
+        let other = key_rows::create(
+            &db.pool,
+            &key_rows::NewKey { id: "other", ..new },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        loaded.reload(&db.pool).await.unwrap();
+        db.pool.close().await;
+        assert!(loaded.reload(&db.pool).await.is_err());
+        assert_eq!(loaded.find(&other).unwrap().key_id, "other");
     }
 }
