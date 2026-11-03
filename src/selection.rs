@@ -68,7 +68,8 @@ fn non_empty(names: Vec<String>) -> Option<Vec<String>> {
 /// The catalogs a connection names: the `X-OKF-Catalogs` header, else the
 /// `catalogs` query parameter.
 ///
-/// Repeated headers are read in order, as one list (RFC 9110 5.3). A header
+/// Repeated headers are read in order, as one list (RFC 9110 5.3), and so
+/// are repeated `catalogs` parameters (`?catalogs=pg&catalogs=work`). A header
 /// that names nothing (`" , "`) counts as unset, so the query is read. Bytes
 /// that are not UTF-8 are kept (lossily), so a garbled name reaches
 /// [`resolve`] and fails naming it rather than being dropped.
@@ -88,10 +89,14 @@ pub fn connection_catalogs(parts: &Parts) -> Option<Vec<String>> {
     // `or_else` runs the closure only when the header named nothing.
     non_empty(from_header).or_else(|| {
         let query = parts.uri.query()?;
+        let mut from_query: Vec<String> = Vec::new();
         // `parse` yields decoded `(key, value)` pairs (`%2C` becomes `,`).
-        form_urlencoded::parse(query.as_bytes())
-            .find(|(key, _)| key == CATALOGS_QUERY)
-            .and_then(|(_, value)| non_empty(split_names(&value).collect()))
+        for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+            if key == CATALOGS_QUERY {
+                from_query.extend(split_names(&value));
+            }
+        }
+        non_empty(from_query)
     })
 }
 
@@ -131,8 +136,8 @@ pub fn resolve(
         vec![name]
     } else {
         return Err(OkfError::Refused {
-            reason: "no catalog selected: pass `catalog`, set the X-OKF-Catalogs header, \
-                     or give the key a default catalog"
+            reason: "no catalog selected: pass `catalog`, set the X-OKF-Catalogs header \
+                     or `?catalogs=` on the MCP URL, or give the key a default catalog"
                 .to_string(),
         });
     };
@@ -297,6 +302,7 @@ mod tests {
 
         assert!(matches!(error, OkfError::Refused { .. }));
         assert!(error.to_string().contains("X-OKF-Catalogs"));
+        assert!(error.to_string().contains("?catalogs="));
     }
 
     fn parts(uri: &str, header: Option<&str>) -> Parts {
@@ -323,6 +329,14 @@ mod tests {
         );
         assert_eq!(connection_catalogs(&parts("/mcp", Some(" , "))), None);
         assert_eq!(connection_catalogs(&parts("/mcp", None)), None);
+        assert_eq!(
+            connection_catalogs(&parts("/mcp?catalogs=pg&catalogs=work", None)),
+            Some(names(&["pg", "work"]))
+        );
+        assert_eq!(
+            connection_catalogs(&parts("/mcp?catalogs=&catalogs=pg", None)),
+            Some(names(&["pg"]))
+        );
 
         let mut repeated = parts("/mcp?catalogs=home", Some("pg"));
         repeated
