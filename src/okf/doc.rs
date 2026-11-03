@@ -298,6 +298,28 @@ impl Doc {
         out
     }
 
+    /// The text after the frontmatter (the whole text without one), with
+    /// its line endings as written.
+    ///
+    /// # Returns
+    /// A new `String`: the body lines joined.
+    ///
+    /// # Examples
+    /// ```
+    /// use okf_mcp::okf::doc::Doc;
+    /// let doc = Doc::from_text("a.md", "---\ntype: Note\n---\nBody\n");
+    /// assert_eq!(doc.body(), "Body\n");
+    /// ```
+    pub fn body(&self) -> String {
+        // `from_text` keeps the closing `---` as the tail's first line, so a
+        // document with frontmatter skips it (`usize::from(true)` is 1).
+        self.tail
+            .iter()
+            .skip(usize::from(self.has_frontmatter))
+            .map(String::as_str)
+            .collect()
+    }
+
     /// Reassembles the file text after checking the frontmatter still parses.
     ///
     /// # Errors
@@ -576,6 +598,15 @@ mod tests {
                 crate::okf::yaml::scalar(text, ScalarStyle::Quoted)
             )]
         }
+    }
+
+    #[test]
+    fn body_is_the_text_after_the_frontmatter() {
+        let with = Doc::from_text("a.md", "---\ntype: Note\n---\n# A\r\nText\n");
+        let without = Doc::from_text("b.md", "# B\n");
+
+        assert_eq!(with.body(), "# A\r\nText\n");
+        assert_eq!(without.body(), "# B\n");
     }
 
     #[test]
