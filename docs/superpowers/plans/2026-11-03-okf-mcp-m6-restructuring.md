@@ -3618,9 +3618,10 @@ mod tests {
             ["note: /solo/ now holds only its index.md, which stays; delete_concept never \
               deletes an index"]
         );
+        // Only the bullet's line goes, as `unlist_text` (and its replay) take it.
         assert_eq!(
             workspace.read_to_string("solo/index.md").unwrap(),
-            "# Solo\n"
+            "# Solo\n\n"
         );
     }
 
@@ -3642,6 +3643,8 @@ mod tests {
     }
 }
 ```
+
+> **Corrected (issue #124), 2026-11-03.** `an_emptied_folder_keeps_its_index_and_says_so` expected `"# Solo\n"`, but `unlist_text` removes only the bullet's line (as `cmd_mv` takes it, and as the `Unlist` replay does), so `"# Solo\n\n* [Only](only.md) - the only one\n"` becomes `"# Solo\n\n"`. The test now expects that. Trimming the blank line in the op alone would make the op and its replay disagree.
 
 - [ ] **Step 4: Run them to see them fail**
 
@@ -3757,10 +3760,9 @@ fn links_into(
             if source == index && listing == Some(number) {
                 continue;
             }
-            // In-page links (`#x`) point into the source itself.
+            // In-page links (`#x`) resolve to `None`, so they never count.
             let hits = find_links(line)
                 .iter()
-                .filter(|link| !link.target.starts_with('#'))
                 .filter(|link| {
                     resolve_link(workspace, &link.target, &source)
                         .is_some_and(|resolved| resolved.path == path)
@@ -3799,6 +3801,8 @@ fn only_the_index_is_left(
             .all(|file| file == index))
 }
 ```
+
+> **Corrected (issue #124), 2026-11-03.** `links_into` drops the `!link.target.starts_with('#')` filter: `resolve_link` already returns `None` for a pure `#fragment` target, so the filter never changed the result.
 
 In `src/okf/ops/mod.rs`, add `pub use delete::delete_concept;`, and append `delete_concept` to the module doc's list of restructuring edits. Tasks 3, 4 and 5 run in parallel and all extend that list: keep every side, so that it ends up reading "...`rewrite_links` (`relink`), `move_concept`, `split_concept` and `delete_concept`."
 
