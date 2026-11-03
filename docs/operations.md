@@ -641,11 +641,33 @@ spec:
   source's path (`serverName: okf-mcp-db`), or it would write over the
   backups it came from. If it is to become the live database, give it its
   own `plugins` entry with a new `serverName` once it is up.
-- When it is ready, compare it with what you expect (for example
-  `SELECT count(*) FROM documents` on both), then either point `DATABASE_URL`
-  and `PGSSLROOTCERT` at its `-app` and `-ca` secrets, or delete it
-  (`kubectl -n okf-mcp delete cluster okf-mcp-db-restore`; CloudNativePG
-  removes its volumes).
+- **The image:** if your cluster needs `imageName` on every `Cluster` (an
+  image mirror, say), give the restored one the same `imageName` as the source.
+- **Compare it** with the live database when it is ready, querying both at the
+  same moment and with publishing paused, so the two must be equal. Counts
+  catch missing rows, and one checksum over every document catches changed
+  content:
+
+  ```sql
+  SELECT (SELECT count(*) FROM catalogs) AS catalogs,
+         (SELECT count(*) FROM documents) AS documents,
+         (SELECT count(*) FROM revisions) AS revisions,
+         (SELECT max(created_at) FROM revisions) AS last_revision,
+         (SELECT encode(sha256(string_agg(path || ':' || encode(sha256(content), 'hex'),
+                                          ',' ORDER BY path)::bytea), 'hex')
+            FROM documents) AS content_checksum;
+  ```
+
+  Run it with `kubectl -n okf-mcp exec <instance> -c postgres -- psql -d okf_mcp -c '...'`
+  on each cluster's primary. If the live database moved meanwhile, require each
+  count to be at least the value taken before the backup and at most the live
+  one.
+- **Then** either point `DATABASE_URL` and `PGSSLROOTCERT` at its `-app` and
+  `-ca` secrets, or delete it (`kubectl -n okf-mcp delete cluster
+  okf-mcp-db-restore`; CloudNativePG removes its volumes).
+- **Tested:** this section was followed as written in milestone 7's restore
+  drill. A small catalog was ready about 3 minutes after the `Cluster` was
+  created, and matched the live database exactly.
 
 ### An extra copy of each catalog
 
