@@ -3471,10 +3471,30 @@ impl OkfServer {
 
 In `src/mcp/mod.rs`, add `mod search;` and make `tools()` return `Self::catalogs_router() + Self::search_router()`.
 
+> **Corrected (issue #34), 2026-11-03.** The public API above shipped as written
+> (`search_catalogs`, `CatalogHit`, `SearchParams`, `SearchResult`, `run`,
+> `search_router`); later tasks need no change. Differences: (1) a doc comment's line
+> breaks stay in the schemars description, so `SearchParams::tags`' comment is rewrapped
+> to keep "whole tags only" on one line, and `the_schema_says_tags_match_whole_tags_only`
+> checks the `tags` and `query` property descriptions (and the tool description for both
+> phrases) instead of searching the serialized schema, which held `whole\ntags`; it also
+> asserts an object output schema. (2) The merge test adds work's `a.md` (tier 3) and
+> expects it after pg's `b.md`, so catalog order is shown to win over path, and checks the
+> `limit = 2` result is the first two hits, not just two. (3) `search_catalogs` sorts with
+> `sort_unstable_by` ((catalog order, path) is unique, so the order is total). (4) `run`
+> hands the blocking thread `(Arc<CatalogState>, Arc<Loaded>)` pairs and borrows the name
+> there, rather than copying each name into a `String`. (5) After review (PR #81),
+> `limit` is capped at 200 (`MAX_LIMIT`, through a private `hit_limit` with its own test,
+> `the_limit_defaults_to_20_and_is_capped_at_200`), and its description says so and that
+> 0 returns none; the design's `search` row says "at most 200". The span test also passes
+> `catalogs: ["pg"]` on a `["work", "pg"]` connection and expects only pg's hit. So
+> `mcp::search` has four tests, and Step 5's filter runs five. Read `src/mcp/search.rs` and
+> `src/okf/search.rs` for the shipped code.
+
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --lib -- mcp::search search_catalogs`
-Expected: 4 passed.
+Expected: 5 passed (4 before the review of PR #81).
 
 - [ ] **Step 6: Changelog, gates, commit**
 

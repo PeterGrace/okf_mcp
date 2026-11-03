@@ -9,8 +9,9 @@
 //!
 //! `okf.py` has no search command, so there is nothing to keep parity with:
 //! the rules above (decision 3 of the M2 plan) and this module's tests are
-//! the specification. M3's `search` tool runs [`search`] per catalog and
-//! merges the hits by [`SearchHit::rank`], then path.
+//! the specification. [`search_catalogs`] (behind M4's `search` tool) runs
+//! [`search`] per catalog and merges the hits by [`SearchHit::rank`], then
+//! catalog order, then path.
 
 use std::cmp::Ordering;
 
@@ -175,7 +176,9 @@ pub struct SearchRank {
 }
 
 /// One result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+// `JsonSchema` gives the `search` tool its output schema; the skipped `rank`
+// is left out of it, as it is out of the JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SearchHit {
     /// `/`-prefixed concept path.
     pub path: String,
@@ -187,7 +190,8 @@ pub struct SearchHit {
     /// any term, stripped and cut to 160 characters; `None` for an empty
     /// query or when no body line matches.
     pub snippet: Option<String>,
-    /// The ranking key (M3 merges catalogs by it); not serialized.
+    /// The ranking key ([`search_catalogs`] merges catalogs by it); not
+    /// serialized.
     #[serde(skip)]
     pub rank: SearchRank,
 }
@@ -261,6 +265,58 @@ pub fn search(snapshot: &Snapshot, query: &SearchQuery) -> Vec<SearchHit> {
     ranked
         .into_iter()
         .map(|(rank, doc, fields)| hit(doc, fields, rank, &prepared))
+        .collect()
+}
+
+/// One hit of a search across catalogs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct CatalogHit {
+    /// The catalog holding the concept.
+    pub catalog: String,
+    /// The hit; `flatten` writes its fields beside `catalog` in the JSON
+    /// (and in the schema), rather than nested under a `hit` key.
+    #[serde(flatten)]
+    pub hit: SearchHit,
+}
+
+/// Searches several catalogs and merges the hits: best [`SearchRank`] first,
+/// then catalog order, then path.
+///
+/// # Arguments
+/// * `catalogs` - `(name, snapshot)` pairs, in the selection's order.
+/// * `query` - text, filters and limit.
+///
+/// # Returns
+/// At most `query.limit` hits.
+pub fn search_catalogs(catalogs: &[(&str, &Snapshot)], query: &SearchQuery) -> Vec<CatalogHit> {
+    // Each search already runs across its documents with rayon and returns
+    // at most `limit` hits, so the merge sorts at most catalogs x limit.
+    let mut ranked: Vec<(usize, SearchHit)> = catalogs
+        .iter()
+        .enumerate()
+        // `move` hands the closure its own copy of `order` (a plain `usize`),
+        // since the inner iterator outlives this call of the outer closure.
+        .flat_map(|(order, (_, snapshot))| {
+            search(snapshot, query)
+                .into_iter()
+                .map(move |hit| (order, hit))
+        })
+        .collect();
+    // A path is unique within a catalog, so (catalog order, path) is unique
+    // and the order is total: an unstable sort is exact.
+    ranked.sort_unstable_by(|(left_order, left), (right_order, right)| {
+        left.rank
+            .cmp(&right.rank)
+            .then(left_order.cmp(right_order))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    ranked.truncate(query.limit);
+    ranked
+        .into_iter()
+        .map(|(order, hit)| CatalogHit {
+            catalog: catalogs[order].0.to_string(),
+            hit,
+        })
         .collect()
 }
 
@@ -501,5 +557,47 @@ mod tests {
             serde_json::to_string(&hits[0]).unwrap(),
             r#"{"path":"/infra/old-ntp.md","title":"Old NTP server","description":null,"snippet":"Retired."}"#
         );
+    }
+
+    #[test]
+    fn search_catalogs_merges_by_rank_then_catalog_order_then_path() {
+        // "time" is in work's z.md title (tier 0) but only in the bodies of
+        // pg's a.md and b.md and of work's a.md (tier 3). Among those, pg
+        // comes first (catalog order), even though work's a.md sorts before
+        // pg's b.md by path.
+        let pg = Snapshot::build(&MemWorkspace::from_files([
+            ("b.md", "---\ntype: Note\ntitle: Beta\n---\nAbout time.\n"),
+            ("a.md", "---\ntype: Note\ntitle: Alpha\n---\nAbout time.\n"),
+        ]))
+        .unwrap();
+        let work = Snapshot::build(&MemWorkspace::from_files([
+            ("z.md", "---\ntype: Note\ntitle: Time\n---\nText.\n"),
+            ("a.md", "---\ntype: Note\ntitle: Gamma\n---\nAbout time.\n"),
+        ]))
+        .unwrap();
+        let mut query = SearchQuery::new("time");
+
+        let all = search_catalogs(&[("pg", &pg), ("work", &work)], &query);
+        query.limit = 2;
+        let two = search_catalogs(&[("pg", &pg), ("work", &work)], &query);
+
+        let order = |hits: &[CatalogHit]| -> Vec<(String, String)> {
+            hits.iter()
+                .map(|hit| (hit.catalog.clone(), hit.hit.path.clone()))
+                .collect()
+        };
+        assert_eq!(
+            order(&all),
+            [
+                ("work".to_string(), "/z.md".to_string()),
+                ("pg".to_string(), "/a.md".to_string()),
+                ("pg".to_string(), "/b.md".to_string()),
+                ("work".to_string(), "/a.md".to_string()),
+            ]
+        );
+        assert_eq!(order(&two), order(&all)[..2]);
+        let json = serde_json::to_value(&all[0]).unwrap();
+        assert_eq!(json["catalog"], "work");
+        assert_eq!(json["path"], "/z.md");
     }
 }
