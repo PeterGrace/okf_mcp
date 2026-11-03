@@ -138,6 +138,9 @@ OPS_DEFAULTS: dict[str, dict[str, Json]] = {
     "question": {},
     "unquestion": {},
     "source": {"title": None, "author": None},
+    "log": {"kind": "Update"},
+    "index": {"title": None, "section": None},
+    "ensure_index": {},
 }
 
 
@@ -166,7 +169,16 @@ def run_op(okf: ModuleType, work: str, step: dict[str, Any]) -> Json:
     failed = False
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         try:
-            getattr(okf, f"cmd_{command}")(argparse.Namespace(root=work, **fields))
+            if command == "ensure_index":
+                # A helper, not a command: mv and split call it after creating
+                # the folder. The output is the files it wrote, each once.
+                folder = str(step["folder"])
+                os.makedirs(os.path.join(work, folder), exist_ok=True)
+                touched: list[str] = []
+                okf.ensure_index(work, folder, touched)
+                print("\n".join(dict.fromkeys(touched)))
+            else:
+                getattr(okf, f"cmd_{command}")(argparse.Namespace(root=work, **fields))
         except SystemExit:
             failed = True
     prefix = work + os.sep
