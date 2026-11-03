@@ -14,6 +14,7 @@ use okf_mcp::config::Config;
 use okf_mcp::store::keys::Access;
 use serde_json::{json, Value};
 use support::server::{call, files, structured, Client, TestServer};
+use tokio::sync::Barrier;
 
 const TIME: &str =
     "---\ntype: System\ntitle: Time server\ndescription: The GPS clock.\n---\n# Time server\n";
@@ -48,12 +49,13 @@ async fn ok(client: &Client, tool: &'static str, arguments: Value) -> Value {
 }
 
 /// The `path` field of each object in `list` (a result's `revisions` or
-/// `files`).
+/// `files`). Panics on an item without a string `path`, so a change in the
+/// result's shape fails here instead of shortening the list.
 fn paths(list: &Value) -> Vec<&str> {
     list.as_array()
         .expect("a list")
         .iter()
-        .filter_map(|item| item["path"].as_str())
+        .map(|item| item["path"].as_str().expect("a string path"))
         .collect()
 }
 
@@ -271,16 +273,21 @@ async fn concurrent_writes_from_two_connections_of_one_key_share_one_changeset()
     let first = server.client(&key, None).await.unwrap();
     let second = server.client(&key, None).await.unwrap();
     let entry = |client: &str, number: usize| json!({"text": format!("{client} {number}")});
+    // Both connections wait here before each write, so every round sends the
+    // two writes together (like `asyncio.Barrier`), not one loop after the other.
+    let round = Barrier::new(2);
 
-    // `tokio::join!` runs the two connections' three writes each at once.
+    // `tokio::join!` runs the two connections' loops at once.
     tokio::join!(
         async {
             for number in 0..3 {
+                round.wait().await;
                 ok(&first, "log", entry("first", number)).await;
             }
         },
         async {
             for number in 0..3 {
+                round.wait().await;
                 ok(&second, "log", entry("second", number)).await;
             }
         },
