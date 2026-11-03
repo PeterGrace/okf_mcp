@@ -26,7 +26,10 @@
 //! `okf_mcp::okf::ops` on an in-memory copy of the corpus and through
 //! okf.py's `cmd_*` functions on a temp copy, both with "now" frozen at
 //! [`FIXED_NOW`], and compare every step's output or error and every file
-//! that changed, byte for byte. The script's error steps are refusals the
+//! that changed, byte for byte. For `mv` and `split` the output also carries
+//! okf.py's touched list, rebuilt from `OpOutcome::touched` by
+//! [`print_touched`] (the op's message leaves it out, since the tool returns
+//! `touched` itself). The script's error steps are refusals the
 //! port words as okf.py does (`OkfError::Refused`); the variants it words
 //! differently (`NotFound`, `FrontmatterParse`, `Shape`) are unit-tested.
 //! The live test runs on the synthetic corpus only: the script names its paths.
@@ -63,8 +66,8 @@ use okf_mcp::okf::analysis::sprawl::{sprawl, SprawlQuery};
 use okf_mcp::okf::doc::Doc;
 use okf_mcp::okf::markdown::{body_split, footnote_defs, headings};
 use okf_mcp::okf::ops::{
-    ensure_index, index, log, question, review, source, stamp, unquestion, LogKind, OpContext,
-    OpOutcome, SourceEntry,
+    ensure_index, index, log, move_concept, question, review, source, stamp, unquestion, LogKind,
+    OpContext, OpOutcome, SourceEntry,
 };
 use okf_mcp::okf::snapshot::Snapshot;
 use okf_mcp::okf::timestamp::parse_iso;
@@ -377,6 +380,25 @@ fn ops_corpus(root: &Path, script: &Json) -> BTreeMap<String, StoredFile> {
     files
 }
 
+/// `okf.py`'s `print_touched` (`:1514`): the paths under its heading, one
+/// per line. `OpOutcome::touched` is already de-duplicated in first-seen
+/// order, as `print_touched` de-duplicates.
+fn print_touched(touched: &[String]) -> String {
+    let mut out = "touched (pass these to publish):".to_string();
+    for path in touched {
+        out.push_str("\n  ");
+        out.push_str(path);
+    }
+    out
+}
+
+/// An `mv` or `split` outcome as `okf.py` prints it: the message, then the
+/// touched list.
+fn with_touched(mut outcome: OpOutcome) -> OpOutcome {
+    outcome.message = format!("{}\n{}", outcome.message, print_touched(&outcome.touched));
+    outcome
+}
+
 /// Runs one script step through `okf_mcp::okf::ops`. Missing fields fall
 /// back to the shim's `OPS_DEFAULTS` (`by` is "fixture").
 fn run_op(
@@ -445,6 +467,7 @@ fn run_op(
             outcome.message = outcome.touched.join("\n");
             Ok(outcome)
         }
+        "mv" => move_concept(workspace, text("old"), text("new")).map(with_touched),
         other => panic!("unknown ops command {other}"),
     }
 }
