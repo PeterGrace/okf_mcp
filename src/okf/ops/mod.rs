@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::clock::format_timestamp;
@@ -100,13 +101,15 @@ impl OpOutcome {
 /// Which stamp `stamp` writes.
 ///
 /// `Copy` makes it a plain value (passing it copies it, like a Python int).
-/// `Deserialize` reads `"generated"` / `"verified"`, `okf.py`'s spellings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// `Deserialize` reads `"generated"` / `"verified"`, `okf.py`'s spellings,
+/// and `JsonSchema` describes them in the `stamp` tool's input schema (the
+/// variants' doc comments become the choices' descriptions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StampField {
-    /// Replace `generated`.
+    /// Replace `generated`: the content was (re)written.
     Generated,
-    /// Append to `verified`.
+    /// Append to `verified`: the facts were checked against the real system.
     Verified,
 }
 
@@ -135,9 +138,14 @@ pub struct SourceEntry<'a> {
 }
 
 /// The kind of a `log.md` entry (`okf.py`'s `LOG_KINDS`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+///
+/// No `rename_all`: the JSON spellings are `okf.py`'s capitalized ones
+/// (`"Update"` etc.). `#[default]` marks the variant `Default::default()`
+/// returns, `okf.py log`'s `--kind` default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 pub enum LogKind {
     /// `Update` (the default in `okf.py`).
+    #[default]
     Update,
     /// `Creation`.
     Creation,
