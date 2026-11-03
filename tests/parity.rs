@@ -27,7 +27,7 @@
 //! okf.py's `cmd_*` functions on a temp copy, both with "now" frozen at
 //! [`FIXED_NOW`], and compare every step's output or error and every file
 //! that changed, byte for byte. For `mv` and `split` the output also carries
-//! `okf.py`'s touched list, rebuilt from `OpOutcome::touched` by
+//! okf.py's touched list, rebuilt from `OpOutcome::touched` by
 //! [`print_touched`] (the op's message leaves it out, since the tool returns
 //! `touched` itself). The script's error steps are refusals the
 //! port words as okf.py does (`OkfError::Refused`); the variants it words
@@ -66,8 +66,8 @@ use okf_mcp::okf::analysis::sprawl::{sprawl, SprawlQuery};
 use okf_mcp::okf::doc::Doc;
 use okf_mcp::okf::markdown::{body_split, footnote_defs, headings};
 use okf_mcp::okf::ops::{
-    ensure_index, index, log, question, review, source, split_concept, stamp, unquestion, LogKind,
-    OpContext, OpOutcome, SourceEntry, Split, DEFAULT_SPLIT_TYPE,
+    ensure_index, index, log, move_concept, question, review, source, split_concept, stamp,
+    unquestion, LogKind, OpContext, OpOutcome, SourceEntry, Split, DEFAULT_SPLIT_TYPE,
 };
 use okf_mcp::okf::snapshot::Snapshot;
 use okf_mcp::okf::timestamp::parse_iso;
@@ -467,6 +467,7 @@ fn run_op(
             outcome.message = outcome.touched.join("\n");
             Ok(outcome)
         }
+        "mv" => move_concept(workspace, text("old"), text("new")).map(with_touched),
         "split" => {
             // `source` is okf.py's repeatable `--source`: null or a list of ids.
             let sources: Vec<String> = step

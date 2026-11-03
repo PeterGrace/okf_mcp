@@ -137,6 +137,28 @@
       "output": ""
     },
     {
+      "output": "log.md: ## 2026-10-27: * **Update:** Linked [alpha](/moves/alpha.md)."
+    },
+    {
+      "output": "moved /moves/alpha.md -> /moves/renamed.md\ntouched (pass these to publish):\n  moves/alpha.md\n  moves/renamed.md\n  log.md\n  moves/beta.md\n  moves/index.md\n  people/linker.md"
+    },
+    {
+      "output": "moved /moves/beta.md -> /elsewhere/new-folder/beta.md\ntouched (pass these to publish):\n  moves/beta.md\n  elsewhere/new-folder/beta.md\n  elsewhere/new-folder/index.md\n  elsewhere/index.md\n  index.md\n  moves/index.md\n  moves/gamma.md\n  moves/renamed.md\n  people/linker.md",
+      "notes": [
+        "created /elsewhere/index.md; replace its TODO lines (and the parent's listing)",
+        "created /elsewhere/new-folder/index.md; replace its TODO lines (and the parent's listing)"
+      ]
+    },
+    {
+      "output": "moved /moves/gamma.md -> /infra/Gamma_Ray.md\ntouched (pass these to publish):\n  moves/gamma.md\n  infra/Gamma_Ray.md\n  infra/index.md",
+      "notes": [
+        "note: Gamma_Ray.md isn't short, lowercase and hyphenated"
+      ]
+    },
+    {
+      "error": "moves/index.md: index.md is a reserved name, not a concept"
+    },
+    {
       "output": "split 'Background' (5 lines) out of /splits/parent.md into /splits/background.md\nsources copied: s1 (cited by the section's footnotes)\nfootnotes carried: s1\ntouched (pass these to publish):\n  splits/parent.md\n  splits/background.md\n  splits/index.md\n  splits/user.md"
     },
     {
@@ -168,16 +190,26 @@
     "analysis/offsets.md": "---\ntype: Note\ntitle: Offsets\ndescription: Non-UTC and fractional stamps.\ngenerated: { by: fixture, at: \"2026-10-26T10:00:00.5+05:30\" }\nreviewed:\n  by: fixture\n  at: 2026-10-27T12:00:00Z\n  outcome: updated\n  note: \"x: y\"\nstale_after: 2026-11-01T00:00:00Z\n---\nBack to [the hub](/analysis/hub.md).\n",
     "analysis/stamps.md": "---\ntype: Note\ntitle: Stamp Rules\nstatus: bogus\ngenerated: { by: fixture, at: 2027-01-01T00:00:00Z }\nverified:\n  - { by: fixture, at: \"2026-10-01T10:00:00-04:00\" }\n  - plain\n  - { by: fixture, at: 2026-10-27T12:00:00Z }\nreviewed: { by: fixture, at: 2026-10-02T00:00:00Z, outcome: maybe }\nstale_after: 2026-01-01T00:00:00Z\nopen_questions:\n  - Is the clock right?\nsources:\n  - { id: a }\n  - { id: b, resource: r, last_modified: 2026-13-01T00:00:00Z }\n  - { id: c, resource: r, last_modified: \"2026-10-01T00:00:00+00:00\" }\n  - id: d\n    resource: r\n---\nTimestamps of every shape. See [the hub](/analysis/hub.md).\n",
     "brand-new/index.md": "# Brand new\n\nTODO: say what this folder holds.\n",
-    "index.md": "---\nokf_version: \"0.2\"\n---\n\n# Fixture catalog\n\n* [Infra](infra/) - systems\n* [Analysis](analysis/) - analysis cases\n* [Root note](root-note.md) - at the root\n\n# Sections\n\n* [Brand new](brand-new/) - TODO: describe this folder\n",
+    "elsewhere/index.md": "# Elsewhere\n\nTODO: say what this folder holds.\n\n# Sections\n\n* [New folder](new-folder/) - TODO: describe this folder\n",
+    "elsewhere/new-folder/beta.md": "---\ntype: Note\ntitle: Beta\ndescription: The   second letter.\n---\nBack to [alpha](/moves/renamed.md#part) and [abs](/moves/renamed.md).\r\n",
+    "elsewhere/new-folder/index.md": "# New folder\n\nTODO: say what this folder holds.\n\n# Concepts\n\n* [Beta](beta.md) - second\n",
+    "index.md": "---\nokf_version: \"0.2\"\n---\n\n# Fixture catalog\n\n* [Infra](infra/) - systems\n* [Analysis](analysis/) - analysis cases\n* [Root note](root-note.md) - at the root\n\n# Sections\n\n* [Brand new](brand-new/) - TODO: describe this folder\n* [Elsewhere](elsewhere/) - TODO: describe this folder\n",
+    "infra/Gamma_Ray.md": "---\ntype: Note\ntitle: Gamma\ndescription: Third.\n---\nUnlisted; [beta](/elsewhere/new-folder/beta.md).\n",
     "infra/hosts/crlf-host.md": "---\r\ntype: Host\r\ntitle: CRLF host\r\ngenerated: { by: fixture, at: 2026-10-27T12:00:00Z }\r\n...\r\nBody with CRLF.\r\n",
-    "infra/index.md": "# Infra\n\n# Concepts\n\n* [Time server](time-server.md) - GPS clock\n* [NTP](ntp.md) - pool\n",
+    "infra/index.md": "# Infra\n\n# Concepts\n\n* [Time server](time-server.md) - GPS clock\n* [NTP](ntp.md) - pool\n* [Gamma](Gamma_Ray.md) - Third.\n",
     "infra/time-server.md": "---\ntype: Service\ntitle: Time server # trailing comment\ndescription: \"GPS stratum 1: the network's clock\"\nresource: ntp://mosaic.internal\naliases: [mosaic, 'gps clock', \"the \\\"clock\\\"\"]\ntags:\n  - time\n  - gps\nstatus: stable\ngenerated: { by: claude-code/claude-opus-5-5, at: 2026-10-27T12:00:00Z }\nverified:\n  - { by: \"human:pgrace\", at: 2026-10-25T10:00:00Z }\n  - by: claude-code/claude-opus-5-5\n    at: 2026-10-26T01:02:03Z\n  - { by: human:pgrace, at: 2026-10-27T12:00:00Z }\nreviewed:\n  by: human:pgrace\n  at: 2026-10-27T12:00:00Z\n  outcome: verified\n  note: \"Re-checked\"\nsources:\n  - id: chrony\n    resource: chronyc tracking\n    title: Live check\n  - id: empty-title\n    resource: x\n    title:\ncustom_null: ~\ncustom_block: |\n  line one\n    indented\n\n  last\ncustom_folded: >\n  folded\n  text\ncustom_flow_multi: [a,\n  b, c]\nescapes: \"tab\\thereé\\x41 \\\\ end\"\nsingle: 'it''s'\nurl: https://example.com/a:b\n---\n\n# Overview\n\nThe [clock](/infra/time-server.md#overview) feeds [hosts](/infra/hosts/).\nSee [the root](../index.md) and ![a diagram](d.png).\n\n## Overview\n\n```\n# not a heading\n```\n\n### Plan: CLI first, MCP later\n\n<a name=\"custom-anchor\"></a>\n\nFootnoted claim.[^chrony]\n\n[^chrony]: chronyc tracking\n    continued here\n",
-    "log.md": "# Log\n\n## 2026-10-27\n\n* **Change:** Second entry.\n* **Update:** Ran the ops script.\n\n## 2026-10-26\n\n* **Creation:** Added fixtures.\n",
+    "log.md": "# Log\n\n## 2026-10-27\n\n* **Update:** Linked [alpha](/moves/renamed.md).\n* **Change:** Second entry.\n* **Update:** Ran the ops script.\n\n## 2026-10-26\n\n* **Creation:** Added fixtures.\n",
+    "moves/alpha.md": null,
+    "moves/beta.md": null,
+    "moves/gamma.md": null,
+    "moves/index.md": "# Moves\n\n# Concepts\n\n* [Alpha](renamed.md) - first letter\n\nSee also [alpha again](renamed.md).\n",
+    "moves/renamed.md": "---\ntype: Note\ntitle: Alpha\n---\nSee [beta](/elsewhere/new-folder/beta.md), [own part](#part) and [hub](/analysis/hub.md).\n\n## Part\n\nText.\n",
     "ops/deep/er/index.md": "# Er\n\nTODO: say what this folder holds.\n",
     "ops/deep/index.md": "# Deep\n\nTODO: say what this folder holds.\n\n# Sections\n\n* [Er](er/) - TODO: describe this folder\n",
     "ops/flow.md": "---\ntype: Note\ntitle: Flow shapes\nverified:\n  - { by: x, at: 2026-01-01T00:00:00Z }\n  - { by: fixture, at: 2026-10-27T12:00:00Z }\nreviewed:\n  by: fixture\n  at: 2026-10-27T12:00:00Z\n  outcome: verified\n  note: \"n\"\nopen_questions:\n  - \"one\"\n  - \"two, three\"\n  - \"four\"\n  - \"five\"\n---\nBody.\n",
     "ops/index.md": "# Ops\n\nNo bullets yet.\n\n# Concepts\n\n* [NTP \\[pool\\] notes](bracket-title.md) - brackets escaped\n* [Second](second.md) - after the first\n\n# Sections\n\n* [Deep](deep/) - TODO: describe this folder\n",
     "people/index.md": "# People\n\n# Concepts\n\n* [Pete](pgrace.md) - me\n\n# Sections\n\n* [Teams](teams/) - groups\n",
+    "people/linker.md": "---\ntype: Note\ntitle: Linker\n---\nSee [alpha](../moves/renamed.md#part), [beta](/elsewhere/new-folder/beta.md) and [folder](/moves/).\n",
     "splits/background.md": "---\ntype: Note\ntitle: Background\ndescription: Why the parent exists.\nstatus: draft\ngenerated: { by: fixture, at: 2026-10-27T12:00:00Z }\nsources:\n  - id: s1\n    resource: r1\n    title: One\n---\n\nSplit out of [Parent](/splits/parent.md); see it for the surrounding context.\n\nWhy it exists.[^s1]\n\n# Detail\n\nFine print, see [intro](/splits/parent.md#intro).\n\n[^s1]: From s1.\n",
     "splits/deeper/index.md": "# Deeper\n\nTODO: say what this folder holds.\n\n# Concepts\n\n* [Last bit](last.md) - Last bit, split out of Parent.\n",
     "splits/deeper/last.md": "---\ntype: Note\ntitle: Last bit\ndescription: Last bit, split out of Parent.\nstatus: draft\ngenerated: { by: fixture, at: 2026-10-27T12:00:00Z }\nsources:\n  - id: s2\n    resource: https://example.com/two\n---\n\nSplit out of [Parent](/splits/parent.md); see it for the surrounding context.\n\nThe end.[^s1]\n\n[^s1]: From s1.\n",

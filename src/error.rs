@@ -174,6 +174,20 @@ pub enum OkfError {
         /// and the published one.
         files: Vec<ConflictFile>,
     },
+
+    /// `delete_concept` was refused: other documents still link to the
+    /// concept.
+    #[error(
+        "{path}: still linked from {} place(s); retarget or remove those links first \
+         (move_concept retargets them)",
+        .links.len()
+    )]
+    StillLinked {
+        /// The concept's catalog-relative path.
+        path: String,
+        /// Each link into it, in walk order, then line order.
+        links: Vec<LinkSource>,
+    },
 }
 
 /// One file of an [`OkfError::Conflict`] (a record, so its fields are public).
@@ -186,6 +200,16 @@ pub struct ConflictFile {
     pub base_revision: Option<i32>,
     /// The published revision now (`None`: no live document).
     pub current_revision: Option<i32>,
+}
+
+/// One link of an [`OkfError::StillLinked`] (a record, so its fields are
+/// public).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct LinkSource {
+    /// The linking document's catalog-relative path.
+    pub source: String,
+    /// The 1-based line of the link (frontmatter lines count, as in lint).
+    pub line: usize,
 }
 
 impl OkfError {
@@ -214,6 +238,7 @@ impl OkfError {
             OkfError::Busy { .. } => "Busy",
             OkfError::LintFailed { .. } => "LintFailed",
             OkfError::Conflict { .. } => "Conflict",
+            OkfError::StillLinked { .. } => "StillLinked",
         }
     }
 
@@ -274,6 +299,10 @@ impl OkfError {
                 body["warnings"] = json_list(warnings);
             }
             OkfError::Conflict { files } => body["files"] = json_list(files),
+            OkfError::StillLinked { path, links } => {
+                body["path"] = path.as_str().into();
+                body["links"] = json_list(links);
+            }
             OkfError::Database { .. }
             | OkfError::Migrate { .. }
             | OkfError::Config { .. }
@@ -285,9 +314,9 @@ impl OkfError {
     }
 }
 
-/// A list as JSON, for an error body. `Finding` and `ConflictFile` are plain
-/// records that always serialize; the `Null` fallback only keeps this free
-/// of `unwrap`.
+/// A list as JSON, for an error body. `Finding`, `ConflictFile` and
+/// `LinkSource` are plain records that always serialize; the `Null` fallback
+/// only keeps this free of `unwrap`.
 fn json_list<T: serde::Serialize>(items: &[T]) -> serde_json::Value {
     serde_json::to_value(items).unwrap_or_default()
 }
@@ -327,6 +356,32 @@ impl From<sqlx::Error> for OkfError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn still_linked_lists_its_links_and_is_a_conflict_not_internal() {
+        let error = OkfError::StillLinked {
+            path: "infra/x.md".to_string(),
+            links: vec![LinkSource {
+                source: "hub.md".to_string(),
+                line: 5,
+            }],
+        };
+
+        let body = error.to_json();
+
+        assert_eq!(error.kind(), "StillLinked");
+        assert!(!error.is_internal());
+        assert_eq!(body["path"], "infra/x.md");
+        assert_eq!(
+            body["links"],
+            serde_json::json!([{"source": "hub.md", "line": 5}])
+        );
+        assert_eq!(
+            body["message"],
+            "infra/x.md: still linked from 1 place(s); retarget or remove those links \
+             first (move_concept retargets them)"
+        );
+    }
 
     #[test]
     fn to_json_names_the_kind_and_what_to_act_on() {

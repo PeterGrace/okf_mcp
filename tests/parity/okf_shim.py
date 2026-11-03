@@ -15,7 +15,8 @@ usage:
     okf_shim.py ops ROOT NOW         stdin: an ops script ({"setup": {path: text}, "steps": [...]});
                                      runs each step through okf.py's cmd_* functions on a temp copy
                                      of ROOT (plus setup) with now_utc frozen at NOW; stdout: each
-                                     step's output or error, and every file that changed
+                                     step's output or error, and every file that changed;
+                                     mv runs with git stubbed out (os.rename)
 """
 import argparse
 import contextlib
@@ -25,6 +26,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from types import ModuleType
@@ -141,6 +143,7 @@ OPS_DEFAULTS: dict[str, dict[str, Json]] = {
     "log": {"kind": "Update"},
     "index": {"title": None, "section": None},
     "ensure_index": {},
+    "mv": {},
     "split": {"title": None, "type": "Note", "description": None, "stub": None,
               "source": None, "by": "fixture"},
 }
@@ -195,6 +198,13 @@ def run_op(okf: ModuleType, work: str, step: dict[str, Any]) -> Json:
     return entry
 
 
+def untracked_git(
+    _root: str, *args: str, check: bool = False
+) -> "subprocess.CompletedProcess[str]":
+    """okf.py's `git` for a copy no repository tracks: every call fails (code 1)."""
+    return subprocess.CompletedProcess(list(args), 1, "", "")
+
+
 def ops(okf: ModuleType, root: str, now: str, script: dict[str, Any]) -> Json:
     """Run an ops script on a temp copy of root with now_utc frozen at now.
 
@@ -205,6 +215,11 @@ def ops(okf: ModuleType, root: str, now: str, script: dict[str, Any]) -> Json:
     """
     fixed = okf.parse_ts(now)
     setattr(okf, "now_utc", lambda: fixed)
+    # cmd_mv runs `git mv` for a tracked file, else os.rename. The copy is
+    # never tracked, so answer `git ls-files --error-unmatch` with "no"
+    # (return code 1) without running git: the run needs no git binary and
+    # never sees an enclosing repository.
+    setattr(okf, "git", untracked_git)
     home = os.getcwd()
     with tempfile.TemporaryDirectory() as tmp:
         work = os.path.join(tmp, "catalog")
