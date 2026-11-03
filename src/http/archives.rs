@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::header;
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -15,10 +15,10 @@ use crate::app::App;
 use crate::archive::read_tarball;
 use crate::auth::Principal;
 use crate::error::OkfError;
-use crate::http::{timeout_layer, AppError};
+use crate::http::{timeout_layer, AppError, REQUEST_TIMEOUT};
 use crate::mcp::blocking;
 use crate::store::export::export;
-use crate::store::import::{import, ImportOptions, ImportReport};
+use crate::store::import::{import, ImportOptions};
 use crate::store::keys::Access;
 
 /// The two routes, for the keyed part of the router.
@@ -27,19 +27,25 @@ use crate::store::keys::Access;
 /// * `app` - the shared state (for `max_import_bytes`).
 ///
 /// # Returns
-/// A router over `Arc<App>` state, with the import's body cap and the
-/// request timeout applied.
+/// A router over `Arc<App>` state: the export behind the request timeout,
+/// the import with its body cap (and its own deadline, see
+/// [`import_catalog`]).
 pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
     let limit = body_limit(app.config().max_import_bytes.as_u64());
     Router::new()
-        .route("/catalogs/{name}/export", get(export_catalog))
+        // The same timeout as `/healthz` (503 after `REQUEST_TIMEOUT`). A
+        // layer on one method router applies to that route only.
+        .route(
+            "/catalogs/{name}/export",
+            get(export_catalog).layer(timeout_layer()),
+        )
+        // No timeout layer: one firing after the import commits would answer
+        // 503 for an import that happened (and a retry would get 409). The
+        // handler bounds the upload itself instead.
         .route(
             "/catalogs/{name}/import",
-            // A layer on one method router: only the import's body is capped.
             post(import_catalog).layer(DefaultBodyLimit::max(limit)),
         )
-        // The same timeout as `/healthz` (503 after `REQUEST_TIMEOUT`).
-        .layer(timeout_layer())
 }
 
 /// The request-body cap for an import whose decompressed tar stream may be
@@ -108,15 +114,22 @@ struct ImportQuery {
 /// `.tar.gz` as the key's actor, for a key with `admin` on the catalog, and
 /// swaps the new snapshot in before answering, so the next read sees it.
 ///
+/// The key is checked before the body is read, so a key that may not import
+/// cannot make the server buffer an upload. Reading and checking the upload
+/// must finish within [`REQUEST_TIMEOUT`] (else 503, nothing imported); the
+/// import and the refresh after it have no deadline, so a committed import
+/// is never answered with a timeout.
+///
 /// # Arguments
 /// * `app` - the shared state.
 /// * `principal` - the caller, from the auth layer.
 /// * `name` - the catalog, from the path.
 /// * `query` - `?replace=true`, if given.
-/// * `body` - the tarball (413 past [`body_limit`], before this runs).
+/// * `request` - the rest of the request: its body is the tarball.
 ///
 /// # Returns
-/// The import's report.
+/// The import's report as JSON; 413 past [`body_limit`]; 503 if the upload
+/// is not read and checked within [`REQUEST_TIMEOUT`].
 ///
 /// # Errors
 /// 404 for a catalog that does not exist or that the key does not reach;
@@ -130,15 +143,36 @@ async fn import_catalog(
     Extension(principal): Extension<Arc<Principal>>,
     Path(name): Path<String>,
     Query(query): Query<ImportQuery>,
-    // The body extractor must come last: it consumes the request.
-    body: Bytes,
-) -> Result<Json<ImportReport>, AppError> {
+    // The whole request, unread, must come last: reading its body consumes
+    // it. Taking `Request` rather than `Bytes` defers the read until after
+    // the key check.
+    request: Request,
+) -> Result<Response, AppError> {
     principal.require(Access::Admin, &name)?;
     let max_bytes = app.config().max_import_bytes.as_u64();
-    // Decompressing and checking every entry is CPU work, so it runs on a
-    // blocking thread; `move` hands `body` (a cheap reference-counted
-    // buffer) to the closure.
-    let files = blocking(move || read_tarball(body.as_ref(), max_bytes)).await?;
+    // An `async` block is a future that runs only when awaited (here, under
+    // the deadline). Its error is the response to send instead.
+    let upload = async {
+        // `Bytes::from_request` is what a `Bytes` handler argument runs: it
+        // honours the route's `DefaultBodyLimit`, and its rejection is a
+        // ready-made response (413 past the cap).
+        let body = Bytes::from_request(request, &())
+            .await
+            .map_err(IntoResponse::into_response)?;
+        // Decompressing and checking every entry is CPU work, so it runs on
+        // a blocking thread; `move` hands `body` (a cheap reference-counted
+        // buffer) to the closure.
+        blocking(move || read_tarball(body.as_ref(), max_bytes))
+            .await
+            .map_err(|error| AppError(error).into_response())
+    };
+    // `timeout` gives `Err(Elapsed)` if the deadline passes first; dropping
+    // the unfinished upload then cancels it, and nothing is imported.
+    let files = match tokio::time::timeout(REQUEST_TIMEOUT, upload).await {
+        Ok(Ok(files)) => files,
+        Ok(Err(refusal)) => return Ok(refusal),
+        Err(_elapsed) => return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+    };
     let options = ImportOptions {
         replace: query.replace,
         actor: &principal.actor,
@@ -159,7 +193,9 @@ async fn import_catalog(
     // Swap the new snapshot in now, not at the next poll. The import has
     // committed, so a failed refresh must not turn it into an error (a
     // retry would then get 409): log it and leave it to the poll loop. A
-    // catalog the app has not loaded yet arrives with the next poll.
+    // catalog the app has not loaded yet arrives with the next poll, as does
+    // the import of a client that disconnects (dropping this future) before
+    // the refresh ends.
     if let Some(state) = app.catalog(&name) {
         if let Err(error) = state.refresh(app.pool()).await {
             tracing::error!(
@@ -171,12 +207,53 @@ async fn import_catalog(
     }
     // The key's id, never the key itself.
     tracing::info!(catalog = %name, key = %principal.key_id, "imported");
-    Ok(Json(report))
+    Ok(Json(report).into_response())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    // `oneshot` sends one request through a router without a socket.
+    use tower::ServiceExt;
+
+    use crate::config::Config;
+    use crate::mcp::testing::{app_with, principal};
+
+    /// An import of `size` zero bytes into `pg` by `caller`, through the
+    /// routes alone (the auth layer's principal added by hand), with a 1 KiB
+    /// `max_import_bytes`.
+    async fn import_status(caller: Arc<Principal>, size: usize) -> StatusCode {
+        let config = Config {
+            max_import_bytes: bytesize::ByteSize::b(1024),
+            ..Config::default()
+        };
+        let test = app_with(&[("pg", &[])], config).await;
+        let router = routes(&test.app)
+            .layer(Extension(caller))
+            .with_state(Arc::clone(&test.app));
+        let request = Request::post("/catalogs/pg/import")
+            .body(Body::from(vec![0u8; size]))
+            .expect("request");
+        router.oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_key_is_checked_before_the_body_is_read() {
+        let reader = principal(&[], None);
+        let admin = Arc::new(Principal {
+            access: Access::Admin,
+            ..(*principal(&[], None)).clone()
+        });
+        let oversized = body_limit(1024) + 1;
+
+        let as_reader = import_status(reader, oversized).await;
+        let as_admin = import_status(admin, oversized).await;
+
+        // A body read first would have made both 413.
+        assert_eq!(as_reader, StatusCode::FORBIDDEN);
+        assert_eq!(as_admin, StatusCode::PAYLOAD_TOO_LARGE);
+    }
 
     #[test]
     fn the_body_limit_leaves_room_for_gzip_overhead() {

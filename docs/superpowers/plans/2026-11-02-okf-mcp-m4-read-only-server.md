@@ -5113,6 +5113,18 @@ In `src/http/mod.rs`, add `mod archives;` and put `.merge(archives::routes(&app)
 > module doc no longer says "Task 11". A refresh that fails after a committed import is
 > logged and the report still returned, as written; no test forces that failure (the
 > refresh and the import share one pool).
+> Review of PR #86 changed the import route's design (read `src/http/archives.rs`):
+> (5) the key is checked before the body is read: `import_catalog` takes the unread
+> `axum::extract::Request` last and calls `Bytes::from_request` after
+> `principal.require`, so a key that may not import cannot make the server buffer up to
+> `body_limit`; the route's `DefaultBodyLimit` still gives 413. (6) `timeout_layer()`
+> wraps the export route only (`get(export_catalog).layer(timeout_layer())`). The
+> import bounds reading and checking its upload with `tokio::time::timeout(REQUEST_TIMEOUT,
+> ..)` (503, nothing imported) and gives the import and the refresh no deadline, so a
+> committed import is never answered with 503 (a retry would get 409). The handler
+> returns `Result<Response, AppError>`. A unit test,
+> `the_key_is_checked_before_the_body_is_read`, sends an oversized body: 403 for a
+> reader, 413 for an admin. So Step 3 expects 8 server tests and 2 `archives` unit tests.
 
 - [ ] **Step 3: Run the tests**
 

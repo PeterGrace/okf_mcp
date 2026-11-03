@@ -27,13 +27,15 @@ use crate::auth::require_key;
 use crate::error::OkfError;
 use crate::mcp::OkfServer;
 
-/// How long a request on any route but `/mcp` may take. `/mcp`'s `GET` is a
-/// long-lived event stream, which rmcp's keep-alive and the session idle
-/// timeout bound instead.
+/// How long a request on any route but `/mcp` may take; for an import, how
+/// long reading and checking its upload may take (the import itself has no
+/// deadline, so a committed import is never answered with a timeout).
+/// `/mcp`'s `GET` is a long-lived event stream, which rmcp's keep-alive and
+/// the session idle timeout bound instead.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The timeout layer for every route but `/mcp`: [`REQUEST_TIMEOUT`], then
-/// 503. Not 408, which says the *client* was slow to send its request (and
+/// The timeout layer for `/healthz` and the export route:
+/// [`REQUEST_TIMEOUT`], then 503. Not 408, which says the *client* was slow to send its request (and
 /// which some clients and proxies retry on their own).
 ///
 /// # Returns
