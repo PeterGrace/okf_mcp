@@ -299,7 +299,7 @@ impl ToolContext { pub async fn view(&self, state: &CatalogState) -> Result<View
 
 // Task 8: src/write.rs, and src/store/changesets.rs (adds `lock`)
 pub async fn lock(conn: &mut PgConnection, changeset_id: i64) -> Result<Option<ChangesetRow>, OkfError>; // store::changesets: FOR UPDATE, re-read (None: gone); write::apply takes it before reading the overlay
-pub struct WriteReport { pub catalog: String, pub changeset: i64, pub label: String, pub touched: Vec<String>, pub message: String, pub notes: Vec<String> }
+pub struct WriteReport { pub catalog: String, pub changeset: i64, pub label: String, pub touched: Vec<String>, pub message: String, pub notes: Vec<String> } // touched: paths with an entry after the write
 #[derive(Serialize, JsonSchema)] (paths in WriteReport start with "/")
 pub async fn apply<F>(ctx: &ToolContext, catalog: Option<&str>, by: Option<&str>, op: F) -> Result<WriteReport, OkfError>
 where F: FnOnce(&MemWorkspace, &OpContext<'_>) -> Result<OpOutcome, OkfError> + Send + 'static;
@@ -8091,6 +8091,7 @@ The four content tools (`create_concept`, `edit_document`, `replace_body`, `set_
 > - `WriteReport::label`'s doc no longer names the MCP session (Decision 1: a session id is never a label).
 > - The params and tool descriptions state the path forms (the note above) and Task 4's review refusals: `edit_document` and `replace_body` refuse adding or changing frontmatter, `index_section` needs `index_summary`, `type` must be a non-blank string.
 > - After review of PR #112 (2026-11-03): a gone path with no base revision that is not published now is not stored; the changeset's own entry for it (a file it created, then removed) is dropped with `remove_entries`. So every deletion entry names something published, at its base or since, and publish (Task 10) either deletes it or reports a conflict; it never sees a delete of a path that was never published. `new_entry` takes the published revision and the path's ops and returns `Err(path)` for "nothing to store". `Busy`'s reason no longer ends in "; retry" (its `Display` adds it). The test `a_deleted_path_is_stored_as_a_deletion_entry` became `a_gone_path_is_a_deletion_only_if_something_is_published`, plus the pure `a_gone_published_path_keeps_its_first_base_revision`.
+> - After the second review of PR #112 (2026-11-03): `WriteReport.touched` lists only the paths that have an entry after the write (written, or a deletion); a gone, never-published path is left out. `SetFrontmatterParams::value` is required (no `#[serde(default)]`): a missing `value` is a parameter error, and only an explicit null deletes (test `set_frontmatter_requires_value_and_only_an_explicit_null_deletes`). The design's Write step 2 notes that writers queued on one changeset's row lock each hold a pooled connection (8 in the pool), which is accepted for now.
 > - Tests beyond Step 3 and Step 5: `a_deleted_path_is_stored_as_a_deletion_entry` (renamed after review, above), `concurrent_writes_to_one_changeset_lose_no_edit`; `edit_document_refuses_log_md` also refuses `/a` (no `.md`); `replay_operations_accumulate_until_a_free_edit` checks the appended array's contents. The tool tests' catalog has a root `index.md`.
 
 **Files:**

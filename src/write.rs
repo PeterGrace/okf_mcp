@@ -39,7 +39,9 @@ pub struct WriteReport {
     pub changeset: i64,
     /// The changeset's label (`X-OKF-Changeset`, `?changeset=`, or `default`).
     pub label: String,
-    /// The `/`-prefixed paths the edit wrote or deleted, in order.
+    /// The `/`-prefixed paths that now have an entry in the changeset (written,
+    /// or a deletion), in the op's order. A touched path that left nothing to
+    /// store (gone, and never published) is not listed.
     pub touched: Vec<String>,
     /// What `okf.py` would have printed, e.g. `infra/x.md: generated { by: a, at: ... }`.
     pub message: String,
@@ -148,17 +150,18 @@ where
     let work = Arc::clone(&overlay);
     let (outcome, files) = blocking(move || run(&work, &by, now, op)).await?;
 
-    let paths: Vec<String> = files
-        .iter()
-        .map(|touched| format!("/{}", touched.path))
-        .collect();
+    // Only the paths that end up with an entry (written or a deletion).
+    let mut paths = Vec::with_capacity(files.len());
     for Touched { path, file } in files {
         // `remove` takes the entry out of the map (no copy).
         let previous = existing.remove(&path);
         let published = overlay.base().revision(&path);
         let replay = outcome.replay.get(&path);
         match new_entry(previous.as_ref(), published, replay, path, file) {
-            Ok(entry) => changesets::upsert_entry(&mut tx, changeset.id, &entry, now).await?,
+            Ok(entry) => {
+                changesets::upsert_entry(&mut tx, changeset.id, &entry, now).await?;
+                paths.push(format!("/{}", entry.path));
+            }
             // Nothing published and nothing left: drop the changeset's own
             // entry for it (a file it created, then removed), if any.
             Err(path) if previous.is_some() => {
@@ -584,7 +587,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(report.touched, ["/a.md", "/new.md", "/gone.md"]);
+        // Only the path with an entry is reported.
+        assert_eq!(report.touched, ["/a.md"]);
         let stored = entries(&test, report.changeset).await;
         // Only a.md, published, is left to delete; the others are dropped.
         let paths: Vec<&str> = stored.iter().map(|entry| entry.path.as_str()).collect();

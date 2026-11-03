@@ -395,7 +395,11 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
    run one at a time. Every changeset transaction takes these locks in that order;
    `catalogs::delete` takes the row `FOR UPDATE` first, so neither side can deadlock the
    other. The overlay is read under that lock, in the same transaction: its cached
-   `version` is a cache label, never a concurrency token.
+   `version` is a cache label, never a concurrency token. Each write holds one pooled
+   connection for its whole transaction, so writers queued on one changeset's row lock
+   each hold one while they wait; with the pool's 8 connections, enough of them can
+   leave reads waiting for a connection. This is accepted for now: one agent's
+   writes to one changeset are rarely that concurrent.
 3. On a blocking thread, the `okf::ops` function runs on a copy of the connection's
    overlay workspace (the published files plus the changeset's entries). Every path it
    touched then passes the write rules: inside the catalog, not machinery, secret scan,
