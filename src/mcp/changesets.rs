@@ -2276,7 +2276,7 @@ mod restructure_publish_tests {
     const X: &str = "---\ntype: Note\ntitle: X\ndescription: X.\n---\n# X\n";
     const Y: &str = "---\ntype: Note\ntitle: Y\ndescription: Y.\n---\n# Y\n";
     const BIG: &str = "---\ntype: Note\ntitle: Big\ndescription: Big.\n---\n# Big\n\n\
-                       ## Part\n\nPart text.\n\n## Rest\n\nRest text.\n";
+                       ## Part\n\nPart text.\n\n### Deep\n\nDeep text.\n\n## Rest\n\nRest text.\n";
     const HUB: &str = "---\ntype: Note\ntitle: Hub\ndescription: Links.\n---\n\
                        See [X](/infra/x.md) and [the part](/infra/big.md#part).\n";
 
@@ -2325,6 +2325,26 @@ mod restructure_publish_tests {
         let text = text.to_string();
         apply(ctx, None, None, move |ws, op| {
             ops::log(ws, op, LogKind::Update, &text)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A `split_concept` write: `## Part` of `infra/big.md` (with its
+    /// `### Deep`) to `infra/part.md`.
+    async fn split_part(ctx: &ToolContext) -> WriteReport {
+        apply(ctx, None, None, |ws, op| {
+            let split = Split {
+                concept: "infra/big.md",
+                section: "Part",
+                to: "infra/part.md",
+                kind: DEFAULT_SPLIT_TYPE,
+                title: None,
+                description: Some("The part."),
+                stub: None,
+                sources: &[],
+            };
+            ops::split_concept(ws, op, &split)
         })
         .await
         .unwrap()
@@ -2605,21 +2625,7 @@ mod restructure_publish_tests {
     async fn a_published_split_writes_the_parent_the_new_concept_and_its_listing() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
-        apply(&ctx, None, None, |ws, op| {
-            let split = Split {
-                concept: "infra/big.md",
-                section: "Part",
-                to: "infra/part.md",
-                kind: DEFAULT_SPLIT_TYPE,
-                title: None,
-                description: Some("The part."),
-                stub: None,
-                sources: &[],
-            };
-            ops::split_concept(ws, op, &split)
-        })
-        .await
-        .unwrap();
+        split_part(&ctx).await;
 
         let published = publish_as(&ctx, "split big").await.unwrap();
 
@@ -2637,5 +2643,43 @@ mod restructure_publish_tests {
             .contains("## Part\n\n[Part](/infra/part.md): The part.\n"));
         assert!(published_text(&test, "hub.md").contains("[the part](/infra/part.md)"));
         assert!(published_text(&test, "infra/index.md").contains("* [Part](part.md) - The part."));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn links_into_a_split_section_published_meanwhile_resolve_or_only_warn() {
+        let test = pg().await;
+        let splitter = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        split_part(&splitter).await;
+        created(&other, "/b.md", "See [deep](/infra/big.md#deep).\n", false).await;
+        created(
+            &other,
+            "/c.md",
+            "See [the part](/infra/big.md#part).\n",
+            false,
+        )
+        .await;
+        publish_as(&other, "add b and c").await.unwrap();
+
+        let published = publish_as(&splitter, "split big").await.unwrap();
+
+        // Plan Decision 18: split moves no path. `### Deep` moved to part.md,
+        // so b.md's anchor is broken, in a file this publish does not change:
+        // a warning. The parent keeps `## Part` (with its stub), so c.md's
+        // link still resolves and has no finding at all.
+        assert!(published.report.published);
+        let warnings = &published.report.warnings;
+        let broken: Vec<&str> = warnings
+            .iter()
+            .filter(|finding| finding.rule == "broken-anchor")
+            .map(|finding| finding.file.as_str())
+            .collect();
+        assert_eq!(broken, ["b.md"], "{warnings:?}");
+        assert!(
+            !warnings.iter().any(|finding| finding.file == "c.md"),
+            "{warnings:?}"
+        );
+        assert!(published_text(&test, "infra/big.md").contains("## Part\n"));
+        assert!(published_text(&test, "infra/part.md").contains("Deep text."));
     }
 }
