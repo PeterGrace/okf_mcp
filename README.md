@@ -301,7 +301,8 @@ secret scan and frontmatter again on every changed file:
   `.claude/`, `install/` and any `.git*` path. Only an import writes them.
 
 Every timestamp comes from the server's clock; no tool takes one. `by`
-(on `create_concept`, `stamp` and `review`) defaults to the key's actor.
+(on `create_concept`, `split_concept`, `stamp` and `review`) defaults to the
+key's actor.
 
 ## Layout
 
