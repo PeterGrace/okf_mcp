@@ -3,7 +3,7 @@
 //! memory, and the poll loop that notices changes made outside the server
 //! (design "Noticing changes made outside the server").
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -21,6 +21,11 @@ use crate::store::catalogs;
 /// Every loaded catalog, by name (a `BTreeMap`, so iteration is in name
 /// order, like `catalog list`).
 pub type Catalogs = BTreeMap<String, Arc<CatalogState>>;
+
+/// Catalogs whose stored data failed to build into a snapshot: each one's id,
+/// and the generation that failed. Building the same generation again would
+/// fail the same way, so it is retried only once the generation moves.
+type Broken = HashMap<i64, i64>;
 
 /// The state every route and tool shares. Built once by [`App::load`] and
 /// shared as an `Arc<App>`.
@@ -41,16 +46,18 @@ pub struct App {
     // loop and a test's or a later milestone's direct call) could swap an
     // older key list in after a newer one while storing the newer counter,
     // and a revoked key would keep working until the next admin change.
-    // tokio's `Mutex`: it is held across `.await`s.
-    polling: tokio::sync::Mutex<()>,
+    // tokio's `Mutex`: it is held across `.await`s. It also guards the
+    // pass's own memory, the broken catalogs: a Rust mutex owns the data it
+    // protects, which can only be reached through the lock.
+    polling: tokio::sync::Mutex<Broken>,
 }
 
 impl App {
     /// Loads the key cache and every catalog's snapshot.
     ///
     /// A catalog whose snapshot fails to build is logged and left out, as
-    /// [`App::poll`] does, and the next poll tries it again: one bad catalog
-    /// never takes the others offline.
+    /// [`App::poll`] does, and a later poll tries it again (see there for
+    /// when): one bad catalog never takes the others offline.
     ///
     /// # Arguments
     /// * `pool` - the database (migrated).
@@ -72,6 +79,7 @@ impl App {
         let admin_generation = catalogs::admin_generation(&pool).await?;
         let keys = Arc::new(Keys::load(&pool).await?);
         let mut loaded = Catalogs::new();
+        let mut broken = Broken::new();
         for row in catalogs::list(&pool).await? {
             match CatalogState::load(&pool, &row.name).await {
                 Ok(state) => {
@@ -79,14 +87,8 @@ impl App {
                 }
                 // Deleted between the list and the load.
                 Err(OkfError::CatalogNotSelected { .. }) => {}
-                // Not in the map, so the first poll tries to load it again.
-                Err(error) => {
-                    tracing::error!(
-                        catalog = %row.name,
-                        %error,
-                        "load failed; retrying at the next poll"
-                    );
-                }
+                // Not in the map, so a later poll tries to load it again.
+                Err(error) => note_failure(&mut broken, &row, "load", &error),
             }
         }
         // `if let Some(name) = ...`: Python's `if (name := ...) is not None`.
@@ -102,7 +104,7 @@ impl App {
             keys,
             catalogs: RwLock::new(Arc::new(loaded)),
             admin_generation: AtomicI64::new(admin_generation),
-            polling: tokio::sync::Mutex::new(()),
+            polling: tokio::sync::Mutex::new(broken),
         }))
     }
 
@@ -147,8 +149,12 @@ impl App {
     /// moved, and brings the catalogs in line with the catalog list.
     ///
     /// A catalog that fails to load or refresh, or a key reload that fails,
-    /// is logged and retried at the next pass; the rest of the pass goes
-    /// ahead. Passes never overlap: a call made while another runs waits for
+    /// is logged and the rest of the pass goes ahead. A key reload, or a
+    /// catalog that failed on a database error, is retried at the next pass.
+    /// A catalog whose stored data would not build is retried only once its
+    /// `generation` moves (an import or publish), since the same data would
+    /// fail the same way: until then a refresh keeps the old snapshot, and a
+    /// catalog never loaded stays out. Passes never overlap: a call made while another runs waits for
     /// it, then makes its own pass.
     ///
     /// # Returns
@@ -157,40 +163,42 @@ impl App {
     /// # Errors
     /// [`OkfError::Database`] reading the counter or the catalog list.
     pub async fn poll(&self) -> Result<(), OkfError> {
-        // The guard (`_` prefix: kept only for its lifetime) releases the
-        // mutex when the function returns.
-        let _polling = self.polling.lock().await;
+        // The guard releases the mutex when the function returns; through
+        // it (`*broken`, like a reference) the pass reads and replaces the
+        // broken catalogs.
+        let mut broken = self.polling.lock().await;
         self.reload_keys_if_changed().await?;
         let current = self.catalogs();
         let mut next = Catalogs::new();
+        // Rebuilt each pass, so a deleted catalog's entry goes with it.
+        let mut still_broken = Broken::new();
         for row in catalogs::list(&self.pool).await? {
+            // This very generation already failed to build: don't try again.
+            let failed_before = broken.get(&row.id) == Some(&row.generation);
+            if failed_before {
+                still_broken.insert(row.id, row.generation);
+            }
             // The same id: the same catalog. A different id under the same
             // name: deleted and created again, so load it from scratch.
             let existing = current.get(&row.name).filter(|state| state.id() == row.id);
             let state = match existing {
                 Some(state) => {
-                    if row.generation > state.current().generation() {
+                    if row.generation > state.current().generation() && !failed_before {
                         if let Err(error) = state.refresh(&self.pool).await {
-                            tracing::error!(
-                                catalog = %row.name,
-                                %error,
-                                "refresh failed; keeping the old snapshot"
-                            );
+                            // The old snapshot stays in place.
+                            note_failure(&mut still_broken, &row, "refresh", &error);
                         }
                     }
                     Arc::clone(state)
                 }
+                None if failed_before => continue,
                 None => match CatalogState::load(&self.pool, &row.name).await {
                     Ok(state) => {
                         tracing::info!(catalog = %row.name, "catalog loaded");
                         Arc::new(state)
                     }
                     Err(error) => {
-                        tracing::error!(
-                            catalog = %row.name,
-                            %error,
-                            "load failed; retrying at the next poll"
-                        );
+                        note_failure(&mut still_broken, &row, "load", &error);
                         continue;
                     }
                 },
@@ -198,6 +206,7 @@ impl App {
             next.insert(row.name, state);
         }
         *self.catalogs.write().expect("catalog map lock poisoned") = Arc::new(next);
+        *broken = still_broken;
         Ok(())
     }
 
@@ -251,6 +260,31 @@ impl App {
             }
         }
     }
+}
+
+/// Logs a catalog that failed to load or refresh and, unless the failure was
+/// the database's (worth retrying at once), remembers its generation as
+/// broken.
+///
+/// # Arguments
+/// * `broken` - the broken catalogs, to add to.
+/// * `row` - the catalog's row from this pass's list.
+/// * `action` - `"load"` or `"refresh"`, for the log line.
+/// * `error` - what went wrong.
+fn note_failure(broken: &mut Broken, row: &catalogs::Catalog, action: &str, error: &OkfError) {
+    // `matches!` is a one-pattern `match` that yields a `bool`.
+    let retry = if matches!(error, OkfError::Database { .. }) {
+        "at the next poll"
+    } else {
+        broken.insert(row.id, row.generation);
+        "when the catalog changes"
+    };
+    tracing::error!(
+        catalog = %row.name,
+        generation = row.generation,
+        %error,
+        "{action} failed; retrying {retry}"
+    );
 }
 
 #[cfg(test)]
@@ -317,6 +351,25 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    /// Removes the row [`break_catalog`] stored, without moving the
+    /// catalog's generation (as a hand repair in SQL would).
+    async fn repair_catalog(pool: &PgPool, catalog_id: i64) {
+        sqlx::query("DELETE FROM documents WHERE catalog_id = $1 AND path = '../escape.md'")
+            .bind(catalog_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Moves a catalog's generation, as an import or publish does.
+    async fn bump_generation(pool: &PgPool, catalog_id: i64) {
+        sqlx::query("UPDATE catalogs SET generation = generation + 1 WHERE id = $1")
+            .bind(catalog_id)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -408,7 +461,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_catalog_that_fails_to_load_is_skipped_and_retried() {
+    async fn a_catalog_that_fails_to_load_is_skipped_until_it_changes() {
         let db = test_db().await;
         catalogs::create(&db.pool, "pg", "", Utc::now())
             .await
@@ -423,18 +476,20 @@ mod tests {
         assert_eq!(names(&app), ["pg"]);
         app.poll().await.unwrap();
         assert_eq!(names(&app), ["pg"]);
-        sqlx::query("DELETE FROM documents WHERE catalog_id = $1")
-            .bind(bad.id)
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        // Repaired behind the server's back: the generation it failed at is
+        // not built again, so the repair goes unnoticed...
+        repair_catalog(&db.pool, bad.id).await;
+        app.poll().await.unwrap();
+        assert_eq!(names(&app), ["pg"]);
+        // ...until the catalog changes, as an import would change it.
+        bump_generation(&db.pool, bad.id).await;
         app.poll().await.unwrap();
 
         assert_eq!(names(&app), ["bad", "pg"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_failed_refresh_keeps_the_old_snapshot() {
+    async fn a_failed_refresh_keeps_the_old_snapshot_until_the_catalog_changes() {
         let db = test_db().await;
         let pg = catalogs::create(&db.pool, "pg", "", Utc::now())
             .await
@@ -442,16 +497,20 @@ mod tests {
         import_files(&db.pool, "pg", &[("a.md", "# A\n")], false).await;
         let app = app(&db.pool).await;
         break_catalog(&db.pool, pg.id).await;
-        sqlx::query("UPDATE catalogs SET generation = generation + 1 WHERE id = $1")
-            .bind(pg.id)
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        bump_generation(&db.pool, pg.id).await;
 
+        app.poll().await.unwrap();
+        let loaded = app.catalog("pg").unwrap().current();
+        assert_eq!((loaded.generation(), loaded.files()), (1, 1));
+        // Not rebuilt at the generation that failed, even once it would build.
+        repair_catalog(&db.pool, pg.id).await;
+        app.poll().await.unwrap();
+        assert_eq!(app.catalog("pg").unwrap().current().generation(), 1);
+        bump_generation(&db.pool, pg.id).await;
         app.poll().await.unwrap();
 
         let loaded = app.catalog("pg").unwrap().current();
-        assert_eq!((loaded.generation(), loaded.files()), (1, 1));
+        assert_eq!((loaded.generation(), loaded.files()), (3, 1));
     }
 
     #[tokio::test(flavor = "multi_thread")]
