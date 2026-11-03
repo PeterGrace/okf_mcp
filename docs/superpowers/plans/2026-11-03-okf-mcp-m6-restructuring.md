@@ -4426,10 +4426,12 @@ impl OkfServer {
 
 In `src/mcp/mod.rs`, `OkfServer::tools()` gains `+ Self::restructure_router()` after `+ Self::changes_router()`.
 
+> **Corrected (issue #125, review of PR #134), 2026-11-03.** A blank or whitespace-only `type` used to pass `kind.as_deref().unwrap_or(DEFAULT_SPLIT_TYPE)` and be written into the new concept's frontmatter. `create_concept` and `set_frontmatter` refuse a blank `type`, so `split_concept` (the op, `src/okf/ops/split.rs`) now refuses it first, before it reads anything, with `set_frontmatter`'s `Refused` "type must be a non-blank string; every concept needs one". That refusal is now one crate-private helper, `okf::ops::blank_type()` (`src/okf/ops/mod.rs`), which both ops call. The check is in the op rather than the tool so that Task 7's direct op calls and the tool agree. It diverges from `okf.py`: `split --type ""` writes `type: ""` (`okf.py:1656`, `scalar` quotes the empty string). `split.rs`'s module doc lists that as its first divergence. The parity script never passes a blank type, so the goldens are unchanged. Two more tests: `okf::ops::split::tests::a_blank_type_is_refused_before_anything_is_read_or_written` and `mcp::restructure::tests::a_blank_type_is_refused_and_nothing_is_stored` (so Task 6 has 6 tool tests). The `type` parameter's schema text says a blank one is refused. No tool name, params struct or router changed.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --lib -- mcp:: --test-threads=6`
-Expected: the 5 new tests pass, and so does every other `mcp` test. No existing test counts `OkfServer::tools()` (checked: `history.rs:202`, `documents.rs:586`, `catalogs.rs:156` and `changesets.rs:1147` look tools up by name), so none needs a change.
+Expected: the 5 new tests (6 with the Corrected note above) pass, and so does every other `mcp` test. No existing test counts `OkfServer::tools()` (checked: `history.rs:202`, `documents.rs:586`, `catalogs.rs:156` and `changesets.rs:1147` look tools up by name), so none needs a change.
 
 - [ ] **Step 5: Update the design**
 
