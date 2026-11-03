@@ -34,3 +34,16 @@ The entry is generic because the repository is public.
   - the comparison query, now with an all-content checksum;
   - the rule for when the live database moved meanwhile;
   - a line saying the section was tested in this drill.
+
+## Review (Brooke, PR #156)
+
+The drill's own checksum ordered documents by `path` alone and cast text with `::bytea`.
+That is fine for its one catalog, but not deterministic for several catalogs that share
+a path, and it breaks on a backslash in a path. The documented query now:
+- orders by `catalog_id, path`;
+- includes `catalog_id` in each row;
+- uses `convert_to(..., 'UTF8')`;
+- runs through a heredoc, so it pastes as written.
+
+The section also adds a step to record the baseline before the backup, and says that
+the checksum only works while publishing is paused.

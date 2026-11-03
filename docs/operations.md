@@ -643,25 +643,34 @@ spec:
   own `plugins` entry with a new `serverName` once it is up.
 - **The image:** if your cluster needs `imageName` on every `Cluster` (an
   image mirror, say), give the restored one the same `imageName` as the source.
+- **Before the backup,** pause publishing and record the live database's
+  numbers with the query below. These are the baseline.
 - **Compare it** with the live database when it is ready, querying both at the
-  same moment and with publishing paused, so the two must be equal. Counts
-  catch missing rows, and one checksum over every document catches changed
-  content:
+  same moment with publishing still paused, so the two must be equal. Counts
+  catch missing rows, and one checksum over every document (catalog, path and
+  content) catches changed content:
 
-  ```sql
+  ```sh
+  kubectl -n okf-mcp exec -i <instance> -c postgres -- psql -d okf_mcp <<'SQL'
   SELECT (SELECT count(*) FROM catalogs) AS catalogs,
          (SELECT count(*) FROM documents) AS documents,
          (SELECT count(*) FROM revisions) AS revisions,
          (SELECT max(created_at) FROM revisions) AS last_revision,
-         (SELECT encode(sha256(string_agg(path || ':' || encode(sha256(content), 'hex'),
-                                          ',' ORDER BY path)::bytea), 'hex')
+         (SELECT encode(sha256(convert_to(string_agg(
+                    catalog_id || '/' || path || ':' || encode(sha256(content), 'hex'),
+                    ',' ORDER BY catalog_id, path), 'UTF8')), 'hex')
             FROM documents) AS content_checksum;
+  SQL
   ```
 
-  Run it with `kubectl -n okf-mcp exec <instance> -c postgres -- psql -d okf_mcp -c '...'`
-  on each cluster's primary. If the live database moved meanwhile, require each
-  count to be at least the value taken before the backup and at most the live
-  one.
+  Run it on each cluster's primary. `catalog_id` is kept by a physical
+  restore, so the checksum compares like with like, even for catalogs that share
+  a path. `convert_to` keeps backslashes in paths from being read as `bytea`
+  escapes.
+- **If the live database moved anyway,** the checksum can no longer match.
+  Require each count to be at least the baseline and at most the live value,
+  and compare one document you know didn't change by its own
+  `encode(sha256(content), 'hex')`.
 - **Then** either point `DATABASE_URL` and `PGSSLROOTCERT` at its `-app` and
   `-ca` secrets, or delete it (`kubectl -n okf-mcp delete cluster
   okf-mcp-db-restore`; CloudNativePG removes its volumes).
