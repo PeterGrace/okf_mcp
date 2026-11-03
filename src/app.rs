@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use chrono::TimeDelta;
 use sqlx::PgPool;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -18,7 +19,7 @@ use crate::config::Config;
 use crate::error::OkfError;
 use crate::http::sessions::SessionKeys;
 use crate::overlay::Overlays;
-use crate::store::catalogs;
+use crate::store::{catalogs, changesets};
 
 /// Every loaded catalog, by name (a `BTreeMap`, so iteration is in name
 /// order, like `catalog list`).
@@ -28,6 +29,10 @@ pub type Catalogs = BTreeMap<String, Arc<CatalogState>>;
 /// and the generation that failed. Building the same generation again would
 /// fail the same way, so it is retried only once the generation moves.
 type Broken = HashMap<i64, i64>;
+
+/// How long an empty open changeset may go unchanged before the poll loop
+/// discards it (design "Session lifecycle").
+const EMPTY_CHANGESET_HOURS: i64 = 24;
 
 /// The state every route and tool shares. Built once by [`App::load`] and
 /// shared as an `Arc<App>`.
@@ -171,7 +176,11 @@ impl App {
     }
 
     /// One pass of the poll loop: reloads the key cache if `admin_generation`
-    /// moved, and brings the catalogs in line with the catalog list.
+    /// moved, and brings the catalogs in line with the catalog list. Between
+    /// the two, it discards empty changesets unchanged for 24 hours (design
+    /// "Session lifecycle"), so that runs on every pass, even one whose
+    /// catalog list then fails; a prune failure is logged and retried at the
+    /// next pass.
     ///
     /// A catalog that fails to load or refresh, or a key reload (or the
     /// `admin_generation` read before it) that fails, is logged and the rest
@@ -197,6 +206,8 @@ impl App {
         // broken catalogs.
         let mut broken = self.polling.lock().await;
         self.reload_keys_if_changed().await;
+        // Before the catalog list, whose `?` would skip it on a failure.
+        self.prune_empty_changesets().await;
         let current = self.catalogs();
         let mut next = Catalogs::new();
         // Rebuilt each pass, so a deleted catalog's entry goes with it.
@@ -262,6 +273,23 @@ impl App {
                 .store(admin_generation, Ordering::Relaxed),
             Err(error) => {
                 tracing::error!(%error, "key reload failed; retrying at the next poll");
+            }
+        }
+    }
+
+    /// Discards empty changesets unchanged for [`EMPTY_CHANGESET_HOURS`].
+    /// Called only under `polling`.
+    ///
+    /// A failure is logged, not returned: the next pass tries again, and
+    /// the rest of the pass is not held up by it.
+    async fn prune_empty_changesets(&self) {
+        let now = self.clock.now();
+        let older_than = now - TimeDelta::hours(EMPTY_CHANGESET_HOURS);
+        match changesets::prune_empty(&self.pool, older_than, now).await {
+            Ok(0) => {}
+            Ok(pruned) => tracing::info!(pruned, "discarded empty changesets a day old"),
+            Err(error) => {
+                tracing::error!(%error, "pruning empty changesets failed; retrying at the next poll");
             }
         }
     }
@@ -337,9 +365,10 @@ mod tests {
     use crate::clock::SystemClock;
     use crate::db::test_db;
     use crate::okf::workspace::StoredFile;
+    use crate::store::changesets::{ChangesetKey, ChangesetState, EntryRow};
     use crate::store::import::{import, ImportOptions};
     use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
-    use chrono::Utc;
+    use chrono::{DateTime, TimeDelta, Utc};
     use std::time::{Duration, Instant};
 
     async fn import_files(pool: &PgPool, catalog: &str, files: &[(&str, &str)], replace: bool) {
@@ -687,5 +716,64 @@ mod tests {
             .await
             .expect("poll_until returns after cancel")
             .unwrap();
+    }
+
+    /// Opens `label`'s changeset for key `writer` at `at`, with an entry for
+    /// `path` if given.
+    async fn changeset_at(
+        pool: &PgPool,
+        catalog_id: i64,
+        label: &str,
+        at: DateTime<Utc>,
+        path: Option<&str>,
+    ) -> i64 {
+        let key = ChangesetKey {
+            catalog_id,
+            key_id: "writer",
+            label,
+        };
+        let mut tx = pool.begin().await.unwrap();
+        changesets::lock_catalog(&mut tx, catalog_id).await.unwrap();
+        let changeset = changesets::get_or_create(&mut tx, &key, "writer", at)
+            .await
+            .unwrap();
+        if let Some(path) = path {
+            let entry = EntryRow {
+                path: path.to_string(),
+                base_revision: None,
+                content: Some(b"x\n".to_vec()),
+                executable: false,
+                replay: None,
+            };
+            changesets::upsert_entry(&mut tx, changeset.id, &entry, at)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        changeset.id
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn poll_discards_empty_changesets_a_day_old_and_keeps_the_rest() {
+        let db = test_db().await;
+        let pg = catalogs::create(&db.pool, "pg", "", Utc::now())
+            .await
+            .unwrap();
+        new_key(&db.pool, "writer").await;
+        let app = app(&db.pool).await;
+        let day_old = Utc::now() - TimeDelta::hours(25);
+        let empty_old = changeset_at(&db.pool, pg.id, "a", day_old, None).await;
+        let empty_new = changeset_at(&db.pool, pg.id, "b", Utc::now(), None).await;
+        let full_old = changeset_at(&db.pool, pg.id, "c", day_old, Some("a.md")).await;
+
+        app.poll().await.unwrap();
+
+        let state = |id| {
+            let pool = db.pool.clone();
+            async move { changesets::by_id(&pool, id).await.unwrap().unwrap().state }
+        };
+        assert_eq!(state(empty_old).await, ChangesetState::Discarded);
+        assert_eq!(state(empty_new).await, ChangesetState::Open);
+        assert_eq!(state(full_old).await, ChangesetState::Open);
     }
 }
