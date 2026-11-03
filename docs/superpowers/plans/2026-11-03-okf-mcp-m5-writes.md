@@ -4579,6 +4579,13 @@ git commit -m "feat: okf::ops log, index, ensure_index and idempotent replay (M5
 > - **`doc::is_top_key(key)` is new and `pub(crate)` in `src/okf/doc.rs`.** It reuses `Doc`'s own key pattern, so `create_concept` and `set_frontmatter` refuse a key that `Doc` could not find again.
 > - **Machinery check:** `edit_document` refuses machinery with Task 5's `crate::okf::rules::is_machinery`, so this task depends on Task 5 (edge T5 -> T4; review of PR #88 replaced a temporary local copy).
 
+> **Corrected (issue #94), 2026-11-03.** Three changes, made inline below (Steps 3 and 5 hold the shipped code after `cargo fmt`):
+> - `edit_replaces_one_match_and_keeps_every_other_byte` replaces `" here"`, not `"here"`, which also occurs inside `there` (2 matches, so the plan's test failed with `EditMismatch`).
+> - `editable_path` starts from Task 5's `rules::check_path` (normalize, inside the catalog, not machinery, which calls `is_machinery`) instead of repeating those checks, so a machinery refusal carries `check_path`'s reason; `normpath` and `escapes_root` are no longer imported here.
+> - `set_frontmatter` compares the key's current lines as a borrowed slice instead of copying them.
+>
+> No interface changed: `NewConcept` and the four op signatures are as in "Interfaces shared across tasks".
+
 The four content tools of the design's "Write tools" table. `okf.py` has none of them, so there is no parity golden. They reuse M1's path rules (`new_concept_path`), renderers (`okf::yaml`) and textual frontmatter edits (`Doc`), plus Task 3's `ensure_index` and listing.
 
 - **`create_concept`:**
@@ -4731,7 +4738,11 @@ mod tests {
         }
     }
 
-    fn concept<'a>(path: &'a str, frontmatter: &'a Map<String, Json>, body: &'a str) -> NewConcept<'a> {
+    fn concept<'a>(
+        path: &'a str,
+        frontmatter: &'a Map<String, Json>,
+        body: &'a str,
+    ) -> NewConcept<'a> {
         NewConcept {
             path,
             frontmatter,
@@ -4763,9 +4774,12 @@ mod tests {
             "description": "Pool servers.",
         }));
 
-        let outcome =
-            create_concept(&ws, &ctx(), &concept("/infra/ntp-pool", &frontmatter, "# NTP pool\n"))
-                .unwrap();
+        let outcome = create_concept(
+            &ws,
+            &ctx(),
+            &concept("/infra/ntp-pool", &frontmatter, "# NTP pool\n"),
+        )
+        .unwrap();
 
         assert_eq!(
             read(&ws, "infra/ntp-pool.md"),
@@ -4794,7 +4808,12 @@ mod tests {
 
         assert_eq!(
             outcome.touched,
-            ["ops/new/thing.md", "ops/new/index.md", "ops/index.md", "index.md"]
+            [
+                "ops/new/thing.md",
+                "ops/new/index.md",
+                "ops/index.md",
+                "index.md"
+            ]
         );
         assert_eq!(
             read(&ws, "ops/new/index.md"),
@@ -4869,7 +4888,8 @@ mod tests {
         };
         let no_title = create_concept(&ws, &ctx(), &listed).unwrap_err();
         let taken = create_concept(&ws, &ctx(), &concept("infra/x", &untitled, "")).unwrap_err();
-        let machinery = create_concept(&ws, &ctx(), &concept("tools/x", &untitled, "")).unwrap_err();
+        let machinery =
+            create_concept(&ws, &ctx(), &concept("tools/x", &untitled, "")).unwrap_err();
 
         assert_eq!(
             errors.map(refusal),
@@ -4901,7 +4921,7 @@ mod tests {
     fn edit_replaces_one_match_and_keeps_every_other_byte() {
         let ws = MemWorkspace::from_files([("a.md", EDIT_DOC)]);
 
-        let outcome = edit_document(&ws, "/a.md", "here", "HERE", false).unwrap();
+        let outcome = edit_document(&ws, "/a.md", " here", " HERE", false).unwrap();
 
         assert_eq!(
             read(&ws, "a.md"),
@@ -4960,15 +4980,27 @@ mod tests {
         ]);
 
         let index = edit_document(&ws, "index.md", "old", "new", false).unwrap();
-        let refused: Vec<OkfError> = ["log.md", "AGENTS.md", "tools/notes.md", "install/setup.md", "notes.txt", "../x.md"]
-            .iter()
-            .map(|path| edit_document(&ws, path, "old", "new", false).unwrap_err())
-            .collect();
+        let refused: Vec<OkfError> = [
+            "log.md",
+            "AGENTS.md",
+            "tools/notes.md",
+            "install/setup.md",
+            "notes.txt",
+            "../x.md",
+        ]
+        .iter()
+        .map(|path| edit_document(&ws, path, "old", "new", false).unwrap_err())
+        .collect();
         let missing = edit_document(&ws, "nope.md", "old", "new", false).unwrap_err();
 
         assert_eq!(index.touched, ["index.md"]);
         assert_eq!(read(&ws, "index.md"), "# Root\n\n* [A](a.md) - new\n");
-        assert!(refused.iter().all(|e| matches!(e, OkfError::InvalidPath { .. })), "{refused:?}");
+        assert!(
+            refused
+                .iter()
+                .all(|e| matches!(e, OkfError::InvalidPath { .. })),
+            "{refused:?}"
+        );
         assert!(matches!(
             &refused[0],
             OkfError::InvalidPath { reason, .. } if reason == "is written by the log tool only"
@@ -4979,7 +5011,10 @@ mod tests {
     #[test]
     fn replace_body_keeps_the_frontmatter_byte_for_byte() {
         let ws = MemWorkspace::from_files([
-            ("c.md", "---\r\ntype: Note # kept\r\n\r\n---\r\nOld body\r\n"),
+            (
+                "c.md",
+                "---\r\ntype: Note # kept\r\n\r\n---\r\nOld body\r\n",
+            ),
             ("n.md", "old\n"),
             ("e.md", "---\ntype: Note\n---"),
             ("index.md", "# Root\n"),
@@ -4991,7 +5026,10 @@ mod tests {
         let same = replace_body(&ws, "c", "New body\n").unwrap();
         let index = replace_body(&ws, "index.md", "x").unwrap_err();
 
-        assert_eq!(read(&ws, "c.md"), "---\r\ntype: Note # kept\r\n\r\n---\r\nNew body\n");
+        assert_eq!(
+            read(&ws, "c.md"),
+            "---\r\ntype: Note # kept\r\n\r\n---\r\nNew body\n"
+        );
         assert_eq!(outcome.message, "c.md: body replaced");
         assert_eq!(read(&ws, "n.md"), "new\n");
         assert_eq!(read(&ws, "e.md"), "---\ntype: Note\n---\nText\n");
@@ -5026,7 +5064,13 @@ mod tests {
         let ws = MemWorkspace::from_files([("s.md", SET_DOC)]);
 
         set_frontmatter(&ws, "s", "tags", Some(&json!(["a", "b c"]))).unwrap();
-        set_frontmatter(&ws, "s", "x_links", Some(&json!([{ "id": "a", "url": "u" }]))).unwrap();
+        set_frontmatter(
+            &ws,
+            "s",
+            "x_links",
+            Some(&json!([{ "id": "a", "url": "u" }])),
+        )
+        .unwrap();
         set_frontmatter(&ws, "s", "x_custom", Some(&json!(2))).unwrap();
 
         assert_eq!(
@@ -5045,7 +5089,10 @@ mod tests {
         let deleted = set_frontmatter(&ws, "s", "x_custom", None).unwrap();
         let again = set_frontmatter(&ws, "s", "x_custom", Some(&Json::Null)).unwrap();
 
-        assert_eq!(read(&ws, "s.md"), "---\ntype: Note\n# a comment\ntitle: Old\n---\nBody\n");
+        assert_eq!(
+            read(&ws, "s.md"),
+            "---\ntype: Note\n# a comment\ntitle: Old\n---\nBody\n"
+        );
         assert_eq!(deleted.message, "s.md: deleted x_custom");
         assert!(again.touched.is_empty());
         assert_eq!(again.message, "s.md: x_custom is not set");
@@ -5069,7 +5116,10 @@ mod tests {
                 )
             );
         }
-        assert_eq!(refusal(no_type), "type cannot be deleted; every concept needs one");
+        assert_eq!(
+            refusal(no_type),
+            "type cannot be deleted; every concept needs one"
+        );
         assert_eq!(refusal(bad_key), "'bad key' is not a valid frontmatter key");
         assert_eq!(
             refusal(bare),
@@ -5104,11 +5154,9 @@ use crate::okf::ops::log_index::{list_concept, Listing};
 use crate::okf::ops::{
     ensure_index, load_concept, refused, save, stamp_value, LoadedConcept, OpContext, OpOutcome,
 };
-use crate::okf::paths::{
-    basename, dirname, escapes_root, is_concept, new_concept_path, normpath, resolve_concept,
-};
+use crate::okf::paths::{basename, dirname, is_concept, new_concept_path, resolve_concept};
 use crate::okf::pystr::{py_repr_str, py_strip};
-use crate::okf::rules::is_machinery;
+use crate::okf::rules::check_path;
 use crate::okf::workspace::Workspace;
 use crate::okf::yaml::{block_item, flow_value, scalar, ScalarStyle, Value};
 
@@ -5164,7 +5212,11 @@ pub(crate) fn key_lines(key: &str, value: &Value) -> Vec<String> {
     match value {
         Value::Null => vec![format!("{key}:")],
         Value::Str(text) => vec![format!("{key}: {}", scalar(text, ScalarStyle::Block))],
-        Value::Seq(items) if items.iter().any(|item| matches!(item, Value::Seq(_) | Value::Map(_))) => {
+        Value::Seq(items)
+            if items
+                .iter()
+                .any(|item| matches!(item, Value::Seq(_) | Value::Map(_))) =>
+        {
             let mut lines = vec![format!("{key}:")];
             lines.extend(items.iter().flat_map(|item| block_item(item, 2)));
             lines
@@ -5247,7 +5299,10 @@ pub fn create_concept(
             .unwrap_or(KEY_ORDER.len())
     });
     let mut text = String::from("---\n");
-    for line in entries.iter().flat_map(|(key, value)| key_lines(key, value)) {
+    for line in entries
+        .iter()
+        .flat_map(|(key, value)| key_lines(key, value))
+    {
         text.push_str(&line);
         text.push('\n');
     }
@@ -5258,7 +5313,9 @@ pub fn create_concept(
     let mut outcome = OpOutcome::default();
     outcome.touch(&path);
     // `Option` is iterable (zero or one item), so `extend` adds the note if any.
-    outcome.notes.extend(note.map(|note| format!("note: {note}")));
+    outcome
+        .notes
+        .extend(note.map(|note| format!("note: {note}")));
     let mut lines = vec![format!("created {path}")];
     if let (Some(summary), Some(title)) = (new.index_summary, listed_title) {
         ensure_index(workspace, dirname(&path), &mut outcome)?;
@@ -5283,14 +5340,12 @@ fn invalid(path: &str, reason: &str) -> OkfError {
 }
 
 /// The normalized path `edit_document` may edit: a concept or an `index.md`.
+///
+/// [`check_path`] refuses a path outside the catalog and machinery (with
+/// [`crate::okf::rules::is_machinery`]); `log.md` and every other file are
+/// refused here.
 fn editable_path(path: &str) -> Result<String, OkfError> {
-    let normalized = normpath(path.trim_start_matches('/'));
-    if normalized == "." || escapes_root(&normalized) {
-        return Err(invalid(path, "not a path inside the catalog"));
-    }
-    if is_machinery(&normalized) {
-        return Err(invalid(&normalized, "is repository machinery; only import writes it"));
-    }
+    let normalized = check_path(path)?;
     let name = basename(&normalized);
     if name == "log.md" {
         return Err(invalid(&normalized, "is written by the log tool only"));
@@ -5451,9 +5506,8 @@ pub fn set_frontmatter(
         ));
     }
     let LoadedConcept { path, mut doc, .. } = load_concept(workspace, concept)?;
-    let current = doc
-        .block(key)
-        .map(|block| doc.frontmatter()[block.start..block.end].to_vec());
+    // The key's current lines, borrowed from the document (no copy).
+    let current = doc.block(key).map(|block| block.start..block.end);
     let verb = match value {
         None if current.is_none() => {
             return Ok(OpOutcome::unchanged(format!("{path}: {key} is not set")));
@@ -5464,7 +5518,9 @@ pub fn set_frontmatter(
         }
         Some(json) => {
             let lines = key_lines(key, &yaml_value(json));
-            if current.as_ref() == Some(&lines) {
+            // `is_some_and` borrows `doc` only inside the closure, before the
+            // `set_block` below needs it mutably.
+            if current.is_some_and(|span| doc.frontmatter()[span] == lines[..]) {
                 return Ok(OpOutcome::unchanged(format!("{path}: {key} unchanged")));
             }
             doc.set_block(key, lines);

@@ -85,6 +85,7 @@ impl AppError {
             | OkfError::FrontmatterParse { .. }
             | OkfError::SecretDetected { .. }
             | OkfError::Shape { .. }
+            | OkfError::EditMismatch { .. }
             | OkfError::ImportRefused { .. } => StatusCode::BAD_REQUEST,
             OkfError::Io { .. }
             | OkfError::Database { .. }
@@ -324,6 +325,18 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"], "Busy");
         assert!(body["message"].as_str().unwrap().ends_with("retry"));
+    }
+
+    #[test]
+    fn an_edit_mismatch_is_a_bad_request() {
+        let mismatch = AppError(OkfError::EditMismatch {
+            path: "a.md".to_string(),
+            matches: 0,
+        });
+
+        let status = mismatch.status();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
