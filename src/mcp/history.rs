@@ -63,7 +63,9 @@ pub struct History {
 
 /// The stored paths a reference may mean, as `get_concept` spells them: as
 /// written, then with `.md`; the leading `/` is optional. Unlike
-/// `get_concept`, any file counts, not only concepts.
+/// `get_concept`, any file counts, not only concepts. So if a catalog has
+/// both `notes` and `notes.md`, `notes` means the extensionless file (as in
+/// `resolve_concept`); ask for `notes.md` to get the other.
 ///
 /// # Arguments
 /// * `reference` - the caller's path.

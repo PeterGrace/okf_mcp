@@ -6,13 +6,14 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use crate::app::App;
-use crate::archive::Files;
+// Re-exported so tool tests keep calling `testing::files`; it lives in
+// `archive`, beside `Files`, so store tests need not reach up into `mcp`.
+pub(crate) use crate::archive::files;
 use crate::auth::{Principal, Reach};
 use crate::clock::SystemClock;
 use crate::config::Config;
 use crate::db::pg_support::TestDb;
 use crate::mcp::context::ToolContext;
-use crate::okf::workspace::StoredFile;
 use crate::store::catalogs;
 use crate::store::import::{import, ImportOptions};
 use crate::store::keys::Access;
@@ -23,26 +24,6 @@ pub(crate) struct TestApp {
     /// The shared state, as a server would hold it.
     pub(crate) app: Arc<App>,
     _db: TestDb,
-}
-
-/// Literal files, as an import takes them.
-///
-/// # Arguments
-/// * `entries` - `(path, text)` pairs.
-///
-/// # Returns
-/// The files, none executable.
-pub(crate) fn files(entries: &[(&str, &str)]) -> Files {
-    entries
-        .iter()
-        .map(|(path, text)| {
-            let file = StoredFile {
-                content: text.as_bytes().to_vec(),
-                executable: false,
-            };
-            (path.to_string(), file)
-        })
-        .collect()
 }
 
 /// Creates each catalog, imports its files, and loads the app.

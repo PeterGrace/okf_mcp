@@ -58,8 +58,8 @@ pub async fn revisions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::files;
     use crate::db::test_db;
-    use crate::mcp::testing::files;
     use crate::store::catalogs;
     use crate::store::import::{import, ImportOptions};
     use chrono::Utc;
