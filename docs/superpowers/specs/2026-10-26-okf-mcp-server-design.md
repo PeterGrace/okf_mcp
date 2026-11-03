@@ -238,12 +238,20 @@ write, skip it), so an agent sees its own pending edits and no one else's. `hist
 `list_catalogs` report the published state. Each cached overlay pins a copy of the workspace, a snapshot
 and its base state, so overlay memory is about the number of active changesets times the
 catalog's size, bounded by evicting overlays unused for `session_idle_timeout` (checked
-on every read). An overlay whose entries no longer apply over the published files (a
-file and a directory at one path) fails that connection's reads of the catalog with an
-error naming the changeset and how to recover (discard the clashing path or the
-changeset); they do not fall back to the published state, which would hide the agent's
-own pending edits. `search` leaves such a catalog out, lists it in `skipped`, and still
-answers from the others.
+on every read). There is no cap on the number of cached overlays; one is deferred
+until a deployment sets a long `session_idle_timeout` with many writers. An overlay whose
+entries no longer apply over the published files (a file and a directory at one path)
+is never replaced by the published state, which would hide the agent's own pending
+edits. Its error names the changeset and how to recover (discard the clashing path or
+the changeset):
+- a report on that catalog fails with it;
+- `search` leaves the catalog out, lists it in `skipped`, and still answers from the
+  others;
+- `get_concept` and `read_document` go on to the next catalog of the read set, and
+  return the error only if none resolves the path.
+
+A database error or `Busy` while looking the changeset up fails the call, so the agent
+retries.
 
 The server runs one replica. It notices changes made outside it (a CLI import) through
 the catalog's `generation` counter (see "Publish"). A second replica would need the same

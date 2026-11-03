@@ -16,6 +16,23 @@ use crate::selection::{
 use crate::store::changesets::{self, ChangesetKey};
 use crate::store::keys::Access;
 
+/// Is this [`ToolContext::view`] error the connection's overlay failing to
+/// apply (its entries clash with the published files), rather than the
+/// database failing?
+///
+/// A read across several catalogs leaves such a catalog out and carries on;
+/// a database error (internal) or [`OkfError::Busy`] fails the call, so the
+/// agent is told to retry instead of seeing fewer results.
+///
+/// # Arguments
+/// * `error` - the error `view` returned.
+///
+/// # Returns
+/// `true` for an overlay that does not apply.
+pub fn is_broken_overlay(error: &OkfError) -> bool {
+    !error.is_internal() && !matches!(error, OkfError::Busy { .. })
+}
+
 /// One tool call's context.
 // `Arc<T>` is a shared, reference-counted pointer (like holding a Python
 // reference): cloning one bumps a counter, it never copies `T`.

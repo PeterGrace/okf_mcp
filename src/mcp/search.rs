@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogState;
 use crate::error::OkfError;
-use crate::mcp::context::ToolContext;
+use crate::mcp::context::{is_broken_overlay, ToolContext};
 use crate::mcp::{blocking, reply, OkfServer};
 use crate::okf::search::{search_catalogs, CatalogHit, SearchQuery};
 use crate::okf::snapshot::Snapshot;
@@ -61,9 +61,9 @@ pub struct SearchResult {
     /// Best first: concepts holding the whole query in a better field
     /// first, deprecated concepts last, then catalog order, then path.
     pub hits: Vec<CatalogHit>,
-    /// Catalogs left out because this connection's view of them could not
-    /// be built (its pending changeset does not apply); every other
-    /// catalog still answered. Empty when every catalog was searched.
+    /// Catalogs left out because this connection's pending changeset in
+    /// them does not apply over the published files; every other catalog
+    /// still answered. Empty when every catalog was searched.
     pub skipped: Vec<SkippedCatalog>,
 }
 
@@ -87,10 +87,11 @@ pub struct SkippedCatalog {
 /// The merged hits.
 ///
 /// # Errors
-/// A selection error ([`ToolContext::states`]). A catalog whose view fails
-/// ([`ToolContext::view`]) is not an error: it is left out and listed in
-/// [`SearchResult::skipped`], so one broken changeset does not fail a search
-/// across every catalog.
+/// A selection error ([`ToolContext::states`]); [`OkfError::Database`] or
+/// [`OkfError::Busy`] from [`ToolContext::view`]. A catalog whose overlay
+/// does not apply ([`is_broken_overlay`]) is not an error: it is left out
+/// and listed in [`SearchResult::skipped`], so one broken changeset does not
+/// fail a search across every catalog.
 pub(crate) async fn run(ctx: &ToolContext, params: SearchParams) -> Result<SearchResult, OkfError> {
     let states = ctx.states(params.catalogs.as_deref())?;
     let query = SearchQuery {
@@ -108,15 +109,19 @@ pub(crate) async fn run(ctx: &ToolContext, params: SearchParams) -> Result<Searc
     for state in states {
         match ctx.view(&state).await {
             Ok(view) => views.push((state, view)),
-            Err(error) => {
-                // The catalog and kind are enough to find it in the log; the
-                // caller gets the full error in `skipped`.
+            // `if` on a match arm is a guard: the arm applies only when it
+            // holds. A broken overlay is never internal, so the kind is
+            // enough for the log; the caller gets the full error.
+            Err(error) if is_broken_overlay(&error) => {
                 tracing::warn!(catalog = %state.name(), kind = error.kind(), "search skipped a catalog");
                 skipped.push(SkippedCatalog {
                     catalog: state.name().to_string(),
                     error: error.to_json(),
                 });
             }
+            // A database failure or `Busy`: the call fails (and `tool_error`
+            // logs an internal error with its details), so the agent retries.
+            Err(error) => return Err(error),
         }
     }
     // `move` hands `views` and `query` to the closure, which runs on
@@ -275,6 +280,22 @@ mod tests {
             message.contains(&format!("pending changeset {}", changeset.id)),
             "{message}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_database_failure_fails_the_search_instead_of_skipping() {
+        let test = app_with(&[("pg", &[("router.md", TAGGED)])], Config::default()).await;
+        let ctx = context(
+            &test,
+            principal_as("writer", Access::Write, &[], Some("pg")),
+            None,
+        );
+        // A closed pool fails the changeset lookup, as an outage would.
+        test.app.pool().close().await;
+
+        let result = run(&ctx, params("routes", &[])).await;
+
+        assert_eq!(result.unwrap_err().kind(), "Database");
     }
 
     #[test]
