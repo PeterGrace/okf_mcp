@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::{HeaderName, HeaderValue};
 use chrono::Utc;
@@ -23,9 +24,16 @@ use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{RoleClient, ServiceExt};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::pg::TestDb;
+
+/// The task running `http::serve`.
+type Served = JoinHandle<std::io::Result<()>>;
+
+/// How long `restart` waits for the old server to stop.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A connected MCP client.
 pub type Client = RunningService<RoleClient, ()>;
@@ -57,6 +65,8 @@ pub struct TestServer {
     /// The server's state, to `poll` after changing the database.
     pub app: Arc<App>,
     shutdown: CancellationToken,
+    /// The task running `http::serve`, awaited by `restart`.
+    served: Served,
     /// The database, for changes made "by the subcommands".
     pub db: TestDb,
 }
@@ -100,11 +110,12 @@ impl TestServer {
                 .await
                 .expect("import");
         }
-        let (base, app, shutdown) = serve_app(&db, config).await;
+        let (base, app, shutdown, served) = serve_app(&db, config).await;
         Self {
             base,
             app,
             shutdown,
+            served,
             db,
         }
     }
@@ -115,16 +126,29 @@ impl TestServer {
     /// # Arguments
     /// * `config` - the new server's settings.
     ///
+    /// The old server has stopped (its poll loop ended, its connections
+    /// closed) before the new one starts, so the two never share the database.
+    /// Close every client first: an open connection holds the old server up.
+    ///
     /// # Panics
-    /// As [`TestServer::start`].
+    /// As [`TestServer::start`], or if the old server does not stop within
+    /// [`STOP_TIMEOUT`] or its task fails.
     pub async fn restart(&mut self, config: Config) {
-        // The old server's sessions and poll loop stop; its connections close.
-        // `Drop` forbids moving fields out of `self`, so each is replaced in place.
         self.shutdown.cancel();
-        let (base, app, shutdown) = serve_app(&self.db, config).await;
+        // A `JoinHandle` is a future of the task's result (like awaiting an
+        // `asyncio.Task`); `&mut` awaits it in place, since `Drop` forbids
+        // moving fields out of `self`. The outer `expect` is the timeout, the
+        // middle one a panic in the task, the inner one `serve`'s I/O error.
+        tokio::time::timeout(STOP_TIMEOUT, &mut self.served)
+            .await
+            .expect("the old server stops")
+            .expect("the old server's task")
+            .expect("the old server serves without an I/O error");
+        let (base, app, shutdown, served) = serve_app(&self.db, config).await;
         self.base = base;
         self.app = app;
         self.shutdown = shutdown;
+        self.served = served;
     }
 
     /// The MCP endpoint.
@@ -241,11 +265,12 @@ impl TestServer {
 /// * `config` - the server's settings.
 ///
 /// # Returns
-/// The base URL, the app, and the token that stops the server.
+/// The base URL, the app, the token that stops the server, and the task
+/// serving it.
 ///
 /// # Panics
 /// If the app does not load or the bind fails.
-async fn serve_app(db: &TestDb, config: Config) -> (String, Arc<App>, CancellationToken) {
+async fn serve_app(db: &TestDb, config: Config) -> (String, Arc<App>, CancellationToken, Served) {
     let app = App::load(db.pool.clone(), config, Arc::new(SystemClock))
         .await
         .expect("app loads");
@@ -255,12 +280,12 @@ async fn serve_app(db: &TestDb, config: Config) -> (String, Arc<App>, Cancellati
         .expect("bind");
     let base = format!("http://{}", listener.local_addr().expect("address"));
     let shutdown = CancellationToken::new();
-    tokio::spawn(okf_mcp::http::serve(
+    let served = tokio::spawn(okf_mcp::http::serve(
         Arc::clone(&app),
         listener,
         shutdown.clone(),
     ));
-    (base, app, shutdown)
+    (base, app, shutdown, served)
 }
 
 /// Calls a tool.
