@@ -29,7 +29,8 @@ Every subcommand reads the database URL from `DATABASE_URL` (or
 `--database-url`) and the optional TOML configuration file from
 `OKF_MCP_CONFIG` (or `--config`); its fields are listed under "Running the
 server" (the subcommands read only `max_import_bytes`, default `64MiB`, the
-largest uncompressed import). Every
+largest uncompressed import, but a file that fails validation fails every
+subcommand). Every
 subcommand applies the embedded migrations first, so `migrate` is only needed
 as a separate deploy step. `okf-mcp --help` and `okf-mcp <command> --help`
 list the rest: `catalog list|delete`, `key list|revoke|grant|ungrant`,
@@ -154,7 +155,8 @@ body). A catalog that does not exist, or that the key does not reach, is 404
 (never 403, so a key cannot probe which catalogs exist); a reachable catalog
 the key's level does not allow (a `read` key importing) is 403. Those and
 the other route errors have the body `{"error": ..., "message": ...}`; the
-401, the 413 and the timeout layer's 503 below are the exceptions.
+401, the 413, the timeout layer's 503 below and `/healthz`'s own body are the
+exceptions.
 
 The import checks the key before it reads the upload. It then reads and
 checks the tarball (400 with every problem for an unreadable or
@@ -168,7 +170,7 @@ bounded: if reading and checking it takes more than 120 s the answer is 503
 with `{"error": "Timeout", ...}` and nothing is imported; the import and the
 snapshot refresh after it have no deadline, so a committed import always
 gets its report, and the next read sees the new snapshot. `/healthz` and the
-export time out after 120 s with 503 (an empty body); `/mcp` has no timeout,
+export time out after 120 s with 503; `/mcp` has no timeout,
 since its `GET` is a long-lived event stream.
 
 ## Layout
