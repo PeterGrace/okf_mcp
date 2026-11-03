@@ -663,9 +663,9 @@ the deployment is.
 
 - **Image:** a multi-stage `Dockerfile`: a Rust build stage, then `debian:bookworm-slim`
   with CA certificates only (no git; the binary links no OpenSSL), running as a non-root
-  user. `.github/workflows/image.yml` builds it on a `v*` tag (or a manual dispatch) and
-  pushes `ghcr.io/petergrace/okf-mcp:<version>` and `:sha-<short>` with the workflow's
-  own token; there is no `latest`, so a deployment pins a version. The workflow runs no
+  user. `.github/workflows/image.yml` builds it on a `v*` tag and pushes
+  `ghcr.io/petergrace/okf-mcp:<version>` and `:sha-<short>` with the workflow's own
+  token (a manual dispatch pushes only `:sha-<short>`); there is no `latest`, so a deployment pins a version. The workflow runs no
   gates. The cluster pulls the image through the site's registry mirror, and the
   Deployment names the mirror's path for it.
 - **Manifests:** only in the site's private Argo CD source repository, because this

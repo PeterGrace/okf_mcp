@@ -13,9 +13,9 @@ bearer key), from the image `ghcr.io/petergrace/okf-mcp`, with its database
 backed up continuously and a restore drill done.
 
 The library reads a catalog into an in-memory `Snapshot` and runs `okf.py`'s
-analyses on it with the same JSON output (compared as parsed values): `lint`, the links report,
-`oldest`, `sprawl` and the secret scan, plus ranked `search`, which `okf.py`
-does not have. Catalogs live in Postgres: every file is a row holding its
+analyses on it with the same JSON output (compared as parsed values):
+`lint`, the links report, `oldest`, `sprawl` and the secret scan, plus ranked
+`search`, which `okf.py` does not have. Catalogs live in Postgres: every file is a row holding its
 exact bytes and execute bit, with an append-only revision history, and each
 catalog's snapshot is built from its rows and swapped when the catalog
 changes. The `okf-mcp` command line administers catalogs and API keys and
