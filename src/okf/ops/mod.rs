@@ -258,6 +258,13 @@ pub(crate) fn refused(reason: String) -> OkfError {
     OkfError::Refused { reason }
 }
 
+/// The refusal for a concept `type` that is blank (Python's `str.strip()`)
+/// or not a string: `set_frontmatter`'s and `split_concept`'s rule, since
+/// every concept needs one.
+pub(crate) fn blank_type() -> OkfError {
+    refused("type must be a non-blank string; every concept needs one".to_string())
+}
+
 /// Does publish replay edits to this file (`index.md`, `log.md`)?
 fn is_bookkeeping(path: &str) -> bool {
     matches!(basename(path), "index.md" | "log.md")
