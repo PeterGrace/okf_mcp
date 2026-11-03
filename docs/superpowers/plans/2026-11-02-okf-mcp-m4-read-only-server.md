@@ -240,6 +240,14 @@ mod tests {
             ("poll_interval = \"0s\"\n", "poll_interval"),
             ("session_idle_timeout = \"0s\"\n", "session_idle_timeout"),
             ("allowed_hosts = []\n", "allowed_hosts"),
+            (
+                "allowed_hosts = [\"\"]\n",
+                "allowed_hosts has a blank entry",
+            ),
+            (
+                "allowed_hosts = [\"localhost\", \"  \"]\n",
+                "allowed_hosts has a blank entry",
+            ),
         ] {
             std::fs::write(&path, text).unwrap();
 
@@ -349,6 +357,9 @@ impl Default for Config {
 > `max_import_bytes` plus slack (`body_limit`), not this size. Task 11 adds a sentence
 > saying so. (2) `allowed_hosts` is built with `Vec::from(array)`, which moves the
 > mapped array into the `Vec`, instead of `.to_vec()`, which copies it.
+> Review of PR #76 added a third: `validate` also refuses a blank `allowed_hosts` entry
+> (`""` or whitespace), which would otherwise reject every request with no hint why;
+> the code below and Step 2's refusal test include it.
 
 Keep `from_toml` as it is. Add `validate` after it and call it from `load`:
 
@@ -360,8 +371,9 @@ Keep `from_toml` as it is. Add `validate` after it and call it from `load`:
     ///
     /// # Errors
     /// A zero `poll_interval` (tokio's interval panics on zero) or
-    /// `session_idle_timeout`, or an empty `allowed_hosts` (which rmcp reads
-    /// as "accept any `Host`").
+    /// `session_idle_timeout`, an empty `allowed_hosts` (which rmcp reads as
+    /// "accept any `Host`"), or a blank entry in it (which no `Host` matches,
+    /// so every request would get 403 with no hint why).
     pub fn validate(&self) -> Result<(), String> {
         if self.poll_interval.is_zero() {
             return Err("poll_interval must be more than zero".to_string());
@@ -373,6 +385,11 @@ Keep `from_toml` as it is. Add `validate` after it and call it from `load`:
             return Err(
                 "allowed_hosts is empty; list the host names clients connect to".to_string(),
             );
+        }
+        // `trim` returns a borrowed slice (`&str`) without the surrounding
+        // whitespace, so the check allocates nothing.
+        if self.allowed_hosts.iter().any(|host| host.trim().is_empty()) {
+            return Err("allowed_hosts has a blank entry; remove it or name a host".to_string());
         }
         Ok(())
     }
@@ -413,7 +430,7 @@ Expected: 6 passed.
 
 - [ ] **Step 6: Update the design**
 
-In "Configuration", after "Each milestone reads only its own fields (M3: `max_import_bytes`)", make it read: "Each milestone reads only its own fields (M3: `max_import_bytes`; M4: the rest except `time_server`, which M7's clock check reads); unknown keys are ignored, so one file serves every version. A zero `poll_interval` or `session_idle_timeout`, or an empty `allowed_hosts` (which rmcp would read as "accept any host"), is refused at load."
+In "Configuration", after "Each milestone reads only its own fields (M3: `max_import_bytes`)", make it read: "Each milestone reads only its own fields (M3: `max_import_bytes`; M4: the rest except `time_server`, which M7's clock check reads); unknown keys are ignored, so one file serves every version. A zero `poll_interval` or `session_idle_timeout`, or an empty `allowed_hosts` (which rmcp would read as "accept any host") or a blank entry in it, is refused at load."
 
 - [ ] **Step 7: Changelog, gates, commit**
 
