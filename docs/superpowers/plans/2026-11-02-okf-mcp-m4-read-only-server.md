@@ -1854,6 +1854,32 @@ impl App {
 
 Add `pub mod app;` to `src/lib.rs` and the crate doc.
 
+> **Corrected (issue #68), 2026-11-02.** The public API above shipped as written
+> (`App::{load, pool, config, clock, keys, catalogs, catalog, poll, poll_until}`,
+> `Catalogs`, `CatalogState::description`, `Loaded::{files, last_change}`); later tasks
+> need no change. Differences, all inside `src/app.rs` and its tests:
+> (1) The key half of `poll` is a private `reload_keys_if_changed` that returns nothing:
+> a failed reload *or a failed `admin_generation` read* is logged, the counter stays
+> unstored, and the catalog half goes ahead, so `poll`'s only error is reading the
+> catalog list (review of PR #79).
+> (2) `polling` is `tokio::sync::Mutex<Broken>`, not `Mutex<()>`: `Broken` maps a catalog
+> id to the generation whose stored data failed to build (any error but
+> `OkfError::Database` and `CatalogNotSelected`; the latter, a catalog deleted since the
+> pass listed it, is logged at debug level only, in `load` and `poll` alike). That generation is not built again: a refresh keeps the old
+> snapshot and a never-loaded catalog stays out until the generation moves (an import or
+> publish), instead of a full read, rebuild and error line every tick. A database error
+> is still retried at the next pass. `App::load` seeds the map (review of PR #79).
+> (3) Five more tests: `a_catalog_that_fails_to_load_is_skipped_until_it_changes` (a
+> stored `../escape.md` row breaks the snapshot), `a_failed_refresh_keeps_the_old_snapshot_until_the_catalog_changes`,
+> `a_re_created_catalog_that_fails_to_load_drops_the_old_one`,
+> `a_failed_key_reload_does_not_stop_the_pass_and_is_retried` (`api_keys` renamed away)
+> and `a_failed_admin_generation_read_does_not_stop_the_pass` (`server_state` renamed
+> away), so `app` has ten tests, not five, plus the plain unit test
+> `only_data_failures_are_remembered_as_broken`.
+> (4) `poll_until_stops_when_cancelled` waits up to 30 s (a deadline, not 100 x 20 ms
+> sleeps) and 30 s for the task, for a loaded shared machine.
+> (5) The catalog test imports at a fixed time and checks `last_change` equals it.
+
 - [ ] **Step 7: Run the tests**
 
 Run: `cargo test --lib -- app:: catalog`

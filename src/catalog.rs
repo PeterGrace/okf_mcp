@@ -26,6 +26,8 @@ pub struct Loaded {
     generation: i64,
     snapshot: Snapshot,
     commit_times: CommitTimes,
+    files: usize,
+    last_change: Option<DateTime<Utc>>,
 }
 
 impl Loaded {
@@ -43,6 +45,16 @@ impl Loaded {
     /// first import, the import time).
     pub fn commit_times(&self) -> &CommitTimes {
         &self.commit_times
+    }
+
+    /// How many files the catalog holds (every stored file, markdown or not).
+    pub fn files(&self) -> usize {
+        self.files
+    }
+
+    /// The newest document change (`updated_at`), or `None` for an empty catalog.
+    pub fn last_change(&self) -> Option<DateTime<Utc>> {
+        self.last_change
     }
 
     /// Lints the snapshot with its commit times, so `generated-after-commit`
@@ -63,6 +75,7 @@ impl Loaded {
 pub struct CatalogState {
     id: i64,
     name: String,
+    description: String,
     // `RwLock<Arc<_>>`: the lock is held only to clone or replace the `Arc`
     // (a pointer copy plus a reference count), never while a snapshot is read
     // or built. It is `std`'s lock, not tokio's: it is never held across an
@@ -95,6 +108,7 @@ impl CatalogState {
         Ok(Self {
             id: catalog.id,
             name: catalog.name,
+            description: catalog.description,
             current: RwLock::new(Arc::new(loaded)),
             rebuilding: tokio::sync::Mutex::new(()),
         })
@@ -108,6 +122,11 @@ impl CatalogState {
     /// The catalog's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The catalog's description (`catalog create --description`).
+    pub fn description(&self) -> &str {
+        &self.description
     }
 
     /// The current loaded state. Cheap: it clones an `Arc` (bumps a
@@ -193,6 +212,10 @@ async fn build(pool: &PgPool, catalog_id: i64, name: &str) -> Result<Loaded, Okf
     tx.commit().await?;
     // Before `rows` moves into the closure below: it borrows the rows.
     let commit_times = documents::commit_times(&rows);
+    let files = rows.len();
+    // `max()` over an empty iterator is `None`, so an empty catalog has no
+    // last change.
+    let last_change = rows.iter().map(|row| row.updated_at).max();
     // Building a snapshot is CPU work (rayon across documents): run it on a
     // blocking thread so the async runtime's threads stay free. `move` hands
     // `rows` to the closure.
@@ -214,6 +237,8 @@ async fn build(pool: &PgPool, catalog_id: i64, name: &str) -> Result<Loaded, Okf
         generation,
         snapshot,
         commit_times,
+        files,
+        last_change,
     })
 }
 
@@ -268,6 +293,32 @@ mod tests {
         assert_eq!(loaded.snapshot().docs().len(), 1);
         // The image is in the workspace, so the link to it resolves.
         assert!(loaded.snapshot().get("a.md").unwrap().links()[0].target_exists);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_records_the_description_file_count_and_last_change() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "pg", "pgrace's world", Utc::now())
+            .await
+            .unwrap();
+        let empty = CatalogState::load(&db.pool, "pg").await.unwrap();
+        assert_eq!(empty.description(), "pgrace's world");
+        assert_eq!(empty.current().files(), 0);
+        assert_eq!(empty.current().last_change(), None);
+        let imported = Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap();
+        let options = ImportOptions {
+            replace: false,
+            actor: "t",
+            now: imported,
+        };
+        let entries = files(&[("a.md", b"# A\n"), ("b.txt", b"b\n")]);
+        import(&db.pool, "pg", entries, &options).await.unwrap();
+
+        empty.refresh(&db.pool).await.unwrap();
+
+        let loaded = empty.current();
+        assert_eq!(loaded.files(), 2);
+        assert_eq!(loaded.last_change(), Some(imported));
     }
 
     #[tokio::test(flavor = "multi_thread")]
