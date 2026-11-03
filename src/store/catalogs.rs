@@ -148,9 +148,11 @@ pub async fn find<'e>(executor: impl PgExecutor<'e>, name: &str) -> Result<Catal
 /// takes `FOR KEY SHARE` on the row it references, which conflicts with
 /// `FOR UPDATE`, so a changeset or entry being written concurrently is either
 /// committed first (and seen) or held off until the delete ends (and then
-/// fails its foreign-key check): the refusal cannot be raced. A writer that
-/// holds an uncommitted entry and then needs the catalog row can deadlock
-/// with this (Postgres aborts one side); see the plan's note for M5.
+/// fails its foreign-key check): the refusal cannot be raced. Writers take the
+/// catalog row (`FOR KEY SHARE`, `changesets::lock_catalog`) before any
+/// changeset or entry, the same order as here, so a write and a delete wait
+/// for each other rather than deadlock: a write that waited finds the
+/// catalog gone.
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -176,10 +178,15 @@ pub async fn delete(pool: &PgPool, name: &str, force: bool) -> Result<(), OkfErr
             catalog: name.to_string(),
         });
     }
-    sqlx::query("SELECT id FROM changesets WHERE catalog_id = $1 AND state = 'open' FOR UPDATE")
-        .bind(catalog.id)
-        .execute(&mut *tx)
-        .await?;
+    // In id order, so two transactions locking several changesets cannot
+    // take them in opposite orders.
+    sqlx::query(
+        "SELECT id FROM changesets WHERE catalog_id = $1 AND state = 'open' \
+         ORDER BY id FOR UPDATE",
+    )
+    .bind(catalog.id)
+    .execute(&mut *tx)
+    .await?;
     // An open changeset with no entries holds no work, so it does not block.
     let unpublished: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM changesets c \
@@ -339,7 +346,7 @@ pub(crate) mod tests {
         let db = test_db().await;
         let pg = create(&db.pool, "pg", "", now()).await.unwrap();
         let changeset: i64 = sqlx::query_scalar(
-            "INSERT INTO changesets (catalog_id, session_id, actor, state, created_at, updated_at) \
+            "INSERT INTO changesets (catalog_id, label, actor, state, created_at, updated_at) \
              VALUES ($1, 's', 'a', 'open', $2, $2) RETURNING id",
         )
         .bind(pg.id)
@@ -375,7 +382,7 @@ pub(crate) mod tests {
         let db = test_db().await;
         let pg = create(&db.pool, "pg", "", now()).await.unwrap();
         sqlx::query(
-            "INSERT INTO changesets (catalog_id, session_id, actor, state, created_at, updated_at) \
+            "INSERT INTO changesets (catalog_id, label, actor, state, created_at, updated_at) \
              VALUES ($1, 's', 'a', 'open', $2, $2)",
         )
         .bind(pg.id)
@@ -465,7 +472,7 @@ pub(crate) mod tests {
         let db = test_db().await;
         let pg = create(&db.pool, "pg", "", now()).await.unwrap();
         let changeset: i64 = sqlx::query_scalar(
-            "INSERT INTO changesets (catalog_id, session_id, actor, state, created_at, updated_at) \
+            "INSERT INTO changesets (catalog_id, label, actor, state, created_at, updated_at) \
              VALUES ($1, 's', 'a', 'open', $2, $2) RETURNING id",
         )
         .bind(pg.id)

@@ -415,8 +415,11 @@ Decision 1's identity and Decision 3's lock order, in the database. Migration `0
 - Modify: `src/error.rs` (`Busy`, `From<sqlx::Error>`)
 - Modify: `src/http/mod.rs` (`Busy` is 503)
 - Modify: `src/app.rs` (`note_failure` arm for `Busy`)
+- Modify: `src/cli.rs` (`migrate_applies_the_schema` counts the embedded migrations)
 - Modify: `docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md` ("Decisions", "Storage", "Session lifecycle", "Errors", "Open questions for M5")
 - Create: `changelog/<ts>-m5-task-01-changesets.md`
+
+> **Corrected (issue #90), 2026-11-03.** `cli::tests::migrate_applies_the_schema` asserted exactly one row in `_sqlx_migrations`, so the second migration failed it. It now compares against `crate::db::MIGRATOR.iter().count()`, so later migrations need no change there. The rest of this task's code shipped as written (`rustfmt` of Step 6 plus Step 2 equals `src/store/changesets.rs`). Review of PR #106 added three things, none of which changes an interface: `From<sqlx::Error>` logs a retryable driver error at `warn` before answering `Busy` (the variant drops it); a 12th test, `the_prune_passes_by_a_changeset_get_or_create_found_and_holds`, pins the conflict path's `FOR UPDATE` against the prune's `SKIP LOCKED`; and the design's "Lock order" paragraph covers key deletes.
 
 - [ ] **Step 1: The dependency**
 
@@ -1671,7 +1674,7 @@ Write `changelog/<ts>-m5-task-01-changesets.md` (`<ts>` from `date -u +%Y-%m-%dT
 
 ```bash
 git add Cargo.toml Cargo.lock migrations/0002_changeset_identity.sql src/store/ src/db.rs \
-    src/error.rs src/http/mod.rs src/app.rs \
+    src/error.rs src/http/mod.rs src/app.rs src/cli.rs \
     docs/superpowers/specs/2026-10-26-okf-mcp-server-design.md changelog/
 git commit -m "$(cat <<'EOF'
 feat: changesets keyed by catalog, key and label, in lock order (M5.01)

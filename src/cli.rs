@@ -543,7 +543,10 @@ mod tests {
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(applied, 1);
+        // One row per embedded migration (`iter` walks the files `migrate!`
+        // found), so adding a migration does not break this test.
+        let embedded = i64::try_from(crate::db::MIGRATOR.iter().count()).unwrap();
+        assert_eq!(applied, embedded);
     }
 
     #[test]

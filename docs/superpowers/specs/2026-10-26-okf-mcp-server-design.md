@@ -52,7 +52,7 @@ work unchanged over an in-memory workspace loaded from the database.
 | Auth | Bearer API keys stored as SHA-256 hashes in the database; per-key catalog grants and `read`/`write`/`admin` access, each level including the ones before it and always limited to the key's granted catalogs |
 | Scope | Full read-write: every `okf.py` command plus content editing, search and concept retrieval |
 | Implementation | Port everything to Rust. No Python at runtime |
-| Write grouping | One changeset per (MCP session, catalog), created on first write and kept in the database; explicit `publish` |
+| Write grouping | One changeset per (catalog, key, label), created on first write and kept in the database until published or discarded; explicit `publish`. The label is the connection's `X-OKF-Changeset` header, else `?changeset=`, else `default` (never the MCP session id, which changes on every reconnect) |
 | Concurrency | Publishes to a catalog are serialized by a per-catalog lock; each checks its documents' base revisions, replays bookkeeping edits of `log.md` and `index.md` onto the current text, and re-checks links into deleted or moved paths |
 | Getting data in and out | Import from an OKF directory or tarball; export as a tarball through an authenticated route. No git anywhere in the server |
 | Administration | `okf-mcp` subcommands against the database (`migrate`, `catalog`, `key`, `import`, `export`), plus the HTTP import and export routes |
@@ -177,17 +177,32 @@ One Postgres database. Migrations live in `migrations/` and are embedded with
 | `catalogs` | `id`, `name` (unique, `[a-z0-9-]+`), `description`, `generation` (bumped by every publish and import), `created_at` |
 | `documents` | One row per file: `catalog_id`, `path` (catalog-relative, `/`-separated), `content` (`bytea`, the file's exact bytes), `executable` (the file's execute bit, so scripts round-trip), `revision` (+1 per change, never reused for a path), `deleted_at` (a tombstone: a deleted document keeps its row, so a path created again continues its revision numbering), `updated_at`, `updated_by`; derived `kind`, `concept_type`, `title`, `status`, `tags`. Primary key `(catalog_id, path)` |
 | `revisions` | Append-only history: `catalog_id`, `path`, `revision`, `op` (`create`, `update`, `delete`, `import`), `content` (NULL for a delete), `actor`, `changeset_id`, `message`, `created_at` |
-| `changesets` | One per (MCP session, catalog): `id`, `catalog_id`, `session_id`, `key_id`, `actor`, `state` (`open`, `published`, `discarded`), `created_at`, `updated_at` |
+| `changesets` | One open per (catalog, key, label): `id`, `catalog_id`, `label`, `key_id`, `actor`, `state` (`open`, `published`, `discarded`), `version` (bumped by every change to it or its entries; overlay caches key on it), `created_at`, `updated_at` |
 | `changeset_entries` | Per changed path: `changeset_id`, `path`, `base_revision` (NULL for a path with no live document), `content` (NULL for a delete), `replay` (the entry's listing and log operations, JSON, while every change to the entry came from one; NULL once any other edit touches it) |
 | `api_keys` | `id`, `sha256`, `access`, `all_catalogs`, `default_catalog_id` (references `catalogs`; cleared when that catalog is deleted, or when the key loses its grant), `actor`, `created_at`, `revoked_at` |
 | `key_catalogs` | `(key_id, catalog_id)` grants |
 | `server_state` | One row: `admin_generation`, bumped by every `catalog` and `key` subcommand |
 
 Constraints the design relies on: `revisions` is unique on `(catalog_id, path,
-revision)`; `changesets` has a partial unique index on `(catalog_id, session_id) WHERE
-state = 'open'`, so a racing "get or create" cannot open two changesets for one session;
-`api_keys.sha256` is unique and indexed. Every table that refers to a catalog does so
-with `ON DELETE CASCADE`.
+revision)`; `changesets` has a partial unique index on `(catalog_id, key_id, label)
+WHERE state = 'open'`, so a racing get-or-create cannot open two changesets for one
+identity; `api_keys.sha256` is unique and indexed. Every table that refers to a catalog
+does so with `ON DELETE CASCADE`.
+
+**Lock order.** Every transaction that writes changesets or entries takes the catalog
+row `FOR KEY SHARE` first, then the changeset row (the `UPDATE` that bumps `version`),
+then entries. `catalog delete` takes the catalog's advisory publish lock
+(`catalogs::lock`), then the catalog row `FOR UPDATE`, then the open changesets in id
+order; publish (M5 Task 10) takes the in-process mutex, the same advisory lock, then the
+catalog row and the changeset. Plain writes never take the advisory lock, so no order is
+reversed: writes and deletes wait for each other instead of deadlocking; a write that
+waited finds the catalog gone and writes nothing. The 24-hour prune takes no catalog lock
+and skips changesets other transactions hold (`SKIP LOCKED`). Deleting a key sets its
+changesets' `key_id` to NULL without touching the catalog row; writes never change
+`key_id`, and the insert's `ON CONFLICT DO NOTHING` fires no foreign-key check, so this
+forms no cycle either. A deadlock or
+serialization failure Postgres still reports (`40P01`, `40001`) is the `Busy` error,
+which says to retry.
 
 Every file of a catalog is a document: concepts, `index.md`, `log.md`, `AGENTS.md`, and
 non-markdown files such as `tools/okf.py`. Content is stored as bytes (`bytea`, since
@@ -464,14 +479,17 @@ exported.
 
 ### Session lifecycle
 
-- A changeset is created on the session's first write to a catalog.
-- When an MCP session is closed (`DELETE /mcp`) or idles past `session_idle_timeout`,
-  each of its changesets is discarded if empty. A non-empty one stays `open`, is logged
-  at `warn`, and is listed by `stranded_sessions`. Changesets are in the database, so a
-  pod restart strands sessions but loses no edits; `adopt_changeset` picks one up.
-- A periodic prune marks empty changesets older than 24 hours `discarded`. Non-empty
-  stranded changesets are never pruned: they hold unpublished work, and only `discard`
-  (after `adopt_changeset`) or `catalog delete --force` removes them.
+- A changeset is created on the first write by a (key, label) to a catalog (see "Write
+  grouping"), and stays open until `publish` or `discard`, across sessions and restarts:
+  closing an MCP session strands nothing, and a client on MCP `2026-07-28` (no sessions)
+  gets the same changeset on every request through its label.
+- `stranded_sessions` lists open, non-empty changesets not changed within
+  `session_idle_timeout`: the key's own, or for an `admin` key every one in the catalogs
+  it reaches. `adopt_changeset` moves one to the calling connection's key and label (the
+  key's own with `write`, another key's with `admin`).
+- The poll loop discards empty changesets whose last change is more than 24 hours old.
+  Non-empty ones are never pruned: they hold unpublished work, and only `discard` (after
+  `adopt_changeset`, if need be) or `catalog delete --force` removes them.
 
 ## Errors
 
@@ -488,6 +506,7 @@ One `thiserror` enum, `OkfError`:
 | `EditMismatch { path, matches }` | `old_str` found 0 or more than 1 times |
 | `LintFailed { errors, warnings }` | Publish refused; findings as structured lists |
 | `Conflict { files }` | Publish found documents changed since this session read them |
+| `Busy` | The database aborted the request to resolve a lock conflict, or the changeset closed under a write; nothing was stored; retry (HTTP 503) |
 | `Database` | Any database failure (details logged, not returned) |
 | `Io` | Filesystem errors (import, export) |
 
@@ -743,19 +762,13 @@ Plan corrections (each a dated `Corrected` note in the plan):
 
 ### Open questions for M5
 
-- **Changeset identity without sessions.** MCP `2026-07-28` removes sessions; rmcp 3.8
-  serves a client on that version statelessly, with no `Mcp-Session-Id`. "One changeset
-  per (MCP session, catalog)" needs a different identity for such clients (for example
-  per key and a client-chosen name); M5 decides (M4 plan, Decision 2).
 - **Binding it to a key.** Whatever the identity, M5 binds it to the key that created it.
   In M4 each request is authorized by its own key, but a session's streams are not bound
   to the key that opened it: another valid key that learned an `Mcp-Session-Id` (a random
   UUID) could attach to the session's `GET /mcp` stream, or resume it with
   `Last-Event-ID`, and receive messages meant for the first key. M5 records the creating
   key with the session and refuses any other, before changesets depend on sessions.
-- **Carried from M3** (see "What M3 shipped differently"): the deadlock rule for writes
-  beside `catalogs::delete` (take `catalogs::lock` first, or touch the catalog row or
-  create the changeset before writing entries, or retry on SQLSTATE `40P01`); whether
+- **Carried from M3** (see "What M3 shipped differently"): whether
   `install/` and the root `docs/` and `tests/` are read-only machinery for the write
   tools; and a backfill of the derived columns whenever `Derived::of` changes, since an
   import skips files whose bytes are unchanged.
