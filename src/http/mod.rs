@@ -1,6 +1,8 @@
 //! The HTTP server (design "Process and routes"): `/healthz`, `/mcp`, and
-//! the archive routes (`archives`, Task 11), with request tracing, timeouts
-//! and the key layer.
+//! the archive routes (`archives`), with request tracing, timeouts and the
+//! key layer.
+
+mod archives;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,14 +27,17 @@ use crate::auth::require_key;
 use crate::error::OkfError;
 use crate::mcp::OkfServer;
 
-/// How long a request on any route but `/mcp` may take. `/mcp`'s `GET` is a
-/// long-lived event stream, which rmcp's keep-alive and the session idle
-/// timeout bound instead.
+/// How long a request on any route but `/mcp` may take; for an import, how
+/// long reading and checking its upload may take (the import itself has no
+/// deadline, so a committed import is never answered with a timeout).
+/// `/mcp`'s `GET` is a long-lived event stream, which rmcp's keep-alive and
+/// the session idle timeout bound instead.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The timeout layer for every route but `/mcp`: [`REQUEST_TIMEOUT`], then
-/// 503. Not 408, which says the *client* was slow to send its request (and
-/// which some clients and proxies retry on their own).
+/// The timeout layer for `/healthz` and the export route:
+/// [`REQUEST_TIMEOUT`], then 503. Not 408, which says the *client* was slow
+/// to send its request (and which some clients and proxies retry on their
+/// own).
 ///
 /// # Returns
 /// The layer, for `Router::layer`.
@@ -177,9 +182,10 @@ fn mcp_service(
 pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     let keys = Arc::clone(app.keys());
     // `route_layer` applies to the routes added before it, so every keyed
-    // route goes above it (Task 11 merges the archive routes here).
+    // route goes above it.
     let keyed = Router::new()
         .route_service("/mcp", mcp_service(&app, shutdown))
+        .merge(archives::routes(&app))
         .route_layer(middleware::from_fn_with_state(keys, require_key));
     let health = Router::new()
         .route("/healthz", get(healthz))

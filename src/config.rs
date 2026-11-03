@@ -40,6 +40,8 @@ pub struct Config {
     /// a number of bytes). `MiB` is binary; `MB` and `M` are decimal. For a
     /// tarball it counts the whole decompressed tar stream (headers and
     /// 512-byte padding included); for a directory, the files' contents.
+    /// The import route caps the request body at this size plus a little
+    /// slack for gzip (`body_limit`).
     pub max_import_bytes: ByteSize,
     /// The address `serve` listens on (`"0.0.0.0:8080"`); `--listen` overrides it.
     pub listen: SocketAddr,
