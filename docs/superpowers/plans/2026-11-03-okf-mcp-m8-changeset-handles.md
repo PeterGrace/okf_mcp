@@ -53,7 +53,9 @@ Deliberately deferred:
    - `path` of `NotFound`, `FrontmatterParse`, `Shape`, `SecretDetected` and `EditMismatch`;
    - `file` of each finding in `LintFailed`.
 
-   `InvalidPath` keeps the caller's reference as given, because it may not be a catalog path at all (`../x`). `Io` is internal: its payload is the generic "internal error" message plus its `path`, which stays as it is. `Io.path` is documented as catalog-relative, but it is also a filesystem path for a catalog root and an archive entry's name for import and export (M7 Task 1's table). `Config` writes no `path` in its payload at all (its `to_json` arm is empty, `src/error.rs:310-315`), so there is nothing to change. Report results (`lint`, `oldest`, `sprawl`, `links_report`) keep `okf.py`'s unprefixed forms on purpose, for parity. So the same finding reads `/a.md` in a `LintFailed` error body and `a.md` in the `lint` tool's result. The README and the design say this explicitly (Task 1, Step 5).
+   - `path` of `InvalidPath` too, unless it climbs out of the catalog (`okf::paths::escapes_root`: `..` or `../...`), which isn't a catalog path at all and stays as given. `InvalidPath.path` is mixed today (M7 Task 1's table): a normalized catalog path for machinery (`check_path`), "already exists" (`new_concept_path`) and "is not a concept document" (`resolve_concept`), and the caller's reference otherwise. Both become `/`-prefixed, and a reference given as `infra/x` reads `/infra/x`, which every tool accepts.
+
+   `Io` is internal: its payload is the generic "internal error" message plus its `path`, which stays as it is. `Io.path` is documented as catalog-relative, but it is also a filesystem path for a catalog root and an archive entry's name for import and export (M7 Task 1's table). `Config` writes no `path` in its payload at all (its `to_json` arm is empty, `src/error.rs:310-315`), so there is nothing to change. Report results (`lint`, `oldest`, `sprawl`, `links_report`) keep `okf.py`'s unprefixed forms on purpose, for parity. So the same finding reads `/a.md` in a `LintFailed` error body and `a.md` in the `lint` tool's result. The README and the design say this explicitly (Task 1, Step 5).
 10. **Version 0.8.0.** This breaks the tool API, but no client uses the write tools yet: claude.ai is read-only (pgrace's instructions file), and no other client is connected with a write key. The read tools change only by adding an optional `changeset`. The release and its rollout follow M7's go-ahead rules (Task 6).
 11. **The header helper script goes** (pgrace). `~/.claude/okf-mcp-changeset.sh` was written on 2026-11-03 to give each Claude Code session its own label. It was tested only against a dummy server and never configured for a real client, which is consistent with Decision 10. It lives outside this repo, so Task 7 deletes it locally and records that in the catalog.
 
@@ -209,13 +211,18 @@ fn lint_failed_findings_name_their_file_with_a_leading_slash() {
 }
 
 #[test]
-fn invalid_path_keeps_the_reference_as_given() {
-    let error = OkfError::InvalidPath {
-        path: "../x.md".to_string(),
-        reason: "leaves the catalog".to_string(),
+fn invalid_path_is_prefixed_unless_it_leaves_the_catalog() {
+    let invalid = |path: &str| OkfError::InvalidPath {
+        path: path.to_string(),
+        reason: "refused".to_string(),
     };
 
-    assert_eq!(error.to_json()["path"], "../x.md");
+    // A normalized catalog path (machinery, "already exists").
+    assert_eq!(invalid("AGENTS.md").to_json()["path"], "/AGENTS.md");
+    assert_eq!(invalid("infra/x.md").to_json()["path"], "/infra/x.md");
+    // A path that climbs out is not a catalog path: as given.
+    assert_eq!(invalid("../x.md").to_json()["path"], "../x.md");
+    assert_eq!(invalid("..").to_json()["path"], "..");
 }
 ```
 
@@ -223,7 +230,7 @@ fn invalid_path_keeps_the_reference_as_given() {
 
 - [ ] **Step 3: Implement.** In `to_json`:
   - write `client_path(path)` for `NotFound`, `FrontmatterParse`, `Shape`, `SecretDetected` and `EditMismatch`;
-  - write `path` unchanged for `InvalidPath` and `Io`. Split the shared `|` arm so that `InvalidPath` and `Io` keep `path.as_str()`;
+  - write `InvalidPath`'s `path` through `client_path` unless `escapes_root(path)`, and `Io`'s unchanged. Split the shared `|` arm accordingly;
   - for `LintFailed`, serialize the findings through `findings_json`, which maps each finding's `file` through `client_path`.
 
   `Conflict` and `StillLinked` are already prefixed, and `client_path` leaves them unchanged.
@@ -254,7 +261,7 @@ fn findings_json(findings: &[Finding]) -> serde_json::Value {
 
 - [ ] **Step 4: Update the expected payloads in other tests.** Run the full gates and fix each assertion on an error body's `path` or finding `file`. Assertions on `error.to_string()` (the message) don't change.
 
-- [ ] **Step 5: The design's "Errors" section and the README.** Add: every catalog path in an error body (`path`, `files[].path`, `links[].source`, `errors[].file`, `warnings[].file`) is `/`-prefixed, and `InvalidPath` echoes the reference as given. Report results (`lint`, `oldest`, `sprawl`, `links_report`) keep `okf.py`'s unprefixed paths, so the same lint finding is `/a.md` in a `LintFailed` error and `a.md` in `lint`'s result, on purpose. The `Finding.file` doc comment (`src/okf/analysis/mod.rs:22`, "without a leading `/`") stays true for the struct; add that the error payload prefixes it.
+- [ ] **Step 5: The design's "Errors" section and the README.** Add: every catalog path in an error body (`path`, `files[].path`, `links[].source`, `errors[].file`, `warnings[].file`) is `/`-prefixed; an `InvalidPath` whose path climbs out of the catalog (`../x`) echoes it as given. Report results (`lint`, `oldest`, `sprawl`, `links_report`) keep `okf.py`'s unprefixed paths, so the same lint finding is `/a.md` in a `LintFailed` error and `a.md` in `lint`'s result, on purpose. The `Finding.file` doc comment (`src/okf/analysis/mod.rs:22`, "without a leading `/`") stays true for the struct; add that the error payload prefixes it.
 
 - [ ] **Step 6: Changelog, gates, commit:** `fix: error payloads write catalog paths with a leading slash`. In the PR body, list the variants that changed and the ones left as they are.
 
@@ -535,7 +542,9 @@ pub async fn apply<F>(
   The body:
   1. `let Pinned { state, row } = ctx.changeset(changeset, Access::Write).await?;`
   2. Begin the transaction and run `changesets::lock_catalog(&mut tx, state.id())`.
-  3. Lock the changeset: `changesets::lock(&mut tx, row.id)`, `.filter(open)`. If it was published or discarded while this write waited, return `Refused` with `format!("changeset {changeset} was published or discarded while this write waited")`.
+  3. Lock the changeset: `changesets::lock(&mut tx, row.id)`. Handle its two outcomes apart:
+     - `None`: the row is gone, because its catalog was deleted (the cascade). `lock_catalog` normally refuses first, so this is only a backstop. Return `Refused` with `changesets::CATALOG_GONE`;
+     - a row that isn't open: return `Refused` with `format!("changeset {changeset} was published or discarded while this write waited; open a new one with open_changeset")`.
   4. Read the overlay and entries, run the op, and store the entries, exactly as now.
 
   `WriteReport` becomes `{ catalog, changeset: String /* handle */, touched, message, notes }`.
@@ -551,7 +560,7 @@ pub changeset: String,
 
 - [ ] **Step 4: The changeset tools.**
   - `publish(changeset, message)`: `ctx.changeset(&params.changeset, Access::Write)`, then `store::publish::publish(app, &pinned.state, &pinned.row, actor, message)`. `Published` becomes `{ catalog, changeset: String, report }` (no `label`). The blank-message check comes first, as now.
-  - `discard(changeset, paths?)`: the same lookup with `Write`. `Discarded` becomes `{ catalog, changeset: String, removed, closed }`.
+  - `discard(changeset, paths?)`: the same lookup with `Write`. `Discarded` becomes `{ catalog, changeset: String, removed, closed }`. Its description changes: discarding every entry closes the changeset for good, and its handle is then refused, so call `open_changeset` again for new work. Before, the next write opened a new changeset by itself. The README says the same.
   - `revert(changeset, path, revision)`: goes through `write::apply` with the handle.
   - `pending_changes(changeset)`: resolves with `Access::Read`. The key's own and an admin's resolve; a `read` key never owns one. `PendingChanges` becomes `{ catalog, changeset: String, files }`. Its params are a new `PendingParams { changeset: String }`, because `CatalogParam` stays for `open_questions`.
   - Remove `own_changeset` and `OwnChangeset`.
@@ -638,7 +647,7 @@ pub fn require_selected(pinned: Option<&Pinned>, states: &[Arc<CatalogState>]) -
 pub changeset: Option<String>,
 ```
 
-  It calls `ctx.pin(params.changeset.as_deref())`, then `require_selected`, then passes the pinned changeset to every `view` call. `lint` with `changeset` lints that overlay, and `Lint.pending` is true then.
+  It calls `ctx.pin(params.changeset.as_deref())`, then `require_selected`, then passes the pinned changeset to every `view` call. The reports that run on one catalog (`open_questions`, `oldest`, `sprawl`, `links_report`, `lint`) default to the pinned changeset's catalog when the call names no `catalog`, rather than to the first selected one. That way a `pg` handle on a `work,pg` connection lints `pg` instead of being refused. An explicit `catalog` that differs from the changeset's is refused by `require_selected`, as for any other catalog the changeset isn't in. The test is `a_report_defaults_to_the_pinned_changeset_s_catalog`. The multi-catalog reads (`search`, and `get_concept`/`read_document` without `catalog`) keep their read set; the changeset applies to its own catalog within it. `lint` with `changeset` lints that overlay, and `Lint.pending` is true then.
 
   Rewrite the existing tests that read drafts back (`src/mcp/context.rs`, `src/mcp/documents.rs`, and the read-after-write flows in `tests/writes.rs`) to pass the handle, and give every other `ctx.view(&state)` call `None`.
 
