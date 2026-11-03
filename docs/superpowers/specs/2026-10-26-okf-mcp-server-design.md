@@ -312,7 +312,7 @@ first selected catalog.
 | `lint` | `pending?` | Port of `lint --json`, on the published catalog or (with `pending`) on this connection's overlay, with a `pending` flag saying which |
 | `history` | `path`, `limit?` (default 20, at most 200) | The document's revisions, newest first: revision, op, actor, message, time |
 | `pending_changes` | none | This session's changeset in the catalog: changed paths and a unified diff against the published text |
-| `stranded_sessions` | none | Open changesets whose MCP session has ended: id, catalog, actor, last change, changed paths |
+| `stranded_sessions` | `catalog?` | Open changesets holding edits that nobody changed within `session_idle_timeout`: the key's own (other labels than this connection's), or for an `admin` key every one in the catalogs it reaches: id, catalog, label, key, actor, creation and last-change times, changed paths |
 
 Lint's `generated-after-commit` check reads each document's last revision time where
 `okf.py` reads its last git commit time; paths in the connection's changeset count as
@@ -342,7 +342,7 @@ Nothing is visible to other sessions until `publish`.
 | `publish` | `message` | See "Publish" below |
 | `discard` | `paths?` | Drops this session's changeset entries (all, or the named paths) |
 | `revert` | `path`, `revision` | Adds the document's content at `revision` (or its deletion) to this session's changeset, for review and publish like any other edit. Subject to every write rule, so machinery cannot be reverted |
-| `adopt_changeset` | `id` | Moves a stranded changeset created with this same key into this session; an `admin` key may adopt any stranded changeset in its granted catalogs |
+| `adopt_changeset` | `id` | Moves an open changeset to this connection's key and label. The key's own needs `write`; another key's needs `admin` on its catalog. Refused while this connection has another open changeset in that catalog; an unknown id, a closed changeset and one in a catalog the key does not reach are refused alike |
 
 `by` defaults to the key's `actor`. A call may override it (for example `human:pgrace`
 when a person really did the verifying); AGENTS.md's honesty rule still applies.
@@ -545,7 +545,8 @@ exported.
   `session_idle_timeout`: the key's own, or for an `admin` key every one in the catalogs
   it reaches. `adopt_changeset` moves one to the calling connection's key and label (the
   key's own with `write`, another key's with `admin`).
-- The poll loop discards empty changesets whose last change is more than 24 hours old.
+- Every poll pass discards empty changesets whose last change is more than 24 hours old
+  (a failure is logged and retried at the next pass).
   Non-empty ones are never pruned: they hold unpublished work, and only `discard` (after
   `adopt_changeset`, if need be) or `catalog delete --force` removes them.
 

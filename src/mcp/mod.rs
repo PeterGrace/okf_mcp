@@ -68,6 +68,7 @@ impl OkfServer {
             + Self::history_router()
             + Self::reports_router()
             + Self::writes_router()
+            + Self::lifecycle_router()
             + Self::publish_router()
     }
 
