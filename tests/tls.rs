@@ -157,9 +157,11 @@ async fn verify_full_refuses_a_server_another_ca_signed() {
     // Refused for the certificate, not for any reason: a refused or dropped
     // connection must not pass. sqlx reports rustls's verdict as an I/O
     // error during the handshake, so the check reads rustls's name for it.
+    // `{error:?}` is the `Debug` form (like Python's `repr`): if a dependency
+    // bump changes the wording, the failure shows the whole error chain.
     let error = refused.expect_err("connected to a server the CA did not sign");
     assert!(
         error.to_string().contains("UnknownIssuer"),
-        "refused for another reason than the certificate's issuer: {error}"
+        "refused for another reason than the certificate's issuer: {error} ({error:?})"
     );
 }
