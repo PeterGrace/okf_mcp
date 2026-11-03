@@ -775,9 +775,8 @@ Put this above the test module in `src/okf/ops/relink.rs`:
 
 ```rust
 //! Link rewriting across a catalog: `okf.py`'s `rewrite_links` (`:1343`).
-//! `move_concept` and `split_concept` use it to point every link into a
-//! moved document (or a moved section) at its new place, and publish
-//! replays it on `index.md` and `log.md` (`ReplayOp::Relink`, M6 Task 2).
+//! `okf.py`'s `mv` and `split` use it to point every link into a moved
+//! document (or a moved section) at its new place; M6 ports both onto it.
 //!
 //! A link keeps its style: in-page (`#x`), bundle-absolute (`/dir/x.md`) or
 //! relative (`x.md`). A document that has just been moved, or created from
@@ -786,7 +785,7 @@ Put this above the test module in `src/okf/ops/relink.rs`:
 //! Files are read byte for byte (`okf.py` opens them with `newline=""`) and
 //! split on `\n` only, so a `\r\n` file keeps its line endings: only link
 //! targets change. `rewrite_text` (crate-internal) is one file's rewrite,
-//! shared by [`rewrite_links`] and the replay, so the two cannot drift apart.
+//! pure over its text, so a replay can share it with [`rewrite_links`].
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -1026,7 +1025,9 @@ fn redirected_target(
 In `src/okf/ops/mod.rs`:
 - add `pub mod relink;` between `pub mod log_index;` and `pub mod replay;`;
 - add `pub use relink::{rewrite_links, Moved, Redirect};` after the `log_index` re-export;
-- extend the module doc's first paragraph to say: "...and the server's content edits (`create_concept`, `edit_document`, `replace_body`, `set_frontmatter`), and the restructuring edits (M6): `rewrite_links` (`relink`), `move_concept`, `split_concept` and `delete_concept`."
+- extend the module doc's first paragraph to say: "...and the server's content edits (`create_concept`, `edit_document`, `replace_body`, `set_frontmatter`), and the restructuring edits (M6): `rewrite_links` (`relink`)."
+
+> **Corrected (issue #120), 2026-11-03.** The docs name only code that exists. The `ops` module doc lists `rewrite_links` alone; Tasks 3, 4 and 5 each add their op's name to that list (`move_concept`, `split_concept`, `delete_concept`) in the step that adds its `pub use`. The `relink` module doc no longer names `ReplayOp::Relink`; Task 2 adds it there. Review on PR #129.
 
 - [ ] **Step 8: Run the tests**
 
@@ -1255,6 +1256,8 @@ Run: `cargo test --lib -- okf::ops::replay okf::ops::tests`
 Expected: compile errors, `no variant named Unlist`, `Relink`, `cannot find function listing_line`, `unlist_text`, `no method named record_rewrites`.
 
 - [ ] **Step 3: The variants and their edits**
+
+In `src/okf/ops/relink.rs`, add to the module doc's first paragraph: "Publish replays its link rewrites in `index.md` and `log.md` through [`crate::okf::ops::ReplayOp::Relink`]." (Corrected (issue #120), 2026-11-03: Task 1 left this out, so the doc did not name a variant before it existed.)
 
 In `src/okf/ops/replay.rs`:
 
@@ -2055,7 +2058,7 @@ fn frontmatter_bullet(workspace: &dyn Workspace, new: &str) -> Result<String, Ok
 }
 ```
 
-In `src/okf/ops/mod.rs`, add `pub use moves::move_concept;` after the `log_index` re-export.
+In `src/okf/ops/mod.rs`, add `pub use moves::move_concept;` after the `log_index` re-export, and append `move_concept` to the module doc's list of restructuring edits ("...the restructuring edits (M6): `rewrite_links` (`relink`), `move_concept`..."). Keep both sides when Task 4 adds `split_concept` to the same list.
 
 - [ ] **Step 7: Run the tests**
 
@@ -3224,7 +3227,7 @@ fn moved_anchors(
 }
 ```
 
-In `src/okf/ops/mod.rs`, add `pub use split::{split_concept, Split, DEFAULT_SPLIT_TYPE};`.
+In `src/okf/ops/mod.rs`, add `pub use split::{split_concept, Split, DEFAULT_SPLIT_TYPE};`, and append `split_concept` to the module doc's list of restructuring edits. Keep both sides when Task 3 adds `move_concept` to the same list.
 
 - [ ] **Step 6: Run the tests**
 
@@ -3752,7 +3755,7 @@ fn only_the_index_is_left(
 }
 ```
 
-In `src/okf/ops/mod.rs`, add `pub use delete::delete_concept;`.
+In `src/okf/ops/mod.rs`, add `pub use delete::delete_concept;`, and append `delete_concept` to the module doc's list of restructuring edits. Tasks 3, 4 and 5 run in parallel and all extend that list: keep every side, so that it ends up reading "...`rewrite_links` (`relink`), `move_concept`, `split_concept` and `delete_concept`."
 
 - [ ] **Step 6: Run the tests**
 

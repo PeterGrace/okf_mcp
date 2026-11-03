@@ -1,7 +1,6 @@
 //! Link rewriting across a catalog: `okf.py`'s `rewrite_links` (`:1343`).
-//! `move_concept` and `split_concept` use it to point every link into a
-//! moved document (or a moved section) at its new place, and publish
-//! replays it on `index.md` and `log.md` (`ReplayOp::Relink`, M6 Task 2).
+//! `okf.py`'s `mv` and `split` use it to point every link into a moved
+//! document (or a moved section) at its new place; M6 ports both onto it.
 //!
 //! A link keeps its style: in-page (`#x`), bundle-absolute (`/dir/x.md`) or
 //! relative (`x.md`). A document that has just been moved, or created from
@@ -10,7 +9,7 @@
 //! Files are read byte for byte (`okf.py` opens them with `newline=""`) and
 //! split on `\n` only, so a `\r\n` file keeps its line endings: only link
 //! targets change. `rewrite_text` (crate-internal) is one file's rewrite,
-//! shared by [`rewrite_links`] and the replay, so the two cannot drift apart.
+//! pure over its text, so a replay can share it with [`rewrite_links`].
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
