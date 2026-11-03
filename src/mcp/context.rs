@@ -1,5 +1,5 @@
 //! What one tool call acts as and on: the principal, the connection's
-//! catalogs, and one view of the catalog map.
+//! catalogs and changeset label, and one view of the catalog map.
 
 use std::sync::Arc;
 
@@ -9,7 +9,9 @@ use crate::app::{App, Catalogs};
 use crate::auth::Principal;
 use crate::catalog::CatalogState;
 use crate::error::OkfError;
-use crate::selection::{connection_catalogs, resolve, Selection, Sources};
+use crate::selection::{
+    connection_catalogs, connection_label, resolve, Selection, Sources, DEFAULT_LABEL,
+};
 
 /// One tool call's context.
 // `Arc<T>` is a shared, reference-counted pointer (like holding a Python
@@ -18,6 +20,8 @@ pub struct ToolContext {
     app: Arc<App>,
     principal: Arc<Principal>,
     connection: Option<Vec<String>>,
+    // The connection's changeset label (M5 Decision 1).
+    label: String,
     // Taken once per call, so the names `select` checks are the states the
     // tool then reads, even if the poll loop swaps the map meanwhile.
     catalogs: Arc<Catalogs>,
@@ -40,6 +44,7 @@ impl ToolContext {
             app,
             principal,
             connection,
+            label: DEFAULT_LABEL.to_string(),
             catalogs,
         }
     }
@@ -67,11 +72,10 @@ impl ToolContext {
             .ok_or_else(|| OkfError::Forbidden {
                 reason: "the request carries no API key".to_string(),
             })?;
-        Ok(Self::new(
-            Arc::clone(app),
-            principal,
-            connection_catalogs(parts),
-        ))
+        Ok(
+            Self::new(Arc::clone(app), principal, connection_catalogs(parts))
+                .with_label(connection_label(parts)),
+        )
     }
 
     /// The shared state.
@@ -88,6 +92,27 @@ impl ToolContext {
     /// Its principal.
     pub fn principal(&self) -> &Principal {
         &self.principal
+    }
+
+    /// The connection's changeset label (M5 Decision 1).
+    ///
+    /// # Returns
+    /// The label: from the request in [`ToolContext::from_parts`],
+    /// [`DEFAULT_LABEL`] from [`ToolContext::new`].
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// The same context on another label.
+    ///
+    /// # Arguments
+    /// * `label` - the label; `impl Into<String>` takes a `&str` or a `String`.
+    ///
+    /// # Returns
+    /// The context, consumed and returned (`self` by value), so calls chain.
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
     }
 
     /// The catalog map this call sees.
@@ -188,8 +213,14 @@ impl ToolContext {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+
     use crate::config::Config;
-    use crate::mcp::testing::{app_with, context, principal};
+    use crate::mcp::testing::{
+        app_with, context, pending_entry, principal, principal_as, store_key, PendingEdit,
+    };
+    use crate::selection::{CHANGESET_HEADER, DEFAULT_LABEL};
+    use crate::store::keys::Access;
 
     // `Arc<CatalogState>` to its name, for asserts.
     fn names(states: &[std::sync::Arc<crate::catalog::CatalogState>]) -> Vec<&str> {
@@ -220,5 +251,62 @@ mod tests {
         assert_eq!(first.name(), "work");
         assert_eq!(names(&fallback), ["home"]);
         assert_eq!(unreachable.kind(), "CatalogNotSelected");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_context_takes_its_label_from_the_request() {
+        let test = app_with(&[("pg", &[])], Config::default()).await;
+        let mut request = axum::http::Request::builder()
+            .uri("/mcp")
+            .header(CHANGESET_HEADER, "drafts")
+            .body(())
+            .unwrap();
+        request.extensions_mut().insert(principal(&[], Some("pg")));
+        let (parts, _) = request.into_parts();
+
+        let from_request = super::ToolContext::from_parts(&test.app, &parts).unwrap();
+        let plain = context(&test, principal(&[], Some("pg")), None);
+        let relabelled = context(&test, principal(&[], Some("pg")), None).with_label("other");
+
+        assert_eq!(from_request.label(), "drafts");
+        assert_eq!(plain.label(), DEFAULT_LABEL);
+        assert_eq!(relabelled.label(), "other");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_s_key_and_label_pick_its_changeset() {
+        let test = app_with(&[("pg", &[])], Config::default()).await;
+        store_key(&test, "alice").await;
+        store_key(&test, "bob").await;
+        let alice = || {
+            context(
+                &test,
+                principal_as("alice", Access::Write, &[], Some("pg")),
+                None,
+            )
+        };
+        let bob = context(
+            &test,
+            principal_as("bob", Access::Write, &[], Some("pg")),
+            None,
+        );
+        let edit = PendingEdit {
+            catalog: "pg",
+            path: "a.md",
+            text: Some("# A\n"),
+            at: Utc::now(),
+        };
+
+        let first = pending_entry(&test, &alice(), &edit).await;
+        let again = pending_entry(&test, &alice(), &edit).await;
+        let drafts = pending_entry(&test, &alice().with_label("drafts"), &edit).await;
+        let other_key = pending_entry(&test, &bob, &edit).await;
+
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.version, 2);
+        assert_eq!(drafts.label, "drafts");
+        assert_ne!(drafts.id, first.id);
+        assert_eq!(other_key.key_id.as_deref(), Some("bob"));
+        assert_ne!(other_key.id, first.id);
     }
 }

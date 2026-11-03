@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::app::App;
 // Re-exported so tool tests keep calling `testing::files`; it lives in
@@ -15,8 +15,9 @@ use crate::config::Config;
 use crate::db::pg_support::TestDb;
 use crate::mcp::context::ToolContext;
 use crate::store::catalogs;
+use crate::store::changesets::{self, ChangesetKey, ChangesetRow, EntryRow};
 use crate::store::import::{import, ImportOptions};
-use crate::store::keys::Access;
+use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
 
 /// An app and the database under it. Fields drop in declaration order: the
 /// app (and its pool) before the container.
@@ -61,7 +62,38 @@ pub(crate) async fn app_with(
     TestApp { app, _db: db }
 }
 
-/// A `read` key reaching `reach` (every catalog when empty), with a default.
+/// A key with this id and access, reaching `reach` (every catalog when
+/// empty), with a default.
+///
+/// # Arguments
+/// * `key_id` - its id (also its actor).
+/// * `access` - its access level.
+/// * `reach` - the catalogs it is granted; empty for every catalog.
+/// * `default` - its default catalog.
+///
+/// # Returns
+/// The principal, as the auth layer would put it in a request.
+pub(crate) fn principal_as(
+    key_id: &str,
+    access: Access,
+    reach: &[&str],
+    default: Option<&str>,
+) -> Arc<Principal> {
+    Arc::new(Principal {
+        key_id: key_id.to_string(),
+        access,
+        reach: if reach.is_empty() {
+            Reach::All
+        } else {
+            Reach::Catalogs(reach.iter().map(|name| name.to_string()).collect())
+        },
+        default_catalog: default.map(str::to_string),
+        actor: key_id.to_string(),
+    })
+}
+
+/// A `read` key `tester` reaching `reach` (every catalog when empty), with
+/// a default.
 ///
 /// # Arguments
 /// * `reach` - the catalogs it is granted; empty for every catalog.
@@ -70,17 +102,91 @@ pub(crate) async fn app_with(
 /// # Returns
 /// The principal, as the auth layer would put it in a request.
 pub(crate) fn principal(reach: &[&str], default: Option<&str>) -> Arc<Principal> {
-    Arc::new(Principal {
-        key_id: "tester".to_string(),
-        access: Access::Read,
-        reach: if reach.is_empty() {
-            Reach::All
-        } else {
-            Reach::Catalogs(reach.iter().map(|name| name.to_string()).collect())
-        },
-        default_catalog: default.map(str::to_string),
-        actor: "tester".to_string(),
-    })
+    principal_as("tester", Access::Read, reach, default)
+}
+
+/// Stores a key row, so changesets can name it (`changesets.key_id` is a
+/// foreign key). Its stored access does not matter: tests build the
+/// principal with [`principal_as`].
+///
+/// # Arguments
+/// * `test` - the app.
+/// * `key_id` - the key's id.
+///
+/// # Panics
+/// If the store refuses it.
+pub(crate) async fn store_key(test: &TestApp, key_id: &str) {
+    let new = NewKey {
+        id: key_id,
+        access: Access::Admin,
+        grants: Grants::All,
+        default_catalog: None,
+        actor: key_id,
+    };
+    key_rows::create(test.app.pool(), &new, Utc::now())
+        .await
+        .expect("store the test key");
+}
+
+/// One pending edit, for [`pending_entry`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingEdit<'a> {
+    /// The catalog's name.
+    pub(crate) catalog: &'a str,
+    /// Catalog-relative path.
+    pub(crate) path: &'a str,
+    /// The new text; `None` deletes the path.
+    pub(crate) text: Option<&'a str>,
+    /// The time of the edit.
+    pub(crate) at: DateTime<Utc>,
+}
+
+/// Stores an edit in the changeset of `ctx`'s key and label, in the lock
+/// order (opening the changeset if need be), as a write tool would.
+///
+/// # Arguments
+/// * `test` - the app.
+/// * `ctx` - the connection: its key and label pick the changeset.
+/// * `edit` - the catalog, path, text and time.
+///
+/// # Returns
+/// The changeset after the edit.
+///
+/// # Panics
+/// If the catalog is not loaded or the store fails.
+pub(crate) async fn pending_entry(
+    test: &TestApp,
+    ctx: &ToolContext,
+    edit: &PendingEdit<'_>,
+) -> ChangesetRow {
+    let state = test.app.catalog(edit.catalog).expect("a loaded catalog");
+    let key = ChangesetKey {
+        catalog_id: state.id(),
+        key_id: &ctx.principal().key_id,
+        label: ctx.label(),
+    };
+    let entry = EntryRow {
+        path: edit.path.to_string(),
+        base_revision: None,
+        content: edit.text.map(|text| text.as_bytes().to_vec()),
+        executable: false,
+        replay: None,
+    };
+    let mut tx = test.app.pool().begin().await.expect("begin");
+    changesets::lock_catalog(&mut tx, state.id())
+        .await
+        .expect("lock the catalog");
+    let changeset = changesets::get_or_create(&mut tx, &key, &ctx.principal().actor, edit.at)
+        .await
+        .expect("open the changeset");
+    changesets::upsert_entry(&mut tx, changeset.id, &entry, edit.at)
+        .await
+        .expect("store the entry");
+    tx.commit().await.expect("commit");
+    changesets::by_id(test.app.pool(), changeset.id)
+        .await
+        .expect("read the changeset back")
+        .expect("the changeset exists")
 }
 
 /// A tool context for `principal` on a connection naming `connection`.

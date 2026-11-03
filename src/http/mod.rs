@@ -1,8 +1,9 @@
 //! The HTTP server (design "Process and routes"): `/healthz`, `/mcp`, and
 //! the archive routes (`archives`), with request tracing, timeouts and the
-//! key layer.
+//! key layer, and on `/mcp` the session binding (`sessions`).
 
 mod archives;
+pub mod sessions;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +26,7 @@ use tracing::Level;
 use crate::app::App;
 use crate::auth::require_key;
 use crate::error::OkfError;
+use crate::http::sessions::bind_session;
 use crate::mcp::OkfServer;
 
 /// How long a request on any route but `/mcp` may take; for an import, how
@@ -184,10 +186,19 @@ fn mcp_service(
 /// The router, ready for [`axum::serve()`] (which [`serve`] calls).
 pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     let keys = Arc::clone(app.keys());
-    // `route_layer` applies to the routes added before it, so every keyed
-    // route goes above it.
-    let keyed = Router::new()
+    // Layers wrap what is added before them, so a layer added later runs
+    // first on the way in: `require_key` (on `keyed`) runs before
+    // `bind_session` (on `mcp`), which can then read the principal.
+    let mcp = Router::new()
         .route_service("/mcp", mcp_service(&app, shutdown))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&app),
+            bind_session,
+        ));
+    // `route_layer` applies to the routes added before it, merged ones
+    // included, so every keyed route goes above it.
+    let keyed = Router::new()
+        .merge(mcp)
         .merge(archives::routes(&app))
         .route_layer(middleware::from_fn_with_state(keys, require_key));
     let health = Router::new()

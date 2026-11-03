@@ -342,7 +342,7 @@ impl CatalogState { pub fn publish_lock(&self) -> &tokio::sync::Mutex<()>; }
 | `src/okf/analysis/links.rs` | T3 (`INDEX_HEADING` becomes `pub(crate)`) | Index headings shared with `insert_index_bullet` |
 | `src/okf/workspace.rs` | T7 (`MemWorkspace::with_changes`), T11 (`MemWorkspace::remove`) | Overlay copies, deletions |
 | `src/okf/analysis/lint.rs` | T7 (`CommitTimes::with_dirty`) | Dirty paths for `lint pending` |
-| `src/mcp/testing.rs` | T6 (`principal_as`, `store_key`, `PendingEdit`, `pending_entry`, `app_at`), T8 (`writer`) | Test support |
+| `src/mcp/testing.rs` | T6 (`principal_as`, `store_key`, `PendingEdit`, `pending_entry`), T7 (`app_at`), T8 (`writer`) | Test support |
 | `tests/support/server.rs` | T13 (`restart`, `client_with`) | Harness restart on the same database |
 | `src/store/import.rs` | T10 (uses `store::documents::write_document` and friends) | Shared document writers |
 | `src/selection.rs`, `src/mcp/context.rs` | T6 (label), T7 (`view`) | Connection identity, views |
@@ -5978,6 +5978,8 @@ git commit -m "feat: okf::rules: machinery, path and content checks for writes (
 ---
 
 ### Task 6: connection identity: the changeset label and the session binding
+
+> **Corrected (issue #95), 2026-11-03.** This task's code compiled and passed as written; only `rustfmt` reflowed `ToolContext::from_parts`'s last expression. The File map credited `mcp::testing::app_at` to this task, but Task 7 adds it (its Interfaces note (6) and Files list), so the File map now says T7. `tests/server.rs`'s module doc also names the session binding.
 
 > Interfaces note: (1) `selection` also exports `SESSION_HEADER` (`"mcp-session-id"`, the name `http` stores rmcp's `Mcp-Session-Id` under) and `DEFAULT_LABEL` (`"default"`), used by `http::sessions` (never by `connection_label`: a session id is not a label, Decision 1). (2) `ToolContext` gains `with_label(self, label) -> Self`, so tests (and Task 7, Task 12) can build a context on another label; `ToolContext::new` keeps its three arguments and the label `"default"`. (3) `SessionKeys` has `new(idle)`, `bind(session, key_id, now)`, `admits(session, key_id, now) -> bool` and `release(session)`, each taking an `Instant` from the caller so tests need no sleep. (4) A request whose `Mcp-Session-Id` has **no** binding also gets 404: every session rmcp issues passes through the middleware and is bound, so an unbound id is one whose binding idled out (or that never existed), and refusing it means pruning can never let a second key in. (5) A successful `DELETE /mcp` releases the binding. (6) `mcp::testing` gains `principal_as`, `store_key`, `PendingEdit` and `pending_entry`, used here and by Tasks 7 and 12. (7) **Dependency:** Task 7's `ToolContext::view` reads `label()`, so Task 7 needs this task too (add the edge T6 -> T7 to "Task dependencies").
 

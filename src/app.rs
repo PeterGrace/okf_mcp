@@ -16,6 +16,7 @@ use crate::catalog::CatalogState;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::error::OkfError;
+use crate::http::sessions::SessionKeys;
 use crate::store::catalogs;
 
 /// Every loaded catalog, by name (a `BTreeMap`, so iteration is in name
@@ -37,6 +38,8 @@ pub struct App {
     // typing, with the method looked up at run time.
     clock: Arc<dyn Clock>,
     keys: Arc<Keys>,
+    // Which key opened each MCP session (M5 Decision 2).
+    sessions: SessionKeys,
     // As in `CatalogState`: the lock is held only to clone or swap the `Arc`.
     catalogs: RwLock<Arc<Catalogs>>,
     // The `admin_generation` the key cache was loaded at. Written only under
@@ -96,11 +99,13 @@ impl App {
                 tracing::warn!(catalog = %name, "default_catalog is not loaded (yet)");
             }
         }
+        let sessions = SessionKeys::new(config.session_idle_timeout);
         Ok(Arc::new(Self {
             pool,
             config,
             clock,
             keys,
+            sessions,
             catalogs: RwLock::new(Arc::new(loaded)),
             admin_generation: AtomicI64::new(admin_generation),
             polling: tokio::sync::Mutex::new(broken),
@@ -125,6 +130,14 @@ impl App {
     /// The key cache (shared with the auth layer).
     pub fn keys(&self) -> &Arc<Keys> {
         &self.keys
+    }
+
+    /// Which key opened each MCP session (the `/mcp` session binding).
+    ///
+    /// # Returns
+    /// The bindings, shared by every `/mcp` request.
+    pub fn sessions(&self) -> &SessionKeys {
+        &self.sessions
     }
 
     /// Every loaded catalog, as of now. Cheap (an `Arc` clone); one call
