@@ -8,6 +8,7 @@ mod catalogs;
 // `tool_error` and `reply` below, are used by later tool modules, and a
 // public item is never flagged as dead code meanwhile.
 pub mod context;
+mod search;
 #[cfg(test)]
 pub(crate) mod testing;
 
@@ -55,7 +56,7 @@ impl OkfServer {
     /// # Returns
     /// The router `#[tool_handler]` dispatches calls through.
     pub fn tools() -> ToolRouter<Self> {
-        Self::catalogs_router()
+        Self::catalogs_router() + Self::search_router()
     }
 
     /// The context of the request rmcp handed a tool. The error is already a
