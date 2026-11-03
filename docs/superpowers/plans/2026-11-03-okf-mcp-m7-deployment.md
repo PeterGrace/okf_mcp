@@ -2018,10 +2018,12 @@ SELECT (SELECT count(*) FROM catalogs) AS catalogs,
 
 - [ ] **Step 2: The scratch cluster (go-ahead 4).** Show pgrace the manifest, then `kubectl apply` it:
   - `Cluster okf-mcp-db-restore`, 1 instance, the same `imageName`;
-  - `bootstrap.recovery.source: origin`;
+  - `bootstrap.recovery: {source: origin, database: okf_mcp, owner: okf_mcp}`;
   - `externalClusters: [{name: origin, plugin: {name: barman-cloud.cloudnative-pg.io, parameters: {barmanObjectName: okf-mcp-backup, serverName: okf-mcp-db}}}]`;
   - **no `plugins` section**, so it never archives into the source's path;
   - `storage.size: 10Gi`.
+
+  > **Corrected (issue #145), 2026-11-03.** `bootstrap.recovery` gains `database: okf_mcp` and `owner: okf_mcp`. Without them CloudNativePG defaults both to `app` (`api/v1/cluster_defaults.go`), so the restored cluster's `-app` secret would name a database and user that hold none of the restored data (Brooke's review of PR #154).
 
 - [ ] **Step 3: Compare.** When it is Ready, run the same query on it and, at the same moment, on the live database.
   - **The restore replays the archived WAL to its end**, so it should match the live database as of the last archived segment, not only the counts taken before the backup.

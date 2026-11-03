@@ -603,6 +603,8 @@ spec:
   bootstrap:
     recovery:
       source: origin
+      database: okf_mcp
+      owner: okf_mcp
   externalClusters:
     - name: origin
       plugin:
@@ -612,6 +614,9 @@ spec:
           serverName: okf-mcp-db
 ```
 
+- **`database` and `owner` name the source's database and owner.** Without
+  them CloudNativePG names both `app`, and the restored cluster's `-app`
+  secret points at a database and user that hold none of the restored data.
 - **No `plugins` section:** the restored cluster must not archive into the
   source's path (`serverName: okf-mcp-db`), or it would write over the
   backups it came from. If it is to become the live database, give it its
