@@ -411,8 +411,18 @@ mod tests {
     async fn get_concept_looks_through_the_read_set_in_order() {
         let test = app_with(
             &[
-                ("pg", &[("only-pg.md", LEAF), ("index.md", "# Index\n")]),
-                ("work", &[("hub.md", HUB), ("only-pg.md", HUB)]),
+                (
+                    "pg",
+                    &[
+                        ("only-pg.md", LEAF),
+                        ("index.md", "# Index\n"),
+                        ("twice.md", "---\ntitle: A\ntitle: B\n---\nBody\n"),
+                    ],
+                ),
+                (
+                    "work",
+                    &[("hub.md", HUB), ("only-pg.md", HUB), ("index.md.md", LEAF)],
+                ),
             ],
             Config::default(),
         )
@@ -423,16 +433,32 @@ mod tests {
         let first = get_concept(&ctx, concept_params("only-pg")).unwrap();
         let missing = get_concept(&ctx, concept_params("nowhere")).unwrap_err();
         let not_a_concept = get_concept(&ctx, concept_params("index")).unwrap_err();
+        // `index.md` is refused in `pg`, but `resolve_concept` also tries
+        // `index.md.md`, which `work` holds as a concept: the search goes on.
+        let later = get_concept(&ctx, concept_params("index.md")).unwrap();
+        let invalid = get_concept(&ctx, concept_params("twice")).unwrap();
         let mut pinned = concept_params("hub");
         pinned.catalog = Some("pg".to_string());
         let not_in_pg = get_concept(&ctx, pinned).unwrap_err();
 
         assert_eq!(found.catalog, "work");
         assert!(found.links.is_none() && found.backlinks.is_none() && found.raw.is_none());
+        // Fields not asked for are left out of the JSON, not sent as null.
+        let json = serde_json::to_value(&found).unwrap();
+        assert!(["raw", "links", "backlinks"]
+            .iter()
+            .all(|key| json.get(key).is_none()));
         assert_eq!(first.catalog, "pg");
         assert_eq!(first.title.as_deref(), Some("Leaf"));
         assert!(matches!(missing, OkfError::NotFound { .. }));
         assert!(matches!(not_a_concept, OkfError::InvalidPath { .. }));
+        assert_eq!(
+            (later.catalog.as_str(), later.path.as_str()),
+            ("work", "/index.md.md")
+        );
+        assert_eq!(invalid.frontmatter, serde_json::Value::Null);
+        assert!(invalid.frontmatter_error.is_some());
+        assert_eq!(invalid.body, "Body\n");
         assert!(matches!(not_in_pg, OkfError::NotFound { .. }));
     }
 

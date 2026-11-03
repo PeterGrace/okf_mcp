@@ -3929,8 +3929,12 @@ In `src/mcp/mod.rs`, add `mod documents;` and `+ Self::documents_router()` to `t
 > tests assert more than Step 2 lists: the first also checks `title`, an empty
 > `frontmatter_error`, the whole `body`, the links' and backlink's titles and the broken
 > link's missing description; the second also shows that the first catalog wins when
-> both have the path (`only-pg.md` in both) and that a non-concept path
-> (`index`) is `InvalidPath`; the third checks the default's `catalog` and `path`.
+> both have the path (`only-pg.md` in both), that a non-concept path (`index`) is
+> `InvalidPath`, that a refusal does not stop the search (`index.md` is refused in `pg`,
+> but `resolve_concept` also tries `index.md.md`, a concept in `work`), that a
+> duplicate-key frontmatter gives null `frontmatter` with `frontmatter_error`, and that
+> fields not asked for are absent from the JSON; the third checks the default's
+> `catalog` and `path`.
 > (3) A fourth test, `the_server_lists_both_tools_with_object_output_schemas`, guards
 > against the `ToolResult` alias problem (verified fact 5's note), so Step 4 runs 5
 > tests, not 4.
