@@ -9,12 +9,14 @@ use rmcp::{tool, tool_router, Json};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::CatalogState;
 use crate::error::OkfError;
-use crate::mcp::context::ToolContext;
+use crate::mcp::context::{is_broken_overlay, ToolContext};
 use crate::mcp::{reply, OkfServer};
 use crate::okf::paths::{basename, escapes_root, normpath};
 use crate::okf::snapshot::{Frontmatter, Snapshot, SnapshotDoc};
 use crate::okf::yaml::Value;
+use crate::overlay::View;
 
 /// `get_concept`'s arguments.
 // `Deserialize` reads them from the call's JSON; `JsonSchema` gives the tool
@@ -222,15 +224,22 @@ fn concept(
 /// # Errors
 /// A selection error; [`OkfError::NotFound`] if no selected catalog has it;
 /// [`OkfError::InvalidPath`] if no selected catalog has it as a concept and
-/// one holds a document at that path that is not a concept.
-pub(crate) fn get_concept(
+/// one holds a document at that path that is not a concept; the first
+/// catalog's overlay error ([`is_broken_overlay`]) if no catalog resolves
+/// it and one's pending changeset does not apply; any other error from
+/// [`ToolContext::view`] (a database error, `Busy`), at once.
+pub(crate) async fn get_concept(
     ctx: &ToolContext,
     params: GetConceptParams,
 ) -> Result<Concept, OkfError> {
     let mut refused = None;
+    let mut broken = None;
     for state in ctx.read_set(params.catalog.as_deref())? {
-        let loaded = state.current();
-        let snapshot = loaded.snapshot();
+        // This connection's view: its overlay if it has pending edits here.
+        let Some(view) = view_or_note(ctx, &state, &mut broken).await? else {
+            continue;
+        };
+        let snapshot = view.snapshot();
         match snapshot.resolve_concept(&params.path) {
             Ok(path) => {
                 let doc = snapshot
@@ -246,7 +255,41 @@ pub(crate) fn get_concept(
             }
         }
     }
-    Err(refused.unwrap_or(OkfError::NotFound { path: params.path }))
+    // A broken overlay first: the concept may be among its pending edits.
+    Err(broken
+        .or(refused)
+        .unwrap_or(OkfError::NotFound { path: params.path }))
+}
+
+/// This connection's view of one catalog of a read set, or `None` if its
+/// overlay does not apply; the first such error is kept in `broken`, so a
+/// later catalog can still answer and the error is reported if none does.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `state` - the catalog.
+/// * `broken` - the first broken overlay's error so far.
+///
+/// # Returns
+/// The view, or `None` to skip the catalog.
+///
+/// # Errors
+/// Any error from [`ToolContext::view`] but a broken overlay (a database
+/// error, `Busy`): the call fails at once.
+async fn view_or_note(
+    ctx: &ToolContext,
+    state: &CatalogState,
+    broken: &mut Option<OkfError>,
+) -> Result<Option<View>, OkfError> {
+    match ctx.view(state).await {
+        Ok(view) => Ok(Some(view)),
+        Err(error) if is_broken_overlay(&error) => {
+            // `get_or_insert` keeps the first error.
+            broken.get_or_insert(error);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// The documents `read_document` serves.
@@ -272,8 +315,11 @@ fn readable(path: &str) -> bool {
 ///
 /// # Errors
 /// A selection error; [`OkfError::InvalidPath`] for any other path or one
-/// outside the catalog; [`OkfError::NotFound`] if no selected catalog has it.
-pub(crate) fn read_document(
+/// outside the catalog; [`OkfError::NotFound`] if no selected catalog has it,
+/// or the first catalog's overlay error if one's pending changeset does not
+/// apply ([`is_broken_overlay`]); any other error from
+/// [`ToolContext::view`] (a database error, `Busy`), at once.
+pub(crate) async fn read_document(
     ctx: &ToolContext,
     params: ReadDocumentParams,
 ) -> Result<Document, OkfError> {
@@ -287,8 +333,12 @@ pub(crate) fn read_document(
                 .to_string(),
         });
     }
+    let mut broken = None;
     for state in ctx.read_set(params.catalog.as_deref())? {
-        if let Some(doc) = state.current().snapshot().get(&path) {
+        let Some(view) = view_or_note(ctx, &state, &mut broken).await? else {
+            continue;
+        };
+        if let Some(doc) = view.snapshot().get(&path) {
             return Ok(Document {
                 catalog: state.name().to_string(),
                 path: format!("/{path}"),
@@ -296,7 +346,7 @@ pub(crate) fn read_document(
             });
         }
     }
-    Err(OkfError::NotFound { path: asked })
+    Err(broken.unwrap_or(OkfError::NotFound { path: asked }))
 }
 
 // The macro turns this block's `#[tool]` methods into `documents_router`,
@@ -321,7 +371,7 @@ impl OkfServer {
         Parameters(params): Parameters<GetConceptParams>,
     ) -> Result<Json<Concept>, CallToolResult> {
         let ctx = self.context(&parts)?;
-        reply(get_concept(&ctx, params))
+        reply(get_concept(&ctx, params).await)
     }
 
     /// The `read_document` tool.
@@ -336,15 +386,20 @@ impl OkfServer {
         Parameters(params): Parameters<ReadDocumentParams>,
     ) -> Result<Json<Document>, CallToolResult> {
         let ctx = self.context(&parts)?;
-        reply(read_document(&ctx, params))
+        reply(read_document(&ctx, params).await)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
     use crate::config::Config;
-    use crate::mcp::testing::{app_with, context, principal};
+    use crate::mcp::testing::{
+        app_with, context, pending_entry, principal, principal_as, store_key, PendingEdit,
+    };
+    use crate::store::keys::Access;
 
     const HUB: &str = "---\ntype: Note\ntitle: Hub\ndescription: The hub.\n---\n\
                        See [leaf](leaf.md) and [gone](gone.md). [Top](#hub).\n";
@@ -379,7 +434,7 @@ mod tests {
         params.links = true;
         params.raw = true;
 
-        let concept = get_concept(&ctx, params).unwrap();
+        let concept = get_concept(&ctx, params).await.unwrap();
 
         assert_eq!(concept.catalog, "pg");
         assert_eq!(concept.path, "/hub.md");
@@ -433,17 +488,21 @@ mod tests {
         .await;
         let ctx = context(&test, principal(&[], None), Some(&["pg", "work"]));
 
-        let found = get_concept(&ctx, concept_params("/hub.md")).unwrap();
-        let first = get_concept(&ctx, concept_params("only-pg")).unwrap();
-        let missing = get_concept(&ctx, concept_params("nowhere")).unwrap_err();
-        let not_a_concept = get_concept(&ctx, concept_params("index")).unwrap_err();
+        let found = get_concept(&ctx, concept_params("/hub.md")).await.unwrap();
+        let first = get_concept(&ctx, concept_params("only-pg")).await.unwrap();
+        let missing = get_concept(&ctx, concept_params("nowhere"))
+            .await
+            .unwrap_err();
+        let not_a_concept = get_concept(&ctx, concept_params("index"))
+            .await
+            .unwrap_err();
         // `index.md` is refused in `pg`, but `resolve_concept` also tries
         // `index.md.md`, which `work` holds as a concept: the search goes on.
-        let later = get_concept(&ctx, concept_params("index.md")).unwrap();
-        let invalid = get_concept(&ctx, concept_params("twice")).unwrap();
+        let later = get_concept(&ctx, concept_params("index.md")).await.unwrap();
+        let invalid = get_concept(&ctx, concept_params("twice")).await.unwrap();
         let mut pinned = concept_params("hub");
         pinned.catalog = Some("pg".to_string());
-        let not_in_pg = get_concept(&ctx, pinned).unwrap_err();
+        let not_in_pg = get_concept(&ctx, pinned).await.unwrap_err();
 
         assert_eq!(found.catalog, "work");
         assert!(found.links.is_none() && found.backlinks.is_none() && found.raw.is_none());
@@ -495,26 +554,29 @@ mod tests {
             )
         };
 
-        let root = read(None).unwrap();
+        let root = read(None).await.unwrap();
 
         assert_eq!(
             (root.catalog.as_str(), root.path.as_str()),
             ("pg", "/index.md")
         );
         assert_eq!(root.text, "# Index\n");
-        assert_eq!(read(Some("/infra/index.md")).unwrap().text, "# Infra\n");
-        assert_eq!(read(Some("log.md")).unwrap().text, "# Log\n");
-        assert_eq!(read(Some("/AGENTS.md")).unwrap().text, "# Agents\n");
+        assert_eq!(
+            read(Some("/infra/index.md")).await.unwrap().text,
+            "# Infra\n"
+        );
+        assert_eq!(read(Some("log.md")).await.unwrap().text, "# Log\n");
+        assert_eq!(read(Some("/AGENTS.md")).await.unwrap().text, "# Agents\n");
         assert!(matches!(
-            read(Some("/hub.md")),
+            read(Some("/hub.md")).await,
             Err(OkfError::InvalidPath { .. })
         ));
         assert!(matches!(
-            read(Some("/../index.md")),
+            read(Some("/../index.md")).await,
             Err(OkfError::InvalidPath { .. })
         ));
         assert!(matches!(
-            read(Some("/nope/index.md")),
+            read(Some("/nope/index.md")).await,
             Err(OkfError::NotFound { .. })
         ));
     }
@@ -531,5 +593,126 @@ mod tests {
             let schema = listed.output_schema.as_ref().expect("an output schema");
             assert_eq!(schema["type"], "object", "{name}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_concept_sees_a_pending_edit_only_on_the_key_and_label_that_made_it() {
+        let test = app_with(&[("pg", &[("hub.md", HUB)])], Config::default()).await;
+        store_key(&test, "alice").await;
+        store_key(&test, "bob").await;
+        let alice = || {
+            context(
+                &test,
+                principal_as("alice", Access::Write, &[], Some("pg")),
+                None,
+            )
+        };
+        let bob = context(
+            &test,
+            principal_as("bob", Access::Write, &[], Some("pg")),
+            None,
+        );
+        let edited = HUB.replace("The hub.", "The edited hub.");
+        let edit = PendingEdit {
+            catalog: "pg",
+            path: "hub.md",
+            text: Some(&edited),
+            at: Utc::now(),
+        };
+        pending_entry(&test, &alice(), &edit).await;
+
+        let mine = get_concept(&alice(), concept_params("hub")).await.unwrap();
+        let other_label = get_concept(&alice().with_label("other"), concept_params("hub"))
+            .await
+            .unwrap();
+        let other_key = get_concept(&bob, concept_params("hub")).await.unwrap();
+
+        assert_eq!(mine.frontmatter["description"], "The edited hub.");
+        assert_eq!(other_label.frontmatter["description"], "The hub.");
+        assert_eq!(other_key.frontmatter["description"], "The hub.");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_broken_overlay_is_reported_not_hidden_behind_the_published_state() {
+        let test = app_with(&[("pg", &[("hub.md", HUB)])], Config::default()).await;
+        store_key(&test, "alice").await;
+        let alice = || {
+            context(
+                &test,
+                principal_as("alice", Access::Write, &[], Some("pg")),
+                None,
+            )
+        };
+        // `hub.md` is a published file, so a pending `hub.md/x.md` cannot be
+        // applied over it.
+        let clash = PendingEdit {
+            catalog: "pg",
+            path: "hub.md/x.md",
+            text: Some("# X\n"),
+            at: Utc::now(),
+        };
+        let changeset = pending_entry(&test, &alice(), &clash).await;
+
+        let error = get_concept(&alice(), concept_params("hub"))
+            .await
+            .unwrap_err();
+
+        // Falling back to the published `hub.md` would hide alice's own
+        // pending edits; the error says which changeset to fix, and how.
+        let message = error.to_string();
+        assert_eq!(error.kind(), "InvalidPath");
+        assert!(
+            message.contains(&format!("in pending changeset {}", changeset.id)),
+            "{message}"
+        );
+        assert!(message.contains("discard the clashing path"), "{message}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_broken_overlay_in_one_catalog_does_not_hide_a_later_catalog() {
+        let test = app_with(
+            &[
+                ("pg", &[("a.md", HUB)]),
+                ("work", &[("hub.md", HUB), ("index.md", "# Work\n")]),
+            ],
+            Config::default(),
+        )
+        .await;
+        store_key(&test, "alice").await;
+        let alice = || {
+            context(
+                &test,
+                principal_as("alice", Access::Write, &[], None),
+                Some(&["pg", "work"]),
+            )
+        };
+        // A pending `a.md/x.md` cannot be applied over the published `a.md`.
+        let clash = PendingEdit {
+            catalog: "pg",
+            path: "a.md/x.md",
+            text: Some("# X\n"),
+            at: Utc::now(),
+        };
+        let changeset = pending_entry(&test, &alice(), &clash).await;
+        let index = ReadDocumentParams {
+            path: None,
+            catalog: None,
+        };
+
+        let found = get_concept(&alice(), concept_params("hub")).await.unwrap();
+        let document = read_document(&alice(), index).await.unwrap();
+        let missing = get_concept(&alice(), concept_params("nowhere"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(found.catalog, "work");
+        assert_eq!(document.catalog, "work");
+        // Nothing resolves `nowhere`: the broken overlay, not `NotFound`.
+        assert_eq!(missing.kind(), "InvalidPath");
+        let message = missing.to_string();
+        assert!(
+            message.contains(&format!("in pending changeset {}", changeset.id)),
+            "{message}"
+        );
     }
 }

@@ -69,6 +69,21 @@ impl CommitTimes {
         Self { times, dirty }
     }
 
+    /// The same commit times with more paths marked uncommitted: for
+    /// `lint pending`, a changeset's paths, as `git status` would list a
+    /// working tree's edits for `okf.py`.
+    ///
+    /// # Arguments
+    /// * `dirty` - the paths to add (spelled as [`CommitTimes::new`] says).
+    ///
+    /// # Returns
+    /// A new record; this one is unchanged.
+    pub fn with_dirty(&self, dirty: impl IntoIterator<Item = String>) -> Self {
+        let mut marked = self.clone();
+        marked.dirty.extend(dirty);
+        marked
+    }
+
     /// The last commit time of a clean, committed file: `None` when the
     /// file has uncommitted changes or was never committed (`okf.py` then
     /// skips the check).
@@ -628,6 +643,21 @@ mod tests {
             assert_eq!(a.len(), e.len(), "{list} count");
         }
         assert_eq!(actual.to_string(), expected.to_string(), "key order");
+    }
+
+    #[test]
+    fn with_dirty_marks_more_paths_uncommitted_and_leaves_the_original() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-03T12:00:00+00:00").unwrap();
+        let times: HashMap<String, _> = [("a.md".to_string(), at), ("b.md".to_string(), at)]
+            .into_iter()
+            .collect();
+        let clean = CommitTimes::new(times, HashSet::new());
+
+        let marked = clean.with_dirty(["a.md".to_string()]);
+
+        assert_eq!(marked.committed_clean("a.md"), None);
+        assert_eq!(marked.committed_clean("b.md"), Some(at));
+        assert_eq!(clean.committed_clean("a.md"), Some(at));
     }
 
     #[test]

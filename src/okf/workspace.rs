@@ -643,6 +643,53 @@ impl MemWorkspace {
         self.files.into_inner().expect("MemWorkspace lock poisoned")
     }
 
+    /// A copy of this workspace with `changes` applied: a changeset's view of
+    /// the published files (an overlay).
+    ///
+    /// The copy is checked as [`MemWorkspace::from_stored`] checks its input,
+    /// so it is always a consistent tree; this workspace is not changed.
+    ///
+    /// # Arguments
+    /// * `changes` - `(catalog-relative path, file)` pairs, applied in order:
+    ///   `Some` writes the file (bytes and execute bit as given), `None`
+    ///   deletes the path (a missing path is fine).
+    ///
+    /// # Returns
+    /// The new workspace.
+    ///
+    /// # Errors
+    /// [`OkfError::InvalidPath`] if a path escapes the catalog or is the root,
+    /// or if the result has a file that is also a directory of another.
+    pub fn with_changes(
+        &self,
+        changes: impl IntoIterator<Item = (String, Option<StoredFile>)>,
+    ) -> Result<Self, OkfError> {
+        // `clone()` on the read guard copies the map it guards (the guard
+        // itself is not `Clone`, so method lookup reaches the map); the
+        // guard, and the lock, end with this statement.
+        let mut map = self.files().clone();
+        for (path, file) in changes {
+            let rel = checked_file(&path)?;
+            match file {
+                Some(file) => {
+                    map.insert(rel, file);
+                }
+                None => {
+                    map.remove(&rel);
+                }
+            }
+        }
+        if let Some(path) = files_that_are_directories(&map).next() {
+            return Err(OkfError::InvalidPath {
+                path: path.clone(),
+                reason: "is a file and a directory".to_string(),
+            });
+        }
+        Ok(Self {
+            files: RwLock::new(map),
+        })
+    }
+
     fn files(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, StoredFile>> {
         // A poisoned lock means a thread panicked mid-write; propagating the panic is right.
         self.files.read().expect("MemWorkspace lock poisoned")
@@ -805,6 +852,36 @@ mod tests {
             ("a/b.md".to_string(), stored(b"", false)),
         ]);
         assert!(matches!(refused, Err(OkfError::InvalidPath { path, .. }) if path == "a"));
+    }
+
+    #[test]
+    fn with_changes_copies_the_files_and_applies_writes_and_deletes() {
+        let base = MemWorkspace::from_stored([
+            ("a.md".to_string(), stored(b"# A\n", false)),
+            ("b.md".to_string(), stored(b"# B\n", false)),
+            ("run.sh".to_string(), stored(b"#!/bin/sh\n", true)),
+        ])
+        .unwrap();
+
+        let changed = base
+            .with_changes([
+                ("a.md".to_string(), Some(stored(b"# A2\n", false))),
+                ("b.md".to_string(), None),
+                ("new/c.md".to_string(), Some(stored(b"# C\n", false))),
+            ])
+            .unwrap();
+        let clash = base.with_changes([("a.md/x.md".to_string(), Some(stored(b"x", false)))]);
+        let escape = base.with_changes([("../x.md".to_string(), None)]);
+
+        assert_eq!(changed.read_to_string("a.md").unwrap(), "# A2\n");
+        assert!(!changed.is_file("b.md"));
+        assert_eq!(changed.read_to_string("new/c.md").unwrap(), "# C\n");
+        assert_eq!(changed.stored("run.sh"), Some(stored(b"#!/bin/sh\n", true)));
+        // The original is a separate copy, unchanged.
+        assert_eq!(base.read_to_string("a.md").unwrap(), "# A\n");
+        assert!(base.is_file("b.md"));
+        assert!(matches!(clash, Err(OkfError::InvalidPath { .. })));
+        assert!(matches!(escape, Err(OkfError::InvalidPath { .. })));
     }
 
     #[test]

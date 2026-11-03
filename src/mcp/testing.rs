@@ -10,7 +10,7 @@ use crate::app::App;
 // `archive`, beside `Files`, so store tests need not reach up into `mcp`.
 pub(crate) use crate::archive::files;
 use crate::auth::{Principal, Reach};
-use crate::clock::SystemClock;
+use crate::clock::{Clock, SystemClock};
 use crate::config::Config;
 use crate::db::pg_support::TestDb;
 use crate::mcp::context::ToolContext;
@@ -27,7 +27,8 @@ pub(crate) struct TestApp {
     _db: TestDb,
 }
 
-/// Creates each catalog, imports its files, and loads the app.
+/// Creates each catalog, imports its files now, and loads the app with the
+/// system clock.
 ///
 /// # Arguments
 /// * `catalogs_and_files` - `(catalog name, its files)` pairs, in creation order.
@@ -37,26 +38,55 @@ pub(crate) struct TestApp {
 /// The loaded app and its database.
 ///
 /// # Panics
-/// If the database, a create or an import fails: a broken test setup.
+/// As [`app_at`].
 pub(crate) async fn app_with(
     catalogs_and_files: &[(&str, &[(&str, &str)])],
     config: Config,
 ) -> TestApp {
+    app_at(
+        catalogs_and_files,
+        config,
+        Utc::now(),
+        Arc::new(SystemClock),
+    )
+    .await
+}
+
+/// Creates each catalog, imports its files at `imported`, and loads the app
+/// with `clock`.
+///
+/// # Arguments
+/// * `catalogs_and_files` - `(catalog name, its files)` pairs, in creation order.
+/// * `config` - the server's settings.
+/// * `imported` - the creation and import time (each document's revision time).
+/// * `clock` - the server's clock.
+///
+/// # Returns
+/// The loaded app and its database.
+///
+/// # Panics
+/// If the database, a create or an import fails: a broken test setup.
+pub(crate) async fn app_at(
+    catalogs_and_files: &[(&str, &[(&str, &str)])],
+    config: Config,
+    imported: DateTime<Utc>,
+    clock: Arc<dyn Clock>,
+) -> TestApp {
     let db = crate::db::test_db().await;
     for (name, entries) in catalogs_and_files {
-        catalogs::create(&db.pool, name, "", Utc::now())
+        catalogs::create(&db.pool, name, "", imported)
             .await
             .expect("create the test catalog");
         let options = ImportOptions {
             replace: false,
             actor: "tester",
-            now: Utc::now(),
+            now: imported,
         };
         import(&db.pool, name, files(entries), &options)
             .await
             .expect("import the test files");
     }
-    let app = App::load(db.pool.clone(), config, Arc::new(SystemClock))
+    let app = App::load(db.pool.clone(), config, clock)
         .await
         .expect("load the app");
     TestApp { app, _db: db }
