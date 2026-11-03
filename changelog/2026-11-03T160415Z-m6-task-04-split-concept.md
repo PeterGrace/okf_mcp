@@ -13,20 +13,23 @@ issue #123).
   (three of them are also parity steps).
 - `markdown::footnote_refs` (FOOTREF_RE, its lookahead done by hand) and the
   crate-internal `atx_heading`; 2 unit tests and a doc example.
-- Parity: 3 setup files and 5 split steps (two refused); `ops.json` regenerated
-  (47 steps, 10 errors, 25 changed files).
-- `tests/parity.rs`: `print_touched` and `with_touched` (Task 3, Step 10), so the
-  split steps compare okf.py's touched list too. Task 3 adds the same helpers;
-  whichever of #122/#123 merges second keeps one copy.
+- Parity: 3 setup files and 5 split steps (two refused), and a `split` arm in
+  `tests/parity.rs`' `run_op`. `ops.json` was regenerated: 47 steps, 10 errors and
+  25 changed files before main (#122, #124) was merged in; 52 steps, 11 errors and
+  35 changed files with every step after the merge.
 
 ## Changed
 
 - `markdown::headings` reads each heading through `atx_heading`.
-- `pystr::py_truthy_str` loses its `expect(dead_code)` attribute: `split_concept`
-  calls it.
 - The `okf::ops` module doc lists `split_concept` among the restructuring edits.
 
 ## Notes
+
+- `tests/parity.rs`' `print_touched` and `with_touched` (which give the split steps
+  okf.py's touched list) are #122's copy, kept by the merge with main; this branch
+  had added the same helpers before #122 merged.
+- `py_truthy_str`'s `expect(dead_code)` attribute was already removed on main by #122,
+  so this PR makes no change to `src/okf/pystr.rs`; `split_concept` is a second caller.
 
 - A list or mapping `status` is written as Python's `str()` of it, where okf.py's
   `scalar` raises; the module doc lists this divergence.

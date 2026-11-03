@@ -99,10 +99,13 @@ struct Header<'a> {
 ///   the headings), several matches (listing their slugs), a section with
 ///   no content, an unknown `--source` id, or generated frontmatter that
 ///   would not parse.
-/// - The workspace's read or write error.
+/// - The workspace's read or write error, including [`OkfError::NotFound`]
+///   for a new concept at the catalog root when there is no root `index.md`.
 ///
-/// Every refusal comes before anything is written. Run the op on a scratch
-/// copy, as the write path does, and drop the copy on an I/O error.
+/// Every [`OkfError::Refused`] comes before anything is written, but later
+/// errors do not: that `NotFound` and any read or write error after the
+/// parent and the new concept are written leave them in place. Run the op
+/// on a scratch copy, as the write path does, and drop the copy on any error.
 pub fn split_concept(
     workspace: &dyn Workspace,
     ctx: &OpContext<'_>,
