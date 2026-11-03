@@ -219,17 +219,6 @@ pub fn py_truthy(value: Option<&Value>) -> bool {
 ///
 /// # Returns
 /// [`py_str`] of the value when it is truthy ([`py_truthy`]), else `None`.
-// `expect(dead_code)` silences the unused warning until Tasks 3 and 4 of the
-// M6 plan call this; once one does, the expectation is unfulfilled, which is
-// itself a warning, so that task must delete this attribute. `cfg_attr`
-// applies it outside test builds only, since the unit test below uses it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "first callers: move_concept and split_concept (M6)"
-    )
-)]
 pub fn py_truthy_str(value: Option<&Value>) -> Option<String> {
     if py_truthy(value) {
         value.map(py_str)

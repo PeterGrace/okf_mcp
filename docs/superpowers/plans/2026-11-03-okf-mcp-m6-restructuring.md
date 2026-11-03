@@ -2113,14 +2113,24 @@ Expected: the 5 move tests and every workspace test pass.
 In `tests/parity/okf_shim.py`:
 - add `import subprocess` after `import shutil`;
 - add `"mv": {},` to `OPS_DEFAULTS` after `"ensure_index": {},`;
-- in `ops()`, right after `setattr(okf, "now_utc", lambda: fixed)`, add:
+- add a typed stub before `ops()`, and install it right after `setattr(okf, "now_utc", lambda: fixed)`:
+
+> **Corrected (issue #122), 2026-11-03.** The stub is a named, annotated function rather than a 100-character lambda, so it carries types (mypy cannot annotate a lambda) and fits the line length.
+
+```python
+def untracked_git(
+    _root: str, *args: str, check: bool = False
+) -> "subprocess.CompletedProcess[str]":
+    """okf.py's `git` for a copy no repository tracks: every call fails (code 1)."""
+    return subprocess.CompletedProcess(list(args), 1, "", "")
+```
 
 ```python
     # cmd_mv runs `git mv` for a tracked file, else os.rename. The copy is
     # never tracked, so answer `git ls-files --error-unmatch` with "no"
     # (return code 1) without running git: the run needs no git binary and
     # never sees an enclosing repository.
-    setattr(okf, "git", lambda _root, *args, check=False: subprocess.CompletedProcess(args, 1, "", ""))
+    setattr(okf, "git", untracked_git)
 ```
 
 and add to the docstring's `ops` line: "mv runs with git stubbed out (os.rename)".

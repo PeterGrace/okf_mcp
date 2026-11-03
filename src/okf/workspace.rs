@@ -494,6 +494,26 @@ fn has_key_with_prefix(files: &BTreeMap<String, StoredFile>, prefix: &str) -> bo
         .is_some_and(|(key, _)| key.starts_with(prefix))
 }
 
+/// Why no file can be placed at `rel`: it is a directory (a prefix of other
+/// files), or one of its parent components is a file.
+///
+/// # Arguments
+/// * `files` - the workspace's files.
+/// * `rel` - a checked, catalog-relative file path.
+///
+/// # Returns
+/// `write_atomic`'s reason, or `None` when the path is free to hold a file.
+fn placement_conflict(files: &BTreeMap<String, StoredFile>, rel: &str) -> Option<&'static str> {
+    if has_key_with_prefix(files, &format!("{rel}/")) {
+        Some("is a directory")
+    } else {
+        // Any proper prefix of the path that is a file blocks it.
+        rel.match_indices('/')
+            .any(|(i, _)| files.contains_key(&rel[..i]))
+            .then_some("a parent component is a file")
+    }
+}
+
 /// Every file that is also another file's directory (`a` beside `a/b.md`), in
 /// path order. Such a map is not a tree: [`MemWorkspace::from_stored`] refuses
 /// it, and `crate::archive` lists every clash as an import problem.
@@ -660,6 +680,38 @@ impl MemWorkspace {
             .is_some())
     }
 
+    /// Moves a file to a new path, keeping its bytes and execute bit, as
+    /// `git mv` keeps a file's mode (`move_concept`).
+    ///
+    /// Not part of [`Workspace`], for the reason [`MemWorkspace::remove`]
+    /// gives.
+    ///
+    /// # Arguments
+    /// * `from` - the file's catalog-relative path.
+    /// * `to` - its new path.
+    ///
+    /// # Errors
+    /// [`OkfError::InvalidPath`] if either path escapes the catalog or is
+    /// the root, or `to` already exists, is a directory, or sits below a
+    /// file; [`OkfError::NotFound`] if there is no file at `from`.
+    pub fn rename(&self, from: &str, to: &str) -> Result<(), OkfError> {
+        let (from_rel, to_rel) = (checked_file(from)?, checked_file(to)?);
+        let mut files = self.files.write().expect("MemWorkspace lock poisoned");
+        // `or_else` only runs the placement check when the path is not taken.
+        let taken = files.contains_key(&to_rel).then_some("already exists");
+        if let Some(reason) = taken.or_else(|| placement_conflict(&files, &to_rel)) {
+            return Err(OkfError::InvalidPath {
+                path: to.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+        let file = files.remove(&from_rel).ok_or_else(|| OkfError::NotFound {
+            path: from.to_string(),
+        })?;
+        files.insert(to_rel, file);
+        Ok(())
+    }
+
     /// Every file, consuming the workspace (no copy).
     ///
     /// # Returns
@@ -756,16 +808,8 @@ impl Workspace for MemWorkspace {
     fn write_atomic(&self, path: &str, contents: &str) -> Result<(), OkfError> {
         let rel = checked_file(path)?;
         let mut files = self.files.write().expect("MemWorkspace lock poisoned");
-        let dir_prefix = format!("{rel}/");
-        let conflict = if has_key_with_prefix(&files, &dir_prefix) {
-            Some("is a directory")
-        } else {
-            // Any proper prefix of the path that is a file blocks the write.
-            rel.match_indices('/')
-                .any(|(i, _)| files.contains_key(&rel[..i]))
-                .then_some("a parent component is a file")
-        };
-        if let Some(reason) = conflict {
+        // `&files` derefs from the lock guard to the map it guards.
+        if let Some(reason) = placement_conflict(&files, &rel) {
             return Err(OkfError::InvalidPath {
                 path: path.to_string(),
                 reason: reason.to_string(),
@@ -814,6 +858,33 @@ mod tests {
             content: content.to_vec(),
             executable,
         }
+    }
+
+    #[test]
+    fn rename_keeps_bytes_and_execute_bit_and_refuses_a_bad_target() {
+        let workspace = MemWorkspace::from_stored([
+            ("a/x.md".to_string(), stored(b"x", true)),
+            ("b.md".to_string(), stored(b"b", false)),
+        ])
+        .unwrap();
+
+        workspace.rename("a/x.md", "c/y.md").unwrap();
+        let taken = workspace.rename("c/y.md", "b.md").unwrap_err();
+        let below_a_file = workspace.rename("c/y.md", "b.md/z.md").unwrap_err();
+        let missing = workspace.rename("a/x.md", "d.md").unwrap_err();
+
+        assert_eq!(workspace.stored("c/y.md"), Some(stored(b"x", true)));
+        // Directories exist only as prefixes, so the emptied `a` is gone.
+        assert!(!workspace.is_file("a/x.md") && !workspace.is_dir("a"));
+        assert!(matches!(
+            taken,
+            OkfError::InvalidPath { ref reason, .. } if reason == "already exists"
+        ));
+        assert!(matches!(
+            below_a_file,
+            OkfError::InvalidPath { ref reason, .. } if reason == "a parent component is a file"
+        ));
+        assert!(matches!(missing, OkfError::NotFound { .. }));
     }
 
     #[test]
