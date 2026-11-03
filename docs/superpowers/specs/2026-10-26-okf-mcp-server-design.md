@@ -415,11 +415,16 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
      recorded as operations: `log` adds a log entry; `index`, `create_concept` (with
      `index_summary`) and the listing changes of `move_concept`, `split_concept` and
      `delete_concept` add, rename or remove an `index.md` bullet. The operations are
-     `Log { date, bullet }`, `ListBullet { target, bullet, section, create_section }`
-     and `CreateIndex { folder }` (`okf::ops::ReplayOp`). They are stored as JSON with
-     an `op` tag and re-applied by `okf::ops::replay`, which shares its text edits with
-     the ops themselves. Text that no operation changes keeps its bytes; changed text
-     gets `\n` line endings, as `okf.py` writes. The entry keeps the existing replay
+     `Log { date, bullet }`, `ListBullet { target, bullet, section, create_section }`,
+     `CreateIndex { folder }`, `Unlist { target, bullet }` (remove the bullet listing a
+     path; with `bullet`, refuse a listing that changed since) and `Relink { redirect }`
+     (redirect the links into a moved document or section, in an `index.md` or
+     `log.md`) (`okf::ops::ReplayOp`). A move to another folder is `Unlist` on the old
+     index and `ListBullet` on the new one. They are stored as JSON with an `op` tag and
+     re-applied by `okf::ops::replay`, which shares its text edits with the ops
+     themselves. Text that no operation changes keeps its bytes; text a bookkeeping
+     operation changes gets `\n` line endings, as `okf.py` writes, while `Relink` keeps
+     the file's own, as `okf.py`'s `rewrite_links` does. The entry keeps the existing replay
      plus the new operations while every edit to it came from one. Any other edit (an
      `edit_document` of an `index.md`, say) clears it for good, so that entry conflicts
      like any other on a stale base.

@@ -2,7 +2,15 @@
 //! is redone on newer text at publish (design "Data flow", "Write" step 3
 //! and "Publish" step 3), and the pure text edits that both the ops
 //! (`log_index.rs`) and [`replay`] run, so an edit and its replay cannot
-//! drift apart.
+//! drift apart. M6 adds [`ReplayOp::Unlist`] (a listing taken out of a
+//! folder index) and [`ReplayOp::Relink`] (links redirected by a move or
+//! split), whose edits are `unlist_text` and `relink::rewrite_text` (both
+//! crate-internal: a public doc may not link them, or `cargo doc -D
+//! warnings` fails). `Unlist` works on universal-newline text, so a CRLF
+//! `index.md` comes out with `\n` endings, while `Relink` keeps bytes as
+//! they are. Both match `okf.py`: `cmd_mv` reads and writes the old index
+//! in text mode (`okf.py:1538`), and `rewrite_links` opens files with
+//! `newline=''` (`okf.py:1359`). This is not a parity bug.
 //!
 //! [`log_text`] is `okf.py`'s `cmd_log` body (`:752`) and
 //! [`insert_index_bullet_text`] its `insert_index_bullet` (`:1410`), line
@@ -16,7 +24,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::OkfError;
 use crate::okf::analysis::links::INDEX_HEADING;
 use crate::okf::markdown::{find_links, resolve_link};
-use crate::okf::paths::basename;
+use crate::okf::ops::relink::{rewrite_text, Redirect};
+use crate::okf::paths::{basename, is_concept};
 use crate::okf::pystr::{py_repr_str, py_strip, universal_newlines};
 use crate::okf::workspace::{MemWorkspace, Workspace};
 
@@ -53,15 +62,34 @@ pub enum ReplayOp {
         /// Catalog-relative folder, `infra/hosts`.
         folder: String,
     },
+    /// `move_concept` and `delete_concept`: remove the first bullet of an
+    /// `index.md` that links `target`.
+    Unlist {
+        /// Catalog-relative path the bullet lists.
+        target: String,
+        /// `Some`: the bullet as it read when the edit was made. A move
+        /// carries that text to the new folder, so the replay refuses a
+        /// listing that reads otherwise now, rather than drop someone
+        /// else's change to it. `None`: whatever it reads (a delete).
+        bullet: Option<String>,
+    },
+    /// `move_concept` and `split_concept`: redirect the links of an
+    /// `index.md` or `log.md` that point into the moved document or section.
+    Relink {
+        /// Which links, and where to.
+        redirect: Redirect,
+    },
 }
 
 /// Redoes `ops` on a file's current text (design "Publish", step 3).
 ///
 /// Idempotent where publish needs it: a log bullet already under its date,
-/// a listing whose `target` the index already links, and a `CreateIndex`
-/// of a file that exists all leave the text alone. Text that no operation
-/// changes is returned byte for byte; changed text has `\n` endings, as
-/// `okf.py` writes it.
+/// a listing whose `target` the index already links, a `CreateIndex` of a
+/// file that exists, an `Unlist` whose listing is gone, and a `Relink` with
+/// no link left into its source all leave the text alone. Text that no operation
+/// changes is returned byte for byte; text a bookkeeping edit changed has
+/// `\n` endings, as `okf.py` writes it, while a `Relink` keeps the file's
+/// own line endings.
 ///
 /// # Arguments
 /// * `path` - the file's catalog-relative path (`log.md`, `infra/index.md`),
@@ -74,7 +102,9 @@ pub enum ReplayOp {
 ///
 /// # Errors
 /// [`OkfError::NotFound`] when a `Log` or `ListBullet` (or nothing) finds
-/// no file; [`OkfError::Refused`] when a listing's section heading is gone.
+/// no file (as do `Unlist` and `Relink`); [`OkfError::Refused`] when a
+/// listing's section heading is gone, or when a move's `Unlist` finds its
+/// listing changed since the move.
 ///
 /// # Examples
 /// ```
@@ -112,6 +142,29 @@ pub fn replay(path: &str, current: Option<&str>, ops: &[ReplayOp]) -> Result<Str
                         insert_index_bullet_text(&base, bullet, section, *create_section);
                     Some(inserted.ok_or_else(|| missing_heading(path, section.unwrap_or("")))?)
                 }
+            }
+            ReplayOp::Unlist { target, bullet } => {
+                let base = universal_newlines(present(path, &text)?);
+                match unlist_text(&no_dirs, &base, path, target) {
+                    // Already gone: nothing to do (idempotent).
+                    None => None,
+                    // `is_some_and` is false for `None`: a delete removes any bullet.
+                    Some((_, found)) if bullet.as_deref().is_some_and(|want| want != found) => {
+                        return Err(changed_listing(path, target));
+                    }
+                    Some((rest, _)) => Some(rest),
+                }
+            }
+            // Byte for byte, as the op itself rewrote the file.
+            ReplayOp::Relink { redirect } => {
+                // `no_dirs` cannot tell a directory link (`[x](../a)`) from a file
+                // link, which only matters when `from` is an `index.md`. Moves and
+                // splits only redirect concepts (see `rewrite_text`'s doc).
+                debug_assert!(
+                    is_concept(&redirect.from),
+                    "a Relink redirects a concept, never an index.md or log.md"
+                );
+                rewrite_text(&no_dirs, path, path, present(path, &text)?, redirect)
             }
         };
         if let Some(updated) = updated {
@@ -155,6 +208,67 @@ pub(crate) fn lists_target(
             resolved.path == target
                 || target.strip_suffix("/index.md") == Some(resolved.path.as_str())
         })
+}
+
+/// The line of `text` (an `index.md` at `index`) that lists `target`: the
+/// first bullet (`* ` or `- `) with a link resolving to it, as `cmd_mv`
+/// takes it.
+///
+/// # Arguments
+/// * `workspace` - resolves directory links (replay passes an empty one).
+/// * `text` - the index, with universal newlines.
+/// * `index` - its catalog-relative path, to resolve relative links.
+/// * `target` - the catalog-relative path listed.
+///
+/// # Returns
+/// The 0-based line index, or `None` when no bullet links `target`.
+pub(crate) fn listing_line(
+    workspace: &dyn Workspace,
+    text: &str,
+    index: &str,
+    target: &str,
+) -> Option<usize> {
+    text.split('\n').position(|line| {
+        is_bullet(line)
+            && find_links(line).iter().any(|link| {
+                resolve_link(workspace, &link.target, index)
+                    .is_some_and(|resolved| resolved.path == target)
+            })
+    })
+}
+
+/// `cmd_mv`'s edit of the old folder's index: the text without the line
+/// [`listing_line`] finds.
+///
+/// # Arguments
+/// As [`listing_line`].
+///
+/// # Returns
+/// The text without that line and the line itself, or `None` when no
+/// bullet links `target`.
+pub(crate) fn unlist_text(
+    workspace: &dyn Workspace,
+    text: &str,
+    index: &str,
+    target: &str,
+) -> Option<(String, String)> {
+    let at = listing_line(workspace, text, index, target)?;
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    // `Vec::remove(at)` takes the line out, like Python's `lines.pop(at)`.
+    let bullet = lines.remove(at).to_string();
+    Some((lines.join("\n"), bullet))
+}
+
+/// The refusal of a move's `Unlist` whose listing changed since the move.
+fn changed_listing(index: &str, target: &str) -> OkfError {
+    OkfError::Refused {
+        reason: format!(
+            "{index}: the listing of /{target} changed since this changeset moved it; \
+             discard every path of the move together (pending_changes lists them: \
+             both concept paths, both folder indexes and the files whose links it \
+             rewrote), or the whole changeset, then move the concept again"
+        ),
+    }
 }
 
 /// Python's `str.capitalize`: the first character upper-cased, the rest
@@ -712,5 +826,123 @@ mod tests {
             assert_eq!(copies, 1, "{bullet} in\n{merged}");
         }
         assert_eq!(again, merged);
+    }
+
+    const INFRA: &str =
+        "# Infra\n\n# Concepts\n\n* [Time](time.md) - the clock\n* [NTP](ntp.md) - sync\n";
+
+    fn unlist(target: &str, bullet: Option<&str>) -> ReplayOp {
+        ReplayOp::Unlist {
+            target: target.to_string(),
+            bullet: bullet.map(str::to_string),
+        }
+    }
+
+    fn relink(from: &str, to: &str) -> ReplayOp {
+        ReplayOp::Relink {
+            redirect: Redirect {
+                from: from.to_string(),
+                to: to.to_string(),
+                anchors: None,
+            },
+        }
+    }
+
+    #[test]
+    fn unlist_text_takes_the_first_bullet_linking_the_target() {
+        let workspace = MemWorkspace::default();
+        let text = concat!(
+            "# Infra\n\nSee [NTP](ntp.md).\n\n",
+            "* [NTP](/infra/ntp.md) - sync\n* [NTP again](ntp.md) - twice\n",
+        );
+
+        let line = listing_line(&workspace, text, "infra/index.md", "infra/ntp.md");
+        let taken = unlist_text(&workspace, text, "infra/index.md", "infra/ntp.md");
+        let missing = unlist_text(&workspace, INFRA, "infra/index.md", "infra/other.md");
+
+        // The prose link on line 2 is not a bullet; the absolute bullet is first.
+        assert_eq!(line, Some(4));
+        assert_eq!(
+            taken,
+            Some((
+                "# Infra\n\nSee [NTP](ntp.md).\n\n* [NTP again](ntp.md) - twice\n".to_string(),
+                "* [NTP](/infra/ntp.md) - sync".to_string()
+            ))
+        );
+        assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn unlist_replays_idempotently_and_refuses_a_changed_listing() {
+        let moved = [unlist("infra/ntp.md", Some("* [NTP](ntp.md) - sync"))];
+        let edited = INFRA.replace("- sync", "- how hosts sync");
+
+        let once = replay("infra/index.md", Some(INFRA), &moved).unwrap();
+        let twice = replay("infra/index.md", Some(&once), &moved).unwrap();
+        let refused = replay("infra/index.md", Some(&edited), &moved).unwrap_err();
+        let deleted = replay(
+            "infra/index.md",
+            Some(&edited),
+            &[unlist("infra/ntp.md", None)],
+        );
+
+        assert_eq!(
+            once,
+            "# Infra\n\n# Concepts\n\n* [Time](time.md) - the clock\n"
+        );
+        assert_eq!(twice, once);
+        assert!(
+            matches!(refused, OkfError::Refused { ref reason } if reason.contains("changed since")),
+            "{refused:?}"
+        );
+        // A delete removes the listing whatever it reads now.
+        assert_eq!(deleted.unwrap(), once);
+    }
+
+    #[test]
+    fn relink_replays_byte_for_byte_and_idempotently() {
+        let crlf = "# Infra\r\n\r\n* [Time](time.md) - the clock\r\n";
+        let ops = [relink("infra/time.md", "infra/clock.md")];
+
+        let once = replay("infra/index.md", Some(crlf), &ops).unwrap();
+        let twice = replay("infra/index.md", Some(&once), &ops).unwrap();
+
+        assert_eq!(once, "# Infra\r\n\r\n* [Time](clock.md) - the clock\r\n");
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn a_log_entry_then_a_relink_replay_in_order() {
+        let ops = [
+            ReplayOp::Log {
+                date: "2026-11-03".to_string(),
+                bullet: "* **Update:** Added [x](/infra/x.md).".to_string(),
+            },
+            relink("infra/x.md", "infra/y.md"),
+        ];
+
+        let replayed = replay("log.md", Some("# Log\n"), &ops).unwrap();
+
+        assert_eq!(
+            replayed,
+            "# Log\n\n## 2026-11-03\n\n* **Update:** Added [x](/infra/y.md).\n"
+        );
+    }
+
+    #[test]
+    fn the_new_ops_serialize_with_an_op_tag() {
+        let ops = vec![unlist("a/b.md", None), relink("a/b.md", "a/c.md")];
+
+        let value = serde_json::to_value(&ops).unwrap();
+        let back: Vec<ReplayOp> = serde_json::from_value(value.clone()).unwrap();
+
+        assert_eq!(
+            value,
+            json!([
+                {"op": "unlist", "target": "a/b.md", "bullet": null},
+                {"op": "relink", "redirect": {"from": "a/b.md", "to": "a/c.md", "anchors": null}},
+            ])
+        );
+        assert_eq!(back, ops);
     }
 }

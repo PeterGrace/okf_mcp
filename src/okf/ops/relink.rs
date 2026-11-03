@@ -1,6 +1,8 @@
 //! Link rewriting across a catalog: `okf.py`'s `rewrite_links` (`:1343`).
 //! `okf.py`'s `mv` and `split` use it to point every link into a moved
 //! document (or a moved section) at its new place; M6 ports both onto it.
+//! Publish replays its link rewrites in `index.md` and `log.md` through
+//! [`crate::okf::ops::ReplayOp::Relink`].
 //!
 //! A link keeps its style: in-page (`#x`), bundle-absolute (`/dir/x.md`) or
 //! relative (`x.md`). A document that has just been moved, or created from

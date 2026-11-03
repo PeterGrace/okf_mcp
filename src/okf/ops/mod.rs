@@ -27,7 +27,7 @@ use serde::Deserialize;
 use crate::clock::format_timestamp;
 use crate::error::OkfError;
 use crate::okf::doc::Doc;
-use crate::okf::paths::resolve_concept;
+use crate::okf::paths::{basename, resolve_concept};
 use crate::okf::workspace::Workspace;
 use crate::okf::yaml::Value;
 
@@ -98,6 +98,27 @@ impl OpOutcome {
         self.touch(path);
         // `entry(..).or_default()` is `dict.setdefault(key, [])`.
         self.replay.entry(path.to_string()).or_default().push(op);
+    }
+
+    /// Records the files `rewrite_links` changed: an `index.md` or `log.md`
+    /// with a [`ReplayOp::Relink`], so publish can redo the rewrite on newer
+    /// text (plan Decision 7); any other file as a free edit.
+    ///
+    /// # Arguments
+    /// * `changed` - the paths [`relink::rewrite_links`] returned.
+    /// * `redirect` - the redirect it applied.
+    pub fn record_rewrites(&mut self, changed: &[String], redirect: &Redirect) {
+        for path in changed {
+            if is_bookkeeping(path) {
+                // `clone`: each recorded op owns its own copy of the redirect.
+                let op = ReplayOp::Relink {
+                    redirect: redirect.clone(),
+                };
+                self.record(path, op);
+            } else {
+                self.touch(path);
+            }
+        }
     }
 }
 
@@ -229,4 +250,46 @@ pub(crate) fn stamp_value(ctx: &OpContext<'_>) -> Value {
 /// `okf.py`'s `die(reason)` as an error.
 pub(crate) fn refused(reason: String) -> OkfError {
     OkfError::Refused { reason }
+}
+
+/// Does publish replay edits to this file (`index.md`, `log.md`)?
+fn is_bookkeeping(path: &str) -> bool {
+    matches!(basename(path), "index.md" | "log.md")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_of_bookkeeping_files_replay_and_the_others_are_free() {
+        let redirect = Redirect {
+            from: "infra/x.md".to_string(),
+            to: "infra/y.md".to_string(),
+            anchors: None,
+        };
+        let mut outcome = OpOutcome::default();
+        outcome.touch("infra/y.md");
+        let changed = [
+            "hub.md".to_string(),
+            "infra/index.md".to_string(),
+            "infra/y.md".to_string(),
+            "log.md".to_string(),
+        ];
+
+        outcome.record_rewrites(&changed, &redirect);
+
+        assert_eq!(
+            outcome.touched,
+            ["infra/y.md", "hub.md", "infra/index.md", "log.md"]
+        );
+        let relink = ReplayOp::Relink { redirect };
+        assert_eq!(
+            outcome.replay,
+            BTreeMap::from([
+                ("infra/index.md".to_string(), vec![relink.clone()]),
+                ("log.md".to_string(), vec![relink]),
+            ])
+        );
+    }
 }

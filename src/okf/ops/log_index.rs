@@ -30,8 +30,9 @@ const LOG: &str = "log.md";
 const SECTIONS: &str = "Sections";
 
 /// Python's `" ".join(text.split())`: runs of whitespace become one space,
-/// and leading and trailing whitespace goes.
-fn collapse_whitespace(text: &str) -> String {
+/// and leading and trailing whitespace goes. Shared with `move_concept` and
+/// `split_concept`, whose listings collapse the description the same way.
+pub(crate) fn collapse_whitespace(text: &str) -> String {
     text.split(is_py_space)
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()

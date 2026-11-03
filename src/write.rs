@@ -338,7 +338,8 @@ fn merged_replay(
         },
     };
     ops.extend(new_ops.iter().map(|op| {
-        serde_json::to_value(op).expect("a ReplayOp (strings and a bool) always serializes")
+        serde_json::to_value(op)
+            .expect("a ReplayOp (strings, a bool and a string map) always serializes")
     }));
     Some(serde_json::Value::Array(ops))
 }
