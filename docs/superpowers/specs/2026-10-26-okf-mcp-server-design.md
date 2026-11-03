@@ -423,7 +423,14 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
      `edit_document` of an `index.md`, say) clears it for good, so that entry conflicts
      like any other on a stale base.
 5. Commit, and drop the connection's cached overlay; its next read rebuilds it. A
-   refused edit stores nothing.
+   refused edit stores nothing. So every write after the first rebuilds the overlay
+   (a full snapshot, Decision 6 of the M5 plan) while it holds the changeset's row
+   lock, and writes queued on one changeset wait for each other's rebuilds. This is
+   kept on purpose (M5 Task 13): on the real catalog (193 documents), a debug build
+   took about 25 ms per write, and eight writers racing on one changeset all finished
+   within about 190 ms. Writes to one changeset are serialized by the row lock in any
+   case, so reusing the overlay would only shorten each turn, at the price of keeping
+   a cached overlay in step with the entries a write stores.
 
 ### Publish
 

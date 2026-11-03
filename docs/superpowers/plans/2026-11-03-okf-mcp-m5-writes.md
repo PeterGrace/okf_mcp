@@ -101,6 +101,7 @@ pgrace delegated every open question in this milestone to Claude's recommended a
    - An overlay is the published `MemWorkspace` with the changeset's entries applied, plus a full `Snapshot::build` of that workspace (about 10 ms for the real catalog, measured in M2).
    - It is cached per changeset id and reused while both the changeset's `version` and the base snapshot's `generation` are unchanged.
    - No incremental snapshot.
+   - A write still rebuilds the overlay under the changeset's row lock (the previous write `forget`s it). Task 13 measured this on the real catalog and kept it (its Corrected note).
 7. **The bookkeeping ops are checked byte for byte against `okf.py`.** (decided by Claude; pgrace delegated)
    - The parity shim gains an `ops` command. It applies a script of `stamp`, `review`, `question`, `unquestion`, `source`, `log` and `index` calls to a copy of the synthetic corpus with `now_utc` frozen, and returns every file that changed.
    - A golden file records the result, and a live `--ignored` test compares against `okf.py` itself.
@@ -12521,6 +12522,13 @@ The write path over real HTTP, with rmcp clients, as an agent sees it (design "T
 
 > **Note from Task 8 (issue #98, review of PR #112), 2026-11-03.** Every write rebuilds the connection's overlay (about 10 ms on the real catalog) while it holds the changeset's row lock, because the previous write `forget`s it. This is accepted for M5. This task's concurrency work decides whether the write path should stop storing the overlays it builds, or should reuse them.
 
+> **Corrected (issue #102), 2026-11-03.** What shipped differs from the code below in these ways (read `tests/writes.rs` and `tests/support/server.rs` for the shipped text):
+> - **The Task 8 note is decided: the write path keeps rebuilding the overlay under the row lock** (no reuse of the overlay a write builds, no change to `write::apply` or `Overlays`). Measured with a throwaway test on the real catalog (193 documents, debug build, eight connections of one key): about 25 ms per sequential `log` write, against about 6.6 ms for a `pending_changes` round trip that builds no overlay; eight writes racing on one changeset all finished within about 190 ms, the slowest waiting about 190 ms. Writes to one changeset are serialized by the row lock in any case, so reuse would only shorten each turn, and keeping a cached overlay in step with the entries each write stores is the incremental work Decision 6 rejected. The design's "Write" step 5 says so.
+> - **A sixth test,** `concurrent_writes_from_two_connections_of_one_key_share_one_changeset`: two unlabelled connections of one key (Decision 1's shared `default`) each write three `log` entries at once, and all six bullets are published from the one changeset.
+> - **Assertions follow what shipped:** the create test compares the pending paths and the `(path, op)` pairs of the revisions sorted, rather than relying on their order; the conflict test also asserts `current_revision == 2` and `stale == true` on the still-pending entry (Task 11's Corrected note); the restart test also reads the published `log.md`; the label test checks each result's `label`, that draft b did not see draft a's edit before the publish, and that `pending_changes` names draft b's changeset. One helper, `paths`, replaces `revised` for both `revisions` and `files`.
+> - `client` builds its header list with `Option::map(..).into_iter()` and calls `client_with`; `client_with`'s doc has a `# Panics` section; `restart` cancels the old server before `serve_app` starts the new one. `rustfmt` reflowed the plan's code.
+> - The plan's Step 3 note that "the restart test uses `X-OKF-Changeset`" is wrong: it uses no label, and relies on the `default` label being stable across sessions (Decision 1). The changelog says so.
+
 **Files:**
 - Modify: `tests/support/server.rs` (`client_with`, `restart`, `serve_app`)
 - Create: `tests/writes.rs`
@@ -12969,7 +12977,7 @@ If the real catalog's root `index.md` has lint errors of its own, publish refuse
 - [ ] **Step 2: README**
 
 Rewrite the status line (M1 to M5 delivered) and add a "Writing" section after "Running the server":
-- **Changesets.** A write key's edits go to a changeset per (catalog, key, label). The label is the `X-OKF-Changeset` header, else `?changeset=` on the MCP URL, else the MCP session, else `default`. Nothing is visible to others until `publish`, and a changeset survives disconnects and restarts until it is published or discarded.
+- **Changesets.** A write key's edits go to a changeset per (catalog, key, label). The label is the `X-OKF-Changeset` header, else `?changeset=` on the MCP URL, else `default` (never the MCP session; Decision 1). Nothing is visible to others until `publish`, and a changeset survives disconnects and restarts until it is published or discarded.
 - **The `mcp.json` entry with a label:**
 
   ```json
@@ -13026,7 +13034,7 @@ Write `changelog/<ts>-m5-writes.md`. It covers:
 - the deviations;
 - every `Corrected` note;
 - the smoke timings: create, stamp, log, pending, lint pending, publish;
-- the test counts against M4's: 342 unit, 8 server, 6 golden parity, 1 roundtrip, 13 doc. Add the new suites: `tests/writes.rs` (5), the ops parity golden and live tests, and the smoke test (4 ignored).
+- the test counts against M4's: 342 unit, 8 server, 6 golden parity, 1 roundtrip, 13 doc. Add the new suites: `tests/writes.rs` (6; Corrected, issue #102), the ops parity golden and live tests, and the smoke test (4 ignored).
 - the follow-ups for M6:
   - `move_concept`, `split_concept` and `delete_concept` on `write::apply`. A deletion is a touched path the op removed, through `MemWorkspace::remove`. Their listing changes need `ReplayOp` variants for renaming and removing a bullet;
   - the derived-column backfill, when `Derived::of` first changes;

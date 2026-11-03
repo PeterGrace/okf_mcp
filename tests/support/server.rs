@@ -100,26 +100,31 @@ impl TestServer {
                 .await
                 .expect("import");
         }
-        let app = App::load(db.pool.clone(), config, Arc::new(SystemClock))
-            .await
-            .expect("app loads");
-        // Port 0: the OS picks a free one.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let base = format!("http://{}", listener.local_addr().expect("address"));
-        let shutdown = CancellationToken::new();
-        tokio::spawn(okf_mcp::http::serve(
-            Arc::clone(&app),
-            listener,
-            shutdown.clone(),
-        ));
+        let (base, app, shutdown) = serve_app(&db, config).await;
         Self {
             base,
             app,
             shutdown,
             db,
         }
+    }
+
+    /// Stops the server and starts a new one on the same database, as a
+    /// pod restart would: nothing in memory survives, everything stored does.
+    ///
+    /// # Arguments
+    /// * `config` - the new server's settings.
+    ///
+    /// # Panics
+    /// As [`TestServer::start`].
+    pub async fn restart(&mut self, config: Config) {
+        // The old server's sessions and poll loop stop; its connections close.
+        // `Drop` forbids moving fields out of `self`, so each is replaced in place.
+        self.shutdown.cancel();
+        let (base, app, shutdown) = serve_app(&self.db, config).await;
+        self.base = base;
+        self.app = app;
+        self.shutdown = shutdown;
     }
 
     /// The MCP endpoint.
@@ -183,13 +188,42 @@ impl TestServer {
     /// # Errors
     /// The client's failure to initialize (a refused key, say), as text.
     pub async fn client(&self, key: &str, catalogs: Option<&str>) -> Result<Client, String> {
-        let mut headers = HashMap::new();
-        if let Some(list) = catalogs {
-            headers.insert(
-                HeaderName::from_static("x-okf-catalogs"),
-                HeaderValue::from_str(list).expect("header value"),
-            );
-        }
+        // `Option::map` then `into_iter` yields zero or one pair: no header, or one.
+        let headers: Vec<(&'static str, &str)> = catalogs
+            .map(|list| ("x-okf-catalogs", list))
+            .into_iter()
+            .collect();
+        self.client_with(key, &headers).await
+    }
+
+    /// An MCP client with `key` and extra request headers (`X-OKF-Catalogs`,
+    /// `X-OKF-Changeset`) on every request.
+    ///
+    /// # Arguments
+    /// * `key` - the bearer key.
+    /// * `headers` - `(lowercase name, value)` pairs.
+    ///
+    /// # Returns
+    /// The connected client.
+    ///
+    /// # Errors
+    /// As [`TestServer::client`].
+    ///
+    /// # Panics
+    /// If a name is not lowercase or a value is not a valid header value.
+    pub async fn client_with(
+        &self,
+        key: &str,
+        headers: &[(&'static str, &str)],
+    ) -> Result<Client, String> {
+        let headers: HashMap<HeaderName, HeaderValue> = headers
+            .iter()
+            // `&(name, value)` copies the two references out of each pair.
+            .map(|&(name, value)| {
+                let value = HeaderValue::from_str(value).expect("header value");
+                (HeaderName::from_static(name), value)
+            })
+            .collect();
         let config = StreamableHttpClientTransportConfig::with_uri(self.mcp_url())
             .auth_header(key)
             .custom_headers(headers);
@@ -198,6 +232,35 @@ impl TestServer {
             .await
             .map_err(|error| error.to_string())
     }
+}
+
+/// Loads the app on `db` and serves it on a free port.
+///
+/// # Arguments
+/// * `db` - the database, already migrated and imported.
+/// * `config` - the server's settings.
+///
+/// # Returns
+/// The base URL, the app, and the token that stops the server.
+///
+/// # Panics
+/// If the app does not load or the bind fails.
+async fn serve_app(db: &TestDb, config: Config) -> (String, Arc<App>, CancellationToken) {
+    let app = App::load(db.pool.clone(), config, Arc::new(SystemClock))
+        .await
+        .expect("app loads");
+    // Port 0: the OS picks a free one.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let shutdown = CancellationToken::new();
+    tokio::spawn(okf_mcp::http::serve(
+        Arc::clone(&app),
+        listener,
+        shutdown.clone(),
+    ));
+    (base, app, shutdown)
 }
 
 /// Calls a tool.
