@@ -105,7 +105,11 @@ async fn create_link_index_log_publish_and_export() {
         ["/infra/index.md", "/infra/ntp.md", "/log.md"]
     );
     assert_eq!(seen["title"], "NTP");
+    // `NotFound`, not just any error: the reader's published view lacks the concept.
     assert_eq!(unseen.is_error, Some(true));
+    let unseen = unseen.structured_content.expect("the error's JSON");
+    assert_eq!(unseen["error"], "NotFound");
+    assert_eq!(unseen["path"], "/infra/ntp.md");
     assert_eq!(published["published"], true);
     let mut revisions: Vec<(&str, &str)> = published["revisions"]
         .as_array()
