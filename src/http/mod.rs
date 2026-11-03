@@ -310,6 +310,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_refused_secret_is_a_bad_request_with_its_rule_and_line() {
+        let refused = AppError(OkfError::SecretDetected {
+            path: "notes.md".to_string(),
+            line: 6,
+            rule: "secret:assignment".to_string(),
+            message: "possible secret: 'password' followed by a literal value Ab1A...".to_string(),
+        });
+
+        let status = refused.status();
+        let body = json_body(refused.into_response()).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "SecretDetected");
+        assert_eq!(
+            (&body["line"], &body["rule"]),
+            (&6.into(), &"secret:assignment".into())
+        );
+    }
+
     // `start_paused`: tokio's clock jumps ahead whenever every task is
     // waiting on a timer, so the 120-second timeout passes at once.
     #[tokio::test(start_paused = true)]
