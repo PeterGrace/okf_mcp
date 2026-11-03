@@ -27,6 +27,7 @@ use chrono::{DateTime, FixedOffset, Utc};
 use indexmap::IndexMap;
 use rayon::prelude::*;
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::okf::pystr::py_str;
@@ -38,7 +39,7 @@ use crate::okf::yaml::Value;
 const STAMP_FIELDS: [&str; 3] = ["generated", "verified", "reviewed"];
 
 /// One row of `oldest --json`, keys in `okf.py`'s order.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct OldestRow {
     /// `/`-prefixed concept path.
     pub path: String,

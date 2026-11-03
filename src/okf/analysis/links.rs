@@ -14,6 +14,7 @@ use std::sync::LazyLock;
 
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::okf::markdown::{find_links, split_frontmatter};
@@ -27,7 +28,7 @@ pub const MIN_NAME_LEN: usize = 4;
 const HIT_TEXT_LEN: usize = 160;
 
 /// A link problem: `{"file", "line", "link"}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct LinkIssue {
     /// The linking document.
     pub file: String,
@@ -38,7 +39,7 @@ pub struct LinkIssue {
 }
 
 /// An index problem: `{"file", "problem"}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct IndexDrift {
     /// The unlisted document, or the index with a misfiled bullet.
     pub file: String,
@@ -47,7 +48,7 @@ pub struct IndexDrift {
 }
 
 /// One line mentioning a concept by name: `{"line", "name", "text"}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct MentionHit {
     /// 1-based line.
     pub line: usize,
@@ -58,7 +59,7 @@ pub struct MentionHit {
 }
 
 /// A concept mentioning another without linking to it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct UnlinkedMention {
     /// The mentioning concept.
     pub file: String,
@@ -69,7 +70,7 @@ pub struct UnlinkedMention {
 }
 
 /// Counts: `concepts`, then one per report list, in `okf.py`'s key order.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct LinksSummary {
     /// Number of concepts.
     pub concepts: usize,
@@ -90,7 +91,7 @@ pub struct LinksSummary {
 }
 
 /// The whole report, keys in `okf.py`'s order.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct LinksReport {
     /// Links whose target does not exist.
     pub broken: Vec<LinkIssue>,
