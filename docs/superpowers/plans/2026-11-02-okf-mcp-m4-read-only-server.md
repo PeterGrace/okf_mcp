@@ -934,12 +934,25 @@ form_urlencoded = "1.2.2"
 
 - [ ] **Step 2: Write the failing tests**
 
+> **Corrected (issue #67), 2026-11-03.** The code below is what shipped, with three
+> changes from the original plan, none to the public API (`Selection::{catalogs,
+> write_target}`, `Sources`, `resolve`, `connection_catalogs`, `CATALOGS_HEADER` are
+> as planned): `resolve` treats an empty *connection* list like an empty argument
+> (unset), so no caller can build an empty `Selection`; `connection_catalogs` reads the
+> query when the header names nothing (`" , "`), and reads repeated headers as one
+> list; and a header that is not ASCII is decoded lossily instead of ignored, so a
+> garbled name fails naming it in `resolve` rather than silently falling back to the
+> key's default (design: "Catalogs are never silently dropped"). Step 2's tests gained
+> asserts for each.
+
 Create `src/selection.rs` with the tests module:
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+
     use crate::auth::Reach;
     use crate::store::keys::Access;
 
@@ -983,9 +996,15 @@ mod tests {
         };
 
         assert_eq!(select(&key, all).unwrap(), ["work"]);
-        let no_argument = Sources { argument: None, ..all };
+        let no_argument = Sources {
+            argument: None,
+            ..all
+        };
         assert_eq!(select(&key, no_argument).unwrap(), ["pg", "work"]);
-        let key_default = Sources { connection: None, ..no_argument };
+        let key_default = Sources {
+            connection: None,
+            ..no_argument
+        };
         assert_eq!(select(&key, key_default).unwrap(), ["home"]);
         let server_default = principal(&[], None);
         assert_eq!(select(&server_default, key_default).unwrap(), ["pg"]);
@@ -1003,6 +1022,12 @@ mod tests {
         };
 
         assert_eq!(select(&key, sources).unwrap(), ["work"]);
+        let empty_connection = Sources {
+            connection: Some(&empty),
+            server_default: Some("pg"),
+            ..sources
+        };
+        assert_eq!(select(&key, empty_connection).unwrap(), ["pg"]);
     }
 
     #[test]
@@ -1089,8 +1114,28 @@ mod tests {
             connection_catalogs(&parts("/mcp?x=1&catalogs=home%2Cpg", None)),
             Some(names(&["home", "pg"]))
         );
+        assert_eq!(
+            connection_catalogs(&parts("/mcp?catalogs=home", Some(" , "))),
+            Some(names(&["home"]))
+        );
         assert_eq!(connection_catalogs(&parts("/mcp", Some(" , "))), None);
         assert_eq!(connection_catalogs(&parts("/mcp", None)), None);
+
+        let mut repeated = parts("/mcp?catalogs=home", Some("pg"));
+        repeated
+            .headers
+            .append(CATALOGS_HEADER, HeaderValue::from_static("work"));
+        assert_eq!(connection_catalogs(&repeated), Some(names(&["pg", "work"])));
+
+        let mut garbled = parts("/mcp?catalogs=home", None);
+        garbled.headers.insert(
+            CATALOGS_HEADER,
+            HeaderValue::from_bytes(b"pg,w\xffrk").unwrap(),
+        );
+        assert_eq!(
+            connection_catalogs(&garbled),
+            Some(names(&["pg", "w\u{fffd}rk"]))
+        );
     }
 }
 ```
@@ -1157,34 +1202,49 @@ pub struct Sources<'a> {
 }
 
 /// Splits a comma-separated list, trimming names and dropping empty ones.
-fn split_names(list: &str) -> Option<Vec<String>> {
-    let names: Vec<String> = list
-        .split(',')
+// `impl Iterator<...> + '_`: a lazy sequence (like a Python generator) that
+// borrows `list`, so nothing is copied until a caller collects it.
+fn split_names(list: &str) -> impl Iterator<Item = String> + '_ {
+    list.split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
-        .collect();
+}
+
+/// `None` for an empty list, so an empty source counts as unset.
+fn non_empty(names: Vec<String>) -> Option<Vec<String>> {
+    // `then_some(x)`: `Some(x)` if the condition holds, else `None`.
     (!names.is_empty()).then_some(names)
 }
 
 /// The catalogs a connection names: the `X-OKF-Catalogs` header, else the
 /// `catalogs` query parameter.
 ///
+/// Repeated headers are read in order, as one list (RFC 9110 5.3). A header
+/// that names nothing (`" , "`) counts as unset, so the query is read. Bytes
+/// that are not UTF-8 are kept (lossily), so a garbled name reaches
+/// [`resolve`] and fails naming it rather than being dropped.
+///
 /// # Arguments
 /// * `parts` - the HTTP request (rmcp passes it to every tool).
 ///
 /// # Returns
-/// The names, or `None` if neither is set (or both are empty, or the header
-/// is not ASCII).
+/// The names, or `None` if neither source names a catalog.
 pub fn connection_catalogs(parts: &Parts) -> Option<Vec<String>> {
-    if let Some(header) = parts.headers.get(CATALOGS_HEADER) {
-        return header.to_str().ok().and_then(split_names);
+    let mut from_header: Vec<String> = Vec::new();
+    for value in parts.headers.get_all(CATALOGS_HEADER) {
+        // `from_utf8_lossy` returns a `Cow`: a borrow when the bytes are
+        // valid UTF-8, a new string (with U+FFFD for bad bytes) otherwise.
+        from_header.extend(split_names(&String::from_utf8_lossy(value.as_bytes())));
     }
-    let query = parts.uri.query()?;
-    // `parse` yields decoded `(key, value)` pairs (`%2C` becomes `,`).
-    form_urlencoded::parse(query.as_bytes())
-        .find(|(key, _)| key == CATALOGS_QUERY)
-        .and_then(|(_, value)| split_names(&value))
+    // `or_else` runs the closure only when the header named nothing.
+    non_empty(from_header).or_else(|| {
+        let query = parts.uri.query()?;
+        // `parse` yields decoded `(key, value)` pairs (`%2C` becomes `,`).
+        form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == CATALOGS_QUERY)
+            .and_then(|(_, value)| non_empty(split_names(&value).collect()))
+    })
 }
 
 /// Resolves a call's catalogs.
@@ -1208,11 +1268,16 @@ pub fn resolve(
     sources: Sources<'_>,
     exists: impl Fn(&str) -> bool,
 ) -> Result<Selection, OkfError> {
+    // `as_deref`: `Option<String>` to `Option<&str>`, borrowing the name.
     let key_default = principal.default_catalog.as_deref();
-    // An empty list (`catalogs: []`) counts as unset, so the selection is
-    // never empty.
-    let listed = sources.argument.filter(|list| !list.is_empty());
-    let names: Vec<&str> = if let Some(list) = listed.or(sources.connection) {
+    // The argument, else the connection. An empty list (`catalogs: []`)
+    // counts as unset, so the selection is never empty; `flatten` skips the
+    // sources that are `None`.
+    let listed = [sources.argument, sources.connection]
+        .into_iter()
+        .flatten()
+        .find(|list| !list.is_empty());
+    let names: Vec<&str> = if let Some(list) = listed {
         list.iter().map(String::as_str).collect()
     } else if let Some(name) = key_default.or(sources.server_default) {
         vec![name]
