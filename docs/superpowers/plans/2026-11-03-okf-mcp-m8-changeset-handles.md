@@ -277,7 +277,7 @@ fn findings_json(findings: &[Finding]) -> serde_json::Value {
 **Files:**
 - Create: `migrations/0003_changeset_handles.sql`
 - Modify: `src/store/changesets.rs` (`ChangesetRow.handle`, `RawChangeset`, `changeset_columns!`, `open`, `by_handle`, tests)
-- Modify: `src/error.rs` (`UnknownChangeset`: variant, `kind`, `is_internal` arm, `to_json` arm, test)
+- Modify: `src/error.rs` (`UnknownChangeset`: variant, `kind` arm, `to_json` arm, test)
 - Modify: `src/mcp/context.rs` (`Pinned`, `ToolContext::changeset`, tests)
 - Modify: `src/mcp/changesets.rs` (the `open_changeset` tool, its own `#[tool_router]` block, `open_router`)
 - Modify: `src/mcp/mod.rs` (join `open_router` in `OkfServer::tools`; the tool-count test, if any, goes up by one)
