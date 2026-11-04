@@ -1,5 +1,7 @@
 //! The reports: `open_questions`, `oldest`, `sprawl`, `links_report` and
-//! `lint`, each on one catalog (Decision 1) and on a blocking thread.
+//! `lint`, each on one catalog (Decision 1) and on a blocking thread. Each
+//! takes an optional `changeset` handle to read through its drafts (M8
+//! Decision 6); the report then defaults to the changeset's catalog.
 //!
 //! `oldest`, `sprawl`, `links_report` and `lint` answer with `okf.py`'s JSON,
 //! the catalog's name added and lists wrapped in an object (every output
@@ -29,13 +31,15 @@ use crate::overlay::View;
 /// `okf.py`'s default `-n` for `oldest` and `sprawl`.
 const DEFAULT_N: usize = 5;
 
-/// A report's only argument.
-// `Deserialize` reads it from the call's JSON; `JsonSchema` gives the tool its
-// input schema, with the doc comments as the fields' descriptions.
+/// `open_questions`' arguments: a catalog and a changeset.
+// `Deserialize` reads them from the call's JSON; `JsonSchema` gives the tool
+// its input schema, with the doc comments as the fields' descriptions.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct CatalogParam {
-    /// The catalog (default: the first selected catalog).
+    /// The catalog (default: the changeset's, else the first selected catalog).
     pub catalog: Option<String>,
+    /// Read through this changeset's drafts (its handle); the report then runs on its catalog unless `catalog` names it.
+    pub changeset: Option<String>,
 }
 
 /// One queued question.
@@ -70,8 +74,11 @@ pub struct OpenQuestions {
 /// `oldest`'s arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct OldestParams {
-    /// The catalog (default: the first selected catalog).
+    /// The catalog (default: the changeset's, else the first selected catalog).
     pub catalog: Option<String>,
+    /// Read through this changeset's drafts (its handle); the report then runs on its catalog unless `catalog` names it.
+    pub changeset: Option<String>,
+
     /// How many concepts (default 5; ignored with `open_questions_only`).
     pub n: Option<usize>,
     /// Only concepts with queued `open_questions`, all of them.
@@ -93,8 +100,11 @@ pub struct Oldest {
 /// `sprawl`'s arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct SprawlParams {
-    /// The catalog (default: the first selected catalog).
+    /// The catalog (default: the changeset's, else the first selected catalog).
     pub catalog: Option<String>,
+    /// Read through this changeset's drafts (its handle); the report then runs on its catalog unless `catalog` names it.
+    pub changeset: Option<String>,
+
     /// One concept to score (default: the worst `n`).
     pub path: Option<String>,
     /// How many concepts (default 5).
@@ -113,8 +123,11 @@ pub struct Sprawl {
 /// `links_report`'s arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct LinksParams {
-    /// The catalog (default: the first selected catalog).
+    /// The catalog (default: the changeset's, else the first selected catalog).
     pub catalog: Option<String>,
+    /// Read through this changeset's drafts (its handle); the report then runs on its catalog unless `catalog` names it.
+    pub changeset: Option<String>,
+
     /// Also look for unlinked mentions of concept names (default true; the slowest part).
     pub mentions: Option<bool>,
 }
@@ -132,12 +145,10 @@ pub struct Links {
 /// `lint`'s arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct LintParams {
-    /// The catalog (default: the first selected catalog).
+    /// The catalog (default: the changeset's, else the first selected catalog).
     pub catalog: Option<String>,
-    /// Lint this connection's pending changes (its changeset applied to the
-    /// published catalog) instead of the published catalog; the changed
-    /// paths count as uncommitted for `generated-after-commit`.
-    pub pending: Option<bool>,
+    /// Lint this changeset's drafts (its handle) applied to the published catalog, instead of the published catalog; its changed paths count as uncommitted for `generated-after-commit`.
+    pub changeset: Option<String>,
 }
 
 /// `lint`'s result: `okf.py lint --json` plus the catalog.
@@ -145,8 +156,7 @@ pub struct LintParams {
 pub struct Lint {
     /// The catalog.
     pub catalog: String,
-    /// Whether this connection's pending changes were linted: `pending` was
-    /// asked for and the connection has an open changeset in the catalog.
+    /// Whether a changeset's drafts were linted: the call named `changeset`.
     pub pending: bool,
     /// The findings; `flatten` writes `errors` and `warnings` beside `catalog`.
     #[serde(flatten)]
@@ -170,7 +180,8 @@ pub(crate) async fn open_questions(
 ) -> Result<OpenQuestions, OkfError> {
     // The view holds an `Arc` handle to the snapshot; `move` hands it to the
     // blocking thread, which must own what it reads.
-    let (state, view) = one_view(ctx, params.catalog.as_deref()).await?;
+    let (state, view) =
+        one_view(ctx, params.catalog.as_deref(), params.changeset.as_deref()).await?;
     let now = ctx.app().clock().now();
     let query = OldestQuery {
         n: 0,
@@ -214,7 +225,8 @@ pub(crate) async fn oldest_report(
     ctx: &ToolContext,
     params: OldestParams,
 ) -> Result<Oldest, OkfError> {
-    let (state, view) = one_view(ctx, params.catalog.as_deref()).await?;
+    let (state, view) =
+        one_view(ctx, params.catalog.as_deref(), params.changeset.as_deref()).await?;
     let now = ctx.app().clock().now();
     let query = OldestQuery {
         n: params.n.unwrap_or(DEFAULT_N),
@@ -244,7 +256,8 @@ pub(crate) async fn sprawl_report(
     ctx: &ToolContext,
     params: SprawlParams,
 ) -> Result<Sprawl, OkfError> {
-    let (state, view) = one_view(ctx, params.catalog.as_deref()).await?;
+    let (state, view) =
+        one_view(ctx, params.catalog.as_deref(), params.changeset.as_deref()).await?;
     let n = params.n.unwrap_or(DEFAULT_N);
     let path = params.path;
     // The trailing `?` re-raises the analysis' error after the thread ends.
@@ -274,7 +287,8 @@ pub(crate) async fn sprawl_report(
 /// # Errors
 /// A selection error; as [`ToolContext::view`].
 pub(crate) async fn links(ctx: &ToolContext, params: LinksParams) -> Result<Links, OkfError> {
-    let (state, view) = one_view(ctx, params.catalog.as_deref()).await?;
+    let (state, view) =
+        one_view(ctx, params.catalog.as_deref(), params.changeset.as_deref()).await?;
     let mentions = params.mentions.unwrap_or(true);
     let report = blocking(move || links_report(view.snapshot(), mentions)).await;
     Ok(Links {
@@ -284,11 +298,12 @@ pub(crate) async fn links(ctx: &ToolContext, params: LinksParams) -> Result<Link
 }
 
 /// `okf.py lint`, on the published catalog with its commit times, or with
-/// `pending` on this connection's view of it.
+/// `changeset` on that changeset's drafts (whose paths count as
+/// uncommitted; [`crate::overlay::Overlay::lint`]).
 ///
 /// # Arguments
 /// * `ctx` - the call's context.
-/// * `params` - the catalog, if named, and `pending`.
+/// * `params` - the catalog, if named, and the changeset.
 ///
 /// # Returns
 /// The errors and warnings, and whether pending changes were linted.
@@ -296,12 +311,8 @@ pub(crate) async fn links(ctx: &ToolContext, params: LinksParams) -> Result<Link
 /// # Errors
 /// A selection error; as [`ToolContext::view`].
 pub(crate) async fn lint_report(ctx: &ToolContext, params: LintParams) -> Result<Lint, OkfError> {
-    let state = ctx.one(params.catalog.as_deref())?;
-    let view = if params.pending.unwrap_or(false) {
-        ctx.view(&state).await?
-    } else {
-        View::Published(state.current())
-    };
+    let (state, view) =
+        one_view(ctx, params.catalog.as_deref(), params.changeset.as_deref()).await?;
     let pending = view.pending();
     let now = ctx.app().clock().now();
     let report = blocking(move || view.lint(now)).await;
@@ -312,23 +323,28 @@ pub(crate) async fn lint_report(ctx: &ToolContext, params: LintParams) -> Result
     })
 }
 
-/// The one catalog a report runs on, and this connection's view of it.
+/// The one catalog a report runs on, and the call's view of it.
 ///
 /// # Arguments
 /// * `ctx` - the call's context.
 /// * `catalog` - the call's `catalog` argument.
+/// * `changeset` - the call's `changeset` argument.
 ///
 /// # Returns
-/// The catalog's state and view.
+/// The catalog ([`ToolContext::report_catalog`]) and its view: the
+/// changeset's drafts with `changeset`, else published.
 ///
 /// # Errors
-/// A selection error; as [`ToolContext::view`].
+/// As [`ToolContext::pin`]; as [`ToolContext::report_catalog`]; as
+/// [`ToolContext::view`].
 async fn one_view(
     ctx: &ToolContext,
     catalog: Option<&str>,
+    changeset: Option<&str>,
 ) -> Result<(Arc<CatalogState>, View), OkfError> {
-    let state = ctx.one(catalog)?;
-    let view = ctx.view(&state).await?;
+    let pinned = ctx.pin(changeset).await?;
+    let state = ctx.report_catalog(catalog, pinned.as_ref())?;
+    let view = ctx.view(&state, pinned.as_ref()).await?;
     Ok((state, view))
 }
 
@@ -396,9 +412,9 @@ impl OkfServer {
     /// The `lint` tool.
     #[tool(
         description = "Lint a catalog (okf.py lint --json): errors and warnings with file, \
-                          line, rule and message. Without `pending`, the published catalog; with \
-                          `pending: true`, this connection's pending changes applied to it, the \
-                          changed paths counted as uncommitted."
+                          line, rule and message. Without `changeset`, the published catalog; \
+                          with `changeset` (a handle from open_changeset), that changeset's \
+                          drafts applied to it, the changed paths counted as uncommitted."
     )]
     async fn lint(
         &self,
@@ -420,8 +436,8 @@ mod tests {
     use crate::clock::FixedClock;
     use crate::config::Config;
     use crate::mcp::testing::{
-        app_at, app_with, context, pending_entry, principal, principal_as, store_key, PendingEdit,
-        TestApp,
+        app_at, app_with, context, open, pending_entry, principal, principal_as, store_key,
+        PendingEdit, TestApp,
     };
     use crate::store::keys::Access;
 
@@ -450,9 +466,15 @@ mod tests {
         let test = test_app().await;
         let ctx = context(&test, principal(&[], Some("pg")), None);
 
-        let found = open_questions(&ctx, CatalogParam { catalog: None })
-            .await
-            .unwrap();
+        let found = open_questions(
+            &ctx,
+            CatalogParam {
+                catalog: None,
+                changeset: None,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(found.catalog, "pg");
         assert_eq!(found.concepts.len(), 1);
@@ -476,6 +498,7 @@ mod tests {
             LinksParams {
                 catalog: None,
                 mentions: None,
+                changeset: None,
             },
         )
         .await
@@ -485,6 +508,7 @@ mod tests {
             LinksParams {
                 catalog: Some("pg".to_string()),
                 mentions: Some(false),
+                changeset: None,
             },
         )
         .await
@@ -509,6 +533,7 @@ mod tests {
                 catalog: None,
                 n: Some(1),
                 open_questions_only: false,
+                changeset: None,
             },
         )
         .await
@@ -519,6 +544,7 @@ mod tests {
                 catalog: None,
                 path: Some("q".to_string()),
                 n: None,
+                changeset: None,
             },
         )
         .await
@@ -529,6 +555,7 @@ mod tests {
                 catalog: None,
                 path: Some("nowhere".to_string()),
                 n: None,
+                changeset: None,
             },
         )
         .await;
@@ -536,7 +563,7 @@ mod tests {
             &ctx,
             LintParams {
                 catalog: None,
-                pending: None,
+                changeset: None,
             },
         )
         .await
@@ -566,7 +593,7 @@ mod tests {
                 Extension(parts.clone()),
                 Parameters(LintParams {
                     catalog: Some("work".to_string()),
-                    pending: None,
+                    changeset: None,
                 }),
             )
             .await;
@@ -577,6 +604,7 @@ mod tests {
                     catalog: None,
                     path: Some("index".to_string()),
                     n: None,
+                    changeset: None,
                 }),
             )
             .await;
@@ -617,7 +645,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn pending_lint_counts_the_changeset_s_paths_as_uncommitted() {
+    async fn lint_counts_only_the_pinned_changeset_s_paths_as_uncommitted() {
         let imported = Utc.with_ymd_and_hms(2026, 11, 3, 12, 0, 0).unwrap();
         // Stamped after the import: `generated-after-commit` on a clean file.
         let stamped =
@@ -636,21 +664,21 @@ mod tests {
             principal_as("writer", Access::Write, &[], Some("pg")),
             None,
         );
+        let handle = open(&ctx).await;
         let edited = format!("{stamped}More.\n");
         let edit = PendingEdit {
-            catalog: "pg",
             path: "later.md",
             text: Some(&edited),
             at: imported + TimeDelta::minutes(20),
         };
-        pending_entry(&test, &ctx, &edit).await;
-        let params = |pending| LintParams {
+        pending_entry(&test, &handle, &edit).await;
+        let params = |changeset: Option<&str>| LintParams {
             catalog: None,
-            pending,
+            changeset: changeset.map(str::to_string),
         };
 
         let published = lint_report(&ctx, params(None)).await.unwrap();
-        let pending = lint_report(&ctx, params(Some(true))).await.unwrap();
+        let pending = lint_report(&ctx, params(Some(&handle))).await.unwrap();
 
         let flagged = |lint: &Lint| -> Vec<String> {
             lint.report
@@ -664,5 +692,76 @@ mod tests {
         assert!(pending.pending);
         assert_eq!(flagged(&published), ["later.md", "other.md"]);
         assert_eq!(flagged(&pending), ["other.md"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_report_defaults_to_the_pinned_changeset_s_catalog() {
+        let test = test_app().await;
+        store_key(&test, "writer").await;
+        let in_pg = context(
+            &test,
+            principal_as("writer", Access::Write, &[], Some("pg")),
+            None,
+        );
+        // `work` first: without a changeset, reports run on `work`.
+        let connection = context(
+            &test,
+            principal_as("writer", Access::Write, &[], None),
+            Some(&["work", "pg"]),
+        );
+        let handle = open(&in_pg).await;
+        let edit = PendingEdit {
+            path: "new.md",
+            text: Some("---\ntype: Note\ntitle: N\nopen_questions:\n  - Why?\n---\nBody.\n"),
+            at: Utc::now(),
+        };
+        pending_entry(&test, &handle, &edit).await;
+        let questions = |catalog: Option<&str>, changeset: Option<&str>| CatalogParam {
+            catalog: catalog.map(str::to_string),
+            changeset: changeset.map(str::to_string),
+        };
+
+        let plain = open_questions(&connection, questions(None, None))
+            .await
+            .unwrap();
+        let pinned = open_questions(&connection, questions(None, Some(&handle)))
+            .await
+            .unwrap();
+        let lint = lint_report(
+            &connection,
+            LintParams {
+                catalog: None,
+                changeset: Some(handle.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        let elsewhere = open_questions(&connection, questions(Some("work"), Some(&handle)))
+            .await
+            .unwrap_err();
+        // The changeset's catalog stands in for a `catalog` argument, which
+        // wins over the connection's catalogs: a `work`-only connection
+        // reports on `pg` too.
+        let work_only = context(
+            &test,
+            principal_as("writer", Access::Write, &[], None),
+            Some(&["work"]),
+        );
+        let outside_selection = open_questions(&work_only, questions(None, Some(&handle)))
+            .await
+            .unwrap();
+
+        assert_eq!(plain.catalog, "work");
+        assert_eq!(pinned.catalog, "pg");
+        let paths: Vec<&str> = pinned
+            .concepts
+            .iter()
+            .map(|concept| concept.path.as_str())
+            .collect();
+        assert_eq!(paths, ["/new.md", "/q.md"]);
+        assert_eq!((lint.catalog.as_str(), lint.pending), ("pg", true));
+        assert_eq!(elsewhere.kind(), "Refused");
+        assert!(elsewhere.to_string().contains("\"pg\""), "{elsewhere}");
+        assert_eq!(outside_selection.catalog, "pg");
     }
 }

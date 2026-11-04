@@ -427,7 +427,7 @@ mod tests {
     use crate::db::test_db;
     use crate::mcp::testing::app_with;
     use crate::okf::workspace::StoredFile;
-    use crate::store::changesets::{ChangesetKey, ChangesetState, EntryRow};
+    use crate::store::changesets::{ChangesetState, EntryRow};
     use crate::store::import::{import, ImportOptions};
     use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
     use chrono::{DateTime, TimeDelta, Utc};
@@ -833,23 +833,17 @@ mod tests {
         assert_eq!(test.app.clock_status(), None);
     }
 
-    /// Opens `label`'s changeset for key `writer` at `at`, with an entry for
-    /// `path` if given.
+    /// Opens a changeset for key `writer` at `at`, with an entry for `path`
+    /// if given.
     async fn changeset_at(
         pool: &PgPool,
         catalog_id: i64,
-        label: &str,
         at: DateTime<Utc>,
         path: Option<&str>,
     ) -> i64 {
-        let key = ChangesetKey {
-            catalog_id,
-            key_id: "writer",
-            label,
-        };
         let mut tx = pool.begin().await.unwrap();
         changesets::lock_catalog(&mut tx, catalog_id).await.unwrap();
-        let changeset = changesets::get_or_create(&mut tx, &key, "writer", at)
+        let changeset = changesets::open(&mut tx, catalog_id, "writer", "writer", at)
             .await
             .unwrap();
         if let Some(path) = path {
@@ -877,9 +871,9 @@ mod tests {
         new_key(&db.pool, "writer").await;
         let app = app(&db.pool).await;
         let day_old = Utc::now() - TimeDelta::hours(25);
-        let empty_old = changeset_at(&db.pool, pg.id, "a", day_old, None).await;
-        let empty_new = changeset_at(&db.pool, pg.id, "b", Utc::now(), None).await;
-        let full_old = changeset_at(&db.pool, pg.id, "c", day_old, Some("a.md")).await;
+        let empty_old = changeset_at(&db.pool, pg.id, day_old, None).await;
+        let empty_new = changeset_at(&db.pool, pg.id, Utc::now(), None).await;
+        let full_old = changeset_at(&db.pool, pg.id, day_old, Some("a.md")).await;
 
         app.poll().await.unwrap();
 

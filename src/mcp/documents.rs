@@ -1,6 +1,8 @@
 //! `get_concept` and `read_document`: one document, from the first selected
 //! catalog that has it (Decision 1).
 
+use std::sync::Arc;
+
 use axum::http::request::Parts;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
@@ -11,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogState;
 use crate::error::OkfError;
-use crate::mcp::context::{is_broken_overlay, ToolContext};
+use crate::mcp::context::{is_broken_overlay, require_selected, Pinned, ToolContext};
 use crate::mcp::{reply, OkfServer};
 use crate::okf::paths::{basename, escapes_root, normpath};
 use crate::okf::snapshot::{Frontmatter, Snapshot, SnapshotDoc};
@@ -35,6 +37,8 @@ pub struct GetConceptParams {
     /// Also return the file verbatim.
     #[serde(default)]
     pub raw: bool,
+    /// Read through this changeset's drafts (its handle); its catalog must be one this call reads.
+    pub changeset: Option<String>,
 }
 
 /// A link out of the concept.
@@ -101,6 +105,8 @@ pub struct ReadDocumentParams {
     pub path: Option<String>,
     /// The catalog (default: the first selected catalog that has it).
     pub catalog: Option<String>,
+    /// Read through this changeset's drafts (its handle); its catalog must be one this call reads.
+    pub changeset: Option<String>,
 }
 
 /// `read_document`'s result.
@@ -222,7 +228,9 @@ fn concept(
 /// The concept, from the first catalog of the read set that has it.
 ///
 /// # Errors
-/// A selection error; [`OkfError::NotFound`] if no selected catalog has it;
+/// A selection error; as [`ToolContext::pin`] for `changeset`, and
+/// [`OkfError::Refused`] if its catalog is not in the read set;
+/// [`OkfError::NotFound`] if no selected catalog has it;
 /// [`OkfError::InvalidPath`] if no selected catalog has it as a concept and
 /// one holds a document at that path that is not a concept; the first
 /// catalog's overlay error ([`is_broken_overlay`]) if no catalog resolves
@@ -234,9 +242,11 @@ pub(crate) async fn get_concept(
 ) -> Result<Concept, OkfError> {
     let mut refused = None;
     let mut broken = None;
-    for state in ctx.read_set(params.catalog.as_deref())? {
-        // This connection's view: its overlay if it has pending edits here.
-        let Some(view) = view_or_note(ctx, &state, &mut broken).await? else {
+    let (states, pinned) =
+        read_set(ctx, params.catalog.as_deref(), params.changeset.as_deref()).await?;
+    for state in states {
+        // The pinned changeset's overlay in its own catalog, else published.
+        let Some(view) = view_or_note(ctx, &state, pinned.as_ref(), &mut broken).await? else {
             continue;
         };
         let snapshot = view.snapshot();
@@ -261,13 +271,38 @@ pub(crate) async fn get_concept(
         .unwrap_or(OkfError::NotFound { path: params.path }))
 }
 
-/// This connection's view of one catalog of a read set, or `None` if its
-/// overlay does not apply; the first such error is kept in `broken`, so a
-/// later catalog can still answer and the error is reported if none does.
+/// A read tool's read set and its pinned changeset, refusing a changeset
+/// whose catalog is not in the read set.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `catalog` - the call's `catalog` argument.
+/// * `changeset` - the call's `changeset` argument.
+///
+/// # Returns
+/// The catalogs to read, in order, and the pinned changeset, if any.
+///
+/// # Errors
+/// A selection error; as [`ToolContext::pin`]; as [`require_selected`].
+async fn read_set(
+    ctx: &ToolContext,
+    catalog: Option<&str>,
+    changeset: Option<&str>,
+) -> Result<(Vec<Arc<CatalogState>>, Option<Pinned>), OkfError> {
+    let states = ctx.read_set(catalog)?;
+    let pinned = ctx.pin(changeset).await?;
+    require_selected(pinned.as_ref(), &states)?;
+    Ok((states, pinned))
+}
+
+/// The call's view of one catalog of a read set, or `None` if its overlay
+/// does not apply; the first such error is kept in `broken`, so a later
+/// catalog can still answer and the error is reported if none does.
 ///
 /// # Arguments
 /// * `ctx` - the call's context.
 /// * `state` - the catalog.
+/// * `pinned` - the call's changeset, if any.
 /// * `broken` - the first broken overlay's error so far.
 ///
 /// # Returns
@@ -279,9 +314,10 @@ pub(crate) async fn get_concept(
 async fn view_or_note(
     ctx: &ToolContext,
     state: &CatalogState,
+    pinned: Option<&Pinned>,
     broken: &mut Option<OkfError>,
 ) -> Result<Option<View>, OkfError> {
-    match ctx.view(state).await {
+    match ctx.view(state, pinned).await {
         Ok(view) => Ok(Some(view)),
         Err(error) if is_broken_overlay(&error) => {
             // `get_or_insert` keeps the first error.
@@ -314,8 +350,8 @@ fn readable(path: &str) -> bool {
 /// The file verbatim, from the first catalog of the read set that has it.
 ///
 /// # Errors
-/// A selection error; [`OkfError::InvalidPath`] for any other path or one
-/// outside the catalog; [`OkfError::NotFound`] if no selected catalog has it,
+/// A selection error; as [`get_concept`] for `changeset`;
+/// [`OkfError::InvalidPath`] for any other path or one outside the catalog; [`OkfError::NotFound`] if no selected catalog has it,
 /// or the first catalog's overlay error if one's pending changeset does not
 /// apply ([`is_broken_overlay`]); any other error from
 /// [`ToolContext::view`] (a database error, `Busy`), at once.
@@ -334,8 +370,10 @@ pub(crate) async fn read_document(
         });
     }
     let mut broken = None;
-    for state in ctx.read_set(params.catalog.as_deref())? {
-        let Some(view) = view_or_note(ctx, &state, &mut broken).await? else {
+    let (states, pinned) =
+        read_set(ctx, params.catalog.as_deref(), params.changeset.as_deref()).await?;
+    for state in states {
+        let Some(view) = view_or_note(ctx, &state, pinned.as_ref(), &mut broken).await? else {
             continue;
         };
         if let Some(doc) = view.snapshot().get(&path) {
@@ -363,7 +401,8 @@ impl OkfServer {
         description = "Get a concept: its frontmatter as JSON and its body. With `links`, its \
                        resolved outbound links (target, title, description, broken) and its \
                        backlinks; with `raw`, the file verbatim. Without `catalog`, the first \
-                       selected catalog that has it answers."
+                       selected catalog that has it answers. With `changeset` (a handle from \
+                       open_changeset), its catalog reads through that changeset's drafts."
     )]
     async fn get_concept(
         &self,
@@ -378,7 +417,8 @@ impl OkfServer {
     #[tool(
         description = "Read the raw text of an index.md (default /index.md), log.md or \
                        AGENTS.md. Without `catalog`, the first selected catalog that has it \
-                       answers."
+                       answers. With `changeset` (a handle from open_changeset), its catalog \
+                       reads through that changeset's drafts."
     )]
     async fn read_document(
         &self,
@@ -397,7 +437,7 @@ mod tests {
 
     use crate::config::Config;
     use crate::mcp::testing::{
-        app_with, context, pending_entry, principal, principal_as, store_key, PendingEdit,
+        app_with, context, open, pending_entry, principal, principal_as, store_key, PendingEdit,
     };
     use crate::store::keys::Access;
 
@@ -412,6 +452,15 @@ mod tests {
             catalog: None,
             links: false,
             raw: false,
+            changeset: None,
+        }
+    }
+
+    /// `concept_params`, reading through the changeset `handle` names.
+    fn through(path: &str, handle: &str) -> GetConceptParams {
+        GetConceptParams {
+            changeset: Some(handle.to_string()),
+            ..concept_params(path)
         }
     }
 
@@ -550,6 +599,7 @@ mod tests {
                 ReadDocumentParams {
                     path: path.map(str::to_string),
                     catalog: None,
+                    changeset: None,
                 },
             )
         };
@@ -596,64 +646,97 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_concept_sees_a_pending_edit_only_on_the_key_and_label_that_made_it() {
+    async fn get_concept_with_a_changeset_sees_its_draft() {
         let test = app_with(&[("pg", &[("hub.md", HUB)])], Config::default()).await;
         store_key(&test, "alice").await;
         store_key(&test, "bob").await;
-        let alice = || {
-            context(
-                &test,
-                principal_as("alice", Access::Write, &[], Some("pg")),
-                None,
-            )
-        };
+        let alice = context(
+            &test,
+            principal_as("alice", Access::Write, &[], Some("pg")),
+            None,
+        );
         let bob = context(
             &test,
             principal_as("bob", Access::Write, &[], Some("pg")),
             None,
         );
+        let handle = open(&alice).await;
         let edited = HUB.replace("The hub.", "The edited hub.");
         let edit = PendingEdit {
-            catalog: "pg",
             path: "hub.md",
             text: Some(&edited),
             at: Utc::now(),
         };
-        pending_entry(&test, &alice(), &edit).await;
+        pending_entry(&test, &handle, &edit).await;
 
-        let mine = get_concept(&alice(), concept_params("hub")).await.unwrap();
-        let other_label = get_concept(&alice().with_label("other"), concept_params("hub"))
+        let drafted = get_concept(&alice, through("hub", &handle)).await.unwrap();
+        let published = get_concept(&alice, concept_params("hub")).await.unwrap();
+        let not_bobs = get_concept(&bob, through("hub", &handle))
             .await
-            .unwrap();
-        let other_key = get_concept(&bob, concept_params("hub")).await.unwrap();
+            .unwrap_err();
 
-        assert_eq!(mine.frontmatter["description"], "The edited hub.");
-        assert_eq!(other_label.frontmatter["description"], "The hub.");
-        assert_eq!(other_key.frontmatter["description"], "The hub.");
+        assert_eq!(drafted.frontmatter["description"], "The edited hub.");
+        assert_eq!(published.frontmatter["description"], "The hub.");
+        assert_eq!(not_bobs.kind(), "UnknownChangeset");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_concept_refuses_a_changeset_outside_its_read_set() {
+        let test = app_with(
+            &[("pg", &[("hub.md", HUB)]), ("work", &[("hub.md", HUB)])],
+            Config::default(),
+        )
+        .await;
+        store_key(&test, "alice").await;
+        let alice = |connection: Option<&[&str]>| {
+            context(
+                &test,
+                principal_as("alice", Access::Write, &[], Some("pg")),
+                connection,
+            )
+        };
+        let handle = open(&alice(None)).await;
+        let only_work = alice(Some(&["work"]));
+
+        let refused = get_concept(&only_work, through("hub", &handle))
+            .await
+            .unwrap_err();
+        let document = ReadDocumentParams {
+            path: None,
+            catalog: None,
+            changeset: Some(handle.clone()),
+        };
+        let refused_read = read_document(&only_work, document).await.unwrap_err();
+
+        assert_eq!(refused.kind(), "Refused");
+        let message = refused.to_string();
+        assert!(
+            message.contains(&handle) && message.contains("\"pg\""),
+            "{message}"
+        );
+        assert_eq!(refused_read.to_string(), message);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_broken_overlay_is_reported_not_hidden_behind_the_published_state() {
         let test = app_with(&[("pg", &[("hub.md", HUB)])], Config::default()).await;
         store_key(&test, "alice").await;
-        let alice = || {
-            context(
-                &test,
-                principal_as("alice", Access::Write, &[], Some("pg")),
-                None,
-            )
-        };
+        let alice = context(
+            &test,
+            principal_as("alice", Access::Write, &[], Some("pg")),
+            None,
+        );
+        let handle = open(&alice).await;
         // `hub.md` is a published file, so a pending `hub.md/x.md` cannot be
         // applied over it.
         let clash = PendingEdit {
-            catalog: "pg",
             path: "hub.md/x.md",
             text: Some("# X\n"),
             at: Utc::now(),
         };
-        let changeset = pending_entry(&test, &alice(), &clash).await;
+        pending_entry(&test, &handle, &clash).await;
 
-        let error = get_concept(&alice(), concept_params("hub"))
+        let error = get_concept(&alice, through("hub", &handle))
             .await
             .unwrap_err();
 
@@ -662,7 +745,7 @@ mod tests {
         let message = error.to_string();
         assert_eq!(error.kind(), "InvalidPath");
         assert!(
-            message.contains(&format!("in pending changeset {}", changeset.id)),
+            message.contains(&format!("in pending changeset {handle}")),
             "{message}"
         );
         assert!(message.contains("discard the clashing path"), "{message}");
@@ -679,29 +762,29 @@ mod tests {
         )
         .await;
         store_key(&test, "alice").await;
-        let alice = || {
-            context(
-                &test,
-                principal_as("alice", Access::Write, &[], None),
-                Some(&["pg", "work"]),
-            )
-        };
+        let alice = context(
+            &test,
+            principal_as("alice", Access::Write, &[], None),
+            Some(&["pg", "work"]),
+        );
+        // The write target is `pg`, the first selected catalog.
+        let handle = open(&alice).await;
         // A pending `a.md/x.md` cannot be applied over the published `a.md`.
         let clash = PendingEdit {
-            catalog: "pg",
             path: "a.md/x.md",
             text: Some("# X\n"),
             at: Utc::now(),
         };
-        let changeset = pending_entry(&test, &alice(), &clash).await;
+        pending_entry(&test, &handle, &clash).await;
         let index = ReadDocumentParams {
             path: None,
             catalog: None,
+            changeset: Some(handle.clone()),
         };
 
-        let found = get_concept(&alice(), concept_params("hub")).await.unwrap();
-        let document = read_document(&alice(), index).await.unwrap();
-        let missing = get_concept(&alice(), concept_params("nowhere"))
+        let found = get_concept(&alice, through("hub", &handle)).await.unwrap();
+        let document = read_document(&alice, index).await.unwrap();
+        let missing = get_concept(&alice, through("nowhere", &handle))
             .await
             .unwrap_err();
 
@@ -711,7 +794,7 @@ mod tests {
         assert_eq!(missing.kind(), "InvalidPath");
         let message = missing.to_string();
         assert!(
-            message.contains(&format!("in pending changeset {}", changeset.id)),
+            message.contains(&format!("in pending changeset {handle}")),
             "{message}"
         );
     }

@@ -221,7 +221,7 @@ impl TestServer {
     }
 
     /// An MCP client with `key` and extra request headers (`X-OKF-Catalogs`,
-    /// `X-OKF-Changeset`) on every request.
+    /// say) on every request.
     ///
     /// # Arguments
     /// * `key` - the bearer key.
@@ -310,6 +310,31 @@ pub async fn call(
         .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
         .await
         .expect("tool call")
+}
+
+/// Opens a changeset through the `open_changeset` tool (M8 Decision 1).
+///
+/// # Arguments
+/// * `client` - a connected client with a `write` key.
+/// * `catalog` - the catalog; `None` for the connection's write target.
+///
+/// # Returns
+/// The handle to pass as `changeset`.
+///
+/// # Panics
+/// If the tool fails or its result has no string `changeset`.
+pub async fn open_changeset(client: &Client, catalog: Option<&str>) -> String {
+    // `json!` writes `null` for `None`, which the tool reads as no catalog.
+    let opened = call(
+        client,
+        "open_changeset",
+        serde_json::json!({"catalog": catalog}),
+    )
+    .await;
+    structured(&opened)["changeset"]
+        .as_str()
+        .expect("a string handle")
+        .to_string()
 }
 
 /// A tool's structured result, asserting it is not an error.

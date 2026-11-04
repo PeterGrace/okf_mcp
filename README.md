@@ -158,14 +158,18 @@ a `LintFailed` error and `a.md` in `lint`'s result, on purpose.
 | `oldest` | `okf.py oldest --json` |
 | `sprawl` | `okf.py sprawl --json` |
 | `links_report` | `okf.py links --json` (`mentions`, default true) |
-| `lint` | `okf.py lint --json` on the published catalog, or with `pending: true` on this connection's changeset applied to it |
-| `pending_changes` | This connection's changeset: each changed path, its base and current revision, whether it is stale or replayable, and a unified diff |
+| `lint` | `okf.py lint --json` on the published catalog, or with `changeset` on that changeset's drafts applied to it |
+| `pending_changes` | The changeset `changeset` names: each changed path, its base and current revision, whether it is stale or replayable, and a unified diff |
 | `stranded_sessions` | Open changesets nobody changed within `session_idle_timeout`: the key's own, or with an `admin` key every one it reaches |
 
 `get_concept`, `read_document` and `history` without `catalog` answer from
 the first selected catalog that has the path; the reports run on the first
-selected catalog. A connection with an open changeset reads through it: its
-own pending edits are visible to it (`history` reads published revisions
+selected catalog. Every read tool but `history` and `list_catalogs` takes an
+optional `changeset` handle: that changeset's catalog is then read through
+its drafts, and every other catalog as published. A report given one runs on
+the changeset's catalog unless `catalog` names it, and a handle whose catalog
+the call does not read is refused. Without `changeset` a read is always
+published, whatever the key has open (`history` reads published revisions
 only).
 
 ### Routes
@@ -212,38 +216,36 @@ long-lived event stream.
 
 ### Changesets
 
-A `write` key's edits go to a changeset, one per (catalog, key, label), held
-in Postgres. The label comes from the connection:
+A `write` key's edits go to a changeset, held in Postgres. Call
+`open_changeset` (its `catalog`, default the connection's write target) for a
+handle, then pass it as `changeset` to every write tool, `publish`,
+`discard`, `revert` and `pending_changes`. A write without one fails the
+parameter check (`missing field \`changeset\``); a write never opens a
+changeset by itself. A key may have several changesets open at once, and the
+write tools take no `catalog`: the changeset's catalog is the one written.
 
-1. the `X-OKF-Changeset` header;
-2. else `?changeset=` on the MCP URL (`/mcp?changeset=my-agent`);
-3. else `default`.
+The handle works on any connection of the key that opened it, so after a
+reconnect or a server restart the same handle carries on. An `admin` key
+that reaches the catalog may use it too. Any other key gets
+`UnknownChangeset`, worded exactly as for a handle that does not exist.
 
-The MCP session is never the label: a session id changes on every reconnect,
-so an unlabelled client would land in a new, empty changeset each time. Two
-unlabelled connections of one key therefore share `default` (every write
-locks the changeset's row, so neither loses an edit); an agent that wants
-several changesets names them. The key is part of the identity, so one key
-never sees or publishes another key's changeset.
-
-Nothing in a changeset is visible to other keys or labels until `publish`.
-The connection itself reads through it: `search`, `get_concept`,
-`read_document` and the reports see its pending edits. A changeset survives
+Nothing in a changeset is visible to anyone else until `publish`, and a read
+sees its drafts only when it passes the handle. A changeset survives
 disconnects, closed sessions and server restarts until it is published or
-discarded. Each MCP session also answers only the key that opened it: a
-request naming its `Mcp-Session-Id` with another key gets 404.
+discarded; one that gets no edit within 24 hours is discarded. A handle whose
+changeset was published or discarded is refused: open a new one. Each MCP
+session also answers only the key that opened it: a request naming its
+`Mcp-Session-Id` with another key gets 404.
 
-An `mcp.json` entry with a label:
+An `mcp.json` entry:
 
 ```json
 {"mcpServers": {"okf": {"type": "http", "url": "https://okf.example/mcp",
-  "headers": {"Authorization": "Bearer ${OKF_MCP_KEY}", "X-OKF-Catalogs": "pg",
-              "X-OKF-Changeset": "my-agent"}}}}
+  "headers": {"Authorization": "Bearer ${OKF_MCP_KEY}", "X-OKF-Catalogs": "pg"}}}}
 ```
 
-Each write tool acts on exactly one catalog: its `catalog` argument, else the
-connection's write target (the first selected catalog). Its result names the
-catalog, the changeset id, the label and the touched paths.
+A write tool's result names the catalog, the changeset's handle and the
+touched paths.
 
 ### Write tools
 
@@ -280,14 +282,15 @@ Changesets:
 
 | Tool | Key | Does |
 |---|---|---|
-| `pending_changes` | `read` | What this connection's changeset holds, with diffs |
+| `open_changeset` | `write` | Opens a changeset in a catalog and returns its handle |
+| `pending_changes` | `read` (the owner or an admin) | What the changeset holds, with diffs |
 | `publish` | `write` | Publishes the changeset with a `message` (see below) |
-| `discard` | `write` | Drops the named `paths` from the changeset, or every entry, which closes it (the next write opens a new one) |
+| `discard` | `write` | Drops the named `paths` from the changeset, or every entry, which closes it for good: its handle is refused from then on, so call `open_changeset` for new work |
 | `revert` | `write` | Adds a document's content at an earlier `revision` (from `history`), or its deletion, to the changeset |
 | `stranded_sessions` | `read` | Changesets idle past `session_idle_timeout`, with their ids |
 | `adopt_changeset` | `write`; `admin` for another key's | Moves a changeset (`id`) to this connection's key and label |
 
-`lint` with `pending: true` checks the changeset before publishing.
+`lint` with `changeset` checks the changeset before publishing.
 
 ### Publish
 
@@ -314,7 +317,8 @@ file's base revision against the one published now:
 A refused publish leaves the changeset open and unchanged. A successful one
 writes a revision per changed file, carrying the message and the key's actor,
 and closes the changeset. A write that was waiting on the changeset while it
-was published or discarded lands in a new changeset, so no edit is lost.
+was published or discarded is refused and stores nothing; open a new
+changeset and redo it.
 
 ### Write rules
 
@@ -351,7 +355,8 @@ key's actor.
   rows and rebuilt and swapped when its generation moves; lint with revision
   times.
 - `src/auth.rs` - the key cache and the bearer middleware; `src/selection.rs` -
-  which catalogs a call acts on and the changeset label; `src/app.rs` - the
+  which catalogs a call acts on (and the connection's changeset label, which
+  nothing looks up any more); `src/app.rs` - the
   shared state and the poll loop (which also prunes empty changesets).
 - `src/overlay.rs` - a changeset's view (the published files with its entries
   applied), cached per changeset; `src/write.rs` - the one path every write
@@ -375,7 +380,8 @@ key's actor.
   routes.
 - `tests/writes.rs` - end-to-end write tests over HTTP: create, link, index,
   log, publish and export; concurrent `log.md` publishes; a conflict; a
-  changeset surviving a restart; labels.
+  changeset surviving a restart; two handles of one key; concurrent writes
+  to one handle; a write without a handle.
 - `tests/restructure.rs` - end-to-end restructuring over HTTP: a move
   published and exported; a conflict and a replay against other sessions; a
   delete refused while linked.

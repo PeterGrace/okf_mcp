@@ -1,7 +1,7 @@
 //! The restructuring tools (design "Write tools", M6): `move_concept` and
 //! `split_concept`, ports of `okf.py`'s `mv` and `split`, and
 //! `delete_concept`. Each goes through [`crate::write::apply`], so it acts
-//! on this connection's changeset in one catalog and the write rules apply.
+//! on the changeset its `changeset` handle names and the write rules apply.
 //! A block of its own (`restructure_router`), joined in `OkfServer::tools`.
 
 use axum::http::request::Parts;
@@ -26,8 +26,8 @@ pub struct MoveConceptParams {
     pub old: String,
     /// Its new path, `.md` optional, e.g. `/playbooks/ntp.md`; it must not exist.
     pub new: String,
-    /// The catalog (default: this connection's write target).
-    pub catalog: Option<String>,
+    /// The changeset to write to: the handle `open_changeset` returned.
+    pub changeset: String,
 }
 
 /// `split_concept`'s arguments.
@@ -53,8 +53,8 @@ pub struct SplitConceptParams {
     pub sources: Option<Vec<String>>,
     /// Who wrote it, for the `generated` stamp (default: the key's actor).
     pub by: Option<String>,
-    /// The catalog (default: this connection's write target).
-    pub catalog: Option<String>,
+    /// The changeset to write to: the handle `open_changeset` returned.
+    pub changeset: String,
 }
 
 /// `delete_concept`'s arguments.
@@ -62,8 +62,8 @@ pub struct SplitConceptParams {
 pub struct DeleteConceptParams {
     /// The concept, `.md` optional, e.g. `/infra/ntp`.
     pub path: String,
-    /// The catalog (default: this connection's write target).
-    pub catalog: Option<String>,
+    /// The changeset to write to: the handle `open_changeset` returned.
+    pub changeset: String,
 }
 
 /// Moves a concept, its listing and every link to it.
@@ -83,8 +83,12 @@ pub(crate) async fn move_concept(
     ctx: &ToolContext,
     params: MoveConceptParams,
 ) -> Result<WriteReport, OkfError> {
-    let MoveConceptParams { old, new, catalog } = params;
-    apply(ctx, catalog.as_deref(), None, move |ws, _| {
+    let MoveConceptParams {
+        old,
+        new,
+        changeset,
+    } = params;
+    apply(ctx, &changeset, None, move |ws, _| {
         ops::move_concept(ws, &old, &new)
     })
     .await
@@ -107,7 +111,7 @@ pub(crate) async fn split_concept(
     params: SplitConceptParams,
 ) -> Result<WriteReport, OkfError> {
     // Destructuring moves each field into its own variable, so the closure
-    // can take the ones it needs while `catalog` and `by` stay here.
+    // can take the ones it needs while `changeset` and `by` stay here.
     let SplitConceptParams {
         path,
         section,
@@ -118,9 +122,9 @@ pub(crate) async fn split_concept(
         stub,
         sources,
         by,
-        catalog,
+        changeset,
     } = params;
-    apply(ctx, catalog.as_deref(), by.as_deref(), move |ws, op_ctx| {
+    apply(ctx, &changeset, by.as_deref(), move |ws, op_ctx| {
         // `unwrap_or_default` on an `Option<Vec<_>>`: an empty list when absent.
         let sources = sources.unwrap_or_default();
         let split = Split {
@@ -154,8 +158,8 @@ pub(crate) async fn delete_concept(
     ctx: &ToolContext,
     params: DeleteConceptParams,
 ) -> Result<WriteReport, OkfError> {
-    let DeleteConceptParams { path, catalog } = params;
-    apply(ctx, catalog.as_deref(), None, move |ws, _| {
+    let DeleteConceptParams { path, changeset } = params;
+    apply(ctx, &changeset, None, move |ws, _| {
         ops::delete_concept(ws, &path)
     })
     .await
@@ -166,12 +170,14 @@ pub(crate) async fn delete_concept(
 impl OkfServer {
     /// The `move_concept` tool.
     #[tool(
-        description = "Move or rename a concept in this connection's changeset (port of `okf.py \
-                       mv`): its folder listing moves with it (creating folder indexes as \
-                       needed) and every link to it is rewritten, keeping each link's style and \
-                       anchor. `old` and `new` are concept paths, .md optional. Publish replays \
-                       the index.md and log.md edits onto newer text; any other file it changed \
-                       conflicts if someone changed it meanwhile. Write access."
+        description = "Move or rename a concept (port of `okf.py mv`) in the changeset \
+                       `changeset` names (open one with open_changeset): its folder listing moves \
+                       with it \
+                       (creating folder indexes as needed) and every link to it is rewritten, \
+                       keeping each link's style and anchor. `old` and `new` are concept paths, \
+                       .md optional. Publish replays the index.md and log.md edits onto newer \
+                       text; any other file it changed conflicts if someone changed it meanwhile. \
+                       Write access."
     )]
     async fn move_concept(
         &self,
@@ -185,11 +191,12 @@ impl OkfServer {
     /// The `split_concept` tool.
     #[tool(
         description = "Carve a section (and its subsections) out of a concept into a new concept, \
-                       in this connection's changeset (port of `okf.py split`). The new concept \
-                       gets type, title, description, the parent's status, generated, and the \
-                       sources the section's footnotes cite (or `sources`); the parent keeps the \
-                       heading with a stub linking to it; links to the section follow it; it is \
-                       listed in its folder's index.md. Returns okf.py's notes. Write access."
+                       in the changeset `changeset` names (open one with open_changeset); a port \
+                       of `okf.py split`. The new concept gets type, title, description, the \
+                       parent's status, generated, and the sources the section's footnotes cite \
+                       (or `sources`); the parent keeps the heading with a stub linking to it; \
+                       links to the section follow it; it is listed in its folder's index.md. \
+                       Returns okf.py's notes. Write access."
     )]
     async fn split_concept(
         &self,
@@ -202,11 +209,12 @@ impl OkfServer {
 
     /// The `delete_concept` tool.
     #[tool(
-        description = "Delete a concept and its listing in its folder's index.md, in this \
-                       connection's changeset. Refused with StillLinked, listing each link \
-                       (source, line), while any other document links to it, log.md and other \
-                       index.md files included; move_concept or edit_document fixes them first. \
-                       index.md files are never deleted. Write access."
+        description = "Delete a concept and its listing in its folder's index.md, in the \
+                       changeset `changeset` names (open one with open_changeset). Refused with \
+                       StillLinked, listing each link (source, line), while any other document \
+                       links to it, log.md and other index.md files included; move_concept or \
+                       edit_document fixes them first. index.md files are never deleted. Write \
+                       access."
     )]
     async fn delete_concept(
         &self,
@@ -222,10 +230,12 @@ impl OkfServer {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::mcp::changesets::{discard, pending_changes, revert, DiscardParams, RevertParams};
-    use crate::mcp::reports::CatalogParam;
-    use crate::mcp::testing::{app_with, writer, TestApp};
+    use crate::mcp::changesets::{
+        discard, pending_changes, revert, DiscardParams, PendingParams, RevertParams,
+    };
+    use crate::mcp::testing::{app_with, changeset_row, open, writer, TestApp};
     use crate::mcp::writes::{edit_document, EditDocumentParams};
+    use crate::store::changesets::ChangesetState;
     use crate::store::changesets::{self, EntryRow};
 
     const TIME: &str = "---\ntype: System\ntitle: Time\ndescription: The clock.\n---\n\
@@ -256,28 +266,34 @@ mod tests {
         .await
     }
 
-    fn move_time(new: &str) -> MoveConceptParams {
+    fn move_time(handle: &str, new: &str) -> MoveConceptParams {
         MoveConceptParams {
             old: "/infra/time".to_string(),
             new: new.to_string(),
-            catalog: None,
+            changeset: handle.to_string(),
         }
     }
 
+    /// The entries of the changeset `handle` names.
+    async fn entries(test: &TestApp, handle: &str) -> Vec<EntryRow> {
+        let row = changeset_row(test, handle).await;
+        changesets::entries(test.app.pool(), row.id).await.unwrap()
+    }
+
     /// The changeset's entry for `path`.
-    async fn entry(test: &TestApp, changeset: i64, path: &str) -> EntryRow {
-        changesets::entries(test.app.pool(), changeset)
+    async fn entry(test: &TestApp, handle: &str, path: &str) -> EntryRow {
+        entries(test, handle)
             .await
-            .unwrap()
             .into_iter()
             .find(|entry| entry.path == path)
             .unwrap_or_else(|| panic!("no entry for {path}"))
     }
 
-    /// The text of `path` as this connection sees it (its overlay).
-    async fn seen(ctx: &ToolContext, path: &str) -> Option<String> {
+    /// The text of `path` as reads through the changeset `handle` see it.
+    async fn seen(ctx: &ToolContext, handle: &str, path: &str) -> Option<String> {
         let state = ctx.app().catalog("pg").unwrap();
-        let view = ctx.view(&state).await.unwrap();
+        let pinned = ctx.pin(Some(handle)).await.unwrap();
+        let view = ctx.view(&state, pinned.as_ref()).await.unwrap();
         view.snapshot().get(path).map(|doc| doc.text().to_string())
     }
 
@@ -285,8 +301,9 @@ mod tests {
     async fn a_move_stores_a_deletion_a_creation_and_a_replayable_listing() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
 
-        let report = move_concept(&ctx, move_time("/infra/clock.md"))
+        let report = move_concept(&ctx, move_time(&handle, "/infra/clock.md"))
             .await
             .unwrap();
 
@@ -300,15 +317,15 @@ mod tests {
             ]
         );
         assert_eq!(report.message, "moved /infra/time.md -> /infra/clock.md");
-        let old = entry(&test, report.changeset, "infra/time.md").await;
+        let old = entry(&test, &report.changeset, "infra/time.md").await;
         assert_eq!((old.content, old.base_revision), (None, Some(1)));
-        let new = entry(&test, report.changeset, "infra/clock.md").await;
+        let new = entry(&test, &report.changeset, "infra/clock.md").await;
         assert_eq!((new.base_revision, new.replay), (None, None));
-        assert_eq!(entry(&test, report.changeset, "hub.md").await.replay, None);
-        let listing = entry(&test, report.changeset, "infra/index.md").await;
+        assert_eq!(entry(&test, &report.changeset, "hub.md").await.replay, None);
+        let listing = entry(&test, &report.changeset, "infra/index.md").await;
         assert_eq!(listing.replay.expect("a relink replays")[0]["op"], "relink");
-        assert_eq!(seen(&ctx, "infra/time.md").await, None);
-        assert!(seen(&ctx, "hub.md")
+        assert_eq!(seen(&ctx, &handle, "infra/time.md").await, None);
+        assert!(seen(&ctx, &handle, "hub.md")
             .await
             .unwrap()
             .contains("[time](/infra/clock.md#ports)"));
@@ -318,6 +335,7 @@ mod tests {
     async fn a_split_lists_the_new_concept_and_returns_okf_py_s_notes() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
 
         let report = split_concept(
             &ctx,
@@ -331,7 +349,7 @@ mod tests {
                 stub: None,
                 sources: None,
                 by: None,
-                catalog: None,
+                changeset: handle.clone(),
             },
         )
         .await
@@ -348,18 +366,18 @@ mod tests {
         );
         assert_eq!(report.notes.len(), 1, "{:?}", report.notes);
         assert!(report.notes[0].starts_with("note: 'Ports' is the last section"));
-        let ports = seen(&ctx, "infra/ports.md").await.unwrap();
+        let ports = seen(&ctx, &handle, "infra/ports.md").await.unwrap();
         // `type` defaulted to Note, and `by` to the key's actor.
         assert!(
             ports.starts_with("---\ntype: Note\ntitle: Ports\n"),
             "{ports}"
         );
         assert!(ports.contains("by: writer-a"), "{ports}");
-        assert!(seen(&ctx, "hub.md")
+        assert!(seen(&ctx, &handle, "hub.md")
             .await
             .unwrap()
             .contains("[time](/infra/ports.md)"));
-        let listing = entry(&test, report.changeset, "infra/index.md").await;
+        let listing = entry(&test, &report.changeset, "infra/index.md").await;
         assert_eq!(
             listing.replay.expect("a listing replays")[0]["op"],
             "list_bullet"
@@ -370,6 +388,7 @@ mod tests {
     async fn a_blank_type_is_refused_and_nothing_is_stored() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
 
         let refused = split_concept(
             &ctx,
@@ -383,7 +402,7 @@ mod tests {
                 stub: None,
                 sources: None,
                 by: None,
-                catalog: None,
+                changeset: handle.clone(),
             },
         )
         .await
@@ -395,22 +414,21 @@ mod tests {
             refused.to_string(),
             crate::okf::ops::blank_type().to_string()
         );
-        let state = ctx.app().catalog("pg").unwrap();
-        assert!(!ctx.view(&state).await.unwrap().pending());
+        assert!(entries(&test, &handle).await.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_delete_is_refused_while_linked_then_goes_through() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
         let delete = || DeleteConceptParams {
             path: "/infra/time".to_string(),
-            catalog: None,
+            changeset: handle.clone(),
         };
 
         let refused = delete_concept(&ctx, delete()).await.unwrap_err();
-        let state = ctx.app().catalog("pg").unwrap();
-        let nothing_stored = !ctx.view(&state).await.unwrap().pending();
+        let nothing_stored = entries(&test, &handle).await.is_empty();
         edit_document(
             &ctx,
             EditDocumentParams {
@@ -418,7 +436,7 @@ mod tests {
                 old_str: "See [time](/infra/time.md#ports).".to_string(),
                 new_str: "See the time server.".to_string(),
                 replace_all: false,
-                catalog: None,
+                changeset: handle.clone(),
             },
         )
         .await
@@ -433,13 +451,13 @@ mod tests {
         );
         assert!(nothing_stored, "a refused delete stores nothing");
         assert_eq!(deleted.touched, ["/infra/time.md", "/infra/index.md"]);
-        let listing = entry(&test, deleted.changeset, "infra/index.md").await;
+        let listing = entry(&test, &deleted.changeset, "infra/index.md").await;
         assert_eq!(
             listing.replay.expect("an unlist replays")[0]["op"],
             "unlist"
         );
         assert_eq!(
-            seen(&ctx, "infra/index.md").await.as_deref(),
+            seen(&ctx, &handle, "infra/index.md").await.as_deref(),
             Some("# Infra\n\n")
         );
     }
@@ -448,8 +466,11 @@ mod tests {
     async fn a_move_is_listed_reverted_and_discarded_like_any_other_edit() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
-        let pending = || CatalogParam { catalog: None };
-        move_concept(&ctx, move_time("/infra/clock.md"))
+        let handle = open(&ctx).await;
+        let pending = || PendingParams {
+            changeset: handle.clone(),
+        };
+        move_concept(&ctx, move_time(&handle, "/infra/clock.md"))
             .await
             .unwrap();
 
@@ -459,7 +480,7 @@ mod tests {
             RevertParams {
                 path: "/infra/time.md".to_string(),
                 revision: 1,
-                catalog: None,
+                changeset: handle.clone(),
             },
         )
         .await
@@ -469,7 +490,7 @@ mod tests {
             &ctx,
             DiscardParams {
                 paths: None,
-                catalog: None,
+                changeset: handle.clone(),
             },
         )
         .await
@@ -500,8 +521,10 @@ mod tests {
             ("update", "No change from the published text\n")
         );
         assert_eq!((discarded.removed, discarded.closed), (4, true));
-        let state = ctx.app().catalog("pg").unwrap();
-        assert!(!ctx.view(&state).await.unwrap().pending());
+        assert_eq!(
+            changeset_row(&test, &handle).await.state,
+            ChangesetState::Discarded
+        );
     }
 
     #[test]
@@ -530,8 +553,17 @@ mod tests {
                 .iter()
                 .filter_map(|name| name.as_str())
                 .collect::<Vec<_>>(),
-            ["path", "section", "to"]
+            ["path", "section", "to", "changeset"]
         );
+        // The catalog comes from the changeset (M8 Decision 5).
+        for tool in &tools {
+            let inputs = tool.input_schema["properties"].as_object().unwrap();
+            assert!(
+                inputs.contains_key("changeset") && !inputs.contains_key("catalog"),
+                "{}",
+                tool.name
+            );
+        }
         for tool in &tools {
             let output = tool.output_schema.as_ref().expect("an output schema");
             assert_eq!(output["type"], "object", "{}", tool.name);

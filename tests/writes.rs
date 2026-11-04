@@ -3,9 +3,10 @@
 //! - a full create, link, index, log, publish and export cycle;
 //! - concurrent publishes of `log.md`;
 //! - a conflict as an agent sees it;
-//! - a changeset surviving a restart;
-//! - `X-OKF-Changeset` keeping two changesets of one key apart;
-//! - concurrent writes from two connections sharing one changeset.
+//! - a changeset surviving a restart, by its handle;
+//! - two handles of one key staying apart;
+//! - concurrent writes to one handle from two connections;
+//! - a write without a handle refused by the parameter check.
 
 mod support;
 
@@ -13,7 +14,7 @@ use okf_mcp::archive::{read_tarball, Files};
 use okf_mcp::config::Config;
 use okf_mcp::store::keys::Access;
 use serde_json::{json, Value};
-use support::server::{call, files, structured, Client, TestServer};
+use support::server::{call, files, open_changeset, structured, Client, TestServer};
 use tokio::sync::Barrier;
 
 const TIME: &str =
@@ -66,26 +67,40 @@ async fn create_link_index_log_publish_and_export() {
     let reader_key = server.key("reader", Access::Read, &[], Some("pg")).await;
     let client = server.client(&key, None).await.unwrap();
     let reader = server.client(&reader_key, None).await.unwrap();
+    let handle = open_changeset(&client, None).await;
 
     let concept = json!({
         "path": "/infra/ntp.md",
         "frontmatter": {"type": "System", "title": "NTP", "description": "How hosts sync."},
         "body": "# NTP\n\nHosts sync from the [time server](/infra/time.md).\n",
+        "changeset": handle,
     });
     ok(&client, "create_concept", concept).await;
-    let index = json!({"path": "/infra/ntp.md", "summary": "how hosts sync"});
+    let index = json!({"path": "/infra/ntp.md", "summary": "how hosts sync", "changeset": handle});
     ok(&client, "index", index).await;
     ok(
         &client,
         "log",
-        json!({"text": "added NTP", "kind": "Creation"}),
+        json!({"text": "added NTP", "kind": "Creation", "changeset": handle}),
     )
     .await;
-    // Before publish: the writer sees the concept through its overlay, the reader does not.
-    let pending = ok(&client, "pending_changes", json!({})).await;
-    let seen = ok(&client, "get_concept", json!({"path": "/infra/ntp.md"})).await;
+    // Before publish: reads through the handle see the concept; the writer's
+    // plain reads and the reader's do not.
+    let pending = ok(&client, "pending_changes", json!({"changeset": handle})).await;
+    let seen = ok(
+        &client,
+        "get_concept",
+        json!({"path": "/infra/ntp.md", "changeset": handle}),
+    )
+    .await;
+    let unseen_by_writer = call(&client, "get_concept", json!({"path": "/infra/ntp.md"})).await;
     let unseen = call(&reader, "get_concept", json!({"path": "/infra/ntp.md"})).await;
-    let published = ok(&client, "publish", json!({"message": "add NTP"})).await;
+    let published = ok(
+        &client,
+        "publish",
+        json!({"message": "add NTP", "changeset": handle}),
+    )
+    .await;
     let history = ok(&reader, "history", json!({"path": "/infra/ntp.md"})).await;
     let response = reqwest::Client::new()
         .get(format!("{}/catalogs/pg/export", server.base))
@@ -105,6 +120,7 @@ async fn create_link_index_log_publish_and_export() {
         ["/infra/index.md", "/infra/ntp.md", "/log.md"]
     );
     assert_eq!(seen["title"], "NTP");
+    assert_eq!(unseen_by_writer.is_error, Some(true));
     // `NotFound`, not just any error: the reader's published view lacks the concept.
     assert_eq!(unseen.is_error, Some(true));
     let unseen = unseen.structured_content.expect("the error's JSON");
@@ -144,14 +160,18 @@ async fn concurrent_log_publishes_from_two_keys_keep_both_bullets() {
     let second_key = writer(&server, "writer-b").await;
     let first = server.client(&first_key, None).await.unwrap();
     let second = server.client(&second_key, None).await.unwrap();
-    ok(&first, "log", json!({"text": "from a"})).await;
-    ok(&second, "log", json!({"text": "from b"})).await;
+    let (a, b) = (
+        open_changeset(&first, None).await,
+        open_changeset(&second, None).await,
+    );
+    ok(&first, "log", json!({"text": "from a", "changeset": a})).await;
+    ok(&second, "log", json!({"text": "from b", "changeset": b})).await;
 
     // `tokio::join!` (like `asyncio.gather`) sends both publishes at once;
     // the server's publish lock runs them one after the other.
     let (one, two) = tokio::join!(
-        call(&first, "publish", json!({"message": "a"})),
-        call(&second, "publish", json!({"message": "b"})),
+        call(&first, "publish", json!({"message": "a", "changeset": a})),
+        call(&second, "publish", json!({"message": "b", "changeset": b})),
     );
     let log = ok(&first, "read_document", json!({"path": "/log.md"})).await;
     first.cancel().await.unwrap();
@@ -177,19 +197,31 @@ async fn an_agent_sees_a_conflict_and_can_redo_its_edit() {
     let second_key = writer(&server, "writer-b").await;
     let first = server.client(&first_key, None).await.unwrap();
     let second = server.client(&second_key, None).await.unwrap();
-    let edit = |text: &str| {
+    let edit = |text: &str, handle: &str| {
         let body = format!("# Time server\n\n{text}\n");
-        json!({"path": "/infra/time.md", "body": body})
+        json!({"path": "/infra/time.md", "body": body, "changeset": handle})
     };
-    ok(&first, "replace_body", edit("From a.")).await;
-    ok(&second, "replace_body", edit("From b.")).await;
-    ok(&first, "publish", json!({"message": "a"})).await;
+    let (a, b) = (
+        open_changeset(&first, None).await,
+        open_changeset(&second, None).await,
+    );
+    ok(&first, "replace_body", edit("From a.", &a)).await;
+    ok(&second, "replace_body", edit("From b.", &b)).await;
+    ok(&first, "publish", json!({"message": "a", "changeset": a})).await;
 
-    let refused = call(&second, "publish", json!({"message": "b"})).await;
-    let still_pending = ok(&second, "pending_changes", json!({})).await;
-    ok(&second, "discard", json!({})).await;
-    ok(&second, "replace_body", edit("From a, then b.")).await;
-    let redone = ok(&second, "publish", json!({"message": "b again"})).await;
+    let refused = call(&second, "publish", json!({"message": "b", "changeset": b})).await;
+    let still_pending = ok(&second, "pending_changes", json!({"changeset": b})).await;
+    // A full discard kills the handle, so the redo opens a new changeset.
+    ok(&second, "discard", json!({"changeset": b})).await;
+    let spent = call(&second, "replace_body", edit("From a, then b.", &b)).await;
+    let redo = open_changeset(&second, None).await;
+    ok(&second, "replace_body", edit("From a, then b.", &redo)).await;
+    let redone = ok(
+        &second,
+        "publish",
+        json!({"message": "b again", "changeset": redo}),
+    )
+    .await;
     first.cancel().await.unwrap();
     second.cancel().await.unwrap();
 
@@ -203,6 +235,11 @@ async fn an_agent_sees_a_conflict_and_can_redo_its_edit() {
     assert_eq!(file["path"], "/infra/time.md");
     assert_eq!(file["current_revision"], 2);
     assert_eq!(file["stale"], true);
+    assert_eq!(spent.is_error, Some(true));
+    assert_eq!(
+        spent.structured_content.expect("the error's JSON")["error"],
+        "Refused"
+    );
     assert_eq!(redone["revisions"][0]["revision"], 3);
 }
 
@@ -210,73 +247,103 @@ async fn an_agent_sees_a_conflict_and_can_redo_its_edit() {
 async fn a_changeset_survives_a_server_restart() {
     let mut server = TestServer::start(catalog(), Config::default()).await;
     let key = writer(&server, "writer").await;
-    // No label: the `default` changeset is the same across a restart, even
-    // though the new client gets a new MCP session.
+    // The handle is all a new client needs, though it gets a new MCP session
+    // on a new server process.
     let before = server.client(&key, None).await.unwrap();
-    let written = ok(&before, "log", json!({"text": "before the restart"})).await;
+    let handle = open_changeset(&before, None).await;
+    let written = ok(
+        &before,
+        "log",
+        json!({"text": "before the restart", "changeset": handle}),
+    )
+    .await;
     before.cancel().await.unwrap();
 
     server.restart(Config::default()).await;
     let after = server.client(&key, None).await.unwrap();
-    let pending = ok(&after, "pending_changes", json!({})).await;
-    let published = ok(&after, "publish", json!({"message": "after the restart"})).await;
+    let pending = ok(&after, "pending_changes", json!({"changeset": handle})).await;
+    // Still writable: the edit lands in the same changeset.
+    ok(
+        &after,
+        "log",
+        json!({"text": "after the restart", "changeset": handle}),
+    )
+    .await;
+    let published = ok(
+        &after,
+        "publish",
+        json!({"message": "after the restart", "changeset": handle}),
+    )
+    .await;
     let log = ok(&after, "read_document", json!({"path": "/log.md"})).await;
     after.cancel().await.unwrap();
 
-    assert_eq!(written["label"], "default");
-    assert_eq!(pending["changeset"], written["changeset"]);
+    assert_eq!(written["changeset"], handle.as_str());
+    assert_eq!(pending["changeset"], handle.as_str());
     assert_eq!(paths(&pending["files"]), ["/log.md"]);
     assert_eq!(published["published"], true);
     assert_eq!(published["changeset"], written["changeset"]);
     let text = log["text"].as_str().unwrap();
     assert!(text.contains("* **Update:** before the restart"), "{text}");
+    assert!(text.contains("* **Update:** after the restart"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn x_okf_changeset_keeps_two_changesets_of_one_key_apart() {
+async fn two_handles_of_one_key_stay_apart() {
     let server = TestServer::start(catalog(), Config::default()).await;
     let key = writer(&server, "writer").await;
-    let drafts = server
-        .client_with(&key, &[("x-okf-changeset", "draft-a")])
-        .await
-        .unwrap();
-    let others = server
-        .client_with(&key, &[("x-okf-changeset", "draft-b")])
-        .await
-        .unwrap();
-    let draft = json!({"path": "/infra/time.md", "body": "# Time server\n\nDraft a.\n"});
-    let edited = ok(&drafts, "replace_body", draft).await;
-    let logged = ok(&others, "log", json!({"text": "draft b"})).await;
-    // Before publish, draft b's connection does not see draft a's edit.
-    let before = ok(&others, "get_concept", json!({"path": "/infra/time.md"})).await;
+    // One connection, two changesets: the handle picks one per call.
+    let client = server.client(&key, None).await.unwrap();
+    let (a, b) = (
+        open_changeset(&client, None).await,
+        open_changeset(&client, None).await,
+    );
+    let draft = json!({
+        "path": "/infra/time.md",
+        "body": "# Time server\n\nDraft a.\n",
+        "changeset": a,
+    });
+    let edited = ok(&client, "replace_body", draft).await;
+    let logged = ok(&client, "log", json!({"text": "draft b", "changeset": b})).await;
+    let time = |handle: &str| json!({"path": "/infra/time.md", "changeset": handle});
+    // Before publish, reads through b do not see a's edit.
+    let before = ok(&client, "get_concept", time(&b)).await;
 
-    let published = ok(&drafts, "publish", json!({"message": "draft a"})).await;
-    let left = ok(&others, "pending_changes", json!({})).await;
-    let after = ok(&others, "get_concept", json!({"path": "/infra/time.md"})).await;
-    drafts.cancel().await.unwrap();
-    others.cancel().await.unwrap();
+    let published = ok(
+        &client,
+        "publish",
+        json!({"message": "draft a", "changeset": a}),
+    )
+    .await;
+    let left = ok(&client, "pending_changes", json!({"changeset": b})).await;
+    let after = ok(&client, "get_concept", time(&b)).await;
+    client.cancel().await.unwrap();
 
-    assert_eq!(edited["label"], "draft-a");
-    assert_eq!(logged["label"], "draft-b");
-    assert_ne!(edited["changeset"], logged["changeset"]);
+    assert_eq!(edited["changeset"], a.as_str());
+    assert_eq!(logged["changeset"], b.as_str());
+    assert_ne!(a, b);
     assert!(!before["body"].as_str().unwrap().contains("Draft a."));
     assert_eq!(paths(&published["revisions"]), ["/infra/time.md"]);
-    assert_eq!(left["changeset"], logged["changeset"]);
+    assert_eq!(left["changeset"], b.as_str());
     assert_eq!(paths(&left["files"]), ["/log.md"]);
-    // Published now, so draft b's connection sees draft a's edit too.
+    // Published now, so reads through b see a's edit too.
     assert!(after["body"].as_str().unwrap().contains("Draft a."));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn concurrent_writes_from_two_connections_of_one_key_share_one_changeset() {
+async fn concurrent_writes_to_one_handle_from_two_connections_both_land() {
     let server = TestServer::start(catalog(), Config::default()).await;
     let key = writer(&server, "writer").await;
-    // Two unlabelled connections of one key share its `default` changeset
-    // (Decision 1); every write takes the changeset's row lock, so writes
-    // racing from both lose nothing.
+    // Two connections of one key write to one handle (M8 Decision 3); every
+    // write takes the changeset's row lock, so writes racing from both lose
+    // nothing.
     let first = server.client(&key, None).await.unwrap();
     let second = server.client(&key, None).await.unwrap();
-    let entry = |client: &str, number: usize| json!({"text": format!("{client} {number}")});
+    let handle = open_changeset(&first, None).await;
+    let entry = |client: &str, number: usize| {
+        let text = format!("{client} {number}");
+        json!({"text": text, "changeset": handle})
+    };
     // Both connections wait here before each write, so every round sends the
     // two writes together (like `asyncio.Barrier`), not one loop after the other.
     let round = Barrier::new(2);
@@ -296,8 +363,13 @@ async fn concurrent_writes_from_two_connections_of_one_key_share_one_changeset()
             }
         },
     );
-    let pending = ok(&first, "pending_changes", json!({})).await;
-    let published = ok(&second, "publish", json!({"message": "both"})).await;
+    let pending = ok(&first, "pending_changes", json!({"changeset": handle})).await;
+    let published = ok(
+        &second,
+        "publish",
+        json!({"message": "both", "changeset": handle}),
+    )
+    .await;
     let log = ok(&first, "read_document", json!({"path": "/log.md"})).await;
     first.cancel().await.unwrap();
     second.cancel().await.unwrap();
@@ -311,4 +383,36 @@ async fn concurrent_writes_from_two_connections_of_one_key_share_one_changeset()
             assert!(text.contains(&bullet), "{bullet} missing from {text}");
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_without_a_changeset_is_a_parameter_error() {
+    let server = TestServer::start(catalog(), Config::default()).await;
+    let key = writer(&server, "writer").await;
+    let client = server.client(&key, None).await.unwrap();
+
+    let refused = call(
+        &client,
+        "stamp",
+        json!({"path": "/infra/time.md", "field": "verified"}),
+    )
+    .await;
+    client.cancel().await.unwrap();
+
+    // rmcp's parameter check fails before the tool runs, and its router
+    // turns that `invalid_params` error into an `isError` result whose text
+    // is the message (rmcp 3.8.0, `handler/server/router/tool.rs`), with no
+    // structured content: no tool error JSON, and nothing written.
+    assert_eq!(refused.is_error, Some(true));
+    assert!(refused.structured_content.is_none());
+    let text = refused
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .map(|text| text.text.as_str())
+        .unwrap_or_default();
+    assert_eq!(
+        text,
+        "failed to deserialize parameters: missing field `changeset`"
+    );
 }
