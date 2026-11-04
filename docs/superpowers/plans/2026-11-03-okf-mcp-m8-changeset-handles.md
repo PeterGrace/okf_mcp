@@ -142,6 +142,8 @@ After Task 3, the result types name the handle as `changeset: String` and drop `
 | `src/store/changesets.rs` | 2 (`handle`, `open`, `by_handle`), 3 (drop `get_or_create`, `find_open`, `ChangesetKey`), 4 (`list_open`; drop `stranded`, `adopt`), 5 (drop `label`) |
 | `src/mcp/context.rs` | 2 (`Pinned`, `changeset`), 3 (`view(state, pinned)`, `pin`, `require_selected`), 5 (drop `label`, `with_label`) |
 | `src/mcp/changesets.rs` | 2 (`open_changeset` tool), 3 (`publish`, `discard`, `revert`, `pending_changes` take `changeset`; drop `own_changeset`), 4 (`list_changesets`; drop `stranded_sessions`, `adopt_changeset`) |
+| `src/http/mod.rs` (`AppError::status`: `UnknownChangeset` is 404) | 2 |
+| `src/overlay.rs` (its test builds a `ChangesetRow` by hand) | 2 (`handle`), 5 (drop `label`) |
 | `src/write.rs` | 3 |
 | `src/mcp/writes.rs`, `src/mcp/restructure.rs` | 3 |
 | `src/mcp/documents.rs`, `src/mcp/search.rs`, `src/mcp/reports.rs` | 3 |
@@ -277,11 +279,19 @@ fn findings_json(findings: &[Finding]) -> serde_json::Value {
 **Files:**
 - Create: `migrations/0003_changeset_handles.sql`
 - Modify: `src/store/changesets.rs` (`ChangesetRow.handle`, `RawChangeset`, `changeset_columns!`, `open`, `by_handle`, tests)
-- Modify: `src/error.rs` (`UnknownChangeset`: variant, `kind`, `is_internal` arm, `to_json` arm, test)
+- Modify: `src/error.rs` (`UnknownChangeset`: variant, `kind` arm, `to_json` arm, test)
 - Modify: `src/mcp/context.rs` (`Pinned`, `ToolContext::changeset`, tests)
 - Modify: `src/mcp/changesets.rs` (the `open_changeset` tool, its own `#[tool_router]` block, `open_router`)
 - Modify: `src/mcp/mod.rs` (join `open_router` in `OkfServer::tools`; the tool-count test, if any, goes up by one)
+- Modify: `src/http/mod.rs` (`AppError::status` gives `UnknownChangeset` 404, beside `CatalogNotSelected`; its status test)
+- Modify: `src/overlay.rs` (its test's hand-built `ChangesetRow` gains `handle`)
 - Create: `changelog/<ts>-m8-task-02-handles.md`
+
+> **Corrected (issue #161), 2026-11-04.** As shipped:
+> - `AppError::status` (`src/http/mod.rs`) matches `OkfError` with no `_` arm, so the new variant needs a status there too: 404, like `CatalogNotSelected` (a handle is a name that isn't there, or not for this key). `src/overlay.rs`'s test builds a `ChangesetRow` literal, which needs `handle` (and Task 5 must drop its `label`).
+> - `is_internal` is a `matches!` of the internal variants, so `UnknownChangeset` needs no arm there.
+> - The store module's fixture is `setup(&db.pool)` (catalog `pg`, keys `alice` and `bob`), and its tests already have an `open` helper (get-or-create in a transaction), which shadows the store's `open` under `use super::*`; the new test calls `super::open`. Step 2's code below is as shipped.
+> - The `ToolContext::changeset` tests open their changeset through the `open_changeset` tool function (`crate::mcp::changesets::open_changeset`), so no new test helper was added. `src/mcp/changesets.rs` also has `open_changeset_is_listed_with_an_object_output_schema`.
 
 - [ ] **Step 1: The migration.**
 
@@ -290,6 +300,8 @@ fn findings_json(findings: &[Finding]) -> serde_json::Value {
 -- random handle that `open_changeset` returns and every changeset call passes
 -- back, instead of a label the connection sends. A volatile default is
 -- evaluated per row, so existing changesets get distinct handles too.
+-- That rewrites the table under ACCESS EXCLUSIVE, on purpose: changesets is
+-- a small bookkeeping table and migrations run at start-up.
 ALTER TABLE changesets
     ADD COLUMN handle text NOT NULL DEFAULT gen_random_uuid()::text;
 ALTER TABLE changesets ADD CONSTRAINT changesets_handle_key UNIQUE (handle);
@@ -303,12 +315,13 @@ ALTER TABLE changesets ADD CONSTRAINT changesets_handle_key UNIQUE (handle);
 #[tokio::test]
 async fn open_returns_a_fresh_handle_each_time_and_by_handle_finds_it() {
     let db = test_db().await;
-    let pg = catalog(&db, "pg").await;
+    let pg = setup(&db.pool).await;
     let mut tx = db.pool.begin().await.unwrap();
     lock_catalog(&mut tx, pg).await.unwrap();
 
-    let first = open(&mut tx, pg, "alice", "agent:a", Utc::now()).await.unwrap();
-    let second = open(&mut tx, pg, "alice", "agent:a", Utc::now()).await.unwrap();
+    // `super::open`: the test module's own `open` helper shadows the store's.
+    let first = super::open(&mut tx, pg, "alice", "agent:a", now()).await.unwrap();
+    let second = super::open(&mut tx, pg, "alice", "agent:a", now()).await.unwrap();
     tx.commit().await.unwrap();
 
     assert_ne!(first.handle, second.handle);
@@ -318,7 +331,7 @@ async fn open_returns_a_fresh_handle_each_time_and_by_handle_finds_it() {
 }
 ```
 
-  Use the module's real fixture names (`test_db`, a catalog-creating helper). The test above shows the shape.
+  The module's fixture is `setup` (see the correction note above).
 
 - [ ] **Step 3: Implement.** Add `handle` to `RawChangeset`, `ChangesetRow`, `From<RawChangeset>` and the `changeset_columns!` macro. Then:
 
@@ -433,7 +446,8 @@ impl ToolContext {
     ///   in a catalog this key does not reach (or that is not loaded), or
     ///   belongs to another key while this one is not `admin`;
     /// - [`OkfError::Forbidden`] below `access`;
-    /// - [`OkfError::Refused`] for a changeset that was published or discarded;
+    /// - [`OkfError::Refused`] for a changeset that was published or discarded
+    ///   (a discarded one with the 24-hour hint);
     /// - [`OkfError::Database`].
     pub async fn changeset(&self, handle: &str, access: Access) -> Result<Pinned, OkfError> {
         let unknown = || OkfError::UnknownChangeset { changeset: handle.to_string() };
@@ -460,16 +474,21 @@ impl ToolContext {
             return Err(unknown());
         }
         self.principal.require(access, state.name())?;
-        if row.state != ChangesetState::Open {
-            return Err(OkfError::Refused {
-                reason: format!(
-                    "changeset {handle} is {}; open a new one with open_changeset (a \
-                     changeset with no edits is discarded after 24 hours)",
-                    row.state.as_str()
-                ),
-            });
-        }
-        Ok(Pinned { state, row })
+        // Only a discarded changeset gets the 24-hour hint (Brooke's review
+        // of PR #167): a published one was never pruned.
+        let hint = match row.state {
+            ChangesetState::Open => return Ok(Pinned { state, row }),
+            ChangesetState::Published => "",
+            ChangesetState::Discarded => {
+                " (a changeset with no edits is discarded after 24 hours)"
+            }
+        };
+        Err(OkfError::Refused {
+            reason: format!(
+                "changeset {handle} is {}; open a new one with open_changeset{hint}",
+                row.state.as_str()
+            ),
+        })
     }
 }
 ```

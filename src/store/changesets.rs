@@ -39,7 +39,7 @@ const GET_OR_CREATE_TRIES: usize = 3;
 // while it cannot read a `const`. So every query stays one literal string.
 macro_rules! changeset_columns {
     () => {
-        "id, catalog_id, label, key_id, actor, state, version, created_at, updated_at"
+        "id, handle, catalog_id, label, key_id, actor, state, version, created_at, updated_at"
     };
 }
 
@@ -90,6 +90,9 @@ impl ChangesetState {
 pub struct ChangesetRow {
     /// Database id (what `adopt_changeset` takes).
     pub id: i64,
+    /// The handle the server issued (M8 Decision 1): a random UUID in text
+    /// form, what `open_changeset` returns.
+    pub handle: String,
     /// Its catalog.
     pub catalog_id: i64,
     /// The connection's label (Decision 1).
@@ -153,6 +156,7 @@ pub struct StrandedRow {
 #[derive(sqlx::FromRow)]
 struct RawChangeset {
     id: i64,
+    handle: String,
     catalog_id: i64,
     label: String,
     key_id: Option<String>,
@@ -167,6 +171,7 @@ impl From<RawChangeset> for ChangesetRow {
     fn from(raw: RawChangeset) -> Self {
         Self {
             id: raw.id,
+            handle: raw.handle,
             catalog_id: raw.catalog_id,
             label: raw.label,
             key_id: raw.key_id,
@@ -346,6 +351,76 @@ pub async fn by_id<'e>(
         " FROM changesets WHERE id = $1"
     ))
     .bind(id)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(ChangesetRow::from))
+}
+
+/// Opens a new changeset for `key_id` in a catalog (M8 Decision 1). Several
+/// may be open at once for one key and catalog. Until the `label` column goes
+/// (M8 Task 5), the label is set to the handle, so the old one-open-per-label
+/// index can never refuse it.
+///
+/// # Arguments
+/// * `conn` - the transaction's connection, after [`lock_catalog`].
+/// * `catalog_id` - the catalog.
+/// * `key_id` - the opening key.
+/// * `actor` - its actor.
+/// * `now` - the time (server clock), for its timestamps.
+///
+/// # Returns
+/// The new, open, empty changeset.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn open(
+    conn: &mut PgConnection,
+    catalog_id: i64,
+    key_id: &str,
+    actor: &str,
+    now: DateTime<Utc>,
+) -> Result<ChangesetRow, OkfError> {
+    // One statement: the CTE (a named subquery, `WITH drawn AS ...`) draws the
+    // handle once, and the insert writes it to both columns.
+    let row = sqlx::query_as::<_, RawChangeset>(concat!(
+        "WITH drawn AS (SELECT gen_random_uuid()::text AS handle) \
+         INSERT INTO changesets (catalog_id, key_id, label, handle, actor, state, \
+         created_at, updated_at) \
+         SELECT $1, $2, drawn.handle, drawn.handle, $3, 'open', $4, $4 FROM drawn \
+         RETURNING ",
+        changeset_columns!()
+    ))
+    .bind(catalog_id)
+    .bind(key_id)
+    .bind(actor)
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(row.into())
+}
+
+/// A changeset by its handle, in any state.
+///
+/// # Arguments
+/// * `executor` - a pool, connection or transaction.
+/// * `handle` - the handle, as a client sent it.
+///
+/// # Returns
+/// The row, or `None` if no changeset has that handle. One lookup in the
+/// handle's unique index.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn by_handle<'e>(
+    executor: impl PgExecutor<'e>,
+    handle: &str,
+) -> Result<Option<ChangesetRow>, OkfError> {
+    let row = sqlx::query_as::<_, RawChangeset>(concat!(
+        "SELECT ",
+        changeset_columns!(),
+        " FROM changesets WHERE handle = $1"
+    ))
+    .bind(handle)
     .fetch_optional(executor)
     .await?;
     Ok(row.map(ChangesetRow::from))
@@ -573,7 +648,7 @@ pub async fn stranded(
     // selected without listing them in `GROUP BY`. A `NULL` parameter
     // (a Rust `None`) turns its filter off.
     let rows = sqlx::query_as::<_, RawStranded>(
-        "SELECT c.id, c.catalog_id, c.label, c.key_id, c.actor, c.state, c.version, \
+        "SELECT c.id, c.handle, c.catalog_id, c.label, c.key_id, c.actor, c.state, c.version, \
          c.created_at, c.updated_at, k.name AS catalog, \
          array_agg(e.path ORDER BY e.path) AS paths \
          FROM changesets c \
@@ -787,6 +862,36 @@ mod tests {
         assert_eq!((first.state, first.version), (ChangesetState::Open, 0));
         assert_eq!((first.created_at, first.updated_at), (now(), now()));
         assert_eq!(by_id(&db.pool, first.id).await.unwrap(), Some(first));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_returns_a_fresh_handle_each_time_and_by_handle_finds_it() {
+        let db = test_db().await;
+        let pg = setup(&db.pool).await;
+        let mut tx = db.pool.begin().await.unwrap();
+        lock_catalog(&mut tx, pg).await.unwrap();
+
+        // `super::open`: this module's own `open` helper shadows the store's.
+        let first = super::open(&mut tx, pg, "alice", "agent:a", now())
+            .await
+            .unwrap();
+        let second = super::open(&mut tx, pg, "alice", "agent:a", now())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_ne!(first.handle, second.handle);
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.label, first.handle);
+        assert_eq!(
+            (first.state, first.key_id.as_deref(), first.actor.as_str()),
+            (ChangesetState::Open, Some("alice"), "agent:a")
+        );
+        assert_eq!(
+            by_handle(&db.pool, &first.handle).await.unwrap(),
+            Some(first)
+        );
+        assert_eq!(by_handle(&db.pool, "no-such-handle").await.unwrap(), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

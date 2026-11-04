@@ -197,6 +197,18 @@ pub enum OkfError {
         /// Each link into it, in walk order, then line order.
         links: Vec<LinkSource>,
     },
+
+    /// No changeset with this handle that the key may use: it does not exist,
+    /// belongs to another key, or is in a catalog the key does not reach
+    /// (worded alike, so a key cannot probe for other keys' handles).
+    #[error(
+        "{changeset}: no such changeset; open one with open_changeset, or see \
+         list_changesets"
+    )]
+    UnknownChangeset {
+        /// The handle as given.
+        changeset: String,
+    },
 }
 
 /// One file of an [`OkfError::Conflict`] (a record, so its fields are public).
@@ -250,6 +262,7 @@ impl OkfError {
             OkfError::LintFailed { .. } => "LintFailed",
             OkfError::Conflict { .. } => "Conflict",
             OkfError::StillLinked { .. } => "StillLinked",
+            OkfError::UnknownChangeset { .. } => "UnknownChangeset",
         }
     }
 
@@ -317,6 +330,9 @@ impl OkfError {
                 body["matches"] = (*matches).into();
             }
             OkfError::CatalogNotSelected { catalog } => body["catalog"] = catalog.as_str().into(),
+            OkfError::UnknownChangeset { changeset } => {
+                body["changeset"] = changeset.as_str().into();
+            }
             OkfError::ImportRefused { problems } => body["problems"] = problems.as_slice().into(),
             OkfError::LintFailed { errors, warnings } => {
                 body["errors"] = findings_json(errors);
@@ -471,6 +487,26 @@ mod tests {
         assert_eq!(unselected_body["error"], "CatalogNotSelected");
         assert_eq!(unselected_body["catalog"], "work");
         assert_eq!(refused_body["problems"], serde_json::json!(["a: bad"]));
+    }
+
+    #[test]
+    fn unknown_changeset_names_the_handle() {
+        let error = OkfError::UnknownChangeset {
+            changeset: "no-such-handle".to_string(),
+        };
+
+        let body = error.to_json();
+
+        assert!(!error.is_internal());
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "UnknownChangeset",
+                "message": "no-such-handle: no such changeset; open one with open_changeset, \
+                            or see list_changesets",
+                "changeset": "no-such-handle",
+            })
+        );
     }
 
     #[test]

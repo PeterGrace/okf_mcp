@@ -380,6 +380,7 @@ mod tests {
     fn changeset(id: i64, version: i64) -> ChangesetRow {
         ChangesetRow {
             id,
+            handle: format!("handle-{id}"),
             catalog_id: 1,
             label: "default".to_string(),
             key_id: None,
