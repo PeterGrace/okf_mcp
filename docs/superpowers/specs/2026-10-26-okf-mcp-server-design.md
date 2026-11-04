@@ -968,9 +968,10 @@ Found while building it:
   (Tasks 10 and 11). The write waits in `get_or_create`'s `SELECT ... FOR UPDATE`, and
   when the closing transaction commits, Postgres re-checks `state = 'open'` against the
   updated row, finds none and the write opens a new changeset. No edit is lost.
-  `write::apply`'s `Busy` branch stays as a defensive check that no test reaches.
+  In M5, `write::apply` kept a `Busy` branch as a defensive check that no test reached.
   (Replaced in M8: a write names its changeset by handle, so one queued behind a closing
-  publish or discard is refused with `Refused` and stores nothing.)
+  publish or discard is refused with `Refused` and stores nothing; that refusal is
+  tested, and `write::apply` has no `Busy` branch for it.)
 - **Pooled connections are a known limit, accepted for now** (Tasks 8 and 10). Each
   write holds one pooled connection for its whole transaction, so writers queued on one
   changeset's row lock each hold one while they wait; a publish holds one and needs a
