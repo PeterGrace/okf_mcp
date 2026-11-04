@@ -71,7 +71,7 @@ impl AppError {
     /// The HTTP status of the wrapped error.
     ///
     /// # Returns
-    /// 404 for a path or catalog that is not there (or not reachable), 403
+    /// 404 for a path, catalog or changeset that is not there (or not reachable), 403
     /// for an access level that is not enough, 409 for a refused request or a
     /// publish conflict, 422 for a publish whose result fails lint, 400 for a
     /// bad input, 500 for the server's own failures, 503 for a request the
@@ -79,9 +79,9 @@ impl AppError {
     pub fn status(&self) -> StatusCode {
         // No `_` arm: a new variant fails to compile here until it has a status.
         match &self.0 {
-            OkfError::NotFound { .. } | OkfError::CatalogNotSelected { .. } => {
-                StatusCode::NOT_FOUND
-            }
+            OkfError::NotFound { .. }
+            | OkfError::CatalogNotSelected { .. }
+            | OkfError::UnknownChangeset { .. } => StatusCode::NOT_FOUND,
             OkfError::Forbidden { .. } => StatusCode::FORBIDDEN,
             OkfError::Refused { .. } | OkfError::Conflict { .. } | OkfError::StillLinked { .. } => {
                 StatusCode::CONFLICT
@@ -311,8 +311,13 @@ mod tests {
         let internal = AppError(OkfError::Database {
             source: sqlx::Error::PoolClosed,
         });
+        let unknown = AppError(OkfError::UnknownChangeset {
+            changeset: "made-up".to_string(),
+        });
 
-        let errors = [&missing, &forbidden, &refused, &bad, &io, &internal];
+        let errors = [
+            &missing, &forbidden, &refused, &bad, &io, &internal, &unknown,
+        ];
         let statuses = errors.map(AppError::status);
         // A 500 is exactly an internal error: logged in full, redacted here.
         let internal_flags = errors.map(|error| error.0.is_internal());
@@ -327,9 +332,13 @@ mod tests {
                 StatusCode::BAD_REQUEST,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::NOT_FOUND,
             ]
         );
-        assert_eq!(internal_flags, [false, false, false, false, true, true]);
+        assert_eq!(
+            internal_flags,
+            [false, false, false, false, true, true, false]
+        );
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         // The driver's message stays in the log.
         assert_eq!(

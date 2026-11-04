@@ -1,5 +1,6 @@
 //! What one tool call acts as and on: the principal, the connection's
-//! catalogs and changeset label, and one view of the catalog map.
+//! catalogs and changeset label, one view of the catalog map, and the
+//! changeset a handle names ([`Pinned`]).
 
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use crate::overlay::View;
 use crate::selection::{
     connection_catalogs, connection_label, resolve, Selection, Sources, DEFAULT_LABEL,
 };
-use crate::store::changesets::{self, ChangesetKey};
+use crate::store::changesets::{self, ChangesetKey, ChangesetRow, ChangesetState};
 use crate::store::keys::Access;
 
 /// Is this [`ToolContext::view`] error the connection's overlay failing to
@@ -34,6 +35,16 @@ use crate::store::keys::Access;
 /// `true` for an overlay that does not apply.
 pub fn is_broken_overlay(error: &OkfError) -> bool {
     matches!(error, OkfError::InvalidPath { .. })
+}
+
+/// A changeset a call acts on, and its catalog (M8 Decision 5: the catalog
+/// comes from the changeset).
+#[derive(Debug, Clone)]
+pub struct Pinned {
+    /// The changeset's catalog.
+    pub state: Arc<CatalogState>,
+    /// The changeset, as read when the call resolved it (not locked).
+    pub row: ChangesetRow,
 }
 
 /// One tool call's context.
@@ -262,6 +273,63 @@ impl ToolContext {
         }
     }
 
+    /// Resolves a changeset handle for this call (M8 Decisions 1 and 3).
+    ///
+    /// # Arguments
+    /// * `handle` - the call's `changeset` argument.
+    /// * `access` - what the call needs on the changeset's catalog.
+    ///
+    /// # Returns
+    /// The open changeset and its catalog. The row is read without a lock:
+    /// a write locks it again (`changesets::lock`) before trusting its state.
+    ///
+    /// # Errors
+    /// - [`OkfError::UnknownChangeset`] for a handle that does not exist, is
+    ///   in a catalog this key does not reach (or that is not loaded), or
+    ///   belongs to another key while this one is not `admin`;
+    /// - [`OkfError::Forbidden`] below `access`;
+    /// - [`OkfError::Refused`] for a changeset that was published or
+    ///   discarded, with a hint that an empty one is discarded after 24 hours;
+    /// - [`OkfError::Database`].
+    pub async fn changeset(&self, handle: &str, access: Access) -> Result<Pinned, OkfError> {
+        // A closure, so each refusal below builds its own error value.
+        let unknown = || OkfError::UnknownChangeset {
+            changeset: handle.to_string(),
+        };
+        let row = changesets::by_handle(self.app.pool(), handle)
+            .await?
+            .ok_or_else(unknown)?;
+        // The map is keyed by name; a handful of catalogs, so a scan is fine.
+        let state = self
+            .catalogs
+            .values()
+            .find(|state| state.id() == row.catalog_id)
+            .map(Arc::clone)
+            .ok_or_else(unknown)?;
+        // Ownership is checked before `require(access, ..)`, on purpose: a key
+        // that neither owns the changeset nor is `admin` gets
+        // `UnknownChangeset`, never `Forbidden`, so it cannot tell a real
+        // handle from a made-up one (Decision 3). So a `read` key, which owns
+        // none, never resolves one, and `access` only matters for owners and
+        // admins. Don't reorder these checks.
+        let own = row.key_id.as_deref() == Some(self.principal.key_id.as_str());
+        let admin = self.principal.access == Access::Admin;
+        if !self.principal.reaches(state.name()) || !(own || admin) {
+            return Err(unknown());
+        }
+        self.principal.require(access, state.name())?;
+        if row.state != ChangesetState::Open {
+            return Err(OkfError::Refused {
+                reason: format!(
+                    "changeset {handle} is {}; open a new one with open_changeset (a \
+                     changeset with no edits is discarded after 24 hours)",
+                    row.state.as_str()
+                ),
+            });
+        }
+        Ok(Pinned { state, row })
+    }
+
     /// The state of a catalog `select` returned.
     fn state(&self, name: &str) -> Arc<CatalogState> {
         let state = self
@@ -276,11 +344,14 @@ impl ToolContext {
 mod tests {
     use chrono::Utc;
 
+    use super::ToolContext;
     use crate::config::Config;
+    use crate::mcp::changesets::{open_changeset, OpenParams};
     use crate::mcp::testing::{
         app_with, context, pending_entry, principal, principal_as, store_key, PendingEdit,
     };
     use crate::selection::{CHANGESET_HEADER, DEFAULT_LABEL};
+    use crate::store::changesets::{self, ChangesetState};
     use crate::store::keys::Access;
 
     // `Arc<CatalogState>` to its name, for asserts.
@@ -312,6 +383,88 @@ mod tests {
         assert_eq!(first.name(), "work");
         assert_eq!(names(&fallback), ["home"]);
         assert_eq!(unreachable.kind(), "CatalogNotSelected");
+    }
+
+    /// `pg`, the keys `writer`, `other` and `root`, and a changeset the
+    /// writer opened in `pg` (through `open_changeset`, as a client would).
+    async fn opened_by_writer() -> (crate::mcp::testing::TestApp, String) {
+        let test = app_with(&[("pg", &[])], Config::default()).await;
+        for key in ["writer", "other", "root"] {
+            store_key(&test, key).await;
+        }
+        let writer = as_key(&test, "writer", Access::Write);
+        let opened = open_changeset(&writer, OpenParams { catalog: None })
+            .await
+            .unwrap();
+        (test, opened.changeset)
+    }
+
+    fn as_key(test: &crate::mcp::testing::TestApp, key: &str, access: Access) -> ToolContext {
+        context(test, principal_as(key, access, &[], Some("pg")), None)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handle_resolves_for_its_key_and_an_admin_only() {
+        let (test, handle) = opened_by_writer().await;
+
+        let mine = as_key(&test, "writer", Access::Write)
+            .changeset(&handle, Access::Write)
+            .await
+            .unwrap();
+        let admin = as_key(&test, "root", Access::Admin)
+            .changeset(&handle, Access::Write)
+            .await
+            .unwrap();
+        let other = as_key(&test, "other", Access::Write)
+            .changeset(&handle, Access::Write)
+            .await
+            .unwrap_err();
+        let made_up = as_key(&test, "writer", Access::Write)
+            .changeset("made-up", Access::Write)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            (mine.state.name(), mine.row.handle.as_str()),
+            ("pg", handle.as_str())
+        );
+        assert_eq!(admin.row.id, mine.row.id);
+        assert_eq!(other.kind(), "UnknownChangeset");
+        assert_eq!(made_up.kind(), "UnknownChangeset");
+        assert_eq!(
+            other.to_string().replace(&handle, "made-up"),
+            made_up.to_string()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_changeset_is_refused_by_name() {
+        let (test, handle) = opened_by_writer().await;
+        let writer = as_key(&test, "writer", Access::Write);
+        let row = writer.changeset(&handle, Access::Write).await.unwrap().row;
+        let mut tx = test.app.pool().begin().await.unwrap();
+        changesets::set_state(&mut tx, row.id, ChangesetState::Discarded, Utc::now())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let refused = writer.changeset(&handle, Access::Write).await.unwrap_err();
+
+        assert_eq!(refused.kind(), "Refused");
+        let message = refused.to_string();
+        assert!(message.contains(&handle), "{message}");
+        assert!(message.contains("discarded"), "{message}");
+        assert!(message.contains("24 hours"), "{message}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_key_resolves_nothing() {
+        let (test, handle) = opened_by_writer().await;
+        let reader = context(&test, principal(&[], Some("pg")), None);
+
+        let refused = reader.changeset(&handle, Access::Read).await.unwrap_err();
+
+        assert_eq!(refused.kind(), "UnknownChangeset");
     }
 
     #[tokio::test(flavor = "multi_thread")]

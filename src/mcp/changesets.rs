@@ -1,6 +1,7 @@
 //! The changeset tools (design "Write tools"): `publish` (Task 10);
 //! `discard`, `revert` and `pending_changes` (Task 11); `stranded_sessions`
-//! and `adopt_changeset` (Task 12). Each task's tools are one
+//! and `adopt_changeset` (Task 12); `open_changeset` (M8 Task 2). Each task's
+//! tools are one
 //! `#[tool_router]` block with its own router, joined in `OkfServer::tools`.
 
 use std::collections::BTreeMap;
@@ -300,6 +301,89 @@ impl OkfServer {
     ) -> Result<Json<Adopted>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(adopt_changeset(&ctx, params).await)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// open_changeset (M8 Task 2)
+// ---------------------------------------------------------------------------
+
+/// `open_changeset`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct OpenParams {
+    /// The catalog (default: this connection's write target).
+    pub catalog: Option<String>,
+}
+
+/// `open_changeset`'s result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Opened {
+    /// The new changeset's handle: pass it as `changeset` to every write, `publish`, `discard`, `revert` and `pending_changes`, and to reads that should see the drafts.
+    pub changeset: String,
+    /// Its catalog.
+    pub catalog: String,
+}
+
+/// Opens a changeset and returns its handle (M8 Decision 1).
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the catalog; else the connection's write target.
+///
+/// # Returns
+/// The new changeset's handle and its catalog's name.
+///
+/// # Errors
+/// A selection error for `catalog`; [`OkfError::Forbidden`] without `write`;
+/// [`OkfError::Refused`] if the catalog was deleted meanwhile;
+/// [`OkfError::Busy`] on a deadlock; [`OkfError::Database`].
+pub(crate) async fn open_changeset(
+    ctx: &ToolContext,
+    params: OpenParams,
+) -> Result<Opened, OkfError> {
+    // Local, as in the other tasks' functions here.
+    use crate::store::changesets;
+
+    let state = ctx.one(params.catalog.as_deref())?;
+    let principal = ctx.principal();
+    principal.require(Access::Write, state.name())?;
+    let now = ctx.app().clock().now();
+    // The lock order of every changeset write: the catalog row first, so a
+    // concurrent `catalog delete` either waits for this or is seen here.
+    let mut tx = ctx.app().pool().begin().await?;
+    changesets::lock_catalog(&mut tx, state.id()).await?;
+    let opened = changesets::open(
+        &mut tx,
+        state.id(),
+        &principal.key_id,
+        &principal.actor,
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Opened {
+        changeset: opened.handle,
+        catalog: state.name().to_string(),
+    })
+}
+
+#[tool_router(router = open_router, vis = "pub(crate)")]
+impl OkfServer {
+    /// The `open_changeset` tool.
+    #[tool(
+        description = "Open a changeset in a catalog and return its handle. Every edit, \
+                       publish, discard, revert and pending_changes needs a handle, and the \
+                       reads take one to see its drafts. Nothing is visible to anyone else until \
+                       publish. Several changesets may be open at once. A changeset with no \
+                       edits is discarded after 24 hours. Write access."
+    )]
+    async fn open_changeset(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<OpenParams>,
+    ) -> Result<Json<Opened>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(open_changeset(&ctx, params).await)
     }
 }
 
@@ -867,6 +951,65 @@ impl OkfServer {
     ) -> Result<Json<PendingChanges>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(pending_changes(&ctx, params).await)
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+
+    use crate::config::Config;
+    use crate::mcp::testing::{app_with, principal, writer};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_changeset_returns_a_handle_that_resolves() {
+        let test = app_with(&[("pg", &[]), ("work", &[])], Config::default()).await;
+        let ctx = writer(&test, "alice", "pg").await;
+        let reader = crate::mcp::testing::context(&test, principal(&[], Some("pg")), None);
+
+        let opened = open_changeset(&ctx, OpenParams { catalog: None })
+            .await
+            .unwrap();
+        let in_work = open_changeset(
+            &ctx,
+            OpenParams {
+                catalog: Some("work".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let pinned = ctx
+            .changeset(&opened.changeset, Access::Write)
+            .await
+            .unwrap();
+        let refused = open_changeset(&reader, OpenParams { catalog: None })
+            .await
+            .unwrap_err();
+
+        assert_eq!(opened.catalog, "pg");
+        assert_eq!(in_work.catalog, "work");
+        assert_ne!(opened.changeset, in_work.changeset);
+        assert_eq!(pinned.state.name(), "pg");
+        assert_eq!(pinned.row.handle, opened.changeset);
+        assert_eq!(pinned.row.key_id.as_deref(), Some("alice"));
+        assert_eq!(refused.kind(), "Forbidden");
+    }
+
+    #[test]
+    fn open_changeset_is_listed_with_an_object_output_schema() {
+        let tools = OkfServer::tools().list_all();
+
+        let listed = tools
+            .iter()
+            .find(|tool| tool.name == "open_changeset")
+            .expect("open_changeset is registered");
+
+        let schema = listed.output_schema.as_ref().expect("an output schema");
+        assert_eq!(schema["type"], "object");
+        assert!(listed.input_schema["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("catalog"));
     }
 }
 
