@@ -56,3 +56,7 @@ gone from the schema, the code and the docs. Version 0.8.0.
   labels, and lint's name for a timestamp field), none about changesets.
 - 0.8.0 is forward-only: once migration 0004 has run, a 0.7.0 binary
   refuses to start against the database (operations guide, "Upgrades").
+- Review of PR #171: the publish refusal's handle is now tested
+  (`a_publish_of_a_changeset_closed_meanwhile_names_its_handle`), and the
+  operations guide's Troubleshooting row quotes all three refusals of a
+  closed changeset (resolving it, a queued write, publish's re-check).

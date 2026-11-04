@@ -1073,6 +1073,33 @@ mod publish_tests {
         panic!("{count} lock waiter(s) never appeared");
     }
 
+    /// A publish whose changeset closed after the call resolved it (another
+    /// publish won the race) is refused under the lock, naming the handle,
+    /// never the internal id clients don't see.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_publish_of_a_changeset_closed_meanwhile_names_its_handle() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
+        body(&ctx, &handle, "/a.md", "# A\n\nNew.\n").await;
+        // Resolved while open, as the losing publish read it before the lock.
+        let stale = changeset_row(&test, &handle).await;
+        let state = test.app.catalog("pg").unwrap();
+        publish_as(&ctx, &handle, "first").await.unwrap();
+
+        let refused = crate::store::publish::publish(&test.app, &state, &stale, "a", "second")
+            .await
+            .unwrap_err();
+
+        assert_eq!(refused.kind(), "Refused");
+        let message = refused.to_string();
+        assert!(message.contains(&handle), "{message}");
+        assert!(
+            !message.contains(&format!("changeset {} ", stale.id)),
+            "{message}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn publish_writes_revisions_bumps_the_generation_and_swaps_the_snapshot() {
         let test = pg().await;
