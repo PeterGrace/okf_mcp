@@ -13,6 +13,7 @@ mod support;
 use okf_mcp::archive::{read_tarball, Files};
 use okf_mcp::config::Config;
 use okf_mcp::store::keys::Access;
+use rmcp::model::CallToolResult;
 use serde_json::{json, Value};
 use support::server::{call, files, open_changeset, structured, Client, TestServer};
 use tokio::sync::Barrier;
@@ -399,10 +400,23 @@ async fn a_write_without_a_changeset_is_a_parameter_error() {
     .await;
     client.cancel().await.unwrap();
 
-    // rmcp's parameter check fails before the tool runs, and its router
-    // turns that `invalid_params` error into an `isError` result whose text
-    // is the message (rmcp 3.8.0, `handler/server/router/tool.rs`), with no
-    // structured content: no tool error JSON, and nothing written.
+    assert_missing_changeset(&refused);
+}
+
+/// Asserts that `refused` is rmcp's parameter error for a call without
+/// `changeset`.
+///
+/// rmcp's parameter check fails before the tool runs, and its router turns
+/// that `invalid_params` error into an `isError` result whose text is the
+/// message (rmcp 3.8.0, `handler/server/router/tool.rs`), with no structured
+/// content: no tool error JSON, and nothing written.
+///
+/// # Arguments
+/// * `refused` - the call's result.
+///
+/// # Panics
+/// If it is anything else.
+fn assert_missing_changeset(refused: &CallToolResult) {
     assert_eq!(refused.is_error, Some(true));
     assert!(refused.structured_content.is_none());
     let text = refused
@@ -414,5 +428,37 @@ async fn a_write_without_a_changeset_is_a_parameter_error() {
     assert_eq!(
         text,
         "failed to deserialize parameters: missing field `changeset`"
+    );
+}
+
+/// The label header of M5 to M7 (`X-OKF-Changeset`) is gone for good: a
+/// client that still sends it needs `changeset` arguments like any other,
+/// and nothing is ever named after its value.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changeset_header_is_ignored() {
+    let server = TestServer::start(catalog(), Config::default()).await;
+    let key = writer(&server, "writer").await;
+    let client = server
+        .client_with(&key, &[("x-okf-changeset", "anything")])
+        .await
+        .unwrap();
+    let stamp = json!({"path": "/infra/time.md", "field": "verified"});
+
+    let without = call(&client, "stamp", stamp.clone()).await;
+    let handle = open_changeset(&client, None).await;
+    let mut with = stamp;
+    with["changeset"] = json!(handle);
+    let stamped = ok(&client, "stamp", with).await;
+    let pending = ok(&client, "pending_changes", json!({"changeset": handle})).await;
+    let named = call(&client, "pending_changes", json!({"changeset": "anything"})).await;
+    client.cancel().await.unwrap();
+
+    assert_missing_changeset(&without);
+    assert_eq!(stamped["changeset"], handle.as_str());
+    assert_eq!(paths(&pending["files"]), ["/infra/time.md"]);
+    assert_eq!(named.is_error, Some(true));
+    assert_eq!(
+        named.structured_content.expect("the error's JSON")["error"],
+        "UnknownChangeset"
     );
 }

@@ -35,7 +35,7 @@ pub const CATALOG_GONE: &str =
 // while it cannot read a `const`. So every query stays one literal string.
 macro_rules! changeset_columns {
     () => {
-        "id, handle, catalog_id, label, key_id, actor, state, version, created_at, updated_at"
+        "id, handle, catalog_id, key_id, actor, state, version, created_at, updated_at"
     };
 }
 
@@ -92,8 +92,6 @@ pub struct ChangesetRow {
     pub handle: String,
     /// Its catalog.
     pub catalog_id: i64,
-    /// The connection's label (Decision 1).
-    pub label: String,
     /// The key it belongs to; `None` once that key's row is deleted.
     pub key_id: Option<String>,
     /// The actor of the key that opened it.
@@ -145,7 +143,6 @@ struct RawChangeset {
     id: i64,
     handle: String,
     catalog_id: i64,
-    label: String,
     key_id: Option<String>,
     actor: String,
     state: String,
@@ -160,7 +157,6 @@ impl From<RawChangeset> for ChangesetRow {
             id: raw.id,
             handle: raw.handle,
             catalog_id: raw.catalog_id,
-            label: raw.label,
             key_id: raw.key_id,
             actor: raw.actor,
             // The column's CHECK constraint allows only the three spellings.
@@ -245,9 +241,8 @@ pub async fn by_id<'e>(
 }
 
 /// Opens a new changeset for `key_id` in a catalog (M8 Decision 1). Several
-/// may be open at once for one key and catalog. Until the `label` column goes
-/// (M8 Task 5), the label is set to the handle, so the old one-open-per-label
-/// index can never refuse it.
+/// may be open at once for one key and catalog. Postgres draws the handle:
+/// the column's default is `gen_random_uuid()::text` (migration 0003).
 ///
 /// # Arguments
 /// * `conn` - the transaction's connection, after [`lock_catalog`].
@@ -268,13 +263,11 @@ pub async fn open(
     actor: &str,
     now: DateTime<Utc>,
 ) -> Result<ChangesetRow, OkfError> {
-    // One statement: the CTE (a named subquery, `WITH drawn AS ...`) draws the
-    // handle once, and the insert writes it to both columns.
+    // `handle` is left out, so its column default draws it; `RETURNING`
+    // hands the new row back, handle included.
     let row = sqlx::query_as::<_, RawChangeset>(concat!(
-        "WITH drawn AS (SELECT gen_random_uuid()::text AS handle) \
-         INSERT INTO changesets (catalog_id, key_id, label, handle, actor, state, \
-         created_at, updated_at) \
-         SELECT $1, $2, drawn.handle, drawn.handle, $3, 'open', $4, $4 FROM drawn \
+        "INSERT INTO changesets (catalog_id, key_id, actor, state, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'open', $4, $4) \
          RETURNING ",
         changeset_columns!()
     ))
@@ -536,7 +529,7 @@ pub async fn list_open(
     // Postgres array, which sqlx binds from a Rust slice. A `NULL` key (a
     // Rust `None`) turns that filter off.
     let rows = sqlx::query_as::<_, RawListed>(
-        "SELECT c.id, c.handle, c.catalog_id, c.label, c.key_id, c.actor, c.state, c.version, \
+        "SELECT c.id, c.handle, c.catalog_id, c.key_id, c.actor, c.state, c.version, \
          c.created_at, c.updated_at, k.name AS catalog, \
          COALESCE(array_agg(e.path ORDER BY e.path) FILTER (WHERE e.path IS NOT NULL), \
          '{}') AS paths \
@@ -691,7 +684,6 @@ mod tests {
 
         assert_ne!(first.handle, second.handle);
         assert_ne!(first.id, second.id);
-        assert_eq!(first.label, first.handle);
         assert_eq!(
             (first.state, first.key_id.as_deref(), first.actor.as_str()),
             (ChangesetState::Open, Some("alice"), "agent:a")

@@ -346,8 +346,8 @@ pub(crate) mod tests {
         let db = test_db().await;
         let pg = create(&db.pool, "pg", "", now()).await.unwrap();
         let changeset: i64 = sqlx::query_scalar(
-            "INSERT INTO changesets (catalog_id, label, actor, state, created_at, updated_at) \
-             VALUES ($1, 's', 'a', 'open', $2, $2) RETURNING id",
+            "INSERT INTO changesets (catalog_id, actor, state, created_at, updated_at) \
+             VALUES ($1, 'a', 'open', $2, $2) RETURNING id",
         )
         .bind(pg.id)
         .bind(now())
@@ -382,8 +382,8 @@ pub(crate) mod tests {
         let db = test_db().await;
         let pg = create(&db.pool, "pg", "", now()).await.unwrap();
         sqlx::query(
-            "INSERT INTO changesets (catalog_id, label, actor, state, created_at, updated_at) \
-             VALUES ($1, 's', 'a', 'open', $2, $2)",
+            "INSERT INTO changesets (catalog_id, actor, state, created_at, updated_at) \
+             VALUES ($1, 'a', 'open', $2, $2)",
         )
         .bind(pg.id)
         .bind(now())
@@ -472,8 +472,8 @@ pub(crate) mod tests {
         let db = test_db().await;
         let pg = create(&db.pool, "pg", "", now()).await.unwrap();
         let changeset: i64 = sqlx::query_scalar(
-            "INSERT INTO changesets (catalog_id, label, actor, state, created_at, updated_at) \
-             VALUES ($1, 's', 'a', 'open', $2, $2) RETURNING id",
+            "INSERT INTO changesets (catalog_id, actor, state, created_at, updated_at) \
+             VALUES ($1, 'a', 'open', $2, $2) RETURNING id",
         )
         .bind(pg.id)
         .bind(now())

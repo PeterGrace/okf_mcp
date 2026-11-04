@@ -246,7 +246,7 @@ impl Overlays {
         }
         // Read after the caller read the row (a read resolves it unlocked in
         // `ToolContext::changeset`), so the entries may be newer than
-        // `changeset.version`; harmless: the overlay is labelled with the
+        // `changeset.version`; harmless: the overlay is tagged with the
         // older version, and the next read at the newer one rebuilds it.
         let entries = changesets::entries(executor, changeset.id).await?;
         let overlay = Arc::new(build_overlay(base, changeset, entries).await?);
@@ -320,9 +320,9 @@ impl Overlays {
 // Both arms hold an `Arc`, so a `View` is cheap to move to a blocking thread.
 #[derive(Debug, Clone)]
 pub enum View {
-    /// The published state: no open changeset for this key and label.
+    /// The published state: the call names no changeset in this catalog.
     Published(Arc<Loaded>),
-    /// This connection's overlay.
+    /// The named changeset's overlay.
     Pending(Arc<Overlay>),
 }
 
@@ -384,7 +384,6 @@ mod tests {
             id,
             handle: format!("handle-{id}"),
             catalog_id: 1,
-            label: "default".to_string(),
             key_id: None,
             actor: "t".to_string(),
             state: ChangesetState::Open,
