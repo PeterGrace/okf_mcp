@@ -1,9 +1,9 @@
 # OKF MCP server: design
 
 - **Date:** 2026-10-26; storage redesigned 2026-11-02 (see "Revision: Postgres storage")
-- **Status:** approved design, every milestone delivered: M1 (core library), M2
-  (analysis), M3 (storage), M4 (read-only server), M5 (writes), M6 (restructuring) and
-  M7 (deployment); see "Milestones"
+- **Status:** approved design. M1 (core library), M2 (analysis), M3 (storage), M4
+  (read-only server), M5 (writes), M6 (restructuring) and M7 (deployment) are delivered;
+  M8 (changeset handles) is planned. See "Milestones"
 - **Catalog concept:** `/projects/okf-mcp-server.md` in `pg_knowledge_catalog`
 - **Replaces:** `tools/okf.py` in every OKF catalog (how the existing git catalogs hand
   over to the server is decided once the server is complete)
@@ -41,6 +41,25 @@ What did not change: HTTP transport, bearer keys, catalog selection, the existin
 write rules, the time rules, and everything M1 and M2 built. Documents are stored as
 their exact text, so `okf::doc`'s byte-preserving edits, the snapshot and every analysis
 work unchanged over an in-memory workspace loaded from the database.
+
+## Revision: changeset handles (2026-11-03)
+
+M5 named each changeset by (catalog, key, label), with the label coming from the
+connection (`X-OKF-Changeset`, `?changeset=`, else `default`). That made the
+client responsible for a value that had to be stable within a session and distinct
+between sessions. Two sessions sending the same label silently shared drafts, and
+no client setting gave each Claude Code session its own value without a helper
+script. pgrace replaced it for M8 ([plan](../plans/2026-11-03-okf-mcp-m8-changeset-handles.md)):
+
+- `open_changeset` returns a random handle. Every write tool, `publish`, `discard`,
+  `revert` and `pending_changes` takes it as a required `changeset` argument, and the
+  read tools take it optionally to read through the drafts.
+- A changeset can be used by the key that opened it, on any connection, and by an
+  `admin` key that reaches its catalog. `list_changesets` replaces `stranded_sessions`
+  and `adopt_changeset`.
+- The label header, the query parameter and the `label` column go.
+
+Until M8's Task 5, the sections below still describe labels.
 
 ## Decisions
 
@@ -700,6 +719,7 @@ the deployment is.
 | M5. Writes (delivered) | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` ([plan](../plans/2026-11-03-okf-mcp-m5-writes.md); PRs #104-#117) |
 | M6. Restructuring (delivered) | `move_concept`, `split_concept`, `delete_concept`; `ReplayOp::Unlist` and `ReplayOp::Relink`; byte parity with `okf.py`'s `mv` and `split` ([plan](../plans/2026-11-03-okf-mcp-m6-restructuring.md); PRs #129-#137) |
 | M7. Deployment (delivered) | Dockerfile and the GHCR image workflow, k8s manifests (in the site's Argo CD repository), CNPG database with backups and a restore drill, NTP check, TLS to Postgres, operator docs ([plan](../plans/2026-11-03-okf-mcp-m7-deployment.md); PRs #149-#157) |
+| M8. Changeset handles | Server-issued changeset handles instead of connection labels: `open_changeset`, a required `changeset` on writes and the changeset tools, an optional one on reads, `list_changesets`; `/`-prefixed paths in every error payload; release 0.8.0 ([plan](../plans/2026-11-03-okf-mcp-m8-changeset-handles.md)) |
 
 Per the project's `CLAUDE.md`, each iteration adds a dated note under `changelog/`.
 
