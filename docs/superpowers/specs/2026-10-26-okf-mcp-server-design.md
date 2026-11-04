@@ -2,8 +2,8 @@
 
 - **Date:** 2026-10-26; storage redesigned 2026-11-02 (see "Revision: Postgres storage")
 - **Status:** approved design. M1 (core library), M2 (analysis), M3 (storage), M4
-  (read-only server), M5 (writes), M6 (restructuring) and M7 (deployment) are delivered;
-  M8 (changeset handles) is planned. See "Milestones"
+  (read-only server), M5 (writes), M6 (restructuring), M7 (deployment) and M8 (changeset
+  handles) are delivered. See "Milestones"
 - **Catalog concept:** `/projects/okf-mcp-server.md` in `pg_knowledge_catalog`
 - **Replaces:** `tools/okf.py` in every OKF catalog (how the existing git catalogs hand
   over to the server is decided once the server is complete)
@@ -741,7 +741,7 @@ the deployment is.
 | M5. Writes (delivered) | Changesets, overlays, `okf::ops`, the content and bookkeeping write tools, `publish` with conflicts and replay, `discard`, `revert`, `pending_changes`, `stranded_sessions`, `adopt_changeset`, `lint pending` ([plan](../plans/2026-11-03-okf-mcp-m5-writes.md); PRs #104-#117) |
 | M6. Restructuring (delivered) | `move_concept`, `split_concept`, `delete_concept`; `ReplayOp::Unlist` and `ReplayOp::Relink`; byte parity with `okf.py`'s `mv` and `split` ([plan](../plans/2026-11-03-okf-mcp-m6-restructuring.md); PRs #129-#137) |
 | M7. Deployment (delivered) | Dockerfile and the GHCR image workflow, k8s manifests (in the site's Argo CD repository), CNPG database with backups and a restore drill, NTP check, TLS to Postgres, operator docs ([plan](../plans/2026-11-03-okf-mcp-m7-deployment.md); PRs #149-#157) |
-| M8. Changeset handles | Server-issued changeset handles instead of connection labels: `open_changeset`, a required `changeset` on writes and the changeset tools, an optional one on reads, `list_changesets`; `/`-prefixed paths in every error payload; release 0.8.0 ([plan](../plans/2026-11-03-okf-mcp-m8-changeset-handles.md)) |
+| M8. Changeset handles (delivered) | Server-issued changeset handles instead of connection labels: `open_changeset`, a required `changeset` on writes and the changeset tools, an optional one on reads, `list_changesets`; `/`-prefixed paths in every error payload; release and rollout of 0.8.0 ([plan](../plans/2026-11-03-okf-mcp-m8-changeset-handles.md); PRs #167-#172) |
 
 Per the project's `CLAUDE.md`, each iteration adds a dated note under `changelog/`.
 
@@ -1221,6 +1221,35 @@ Plan corrections (each a dated `Corrected` note in the plan):
   corrected it, and the checksum above went into `docs/operations.md`, not the plan.
 - **#148 (wrap-up):** shipped as planned; the design's example `time_server` is now
   `time.example.com`.
+
+### What M8 shipped differently
+
+The M8 plan's "Decisions taken while planning (2026-11-03)" and its dated `Corrected`
+notes have the full list; the sections above already describe handles.
+
+- **The plan lost a task in review.** The first draft read drafts through handles in a
+  task after writes. Brooke's review of the plan (PR #158) showed that the tests that read
+  drafts back would fail in between, so writes, the changeset tools and reads switched
+  together in Task 3, and the plan has 7 tasks instead of 8.
+- **A missing `changeset` is a tool error, not a protocol error.** The plan expected a
+  JSON-RPC `invalid_params` error. rmcp 3.8's tool router turns a parameter error into a
+  tool result with `isError: true` and the text ``failed to deserialize parameters:
+  missing field `changeset` ``. The write is still refused, as Decision 2 asks.
+- **A handle stands in for a `catalog` argument.** A report given a handle and no
+  `catalog` runs on the handle's catalog, even when the connection selects other
+  catalogs (`ToolContext::report_catalog`). That matches how a `catalog` argument already
+  overrides the connection's selection.
+- **Writes queued behind a publish or discard are refused.** With labels, such a write
+  landed in a new changeset. With handles, the changeset it names is closed, so the write
+  is refused with "was published or discarded while this write waited; open a new one".
+  This replaces M5's untested `Busy` branch with a tested refusal.
+- **Clients never see changeset ids.** Overlay errors and `publish`'s "no longer open"
+  refusal name the handle.
+- **`list_changesets` lists empty changesets** with an empty `paths` list. The plan's query
+  would have returned `{NULL}` for them, so the aggregate is filtered.
+- **`UnknownChangeset` is HTTP 404** where the routes report it, like `CatalogNotSelected`.
+- **The rollout checks migrations in the database.** The binary doesn't log migrations at
+  its default level, so the rollout read `_sqlx_migrations` on the primary.
 
 ### Questions M5 answered
 
