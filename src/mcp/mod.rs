@@ -36,7 +36,8 @@ pub const INSTRUCTIONS: &str = "Open Knowledge Format catalogs: concepts (markdo
     optional). Without a `catalog` argument, tools use this connection's catalogs \
     (`list_catalogs` shows them). To write, call `open_changeset` first and pass the handle it \
     returns as `changeset` to every edit, `publish`, `discard`, `revert` and `pending_changes`; \
-    reads take it too to see its drafts. Nothing is visible to others until `publish`.";
+    reads take it too to see its drafts, and `list_changesets` finds a lost one. Nothing is \
+    visible to others until `publish`.";
 
 /// The MCP handler: one per session (rmcp's factory makes it).
 pub struct OkfServer {

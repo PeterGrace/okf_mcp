@@ -18,7 +18,7 @@ pub enum Access {
     Read,
     /// Read, plus the write tools and publish.
     Write,
-    /// Write, plus import into granted catalogs and adopting any stranded changeset.
+    /// Write, plus import into granted catalogs and using any key's changeset.
     Admin,
 }
 

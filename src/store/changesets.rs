@@ -23,7 +23,6 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::error::OkfError;
-use crate::store::catalogs::is_unique_violation;
 
 /// What [`lock_catalog`] reports when the catalog row is gone: it was
 /// deleted while the write waited for the delete to finish.
@@ -85,7 +84,8 @@ impl ChangesetState {
 /// A changeset row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangesetRow {
-    /// Database id (what `adopt_changeset` takes).
+    /// Database id: entries, revisions and the overlay cache refer to it;
+    /// clients see only the handle.
     pub id: i64,
     /// The handle the server issued (M8 Decision 1): a random UUID in text
     /// form, what `open_changeset` returns.
@@ -127,14 +127,15 @@ pub struct EntryRow {
     pub replay: Option<serde_json::Value>,
 }
 
-/// An open, non-empty changeset idle past a cutoff (`stranded_sessions`).
+/// An open changeset as [`list_open`] returns it (`list_changesets`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StrandedRow {
-    /// The changeset.
+pub struct ListedRow {
+    /// The changeset (its handle, catalog id, key, actor, times).
     pub changeset: ChangesetRow,
-    /// Its catalog's name.
+    /// Its catalog's name (joined from `catalogs`).
     pub catalog: String,
-    /// Its changed paths, sorted.
+    /// Its entries' paths, catalog-relative and sorted; empty for an empty
+    /// changeset.
     pub paths: Vec<String>,
 }
 
@@ -171,9 +172,9 @@ impl From<RawChangeset> for ChangesetRow {
     }
 }
 
-/// A [`StrandedRow`] as selected.
+/// A [`ListedRow`] as selected.
 #[derive(sqlx::FromRow)]
-struct RawStranded {
+struct RawListed {
     // `flatten`: the changeset's columns sit beside `catalog` and `paths` in
     // the same result row.
     #[sqlx(flatten)]
@@ -507,16 +508,14 @@ pub async fn set_state(
     Ok(())
 }
 
-/// Every open changeset with entries whose last change is before
-/// `idle_since`, optionally only one key's or one catalog's: what
-/// `stranded_sessions` filters further by reach and connection.
+/// Every open changeset in `catalog_ids`, optionally only one key's, empty
+/// ones included: what `list_changesets` shows (M8 Decision 8).
 ///
 /// # Arguments
 /// * `pool` - the database.
-/// * `idle_since` - the cutoff (now less `session_idle_timeout`).
+/// * `catalog_ids` - the catalogs to list (the ones the calling key reaches).
 /// * `key_id` - only this key's changesets (`None`: every key's, for an
 ///   `admin` caller), so other keys' paths never leave the database.
-/// * `catalog_id` - only this catalog's (`None`: every catalog's).
 ///
 /// # Returns
 /// The changesets with their catalog's name and sorted paths, by catalog
@@ -524,91 +523,43 @@ pub async fn set_state(
 ///
 /// # Errors
 /// [`OkfError::Database`].
-pub async fn stranded(
+pub async fn list_open(
     pool: &PgPool,
-    idle_since: DateTime<Utc>,
+    catalog_ids: &[i64],
     key_id: Option<&str>,
-    catalog_id: Option<i64>,
-) -> Result<Vec<StrandedRow>, OkfError> {
-    // The inner join to the entries keeps only non-empty changesets;
-    // grouping by the primary key `c.id` lets the other `c` columns be
-    // selected without listing them in `GROUP BY`. A `NULL` parameter
-    // (a Rust `None`) turns its filter off.
-    let rows = sqlx::query_as::<_, RawStranded>(
+) -> Result<Vec<ListedRow>, OkfError> {
+    // The `LEFT JOIN` keeps changesets without entries; their one joined row
+    // has a `NULL` path, which `FILTER` leaves out of `array_agg`, and
+    // `COALESCE` turns the resulting `NULL` array into an empty one.
+    // Grouping by the primary key `c.id` lets the other `c` columns be
+    // selected without listing them in `GROUP BY`. `= ANY($1)` matches a
+    // Postgres array, which sqlx binds from a Rust slice. A `NULL` key (a
+    // Rust `None`) turns that filter off.
+    let rows = sqlx::query_as::<_, RawListed>(
         "SELECT c.id, c.handle, c.catalog_id, c.label, c.key_id, c.actor, c.state, c.version, \
          c.created_at, c.updated_at, k.name AS catalog, \
-         array_agg(e.path ORDER BY e.path) AS paths \
+         COALESCE(array_agg(e.path ORDER BY e.path) FILTER (WHERE e.path IS NOT NULL), \
+         '{}') AS paths \
          FROM changesets c \
          JOIN catalogs k ON k.id = c.catalog_id \
-         JOIN changeset_entries e ON e.changeset_id = c.id \
-         WHERE c.state = 'open' AND c.updated_at < $1 \
+         LEFT JOIN changeset_entries e ON e.changeset_id = c.id \
+         WHERE c.state = 'open' AND c.catalog_id = ANY($1) \
          AND ($2::text IS NULL OR c.key_id = $2) \
-         AND ($3::bigint IS NULL OR c.catalog_id = $3) \
          GROUP BY c.id, k.name \
          ORDER BY k.name, c.updated_at, c.id",
     )
-    .bind(idle_since)
+    .bind(catalog_ids)
     .bind(key_id)
-    .bind(catalog_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|raw| StrandedRow {
+        .map(|raw| ListedRow {
             changeset: raw.changeset.into(),
             catalog: raw.catalog,
             paths: raw.paths,
         })
         .collect())
-}
-
-/// Gives an open changeset a new key and label (`adopt_changeset`); the
-/// caller has checked the calling key may.
-///
-/// # Arguments
-/// * `conn` - the transaction's connection, after [`lock_catalog`].
-/// * `id` - the changeset.
-/// * `key_id` - the adopting key.
-/// * `label` - the adopting connection's label.
-/// * `now` - the time (server clock).
-///
-/// # Returns
-/// The changeset as adopted (its `version` bumped).
-///
-/// # Errors
-/// [`OkfError::Refused`] if it is not open, or if that key and label already
-/// have an open changeset in the catalog (the transaction is then aborted:
-/// drop it); [`OkfError::Database`].
-pub async fn adopt(
-    conn: &mut PgConnection,
-    id: i64,
-    key_id: &str,
-    label: &str,
-    now: DateTime<Utc>,
-) -> Result<ChangesetRow, OkfError> {
-    let adopted = sqlx::query_as::<_, RawChangeset>(concat!(
-        "UPDATE changesets SET key_id = $2, label = $3, version = version + 1, \
-         updated_at = $4 WHERE id = $1 AND state = 'open' RETURNING ",
-        changeset_columns!()
-    ))
-    .bind(id)
-    .bind(key_id)
-    .bind(label)
-    .bind(now)
-    .fetch_optional(&mut *conn)
-    .await;
-    match adopted {
-        Ok(Some(row)) => Ok(row.into()),
-        Ok(None) => Err(OkfError::Refused {
-            reason: format!("changeset {id} is not open"),
-        }),
-        Err(error) if is_unique_violation(&error) => Err(OkfError::Refused {
-            reason: "this connection already has an open changeset in that catalog; publish \
-                     or discard it first, or connect with another X-OKF-Changeset label"
-                .to_string(),
-        }),
-        Err(error) => Err(error.into()),
-    }
 }
 
 /// Discards every open changeset without entries whose last change is
@@ -845,23 +796,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn stranded_lists_only_open_non_empty_idle_changesets() {
+    async fn list_open_lists_open_changesets_with_their_sorted_paths() {
         let db = test_db().await;
         let pg = setup(&db.pool).await;
         let old = now() - TimeDelta::hours(3);
-        let idle = opened(&db.pool, pg, "alice", old).await;
-        put(&db.pool, &idle, &entry("b.md", Some("b\n")), old)
+        let edited = opened(&db.pool, pg, "alice", old).await;
+        put(&db.pool, &edited, &entry("b.md", Some("b\n")), old)
             .await
             .unwrap();
-        put(&db.pool, &idle, &entry("a.md", None), old)
+        put(&db.pool, &edited, &entry("a.md", None), old)
             .await
             .unwrap();
-        opened(&db.pool, pg, "alice", old).await;
-        let fresh = opened(&db.pool, pg, "alice", now()).await;
-        put(&db.pool, &fresh, &entry("a.md", Some("a\n")), now())
-            .await
-            .unwrap();
-        let published = opened(&db.pool, pg, "bob", old).await;
+        let empty = opened(&db.pool, pg, "alice", now()).await;
+        let published = opened(&db.pool, pg, "alice", old).await;
         put(&db.pool, &published, &entry("a.md", Some("a\n")), old)
             .await
             .unwrap();
@@ -872,58 +819,22 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let cutoff = now() - TimeDelta::hours(2);
-        let rows = stranded(&db.pool, cutoff, None, None).await.unwrap();
-        let owner = idle.key_id.as_deref();
-        let by_owner = stranded(&db.pool, cutoff, owner, Some(pg)).await.unwrap();
-        let by_other_key = stranded(&db.pool, cutoff, Some("nobody"), None)
-            .await
-            .unwrap();
-        let by_other_catalog = stranded(&db.pool, cutoff, None, Some(pg + 1))
-            .await
-            .unwrap();
+        let rows = list_open(&db.pool, &[pg], None).await.unwrap();
+        let owner = edited.key_id.as_deref();
+        let by_owner = list_open(&db.pool, &[pg], owner).await.unwrap();
+        let by_other_key = list_open(&db.pool, &[pg], Some("nobody")).await.unwrap();
+        let by_other_catalog = list_open(&db.pool, &[pg + 1], None).await.unwrap();
+        let no_catalogs = list_open(&db.pool, &[], None).await.unwrap();
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].changeset.id, idle.id);
+        let ids: Vec<i64> = rows.iter().map(|row| row.changeset.id).collect();
+        assert_eq!(ids, [edited.id, empty.id], "oldest change first");
         assert_eq!(rows[0].catalog, "pg");
         assert_eq!(rows[0].paths, ["a.md", "b.md"]);
+        assert!(rows[1].paths.is_empty());
         assert_eq!(by_owner, rows);
         assert!(by_other_key.is_empty());
         assert!(by_other_catalog.is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn adopt_relabels_and_refuses_a_label_that_already_has_one() {
-        let db = test_db().await;
-        let pg = setup(&db.pool).await;
-        let stranded_one = opened(&db.pool, pg, "alice", now()).await;
-        let taken = opened(&db.pool, pg, "bob", now()).await;
-        let later = now() + TimeDelta::minutes(1);
-
-        let mut tx = db.pool.begin().await.unwrap();
-        lock_catalog(&mut tx, pg).await.unwrap();
-        // `taken`'s label: bob already has an open changeset with it.
-        let refused = adopt(&mut tx, stranded_one.id, "bob", &taken.label, later).await;
-        drop(tx);
-        let mut tx = db.pool.begin().await.unwrap();
-        lock_catalog(&mut tx, pg).await.unwrap();
-        let adopted = adopt(&mut tx, stranded_one.id, "bob", "work", later)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-
-        assert!(matches!(refused, Err(OkfError::Refused { reason }) if reason.contains("already")));
-        assert_eq!(adopted.id, stranded_one.id);
-        assert_eq!(
-            (adopted.key_id.as_deref(), adopted.label.as_str()),
-            (Some("bob"), "work")
-        );
-        assert_eq!((adopted.version, adopted.updated_at), (1, later));
-        assert_eq!(
-            by_id(&db.pool, stranded_one.id).await.unwrap(),
-            Some(adopted)
-        );
-        assert_eq!(by_id(&db.pool, taken.id).await.unwrap(), Some(taken));
+        assert!(no_catalogs.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

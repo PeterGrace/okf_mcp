@@ -89,7 +89,8 @@ struct Publication<'a> {
 /// * `changeset` - the open changeset (read without its lock; it is locked
 ///   and read again here).
 /// * `actor` - the publishing key's actor, recorded on every document and
-///   revision (an adopted changeset keeps its opener's `actor`).
+///   revision (an admin publishing another key's changeset records its own
+///   `actor`, not the opener's).
 /// * `message` - recorded on every revision.
 ///
 /// # Returns

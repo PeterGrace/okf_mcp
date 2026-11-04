@@ -1,8 +1,9 @@
 //! The changeset tools (design "Write tools"): `publish` (Task 10);
-//! `discard`, `revert` and `pending_changes` (Task 11); `stranded_sessions`
-//! and `adopt_changeset` (Task 12); `open_changeset` (M8 Task 2). Each task's
-//! tools are one
-//! `#[tool_router]` block with its own router, joined in `OkfServer::tools`.
+//! `discard`, `revert` and `pending_changes` (Task 11); `list_changesets`
+//! (M8 Task 4, replacing Task 12's `stranded_sessions` and
+//! `adopt_changeset`); `open_changeset` (M8 Task 2). Each task's tools are
+//! one `#[tool_router]` block with its own router, joined in
+//! `OkfServer::tools`.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -30,24 +31,22 @@ use crate::okf::workspace::Workspace;
 use crate::store::keys::Access;
 use crate::write::{apply, WriteReport};
 
-/// `stranded_sessions`' arguments.
+/// `list_changesets`' arguments.
 // `Deserialize` reads them from the call's JSON; `JsonSchema` gives the tool
 // its input schema, with the doc comments as the fields' descriptions.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-pub struct StrandedParams {
+pub struct ListParams {
     /// Only this catalog (default: every catalog the key reaches).
     pub catalog: Option<String>,
 }
 
-/// One stranded changeset.
+/// One open changeset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct StrandedChangeset {
-    /// Its id: what `adopt_changeset` takes.
-    pub id: i64,
+pub struct ListedChangeset {
+    /// Its handle: pass it as `changeset` to resume work on it.
+    pub changeset: String,
     /// Its catalog.
     pub catalog: String,
-    /// The label of the connection that made it.
-    pub label: String,
     /// The key it belongs to; null once that key is deleted.
     pub key: Option<String>,
     /// The actor of the key that opened it.
@@ -56,42 +55,20 @@ pub struct StrandedChangeset {
     pub created: String,
     /// Its last change.
     pub last_change: String,
-    /// Its changed paths, sorted.
+    /// No change within `session_idle_timeout`.
+    pub idle: bool,
+    /// Its changed paths, `/`-prefixed and sorted.
     pub paths: Vec<String>,
 }
 
-/// `stranded_sessions`' result.
+/// `list_changesets`' result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct Stranded {
+pub struct Listed {
     /// By catalog, oldest change first.
-    pub changesets: Vec<StrandedChangeset>,
+    pub changesets: Vec<ListedChangeset>,
 }
 
-/// `adopt_changeset`'s arguments.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-pub struct AdoptParams {
-    /// The changeset's id, from `stranded_sessions`.
-    pub id: i64,
-}
-
-/// `adopt_changeset`'s result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct Adopted {
-    /// The changeset's id.
-    pub id: i64,
-    /// Its catalog.
-    pub catalog: String,
-    /// Its label now: this connection's.
-    pub label: String,
-    /// The key it belonged to.
-    pub previous_key: Option<String>,
-    /// The label it had.
-    pub previous_label: String,
-    /// Its changed paths, sorted.
-    pub paths: Vec<String>,
-}
-
-/// The time before which an open changeset's last change makes it stranded.
+/// The time before which an open changeset's last change makes it idle.
 ///
 /// # Arguments
 /// * `now` - the current time (server clock).
@@ -99,7 +76,7 @@ pub struct Adopted {
 ///
 /// # Returns
 /// `now - idle`, or the earliest representable time if that would overflow
-/// (an absurdly long timeout: nothing is stranded).
+/// (an absurdly long timeout: nothing is idle).
 fn idle_cutoff(now: DateTime<Utc>, idle: Duration) -> DateTime<Utc> {
     // `TimeDelta::from_std` fails for a duration beyond chrono's range, and
     // `checked_sub_signed` for a result before its earliest date; both `ok()`
@@ -110,172 +87,79 @@ fn idle_cutoff(now: DateTime<Utc>, idle: Duration) -> DateTime<Utc> {
         .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
-/// Lists stranded changesets (design "Session lifecycle").
+/// Lists the open changesets this key may use (M8 Decision 8).
 ///
 /// # Arguments
 /// * `ctx` - the call's context.
 /// * `params` - an optional catalog to narrow the list to.
 ///
 /// # Returns
-/// Open, non-empty changesets not changed within `session_idle_timeout`,
-/// in catalogs the key reaches: the key's own, and with `admin` every key's.
+/// Open changesets, empty ones included, in the catalogs the key reaches
+/// (or the one named): the key's own, and with `admin` every key's.
 ///
 /// # Errors
 /// A selection error for `catalog`; [`OkfError::Database`].
-pub(crate) async fn stranded_sessions(
+pub(crate) async fn list_changesets(
     ctx: &ToolContext,
-    params: StrandedParams,
-) -> Result<Stranded, OkfError> {
-    // Local: Tasks 10 and 11 import the store in this file in their own way.
+    params: ListParams,
+) -> Result<Listed, OkfError> {
+    // Local, as in the other tasks' functions here.
     use crate::store::changesets;
 
-    // `transpose` turns `Option<Result<..>>` into `Result<Option<..>>`, so
-    // `?` can fail on an unreachable catalog named in the argument.
-    let only = params
-        .catalog
-        .as_deref()
-        .map(|name| ctx.one(Some(name)))
-        .transpose()?
-        .map(|state| state.id());
-    let now = ctx.app().clock().now();
-    let idle_since = idle_cutoff(now, ctx.app().config().session_idle_timeout);
     let principal = ctx.principal();
+    let catalog_ids: Vec<i64> = match params.catalog.as_deref() {
+        // `one` refuses a catalog the key does not reach.
+        Some(name) => vec![ctx.one(Some(name))?.id()],
+        None => ctx
+            .catalogs()
+            .values()
+            .filter(|state| principal.reaches(state.name()))
+            .map(|state| state.id())
+            .collect(),
+    };
     let admin = principal.access >= Access::Admin;
     // The database narrows by key (unless admin) and catalog, so other
-    // keys' paths never leave it; reach is left out here.
+    // keys' changesets and paths never leave it.
     let key_filter = (!admin).then_some(principal.key_id.as_str());
-    let rows = changesets::stranded(ctx.app().pool(), idle_since, key_filter, only).await?;
+    let rows = changesets::list_open(ctx.app().pool(), &catalog_ids, key_filter).await?;
+    let idle_since = idle_cutoff(
+        ctx.app().clock().now(),
+        ctx.app().config().session_idle_timeout,
+    );
     let changesets = rows
         .into_iter()
-        .filter(|row| principal.reaches(&row.catalog))
-        .map(|row| StrandedChangeset {
-            id: row.changeset.id,
+        .map(|row| ListedChangeset {
+            changeset: row.changeset.handle,
             catalog: row.catalog,
-            label: row.changeset.label,
             key: row.changeset.key_id,
             actor: row.changeset.actor,
             created: format_timestamp(row.changeset.created_at),
             last_change: format_timestamp(row.changeset.updated_at),
-            paths: row.paths,
+            idle: row.changeset.updated_at < idle_since,
+            paths: row.paths.iter().map(|path| format!("/{path}")).collect(),
         })
         .collect();
-    Ok(Stranded { changesets })
-}
-
-/// Moves an open changeset to this connection's key and label.
-///
-/// The changeset is read once to find its catalog. Then, in one
-/// transaction and in the lock order of Tasks 1 and 8, the catalog row is
-/// locked, then the changeset's row, which is read again under that lock.
-/// The access check uses that locked row, so a concurrent adoption,
-/// publish, discard or prune either finishes first (and is seen) or waits
-/// for this one.
-///
-/// # Arguments
-/// * `ctx` - the call's context.
-/// * `params` - the changeset's id.
-///
-/// # Returns
-/// The changeset's catalog, new and old label and key, and its paths.
-///
-/// # Errors
-/// [`OkfError::Refused`] if there is no open changeset with that id in a
-/// catalog the key reaches (one message for every such case), or if this
-/// key already has an open changeset with this connection's label there
-/// (the store's one-open-per-label index, until M8 Task 5);
-/// [`OkfError::Forbidden`] without `write` (the key's own) or `admin`
-/// (another key's); [`OkfError::Busy`] on a deadlock;
-/// [`OkfError::Database`].
-pub(crate) async fn adopt_changeset(
-    ctx: &ToolContext,
-    params: AdoptParams,
-) -> Result<Adopted, OkfError> {
-    use crate::store::changesets::{self, ChangesetState};
-
-    let id = params.id;
-    // One message for "no such id", "closed" and "not in your catalogs", so
-    // a key cannot tell which (and so probe other catalogs).
-    let unknown = || OkfError::Refused {
-        reason: format!("no open changeset {id} in a catalog this key reaches"),
-    };
-    // Used twice with `Option::filter`, which keeps `Some(row)` only when
-    // this returns `true`.
-    let is_open = |row: &changesets::ChangesetRow| row.state == ChangesetState::Open;
-    // A changeset never moves between catalogs, so this unlocked read is
-    // safe for the catalog id; everything else is read again under the lock.
-    let catalog_id = changesets::by_id(ctx.app().pool(), id)
-        .await?
-        .filter(is_open)
-        .ok_or_else(unknown)?
-        .catalog_id;
-    let principal = ctx.principal();
-    let state = ctx
-        .catalogs()
-        .values()
-        .find(|state| state.id() == catalog_id && principal.reaches(state.name()))
-        .ok_or_else(unknown)?;
-
-    let now = ctx.app().clock().now();
-    // An early `return` or `?` below drops `tx` uncommitted, which rolls it
-    // back (Rust runs the transaction's `Drop` on every exit path).
-    let mut tx = ctx.app().pool().begin().await?;
-    changesets::lock_catalog(&mut tx, catalog_id).await?;
-    let row = changesets::lock(&mut tx, id)
-        .await?
-        .filter(is_open)
-        .ok_or_else(unknown)?;
-    let own = row.key_id.as_deref() == Some(principal.key_id.as_str());
-    let needed = if own { Access::Write } else { Access::Admin };
-    principal.require(needed, state.name())?;
-    let adopted = changesets::adopt(&mut tx, id, &principal.key_id, ctx.label(), now).await?;
-    let entries = changesets::entries(&mut *tx, id).await?;
-    tx.commit().await?;
-    Ok(Adopted {
-        id,
-        catalog: state.name().to_string(),
-        label: adopted.label,
-        previous_key: row.key_id,
-        previous_label: row.label,
-        paths: entries.into_iter().map(|entry| entry.path).collect(),
-    })
+    Ok(Listed { changesets })
 }
 
 // As in the read tool modules: the macro turns this block's `#[tool]`
 // methods into `lifecycle_router`, which `OkfServer::tools` joins.
 #[tool_router(router = lifecycle_router, vis = "pub(crate)")]
 impl OkfServer {
-    /// The `stranded_sessions` tool.
+    /// The `list_changesets` tool.
     #[tool(
-        description = "Open changesets holding unpublished edits that nobody has changed \
-                       within session_idle_timeout: this key's own (from other connections or \
-                       labels), or with an admin key every one in the catalogs it reaches. Each \
-                       has an id (for adopt_changeset), catalog, label, key, actor, creation and \
-                       last-change times, and changed paths."
+        description = "List the open changesets this key may use (an admin: every key's, in the \
+                       catalogs it reaches), with their handles, paths and last change; idle \
+                       means nothing changed within the idle timeout. Use it to find a handle \
+                       again after a reconnect or a lost context. Read access."
     )]
-    async fn stranded_sessions(
+    async fn list_changesets(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(params): Parameters<StrandedParams>,
-    ) -> Result<Json<Stranded>, CallToolResult> {
+        Parameters(params): Parameters<ListParams>,
+    ) -> Result<Json<Listed>, CallToolResult> {
         let ctx = self.context(&parts)?;
-        reply(stranded_sessions(&ctx, params).await)
-    }
-
-    /// The `adopt_changeset` tool.
-    #[tool(
-        description = "Move an open changeset (its id from stranded_sessions) to this \
-                       connection, so this connection's reads show it and its writes, publish \
-                       and discard act on it. A write key adopts its own changesets; another \
-                       key's needs an admin key. Refused while this connection already has an \
-                       open changeset in that catalog."
-    )]
-    async fn adopt_changeset(
-        &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(params): Parameters<AdoptParams>,
-    ) -> Result<Json<Adopted>, CallToolResult> {
-        let ctx = self.context(&parts)?;
-        reply(adopt_changeset(&ctx, params).await)
+        reply(list_changesets(&ctx, params).await)
     }
 }
 
@@ -937,8 +821,6 @@ mod lifecycle_tests {
     use crate::mcp::testing::{
         app_with, context, open_at, pending_entry, principal_as, store_key, PendingEdit, TestApp,
     };
-    use crate::store::changesets::{self, ChangesetState};
-    use crate::store::keys::Access;
 
     /// `pg` and `work`, and the keys `alice`, `bob` and `root`.
     async fn test_app() -> TestApp {
@@ -953,20 +835,14 @@ mod lifecycle_tests {
         test
     }
 
-    /// A connection of `key` with `access` on `label`, reaching `reach`.
-    fn connection(
-        test: &TestApp,
-        key: &str,
-        access: Access,
-        reach: &[&str],
-        label: &str,
-    ) -> ToolContext {
-        context(test, principal_as(key, access, reach, Some("pg")), None).with_label(label)
+    /// A connection of `key` with `access`, reaching `reach` (empty: all).
+    fn connection(test: &TestApp, key: &str, access: Access, reach: &[&str]) -> ToolContext {
+        context(test, principal_as(key, access, reach, Some("pg")), None)
     }
 
     /// A new changeset of `ctx`'s key in `pg` with an edit of `a.md`, both
-    /// `hours_ago` hours ago; its id.
-    async fn edit_hours_ago(test: &TestApp, ctx: &ToolContext, hours_ago: i64) -> i64 {
+    /// `hours_ago` hours ago; its handle.
+    async fn edit_hours_ago(test: &TestApp, ctx: &ToolContext, hours_ago: i64) -> String {
         let at = Utc::now() - TimeDelta::hours(hours_ago);
         let opened = open_at(test, ctx, "pg", at).await;
         let edit = PendingEdit {
@@ -974,19 +850,20 @@ mod lifecycle_tests {
             text: Some("# Pending\n"),
             at,
         };
-        pending_entry(test, &opened.handle, &edit).await.id
+        pending_entry(test, &opened.handle, &edit).await.handle
     }
 
-    fn ids(stranded: &Stranded) -> Vec<i64> {
-        stranded
+    /// The handles listed, in order.
+    fn handles(listed: &Listed) -> Vec<&str> {
+        listed
             .changesets
             .iter()
-            .map(|changeset| changeset.id)
+            .map(|changeset| changeset.changeset.as_str())
             .collect()
     }
 
-    fn all() -> StrandedParams {
-        StrandedParams { catalog: None }
+    fn all() -> ListParams {
+        ListParams { catalog: None }
     }
 
     #[test]
@@ -1001,204 +878,71 @@ mod lifecycle_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn stranded_lists_the_key_s_idle_changesets_and_all_of_them_for_an_admin() {
+    async fn list_changesets_shows_a_key_its_own_and_an_admin_everyone_s() {
         let test = test_app().await;
-        let alice_old = edit_hours_ago(
-            &test,
-            &connection(&test, "alice", Access::Write, &[], "old"),
-            3,
-        )
-        .await;
-        edit_hours_ago(
-            &test,
-            &connection(&test, "alice", Access::Write, &[], "fresh"),
-            0,
-        )
-        .await;
-        let bob_old = edit_hours_ago(
-            &test,
-            &connection(&test, "bob", Access::Write, &[], "old"),
-            3,
-        )
-        .await;
+        let alice = connection(&test, "alice", Access::Write, &[]);
+        let empty = open_at(&test, &alice, "pg", Utc::now()).await.handle;
+        // Three hours is past the default `session_idle_timeout` of two.
+        let bobs = edit_hours_ago(&test, &connection(&test, "bob", Access::Write, &[]), 3).await;
+        let admin = connection(&test, "root", Access::Admin, &[]);
 
-        let alice = stranded_sessions(&connection(&test, "alice", Access::Write, &[], "x"), all())
-            .await
-            .unwrap();
-        let admin = stranded_sessions(&connection(&test, "root", Access::Admin, &[], "x"), all())
-            .await
-            .unwrap();
-        let admin_of_work = stranded_sessions(
-            &connection(&test, "root", Access::Admin, &["work"], "x"),
-            all(),
-        )
-        .await
-        .unwrap();
-        let narrowed = stranded_sessions(
-            &connection(&test, "root", Access::Admin, &[], "x"),
-            StrandedParams {
+        let by_alice = list_changesets(&alice, all()).await.unwrap();
+        let by_admin = list_changesets(&admin, all()).await.unwrap();
+        let by_admin_of_work =
+            list_changesets(&connection(&test, "root", Access::Admin, &["work"]), all())
+                .await
+                .unwrap();
+        let narrowed = list_changesets(
+            &admin,
+            ListParams {
                 catalog: Some("work".to_string()),
             },
         )
         .await
         .unwrap();
-        let narrowed_to_pg = stranded_sessions(
-            &connection(&test, "root", Access::Admin, &[], "x"),
-            StrandedParams {
+        let unreachable = list_changesets(
+            &connection(&test, "alice", Access::Write, &["work"]),
+            ListParams {
                 catalog: Some("pg".to_string()),
             },
         )
-        .await
-        .unwrap();
+        .await;
 
-        assert_eq!(ids(&alice), [alice_old]);
-        let listed = &alice.changesets[0];
+        assert_eq!(handles(&by_alice), [empty.as_str()]);
+        let own = &by_alice.changesets[0];
         assert_eq!(
-            (listed.catalog.as_str(), listed.key.as_deref()),
-            ("pg", Some("alice"))
+            (own.catalog.as_str(), own.key.as_deref(), own.actor.as_str()),
+            ("pg", Some("alice"), "alice")
         );
-        assert_eq!(listed.paths, ["a.md"]);
-        let mut both = ids(&admin);
-        both.sort_unstable();
-        let mut expected = vec![alice_old, bob_old];
-        expected.sort_unstable();
-        assert_eq!(both, expected);
-        assert!(ids(&admin_of_work).is_empty());
-        assert!(ids(&narrowed).is_empty());
-        let mut in_pg = ids(&narrowed_to_pg);
-        in_pg.sort_unstable();
-        assert_eq!(in_pg, expected);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn adopt_moves_a_changeset_to_this_connection() {
-        let test = test_app().await;
-        let stranded_id = edit_hours_ago(
-            &test,
-            &connection(&test, "alice", Access::Write, &[], "old"),
-            3,
-        )
-        .await;
-        let here = connection(&test, "alice", Access::Write, &[], "default");
-
-        let adopted = adopt_changeset(&here, AdoptParams { id: stranded_id })
-            .await
-            .unwrap();
-        let after = stranded_sessions(&here, all()).await.unwrap();
-
-        assert_eq!(adopted.id, stranded_id);
+        assert!(own.paths.is_empty(), "an empty changeset is listed too");
+        assert!(!own.idle);
         assert_eq!(
-            (adopted.catalog.as_str(), adopted.label.as_str()),
-            ("pg", "default")
+            handles(&by_admin),
+            [bobs.as_str(), empty.as_str()],
+            "oldest change first"
         );
-        assert_eq!(adopted.paths, ["a.md"]);
-        assert!(
-            after.changesets.is_empty(),
-            "adopted means changed just now"
-        );
-        let row = changesets::by_id(test.app.pool(), stranded_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (row.key_id.as_deref(), row.label.as_str()),
-            (Some("alice"), "default")
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn another_key_s_changeset_needs_admin_to_adopt() {
-        let test = test_app().await;
-        let bobs = edit_hours_ago(
-            &test,
-            &connection(&test, "bob", Access::Write, &[], "old"),
-            3,
-        )
-        .await;
-
-        let by_writer = adopt_changeset(
-            &connection(&test, "alice", Access::Write, &[], "default"),
-            AdoptParams { id: bobs },
-        )
-        .await;
-        let by_admin = adopt_changeset(
-            &connection(&test, "root", Access::Admin, &[], "default"),
-            AdoptParams { id: bobs },
-        )
-        .await;
-
-        assert!(matches!(by_writer, Err(OkfError::Forbidden { .. })));
-        let adopted = by_admin.unwrap();
-        assert_eq!(adopted.previous_key.as_deref(), Some("bob"));
-        let row = changesets::by_id(test.app.pool(), bobs)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.key_id.as_deref(), Some("root"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn adopt_is_refused_for_a_busy_connection_or_an_unknown_id() {
-        let test = test_app().await;
-        let stranded_id = edit_hours_ago(
-            &test,
-            &connection(&test, "alice", Access::Write, &[], "old"),
-            3,
-        )
-        .await;
-        let here = connection(&test, "alice", Access::Write, &[], "default");
-        // Adopting one first gives this connection's label an open changeset.
-        let first_id = edit_hours_ago(&test, &here, 0).await;
-        adopt_changeset(&here, AdoptParams { id: first_id })
-            .await
-            .unwrap();
-        let closed_id = edit_hours_ago(
-            &test,
-            &connection(&test, "alice", Access::Write, &[], "closed"),
-            3,
-        )
-        .await;
-        let pg_id = test.app.catalog("pg").unwrap().id();
-        let mut tx = test.app.pool().begin().await.unwrap();
-        changesets::lock_catalog(&mut tx, pg_id).await.unwrap();
-        changesets::set_state(&mut tx, closed_id, ChangesetState::Discarded, Utc::now())
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-
-        let busy = adopt_changeset(&here, AdoptParams { id: stranded_id }).await;
-        let unknown = adopt_changeset(&here, AdoptParams { id: i64::MAX }).await;
-        let elsewhere = connection(&test, "alice", Access::Write, &[], "elsewhere");
-        let closed = adopt_changeset(&elsewhere, AdoptParams { id: closed_id }).await;
-        let unreachable = adopt_changeset(
-            &connection(&test, "alice", Access::Write, &["work"], "default"),
-            AdoptParams { id: stranded_id },
-        )
-        .await;
-
-        assert!(
-            matches!(&busy, Err(OkfError::Refused { reason }) if reason.contains("already has")),
-            "{busy:?}"
-        );
-        for refused in [unknown, closed, unreachable] {
-            assert!(
-                matches!(&refused, Err(OkfError::Refused { reason }) if reason.contains("no open changeset")),
-                "{refused:?}"
-            );
-        }
+        let old = &by_admin.changesets[0];
+        assert_eq!(old.key.as_deref(), Some("bob"));
+        assert_eq!(old.paths, ["/a.md"]);
+        assert!(old.idle);
+        assert!(old.last_change < own.last_change);
+        assert!(by_admin_of_work.changesets.is_empty());
+        assert!(narrowed.changesets.is_empty());
+        assert_eq!(unreachable.unwrap_err().kind(), "CatalogNotSelected");
     }
 
     #[test]
-    fn both_tools_are_listed_with_object_output_schemas() {
+    fn list_changesets_is_listed_and_the_old_tools_are_gone() {
         let tools = OkfServer::tools().list_all();
 
-        for name in ["stranded_sessions", "adopt_changeset"] {
-            let listed = tools
-                .iter()
-                .find(|tool| tool.name == name)
-                .unwrap_or_else(|| panic!("{name} is registered"));
-            let schema = listed.output_schema.as_ref().expect("an output schema");
-            assert_eq!(schema["type"], "object", "{name}");
+        let listed = tools
+            .iter()
+            .find(|tool| tool.name == "list_changesets")
+            .expect("list_changesets is registered");
+        let schema = listed.output_schema.as_ref().expect("an output schema");
+        assert_eq!(schema["type"], "object");
+        for gone in ["stranded_sessions", "adopt_changeset"] {
+            assert!(tools.iter().all(|tool| tool.name != gone), "{gone}");
         }
     }
 }
@@ -1213,7 +957,7 @@ mod publish_tests {
     use crate::config::Config;
     use crate::error::ConflictFile;
     use crate::mcp::testing::{
-        app_with, changeset_row, context, files, open, principal_as, writer, TestApp,
+        app_with, changeset_row, context, files, open, principal_as, store_key, writer, TestApp,
     };
     use crate::mcp::writes::{replace_body, ReplaceBodyParams};
     use crate::okf::ops::{self, LogKind};
@@ -1388,6 +1132,62 @@ mod publish_tests {
         // The handle is spent: reading or writing through it is refused.
         let spent = ctx.pin(Some(&handle)).await.unwrap_err();
         assert_eq!(spent.kind(), "Refused");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_admin_may_publish_another_key_s_changeset() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
+        body(&ctx, &handle, "/a.md", "# A\n\nBy a.\n").await;
+        store_key(&test, "root").await;
+        let admin = context(
+            &test,
+            principal_as("root", Access::Admin, &[], Some("pg")),
+            None,
+        );
+
+        let published = publish_as(&admin, &handle, "take over").await.unwrap();
+
+        assert!(published.report.published);
+        assert_eq!(state_of(&test, &handle).await, ChangesetState::Published);
+        let state = test.app.catalog("pg").unwrap();
+        let rows = history::revisions(test.app.pool(), state.id(), "a.md", 5)
+            .await
+            .unwrap();
+        // The publishing key's actor, not the opener's.
+        assert_eq!(
+            (rows[0].actor.as_str(), rows[0].message.as_str()),
+            ("root", "take over")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_published_changeset_is_no_longer_listed() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let published = open(&ctx).await;
+        let kept = open(&ctx).await;
+        body(&ctx, &published, "/a.md", "# A\n\nNew.\n").await;
+        let all = || ListParams { catalog: None };
+        let before = list_changesets(&ctx, all()).await.unwrap();
+
+        publish_as(&ctx, &published, "edit a").await.unwrap();
+        let after = list_changesets(&ctx, all()).await.unwrap();
+
+        let listed = |listed: &Listed| -> Vec<String> {
+            listed
+                .changesets
+                .iter()
+                .map(|changeset| changeset.changeset.clone())
+                .collect()
+        };
+        let mut both = listed(&before);
+        both.sort_unstable();
+        let mut expected = vec![published.clone(), kept.clone()];
+        expected.sort_unstable();
+        assert_eq!(both, expected);
+        assert_eq!(listed(&after), [kept]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
