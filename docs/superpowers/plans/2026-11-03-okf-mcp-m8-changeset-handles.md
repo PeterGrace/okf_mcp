@@ -264,6 +264,8 @@ fn findings_json(findings: &[Finding]) -> serde_json::Value {
 
 - [ ] **Step 4: Update the expected payloads in other tests.** Run the full gates and fix each assertion on an error body's `path` or finding `file`. Assertions on `error.to_string()` (the message) don't change.
 
+  > **Corrected (issue #160), 2026-11-04.** Only `src/error.rs`'s own tests asserted unprefixed error-payload paths (`SecretDetected`, `EditMismatch` and a `LintFailed` warning); no test under `tests/` or elsewhere in `src/` did, so the full gate passed without other changes. The file map's "1 (expected paths)" for `tests/` turned out empty.
+
 - [ ] **Step 5: The design's "Errors" section and the README.** Add: every catalog path in an error body (`path`, `files[].path`, `links[].source`, `errors[].file`, `warnings[].file`) is `/`-prefixed; an `InvalidPath` whose path climbs out of the catalog (`../x`) echoes it as given. Report results (`lint`, `oldest`, `sprawl`, `links_report`) keep `okf.py`'s unprefixed paths, so the same lint finding is `/a.md` in a `LintFailed` error and `a.md` in `lint`'s result, on purpose. The `Finding.file` doc comment (`src/okf/analysis/mod.rs:22`, "without a leading `/`") stays true for the struct; add that the error payload prefixes it.
 
 - [ ] **Step 6: Changelog, gates, commit:** `fix: error payloads write catalog paths with a leading slash`. In the PR body, list the variants that changed and the ones left as they are.
