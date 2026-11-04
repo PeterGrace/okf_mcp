@@ -289,7 +289,8 @@ impl ToolContext {
     ///   belongs to another key while this one is not `admin`;
     /// - [`OkfError::Forbidden`] below `access`;
     /// - [`OkfError::Refused`] for a changeset that was published or
-    ///   discarded, with a hint that an empty one is discarded after 24 hours;
+    ///   discarded (a discarded one with a hint that an empty changeset is
+    ///   discarded after 24 hours);
     /// - [`OkfError::Database`].
     pub async fn changeset(&self, handle: &str, access: Access) -> Result<Pinned, OkfError> {
         // A closure, so each refusal below builds its own error value.
@@ -318,16 +319,19 @@ impl ToolContext {
             return Err(unknown());
         }
         self.principal.require(access, state.name())?;
-        if row.state != ChangesetState::Open {
-            return Err(OkfError::Refused {
-                reason: format!(
-                    "changeset {handle} is {}; open a new one with open_changeset (a \
-                     changeset with no edits is discarded after 24 hours)",
-                    row.state.as_str()
-                ),
-            });
-        }
-        Ok(Pinned { state, row })
+        // Only a discarded changeset gets the 24-hour hint: the prune is one
+        // way to be discarded, and a published one was never pruned.
+        let hint = match row.state {
+            ChangesetState::Open => return Ok(Pinned { state, row }),
+            ChangesetState::Published => "",
+            ChangesetState::Discarded => " (a changeset with no edits is discarded after 24 hours)",
+        };
+        Err(OkfError::Refused {
+            reason: format!(
+                "changeset {handle} is {}; open a new one with open_changeset{hint}",
+                row.state.as_str()
+            ),
+        })
     }
 
     /// The state of a catalog `select` returned.
@@ -439,22 +443,44 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_closed_changeset_is_refused_by_name() {
-        let (test, handle) = opened_by_writer().await;
+        let (test, discarded) = opened_by_writer().await;
         let writer = as_key(&test, "writer", Access::Write);
-        let row = writer.changeset(&handle, Access::Write).await.unwrap().row;
-        let mut tx = test.app.pool().begin().await.unwrap();
-        changesets::set_state(&mut tx, row.id, ChangesetState::Discarded, Utc::now())
+        let published = open_changeset(&writer, OpenParams { catalog: None })
             .await
-            .unwrap();
+            .unwrap()
+            .changeset;
+        let mut tx = test.app.pool().begin().await.unwrap();
+        for (handle, closed) in [
+            (&discarded, ChangesetState::Discarded),
+            (&published, ChangesetState::Published),
+        ] {
+            let row = writer.changeset(handle, Access::Write).await.unwrap().row;
+            changesets::set_state(&mut tx, row.id, closed, Utc::now())
+                .await
+                .unwrap();
+        }
         tx.commit().await.unwrap();
 
-        let refused = writer.changeset(&handle, Access::Write).await.unwrap_err();
+        let refused = writer
+            .changeset(&discarded, Access::Write)
+            .await
+            .unwrap_err();
+        let refused_published = writer
+            .changeset(&published, Access::Write)
+            .await
+            .unwrap_err();
 
         assert_eq!(refused.kind(), "Refused");
         let message = refused.to_string();
-        assert!(message.contains(&handle), "{message}");
+        assert!(message.contains(&discarded), "{message}");
         assert!(message.contains("discarded"), "{message}");
         assert!(message.contains("24 hours"), "{message}");
+        // Only the prune discards after 24 hours; a published one gets no hint.
+        assert_eq!(refused_published.kind(), "Refused");
+        assert_eq!(
+            refused_published.to_string(),
+            format!("changeset {published} is published; open a new one with open_changeset")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

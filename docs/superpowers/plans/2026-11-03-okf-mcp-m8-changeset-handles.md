@@ -442,7 +442,8 @@ impl ToolContext {
     ///   in a catalog this key does not reach (or that is not loaded), or
     ///   belongs to another key while this one is not `admin`;
     /// - [`OkfError::Forbidden`] below `access`;
-    /// - [`OkfError::Refused`] for a changeset that was published or discarded;
+    /// - [`OkfError::Refused`] for a changeset that was published or discarded
+    ///   (a discarded one with the 24-hour hint);
     /// - [`OkfError::Database`].
     pub async fn changeset(&self, handle: &str, access: Access) -> Result<Pinned, OkfError> {
         let unknown = || OkfError::UnknownChangeset { changeset: handle.to_string() };
@@ -469,16 +470,21 @@ impl ToolContext {
             return Err(unknown());
         }
         self.principal.require(access, state.name())?;
-        if row.state != ChangesetState::Open {
-            return Err(OkfError::Refused {
-                reason: format!(
-                    "changeset {handle} is {}; open a new one with open_changeset (a \
-                     changeset with no edits is discarded after 24 hours)",
-                    row.state.as_str()
-                ),
-            });
-        }
-        Ok(Pinned { state, row })
+        // Only a discarded changeset gets the 24-hour hint (Brooke's review
+        // of PR #167): a published one was never pruned.
+        let hint = match row.state {
+            ChangesetState::Open => return Ok(Pinned { state, row }),
+            ChangesetState::Published => "",
+            ChangesetState::Discarded => {
+                " (a changeset with no edits is discarded after 24 hours)"
+            }
+        };
+        Err(OkfError::Refused {
+            reason: format!(
+                "changeset {handle} is {}; open a new one with open_changeset{hint}",
+                row.state.as_str()
+            ),
+        })
     }
 }
 ```
