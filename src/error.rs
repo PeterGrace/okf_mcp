@@ -593,6 +593,12 @@ mod tests {
     }
 
     #[test]
+    fn client_path_adds_one_leading_slash() {
+        assert_eq!(client_path("infra/x.md"), "/infra/x.md");
+        assert_eq!(client_path("/infra/x.md"), "/infra/x.md");
+    }
+
+    #[test]
     fn to_json_writes_catalog_paths_with_a_leading_slash() {
         let not_found = OkfError::NotFound {
             path: "infra/x.md".to_string(),
