@@ -35,11 +35,11 @@ changesets and the routes in detail.
 
 ## 2. The image
 
-- **Name:** `ghcr.io/petergrace/okf-mcp:<version>`, for example `:0.7.0`.
+- **Name:** `ghcr.io/petergrace/okf-mcp:<version>`, for example `:0.8.0`.
   Every build is also tagged `:sha-<short commit>`. There is no `:latest`:
   manifests pin a version.
-- **Built by** `.github/workflows/image.yml` when a `v*` tag is pushed (`v0.7.0`
-  gives `:0.7.0`), and on a manual dispatch (which publishes `:sha-<short>`
+- **Built by** `.github/workflows/image.yml` when a `v*` tag is pushed (`v0.8.0`
+  gives `:0.8.0`), and on a manual dispatch (which publishes `:sha-<short>`
   only). The workflow runs no tests; they run before each merge.
 - **Contents:** Debian bookworm-slim with `ca-certificates`, and the binary at
   `/usr/local/bin/okf-mcp`. No git. The binary uses rustls and links no
@@ -240,7 +240,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: okf-mcp
-          image: ghcr.io/petergrace/okf-mcp:0.7.0
+          image: ghcr.io/petergrace/okf-mcp:0.8.0
           args: ["serve"]
           ports:
             - name: http
@@ -462,9 +462,10 @@ claude mcp add --transport http okf https://okf-mcp.example.com/mcp \
     --header "Authorization: Bearer $OKF_MCP_KEY"
 ```
 
-`X-OKF-Catalogs` (or `?catalogs=a,b`) picks the connection's catalogs, and
-`X-OKF-Changeset` (or `?changeset=label`) names its changeset. The README's
-"Connecting a client" and "Changesets" sections describe both.
+`X-OKF-Catalogs` (or `?catalogs=a,b`) picks the connection's catalogs. No
+header names a changeset: an agent calls `open_changeset` and passes the
+handle it returns as `changeset` to every write. The README's "Connecting a
+client" and "Changesets" sections describe both.
 
 **Protocol versions:** the server accepts MCP `2024-11-05`, `2025-03-26`,
 `2025-06-18`, `2025-11-25` and `2026-07-28` (rmcp 3.8's known versions). A
@@ -526,7 +527,7 @@ take the server out of service. Alert on the `error` log line, not on
 - **Release notes** are the `changelog/` directory: one dated entry per change,
   and one per milestone.
 - **Changesets survive** an upgrade: they are in the database. Open MCP
-  sessions do not; clients reconnect.
+  sessions do not; clients reconnect and carry on with the same handles.
 
 ## 9. Backup and restore
 
@@ -709,6 +710,7 @@ curl -sf -H "Authorization: Bearer $OKF_MCP_KEY" -o notes.tar.gz \
 | 401 on `/mcp` or an archive route | No `Authorization: Bearer` header, or the key is unknown or revoked. The body is plain text, with `WWW-Authenticate: Bearer` |
 | 403 on every `/mcp` request through the ingress | The `Host` is not in `allowed_hosts` (rmcp's DNS-rebinding check). Add the public host name and restart the pod |
 | 404 on `/mcp` with "Session not found" | The `Mcp-Session-Id` was opened by another key, idled out past `session_idle_timeout`, or predates a restart. Reconnect with the key that opened it |
+| A tool returns `UnknownChangeset`, or `Refused` with "changeset ... is published" (or "discarded") | `UnknownChangeset`: the handle is mistyped or belongs to another key (only its key, and an `admin` that reaches its catalog, may use it). `Refused`: its changeset is closed, by `publish`, by `discard`, or by the prune of changesets left empty for 24 hours. `list_changesets` lists the open handles the key may use; otherwise call `open_changeset` |
 | A tool returns `CatalogNotSelected` or `Forbidden` | The key is not granted that catalog, or its access level is too low (a `read` key calling a write tool). `okf-mcp key grant`, or a key with more access |
 | 404 on an archive route | The catalog doesn't exist or the key isn't granted it (never 403, so a key can't probe which catalogs exist) |
 | 403 on an archive route | The key reaches the catalog but its level is too low: import needs `admin` |

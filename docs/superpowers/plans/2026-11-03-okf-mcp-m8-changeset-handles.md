@@ -108,7 +108,6 @@ pub struct ChangesetRow {
     pub id: i64,
     pub handle: String,        // new (Task 2)
     pub catalog_id: i64,
-    pub label: String,         // removed in Task 5
     pub key_id: Option<String>,
     pub actor: String,
     pub state: ChangesetState,
@@ -818,7 +817,8 @@ pub struct ListedChangeset {
 
 ```sql
 -- Changesets are named by handle only (M8): the connection label and its
--- one-open-per-label index go.
+-- one-open-per-label index go. Dropping the column would drop the index
+-- with it; dropping the index first says so.
 DROP INDEX changesets_one_open_per_label;
 ALTER TABLE changesets DROP COLUMN label;
 ```
@@ -835,6 +835,15 @@ ALTER TABLE changesets DROP COLUMN label;
 - [ ] **Step 5: Version 0.8.0.** Bump `Cargo.toml`, then run `cargo build` to update `Cargo.lock`.
 
 - [ ] **Step 6: Gates, changelog, commit:** `feat!: drop changeset labels; docs for changeset handles; 0.8.0`.
+
+> **Corrected (issue #164), 2026-11-04.** As shipped:
+> - **`changesets::open`** inserts without `handle` and lets the column's default (`gen_random_uuid()::text`, migration 0003) draw it; the CTE that wrote one value to `label` and `handle` is gone. `list_open`'s hand-written `SELECT` lost `c.label` too.
+> - **`src/store/catalogs.rs`'s tests** also inserted `label` (three raw `INSERT`s); they lose it. `src/mcp/testing.rs`, `src/app.rs` and `tests/support/server.rs` had nothing left to remove.
+> - **`src/db.rs`'s schema test** inserts two open changesets of one key in one catalog (allowed now, Decision 7), then a duplicate handle, which violates `changesets_handle_key`.
+> - **`publish`'s "no longer open" refusal** (`src/store/publish.rs`) named the changeset's internal id; it names the handle.
+> - **`a_changeset_header_is_ignored`** also checks that `pending_changes` with the header's value as a handle is `UnknownChangeset`. It shares `assert_missing_changeset` with `a_write_without_a_changeset_is_a_parameter_error`.
+> - **The design:** `list_changesets` needs only `read`, so it takes `stranded_sessions`' row in the read-tool table; `open_changeset` heads the write-tool table. The `changesets` storage row, its constraints, the overlay paragraph and the tools' introduction changed too.
+> - **`docs/operations.md`** gained a Troubleshooting row for `UnknownChangeset` and closed changesets, and its image examples say `0.8.0`.
 
 ---
 

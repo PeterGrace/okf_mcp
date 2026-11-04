@@ -1,7 +1,6 @@
 //! What one tool call acts as and on: the principal, the connection's
-//! catalogs (and, until M8 Task 5, its changeset label, which nothing looks
-//! up any more), one view of the catalog map, and the changeset a handle
-//! names ([`Pinned`]).
+//! catalogs, one view of the catalog map, and the changeset a handle names
+//! ([`Pinned`]).
 
 use std::sync::Arc;
 
@@ -12,9 +11,7 @@ use crate::auth::Principal;
 use crate::catalog::CatalogState;
 use crate::error::OkfError;
 use crate::overlay::View;
-use crate::selection::{
-    connection_catalogs, connection_label, resolve, Selection, Sources, DEFAULT_LABEL,
-};
+use crate::selection::{connection_catalogs, resolve, Selection, Sources};
 use crate::store::changesets::{self, ChangesetRow, ChangesetState};
 use crate::store::keys::Access;
 
@@ -55,8 +52,6 @@ pub struct ToolContext {
     app: Arc<App>,
     principal: Arc<Principal>,
     connection: Option<Vec<String>>,
-    // The connection's changeset label (M5 Decision 1).
-    label: String,
     // Taken once per call, so the names `select` checks are the states the
     // tool then reads, even if the poll loop swaps the map meanwhile.
     catalogs: Arc<Catalogs>,
@@ -79,7 +74,6 @@ impl ToolContext {
             app,
             principal,
             connection,
-            label: DEFAULT_LABEL.to_string(),
             catalogs,
         }
     }
@@ -107,10 +101,11 @@ impl ToolContext {
             .ok_or_else(|| OkfError::Forbidden {
                 reason: "the request carries no API key".to_string(),
             })?;
-        Ok(
-            Self::new(Arc::clone(app), principal, connection_catalogs(parts))
-                .with_label(connection_label(parts)),
-        )
+        Ok(Self::new(
+            Arc::clone(app),
+            principal,
+            connection_catalogs(parts),
+        ))
     }
 
     /// The shared state.
@@ -127,27 +122,6 @@ impl ToolContext {
     /// Its principal.
     pub fn principal(&self) -> &Principal {
         &self.principal
-    }
-
-    /// The connection's changeset label (M5 Decision 1).
-    ///
-    /// # Returns
-    /// The label: from the request in [`ToolContext::from_parts`],
-    /// [`DEFAULT_LABEL`] from [`ToolContext::new`].
-    pub fn label(&self) -> &str {
-        &self.label
-    }
-
-    /// The same context on another label.
-    ///
-    /// # Arguments
-    /// * `label` - the label; `impl Into<String>` takes a `&str` or a `String`.
-    ///
-    /// # Returns
-    /// The context, consumed and returned (`self` by value), so calls chain.
-    pub fn with_label(mut self, label: impl Into<String>) -> Self {
-        self.label = label.into();
-        self
     }
 
     /// The catalog map this call sees.
@@ -439,7 +413,6 @@ mod tests {
     use crate::mcp::testing::{
         app_with, context, open, pending_entry, principal, principal_as, store_key, PendingEdit,
     };
-    use crate::selection::{CHANGESET_HEADER, DEFAULT_LABEL};
     use crate::store::changesets::{self, ChangesetState};
     use crate::store::keys::Access;
 
@@ -576,26 +549,6 @@ mod tests {
         let refused = reader.changeset(&handle, Access::Read).await.unwrap_err();
 
         assert_eq!(refused.kind(), "UnknownChangeset");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_context_takes_its_label_from_the_request() {
-        let test = app_with(&[("pg", &[])], Config::default()).await;
-        let mut request = axum::http::Request::builder()
-            .uri("/mcp")
-            .header(CHANGESET_HEADER, "drafts")
-            .body(())
-            .unwrap();
-        request.extensions_mut().insert(principal(&[], Some("pg")));
-        let (parts, _) = request.into_parts();
-
-        let from_request = super::ToolContext::from_parts(&test.app, &parts).unwrap();
-        let plain = context(&test, principal(&[], Some("pg")), None);
-        let relabelled = context(&test, principal(&[], Some("pg")), None).with_label("other");
-
-        assert_eq!(from_request.label(), "drafts");
-        assert_eq!(plain.label(), DEFAULT_LABEL);
-        assert_eq!(relabelled.label(), "other");
     }
 
     #[tokio::test(flavor = "multi_thread")]

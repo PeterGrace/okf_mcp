@@ -5,10 +5,6 @@
 //! `X-OKF-Catalogs` header, else `?catalogs=` on the MCP URL); the key's
 //! default catalog; the server's `default_catalog`. The first that is set
 //! wins, and every name in it must exist and be reachable by the key.
-//!
-//! A connection's changeset label (Decision 1 of M5): the `X-OKF-Changeset`
-//! header, else `?changeset=`, else `default`. Never the MCP session id,
-//! which changes on every reconnect.
 
 use axum::http::request::Parts;
 
@@ -22,19 +18,9 @@ pub const CATALOGS_HEADER: &str = "x-okf-catalogs";
 /// The MCP URL's query parameter with the same meaning.
 pub const CATALOGS_QUERY: &str = "catalogs";
 
-/// The header naming a connection's changeset label (M5 Decision 1).
-pub const CHANGESET_HEADER: &str = "x-okf-changeset";
-
-/// The MCP URL's query parameter with the same meaning.
-pub const CHANGESET_QUERY: &str = "changeset";
-
 /// rmcp's session header (`Mcp-Session-Id`), as `http` stores header names:
 /// lowercase. Lookups by it match any case on the wire.
 pub const SESSION_HEADER: &str = "mcp-session-id";
-
-/// The label of a connection that names none: its key's one unnamed
-/// changeset per catalog, the same across reconnects and restarts.
-pub const DEFAULT_LABEL: &str = "default";
 
 /// The resolved catalogs of one call: never empty, no duplicates, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,49 +108,6 @@ pub fn connection_catalogs(parts: &Parts) -> Option<Vec<String>> {
         }
         non_empty(from_query)
     })
-}
-
-/// A label as given, trimmed; `None` when blank.
-fn label_text(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-/// A header's value as text (lossily, as for [`connection_catalogs`]),
-/// trimmed; `None` when blank.
-fn header_label(value: &axum::http::HeaderValue) -> Option<String> {
-    label_text(&String::from_utf8_lossy(value.as_bytes()))
-}
-
-/// The changeset label of a connection (M5 Decision 1): the first of the
-/// `X-OKF-Changeset` header and the `changeset` query parameter that is not
-/// blank, else [`DEFAULT_LABEL`]. Never the `Mcp-Session-Id`: it changes on
-/// every reconnect, which would strand the earlier changeset.
-///
-/// With the key, the label picks the connection's changeset in each catalog,
-/// so a client keeps one changeset across requests, reconnects and restarts,
-/// and an agent that wants several names them.
-///
-/// # Arguments
-/// * `parts` - the HTTP request (rmcp passes it to every tool).
-///
-/// # Returns
-/// The label, trimmed.
-pub fn connection_label(parts: &Parts) -> String {
-    // `find_map` returns the first `Some` the closure gives, like
-    // `next((f(x) for x in xs if f(x) is not None), None)` in Python.
-    parts
-        .headers
-        .get_all(CHANGESET_HEADER)
-        .iter()
-        .find_map(header_label)
-        .or_else(|| {
-            let query = parts.uri.query()?;
-            form_urlencoded::parse(query.as_bytes())
-                .filter(|(key, _)| key == CHANGESET_QUERY)
-                .find_map(|(_, value)| label_text(&value))
-        })
-        .unwrap_or_else(|| DEFAULT_LABEL.to_string())
 }
 
 /// Resolves a call's catalogs.
@@ -378,33 +321,6 @@ mod tests {
             request = request.header(CATALOGS_HEADER, value);
         }
         request.body(()).unwrap().into_parts().0
-    }
-
-    fn label_parts(uri: &str, headers: &[(&str, &str)]) -> Parts {
-        let mut request = axum::http::Request::builder().uri(uri);
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-        request.body(()).unwrap().into_parts().0
-    }
-
-    #[test]
-    fn the_label_is_the_header_then_the_query_then_default_never_the_session() {
-        let header = label_parts(
-            "/mcp?changeset=q",
-            &[(CHANGESET_HEADER, " drafts "), (SESSION_HEADER, "s1")],
-        );
-        let query = label_parts(
-            "/mcp?catalogs=pg&changeset=&changeset=q",
-            &[(CHANGESET_HEADER, " "), (SESSION_HEADER, "s1")],
-        );
-        let session = label_parts("/mcp?changeset=", &[(SESSION_HEADER, "s1")]);
-        let nothing = label_parts("/mcp", &[]);
-
-        let labels = [&header, &query, &session, &nothing].map(connection_label);
-
-        // A session id alone is not a label: it would change on reconnect.
-        assert_eq!(labels, ["drafts", "q", DEFAULT_LABEL, DEFAULT_LABEL]);
     }
 
     #[test]

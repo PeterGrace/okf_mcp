@@ -59,8 +59,6 @@ script. pgrace replaced it for M8 ([plan](../plans/2026-11-03-okf-mcp-m8-changes
   and `adopt_changeset`.
 - The label header, the query parameter and the `label` column go.
 
-Until M8's Task 5, the sections below still describe labels.
-
 ## Decisions
 
 | Question | Decision |
@@ -72,7 +70,7 @@ Until M8's Task 5, the sections below still describe labels.
 | Auth | Bearer API keys stored as SHA-256 hashes in the database; per-key catalog grants and `read`/`write`/`admin` access, each level including the ones before it and always limited to the key's granted catalogs; an MCP session answers only the key that opened it |
 | Scope | Full read-write: every `okf.py` command plus content editing, search and concept retrieval |
 | Implementation | Port everything to Rust. No Python at runtime |
-| Write grouping | One changeset per (catalog, key, label), created on first write and kept in the database until published or discarded; explicit `publish`. The label is the connection's `X-OKF-Changeset` header, else `?changeset=`, else `default` (never the MCP session id, which changes on every reconnect) |
+| Write grouping | Changesets named by a handle the server issues: `open_changeset` returns a random one, and every write, `publish`, `discard`, `revert` and `pending_changes` passes it back as a required `changeset` argument (a write never opens one by itself). A key may hold several open at once; each is kept in the database until published or discarded; explicit `publish`. The handle works on any connection of its key, and for an `admin` key that reaches its catalog |
 | Concurrency | Publishes to a catalog are serialized by a per-catalog lock; each checks its documents' base revisions, replays bookkeeping edits of `log.md` and `index.md` onto the current text, and re-checks links into deleted or moved paths |
 | Getting data in and out | Import from an OKF directory or tarball; export as a tarball through an authenticated route. No git anywhere in the server |
 | Administration | `okf-mcp` subcommands against the database (`migrate`, `catalog`, `key`, `import`, `export`), plus the HTTP import and export routes |
@@ -203,16 +201,15 @@ One Postgres database. Migrations live in `migrations/` and are embedded with
 | `catalogs` | `id`, `name` (unique, `[a-z0-9-]+`), `description`, `generation` (bumped by every publish and import), `created_at` |
 | `documents` | One row per file: `catalog_id`, `path` (catalog-relative, `/`-separated), `content` (`bytea`, the file's exact bytes), `executable` (the file's execute bit, so scripts round-trip), `revision` (+1 per change, never reused for a path), `deleted_at` (a tombstone: a deleted document keeps its row, so a path created again continues its revision numbering), `updated_at`, `updated_by`; derived `kind`, `concept_type`, `title`, `status`, `tags`. Primary key `(catalog_id, path)` |
 | `revisions` | Append-only history: `catalog_id`, `path`, `revision`, `op` (`create`, `update`, `delete`, `import`), `content` (NULL for a delete), `actor`, `changeset_id`, `message`, `created_at` |
-| `changesets` | One open per (catalog, key, label): `id`, `catalog_id`, `label`, `key_id`, `actor`, `state` (`open`, `published`, `discarded`), `version` (bumped by every change to it or its entries; overlay caches key on it), `created_at`, `updated_at` |
+| `changesets` | `id` (internal: entries, revisions and the overlay cache refer to it), `handle` (unique, `gen_random_uuid()::text`: what clients see), `catalog_id`, `key_id`, `actor`, `state` (`open`, `published`, `discarded`), `version` (bumped by every change to it or its entries; overlay caches key on it), `created_at`, `updated_at` |
 | `changeset_entries` | Per changed path: `changeset_id`, `path`, `base_revision` (NULL for a path with no live document), `content` (NULL for a delete), `replay` (the entry's listing and log operations, JSON, while every change to the entry came from one; NULL once any other edit touches it) |
 | `api_keys` | `id`, `sha256`, `access`, `all_catalogs`, `default_catalog_id` (references `catalogs`; cleared when that catalog is deleted, or when the key loses its grant), `actor`, `created_at`, `revoked_at` |
 | `key_catalogs` | `(key_id, catalog_id)` grants |
 | `server_state` | One row: `admin_generation`, bumped by every `catalog` and `key` subcommand |
 
 Constraints the design relies on: `revisions` is unique on `(catalog_id, path,
-revision)`; `changesets` has a partial unique index on `(catalog_id, key_id, label)
-WHERE state = 'open'`, so a racing get-or-create cannot open two changesets for one
-identity; `api_keys.sha256` is unique and indexed. Every table that refers to a catalog
+revision)`; `changesets.handle` is unique (`changesets_handle_key`), so a handle names
+one changeset; `api_keys.sha256` is unique and indexed. Every table that refers to a catalog
 does so with `ON DELETE CASCADE`.
 
 **Lock order.** Every transaction that writes changesets or entries takes the catalog
@@ -225,8 +222,7 @@ reversed: writes and deletes wait for each other instead of deadlocking; a write
 waited finds the catalog gone and writes nothing. The 24-hour prune takes no catalog lock
 and skips changesets other transactions hold (`SKIP LOCKED`). Deleting a key sets its
 changesets' `key_id` to NULL without touching the catalog row; writes never change
-`key_id`, and the insert's `ON CONFLICT DO NOTHING` fires no foreign-key check, so this
-forms no cycle either. A deadlock or
+`key_id`, so this forms no cycle either. A deadlock or
 serialization failure Postgres still reports (`40P01`, `40001`) is the `Busy` error,
 which says to retry.
 
@@ -255,12 +251,13 @@ to a non-text file resolves, reading such a file as text fails as it does on dis
 a write through the workspace keeps an existing file's execute bit (a new file is not
 executable).
 
-A connection with an open changeset in a catalog (its key and label, see "Write
-grouping") reads that catalog through an overlay: the published workspace with the
-changeset's entries applied, and a full snapshot of it, built on a blocking thread and
-cached per changeset while the changeset's `version` and the catalog's `generation` are
-unchanged. Each read looks the changeset up (one index lookup; `read` keys, which cannot
-write, skip it), so an agent sees its own pending edits and no one else's. `history` and
+A read that names a changeset (`changeset`, its handle; see "Write grouping") reads that
+changeset's catalog through an overlay: the published workspace with the changeset's
+entries applied, and a full snapshot of it, built on a blocking thread and cached per
+changeset while the changeset's `version` and the catalog's `generation` are unchanged.
+Every other catalog the read selects is read published, and so is every read without
+`changeset`, so an agent sees pending edits only when it asks, and only in changesets
+its key may use. `history` and
 `list_catalogs` report the published state. Each cached overlay pins a copy of the workspace, a snapshot
 and its base state, so overlay memory is about the number of active changesets times the
 catalog's size, bounded by evicting overlays unused for `session_idle_timeout` (checked
@@ -309,7 +306,9 @@ nor disk in tests.
 
 ## Tools
 
-All tools take an optional `catalog` (`search` takes `catalogs`). Results are structured
+The read tools take an optional `catalog` (`search` takes `catalogs`), and an optional
+`changeset` to read through that changeset's drafts. The write tools take no `catalog`:
+their required `changeset` names it. Results are structured
 JSON (rmcp `Json<T>`, `schemars` schemas). Concept paths accept
 `/infra/time-server.md`, `infra/time-server` or `/infra/time-server`, as `okf.py` does.
 
@@ -321,37 +320,41 @@ filesystem or configuration: the ones the HTTP routes answer with 500) says only
 log has the details. Without a `catalog` argument, `get_concept`, `read_document` and `history` look
 through the selected catalogs in order and answer from the first that has the path, naming
 it; the reports (`open_questions`, `oldest`, `sprawl`, `links_report`, `lint`) run on the
-first selected catalog.
+changeset's catalog when the call names a changeset, else on the first selected catalog. A
+`changeset` whose catalog the call does not select is refused (`Refused`, naming it).
 
 ### Read tools (need `read`)
 
 | Tool | Parameters | Result |
 |---|---|---|
 | `list_catalogs` | none | Catalogs the key can reach (name, description, file count, last change); this connection's selection and default write target, or why there is none |
-| `search` | `query`, `catalogs?`, `type?`, `tags?`, `status?`, `limit?` (default 20, at most 200) | Ranked hits across catalogs: catalog, path, title, description, snippet. A catalog whose overlay cannot be built is listed in `skipped` (catalog and error) and the others still answer. Every whitespace-separated term must occur (case-insensitive substring) in some field; the tier is the best field holding the whole query, else the best holding a term (fields, best first: title/alias, tag, description, body); deprecated concepts last; ties by catalog order, then path. The `tags` filter matches whole tags only, while free text matches tags by substring: the tool description must say so |
-| `get_concept` | `path`, `links?`, `raw?` | Frontmatter as JSON and the body; with `links`, resolved outbound links (path, title, description, broken flag) and inbound backlinks; with `raw`, the file verbatim |
-| `read_document` | `path?` (default `/index.md`) | Raw text of an `index.md`, `log.md` or `AGENTS.md` |
-| `open_questions` | none | Every queued `open_questions` entry, grouped by concept, 1-based |
-| `oldest` | `n?` (default 5), `open_questions_only?` | Port of `oldest --json` |
-| `sprawl` | `path?`, `n?` (default 5) | Port of `sprawl --json` |
-| `links_report` | `mentions?` (default true) | Port of `links --json` |
-| `lint` | `pending?` | Port of `lint --json`, on the published catalog or (with `pending`) on this connection's overlay, with a `pending` flag saying which |
+| `search` | `query`, `catalogs?`, `type?`, `tags?`, `status?`, `limit?` (default 20, at most 200), `changeset?` | Ranked hits across catalogs: catalog, path, title, description, snippet. A catalog whose overlay cannot be built is listed in `skipped` (catalog and error) and the others still answer. Every whitespace-separated term must occur (case-insensitive substring) in some field; the tier is the best field holding the whole query, else the best holding a term (fields, best first: title/alias, tag, description, body); deprecated concepts last; ties by catalog order, then path. The `tags` filter matches whole tags only, while free text matches tags by substring: the tool description must say so |
+| `get_concept` | `path`, `links?`, `raw?`, `changeset?` | Frontmatter as JSON and the body; with `links`, resolved outbound links (path, title, description, broken flag) and inbound backlinks; with `raw`, the file verbatim |
+| `read_document` | `path?` (default `/index.md`), `changeset?` | Raw text of an `index.md`, `log.md` or `AGENTS.md` |
+| `open_questions` | `changeset?` | Every queued `open_questions` entry, grouped by concept, 1-based |
+| `oldest` | `n?` (default 5), `open_questions_only?`, `changeset?` | Port of `oldest --json` |
+| `sprawl` | `path?`, `n?` (default 5), `changeset?` | Port of `sprawl --json` |
+| `links_report` | `mentions?` (default true), `changeset?` | Port of `links --json` |
+| `lint` | `changeset?` | Port of `lint --json`, on the published catalog or (with `changeset`) on that changeset's overlay, with a `pending` flag saying which |
 | `history` | `path`, `limit?` (default 20, at most 200) | The document's revisions, newest first: revision, op, actor, message, time |
-| `pending_changes` | `catalog?` | This connection's changeset in the catalog: each changed path (`create`, `update`, `delete`), its base revision and the revision published now, whether the base is stale, whether it is replayable, and a unified diff against the published text (`/dev/null` for a new or deleted file; non-text files as `Binary files ... differ`; a deletion of a path deleted since, or a file equal to the published one, as a one-line note). Needs only `read`; a key below `write` has no changeset, as for every read (`ToolContext::view`). It reads the entries rather than the overlay, so a changeset whose overlay no longer applies can still be listed and discarded |
-| `stranded_sessions` | `catalog?` | Open changesets holding edits that nobody changed within `session_idle_timeout`: the key's own (other labels than this connection's), or for an `admin` key every one in the catalogs it reaches: id, catalog, label, key, actor, creation and last-change times, changed paths |
+| `pending_changes` | `changeset` | What the changeset holds: each changed path (`create`, `update`, `delete`), its base revision and the revision published now, whether the base is stale, whether it is replayable, and a unified diff against the published text (`/dev/null` for a new or deleted file; non-text files as `Binary files ... differ`; a deletion of a path deleted since, or a file equal to the published one, as a one-line note). Needs only `read`, but only the changeset's key and an `admin` may use a handle, and a `read` key opens none. It reads the entries rather than the overlay, so a changeset whose overlay no longer applies can still be listed and discarded |
+| `list_changesets` | `catalog?` | The open changesets the key may use: its own, or for an `admin` key every one in the catalogs it reaches, empty ones included. Each gives its handle, catalog, key, actor, creation and last-change times, `idle` (no change within `session_idle_timeout`) and changed paths. How an agent finds a handle again after a reconnect or a lost context |
 
 Lint's `generated-after-commit` check reads each document's last revision time where
-`okf.py` reads its last git commit time; paths in the connection's changeset count as
+`okf.py` reads its last git commit time; with `changeset`, that changeset's paths count as
 uncommitted.
 
 ### Write tools (need `write`)
 
-Each acts on this connection's changeset for the target catalog (its key and label; see
-"Write grouping" in "Decisions"), creating it on first use. Nothing is visible to other
-keys or labels until `publish`.
+Each takes a required `changeset` (a handle from `open_changeset`; see "Write grouping"
+in "Decisions") and acts on that changeset in its catalog. Leaving it out fails the
+parameter check before the tool runs. Nothing is visible to anyone else until `publish`,
+and a read sees the drafts only when it names the changeset. The parameters below leave
+`changeset` out.
 
 | Tool | Parameters | Behavior |
 |---|---|---|
+| `open_changeset` | `catalog?` (default: the connection's write target) | Opens a new, empty changeset in the catalog and returns its handle. A key may have several open; one that gets no write within 24 hours is discarded (see "Session lifecycle") |
 | `create_concept` | `path`, `frontmatter` (object), `body`, `index_summary?`, `index_section?`, `by?` | Validates the path (`new_concept_path` rules: inside the catalog, not reserved, not machinery, must not exist; warns on a non-kebab-case name). Requires `type`. Writes `generated: { by, at: now }` itself and rejects `generated`, `verified`, `reviewed` in `frontmatter`. Renders frontmatter in `KEY_ORDER`. Other keys follow in the caller's order. Strings are quoted only when they must be; mappings and lists of scalars are written in flow style, lists of collections as block lists; JSON numbers and booleans are stored as their text. With `index_summary`, lists it in the folder's `index.md`, creating folder indexes and parent listings as `ensure_index` does, and lists it with its `title`; a summary without a non-blank title, and `index_section` without `index_summary`, are refused. The listing (folder index and `index_section`) is checked before anything is written. Index edits are recorded as replay operations, the concept itself as a free edit |
 | `edit_document` | `path`, `old_str`, `new_str`, `replace_all?` | Exact replacement in a concept body or an `index.md`. Without `replace_all`, `old_str` must occur exactly once (`EditMismatch` gives the count); an empty `old_str` is refused. Refuses a match that touches frontmatter, and any result whose frontmatter differs from the original's (none may be added to a document without it, `index.md` included). Refuses `log.md` and machinery |
 | `replace_body` | `path`, `body` | Replaces a concept's body; frontmatter unchanged byte for byte; a body that would add frontmatter to a document without it is refused |
@@ -367,9 +370,8 @@ keys or labels until `publish`.
 | `split_concept` | `path`, `section`, `to`, `type?` (default `Note`; a blank one is refused, as for `create_concept`), `title?`, `description?`, `stub?`, `sources?` (`okf.py`'s `--source` ids), `by?` | Port of `split`; returns touched files and `okf.py`'s notes. The parent and the new concept are free edits; the new listing and link edits in `index.md` and `log.md` replay |
 | `delete_concept` | `path` | Removes the concept and its listing in its folder's `index.md` (a replayable `Unlist`); the concept becomes a deletion entry. Refuses with `StillLinked` while any other document links to it (`log.md` and other `index.md` files included, the folder's own listing bullet not), listing those links. Refuses `index.md`, `log.md`, the root readmes and machinery. An emptied folder keeps its `index.md`, and a note says so |
 | `publish` | `message` | See "Publish" below |
-| `discard` | `paths?` | Drops this connection's changeset entries: the named paths, or all of them, which also marks the changeset `discarded` (the next write opens a new one). Takes publish's locks in publish's order, so a write queued behind a closing discard lands in a new changeset |
-| `revert` | `path`, `revision` | Adds the document's content at `revision` (or its deletion) to this connection's changeset, for review and publish like any other edit. Subject to every write rule, so machinery cannot be reverted. A revert is a free edit (no replay); a revision whose content is not UTF-8 is refused, and a revived file is not executable (scripts are machinery, which revert refuses anyway). Sending a file the changeset created back to absent leaves no entry for it |
-| `adopt_changeset` | `id` | Moves an open changeset to this connection's key and label. The key's own needs `write`; another key's needs `admin` on its catalog. Refused while this connection has another open changeset in that catalog; an unknown id, a closed changeset and one in a catalog the key does not reach are refused alike |
+| `discard` | `paths?` | Drops the changeset's entries: the named paths, or all of them, which also marks the changeset `discarded`; its handle is refused from then on, so new work needs `open_changeset`. Takes publish's locks in publish's order, so a write queued behind a closing discard is refused and stores nothing |
+| `revert` | `path`, `revision` | Adds the document's content at `revision` (or its deletion) to the changeset, for review and publish like any other edit. Subject to every write rule, so machinery cannot be reverted. A revert is a free edit (no replay); a revision whose content is not UTF-8 is refused, and a revived file is not executable (scripts are machinery, which revert refuses anyway). Sending a file the changeset created back to absent leaves no entry for it |
 
 `by` defaults to the key's `actor`. A call may override it (for example `human:pgrace`
 when a person really did the verifying); AGENTS.md's honesty rule still applies.
@@ -405,8 +407,9 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
    auth layer added, into every tool call's request context (verified against rmcp
    3.8.0 while planning M3).
 3. `selection` resolves the catalog set.
-4. For each catalog, the handler takes an `Arc` of the current snapshot, or of this
-   connection's overlay if its key and label have an open changeset there.
+4. With `changeset`, `ToolContext::pin` resolves the handle (the key's own, or any for an
+   `admin` that reaches its catalog). For each catalog, the handler takes an `Arc` of the
+   current snapshot, or of the pinned changeset's overlay for that changeset's catalog.
 5. The work runs in memory (search uses `rayon` across documents, then merges and ranks
    across catalogs).
 
@@ -414,15 +417,17 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
 
 `write::apply` carries every write tool's call into the database:
 
-1. Auth, then `write` access on a single target catalog: the `catalog` argument, else
-   the connection's write target.
-2. One transaction takes the catalog row (`FOR KEY SHARE`), gets or creates the open
-   changeset for (catalog, key, label), and locks its row (`FOR UPDATE`,
-   `store::changesets::lock`), so writes to one changeset, its publish and its discard
-   run one at a time. Every changeset transaction takes these locks in that order;
+1. Auth, then `ToolContext::changeset` resolves the `changeset` handle: the row, its
+   catalog (the one written), and that the key owns it or is an `admin` reaching that
+   catalog; any other key gets `UnknownChangeset`, worded as for a handle that does not
+   exist. Then `write` access on that catalog.
+2. One transaction takes the catalog row (`FOR KEY SHARE`), then locks the changeset's
+   row (`FOR UPDATE`, `store::changesets::lock`) and refuses the write if a publish,
+   discard or prune closed it meanwhile, so writes to one changeset, its publish and its
+   discard run one at a time. Every changeset transaction takes these locks in that order;
    `catalogs::delete` takes the row `FOR UPDATE` first, so neither side can deadlock the
    other. The overlay is read under that lock, in the same transaction: its cached
-   `version` is a cache label, never a concurrency token. Each write holds one pooled
+   `version` is a cache key, never a concurrency token. Each write holds one pooled
    connection for its whole transaction, so writers queued on one changeset's row lock
    each hold one while they wait; with the pool's 8 connections, enough of them can
    leave reads waiting for a connection. This is accepted for now: one agent's
@@ -454,7 +459,7 @@ when a person really did the verifying); AGENTS.md's honesty rule still applies.
      plus the new operations while every edit to it came from one. Any other edit (an
      `edit_document` of an `index.md`, say) clears it for good, so that entry conflicts
      like any other on a stale base.
-5. Commit, and drop the connection's cached overlay; its next read rebuilds it. A
+5. Commit, and drop the changeset's cached overlay; its next read rebuilds it. A
    refused edit stores nothing. So every write after the first rebuilds the overlay
    (a full snapshot, Decision 6 of the M5 plan) while it holds the changeset's row
    lock, and writes queued on one changeset wait for each other's rebuilds. This is
@@ -472,8 +477,9 @@ Every write to a catalog's published state (publish, import) runs under that cat
 running beside the server is serialized too. Publishes to one catalog therefore run one
 at a time, each against the current published state.
 
-1. Nothing changed (no open changeset, or no entries): return `published: false`. A
-   blank `message` is refused.
+1. `ToolContext::changeset` resolves the handle as for a write; a published or discarded
+   changeset is refused. Nothing changed (no entries): return `published: false`, and the
+   changeset stays open. A blank `message` is refused.
 2. Take the in-process mutex, begin the transaction, take the advisory lock, then the
    catalog row (`FOR KEY SHARE`) and the changeset row (`FOR UPDATE`), and check that
    the changeset is still open. If the catalog's `generation` (bumped by every publish
@@ -527,7 +533,8 @@ The checks run while the lock is held, so they stay small: one query reads the c
 paths' rows, and the overlay is a full snapshot of the result (about 10 ms for a full
 snapshot plus lint of the real catalog in M2's smoke test). Reads never take the lock.
 A write that queued on the changeset's row lock behind a publish finds the changeset
-closed when the lock is granted and opens a new one, so its edit is kept, not lost.
+closed when the lock is granted and is refused, storing nothing; the agent opens a new
+changeset and redoes it.
 Like a queued writer (Write, step 2), a publish holds one pooled connection for its
 whole transaction, and refreshing a stale snapshot in step 2 needs a second. Publishes
 of one catalog are serialized by the mutex, so only many catalogs publishing at once on
@@ -592,18 +599,19 @@ exported.
 
 ### Session lifecycle
 
-- A changeset is created on the first write by a (key, label) to a catalog (see "Write
-  grouping"), and stays open until `publish` or `discard`, across sessions and restarts:
-  closing an MCP session strands nothing, and a client on MCP `2026-07-28` (no sessions)
-  gets the same changeset on every request through its label.
-- `stranded_sessions` lists open, non-empty changesets not changed within
-  `session_idle_timeout`: the key's own, or for an `admin` key every one in the catalogs
-  it reaches. `adopt_changeset` moves one to the calling connection's key and label (the
-  key's own with `write`, another key's with `admin`).
+- `open_changeset` creates a changeset (see "Write grouping"), and it stays open until
+  `publish` or `discard`, across sessions and restarts: closing an MCP session strands
+  nothing, since the handle works on any connection of its key, and a client on MCP
+  `2026-07-28` (no sessions) passes the same handle on every request.
+- `list_changesets` lists the open changesets the key may use, empty ones included: its
+  own, or for an `admin` key every one in the catalogs it reaches, each marked `idle` when
+  it has not changed within `session_idle_timeout`. An agent that lost its handle finds it
+  there; an admin takes another key's work over by using its handle directly.
 - Every poll pass discards empty changesets whose last change is more than 24 hours old
-  (a failure is logged and retried at the next pass).
-  Non-empty ones are never pruned: they hold unpublished work, and only `discard` (after
-  `adopt_changeset`, if need be) or `catalog delete --force` removes them.
+  (a failure is logged and retried at the next pass), so a handle that gets no write
+  within 24 hours of `open_changeset` is refused afterwards, with a hint to open a new
+  one. Non-empty ones are never pruned: they hold unpublished work, and only `discard`
+  (by its key or an admin) or `catalog delete --force` removes them.
 
 ## Errors
 

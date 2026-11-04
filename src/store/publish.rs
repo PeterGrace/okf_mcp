@@ -139,7 +139,7 @@ pub async fn publish(
         .await?
         .filter(|row| row.state == ChangesetState::Open)
         .ok_or_else(|| OkfError::Refused {
-            reason: format!("changeset {} is no longer open", changeset.id),
+            reason: format!("changeset {} is no longer open", changeset.handle),
         })?;
     // Again under the lock: a discard may have emptied it meanwhile.
     let entries = changesets::entries(&mut *tx, locked.id).await?;

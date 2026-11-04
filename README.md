@@ -354,8 +354,7 @@ key's actor.
   rows and rebuilt and swapped when its generation moves; lint with revision
   times.
 - `src/auth.rs` - the key cache and the bearer middleware; `src/selection.rs` -
-  which catalogs a call acts on (and the connection's changeset label, which
-  nothing looks up any more); `src/app.rs` - the
+  which catalogs a call acts on; `src/app.rs` - the
   shared state and the poll loop (which also prunes empty changesets).
 - `src/overlay.rs` - a changeset's view (the published files with its entries
   applied), cached per changeset; `src/write.rs` - the one path every write
@@ -380,7 +379,8 @@ key's actor.
 - `tests/writes.rs` - end-to-end write tests over HTTP: create, link, index,
   log, publish and export; concurrent `log.md` publishes; a conflict; a
   changeset surviving a restart; two handles of one key; concurrent writes
-  to one handle; a write without a handle.
+  to one handle; a write without a handle; a leftover `X-OKF-Changeset`
+  header ignored.
 - `tests/restructure.rs` - end-to-end restructuring over HTTP: a move
   published and exported; a conflict and a replay against other sessions; a
   delete refused while linked.
@@ -389,7 +389,7 @@ key's actor.
 - `tests/smoke.rs` - every analysis and a search on a real catalog, the
   storage path (import, load, links, lint, export) through Postgres, and the
   server (every read tool and the export over HTTP) and the write path
-  (create, stamp, log, lint pending and publish over HTTP, into a throwaway
+  (create, stamp, log, lint through the changeset and publish over HTTP, into a throwaway
   copy) and the restructuring tools (move, split, a refused delete and
   publish), timed.
 - `tests/support/` - a throwaway Postgres container per test, and a test

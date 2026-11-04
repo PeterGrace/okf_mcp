@@ -106,8 +106,7 @@ mod tests {
                 .unwrap_err();
         assert!(bad_name.as_database_error().unwrap().is_check_violation());
 
-        // The open-changeset index includes `key_id`, and NULLs never
-        // conflict, so the two changesets below need a key.
+        // A key, for the changesets below and `key_catalogs` further down.
         sqlx::query(
             "INSERT INTO api_keys (id, sha256, access, all_catalogs, default_catalog_id, \
              actor, created_at) VALUES ('k1', $1, 'read', false, $2, 'a', $3)",
@@ -118,23 +117,29 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        let open = "INSERT INTO changesets (catalog_id, label, key_id, actor, state, created_at, \
-                    updated_at) VALUES ($1, 's1', 'k1', 'a', 'open', $2, $2)";
-        sqlx::query(open)
-            .bind(catalog)
-            .bind(chrono::Utc::now())
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        // One key may hold several open changesets in a catalog (M8
+        // Decision 7), but no two changesets share a handle.
+        let open = "INSERT INTO changesets (catalog_id, handle, key_id, actor, state, created_at, \
+                    updated_at) VALUES ($1, $2, 'k1', 'a', 'open', $3, $3)";
+        for handle in ["h1", "h2"] {
+            sqlx::query(open)
+                .bind(catalog)
+                .bind(handle)
+                .bind(chrono::Utc::now())
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
         let second = sqlx::query(open)
             .bind(catalog)
+            .bind("h1")
             .bind(chrono::Utc::now())
             .execute(&db.pool)
             .await
             .unwrap_err();
         let second = second.as_database_error().unwrap();
         assert!(second.is_unique_violation());
-        assert_eq!(second.constraint(), Some("changesets_one_open_per_label"));
+        assert_eq!(second.constraint(), Some("changesets_handle_key"));
 
         let revision = "INSERT INTO revisions (catalog_id, path, revision, op, content, \
                         executable, actor, message, created_at) \
