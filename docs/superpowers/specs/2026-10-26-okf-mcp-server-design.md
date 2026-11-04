@@ -620,10 +620,20 @@ One `thiserror` enum, `OkfError`:
 | `EditMismatch { path, matches }` | `old_str` found 0 or more than 1 times |
 | `LintFailed { errors, warnings }` | Publish refused: lint errors in changed files or links into deleted paths (`errors`), with the rest as `warnings`; HTTP 422 |
 | `Conflict { files }` | Publish found documents changed since this changeset read them; `files` lists each path with its base and current revision; HTTP 409 |
-| `StillLinked { path, links }` | `delete_concept` refused: other documents link to the concept; `path` and each `links[].source` are catalog-relative with a leading `/` (`/infra/x.md`, `/hub.md`), as tool results (`touched`, `message`) and `Conflict` write them (other errors' paths have no leading `/`); `links` lists each (source, line). Not counted: its folder's own listing bullet, its links to itself, the root `AGENTS.md`, `CLAUDE.md` and `README.md` (as publish's link check); `log.md` and other `index.md` files count; HTTP 409 |
+| `StillLinked { path, links }` | `delete_concept` refused: other documents link to the concept; `path` and each `links[].source` are catalog-relative with a leading `/` (`/infra/x.md`, `/hub.md`), as tool results (`touched`, `message`) and `Conflict` write them; `links` lists each (source, line). Not counted: its folder's own listing bullet, its links to itself, the root `AGENTS.md`, `CLAUDE.md` and `README.md` (as publish's link check); `log.md` and other `index.md` files count; HTTP 409 |
 | `Busy` | The database aborted the request to resolve a lock conflict (`40P01`, `40001`); nothing was stored; retry (HTTP 503). `write::apply` also answers it if the changeset it locked is no longer open, a defensive check: a write queued behind a publish or discard opens a new changeset instead (see "Publish") |
 | `Database` | Any database failure (details logged, not returned) |
 | `Io` | Filesystem errors (import, export) |
+
+Every catalog path in an error body is catalog-relative with a leading `/` (M8 Decision 9):
+`path`, `files[].path`, `links[].source`, `errors[].file` and `warnings[].file`.
+`OkfError::to_json` adds the `/`, so the variants' fields and messages keep their
+internal forms. Two exceptions: an `InvalidPath` whose path is empty or climbs out of the
+catalog once normalized (`../x`, `infra/../../x.md`) echoes it as given, and `Io`'s
+`path` (sometimes a filesystem path or an archive entry's name) is written unchanged.
+Report results (`lint`, `oldest`, `sprawl`, `links_report`) keep `okf.py`'s unprefixed
+paths for parity, so the same lint finding is `/a.md` in a `LintFailed` error and `a.md`
+in `lint`'s result, on purpose.
 
 The ported `okf.py` commands (`stamp`, `review`, `question`, `unquestion`, `add_source`,
 `log`, `index`) refuse with `okf.py`'s own words: its `die(msg)` is `Refused { reason: msg }`,
@@ -1133,7 +1143,7 @@ Deviations planned:
   for local runs.
 - **`StillLinked`'s paths gained their leading `/`** (Decision 12, the M6 follow-up),
   matching tool results and `Conflict` (see "Errors"). Other `OkfError` variants'
-  paths keep no leading `/`.
+  paths kept no leading `/` until M8 Task 1 prefixed them in every error payload.
 
 Found while building it:
 

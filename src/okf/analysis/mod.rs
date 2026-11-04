@@ -19,7 +19,8 @@ pub mod sprawl;
 /// One lint-style finding: `{"file", "line", "rule", "message"}` in `okf.py`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct Finding {
-    /// Catalog-relative path, without a leading `/`.
+    /// Catalog-relative path, without a leading `/` (as `okf.py` writes it).
+    /// An error payload (`LintFailed`) adds the `/`.
     pub file: String,
     /// 1-based line number.
     pub line: usize,

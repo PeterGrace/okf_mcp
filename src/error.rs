@@ -1,25 +1,29 @@
 //! The crate's error type.
 
 use crate::okf::analysis::Finding;
+use crate::okf::paths::{escapes_root, normpath};
 
 /// Errors from reading, parsing or editing an OKF catalog.
 ///
 /// Later milestones add variants (auth, lint, publish); variants that
 /// concern one document carry its catalog-relative path, so an agent can act
-/// on it.
+/// on it. The internal value may lack the leading `/`; [`OkfError::to_json`]
+/// writes every catalog path `/`-prefixed (M8 Decision 9).
 #[derive(Debug, thiserror::Error)]
 pub enum OkfError {
     /// No concept or document at the given path.
     #[error("{path}: no such concept or document")]
     NotFound {
-        /// The path as the caller gave it.
+        /// The path as the caller gave it (`/`-prefixed in the payload).
         path: String,
     },
 
     /// The path is outside the catalog, reserved, machinery, or already taken.
     #[error("{path}: {reason}")]
     InvalidPath {
-        /// The path as the caller gave it.
+        /// The path as the caller gave it, or normalized. The payload
+        /// `/`-prefixes it, unless it is empty or climbs out of the catalog
+        /// once normalized (`../x`), which it echoes as given.
         path: String,
         /// Why it was refused.
         reason: String,
@@ -28,7 +32,7 @@ pub enum OkfError {
     /// A document's YAML frontmatter does not parse (or would not, after an edit).
     #[error("{path}: frontmatter does not parse (line {line}): {message}")]
     FrontmatterParse {
-        /// Catalog-relative path of the document.
+        /// Catalog-relative path of the document (`/`-prefixed in the payload).
         path: String,
         /// 1-based line number in the file.
         line: usize,
@@ -41,7 +45,7 @@ pub enum OkfError {
     /// first four characters, so the secret itself is never returned or logged.
     #[error("{path}: line {line}: write refused, {message} ({rule})")]
     SecretDetected {
-        /// Catalog-relative path of the file.
+        /// Catalog-relative path of the file (`/`-prefixed in the payload).
         path: String,
         /// 1-based line of the first hit.
         line: usize,
@@ -54,7 +58,7 @@ pub enum OkfError {
     /// A frontmatter key has a shape the edit can't handle (e.g. `sources` is a string).
     #[error("{path}: {key} has an unexpected shape; fix it by hand")]
     Shape {
-        /// Catalog-relative path of the document.
+        /// Catalog-relative path of the document (`/`-prefixed in the payload).
         path: String,
         /// The frontmatter key.
         key: String,
@@ -67,7 +71,7 @@ pub enum OkfError {
          or at least once with replace_all"
     )]
     EditMismatch {
-        /// Catalog-relative path of the document.
+        /// Catalog-relative path of the document (`/`-prefixed in the payload).
         path: String,
         /// How many times the old text occurs.
         matches: usize,
@@ -76,7 +80,9 @@ pub enum OkfError {
     /// A filesystem operation failed.
     #[error("{path}: {source}")]
     Io {
-        /// Catalog-relative path being read or written.
+        /// Catalog-relative path being read or written (sometimes a
+        /// filesystem path or an archive entry's name); the payload writes it
+        /// unchanged.
         path: String,
         /// The underlying I/O error.
         #[source]
@@ -156,7 +162,8 @@ pub enum OkfError {
         .errors.len()
     )]
     LintFailed {
-        /// The refusing findings (`file` is catalog-relative, no leading `/`).
+        /// The refusing findings (`file` is catalog-relative, no leading `/`;
+        /// the payload `/`-prefixes it).
         errors: Vec<Finding>,
         /// Advice: errors in files the changeset does not change, and
         /// warnings in those it does.
@@ -264,6 +271,11 @@ impl OkfError {
     /// The error as clients see it: `{"error": kind, "message": text}`, plus
     /// the `path`, `catalog` or `problems` it concerns.
     ///
+    /// Every catalog path in the body is `/`-prefixed (`path`, `files[].path`,
+    /// `links[].source`, `errors[].file`, `warnings[].file`). An
+    /// `InvalidPath` that is empty or climbs out of the catalog, and an `Io`
+    /// path, are written as they are. The message is unchanged.
+    ///
     /// # Returns
     /// The JSON body. An internal error's message says only that the server
     /// log has the details, so a driver message never reaches a client.
@@ -280,27 +292,35 @@ impl OkfError {
         // has a field of that name and type.
         match self {
             OkfError::NotFound { path }
-            | OkfError::InvalidPath { path, .. }
             | OkfError::FrontmatterParse { path, .. }
-            | OkfError::Shape { path, .. }
-            | OkfError::Io { path, .. } => body["path"] = path.as_str().into(),
+            | OkfError::Shape { path, .. } => body["path"] = client_path(path).into(),
+            OkfError::InvalidPath { path, .. } => {
+                // `escapes_root` expects a normalized path, so normalize first:
+                // `infra/../../x.md` climbs out although it starts with a name.
+                body["path"] = if path.is_empty() || escapes_root(&normpath(path)) {
+                    path.as_str().into()
+                } else {
+                    client_path(path).into()
+                };
+            }
+            OkfError::Io { path, .. } => body["path"] = path.as_str().into(),
             OkfError::SecretDetected {
                 path, line, rule, ..
             } => {
-                body["path"] = path.as_str().into();
+                body["path"] = client_path(path).into();
                 body["line"] = (*line).into();
                 body["rule"] = rule.as_str().into();
             }
             OkfError::EditMismatch { path, matches } => {
-                body["path"] = path.as_str().into();
+                body["path"] = client_path(path).into();
                 // `*matches` copies the `usize` out of the borrowed field.
                 body["matches"] = (*matches).into();
             }
             OkfError::CatalogNotSelected { catalog } => body["catalog"] = catalog.as_str().into(),
             OkfError::ImportRefused { problems } => body["problems"] = problems.as_slice().into(),
             OkfError::LintFailed { errors, warnings } => {
-                body["errors"] = json_list(errors);
-                body["warnings"] = json_list(warnings);
+                body["errors"] = findings_json(errors);
+                body["warnings"] = findings_json(warnings);
             }
             OkfError::Conflict { files } => body["files"] = json_list(files),
             OkfError::StillLinked { path, links } => {
@@ -316,6 +336,43 @@ impl OkfError {
         }
         body
     }
+}
+
+/// A catalog path as clients see it: catalog-relative with a leading `/`
+/// (`infra/x.md` becomes `/infra/x.md`; `/infra/x.md` stays). The one rule
+/// for every path an error payload names (M8 Decision 9).
+///
+/// # Arguments
+/// * `path` - a catalog-relative path, with or without its leading `/`.
+///
+/// # Returns
+/// The path with exactly one leading `/` added when it had none.
+fn client_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+/// Lint findings for an error body, each `file` as [`client_path`] writes it.
+///
+/// # Arguments
+/// * `findings` - the findings, `file` as the lint wrote it (no leading `/`).
+///
+/// # Returns
+/// The JSON list, in the same order.
+fn findings_json(findings: &[Finding]) -> serde_json::Value {
+    let findings: Vec<Finding> = findings
+        .iter()
+        // `..finding.clone()` is struct update syntax: the other fields are
+        // copied from a clone of `finding` (like `dataclasses.replace`).
+        .map(|finding| Finding {
+            file: client_path(&finding.file),
+            ..finding.clone()
+        })
+        .collect();
+    json_list(&findings)
 }
 
 /// A list as JSON, for an error body. `Finding`, `ConflictFile` and
@@ -431,7 +488,7 @@ mod tests {
 
         assert!(!error.is_internal());
         assert_eq!(body["error"], "SecretDetected");
-        assert_eq!(body["path"], "notes.md");
+        assert_eq!(body["path"], "/notes.md");
         assert_eq!(body["line"], 6);
         assert_eq!(body["rule"], "secret:assignment");
         assert_eq!(
@@ -501,7 +558,7 @@ mod tests {
         assert!(!lint.is_internal() && !conflict.is_internal());
         assert_eq!(lint_body["error"], "LintFailed");
         assert_eq!(lint_body["errors"][0]["rule"], "broken-link");
-        assert_eq!(lint_body["warnings"][0]["file"], "b.md");
+        assert_eq!(lint_body["warnings"][0]["file"], "/b.md");
         assert_eq!(conflict_body["error"], "Conflict");
         assert_eq!(
             conflict_body["files"],
@@ -529,9 +586,93 @@ mod tests {
                 "error": "EditMismatch",
                 "message": "a.md: the old text occurs 2 times; it must occur exactly once, \
                             or at least once with replace_all",
-                "path": "a.md",
+                "path": "/a.md",
                 "matches": 2,
             })
         );
+    }
+
+    #[test]
+    fn client_path_adds_one_leading_slash() {
+        assert_eq!(client_path("infra/x.md"), "/infra/x.md");
+        assert_eq!(client_path("/infra/x.md"), "/infra/x.md");
+    }
+
+    #[test]
+    fn to_json_writes_catalog_paths_with_a_leading_slash() {
+        let not_found = OkfError::NotFound {
+            path: "infra/x.md".to_string(),
+        };
+        let already = OkfError::NotFound {
+            path: "/infra/x.md".to_string(),
+        };
+        let parse = OkfError::FrontmatterParse {
+            path: "a.md".to_string(),
+            line: 2,
+            message: "m".to_string(),
+        };
+        let shape = OkfError::Shape {
+            path: "a.md".to_string(),
+            key: "sources".to_string(),
+        };
+        let mismatch = OkfError::EditMismatch {
+            path: "a.md".to_string(),
+            matches: 0,
+        };
+
+        assert_eq!(not_found.to_json()["path"], "/infra/x.md");
+        // Already prefixed: unchanged, never doubled.
+        assert_eq!(already.to_json()["path"], "/infra/x.md");
+        assert_eq!(parse.to_json()["path"], "/a.md");
+        assert_eq!(shape.to_json()["path"], "/a.md");
+        assert_eq!(mismatch.to_json()["path"], "/a.md");
+        // The message keeps the internal form.
+        assert_eq!(
+            not_found.to_json()["message"],
+            "infra/x.md: no such concept or document"
+        );
+    }
+
+    #[test]
+    fn lint_failed_findings_name_their_file_with_a_leading_slash() {
+        let finding = Finding {
+            file: "a.md".to_string(),
+            line: 3,
+            rule: "broken-link".to_string(),
+            message: "links to /b.md, which does not exist".to_string(),
+        };
+        let error = OkfError::LintFailed {
+            errors: vec![finding.clone()],
+            warnings: vec![finding],
+        };
+
+        let body = error.to_json();
+
+        assert_eq!(body["errors"][0]["file"], "/a.md");
+        assert_eq!(body["warnings"][0]["file"], "/a.md");
+        assert_eq!(body["errors"][0]["line"], 3);
+        assert_eq!(body["errors"][0]["rule"], "broken-link");
+    }
+
+    #[test]
+    fn invalid_path_is_prefixed_unless_it_leaves_the_catalog() {
+        let invalid = |path: &str| OkfError::InvalidPath {
+            path: path.to_string(),
+            reason: "refused".to_string(),
+        };
+
+        // A normalized catalog path (machinery, "already exists").
+        assert_eq!(invalid("AGENTS.md").to_json()["path"], "/AGENTS.md");
+        assert_eq!(invalid("infra/x.md").to_json()["path"], "/infra/x.md");
+        // A path that climbs out is not a catalog path: as given.
+        assert_eq!(invalid("../x.md").to_json()["path"], "../x.md");
+        assert_eq!(invalid("..").to_json()["path"], "..");
+        // Not normalized, and climbs out once it is: as given, never `/infra/../../x.md`.
+        assert_eq!(
+            invalid("infra/../../x.md").to_json()["path"],
+            "infra/../../x.md"
+        );
+        // Empty: as given, not `/`.
+        assert_eq!(invalid("").to_json()["path"], "");
     }
 }

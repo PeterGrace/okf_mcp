@@ -139,6 +139,14 @@ The read tools below need a `read` key; the write tools ("Writing") need
 same JSON as the text block); errors are results with `isError: true` and
 `{"error": ..., "message": ...}`.
 
+Every catalog path in an error body (`path`, `files[].path`,
+`links[].source`, `errors[].file`, `warnings[].file`) has a leading `/`
+(`/infra/x.md`), like the paths in tool results such as `touched`. An
+`InvalidPath` whose path climbs out of the catalog (`../x`) echoes it as
+given. The report results (`lint`, `oldest`, `sprawl`, `links_report`) keep
+`okf.py`'s paths without the `/`, so the same lint finding names `/a.md` in
+a `LintFailed` error and `a.md` in `lint`'s result, on purpose.
+
 | Tool | Does |
 |---|---|
 | `list_catalogs` | The catalogs the key reaches, and this connection's selection |
