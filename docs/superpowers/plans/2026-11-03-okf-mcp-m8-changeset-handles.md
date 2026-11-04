@@ -158,6 +158,19 @@ pub(crate) async fn pending_entry(test: &TestApp, handle: &str, edit: &PendingEd
 // `PendingEdit` lost its `catalog` field: the handle's changeset names the catalog.
 ```
 
+Task 4 adds (as shipped):
+
+```rust
+// src/store/changesets.rs
+pub struct ListedRow { pub changeset: ChangesetRow, pub catalog: String, pub paths: Vec<String> }
+pub async fn list_open(pool: &PgPool, catalog_ids: &[i64], key_id: Option<&str>)
+                       -> Result<Vec<ListedRow>, OkfError>;
+
+// src/mcp/changesets.rs
+pub struct ListParams { pub catalog: Option<String> }
+pub struct Listed { pub changesets: Vec<ListedChangeset> }  // ListedChangeset as in Task 4
+```
+
 ## File map
 
 | File | Tasks |
@@ -776,6 +789,14 @@ pub struct ListedChangeset {
   `idle_cutoff` moves over from `stranded_sessions`. The tool description: "List the open changesets this key may use (an admin: every key's, in the catalogs it reaches), with their handles, paths and last change; `idle` means nothing changed within the idle timeout. Use it to find a handle again after a reconnect or a lost context. Read access."
 
 - [ ] **Step 3: Gates, changelog, commit:** `feat!: list_changesets replaces stranded_sessions and adopt_changeset`.
+
+> **Corrected (issue #163), 2026-11-04.** As shipped:
+> - **The query** needs `array_agg(e.path ORDER BY e.path) FILTER (WHERE e.path IS NOT NULL)` inside the `COALESCE`: over a `LEFT JOIN`, an empty changeset's one joined row has a `NULL` path, and a bare `array_agg` gives `{NULL}`, not `NULL`. The catalogs are bound as an array (`c.catalog_id = ANY($1)`). Its `SELECT` names the changeset's columns by hand, `c.label` among them (the `changeset_columns!` macro's bare names would clash with `catalogs.id` in the join), so Task 5 drops `c.label` there too.
+> - **The tool's description** also says that empty changesets are listed, and that one with no write within 24 hours is discarded and drops off the list (Brooke's review of PR #170).
+> - **The tool** takes `ListParams { catalog: Option<String> }` (only that catalog; `ctx.one` refuses one the key doesn't reach) and returns `Listed { changesets: Vec<ListedChangeset> }`.
+> - **Tests:** `list_changesets_shows_a_key_its_own_and_an_admin_everyone_s` is in `src/mcp/changesets.rs`'s `lifecycle_tests`, whose `edit_hours_ago` now returns the handle. `an_admin_may_publish_another_key_s_changeset` and `a_published_changeset_is_no_longer_listed` are in its `publish_tests`, which have publishable fixtures. The store has `list_open_lists_open_changesets_with_their_sorted_paths`. `tests/writes.rs` had no test of the removed tools, so it is unchanged.
+> - **Docs:** the README's `stranded_sessions` and `adopt_changeset` rows became `list_changesets` rows, and the `session_idle_timeout` comments in the README and `docs/operations.md` say "idle" for "stranded". The server instructions name `list_changesets` as the way to find a lost handle.
+> - After this task, **`ctx.label()`** is used only by the context's own tests, and the lifecycle tests' `connection` helper no longer calls `with_label`.
 
 ---
 

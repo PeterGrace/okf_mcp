@@ -74,7 +74,7 @@ unknown keys are ignored, so one file serves every version.
 | `listen` | `"0.0.0.0:8080"` | The address `serve` listens on. `--listen` or `OKF_MCP_LISTEN` overrides it |
 | `allowed_hosts` | `["localhost", "127.0.0.1", "::1"]` | The `Host` names (optionally `host:port`) that `/mcp` accepts: rmcp's DNS-rebinding check. Behind an ingress, the public host name |
 | `default_catalog` | none | The catalog a key with no default of its own reads and writes |
-| `session_idle_timeout` | `"2h"` | An idle MCP session is closed after this; an untouched changeset counts as stranded after it too |
+| `session_idle_timeout` | `"2h"` | An idle MCP session is closed after this; an open changeset with no change within it is `idle` in `list_changesets` |
 | `poll_interval` | `"10s"` | How often the server looks for catalog, import and key changes made by the subcommands |
 | `max_import_bytes` | `"64MiB"` | The largest uncompressed import (`MiB` is binary, `MB` decimal, or a number of bytes). The import route caps the request body at this plus 0.1% and 64 KiB of gzip slack |
 | `time_server` | none | The NTP server for the clock check (`host`, `host:port` or an address). Without it there is no check |

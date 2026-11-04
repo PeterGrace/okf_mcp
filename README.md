@@ -84,7 +84,7 @@ allowed_hosts = ["okf-mcp.example"] # /mcp Host names (default: loopback)
 default_catalog = "pg"             # for a key with no default of its own
 poll_interval = "10s"              # how often to look for CLI changes
 session_idle_timeout = "2h"        # an idle MCP session is closed after this; also
-                                   # when an untouched changeset counts as stranded
+                                   # when an untouched changeset counts as idle
 max_import_bytes = "64MiB"         # uncompressed total of an import
 time_server = "time.example.com"   # NTP server for the clock check (default: none)
 ```
@@ -160,7 +160,7 @@ a `LintFailed` error and `a.md` in `lint`'s result, on purpose.
 | `links_report` | `okf.py links --json` (`mentions`, default true) |
 | `lint` | `okf.py lint --json` on the published catalog, or with `changeset` on that changeset's drafts applied to it |
 | `pending_changes` | The changeset `changeset` names: each changed path, its base and current revision, whether it is stale or replayable, and a unified diff |
-| `stranded_sessions` | Open changesets nobody changed within `session_idle_timeout`: the key's own, or with an `admin` key every one it reaches |
+| `list_changesets` | The open changesets the key may use, empty ones included: its own, or with an `admin` key every key's in the catalogs it reaches. Each row has the handle, catalog, key, actor, creation and last-change times, `/`-prefixed paths, and `idle` (no change within `session_idle_timeout`) |
 
 `get_concept`, `read_document` and `history` without `catalog` answer from
 the first selected catalog that has the path; the reports run on the first
@@ -287,8 +287,7 @@ Changesets:
 | `publish` | `write` | Publishes the changeset with a `message` (see below) |
 | `discard` | `write` | Drops the named `paths` from the changeset, or every entry, which closes it for good: its handle is refused from then on, so call `open_changeset` for new work |
 | `revert` | `write` | Adds a document's content at an earlier `revision` (from `history`), or its deletion, to the changeset |
-| `stranded_sessions` | `read` | Changesets idle past `session_idle_timeout`, with their ids |
-| `adopt_changeset` | `write`; `admin` for another key's | Moves a changeset (`id`) to this connection's key and label |
+| `list_changesets` | `read`; `admin` to see every key's | The open changesets the key may use, with their handles: how to find a handle again after a reconnect. An admin may then use another key's handle directly |
 
 `lint` with `changeset` checks the changeset before publishing.
 
