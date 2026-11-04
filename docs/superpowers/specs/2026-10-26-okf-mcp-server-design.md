@@ -1251,6 +1251,31 @@ notes have the full list; the sections above already describe handles.
 - **The rollout checks migrations in the database.** The binary doesn't log migrations at
   its default level, so the rollout read `_sqlx_migrations` on the primary.
 
+Plan corrections, by issue (each a dated `Corrected` note in the plan):
+
+- **#160 (error paths):** only `src/error.rs`'s own tests asserted unprefixed error-payload
+  paths, so the planned test edits under `tests/` turned out empty.
+- **#161 (handles):** `UnknownChangeset` also needed a status in `AppError::status` (404),
+  but no `is_internal` arm. `src/overlay.rs`'s hand-built `ChangesetRow` gained `handle`.
+  The store test calls `super::open`, because a test helper shadows it, and the context
+  tests open their changesets through `open_changeset`.
+- **#162 (writes, changeset tools, reads):** the parameter error, the report default
+  (`ToolContext::report_catalog`), handles in overlay errors, refused writes queued behind a
+  close, `revert` resolving the handle before `apply`, and new test helpers (`testing::open`,
+  `open_at`, `changeset_row`). The README's changeset section was rewritten here, ahead of
+  #164.
+- **#163 (`list_changesets`):** the `FILTER` on the aggregate, the catalogs bound as an
+  array, `ListParams { catalog }` and `Listed { changesets }`, a description that names the
+  24-hour discard, and the tests placed in `src/mcp/changesets.rs` rather than
+  `tests/writes.rs`.
+- **#164 (labels removed):** `changesets::open` relies on the column default for the handle;
+  `src/store/catalogs.rs`'s test `INSERT`s lost `label`; the schema test checks two open
+  changesets per key and the unique handle; `publish`'s refusal names the handle;
+  `docs/operations.md` gained a Troubleshooting row for `UnknownChangeset` and closed
+  changesets; `list_changesets` sits in the design's read-tool table.
+- **#165 (rollout):** the migration check reads `_sqlx_migrations`, since the pod doesn't log
+  migrations.
+
 ### Questions M5 answered
 
 - **Changeset identity without sessions** (from M4): (catalog, key, label), the label
