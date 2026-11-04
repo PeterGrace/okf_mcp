@@ -297,7 +297,14 @@ impl ToolContext {
 
     /// The one catalog a report runs on, given its changeset: `catalog`, else
     /// the pinned changeset's catalog, else the first selected. A `pg`
-    /// handle on a `work,pg` connection so reports on `pg`.
+    /// handle on a `work,pg` connection reports on `pg`.
+    ///
+    /// The pinned changeset's catalog stands in for a `catalog` argument, and
+    /// an argument wins over the connection's catalogs (design "Catalog
+    /// selection"), so it needs only the key's reach, not the connection's
+    /// selection: a `pg` handle on a `work`-only connection reports on `pg`
+    /// too. [`ToolContext::changeset`] has already checked that the key
+    /// reaches it, so `one` cannot refuse it.
     ///
     /// # Arguments
     /// * `catalog` - the call's `catalog` argument.
@@ -307,8 +314,9 @@ impl ToolContext {
     /// That catalog's state.
     ///
     /// # Errors
-    /// As [`ToolContext::one`]; as [`require_selected`] for an explicit
-    /// `catalog` that is not the changeset's.
+    /// As [`ToolContext::one`] for an explicit `catalog` (or, without a
+    /// changeset, the connection's selection); as [`require_selected`] for an
+    /// explicit `catalog` that is not the changeset's.
     pub fn report_catalog(
         &self,
         catalog: Option<&str>,

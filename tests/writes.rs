@@ -340,7 +340,10 @@ async fn concurrent_writes_to_one_handle_from_two_connections_both_land() {
     let first = server.client(&key, None).await.unwrap();
     let second = server.client(&key, None).await.unwrap();
     let handle = open_changeset(&first, None).await;
-    let entry = |client: &str, number: usize| json!({"text": format!("{client} {number}"), "changeset": handle});
+    let entry = |client: &str, number: usize| {
+        let text = format!("{client} {number}");
+        json!({"text": text, "changeset": handle})
+    };
     // Both connections wait here before each write, so every round sends the
     // two writes together (like `asyncio.Barrier`), not one loop after the other.
     let round = Barrier::new(2);
