@@ -40,8 +40,11 @@ gone from the schema, the code and the docs. Version 0.8.0.
   `list_changesets` in place of `stranded_sessions`), the write-tool table
   (`open_changeset`; no `adopt_changeset`), "Data flow" (Read step 4, Write
   steps 1, 2 and 5, Publish step 1 and the queued-writer note) and "Session
-  lifecycle" describe handles. The revision section no longer says the
-  sections below still describe labels.
+  lifecycle" describe handles. The Errors table's `Busy` row no longer says
+  a queued write opens a new changeset, and it gains an `UnknownChangeset`
+  row; the M5 "found while building it" note on queued writes says what M8
+  replaced it with. The revision section no longer says the sections below
+  still describe labels.
 - `Cargo.toml` and `Cargo.lock`: version 0.8.0.
 
 ## Notes
@@ -49,7 +52,7 @@ gone from the schema, the code and the docs. Version 0.8.0.
 - `list_changesets` needs only `read`, so the design lists it in the
   read-tool table, in `stranded_sessions`' place, rather than among the
   write tools.
-- `grep -rn label src` now finds only link and footnote labels in
-  `src/okf/`.
+- `grep -rn label src` now finds only hits in `src/okf/` (link and footnote
+  labels, and lint's name for a timestamp field), none about changesets.
 - 0.8.0 is forward-only: once migration 0004 has run, a 0.7.0 binary
   refuses to start against the database (operations guide, "Upgrades").

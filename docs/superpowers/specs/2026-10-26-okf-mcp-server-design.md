@@ -320,8 +320,11 @@ filesystem or configuration: the ones the HTTP routes answer with 500) says only
 log has the details. Without a `catalog` argument, `get_concept`, `read_document` and `history` look
 through the selected catalogs in order and answer from the first that has the path, naming
 it; the reports (`open_questions`, `oldest`, `sprawl`, `links_report`, `lint`) run on the
-changeset's catalog when the call names a changeset, else on the first selected catalog. A
-`changeset` whose catalog the call does not select is refused (`Refused`, naming it).
+changeset's catalog when the call names a changeset (even one the connection does not
+select: it stands in for a `catalog` argument), else on the first selected catalog. A
+`get_concept`, `read_document` or `search` whose selection leaves out the changeset's
+catalog, and a report whose `catalog` argument names another one, is refused (`Refused`,
+naming it).
 
 ### Read tools (need `read`)
 
@@ -629,7 +632,8 @@ One `thiserror` enum, `OkfError`:
 | `LintFailed { errors, warnings }` | Publish refused: lint errors in changed files or links into deleted paths (`errors`), with the rest as `warnings`; HTTP 422 |
 | `Conflict { files }` | Publish found documents changed since this changeset read them; `files` lists each path with its base and current revision; HTTP 409 |
 | `StillLinked { path, links }` | `delete_concept` refused: other documents link to the concept; `path` and each `links[].source` are catalog-relative with a leading `/` (`/infra/x.md`, `/hub.md`), as tool results (`touched`, `message`) and `Conflict` write them; `links` lists each (source, line). Not counted: its folder's own listing bullet, its links to itself, the root `AGENTS.md`, `CLAUDE.md` and `README.md` (as publish's link check); `log.md` and other `index.md` files count; HTTP 409 |
-| `Busy` | The database aborted the request to resolve a lock conflict (`40P01`, `40001`); nothing was stored; retry (HTTP 503). `write::apply` also answers it if the changeset it locked is no longer open, a defensive check: a write queued behind a publish or discard opens a new changeset instead (see "Publish") |
+| `Busy` | The database aborted the request to resolve a lock conflict (`40P01`, `40001`); nothing was stored; retry (HTTP 503). The changeset store's entry writes also answer it if their changeset is no longer open, a backstop: `write::apply` locks the changeset first and refuses a closed one with `Refused` (see "Publish") |
+| `UnknownChangeset { changeset }` | No changeset with this handle that the key may use: none exists, it belongs to another key, or its catalog is out of the key's reach, all worded alike so a key cannot probe for other keys' handles; HTTP 404 |
 | `Database` | Any database failure (details logged, not returned) |
 | `Io` | Filesystem errors (import, export) |
 
@@ -965,6 +969,8 @@ Found while building it:
   when the closing transaction commits, Postgres re-checks `state = 'open'` against the
   updated row, finds none and the write opens a new changeset. No edit is lost.
   `write::apply`'s `Busy` branch stays as a defensive check that no test reaches.
+  (Replaced in M8: a write names its changeset by handle, so one queued behind a closing
+  publish or discard is refused with `Refused` and stores nothing.)
 - **Pooled connections are a known limit, accepted for now** (Tasks 8 and 10). Each
   write holds one pooled connection for its whole transaction, so writers queued on one
   changeset's row lock each hold one while they wait; a publish holds one and needs a

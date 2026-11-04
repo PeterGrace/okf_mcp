@@ -842,7 +842,7 @@ ALTER TABLE changesets DROP COLUMN label;
 > - **`src/db.rs`'s schema test** inserts two open changesets of one key in one catalog (allowed now, Decision 7), then a duplicate handle, which violates `changesets_handle_key`.
 > - **`publish`'s "no longer open" refusal** (`src/store/publish.rs`) named the changeset's internal id; it names the handle.
 > - **`a_changeset_header_is_ignored`** also checks that `pending_changes` with the header's value as a handle is `UnknownChangeset`. It shares `assert_missing_changeset` with `a_write_without_a_changeset_is_a_parameter_error`.
-> - **The design:** `list_changesets` needs only `read`, so it takes `stranded_sessions`' row in the read-tool table; `open_changeset` heads the write-tool table. The `changesets` storage row, its constraints, the overlay paragraph and the tools' introduction changed too.
+> - **The design:** `list_changesets` needs only `read`, so it takes `stranded_sessions`' row in the read-tool table; `open_changeset` heads the write-tool table. The `changesets` storage row, its constraints, the overlay paragraph, the tools' introduction and the Errors table (`Busy`'s queued-write wording, a new `UnknownChangeset` row) changed too.
 > - **`docs/operations.md`** gained a Troubleshooting row for `UnknownChangeset` and closed changesets, and its image examples say `0.8.0`.
 
 ---

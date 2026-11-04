@@ -389,9 +389,9 @@ key's actor.
 - `tests/smoke.rs` - every analysis and a search on a real catalog, the
   storage path (import, load, links, lint, export) through Postgres, and the
   server (every read tool and the export over HTTP) and the write path
-  (create, stamp, log, lint through the changeset and publish over HTTP, into a throwaway
-  copy) and the restructuring tools (move, split, a refused delete and
-  publish), timed.
+  (create, stamp, log, lint through the changeset and publish over HTTP,
+  into a throwaway copy) and the restructuring tools (move, split, a refused
+  delete and publish), timed.
 - `tests/support/` - a throwaway Postgres container per test, and a test
   server on a free port with rmcp clients.
 - `Dockerfile`, `.github/workflows/image.yml` - the container image, built and
