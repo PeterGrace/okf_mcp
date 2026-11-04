@@ -39,3 +39,6 @@ longer fit.
   joined row has a `NULL` path and `array_agg` would otherwise return
   `{NULL}`. The plan's Task 4 has a "Corrected" note.
 - The bigint changeset id no longer reaches clients through any tool.
+- Review of PR #170: the tool description also says empty changesets are
+  listed, and that one with no write within 24 hours is discarded and drops
+  off the list.

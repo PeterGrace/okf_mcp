@@ -150,8 +150,10 @@ impl OkfServer {
     #[tool(
         description = "List the open changesets this key may use (an admin: every key's, in the \
                        catalogs it reaches), with their handles, paths and last change; idle \
-                       means nothing changed within the idle timeout. Use it to find a handle \
-                       again after a reconnect or a lost context. Read access."
+                       means nothing changed within the idle timeout. Empty changesets are \
+                       listed too, but one with no write within 24 hours is discarded and no \
+                       longer listed: open a new one then. Use it to find a handle again after a \
+                       reconnect or a lost context. Read access."
     )]
     async fn list_changesets(
         &self,
