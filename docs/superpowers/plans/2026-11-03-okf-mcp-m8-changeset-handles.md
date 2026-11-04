@@ -859,6 +859,8 @@ This task changes other systems. Its PR in this repo carries only its changelog,
 
 - [ ] **Step 3: Backup, then deployment (go-ahead 2).** 0.8.0 is forward-only. Migration 0004 drops `changesets.label`, and under the Deployment's `Recreate` strategy no 0.7.0 pod runs against the new schema. Going back to 0.7.0 means restoring the database from a backup taken before the upgrade (`docs/operations.md`, section 8, "Upgrades"). So before go-ahead 2, take an on-demand backup of the database (as in M7's restore drill), wait for it to complete, and record its name in the changelog. Say this to pgrace when asking for the go-ahead. Then: In a fresh checkout of the site's Argo CD repository, change only the Deployment's image tag from `0.7.0` to `0.8.0`. Show pgrace the diff, commit, and push. Watch the app become Synced/Healthy, and the pod log the migrations (0003, 0004) on start.
 
+  > **Corrected (issue #165), 2026-11-04.** The binary doesn't log migrations at its default level (`warn,okf_mcp=info,tower_http=info`). The pod logs only `serving`. Check that they applied by reading `_sqlx_migrations` on the primary: versions 3 and 4, `success` true. Also check that `changesets` has `handle` and no `label`.
+
 - [ ] **Step 4: Checks.**
   - `/healthz`: database ok, and `clock` ok.
   - `tools/list` names `open_changeset` and `list_changesets`, and doesn't name `stranded_sessions` or `adopt_changeset`.
