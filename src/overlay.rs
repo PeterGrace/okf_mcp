@@ -244,8 +244,9 @@ impl Overlays {
         if let Some(overlay) = self.lookup(changeset, base.generation(), now) {
             return Ok(overlay);
         }
-        // Read after the caller's `find_open`, so the entries may be newer
-        // than `changeset.version`; harmless: the overlay is labelled with the
+        // Read after the caller read the row (a read resolves it unlocked in
+        // `ToolContext::changeset`), so the entries may be newer than
+        // `changeset.version`; harmless: the overlay is labelled with the
         // older version, and the next read at the newer one rebuilds it.
         let entries = changesets::entries(executor, changeset.id).await?;
         let overlay = Arc::new(build_overlay(base, changeset, entries).await?);
