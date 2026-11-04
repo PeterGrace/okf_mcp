@@ -591,6 +591,7 @@ mod tests {
             })
         );
     }
+
     #[test]
     fn to_json_writes_catalog_paths_with_a_leading_slash() {
         let not_found = OkfError::NotFound {

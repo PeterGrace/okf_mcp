@@ -1143,7 +1143,7 @@ Deviations planned:
   for local runs.
 - **`StillLinked`'s paths gained their leading `/`** (Decision 12, the M6 follow-up),
   matching tool results and `Conflict` (see "Errors"). Other `OkfError` variants'
-  paths keep no leading `/`.
+  paths kept no leading `/` until M8 Task 1 prefixed them in every error payload.
 
 Found while building it:
 
