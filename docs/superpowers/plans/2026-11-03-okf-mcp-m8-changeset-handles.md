@@ -64,7 +64,8 @@ Deliberately deferred:
 
 ## Verified facts the code relies on
 
-- **rmcp 3.8.0, missing required parameter:** `Parameters<P>` deserializes the arguments and fails with `ErrorData::invalid_params(format!("failed to deserialize parameters: {error}"))` (`rmcp-3.8.0/src/handler/server/tool.rs:239-245`). It is a JSON-RPC error, not a tool result with `isError`. A `changeset: String` field with no `#[serde(default)]` is therefore required, and the schema marks it so.
+- **rmcp 3.8.0, missing required parameter:** `Parameters<P>` deserializes the arguments and fails with `ErrorData::invalid_params(format!("failed to deserialize parameters: {error}"))` (`rmcp-3.8.0/src/handler/server/tool.rs:239-245`). A `changeset: String` field with no `#[serde(default)]` is therefore required, and the schema marks it so.
+  > **Corrected (issue #162), 2026-11-04.** The client does not get a JSON-RPC error: rmcp's tool router (`rmcp-3.8.0/src/handler/server/router/tool.rs:144-156`, `into_tool_argument_error`) turns an `invalid_params` error whose message starts with `failed to deserialize parameters:` into a tool result with `isError: true`, no structured content and the message as its text. `tests/writes.rs`'s `a_write_without_a_changeset_is_a_parameter_error` asserts exactly that text.
 - **Postgres `gen_random_uuid()`** is built in since 13 (no `pgcrypto`). The tests run `postgres:17-alpine` (`tests/tls.rs:90-91`) and production runs 18. `ADD COLUMN ... DEFAULT <volatile expression>` evaluates the default once per existing row, so each existing changeset gets a distinct handle.
 - **Migrations run on every subcommand's connect,** `serve` included (`src/cli.rs:481-486`, `connect` calls `db::migrate`). The rollout needs no separate migrate step.
 - **The current lock order** is the catalog row (`changesets::lock_catalog`, `FOR KEY SHARE`), then the changeset row (`changesets::lock`, `FOR UPDATE`). See `src/write.rs:126-145` and `src/store/publish.rs:140-150`. It stays.
@@ -130,7 +131,32 @@ impl ToolContext {
 }
 ```
 
-After Task 3, the result types name the handle as `changeset: String` and drop `label`: `WriteReport`, `Published`, `Discarded` and `PendingChanges`. Task 3 also changes `ToolContext::view(&self, state: &CatalogState, pinned: Option<&Pinned>)`.
+After Task 3, the result types name the handle as `changeset: String` and drop `label`: `WriteReport`, `Published`, `Discarded` and `PendingChanges`. Task 3 also changes `ToolContext::view(&self, state: &CatalogState, pinned: Option<&Pinned>)`, and adds (as shipped):
+
+```rust
+// src/mcp/context.rs
+impl ToolContext {
+    pub async fn pin(&self, handle: Option<&str>) -> Result<Option<Pinned>, OkfError>;
+    // The one catalog a report runs on: `catalog`, else the pinned changeset's, else the first selected.
+    pub fn report_catalog(&self, catalog: Option<&str>, pinned: Option<&Pinned>)
+                          -> Result<Arc<CatalogState>, OkfError>;
+}
+pub fn require_selected(pinned: Option<&Pinned>, states: &[Arc<CatalogState>]) -> Result<(), OkfError>;
+
+// src/write.rs
+pub async fn apply<F>(ctx: &ToolContext, changeset: &str, by: Option<&str>, op: F)
+                      -> Result<WriteReport, OkfError>;
+
+// src/mcp/changesets.rs
+pub struct PendingParams { pub changeset: String }   // pending_changes' arguments
+
+// src/mcp/testing.rs (test helpers)
+pub(crate) async fn open(ctx: &ToolContext) -> String;                       // open_changeset in the write target
+pub(crate) async fn open_at(test: &TestApp, ctx: &ToolContext, catalog: &str, at: DateTime<Utc>) -> ChangesetRow;
+pub(crate) async fn changeset_row(test: &TestApp, handle: &str) -> ChangesetRow;
+pub(crate) async fn pending_entry(test: &TestApp, handle: &str, edit: &PendingEdit<'_>) -> ChangesetRow;
+// `PendingEdit` lost its `catalog` field: the handle's changeset names the catalog.
+```
 
 ## File map
 
@@ -550,7 +576,7 @@ Every write tool, `publish`, `discard`, `revert` and `pending_changes` acts on t
   - rename `x_okf_changeset_keeps_two_changesets_of_one_key_apart` to `two_handles_of_one_key_stay_apart`. Open two changesets on one connection, edit through both, and publish one. The other is still pending;
   - `a_changeset_survives_a_server_restart`: reconnect, and keep working with the same handle;
   - `concurrent_writes_from_two_connections_of_one_key_share_one_changeset` becomes `concurrent_writes_to_one_handle_from_two_connections_both_land`;
-  - `a_write_without_a_changeset_is_a_parameter_error`: call `stamp` without `changeset`. The client gets a JSON-RPC `invalid_params` error whose message contains `missing field` and `changeset`.
+  - `a_write_without_a_changeset_is_a_parameter_error`: call `stamp` without `changeset`. The client gets an `isError` result (not a JSON-RPC error; see the correction in "Verified facts") whose text is `failed to deserialize parameters: missing field \`changeset\``.
 
 - [ ] **Step 2: `write::apply`.** The new signature:
 
@@ -676,6 +702,17 @@ pub changeset: Option<String>,
   Rewrite the existing tests that read drafts back (`src/mcp/context.rs`, `src/mcp/documents.rs`, and the read-after-write flows in `tests/writes.rs`) to pass the handle, and give every other `ctx.view(&state)` call `None`.
 
 - [ ] **Step 7: Gates, changelog, commit:** `feat!: writes, the changeset tools and the reads take a changeset handle`. The changelog lists every tool whose parameters changed.
+
+> **Corrected (issue #162), 2026-11-04.** As shipped:
+> - **The parameter error** is an `isError` tool result, not a JSON-RPC error (see "Verified facts"); the test asserts its text.
+> - **Reports:** the plan's `one_view` default ("the pinned changeset's catalog when the call names no `catalog`") is `ToolContext::report_catalog(catalog, pinned)`, which also runs `require_selected` on the one catalog. `lint_report` goes through the same `one_view` as the other reports: with `changeset` its view is the overlay (`Lint.pending: true`), without it the published state. `CatalogParam` (now only `open_questions`') gains `changeset` too. `documents.rs` has a small `read_set(ctx, catalog, changeset)` that does `read_set`, `pin` and `require_selected` for `get_concept` and `read_document`.
+> - **The overlay's errors name the handle**, not the bigint id (`overlay::in_changeset`): "in pending changeset <handle>; discard ...". A client never sees the id any more (`stranded_sessions` and `adopt_changeset` still do until Task 4).
+> - **`revert`** resolves the handle (with `write`) to find the catalog whose history it reads, then goes through `apply` with the handle, which resolves it again under its locks.
+> - **`stranded_sessions`** no longer leaves out "this connection's own" changeset (there is none: it was the one with the connection's label). **`adopt_changeset`** drops its `find_open` check. It still relabels to the connection's label, so adopting a second changeset onto one connection hits the store's one-open-per-label index, which `changesets::adopt` already reports as `Refused` ("already has an open changeset"). Both tools go in Task 4.
+> - **Test helpers** (Interfaces block): `testing::open`, `open_at`, `changeset_row`, and `pending_entry(test, handle, edit)`. `lifecycle_tests::edit_hours_ago(test, ctx, hours_ago)` now opens its own changeset with `open_at` (created and changed `hours_ago` ago) and returns its id. The `writes`/`restructure`/`changesets` test modules pass a handle to their helpers; `restructure_publish_tests` wraps a writer's context and handle in a `Session`.
+> - **README:** the "Changesets" section, the `lint`, `pending_changes` and `discard` rows and the read-tools paragraph describe handles now (Step 4 asks for the `discard` text). The label rules and the header example went with it; Task 5 still rewrites the rest (`stranded_sessions`, `adopt_changeset`, the operations guide, the design).
+> - **`tests/writes.rs`'s restart test** also writes through the handle after the restart, then publishes.
+> - The **`ctx.label()`** is now used only by `adopt_changeset` (relabel) and the context's own tests.
 
 ---
 

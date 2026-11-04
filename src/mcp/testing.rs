@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::db::pg_support::TestDb;
 use crate::mcp::context::ToolContext;
 use crate::store::catalogs;
-use crate::store::changesets::{self, ChangesetKey, ChangesetRow, EntryRow};
+use crate::store::changesets::{self, ChangesetRow, EntryRow};
 use crate::store::import::{import, ImportOptions};
 use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
 
@@ -159,8 +159,7 @@ pub(crate) async fn store_key(test: &TestApp, key_id: &str) {
 }
 
 /// A tool context for a `write` key reaching every catalog: the key's row
-/// is stored first (a changeset's `key_id` is a foreign key), and the
-/// connection has the label `default`.
+/// is stored first (a changeset's `key_id` is a foreign key).
 ///
 /// # Arguments
 /// * `test` - the app.
@@ -168,8 +167,8 @@ pub(crate) async fn store_key(test: &TestApp, key_id: &str) {
 /// * `default` - its default catalog.
 ///
 /// # Returns
-/// The context a write tool would build for that key. A second label on
-/// the same key is `context(test, principal_as(...), None).with_label(..)`.
+/// The context a write tool would build for that key. A second connection
+/// of the same key is `context(test, principal_as(...), None)`.
 ///
 /// # Panics
 /// If the key row cannot be stored (already stored in this test, say).
@@ -182,11 +181,79 @@ pub(crate) async fn writer(test: &TestApp, key_id: &str, default: &str) -> ToolC
     )
 }
 
+/// Opens a changeset for `ctx`'s key in its write target (the first
+/// selected catalog), as `open_changeset` would.
+///
+/// # Arguments
+/// * `ctx` - the connection.
+///
+/// # Returns
+/// The new changeset's handle.
+///
+/// # Panics
+/// If the tool refuses (a key below `write`, say).
+pub(crate) async fn open(ctx: &ToolContext) -> String {
+    let params = crate::mcp::changesets::OpenParams { catalog: None };
+    crate::mcp::changesets::open_changeset(ctx, params)
+        .await
+        .expect("open a changeset")
+        .changeset
+}
+
+/// Opens a changeset for `ctx`'s key in `catalog` at `at` (its creation and
+/// last-change time), in the lock order.
+///
+/// # Arguments
+/// * `test` - the app.
+/// * `ctx` - the connection: its key and actor own the changeset.
+/// * `catalog` - the catalog's name.
+/// * `at` - the time to record.
+///
+/// # Returns
+/// The new changeset.
+///
+/// # Panics
+/// If the catalog is not loaded or the store fails.
+pub(crate) async fn open_at(
+    test: &TestApp,
+    ctx: &ToolContext,
+    catalog: &str,
+    at: DateTime<Utc>,
+) -> ChangesetRow {
+    let state = test.app.catalog(catalog).expect("a loaded catalog");
+    let principal = ctx.principal();
+    let mut tx = test.app.pool().begin().await.expect("begin");
+    changesets::lock_catalog(&mut tx, state.id())
+        .await
+        .expect("lock the catalog");
+    let changeset = changesets::open(&mut tx, state.id(), &principal.key_id, &principal.actor, at)
+        .await
+        .expect("open the changeset");
+    tx.commit().await.expect("commit");
+    changeset
+}
+
+/// A changeset by its handle.
+///
+/// # Arguments
+/// * `test` - the app.
+/// * `handle` - the handle.
+///
+/// # Returns
+/// The row, in whatever state it is.
+///
+/// # Panics
+/// If there is no such changeset or the store fails.
+pub(crate) async fn changeset_row(test: &TestApp, handle: &str) -> ChangesetRow {
+    changesets::by_handle(test.app.pool(), handle)
+        .await
+        .expect("read the changeset")
+        .expect("the changeset exists")
+}
+
 /// One pending edit, for [`pending_entry`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingEdit<'a> {
-    /// The catalog's name.
-    pub(crate) catalog: &'a str,
     /// Catalog-relative path.
     pub(crate) path: &'a str,
     /// The new text; `None` deletes the path.
@@ -195,30 +262,25 @@ pub(crate) struct PendingEdit<'a> {
     pub(crate) at: DateTime<Utc>,
 }
 
-/// Stores an edit in the changeset of `ctx`'s key and label, in the lock
-/// order (opening the changeset if need be), as a write tool would.
+/// Stores an edit in the changeset `handle` names, in the lock order, as a
+/// write tool would (without the write rules).
 ///
 /// # Arguments
 /// * `test` - the app.
-/// * `ctx` - the connection: its key and label pick the changeset.
-/// * `edit` - the catalog, path, text and time.
+/// * `handle` - the changeset.
+/// * `edit` - the path, text and time.
 ///
 /// # Returns
 /// The changeset after the edit.
 ///
 /// # Panics
-/// If the catalog is not loaded or the store fails.
+/// If there is no such changeset or the store fails.
 pub(crate) async fn pending_entry(
     test: &TestApp,
-    ctx: &ToolContext,
+    handle: &str,
     edit: &PendingEdit<'_>,
 ) -> ChangesetRow {
-    let state = test.app.catalog(edit.catalog).expect("a loaded catalog");
-    let key = ChangesetKey {
-        catalog_id: state.id(),
-        key_id: &ctx.principal().key_id,
-        label: ctx.label(),
-    };
+    let changeset = changeset_row(test, handle).await;
     let entry = EntryRow {
         path: edit.path.to_string(),
         base_revision: None,
@@ -227,20 +289,14 @@ pub(crate) async fn pending_entry(
         replay: None,
     };
     let mut tx = test.app.pool().begin().await.expect("begin");
-    changesets::lock_catalog(&mut tx, state.id())
+    changesets::lock_catalog(&mut tx, changeset.catalog_id)
         .await
         .expect("lock the catalog");
-    let changeset = changesets::get_or_create(&mut tx, &key, &ctx.principal().actor, edit.at)
-        .await
-        .expect("open the changeset");
     changesets::upsert_entry(&mut tx, changeset.id, &entry, edit.at)
         .await
         .expect("store the entry");
     tx.commit().await.expect("commit");
-    changesets::by_id(test.app.pool(), changeset.id)
-        .await
-        .expect("read the changeset back")
-        .expect("the changeset exists")
+    changeset_row(test, handle).await
 }
 
 /// A tool context for `principal` on a connection naming `connection`.

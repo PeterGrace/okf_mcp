@@ -34,8 +34,9 @@ pub const INSTRUCTIONS: &str = "Open Knowledge Format catalogs: concepts (markdo
     frontmatter) about systems, projects, people and decisions. Start with `search`, then \
     `get_concept`. Paths look like /infra/time-server.md (the leading slash and .md are \
     optional). Without a `catalog` argument, tools use this connection's catalogs \
-    (`list_catalogs` shows them). Write tools edit this connection's changeset in one catalog; \
-    nothing is visible to others until `publish`.";
+    (`list_catalogs` shows them). To write, call `open_changeset` first and pass the handle it \
+    returns as `changeset` to every edit, `publish`, `discard`, `revert` and `pending_changes`; \
+    reads take it too to see its drafts. Nothing is visible to others until `publish`.";
 
 /// The MCP handler: one per session (rmcp's factory makes it).
 pub struct OkfServer {

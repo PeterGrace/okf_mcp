@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogState;
 use crate::error::OkfError;
-use crate::mcp::context::{is_broken_overlay, ToolContext};
+use crate::mcp::context::{is_broken_overlay, require_selected, ToolContext};
 use crate::mcp::{blocking, reply, OkfServer};
 use crate::okf::search::{search_catalogs, CatalogHit, SearchQuery};
 use crate::okf::snapshot::Snapshot;
@@ -53,6 +53,8 @@ pub struct SearchParams {
     pub status: Option<String>,
     /// At most this many hits (default 20, at most 200; 0 returns none).
     pub limit: Option<usize>,
+    /// Read through this changeset's drafts (its handle); its catalog must be one this call reads.
+    pub changeset: Option<String>,
 }
 
 /// `search`'s result.
@@ -61,9 +63,9 @@ pub struct SearchResult {
     /// Best first: concepts holding the whole query in a better field
     /// first, deprecated concepts last, then catalog order, then path.
     pub hits: Vec<CatalogHit>,
-    /// Catalogs left out because this connection's pending changeset in
-    /// them does not apply over the published files; every other catalog
-    /// still answered. Empty when every catalog was searched.
+    /// Catalogs left out because the `changeset` read through does not
+    /// apply over their published files; every other catalog still
+    /// answered. Empty when every catalog was searched.
     pub skipped: Vec<SkippedCatalog>,
 }
 
@@ -87,14 +89,18 @@ pub struct SkippedCatalog {
 /// The merged hits.
 ///
 /// # Errors
-/// A selection error ([`ToolContext::states`]); any error from
-/// [`ToolContext::view`] (a database error, `Busy`) but a broken overlay. A
+/// A selection error ([`ToolContext::states`]); as [`ToolContext::pin`] for
+/// `changeset`, and [`OkfError::Refused`] if its catalog is not searched;
+/// any error from [`ToolContext::view`] (a database error, `Busy`) but a
+/// broken overlay. A
 /// catalog whose overlay
 /// does not apply ([`is_broken_overlay`]) is not an error: it is left out
 /// and listed in [`SearchResult::skipped`], so one broken changeset does not
 /// fail a search across every catalog.
 pub(crate) async fn run(ctx: &ToolContext, params: SearchParams) -> Result<SearchResult, OkfError> {
     let states = ctx.states(params.catalogs.as_deref())?;
+    let pinned = ctx.pin(params.changeset.as_deref()).await?;
+    require_selected(pinned.as_ref(), &states)?;
     let query = SearchQuery {
         text: params.query,
         concept_type: params.concept_type,
@@ -102,13 +108,13 @@ pub(crate) async fn run(ctx: &ToolContext, params: SearchParams) -> Result<Searc
         status: params.status,
         limit: hit_limit(params.limit),
     };
-    // Each catalog's view (published, or this connection's overlay), taken
+    // Each catalog's view (published, or the pinned changeset's overlay), taken
     // once here. Both hold `Arc`s (reference-counted pointers, cheap to
     // copy), so the blocking thread can own them.
     let mut views: Vec<(Arc<CatalogState>, View)> = Vec::with_capacity(states.len());
     let mut skipped = Vec::new();
     for state in states {
-        match ctx.view(&state).await {
+        match ctx.view(&state, pinned.as_ref()).await {
             Ok(view) => views.push((state, view)),
             // `if` on a match arm is a guard: the arm applies only when it
             // holds. A broken overlay is never internal, so the kind is
@@ -166,8 +172,10 @@ impl OkfServer {
                        Every term of `query` must occur, as a case-insensitive substring, in \
                        a concept's title or aliases, tags, description or body; free text \
                        matches tags by substring. The `tags` filter matches whole tags only. \
-                       Returns catalog, path, title, description and a snippet, best first; a \
-                       catalog whose pending changes cannot be applied is listed in `skipped`."
+                       Returns catalog, path, title, description and a snippet, best first. With \
+                       `changeset` (a handle from open_changeset), its catalog is searched \
+                       through that changeset's drafts, and is listed in `skipped` if they \
+                       cannot be applied."
     )]
     async fn search(
         &self,
@@ -186,7 +194,7 @@ mod tests {
 
     use crate::config::Config;
     use crate::mcp::testing::{
-        app_with, context, pending_entry, principal, principal_as, store_key, PendingEdit,
+        app_with, context, open, pending_entry, principal, principal_as, store_key, PendingEdit,
     };
     use crate::store::keys::Access;
 
@@ -201,6 +209,7 @@ mod tests {
             tags: tags.iter().map(|tag| tag.to_string()).collect(),
             status: None,
             limit: None,
+            changeset: None,
         }
     }
 
@@ -260,17 +269,20 @@ mod tests {
             principal_as("writer", Access::Write, &[], None),
             Some(&["pg", "work"]),
         );
+        // The write target is `pg`, the first selected catalog.
+        let handle = open(&ctx).await;
         // `router.md` is a published file, so a pending `router.md/x.md`
         // cannot be applied over it.
         let clash = PendingEdit {
-            catalog: "pg",
             path: "router.md/x.md",
             text: Some("# X\n"),
             at: Utc::now(),
         };
-        let changeset = pending_entry(&test, &ctx, &clash).await;
+        pending_entry(&test, &handle, &clash).await;
+        let mut through = params("routes", &[]);
+        through.changeset = Some(handle.clone());
 
-        let found = run(&ctx, params("routes", &[])).await.unwrap();
+        let found = run(&ctx, through).await.unwrap();
 
         let catalogs: Vec<&str> = found.hits.iter().map(|hit| hit.catalog.as_str()).collect();
         assert_eq!(catalogs, ["work"]);
@@ -279,7 +291,7 @@ mod tests {
         assert_eq!(found.skipped[0].error["error"], "InvalidPath");
         let message = found.skipped[0].error["message"].as_str().unwrap();
         assert!(
-            message.contains(&format!("pending changeset {}", changeset.id)),
+            message.contains(&format!("pending changeset {handle}")),
             "{message}"
         );
     }
@@ -294,10 +306,43 @@ mod tests {
         );
         // A closed pool fails the changeset lookup, as an outage would.
         test.app.pool().close().await;
+        let mut through = params("routes", &[]);
+        through.changeset = Some("any-handle".to_string());
 
-        let result = run(&ctx, params("routes", &[])).await;
+        let result = run(&ctx, through).await;
 
         assert_eq!(result.unwrap_err().kind(), "Database");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changeset_outside_the_selected_catalogs_is_refused() {
+        let test = app_with(
+            &[
+                ("pg", &[("router.md", TAGGED)]),
+                ("work", &[("switch.md", TAGGED)]),
+            ],
+            Config::default(),
+        )
+        .await;
+        store_key(&test, "writer").await;
+        let ctx = context(
+            &test,
+            principal_as("writer", Access::Write, &[], Some("pg")),
+            None,
+        );
+        let handle = open(&ctx).await;
+        let mut in_work = params("routes", &[]);
+        in_work.catalogs = Some(vec!["work".to_string()]);
+        in_work.changeset = Some(handle.clone());
+
+        let refused = run(&ctx, in_work).await.unwrap_err();
+
+        assert_eq!(refused.kind(), "Refused");
+        let message = refused.to_string();
+        assert!(
+            message.contains(&handle) && message.contains("\"pg\""),
+            "{message}"
+        );
     }
 
     #[test]

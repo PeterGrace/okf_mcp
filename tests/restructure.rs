@@ -11,7 +11,7 @@ use okf_mcp::archive::{read_tarball, Files};
 use okf_mcp::config::Config;
 use okf_mcp::store::keys::Access;
 use serde_json::{json, Value};
-use support::server::{call, files, structured, Client, TestServer};
+use support::server::{call, files, open_changeset, structured, Client, TestServer};
 
 const TIME: &str = "---\ntype: System\ntitle: Time server\ndescription: The GPS clock.\n---\n\
                     # Time server\n\n## Ports\n\nUDP 123.\n";
@@ -67,9 +67,9 @@ fn revisions(published: &Value) -> Vec<(String, String)> {
     pairs
 }
 
-/// The move every test but the last makes.
-fn move_time() -> Value {
-    json!({"old": "/infra/time", "new": "/infra/clock.md"})
+/// The move every test but the last makes, in the changeset `handle` names.
+fn move_time(handle: &str) -> Value {
+    json!({"old": "/infra/time", "new": "/infra/clock.md", "changeset": handle})
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -77,13 +77,19 @@ async fn a_move_is_published_and_exported() {
     let server = TestServer::start(catalog(), Config::default()).await;
     let key = writer(&server, "writer").await;
     let client = server.client(&key, None).await.unwrap();
+    let handle = open_changeset(&client, None).await;
 
-    let moved = ok(&client, "move_concept", move_time()).await;
-    let seen = ok(&client, "get_concept", json!({"path": "/infra/clock.md"})).await;
+    let moved = ok(&client, "move_concept", move_time(&handle)).await;
+    let seen = ok(
+        &client,
+        "get_concept",
+        json!({"path": "/infra/clock.md", "changeset": handle}),
+    )
+    .await;
     let published = ok(
         &client,
         "publish",
-        json!({"message": "rename the time server"}),
+        json!({"message": "rename the time server", "changeset": handle}),
     )
     .await;
     let new_history = ok(&client, "history", json!({"path": "/infra/clock.md"})).await;
@@ -143,14 +149,32 @@ async fn a_concurrent_edit_of_a_linking_file_conflicts() {
     let editor_key = writer(&server, "writer-b").await;
     let mover = server.client(&mover_key, None).await.unwrap();
     let editor = server.client(&editor_key, None).await.unwrap();
-    ok(&mover, "move_concept", move_time()).await;
-    let body = json!({"path": "/hub.md", "body": "See the [time server](/infra/time.md).\n"});
+    let (moving, editing) = (
+        open_changeset(&mover, None).await,
+        open_changeset(&editor, None).await,
+    );
+    ok(&mover, "move_concept", move_time(&moving)).await;
+    let body = json!({
+        "path": "/hub.md",
+        "body": "See the [time server](/infra/time.md).\n",
+        "changeset": editing,
+    });
     ok(&editor, "replace_body", body).await;
-    ok(&editor, "publish", json!({"message": "reword the hub"})).await;
+    ok(
+        &editor,
+        "publish",
+        json!({"message": "reword the hub", "changeset": editing}),
+    )
+    .await;
 
-    let refused = call(&mover, "publish", json!({"message": "rename"})).await;
-    let pending = ok(&mover, "pending_changes", json!({})).await;
-    // The editor has nothing pending, so it reads the published catalog.
+    let refused = call(
+        &mover,
+        "publish",
+        json!({"message": "rename", "changeset": moving}),
+    )
+    .await;
+    let pending = ok(&mover, "pending_changes", json!({"changeset": moving})).await;
+    // Without a changeset, the editor reads the published catalog.
     let old = ok(&editor, "get_concept", json!({"path": "/infra/time.md"})).await;
     let new = call(&editor, "get_concept", json!({"path": "/infra/clock.md"})).await;
     mover.cancel().await.unwrap();
@@ -198,17 +222,32 @@ async fn a_concurrent_index_of_the_same_folder_replays() {
     let lister_key = writer(&server, "writer-b").await;
     let mover = server.client(&mover_key, None).await.unwrap();
     let lister = server.client(&lister_key, None).await.unwrap();
-    ok(&mover, "move_concept", move_time()).await;
+    let (moving, listing) = (
+        open_changeset(&mover, None).await,
+        open_changeset(&lister, None).await,
+    );
+    ok(&mover, "move_concept", move_time(&moving)).await;
     let concept = json!({
         "path": "/infra/ntp.md",
         "frontmatter": {"type": "System", "title": "NTP", "description": "How hosts sync."},
         "body": "# NTP\n",
         "index_summary": "how hosts sync",
+        "changeset": listing,
     });
     ok(&lister, "create_concept", concept).await;
-    ok(&lister, "publish", json!({"message": "add NTP"})).await;
+    ok(
+        &lister,
+        "publish",
+        json!({"message": "add NTP", "changeset": listing}),
+    )
+    .await;
 
-    let published = ok(&mover, "publish", json!({"message": "rename"})).await;
+    let published = ok(
+        &mover,
+        "publish",
+        json!({"message": "rename", "changeset": moving}),
+    )
+    .await;
     let index = ok(&mover, "read_document", json!({"path": "/infra/index.md"})).await;
     mover.cancel().await.unwrap();
     lister.cancel().await.unwrap();
@@ -236,22 +275,24 @@ async fn a_delete_is_refused_while_linked_then_published() {
     let server = TestServer::start(catalog(), Config::default()).await;
     let key = writer(&server, "writer").await;
     let client = server.client(&key, None).await.unwrap();
+    let handle = open_changeset(&client, None).await;
     // A closure taking no arguments (a `lambda: ...`): `json!` builds a new
     // value per call, since `call` takes its arguments by value.
-    let delete = || json!({"path": "/infra/time.md"});
+    let delete = || json!({"path": "/infra/time.md", "changeset": handle});
 
     let refused = call(&client, "delete_concept", delete()).await;
     let unlink = json!({
         "path": "/hub.md",
         "old_str": "See the [time server](/infra/time.md#ports).",
         "new_str": "See the time server.",
+        "changeset": handle,
     });
     ok(&client, "edit_document", unlink).await;
     let deleted = ok(&client, "delete_concept", delete()).await;
     let published = ok(
         &client,
         "publish",
-        json!({"message": "retire the time server"}),
+        json!({"message": "retire the time server", "changeset": handle}),
     )
     .await;
     let index = ok(&client, "read_document", json!({"path": "/infra/index.md"})).await;

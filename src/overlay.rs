@@ -104,6 +104,9 @@ pub async fn build_overlay(
 ) -> Result<Overlay, OkfError> {
     let changeset_id = changeset.id;
     let version = changeset.version;
+    // Owned, so the blocking closure can take it: errors name the handle,
+    // which is what a client knows the changeset by (M8 Decision 1).
+    let handle = changeset.handle.clone();
     // `move` hands `base` and `entries` to the blocking thread, which must
     // own what it reads.
     blocking(move || {
@@ -119,12 +122,11 @@ pub async fn build_overlay(
         let workspace = base
             .workspace()
             .with_changes(changes)
-            .map_err(|error| in_changeset(error, changeset_id))?;
+            .map_err(|error| in_changeset(error, &handle))?;
         // The published files built into the base snapshot, so a failure
         // here comes from the pending entries (a `.md` whose bytes are not
         // UTF-8): named as theirs, like a clash.
-        let snapshot =
-            Snapshot::build(&workspace).map_err(|error| in_changeset(error, changeset_id))?;
+        let snapshot = Snapshot::build(&workspace).map_err(|error| in_changeset(error, &handle))?;
         let commit_times = base.commit_times().with_dirty(dirty.iter().cloned());
         Ok(Overlay {
             base,
@@ -147,13 +149,13 @@ pub async fn build_overlay(
 /// # Arguments
 /// * `error` - the error from applying the entries or building the
 ///   snapshot of the result.
-/// * `changeset_id` - the changeset whose entries were applied.
+/// * `handle` - the handle of the changeset whose entries were applied.
 ///
 /// # Returns
 /// An `InvalidPath` (a clash) or an `Io` (a pending file the snapshot cannot
 /// read) as an `InvalidPath` with the changeset in its reason; any other
 /// error as it is.
-fn in_changeset(error: OkfError, changeset_id: i64) -> OkfError {
+fn in_changeset(error: OkfError, handle: &str) -> OkfError {
     // Each `format!` runs before the struct is built, because building it
     // moves `path` into the struct.
     match error {
@@ -161,15 +163,14 @@ fn in_changeset(error: OkfError, changeset_id: i64) -> OkfError {
         // pending file or a published one with pending paths under it.
         OkfError::InvalidPath { path, reason } => {
             let reason = format!(
-                "{reason}, in pending changeset {changeset_id}; discard the clashing path \
+                "{reason}, in pending changeset {handle}; discard the clashing path \
                  ({path} or the paths under it) or the changeset"
             );
             OkfError::InvalidPath { path, reason }
         }
         OkfError::Io { path, source } => {
-            let reason = format!(
-                "{source}, in pending changeset {changeset_id}; discard {path} or the changeset"
-            );
+            let reason =
+                format!("{source}, in pending changeset {handle}; discard {path} or the changeset");
             OkfError::InvalidPath { path, reason }
         }
         other => other,
@@ -359,7 +360,7 @@ mod tests {
     use crate::archive::files;
     use crate::config::Config;
     use crate::mcp::testing::{
-        app_with, context, pending_entry, principal_as, store_key, PendingEdit,
+        app_with, context, open, pending_entry, principal_as, store_key, PendingEdit,
     };
     use crate::okf::workspace::Workspace;
     use crate::store::changesets::ChangesetState;
@@ -437,16 +438,16 @@ mod tests {
         let pool = test.app.pool();
         let overlays = test.app.overlays();
         let edit = |text: &'static str| PendingEdit {
-            catalog: "pg",
             path: "a.md",
             text: Some(text),
             at: Utc::now(),
         };
-        let first_row = pending_entry(&test, &ctx, &edit("# One\n")).await;
+        let handle = open(&ctx).await;
+        let first_row = pending_entry(&test, &handle, &edit("# One\n")).await;
 
         let first = overlays.get(pool, &state, &first_row).await.unwrap();
         let again = overlays.get(pool, &state, &first_row).await.unwrap();
-        let second_row = pending_entry(&test, &ctx, &edit("# Two\n")).await;
+        let second_row = pending_entry(&test, &handle, &edit("# Two\n")).await;
         let after_edit = overlays.get(pool, &state, &second_row).await.unwrap();
         let options = ImportOptions {
             replace: true,
@@ -491,7 +492,7 @@ mod tests {
         };
         assert!(
             reason.ends_with(
-                "in pending changeset 9; discard the clashing path (a.md or the paths under \
+                "in pending changeset handle-9; discard the clashing path (a.md or the paths under \
                  it) or the changeset"
             ),
             "{reason}"
@@ -561,7 +562,7 @@ mod tests {
         let message = error.to_string();
         assert!(message.starts_with("bad.md: "), "{message}");
         assert!(
-            message.ends_with("in pending changeset 4; discard bad.md or the changeset"),
+            message.ends_with("in pending changeset handle-4; discard bad.md or the changeset"),
             "{message}"
         );
     }

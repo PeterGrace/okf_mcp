@@ -1,6 +1,7 @@
 //! Changesets and their entries (design "Storage", "Session lifecycle"):
-//! one open changeset per (catalog, key, label) holds a connection's
-//! unpublished edits until `publish` or `discard` closes it.
+//! a changeset, named by the handle [`open`] draws (M8 Decision 1), holds
+//! one key's unpublished edits in one catalog until `publish` or `discard`
+//! closes it. A key may have several open at once.
 //!
 //! # Lock order (Decision 3)
 //!
@@ -28,10 +29,6 @@ use crate::store::catalogs::is_unique_violation;
 /// deleted while the write waited for the delete to finish.
 pub const CATALOG_GONE: &str =
     "the catalog was deleted while this request waited; nothing was written";
-
-/// How often [`get_or_create`] tries again when the changeset it found
-/// closes before it can read it back.
-const GET_OR_CREATE_TRIES: usize = 3;
 
 /// The columns of a changeset row, in [`RawChangeset`]'s order.
 // A macro rather than a `const`: `concat!` (below) joins string literals at
@@ -130,17 +127,6 @@ pub struct EntryRow {
     pub replay: Option<serde_json::Value>,
 }
 
-/// The identity of an open changeset (Decision 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChangesetKey<'a> {
-    /// The catalog.
-    pub catalog_id: i64,
-    /// The key's id.
-    pub key_id: &'a str,
-    /// The connection's label.
-    pub label: &'a str,
-}
-
 /// An open, non-empty changeset idle past a cutoff (`stranded_sessions`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrandedRow {
@@ -229,105 +215,6 @@ pub async fn lock_catalog(conn: &mut PgConnection, catalog_id: i64) -> Result<()
         });
     }
     Ok(())
-}
-
-/// The open changeset of an identity.
-///
-/// # Arguments
-/// * `executor` - a pool, connection or transaction (`&mut *tx`).
-/// * `key` - catalog, key and label.
-///
-/// # Returns
-/// The changeset, or `None` if that identity has none open. One lookup in
-/// the partial unique index.
-///
-/// # Errors
-/// [`OkfError::Database`].
-pub async fn find_open<'e>(
-    executor: impl PgExecutor<'e>,
-    key: &ChangesetKey<'_>,
-) -> Result<Option<ChangesetRow>, OkfError> {
-    let row = sqlx::query_as::<_, RawChangeset>(concat!(
-        "SELECT ",
-        changeset_columns!(),
-        " FROM changesets WHERE catalog_id = $1 AND key_id = $2 AND label = $3 \
-         AND state = 'open'"
-    ))
-    .bind(key.catalog_id)
-    .bind(key.key_id)
-    .bind(key.label)
-    .fetch_optional(executor)
-    .await?;
-    // `Option::map` with a `From` function: `Some(raw)` becomes `Some(row)`.
-    Ok(row.map(ChangesetRow::from))
-}
-
-/// The open changeset of an identity, opening one if there is none.
-///
-/// The insert skips a conflicting open row (`ON CONFLICT DO NOTHING`, which
-/// waits for a racing insert to commit or roll back), then reads the row
-/// that won `FOR UPDATE`. Either way the transaction holds the changeset's
-/// row lock until it ends. Call it after [`lock_catalog`], in the write's
-/// transaction.
-///
-/// # Arguments
-/// * `conn` - the transaction's connection.
-/// * `key` - catalog, key and label.
-/// * `actor` - the key's actor, recorded on a new changeset.
-/// * `now` - the time (server clock), for a new changeset's timestamps.
-///
-/// # Returns
-/// The open changeset.
-///
-/// # Errors
-/// [`OkfError::Busy`] if the changeset kept closing between the insert and
-/// the read; [`OkfError::Database`].
-pub async fn get_or_create(
-    conn: &mut PgConnection,
-    key: &ChangesetKey<'_>,
-    actor: &str,
-    now: DateTime<Utc>,
-) -> Result<ChangesetRow, OkfError> {
-    for _ in 0..GET_OR_CREATE_TRIES {
-        let inserted = sqlx::query_as::<_, RawChangeset>(concat!(
-            "INSERT INTO changesets (catalog_id, key_id, label, actor, state, created_at, \
-             updated_at) VALUES ($1, $2, $3, $4, 'open', $5, $5) \
-             ON CONFLICT (catalog_id, key_id, label) WHERE state = 'open' DO NOTHING \
-             RETURNING ",
-            changeset_columns!()
-        ))
-        .bind(key.catalog_id)
-        .bind(key.key_id)
-        .bind(key.label)
-        .bind(actor)
-        .bind(now)
-        .fetch_optional(&mut *conn)
-        .await?;
-        if let Some(row) = inserted {
-            return Ok(row.into());
-        }
-        // Read committed: this statement sees the row that won the race.
-        // `FOR UPDATE` takes that row's lock too, as the insert above does
-        // for a new row, so from here on the write holds its changeset and
-        // the prune (`SKIP LOCKED`) passes it by.
-        let found = sqlx::query_as::<_, RawChangeset>(concat!(
-            "SELECT ",
-            changeset_columns!(),
-            " FROM changesets WHERE catalog_id = $1 AND key_id = $2 AND label = $3 \
-             AND state = 'open' FOR UPDATE"
-        ))
-        .bind(key.catalog_id)
-        .bind(key.key_id)
-        .bind(key.label)
-        .fetch_optional(&mut *conn)
-        .await?;
-        if let Some(row) = found {
-            return Ok(row.into());
-        }
-    }
-    Err(OkfError::Busy {
-        reason: "the changeset closed while this write opened it".to_string(),
-    })
 }
 
 /// A changeset by id, in any state.
@@ -522,8 +409,8 @@ async fn touch(
 /// * `now` - the time (server clock).
 ///
 /// # Errors
-/// [`OkfError::Busy`] if the changeset is no longer open (a concurrent
-/// publish, discard or prune closed it; a retry opens a new one);
+/// [`OkfError::Busy`] if the changeset is no longer open (callers take
+/// [`lock`] first and refuse a closed one, so this is a backstop);
 /// [`OkfError::Database`].
 pub async fn upsert_entry(
     conn: &mut PgConnection,
@@ -727,11 +614,15 @@ pub async fn adopt(
 /// Discards every open changeset without entries whose last change is
 /// before `older_than` (design "Session lifecycle": the 24-hour prune).
 ///
-/// Changesets another transaction holds are skipped (`SKIP LOCKED`): a
-/// writer holds its changeset's row from [`get_or_create`] on (the insert
-/// locks a new row, the fallback read locks an existing one `FOR UPDATE`),
-/// so a changeset is never discarded under a write, and the prune never
-/// waits on a lock.
+/// Changesets another transaction holds are skipped (`SKIP LOCKED`), so the
+/// prune never waits on a lock, and it never discards a changeset under a
+/// write. A write resolves its handle without a lock, then takes the row
+/// with [`lock`] and reads its state again:
+/// - if the write took the row first, the prune skips it, and the write's
+///   entry (and `updated_at`) keep it from being pruned later;
+/// - if the prune holds the row, [`lock`] waits for it to commit, then reads
+///   `discarded`, and the write is refused ("was published or discarded
+///   while this write waited"), storing nothing.
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -798,19 +689,16 @@ mod tests {
         pg.id
     }
 
-    fn key<'a>(catalog_id: i64, key_id: &'a str, label: &'a str) -> ChangesetKey<'a> {
-        ChangesetKey {
-            catalog_id,
-            key_id,
-            label,
-        }
-    }
-
-    /// Gets or creates the changeset in its own transaction, in the lock order.
-    async fn open(pool: &PgPool, key: &ChangesetKey<'_>, at: DateTime<Utc>) -> ChangesetRow {
+    /// Opens a changeset for `key_id` in its own transaction, in the lock order.
+    async fn opened(
+        pool: &PgPool,
+        catalog_id: i64,
+        key_id: &str,
+        at: DateTime<Utc>,
+    ) -> ChangesetRow {
         let mut tx = pool.begin().await.unwrap();
-        lock_catalog(&mut tx, key.catalog_id).await.unwrap();
-        let changeset = get_or_create(&mut tx, key, key.key_id, at).await.unwrap();
+        lock_catalog(&mut tx, catalog_id).await.unwrap();
+        let changeset = open(&mut tx, catalog_id, key_id, key_id, at).await.unwrap();
         tx.commit().await.unwrap();
         changeset
     }
@@ -840,44 +728,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_or_create_returns_the_open_changeset_it_made() {
-        let db = test_db().await;
-        let pg = setup(&db.pool).await;
-        let alice = key(pg, "alice", "default");
-
-        let first = open(&db.pool, &alice, now()).await;
-        let again = open(&db.pool, &alice, now() + TimeDelta::minutes(5)).await;
-        let found = find_open(&db.pool, &alice).await.unwrap();
-
-        assert_eq!(again, first);
-        assert_eq!(found, Some(first.clone()));
-        assert_eq!(
-            (
-                first.label.as_str(),
-                first.key_id.as_deref(),
-                first.actor.as_str()
-            ),
-            ("default", Some("alice"), "alice")
-        );
-        assert_eq!((first.state, first.version), (ChangesetState::Open, 0));
-        assert_eq!((first.created_at, first.updated_at), (now(), now()));
-        assert_eq!(by_id(&db.pool, first.id).await.unwrap(), Some(first));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn open_returns_a_fresh_handle_each_time_and_by_handle_finds_it() {
         let db = test_db().await;
         let pg = setup(&db.pool).await;
         let mut tx = db.pool.begin().await.unwrap();
         lock_catalog(&mut tx, pg).await.unwrap();
 
-        // `super::open`: this module's own `open` helper shadows the store's.
-        let first = super::open(&mut tx, pg, "alice", "agent:a", now())
-            .await
-            .unwrap();
-        let second = super::open(&mut tx, pg, "alice", "agent:a", now())
-            .await
-            .unwrap();
+        let first = open(&mut tx, pg, "alice", "agent:a", now()).await.unwrap();
+        let second = open(&mut tx, pg, "alice", "agent:a", now()).await.unwrap();
         tx.commit().await.unwrap();
 
         assert_ne!(first.handle, second.handle);
@@ -895,30 +753,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn each_label_and_each_key_get_their_own_changeset() {
-        let db = test_db().await;
-        let pg = setup(&db.pool).await;
-
-        let alice = open(&db.pool, &key(pg, "alice", "default"), now()).await;
-        let alice_drafts = open(&db.pool, &key(pg, "alice", "drafts"), now()).await;
-        let bob = open(&db.pool, &key(pg, "bob", "default"), now()).await;
-
-        assert_ne!(alice.id, alice_drafts.id);
-        assert_ne!(alice.id, bob.id);
-        assert_eq!(bob.key_id.as_deref(), Some("bob"));
-        assert_eq!(
-            find_open(&db.pool, &key(pg, "bob", "drafts"))
-                .await
-                .unwrap(),
-            None
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn upsert_replaces_the_entry_and_bumps_the_version() {
         let db = test_db().await;
         let pg = setup(&db.pool).await;
-        let changeset = open(&db.pool, &key(pg, "alice", "default"), now()).await;
+        let changeset = opened(&db.pool, pg, "alice", now()).await;
         let later = now() + TimeDelta::minutes(1);
         let mut replayed = entry("log.md", Some("# Log\n"));
         replayed.replay = Some(serde_json::json!([{"op": "log", "date": "2026-11-03"}]));
@@ -941,7 +779,7 @@ mod tests {
     async fn remove_entries_drops_the_named_paths_or_all_of_them() {
         let db = test_db().await;
         let pg = setup(&db.pool).await;
-        let changeset = open(&db.pool, &key(pg, "alice", "default"), now()).await;
+        let changeset = opened(&db.pool, pg, "alice", now()).await;
         for path in ["a.md", "b.md", "c.md"] {
             put(&db.pool, &changeset, &entry(path, Some("x\n")), now())
                 .await
@@ -984,11 +822,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn set_state_closes_a_changeset_and_a_new_one_opens_after_it() {
+    async fn set_state_closes_a_changeset_once_and_refuses_a_late_write() {
         let db = test_db().await;
         let pg = setup(&db.pool).await;
-        let alice = key(pg, "alice", "default");
-        let changeset = open(&db.pool, &alice, now()).await;
+        let changeset = opened(&db.pool, pg, "alice", now()).await;
 
         let mut tx = db.pool.begin().await.unwrap();
         lock_catalog(&mut tx, pg).await.unwrap();
@@ -1000,14 +837,11 @@ mod tests {
         let twice = set_state(&mut tx, changeset.id, ChangesetState::Discarded, now()).await;
         drop(tx);
         let late_write = put(&db.pool, &changeset, &entry("a.md", Some("x\n")), now()).await;
-        let next = open(&db.pool, &alice, now()).await;
 
         let closed = by_id(&db.pool, changeset.id).await.unwrap().unwrap();
         assert_eq!(closed.state, ChangesetState::Published);
         assert!(matches!(twice, Err(OkfError::Refused { .. })));
         assert!(matches!(late_write, Err(OkfError::Busy { .. })));
-        assert_ne!(next.id, changeset.id);
-        assert_eq!(find_open(&db.pool, &alice).await.unwrap(), Some(next));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1015,19 +849,19 @@ mod tests {
         let db = test_db().await;
         let pg = setup(&db.pool).await;
         let old = now() - TimeDelta::hours(3);
-        let idle = open(&db.pool, &key(pg, "alice", "idle"), old).await;
+        let idle = opened(&db.pool, pg, "alice", old).await;
         put(&db.pool, &idle, &entry("b.md", Some("b\n")), old)
             .await
             .unwrap();
         put(&db.pool, &idle, &entry("a.md", None), old)
             .await
             .unwrap();
-        open(&db.pool, &key(pg, "alice", "empty"), old).await;
-        let fresh = open(&db.pool, &key(pg, "alice", "fresh"), now()).await;
+        opened(&db.pool, pg, "alice", old).await;
+        let fresh = opened(&db.pool, pg, "alice", now()).await;
         put(&db.pool, &fresh, &entry("a.md", Some("a\n")), now())
             .await
             .unwrap();
-        let published = open(&db.pool, &key(pg, "bob", "done"), old).await;
+        let published = opened(&db.pool, pg, "bob", old).await;
         put(&db.pool, &published, &entry("a.md", Some("a\n")), old)
             .await
             .unwrap();
@@ -1062,13 +896,14 @@ mod tests {
     async fn adopt_relabels_and_refuses_a_label_that_already_has_one() {
         let db = test_db().await;
         let pg = setup(&db.pool).await;
-        let stranded_one = open(&db.pool, &key(pg, "alice", "old-session"), now()).await;
-        let taken = open(&db.pool, &key(pg, "bob", "default"), now()).await;
+        let stranded_one = opened(&db.pool, pg, "alice", now()).await;
+        let taken = opened(&db.pool, pg, "bob", now()).await;
         let later = now() + TimeDelta::minutes(1);
 
         let mut tx = db.pool.begin().await.unwrap();
         lock_catalog(&mut tx, pg).await.unwrap();
-        let refused = adopt(&mut tx, stranded_one.id, "bob", "default", later).await;
+        // `taken`'s label: bob already has an open changeset with it.
+        let refused = adopt(&mut tx, stranded_one.id, "bob", &taken.label, later).await;
         drop(tx);
         let mut tx = db.pool.begin().await.unwrap();
         lock_catalog(&mut tx, pg).await.unwrap();
@@ -1085,17 +920,10 @@ mod tests {
         );
         assert_eq!((adopted.version, adopted.updated_at), (1, later));
         assert_eq!(
-            find_open(&db.pool, &key(pg, "alice", "old-session"))
-                .await
-                .unwrap(),
-            None
+            by_id(&db.pool, stranded_one.id).await.unwrap(),
+            Some(adopted)
         );
-        assert_eq!(
-            find_open(&db.pool, &key(pg, "bob", "default"))
-                .await
-                .unwrap(),
-            Some(taken)
-        );
+        assert_eq!(by_id(&db.pool, taken.id).await.unwrap(), Some(taken));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1103,9 +931,9 @@ mod tests {
         let db = test_db().await;
         let pg = setup(&db.pool).await;
         let old = now() - TimeDelta::hours(25);
-        let empty_old = open(&db.pool, &key(pg, "alice", "a"), old).await;
-        let empty_new = open(&db.pool, &key(pg, "alice", "b"), now()).await;
-        let full_old = open(&db.pool, &key(pg, "alice", "c"), old).await;
+        let empty_old = opened(&db.pool, pg, "alice", old).await;
+        let empty_new = opened(&db.pool, pg, "alice", now()).await;
+        let full_old = opened(&db.pool, pg, "alice", old).await;
         put(&db.pool, &full_old, &entry("a.md", Some("a\n")), old)
             .await
             .unwrap();
@@ -1131,18 +959,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_prune_passes_by_a_changeset_get_or_create_found_and_holds() {
+    async fn the_prune_passes_by_a_changeset_a_write_holds() {
         let db = test_db().await;
         let pg = setup(&db.pool).await;
-        let alice = key(pg, "alice", "default");
-        let existing = open(&db.pool, &alice, now()).await;
+        let existing = opened(&db.pool, pg, "alice", now()).await;
         let mut writer = db.pool.begin().await.unwrap();
         lock_catalog(&mut writer, pg).await.unwrap();
-        // The changeset exists, so this takes the conflict path: the
-        // `FOR UPDATE` read, which holds the row until `writer` ends.
-        let found = get_or_create(&mut writer, &alice, "alice", now())
+        // As a write takes it: the row stays locked until `writer` ends.
+        let found = lock(&mut writer, existing.id)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("the changeset exists");
         let cutoff = now() + TimeDelta::hours(1);
 
         // `SKIP LOCKED`: the prune neither waits for `writer` nor discards
@@ -1189,8 +1016,7 @@ mod tests {
         let writer = tokio::spawn(async move {
             let mut tx = pool.begin().await?;
             lock_catalog(&mut tx, pg).await?;
-            let changeset =
-                get_or_create(&mut tx, &key(pg, "alice", "default"), "alice", now()).await?;
+            let changeset = open(&mut tx, pg, "alice", "alice", now()).await?;
             upsert_entry(&mut tx, changeset.id, &entry("a.md", Some("x\n")), now()).await?;
             ready_tx.send(()).expect("the test waits");
             commit_rx.await.expect("the test signals");
@@ -1228,7 +1054,7 @@ mod tests {
         let writer = tokio::spawn(async move {
             let mut tx = pool.begin().await?;
             lock_catalog(&mut tx, pg).await?;
-            get_or_create(&mut tx, &key(pg, "alice", "default"), "alice", now()).await?;
+            open(&mut tx, pg, "alice", "alice", now()).await?;
             tx.commit().await?;
             Ok::<(), OkfError>(())
         });
@@ -1266,17 +1092,7 @@ mod tests {
             actor: "writer",
         };
         key_rows::create(&db.pool, &new_key, now()).await.unwrap();
-        let key = ChangesetKey {
-            catalog_id: catalog.id,
-            key_id: "writer",
-            label: "default",
-        };
-        let mut first = db.pool.begin().await.unwrap();
-        lock_catalog(&mut first, catalog.id).await.unwrap();
-        let row = get_or_create(&mut first, &key, "writer", now())
-            .await
-            .unwrap();
-        first.commit().await.unwrap();
+        let row = opened(&db.pool, catalog.id, "writer", now()).await;
         let mut holder = db.pool.begin().await.unwrap();
         lock(&mut holder, row.id).await.unwrap();
         let pool = db.pool.clone();

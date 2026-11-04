@@ -313,7 +313,7 @@ async fn writes_on_a_real_catalog() {
     use okf_mcp::config::Config;
     use okf_mcp::store::keys::Access;
     use serde_json::json;
-    use support::server::{call, TestServer};
+    use support::server::{call, open_changeset, TestServer};
 
     let root = std::env::var_os("OKF_PARITY_CATALOG").expect("set OKF_PARITY_CATALOG");
     let files = read_directory(std::path::Path::new(&root), u64::MAX).unwrap();
@@ -325,10 +325,8 @@ async fn writes_on_a_real_catalog() {
         started.elapsed()
     );
     let key = server.key("smoke", Access::Write, &[], Some("pg")).await;
-    let client = server
-        .client_with(&key, &[("x-okf-changeset", "smoke")])
-        .await
-        .unwrap();
+    let client = server.client(&key, None).await.unwrap();
+    let handle = open_changeset(&client, None).await;
 
     // The first write builds the overlay (a full snapshot); the later ones
     // rebuild it after each version bump, so their times show that cost.
@@ -344,16 +342,23 @@ async fn writes_on_a_real_catalog() {
                 },
                 "body": "# M5 smoke probe\n\nSee the [log](/log.md).\n",
                 "index_summary": "the M5 smoke test's probe",
+                "changeset": handle,
             }),
         ),
         (
             "stamp",
-            json!({"path": "/m5-smoke/probe.md", "field": "verified"}),
+            json!({"path": "/m5-smoke/probe.md", "field": "verified", "changeset": handle}),
         ),
-        ("log", json!({"text": "M5 smoke probe", "kind": "Creation"})),
-        ("pending_changes", json!({})),
-        ("lint", json!({"pending": true})),
-        ("publish", json!({"message": "M5 smoke test"})),
+        (
+            "log",
+            json!({"text": "M5 smoke probe", "kind": "Creation", "changeset": handle}),
+        ),
+        ("pending_changes", json!({"changeset": handle})),
+        ("lint", json!({"changeset": handle})),
+        (
+            "publish",
+            json!({"message": "M5 smoke test", "changeset": handle}),
+        ),
     ];
     let mut failed = Vec::new();
     // `Value::Null` until the publish answers; indexing a `Value` with a
@@ -423,7 +428,7 @@ async fn restructuring_on_a_real_catalog() {
     use okf_mcp::config::Config;
     use okf_mcp::store::keys::Access;
     use serde_json::json;
-    use support::server::{call, TestServer};
+    use support::server::{call, open_changeset, TestServer};
 
     let root = std::env::var_os("OKF_PARITY_CATALOG").expect("set OKF_PARITY_CATALOG");
     let files = read_directory(std::path::Path::new(&root), u64::MAX).unwrap();
@@ -435,10 +440,11 @@ async fn restructuring_on_a_real_catalog() {
         started.elapsed()
     );
     let key = server.key("smoke", Access::Write, &[], Some("pg")).await;
-    let client = server
-        .client_with(&key, &[("x-okf-changeset", "smoke")])
-        .await
-        .unwrap();
+    let client = server.client(&key, None).await.unwrap();
+    // One changeset for the probe, one for the restructuring: a publish
+    // closes its changeset, so the second needs its own handle.
+    let probe = open_changeset(&client, None).await;
+    let work = open_changeset(&client, None).await;
 
     let calls = [
         (
@@ -452,12 +458,16 @@ async fn restructuring_on_a_real_catalog() {
                 },
                 "body": "# M6 smoke probe\n\n## Part one\n\nOne.\n\n## Part two\n\nTwo.\n",
                 "index_summary": "the M6 smoke test's probe",
+                "changeset": probe,
             }),
         ),
-        ("publish", json!({"message": "M6 smoke test: probe"})),
+        (
+            "publish",
+            json!({"message": "M6 smoke test: probe", "changeset": probe}),
+        ),
         (
             "move_concept",
-            json!({"old": "/m6-smoke/probe", "new": "/m6-smoke/moved.md"}),
+            json!({"old": "/m6-smoke/probe", "new": "/m6-smoke/moved.md", "changeset": work}),
         ),
         (
             "split_concept",
@@ -466,11 +476,18 @@ async fn restructuring_on_a_real_catalog() {
                 "section": "Part two",
                 "to": "/m6-smoke/part-two.md",
                 "description": "The second part.",
+                "changeset": work,
             }),
         ),
-        ("delete_concept", json!({"path": "/m6-smoke/part-two.md"})),
-        ("pending_changes", json!({})),
-        ("publish", json!({"message": "M6 smoke test: restructure"})),
+        (
+            "delete_concept",
+            json!({"path": "/m6-smoke/part-two.md", "changeset": work}),
+        ),
+        ("pending_changes", json!({"changeset": work})),
+        (
+            "publish",
+            json!({"message": "M6 smoke test: restructure", "changeset": work}),
+        ),
     ];
     let mut failed = Vec::new();
     let mut refusal = serde_json::Value::Null;

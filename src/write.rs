@@ -1,16 +1,16 @@
 //! The write path (design "Data flow", Write): the one function every write
 //! tool calls.
 //!
-//! [`apply`] resolves the target catalog, requires `write` on it, and in one
-//! transaction:
+//! [`apply`] resolves the changeset handle the call names (its catalog and
+//! owner, `write` access; M8 Decisions 1 and 5), and in one transaction:
 //! - takes the catalog row (`FOR KEY SHARE`, plan Decision 3);
-//! - gets or creates the connection's changeset and locks its row;
-//! - runs the edit on a copy of the connection's overlay, on a blocking
+//! - locks the changeset's row and refuses it if it closed meanwhile;
+//! - runs the edit on a copy of the changeset's overlay, on a blocking
 //!   thread, and checks the write rules on every path it touched;
 //! - stores each touched path as a changeset entry.
 //!
-//! Then it commits and drops the cached overlay, so the connection's next
-//! read sees the edit. A refused edit stores nothing.
+//! Then it commits and drops the cached overlay, so the next read through
+//! the changeset sees the edit. A refused edit stores nothing.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,13 +21,13 @@ use serde::Serialize;
 
 use crate::error::OkfError;
 use crate::mcp::blocking;
-use crate::mcp::context::ToolContext;
+use crate::mcp::context::{Pinned, ToolContext};
 use crate::okf::ops::replay::ReplayOp;
 use crate::okf::ops::{OpContext, OpOutcome};
 use crate::okf::rules;
 use crate::okf::workspace::{MemWorkspace, StoredFile};
 use crate::overlay::Overlay;
-use crate::store::changesets::{self, ChangesetKey, ChangesetState, EntryRow};
+use crate::store::changesets::{self, ChangesetState, EntryRow};
 use crate::store::keys::Access;
 
 /// What a write did: the write tools' result.
@@ -35,10 +35,8 @@ use crate::store::keys::Access;
 pub struct WriteReport {
     /// The catalog written to.
     pub catalog: String,
-    /// The changeset holding the edit (what `adopt_changeset` takes).
-    pub changeset: i64,
-    /// The changeset's label (`X-OKF-Changeset`, `?changeset=`, or `default`).
-    pub label: String,
+    /// The changeset holding the edit: the handle the call passed.
+    pub changeset: String,
     /// The `/`-prefixed paths that now have an entry in the changeset (written,
     /// or a deletion), in the op's order. A touched path that left nothing to
     /// store (gone, and never published) is not listed.
@@ -57,7 +55,8 @@ struct Touched {
     file: Option<StoredFile>,
 }
 
-/// Applies an edit to the connection's changeset in the target catalog.
+/// Applies an edit to the changeset a handle names, in that changeset's
+/// catalog.
 ///
 /// Writes to one changeset run one at a time: each holds the changeset's
 /// row lock ([`changesets::lock`]) from before it reads the overlay until it
@@ -65,9 +64,9 @@ struct Touched {
 /// cached `version` is never used as a concurrency token.
 ///
 /// # Arguments
-/// * `ctx` - the call's context: key, label, catalogs.
-/// * `catalog` - the call's `catalog` argument; else the connection's write
-///   target (the first selected catalog).
+/// * `ctx` - the call's context: key and catalogs.
+/// * `changeset` - the call's `changeset` argument: the handle
+///   `open_changeset` returned.
 /// * `by` - the call's `by` argument; else the key's actor.
 /// * `op` - the edit. It gets a copy of the overlay workspace (published
 ///   files plus this changeset's entries) and an [`OpContext`] with the
@@ -80,15 +79,15 @@ struct Touched {
 /// The changeset, the touched paths and the op's message and notes.
 ///
 /// # Errors
-/// - a selection error ([`OkfError::CatalogNotSelected`], [`OkfError::Refused`]);
-/// - [`OkfError::Forbidden`] for a key below `write` on the catalog;
+/// - as [`ToolContext::changeset`]: [`OkfError::UnknownChangeset`],
+///   [`OkfError::Forbidden`] below `write`, [`OkfError::Refused`] for a
+///   changeset already published or discarded;
 /// - [`OkfError::Refused`] (`CATALOG_GONE`) if the catalog was deleted while
 ///   this write waited;
-/// - [`OkfError::Busy`] for a deadlock or serialization failure, or if the
-///   changeset is no longer open once locked. The second is a defensive
-///   check no test reaches: `get_or_create` already holds the row lock, so a
-///   publish or discard that closes the changeset first makes it open a new
-///   one, and the write lands there;
+/// - [`OkfError::Refused`] if the changeset was published or discarded
+///   (by `publish`, `discard` or the prune) while this write waited for its
+///   row lock;
+/// - [`OkfError::Busy`] for a deadlock or serialization failure;
 /// - an overlay that no longer applies ([`OkfError::InvalidPath`], naming the
 ///   changeset and how to recover);
 /// - the op's own error;
@@ -103,48 +102,49 @@ struct Touched {
 // call's borrows. `&OpContext<'_>` lets it borrow `by` only during the call.
 pub async fn apply<F>(
     ctx: &ToolContext,
-    catalog: Option<&str>,
+    changeset: &str,
     by: Option<&str>,
     op: F,
 ) -> Result<WriteReport, OkfError>
 where
     F: FnOnce(&MemWorkspace, &OpContext<'_>) -> Result<OpOutcome, OkfError> + Send + 'static,
 {
-    let state = ctx.one(catalog)?;
-    let principal = ctx.principal();
-    principal.require(Access::Write, state.name())?;
+    // Destructuring: the struct's two fields become two variables.
+    let Pinned { state, row } = ctx.changeset(changeset, Access::Write).await?;
     let app = ctx.app();
     let now = app.clock().now();
     // Owned, so the blocking closure can take it.
-    let by = by.unwrap_or(&principal.actor).to_string();
-    let key = ChangesetKey {
-        catalog_id: state.id(),
-        key_id: &principal.key_id,
-        label: ctx.label(),
-    };
+    let by = by.unwrap_or(&ctx.principal().actor).to_string();
 
     // Dropping `tx` without `commit()` (any `?` below) rolls everything back:
-    // a refused edit leaves no changeset and no entry behind.
+    // a refused edit leaves no entry behind.
     let mut tx = app.pool().begin().await?;
     changesets::lock_catalog(&mut tx, state.id()).await?;
-    let opened = changesets::get_or_create(&mut tx, &key, &principal.actor, now).await?;
-    let changeset = changesets::lock(&mut tx, opened.id)
-        .await?
-        // `filter` keeps the row only while it is still open. Defensive:
-        // `get_or_create` already locked the row, and a publish or discard
-        // that closed it before then made `get_or_create` open a new one.
-        .filter(|row| row.state == ChangesetState::Open)
-        .ok_or_else(|| OkfError::Busy {
-            reason: format!(
-                "changeset {} was published or discarded while this write waited",
-                opened.id
-            ),
-        })?;
+    // The row was read unlocked; `lock` reads it again once the lock is
+    // granted, so a publish, discard or prune that held it is seen here.
+    let changeset_row = match changesets::lock(&mut tx, row.id).await? {
+        // Gone: its catalog was deleted (the cascade). `lock_catalog`
+        // normally refuses first, so this is only a backstop.
+        None => {
+            return Err(OkfError::Refused {
+                reason: changesets::CATALOG_GONE.to_string(),
+            })
+        }
+        Some(locked) if locked.state != ChangesetState::Open => {
+            return Err(OkfError::Refused {
+                reason: format!(
+                    "changeset {changeset} was published or discarded while this write \
+                     waited; open a new one with open_changeset"
+                ),
+            })
+        }
+        Some(locked) => locked,
+    };
     // Read under the row lock, in this transaction (`&mut *tx` reborrows
     // it): no other write can change the entries meanwhile, so the overlay
     // holds every committed entry, and no second connection is needed.
-    let overlay = app.overlays().get(&mut *tx, &state, &changeset).await?;
-    let mut existing: HashMap<String, EntryRow> = changesets::entries(&mut *tx, changeset.id)
+    let overlay = app.overlays().get(&mut *tx, &state, &changeset_row).await?;
+    let mut existing: HashMap<String, EntryRow> = changesets::entries(&mut *tx, changeset_row.id)
         .await?
         .into_iter()
         .map(|entry| (entry.path.clone(), entry))
@@ -163,14 +163,14 @@ where
         let replay = outcome.replay.get(&path);
         match new_entry(previous.as_ref(), published, replay, path, file) {
             Ok(entry) => {
-                changesets::upsert_entry(&mut tx, changeset.id, &entry, now).await?;
+                changesets::upsert_entry(&mut tx, changeset_row.id, &entry, now).await?;
                 paths.push(format!("/{}", entry.path));
             }
             // Nothing published and nothing left: drop the changeset's own
             // entry for it (a file it created, then removed), if any.
             Err(path) if previous.is_some() => {
                 let paths = [path];
-                changesets::remove_entries(&mut tx, changeset.id, Some(&paths), now).await?;
+                changesets::remove_entries(&mut tx, changeset_row.id, Some(&paths), now).await?;
             }
             Err(_) => {}
         }
@@ -178,11 +178,10 @@ where
     tx.commit().await?;
     // The version moved, so the cached overlay is stale; dropping it now
     // also frees its memory before the next read rebuilds it.
-    app.overlays().forget(changeset.id);
+    app.overlays().forget(changeset_row.id);
     Ok(WriteReport {
         catalog: state.name().to_string(),
-        changeset: changeset.id,
-        label: changeset.label,
+        changeset: changeset_row.handle,
         touched: paths,
         message: outcome.message,
         notes: outcome.notes,
@@ -245,7 +244,7 @@ fn new_entry(
 /// path it touched (on a blocking thread: the secret scan is CPU work).
 ///
 /// # Arguments
-/// * `overlay` - the connection's overlay, under the changeset's row lock.
+/// * `overlay` - the changeset's overlay, under its row lock.
 /// * `by` - the actor for the op's `by:` fields.
 /// * `now` - the server clock's time.
 /// * `op` - the edit.
@@ -349,12 +348,14 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::mcp::testing::{
-        app_with, context, files, pending_entry, principal, principal_as, store_key, writer,
-        PendingEdit, TestApp,
+        app_with, changeset_row, context, files, open, pending_entry, principal, principal_as,
+        store_key, writer, PendingEdit, TestApp,
     };
     use crate::okf::workspace::Workspace;
+    use crate::store::catalogs::tests::until_a_lock_is_awaited;
     use crate::store::import::{import, ImportOptions};
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     const NOTE: &str = "---\ntype: Note\ntitle: A\ndescription: A note.\n---\n# A\n";
 
@@ -376,24 +377,25 @@ mod tests {
         }
     }
 
-    /// Writes `text` to `path`, as an op would.
+    /// Writes `text` to `path` in the changeset `handle` names, as an op would.
     async fn write(
         ctx: &ToolContext,
+        handle: &str,
         path: &'static str,
         text: String,
     ) -> Result<WriteReport, OkfError> {
         // `move` hands `text` to the closure, which `apply` runs on another thread.
-        apply(ctx, None, None, move |ws, _| {
+        apply(ctx, handle, None, move |ws, _| {
             ws.write_atomic(path, &text)?;
             Ok(touched(&[path]))
         })
         .await
     }
 
-    async fn entries(test: &TestApp, changeset: i64) -> Vec<EntryRow> {
-        changesets::entries(test.app.pool(), changeset)
-            .await
-            .unwrap()
+    /// The entries of the changeset `handle` names.
+    async fn entries(test: &TestApp, handle: &str) -> Vec<EntryRow> {
+        let row = changeset_row(test, handle).await;
+        changesets::entries(test.app.pool(), row.id).await.unwrap()
     }
 
     /// A `SELECT count(*)` query's answer (sqlx 0.9 takes only literal SQL).
@@ -405,27 +407,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_write_opens_a_changeset_and_stores_an_entry() {
+    async fn a_write_stores_an_entry_in_the_named_changeset() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
 
-        let report = write(&ctx, "a.md", format!("{NOTE}More.\n")).await.unwrap();
+        let report = write(&ctx, &handle, "a.md", format!("{NOTE}More.\n"))
+            .await
+            .unwrap();
 
         assert_eq!(
-            (report.catalog.as_str(), report.label.as_str()),
-            ("pg", "default")
+            (report.catalog.as_str(), report.changeset.as_str()),
+            ("pg", handle.as_str())
         );
         assert_eq!(report.touched, ["/a.md"]);
-        let row = changesets::by_id(test.app.pool(), report.changeset)
-            .await
-            .unwrap()
-            .unwrap();
+        let row = changeset_row(&test, &handle).await;
         assert_eq!(row.state, ChangesetState::Open);
         assert_eq!(
             (row.key_id.as_deref(), row.actor.as_str()),
             (Some("writer-a"), "writer-a")
         );
-        let stored = entries(&test, report.changeset).await;
+        let stored = entries(&test, &handle).await;
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].path, "a.md");
         assert_eq!(stored[0].base_revision, Some(1));
@@ -437,21 +439,132 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_read_key_is_refused_before_anything_is_stored() {
+    async fn a_write_lands_in_the_named_changeset_only() {
         let test = pg().await;
-        let ctx = context(&test, principal(&[], Some("pg")), None);
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let first = open(&ctx).await;
+        let second = open(&ctx).await;
 
-        let error = write(&ctx, "a.md", "x".to_string()).await.unwrap_err();
+        write(&ctx, &first, "a.md", format!("{NOTE}First.\n"))
+            .await
+            .unwrap();
+        write(&ctx, &second, "b.md", "# B\n".to_string())
+            .await
+            .unwrap();
 
-        assert_eq!(error.kind(), "Forbidden");
-        assert_eq!(count(&test, "SELECT count(*) FROM changesets").await, 0);
+        let paths = |entries: Vec<EntryRow>| -> Vec<String> {
+            entries.into_iter().map(|entry| entry.path).collect()
+        };
+        assert_eq!(paths(entries(&test, &first).await), ["a.md"]);
+        assert_eq!(paths(entries(&test, &second).await), ["b.md"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_to_a_closed_changeset_is_refused() {
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
+        let row = changeset_row(&test, &handle).await;
+        let mut tx = test.app.pool().begin().await.unwrap();
+        changesets::set_state(&mut tx, row.id, ChangesetState::Discarded, Utc::now())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let refused = write(&ctx, &handle, "a.md", "x".to_string())
+            .await
+            .unwrap_err();
+
+        assert_eq!(refused.kind(), "Refused");
+        let message = refused.to_string();
+        assert!(
+            message.contains(&handle) && message.contains("discarded"),
+            "{message}"
+        );
+        assert_eq!(
+            count(&test, "SELECT count(*) FROM changeset_entries").await,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn another_key_cannot_write_to_a_handle() {
+        let test = pg().await;
+        let owner = writer(&test, "writer-a", "pg").await;
+        let other = writer(&test, "writer-b", "pg").await;
+        let reader = context(&test, principal(&[], Some("pg")), None);
+        let handle = open(&owner).await;
+
+        let by_other = write(&other, &handle, "a.md", "x".to_string())
+            .await
+            .unwrap_err();
+        // A `read` key owns no changeset, so a handle is unknown to it too.
+        let by_reader = write(&reader, &handle, "a.md", "x".to_string())
+            .await
+            .unwrap_err();
+
+        assert_eq!(by_other.kind(), "UnknownChangeset");
+        assert_eq!(by_reader.kind(), "UnknownChangeset");
+        assert_eq!(
+            count(&test, "SELECT count(*) FROM changeset_entries").await,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_waiting_on_a_changeset_that_closes_is_refused() {
+        let test = pg().await;
+        store_key(&test, "writer-a").await;
+        let connection = || {
+            context(
+                &test,
+                principal_as("writer-a", Access::Write, &[], Some("pg")),
+                None,
+            )
+        };
+        let handle = open(&connection()).await;
+        let row = changeset_row(&test, &handle).await;
+        // Stands in for a prune or a discard holding the changeset's row.
+        let mut holder = test.app.pool().begin().await.unwrap();
+        changesets::lock(&mut holder, row.id).await.unwrap();
+        let (ctx, waiting_on) = (connection(), handle.clone());
+        // `tokio::spawn` runs the write concurrently, like a thread; it
+        // resolves the handle (unlocked, still open) and then blocks in
+        // `changesets::lock` on the row `holder` has.
+        let writing = tokio::spawn(async move {
+            write(&ctx, &waiting_on, "a.md", format!("{NOTE}Late.\n")).await
+        });
+        until_a_lock_is_awaited(test.app.pool()).await;
+
+        changesets::set_state(&mut holder, row.id, ChangesetState::Discarded, Utc::now())
+            .await
+            .unwrap();
+        holder.commit().await.unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(30), writing)
+            .await
+            .expect("the write finishes once the row is free")
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(refused.kind(), "Refused");
+        let message = refused.to_string();
+        assert!(
+            message.contains(&format!(
+                "changeset {handle} was published or discarded while this write waited"
+            )),
+            "{message}"
+        );
+        assert!(entries(&test, &handle).await.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_second_write_keeps_the_first_base_revision() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
-        let first = write(&ctx, "a.md", format!("{NOTE}One.\n")).await.unwrap();
+        let handle = open(&ctx).await;
+        write(&ctx, &handle, "a.md", format!("{NOTE}One.\n"))
+            .await
+            .unwrap();
         // Someone publishes a.md meanwhile (an import stands in for it), and
         // the server notices.
         let options = ImportOptions {
@@ -467,10 +580,11 @@ mod tests {
         state.refresh(test.app.pool()).await.unwrap();
         assert_eq!(state.current().revision("a.md"), Some(2));
 
-        let second = write(&ctx, "a.md", format!("{NOTE}Two.\n")).await.unwrap();
+        write(&ctx, &handle, "a.md", format!("{NOTE}Two.\n"))
+            .await
+            .unwrap();
 
-        assert_eq!(second.changeset, first.changeset);
-        let stored = entries(&test, second.changeset).await;
+        let stored = entries(&test, &handle).await;
         // Still the revision the first edit was made on: publish must see
         // that the published document moved on since.
         assert_eq!(stored[0].base_revision, Some(1));
@@ -484,13 +598,14 @@ mod tests {
     async fn machinery_and_secrets_are_refused_and_nothing_is_stored() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
         // Built at run time, so no source file holds a secret-shaped string.
         let secret = format!("{NOTE}password = {}\n", "Ab1".repeat(4));
 
-        let machinery = write(&ctx, "AGENTS.md", "# Mine now\n".to_string())
+        let machinery = write(&ctx, &handle, "AGENTS.md", "# Mine now\n".to_string())
             .await
             .unwrap_err();
-        let leaked = write(&ctx, "a.md", secret).await.unwrap_err();
+        let leaked = write(&ctx, &handle, "a.md", secret).await.unwrap_err();
 
         assert_eq!(machinery.kind(), "InvalidPath");
         assert!(
@@ -511,6 +626,7 @@ mod tests {
     async fn by_defaults_to_the_keys_actor_and_now_comes_from_the_clock() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
         // A plain function (no captures), so it is `'static` as `apply` needs.
         fn record(ws: &MemWorkspace, op_ctx: &OpContext<'_>) -> Result<OpOutcome, OkfError> {
             ws.write_atomic("a.md", &format!("{} {}", op_ctx.by, op_ctx.now.timestamp()))?;
@@ -518,19 +634,13 @@ mod tests {
         }
 
         let before = Utc::now().timestamp();
-        let defaulted = apply(&ctx, None, None, record).await.unwrap();
-        let content = entries(&test, defaulted.changeset).await[0]
-            .content
-            .clone()
-            .unwrap();
+        apply(&ctx, &handle, None, record).await.unwrap();
+        let content = entries(&test, &handle).await[0].content.clone().unwrap();
         let text = String::from_utf8(content).unwrap();
-        apply(&ctx, None, Some("human:pgrace"), record)
+        apply(&ctx, &handle, Some("human:pgrace"), record)
             .await
             .unwrap();
-        let overridden = entries(&test, defaulted.changeset).await[0]
-            .content
-            .clone()
-            .unwrap();
+        let overridden = entries(&test, &handle).await[0].content.clone().unwrap();
 
         let (by, at) = text.split_once(' ').unwrap();
         assert_eq!(by, "writer-a");
@@ -539,54 +649,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_overlay_shows_the_edit_to_this_key_and_label_only() {
+    async fn the_overlay_shows_the_edit_only_through_its_handle() {
         let test = pg().await;
         let author = writer(&test, "writer-a", "pg").await;
-        let other_key = writer(&test, "writer-b", "pg").await;
-        // The same key (stored above), on another label.
-        let other_label = context(
-            &test,
-            principal_as("writer-a", Access::Write, &[], Some("pg")),
-            None,
-        )
-        .with_label("draft");
+        let handle = open(&author).await;
+        let other_handle = open(&author).await;
         let state = test.app.catalog("pg").unwrap();
+        let pinned = author.changeset(&handle, Access::Read).await.unwrap();
+        let other = author.changeset(&other_handle, Access::Read).await.unwrap();
         // The view before the write, to show the write invalidates the cache.
-        author.view(&state).await.unwrap();
+        author.view(&state, Some(&pinned)).await.unwrap();
 
-        write(&author, "a.md", format!("{NOTE}Pending.\n"))
+        write(&author, &handle, "a.md", format!("{NOTE}Pending.\n"))
             .await
             .unwrap();
 
         let text =
             |view: crate::overlay::View| view.snapshot().get("a.md").unwrap().text().to_string();
+        // Pinned again, as the next read call would: the row's version moved.
+        let pinned = author.changeset(&handle, Access::Read).await.unwrap();
         assert_eq!(
-            text(author.view(&state).await.unwrap()),
+            text(author.view(&state, Some(&pinned)).await.unwrap()),
             format!("{NOTE}Pending.\n")
         );
-        assert_eq!(text(other_key.view(&state).await.unwrap()), NOTE);
-        assert_eq!(text(other_label.view(&state).await.unwrap()), NOTE);
+        assert_eq!(text(author.view(&state, None).await.unwrap()), NOTE);
+        assert_eq!(text(author.view(&state, Some(&other)).await.unwrap()), NOTE);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_gone_path_is_a_deletion_only_if_something_is_published() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
         // Deletion entries as a removing op leaves them (Task 11's `revert`
         // removes files with `MemWorkspace::remove`, not added yet): one for
         // the published a.md, one for new.md, which was never published.
         for path in ["a.md", "new.md"] {
             let edit = PendingEdit {
-                catalog: "pg",
                 path,
                 text: None,
                 at: Utc::now(),
             };
-            pending_entry(&test, &ctx, &edit).await;
+            pending_entry(&test, &handle, &edit).await;
         }
 
         // Every path is gone in the overlay; gone.md never had an entry.
-        let report = apply(&ctx, None, None, |_, _| {
+        let report = apply(&ctx, &handle, None, |_, _| {
             Ok(touched(&["a.md", "new.md", "gone.md"]))
         })
         .await
@@ -594,7 +702,7 @@ mod tests {
 
         // Only the path with an entry is reported.
         assert_eq!(report.touched, ["/a.md"]);
-        let stored = entries(&test, report.changeset).await;
+        let stored = entries(&test, &handle).await;
         // Only a.md, published, is left to delete; the others are dropped.
         let paths: Vec<&str> = stored.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(paths, ["a.md"]);
@@ -627,26 +735,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_writes_to_one_changeset_lose_no_edit() {
         let test = pg().await;
-        // The contexts are built per task below, so only the key row here.
         store_key(&test, "writer-a").await;
+        let connection = || {
+            context(
+                &test,
+                principal_as("writer-a", Access::Write, &[], Some("pg")),
+                None,
+            )
+        };
+        let handle = open(&connection()).await;
         let lines: Vec<String> = (0..6).map(|n| format!("Line {n}.\n")).collect();
 
         // Each task appends its own line to whatever a.md holds when its op
-        // runs. Without the changeset's row lock (`get_or_create` takes it,
-        // `changesets::lock` holds it and re-reads the row) two of them would
-        // read the same text, and the later upsert would drop the earlier
-        // line. The first writes also race to open the changeset.
+        // runs. Without the changeset's row lock (`changesets::lock` holds it
+        // and re-reads the row) two of them would read the same text, and
+        // the later upsert would drop the earlier line.
         let tasks: Vec<_> = lines
             .iter()
             .cloned()
             .map(|line| {
-                let ctx = context(
-                    &test,
-                    principal_as("writer-a", Access::Write, &[], Some("pg")),
-                    None,
-                );
+                // Each task its own context (`ToolContext` is not `Clone`)
+                // and its own copy of the handle; `move` hands both over.
+                let (ctx, handle) = (connection(), handle.clone());
                 tokio::spawn(async move {
-                    apply(&ctx, None, None, move |ws, _| {
+                    apply(&ctx, &handle, None, move |ws, _| {
                         let text = ws.read_to_string("a.md")?;
                         ws.write_atomic("a.md", &format!("{text}{line}"))?;
                         Ok(touched(&["a.md"]))
@@ -655,23 +767,11 @@ mod tests {
                 })
             })
             .collect();
-        let mut changeset_ids = Vec::with_capacity(tasks.len());
         for task in tasks {
-            changeset_ids.push(task.await.unwrap().unwrap().changeset);
+            assert_eq!(task.await.unwrap().unwrap().changeset, handle);
         }
 
-        // `dedup` drops only adjacent repeats, so sort first.
-        changeset_ids.sort_unstable();
-        changeset_ids.dedup();
-        assert_eq!(
-            changeset_ids.len(),
-            1,
-            "one changeset for one key and label"
-        );
-        let content = entries(&test, changeset_ids[0]).await[0]
-            .content
-            .clone()
-            .unwrap();
+        let content = entries(&test, &handle).await[0].content.clone().unwrap();
         let text = String::from_utf8(content).unwrap();
         for line in &lines {
             assert!(text.contains(line.as_str()), "{line:?} lost: {text}");

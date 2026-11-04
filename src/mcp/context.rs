@@ -1,6 +1,7 @@
 //! What one tool call acts as and on: the principal, the connection's
-//! catalogs and changeset label, one view of the catalog map, and the
-//! changeset a handle names ([`Pinned`]).
+//! catalogs (and, until M8 Task 5, its changeset label, which nothing looks
+//! up any more), one view of the catalog map, and the changeset a handle
+//! names ([`Pinned`]).
 
 use std::sync::Arc;
 
@@ -14,10 +15,10 @@ use crate::overlay::View;
 use crate::selection::{
     connection_catalogs, connection_label, resolve, Selection, Sources, DEFAULT_LABEL,
 };
-use crate::store::changesets::{self, ChangesetKey, ChangesetRow, ChangesetState};
+use crate::store::changesets::{self, ChangesetRow, ChangesetState};
 use crate::store::keys::Access;
 
-/// Is this [`ToolContext::view`] error the connection's overlay failing to
+/// Is this [`ToolContext::view`] error a changeset's overlay failing to
 /// apply, rather than the database failing?
 ///
 /// Only [`crate::overlay::build_overlay`] reports one, always as an
@@ -235,42 +236,89 @@ impl ToolContext {
         Ok(self.state(selection.write_target()))
     }
 
-    /// What this call reads of `state`: this key and label's overlay if they
-    /// have an open changeset in the catalog, else the published state.
+    /// The call's changeset, if it named one: what a read tool passes to
+    /// [`ToolContext::view`] (M8 Decision 6). Reads need only `read` access,
+    /// so the key that owns the changeset, or an admin, may read through it.
     ///
-    /// One lookup in the open-changeset index per call and catalog. A `read`
-    /// key can never write, so it never has a changeset and skips it.
+    /// # Arguments
+    /// * `handle` - the call's optional `changeset` argument.
+    ///
+    /// # Returns
+    /// The pinned changeset, or `None` without a handle.
+    ///
+    /// # Errors
+    /// As [`ToolContext::changeset`].
+    pub async fn pin(&self, handle: Option<&str>) -> Result<Option<Pinned>, OkfError> {
+        match handle {
+            None => Ok(None),
+            // `.map(Some)` wraps the `Ok` value: `Ok(pinned)` becomes `Ok(Some(pinned))`.
+            Some(handle) => self.changeset(handle, Access::Read).await.map(Some),
+        }
+    }
+
+    /// What this call reads of `state`: the pinned changeset's overlay if
+    /// it is in this catalog, else the published state (M8 Decision 6).
+    /// Without a pinned changeset a read is always published, whatever the
+    /// key's open changesets.
+    ///
+    /// The pinned row was read unlocked when the handle resolved. The overlay
+    /// cache matches that row's `version` and the catalog's generation, and
+    /// every write, publish and discard forgets the cached overlay, so a write
+    /// that commits meanwhile is seen by the next call, never cached stale.
     ///
     /// # Arguments
     /// * `state` - a catalog this call selected.
+    /// * `pinned` - the call's changeset, from [`ToolContext::pin`].
     ///
     /// # Returns
     /// The view.
     ///
     /// # Errors
-    /// [`OkfError::Database`]; an overlay build error
-    /// ([`crate::overlay::build_overlay`]).
-    pub async fn view(&self, state: &CatalogState) -> Result<View, OkfError> {
-        // `Access` is ordered (`Read < Write < Admin`), like an `IntEnum`.
-        if self.principal.access < Access::Write {
-            return Ok(View::Published(state.current()));
-        }
-        let key = ChangesetKey {
-            catalog_id: state.id(),
-            key_id: &self.principal.key_id,
-            label: &self.label,
-        };
-        match changesets::find_open(self.app.pool(), &key).await? {
+    /// An overlay build error ([`crate::overlay::build_overlay`]);
+    /// [`OkfError::Database`].
+    pub async fn view(
+        &self,
+        state: &CatalogState,
+        pinned: Option<&Pinned>,
+    ) -> Result<View, OkfError> {
+        // `filter` keeps the pinned changeset only if it is in this catalog.
+        match pinned.filter(|pinned| pinned.state.id() == state.id()) {
             None => Ok(View::Published(state.current())),
-            Some(changeset) => {
+            Some(pinned) => {
                 let overlay = self
                     .app
                     .overlays()
-                    .get(self.app.pool(), state, &changeset)
+                    .get(self.app.pool(), state, &pinned.row)
                     .await?;
                 Ok(View::Pending(overlay))
             }
         }
+    }
+
+    /// The one catalog a report runs on, given its changeset: `catalog`, else
+    /// the pinned changeset's catalog, else the first selected. A `pg`
+    /// handle on a `work,pg` connection so reports on `pg`.
+    ///
+    /// # Arguments
+    /// * `catalog` - the call's `catalog` argument.
+    /// * `pinned` - the call's changeset, from [`ToolContext::pin`].
+    ///
+    /// # Returns
+    /// That catalog's state.
+    ///
+    /// # Errors
+    /// As [`ToolContext::one`]; as [`require_selected`] for an explicit
+    /// `catalog` that is not the changeset's.
+    pub fn report_catalog(
+        &self,
+        catalog: Option<&str>,
+        pinned: Option<&Pinned>,
+    ) -> Result<Arc<CatalogState>, OkfError> {
+        // `or_else` runs the closure only when `catalog` is `None`.
+        let name = catalog.or_else(|| pinned.map(|pinned| pinned.state.name()));
+        let state = self.one(name)?;
+        require_selected(pinned, std::slice::from_ref(&state))?;
+        Ok(state)
     }
 
     /// Resolves a changeset handle for this call (M8 Decisions 1 and 3).
@@ -344,15 +392,44 @@ impl ToolContext {
     }
 }
 
+/// Refuses a pinned changeset whose catalog the call does not read (M8
+/// Decision 6), so a handle never silently reads as published.
+///
+/// # Arguments
+/// * `pinned` - the call's changeset, if any.
+/// * `states` - the catalogs the call reads.
+///
+/// # Errors
+/// [`OkfError::Refused`] naming the changeset's catalog.
+pub fn require_selected(
+    pinned: Option<&Pinned>,
+    states: &[Arc<CatalogState>],
+) -> Result<(), OkfError> {
+    // `let ... else`: without a pinned changeset there is nothing to check.
+    let Some(pinned) = pinned else {
+        return Ok(());
+    };
+    if states.iter().any(|state| state.id() == pinned.state.id()) {
+        return Ok(());
+    }
+    Err(OkfError::Refused {
+        reason: format!(
+            "changeset {} is in catalog {:?}, which this call does not read",
+            pinned.row.handle,
+            pinned.state.name()
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
 
-    use super::ToolContext;
+    use super::{require_selected, ToolContext};
     use crate::config::Config;
     use crate::mcp::changesets::{open_changeset, OpenParams};
     use crate::mcp::testing::{
-        app_with, context, pending_entry, principal, principal_as, store_key, PendingEdit,
+        app_with, context, open, pending_entry, principal, principal_as, store_key, PendingEdit,
     };
     use crate::selection::{CHANGESET_HEADER, DEFAULT_LABEL};
     use crate::store::changesets::{self, ChangesetState};
@@ -514,73 +591,66 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_connection_s_key_and_label_pick_its_changeset() {
-        let test = app_with(&[("pg", &[])], Config::default()).await;
-        store_key(&test, "alice").await;
-        store_key(&test, "bob").await;
-        let alice = || {
-            context(
-                &test,
-                principal_as("alice", Access::Write, &[], Some("pg")),
-                None,
-            )
-        };
-        let bob = context(
-            &test,
-            principal_as("bob", Access::Write, &[], Some("pg")),
-            None,
-        );
-        let edit = PendingEdit {
-            catalog: "pg",
-            path: "a.md",
-            text: Some("# A\n"),
-            at: Utc::now(),
-        };
-
-        let first = pending_entry(&test, &alice(), &edit).await;
-        let again = pending_entry(&test, &alice(), &edit).await;
-        let drafts = pending_entry(&test, &alice().with_label("drafts"), &edit).await;
-        let other_key = pending_entry(&test, &bob, &edit).await;
-
-        assert_eq!(again.id, first.id);
-        assert_eq!(again.version, 2);
-        assert_eq!(drafts.label, "drafts");
-        assert_ne!(drafts.id, first.id);
-        assert_eq!(other_key.key_id.as_deref(), Some("bob"));
-        assert_ne!(other_key.id, first.id);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_view_is_pending_only_for_the_key_and_label_with_an_open_changeset() {
+    async fn a_read_without_a_changeset_is_published_even_for_a_writer_with_drafts() {
         let test = app_with(&[("pg", &[("a.md", "# A\n")])], Config::default()).await;
         store_key(&test, "writer").await;
-        let writer = || {
-            context(
-                &test,
-                principal_as("writer", Access::Write, &[], Some("pg")),
-                None,
-            )
-        };
-        let reader = context(&test, principal(&[], Some("pg")), None);
-        let state = test.app.catalog("pg").unwrap();
-        let before = writer().view(&state).await.unwrap();
+        let writer = as_key(&test, "writer", Access::Write);
+        let handle = open(&writer).await;
         let edit = PendingEdit {
-            catalog: "pg",
             path: "a.md",
             text: Some("# Pending\n"),
             at: Utc::now(),
         };
+        pending_entry(&test, &handle, &edit).await;
+        let state = test.app.catalog("pg").unwrap();
 
-        pending_entry(&test, &writer(), &edit).await;
-        let mine = writer().view(&state).await.unwrap();
-        let other_label = writer().with_label("other").view(&state).await.unwrap();
-        let read_key = reader.view(&state).await.unwrap();
+        let pinned = writer.pin(Some(&handle)).await.unwrap();
+        let unpinned = writer.pin(None).await.unwrap();
+        let published = writer.view(&state, None).await.unwrap();
+        let drafts = writer.view(&state, pinned.as_ref()).await.unwrap();
 
-        assert!(!before.pending());
-        assert!(mine.pending());
-        assert_eq!(mine.snapshot().get("a.md").unwrap().text(), "# Pending\n");
-        assert!(!other_label.pending());
-        assert!(!read_key.pending());
-        assert_eq!(read_key.snapshot().get("a.md").unwrap().text(), "# A\n");
+        assert!(unpinned.is_none());
+        assert!(!published.pending());
+        assert_eq!(published.snapshot().get("a.md").unwrap().text(), "# A\n");
+        assert!(drafts.pending());
+        assert_eq!(drafts.snapshot().get("a.md").unwrap().text(), "# Pending\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pinned_changeset_applies_only_to_its_own_catalog() {
+        let test = app_with(
+            &[("pg", &[("a.md", "# A\n")]), ("work", &[("a.md", "# W\n")])],
+            Config::default(),
+        )
+        .await;
+        store_key(&test, "writer").await;
+        let writer = as_key(&test, "writer", Access::Write);
+        let handle = open(&writer).await;
+        let edit = PendingEdit {
+            path: "a.md",
+            text: Some("# Pending\n"),
+            at: Utc::now(),
+        };
+        pending_entry(&test, &handle, &edit).await;
+        let pinned = writer.pin(Some(&handle)).await.unwrap();
+        let pg = test.app.catalog("pg").unwrap();
+        let work = test.app.catalog("work").unwrap();
+
+        let in_work = writer.view(&work, pinned.as_ref()).await.unwrap();
+        let in_pg = writer.view(&pg, pinned.as_ref()).await.unwrap();
+        let outside = require_selected(pinned.as_ref(), std::slice::from_ref(&work)).unwrap_err();
+        let inside = require_selected(pinned.as_ref(), &[work, pg]);
+
+        assert!(!in_work.pending());
+        assert_eq!(in_work.snapshot().get("a.md").unwrap().text(), "# W\n");
+        assert!(in_pg.pending());
+        assert_eq!(outside.kind(), "Refused");
+        let message = outside.to_string();
+        assert!(
+            message.contains(&handle) && message.contains("\"pg\""),
+            "{message}"
+        );
+        assert!(inside.is_ok());
+        assert!(require_selected(None, &[]).is_ok());
     }
 }
