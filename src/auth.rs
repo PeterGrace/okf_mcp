@@ -442,7 +442,7 @@ mod tests {
             .unwrap();
         let names = ["pg".to_string()];
         let new = key_rows::NewKey {
-            id: "reader",
+            name: "reader",
             access: Access::Read,
             grants: key_rows::Grants::Catalogs(&names),
             default_catalog: Some("pg"),
@@ -466,7 +466,10 @@ mod tests {
         // A reload that fails keeps the cache it had.
         let other = key_rows::create_with_id(
             &db.pool,
-            &key_rows::NewKey { id: "other", ..new },
+            &key_rows::NewKey {
+                name: "other",
+                ..new
+            },
             Utc::now(),
         )
         .await

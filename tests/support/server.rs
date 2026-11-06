@@ -186,7 +186,7 @@ impl TestServer {
             Grants::Catalogs(&names)
         };
         let new = NewKey {
-            id,
+            name: id,
             access,
             grants,
             default_catalog: default,

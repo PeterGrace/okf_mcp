@@ -453,7 +453,8 @@ mod tests {
     }
 
     async fn new_key(pool: &PgPool, id: &str) -> String {
-        key_rows::insert_legacy_test_key(pool, id, Access::Read, "tester", Utc::now()).await
+        key_rows::insert_legacy_test_key(pool, id, key_rows::Access::Read, "tester", Utc::now())
+            .await
     }
 
     async fn app(pool: &PgPool) -> Arc<App> {

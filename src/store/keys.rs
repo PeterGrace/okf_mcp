@@ -67,7 +67,7 @@ pub enum Grants<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NewKey<'a> {
     /// Grouping name, `[A-Za-z0-9._-]+`.
-    pub id: &'a str,
+    pub name: &'a str,
     /// Its access level.
     pub access: Access,
     /// Its catalogs.
@@ -138,7 +138,7 @@ fn is_valid_name(name: &str) -> bool {
 ///
 /// # Arguments
 /// * `pool` - the database.
-/// * `new` - the key's id, access, grants, default catalog and actor.
+/// * `new` - the key's name, access, grants, default catalog and actor.
 /// * `now` - the creation time (server clock).
 ///
 /// # Returns
@@ -163,11 +163,11 @@ pub async fn create_with_id(
     new: &NewKey<'_>,
     now: DateTime<Utc>,
 ) -> Result<CreatedKey, OkfError> {
-    if !is_valid_name(new.id) {
+    if !is_valid_name(new.name) {
         return Err(OkfError::Refused {
             reason: format!(
                 "key name {:?} must be letters, digits, '.', '_' and '-'",
-                new.id
+                new.name
             ),
         });
     }
@@ -176,7 +176,7 @@ pub async fn create_with_id(
         return Err(OkfError::Refused {
             reason: format!(
                 "key {:?} must be granted a catalog, or every catalog",
-                new.id
+                new.name
             ),
         });
     }
@@ -209,7 +209,7 @@ pub async fn create_with_id(
          (name, sha256, access, all_catalogs, default_catalog_id, actor, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
     )
-    .bind(new.id)
+    .bind(new.name)
     .bind(crate::keys::hash(&key).as_slice())
     .bind(new.access.as_str())
     .bind(matches!(new.grants, Grants::All))
@@ -233,7 +233,7 @@ pub async fn create_with_id(
             return Err(OkfError::Refused {
                 reason: format!(
                     "an active key named {:?} with actor {:?} already exists",
-                    new.id, new.actor
+                    new.name, new.actor
                 ),
             })
         }
@@ -559,9 +559,9 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap()
     }
 
-    fn new_key<'a>(id: &'a str, grants: Grants<'a>, default: Option<&'a str>) -> NewKey<'a> {
+    fn new_key<'a>(name: &'a str, grants: Grants<'a>, default: Option<&'a str>) -> NewKey<'a> {
         NewKey {
-            id,
+            name,
             access: Access::Write,
             grants,
             default_catalog: default,
@@ -744,7 +744,7 @@ mod tests {
         let db = test_db().await;
         let work_catalog = catalogs::create(&db.pool, "work", "", now()).await.unwrap();
         let terminal = NewKey {
-            id: "claude",
+            name: "claude",
             access: Access::Write,
             grants: Grants::All,
             default_catalog: None,
@@ -868,7 +868,7 @@ mod tests {
         let by_id = create_with_id(
             &db.pool,
             &NewKey {
-                id: "first-name",
+                name: "first-name",
                 access: Access::Write,
                 grants: Grants::Catalogs(&work),
                 default_catalog: None,
@@ -879,7 +879,7 @@ mod tests {
         .await
         .unwrap();
         let collision = NewKey {
-            id: &by_id.id,
+            name: &by_id.id,
             access: Access::Write,
             grants: Grants::Catalogs(&work),
             default_catalog: None,
@@ -906,7 +906,7 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .any(|record| record.name == collision.id && record.revoked_at.is_none()));
+            .any(|record| record.name == collision.name && record.revoked_at.is_none()));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -919,7 +919,7 @@ mod tests {
         let web = create_with_id(
             &db.pool,
             &NewKey {
-                id: "legacy",
+                name: "legacy",
                 access: Access::Write,
                 grants: Grants::Catalogs(&work),
                 default_catalog: None,
@@ -941,7 +941,7 @@ mod tests {
         let replacement = create_with_id(
             &db.pool,
             &NewKey {
-                id: "legacy",
+                name: "legacy",
                 access: Access::Write,
                 grants: Grants::Catalogs(&work),
                 default_catalog: None,
