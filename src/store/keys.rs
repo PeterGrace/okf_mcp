@@ -193,12 +193,6 @@ pub async fn create_with_id(
         (Some(_), Grants::All) | (None, _) => None,
     };
     let mut tx = pool.begin().await?;
-    // Serialise issuance within one grouping name so concurrent requests get
-    // the same clean duplicate-name refusal rather than racing the index.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(new.id)
-        .execute(&mut *tx)
-        .await?;
     let granted = match new.grants {
         Grants::All => Vec::new(),
         Grants::Catalogs(names) => catalog_ids(&mut tx, names).await?,
