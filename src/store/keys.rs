@@ -251,6 +251,32 @@ pub async fn create_with_id(
     Ok(CreatedKey { id, key })
 }
 
+/// Inserts a test-only legacy row whose immutable id is also its name.
+#[cfg(test)]
+pub(crate) async fn insert_legacy_test_key(
+    pool: &PgPool,
+    id: &str,
+    access: Access,
+    actor: &str,
+    now: DateTime<Utc>,
+) -> String {
+    let key = crate::keys::generate().expect("generate test key");
+    sqlx::query(
+        "INSERT INTO api_keys \
+         (id, name, sha256, access, all_catalogs, actor, created_at) \
+         VALUES ($1, $1, $2, $3, true, $4, $5)",
+    )
+    .bind(id)
+    .bind(crate::keys::hash(&key).as_slice())
+    .bind(access.as_str())
+    .bind(actor)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert legacy test key");
+    key
+}
+
 /// The ids of the catalogs called `names`, in the same order, in one query.
 ///
 /// # Errors
@@ -882,17 +908,7 @@ mod tests {
     async fn a_legacy_id_uses_active_name_resolution_after_rotation() {
         let db = test_db().await;
         catalogs::create(&db.pool, "work", "", now()).await.unwrap();
-        let legacy_secret = crate::keys::generate().unwrap();
-        sqlx::query(
-            "INSERT INTO api_keys \
-             (id, name, sha256, access, all_catalogs, actor, created_at) \
-             VALUES ('legacy', 'legacy', $1, 'write', true, 'terminal', $2)",
-        )
-        .bind(crate::keys::hash(&legacy_secret).as_slice())
-        .bind(now())
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        insert_legacy_test_key(&db.pool, "legacy", Access::Write, "terminal", now()).await;
 
         let work = ["work".to_string()];
         let web = create_with_id(

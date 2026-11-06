@@ -453,19 +453,7 @@ mod tests {
     }
 
     async fn new_key(pool: &PgPool, id: &str) -> String {
-        let key = crate::keys::generate().unwrap();
-        sqlx::query(
-            "INSERT INTO api_keys \
-             (id, name, sha256, access, all_catalogs, actor, created_at) \
-             VALUES ($1, $1, $2, 'read', true, 'tester', $3)",
-        )
-        .bind(id)
-        .bind(crate::keys::hash(&key).as_slice())
-        .bind(Utc::now())
-        .execute(pool)
-        .await
-        .unwrap();
-        key
+        key_rows::insert_legacy_test_key(pool, id, Access::Read, "tester", Utc::now()).await
     }
 
     async fn app(pool: &PgPool) -> Arc<App> {

@@ -625,17 +625,14 @@ mod tests {
     async fn setup(pool: &PgPool) -> i64 {
         let pg = catalogs::create(pool, "pg", "", now()).await.unwrap();
         for id in ["alice", "bob"] {
-            sqlx::query(
-                "INSERT INTO api_keys \
-                 (id, name, sha256, access, all_catalogs, actor, created_at) \
-                 VALUES ($1, $1, $2, 'write', true, $1, $3)",
+            crate::store::keys::insert_legacy_test_key(
+                pool,
+                id,
+                crate::store::keys::Access::Write,
+                id,
+                now(),
             )
-            .bind(id)
-            .bind(crate::keys::hash(id).as_slice())
-            .bind(now())
-            .execute(pool)
-            .await
-            .unwrap();
+            .await;
         }
         pg.id
     }
@@ -994,16 +991,14 @@ mod tests {
         let db = test_db().await;
         let catalog = catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
         // `changesets.key_id` is a foreign key: the key needs a row.
-        sqlx::query(
-            "INSERT INTO api_keys \
-             (id, name, sha256, access, all_catalogs, actor, created_at) \
-             VALUES ('writer', 'writer', $1, 'write', true, 'writer', $2)",
+        crate::store::keys::insert_legacy_test_key(
+            &db.pool,
+            "writer",
+            crate::store::keys::Access::Write,
+            "writer",
+            now(),
         )
-        .bind(crate::keys::hash("writer").as_slice())
-        .bind(now())
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        .await;
         let row = opened(&db.pool, catalog.id, "writer", now()).await;
         let mut holder = db.pool.begin().await.unwrap();
         lock(&mut holder, row.id).await.unwrap();

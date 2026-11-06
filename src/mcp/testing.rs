@@ -146,17 +146,14 @@ pub(crate) fn principal(reach: &[&str], default: Option<&str>) -> Arc<Principal>
 /// # Panics
 /// If the store refuses it.
 pub(crate) async fn store_key(test: &TestApp, key_id: &str) {
-    let secret = crate::keys::generate().expect("generate test key");
-    sqlx::query(
-        "INSERT INTO api_keys (id, name, sha256, access, all_catalogs, actor, created_at) \
-         VALUES ($1, $1, $2, 'admin', true, $1, $3)",
+    crate::store::keys::insert_legacy_test_key(
+        test.app.pool(),
+        key_id,
+        Access::Admin,
+        key_id,
+        Utc::now(),
     )
-    .bind(key_id)
-    .bind(crate::keys::hash(&secret).as_slice())
-    .bind(Utc::now())
-    .execute(test.app.pool())
-    .await
-    .expect("store the test key");
+    .await;
 }
 
 /// A tool context for a `write` key reaching every catalog: the key's row
