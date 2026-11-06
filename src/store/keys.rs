@@ -454,10 +454,18 @@ async fn resolve_active(
     target: &str,
     actor: Option<&str>,
 ) -> Result<String, OkfError> {
+    if actor.is_none() {
+        let exact: Option<String> = sqlx::query_scalar("SELECT id FROM api_keys WHERE id = $1")
+            .bind(target)
+            .fetch_optional(&mut *conn)
+            .await?;
+        if let Some(id) = exact {
+            return Ok(id);
+        }
+    }
     let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM api_keys WHERE \
-         (($2::text IS NULL AND (id = $1 OR (name = $1 AND revoked_at IS NULL))) \
-          OR ($2::text IS NOT NULL AND name = $1 AND actor = $2 AND revoked_at IS NULL)) \
+        "SELECT id FROM api_keys WHERE revoked_at IS NULL AND name = $1 \
+         AND ($2::text IS NULL OR actor = $2) \
          ORDER BY actor, id",
     )
     .bind(target)
@@ -698,7 +706,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn names_group_actors_and_revoked_pairs_can_be_reissued() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "work", "", now()).await.unwrap();
+        let work_catalog = catalogs::create(&db.pool, "work", "", now()).await.unwrap();
         let terminal = NewKey {
             id: "claude",
             access: Access::Write,
@@ -713,6 +721,17 @@ mod tests {
 
         let first = create_with_id(&db.pool, &terminal, now()).await.unwrap();
         let second = create_with_id(&db.pool, &web, now()).await.unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        let old_changeset = crate::store::changesets::open(
+            &mut tx,
+            work_catalog.id,
+            &first.id,
+            terminal.actor,
+            now(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
         assert_ne!(first.id, "claude");
         assert_ne!(second.id, first.id);
         assert!(matches!(
@@ -738,6 +757,19 @@ mod tests {
         assert_eq!(revoked_id, first.id);
         let replacement = create_with_id(&db.pool, &terminal, now()).await.unwrap();
         assert_ne!(replacement.id, first.id);
+        let historical = crate::store::changesets::list_open(&db.pool, &[work_catalog.id], None)
+            .await
+            .unwrap();
+        let historical = historical
+            .iter()
+            .find(|row| row.changeset.handle == old_changeset.handle)
+            .unwrap();
+        assert_eq!(
+            historical.changeset.key_id.as_deref(),
+            Some(first.id.as_str())
+        );
+        assert_eq!(historical.key_name.as_deref(), Some("claude"));
+        assert_eq!(historical.changeset.actor, terminal.actor);
 
         let records = list(&db.pool).await.unwrap();
         assert_eq!(records.len(), 3);
@@ -770,5 +802,49 @@ mod tests {
             cache.find(&replacement.key).is_some(),
             "the reissued key works"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exact_id_wins_over_a_colliding_group_name() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "work", "", now()).await.unwrap();
+        let work = ["work".to_string()];
+        let by_id = create_with_id(
+            &db.pool,
+            &NewKey {
+                id: "first-name",
+                access: Access::Write,
+                grants: Grants::Catalogs(&work),
+                default_catalog: None,
+                actor: "first",
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        let collision = NewKey {
+            id: &by_id.id,
+            access: Access::Write,
+            grants: Grants::Catalogs(&work),
+            default_catalog: None,
+            actor: "second",
+        };
+        create(&db.pool, &collision, now()).await.unwrap();
+
+        grant_target(&db.pool, &by_id.id, None, "work")
+            .await
+            .unwrap();
+        ungrant_target(&db.pool, &by_id.id, None, "work")
+            .await
+            .unwrap();
+        let revoked = revoke_target(&db.pool, &by_id.id, None, now())
+            .await
+            .unwrap();
+        assert_eq!(revoked, by_id.id);
+        assert!(list(&db.pool)
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.name == collision.id && record.revoked_at.is_none()));
     }
 }
