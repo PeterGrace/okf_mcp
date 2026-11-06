@@ -510,12 +510,29 @@ async fn resolve_active(
     .await?;
     match ids.as_slice() {
         [id] => Ok(id.clone()),
-        [] => Err(OkfError::Refused {
-            reason: match actor {
-                Some(actor) => format!("no active key named {target:?} with actor {actor:?}"),
-                None => format!("no active key or key id {target:?}"),
-            },
-        }),
+        [] => {
+            // Only diagnose revoked names after looking for live replacements.
+            let revoked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM api_keys WHERE name = $1 \
+                 AND revoked_at IS NOT NULL AND ($2::text IS NULL OR actor = $2))",
+            )
+            .bind(target)
+            .bind(actor)
+            .fetch_one(&mut *conn)
+            .await?;
+            Err(OkfError::Refused {
+                reason: match (revoked, actor) {
+                    (true, Some(actor)) => {
+                        format!("key named {target:?} with actor {actor:?} is revoked")
+                    }
+                    (true, None) => format!("key {target:?} is revoked"),
+                    (false, Some(actor)) => {
+                        format!("no active key named {target:?} with actor {actor:?}")
+                    }
+                    (false, None) => format!("no active key or key id {target:?}"),
+                },
+            })
+        }
         _ => Err(OkfError::Refused {
             reason: format!(
                 "key name {target:?} is ambiguous; use its id or pass --actor (matching ids: {})",
@@ -694,7 +711,7 @@ mod tests {
         ));
         assert!(matches!(
             grant(&db.pool, "k", "pg").await,
-            Err(OkfError::Refused { reason }) if reason.contains("no active key")
+            Err(OkfError::Refused { reason }) if reason.contains("is revoked")
         ));
         assert!(matches!(
             ungrant(&db.pool, "k", "work").await,
@@ -938,6 +955,16 @@ mod tests {
         revoke_target(&db.pool, "legacy", Some("terminal"), now())
             .await
             .unwrap();
+        for actor in [None, Some("terminal")] {
+            assert!(matches!(
+                revoke_target(&db.pool, "legacy", actor, now()).await,
+                Err(OkfError::Refused { reason }) if reason.contains("is revoked")
+            ));
+        }
+        assert!(matches!(
+            revoke_target(&db.pool, "legacy", Some("unknown"), now()).await,
+            Err(OkfError::Refused { reason }) if reason.contains("no active key")
+        ));
         let replacement = create_with_id(
             &db.pool,
             &NewKey {
