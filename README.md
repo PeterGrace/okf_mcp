@@ -43,7 +43,7 @@ below cover local use.
     okf-mcp migrate
     okf-mcp catalog create pg --description "pgrace's catalog"
     git -C ~/repos/pg_knowledge_catalog archive --format=tar.gz HEAD | okf-mcp import pg -
-    okf-mcp key create laptop --access write --catalogs pg --default pg --actor claude-code/claude-opus-5-5
+    okf-mcp key create claude --access write --catalogs pg --default pg --actor claude-code/claude-opus-5-5
     okf-mcp export pg pg.tar.gz
 
 Every subcommand reads the database URL from `DATABASE_URL` (or
@@ -63,7 +63,11 @@ is refused with every problem listed. A directory is read leniently, through
 the same listing as the analyses: untracked files are included, and a
 symlink, special file or non-UTF-8 name it cannot store is flattened or
 skipped with a warning (see `src/archive.rs`). `key create` prints the new key
-once; only its SHA-256 is stored.
+once and its immutable id on stderr; only the key's SHA-256 is stored. The
+positional value is a grouping name: several live credentials may share it
+when their actors differ. `revoke`, `grant` and `ungrant` accept the immutable
+id, an unambiguous live name, or `NAME --actor ACTOR`. A revoked name/actor
+pair can be issued again without changing the old credential's history.
 
 ## Running the server
 
@@ -103,7 +107,7 @@ stops working at the next poll too):
     git -C ~/repos/pg_knowledge_catalog archive --format=tar.gz HEAD | okf-mcp import pg -
     okf-mcp key create laptop --access read --catalogs pg --default pg
 
-`key create` prints the key once. Keep it in an environment variable, here
+`key create` prints the key once (and its administration id on stderr). Keep it in an environment variable, here
 `OKF_MCP_KEY`, and never in a file you commit.
 
 ### Connecting a client
@@ -160,7 +164,7 @@ a `LintFailed` error and `a.md` in `lint`'s result, on purpose.
 | `links_report` | `okf.py links --json` (`mentions`, default true) |
 | `lint` | `okf.py lint --json` on the published catalog, or with `changeset` on that changeset's drafts applied to it |
 | `pending_changes` | The changeset `changeset` names: each changed path, its base and current revision, whether it is stale or replayable, and a unified diff |
-| `list_changesets` | The open changesets the key may use, empty ones included: its own, or with an `admin` key every key's in the catalogs it reaches. Each row has the handle, catalog, key, actor, creation and last-change times, `/`-prefixed paths, and `idle` (no change within `session_idle_timeout`) |
+| `list_changesets` | The open changesets the key may use, empty ones included: its own, or with an `admin` key every key's in the catalogs it reaches. Each row has the handle, catalog, key name and immutable id, actor, creation and last-change times, `/`-prefixed paths, and `idle` (no change within `session_idle_timeout`) |
 
 `get_concept`, `read_document` and `history` without `catalog` answer from
 the first selected catalog that has the path; the reports run on the first

@@ -108,8 +108,8 @@ mod tests {
 
         // A key, for the changesets below and `key_catalogs` further down.
         sqlx::query(
-            "INSERT INTO api_keys (id, sha256, access, all_catalogs, default_catalog_id, \
-             actor, created_at) VALUES ('k1', $1, 'read', false, $2, 'a', $3)",
+            "INSERT INTO api_keys (id, name, sha256, access, all_catalogs, default_catalog_id, \
+             actor, created_at) VALUES ('k1', 'k1', $1, 'read', false, $2, 'a', $3)",
         )
         .bind(vec![0u8; 32])
         .bind(catalog)

@@ -278,6 +278,7 @@ mod tests {
     fn record(id: &str, key: &str, revoked: bool) -> KeyRecord {
         KeyRecord {
             id: id.to_string(),
+            name: id.to_string(),
             sha256: keys::hash(key).to_vec(),
             access: Access::Read,
             all_catalogs: false,
@@ -447,10 +448,13 @@ mod tests {
             default_catalog: Some("pg"),
             actor: "tester",
         };
-        let key = key_rows::create(&db.pool, &new, Utc::now()).await.unwrap();
+        let created = key_rows::create_with_id(&db.pool, &new, Utc::now())
+            .await
+            .unwrap();
+        let key = created.key;
 
         let loaded = Keys::load(&db.pool).await.unwrap();
-        assert_eq!(loaded.find(&key).unwrap().key_id, "reader");
+        assert_eq!(loaded.find(&key).unwrap().key_id, created.id);
         key_rows::revoke(&db.pool, "reader", Utc::now())
             .await
             .unwrap();
@@ -460,7 +464,7 @@ mod tests {
 
         assert!(loaded.find(&key).is_none());
         // A reload that fails keeps the cache it had.
-        let other = key_rows::create(
+        let other = key_rows::create_with_id(
             &db.pool,
             &key_rows::NewKey { id: "other", ..new },
             Utc::now(),
@@ -470,6 +474,6 @@ mod tests {
         loaded.reload(&db.pool).await.unwrap();
         db.pool.close().await;
         assert!(loaded.reload(&db.pool).await.is_err());
-        assert_eq!(loaded.find(&other).unwrap().key_id, "other");
+        assert_eq!(loaded.find(&other.key).unwrap().key_id, other.id);
     }
 }

@@ -126,13 +126,19 @@ pub enum KeyCommand {
     List,
     /// Revoke a key.
     Revoke {
-        /// The key's id.
+        /// The key's id, or an unambiguous active name.
         id: String,
+        /// Select this actor when `id` is a name.
+        #[arg(long)]
+        actor: Option<String>,
     },
     /// Grant a key a catalog.
     Grant {
         /// The key's id.
         id: String,
+        /// Select this actor when `id` is a name.
+        #[arg(long)]
+        actor: Option<String>,
         /// The catalog.
         catalog: String,
     },
@@ -140,6 +146,9 @@ pub enum KeyCommand {
     Ungrant {
         /// The key's id.
         id: String,
+        /// Select this actor when `id` is a name.
+        #[arg(long)]
+        actor: Option<String>,
         /// The catalog.
         catalog: String,
     },
@@ -150,7 +159,7 @@ pub enum KeyCommand {
 // variant (`Create(KeyCreateArgs)`) can hold.
 #[derive(Debug, Args)]
 pub struct KeyCreateArgs {
-    /// Unique id (`[A-Za-z0-9._-]+`).
+    /// Grouping name (`[A-Za-z0-9._-]+`).
     pub id: String,
     /// Access level.
     #[arg(long, value_enum)]
@@ -437,9 +446,12 @@ async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyho
                 default_catalog: args.default.as_deref(),
                 actor: args.actor.as_deref().unwrap_or(&args.id),
             };
-            let key = keys::create(pool, &new, clock.now()).await?;
-            println!("{key}");
-            eprintln!("store this key now: it is not shown again");
+            let created = keys::create_with_id(pool, &new, clock.now()).await?;
+            println!("{}", created.key);
+            eprintln!(
+                "key id: {}\nstore this key now: it is not shown again",
+                created.id
+            );
         }
         KeyCommand::List => {
             for key in keys::list(pool).await? {
@@ -454,25 +466,26 @@ async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyho
                     "active"
                 };
                 println!(
-                    "{}\t{}\t{state}\t{catalogs}\tdefault {}\t{}",
+                    "{}\t{}\t{}\t{}\t{state}\t{catalogs}\tdefault {}",
+                    key.name,
+                    key.actor,
                     key.id,
                     key.access.as_str(),
-                    key.default_catalog.as_deref().unwrap_or("-"),
-                    key.actor
+                    key.default_catalog.as_deref().unwrap_or("-")
                 );
             }
         }
-        KeyCommand::Revoke { id } => {
-            keys::revoke(pool, &id, clock.now()).await?;
-            println!("revoked key {id}");
+        KeyCommand::Revoke { id, actor } => {
+            let resolved = keys::revoke_target(pool, &id, actor.as_deref(), clock.now()).await?;
+            println!("revoked key {resolved}");
         }
-        KeyCommand::Grant { id, catalog } => {
-            keys::grant(pool, &id, &catalog).await?;
-            println!("granted {catalog} to key {id}");
+        KeyCommand::Grant { id, actor, catalog } => {
+            let resolved = keys::grant_target(pool, &id, actor.as_deref(), &catalog).await?;
+            println!("granted {catalog} to key {resolved}");
         }
-        KeyCommand::Ungrant { id, catalog } => {
-            keys::ungrant(pool, &id, &catalog).await?;
-            println!("removed {catalog} from key {id}");
+        KeyCommand::Ungrant { id, actor, catalog } => {
+            let resolved = keys::ungrant_target(pool, &id, actor.as_deref(), &catalog).await?;
+            println!("removed {catalog} from key {resolved}");
         }
     }
     Ok(())
@@ -661,6 +674,7 @@ mod tests {
         .unwrap();
         let revoke = KeyCommand::Revoke {
             id: "k".to_string(),
+            actor: None,
         };
         run(cli(url, Command::Key(revoke)), Arc::clone(&clock))
             .await
