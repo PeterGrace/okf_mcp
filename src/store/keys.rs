@@ -218,6 +218,9 @@ pub async fn create_with_id(
     .bind(now)
     .fetch_one(&mut *tx)
     .await;
+    // Only the live name/actor constraint is a user-facing duplicate. A
+    // `sha256` UNIQUE violation (a credential-hash collision) remains a
+    // database error rather than being mislabeled as a taken name.
     let id = match inserted {
         Ok(id) => id,
         Err(error)
