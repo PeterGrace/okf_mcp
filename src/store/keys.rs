@@ -454,6 +454,19 @@ async fn resolve_active(
     target: &str,
     actor: Option<&str>,
 ) -> Result<String, OkfError> {
+    if actor.is_some() {
+        let is_id: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1)")
+            .bind(target)
+            .fetch_one(&mut *conn)
+            .await?;
+        if is_id {
+            return Err(OkfError::Refused {
+                reason: format!(
+                    "--actor selects a key name and cannot be used with key id {target:?}"
+                ),
+            });
+        }
+    }
     if actor.is_none() {
         let exact: Option<String> = sqlx::query_scalar("SELECT id FROM api_keys WHERE id = $1")
             .bind(target)
@@ -850,6 +863,11 @@ mod tests {
             actor: "second",
         };
         create(&db.pool, &collision, now()).await.unwrap();
+
+        assert!(matches!(
+            grant_target(&db.pool, &by_id.id, Some("first"), "work").await,
+            Err(OkfError::Refused { reason }) if reason.contains("cannot be used with key id")
+        ));
 
         grant_target(&db.pool, &by_id.id, None, "work")
             .await

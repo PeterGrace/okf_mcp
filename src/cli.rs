@@ -134,7 +134,7 @@ pub enum KeyCommand {
     },
     /// Grant a key a catalog.
     Grant {
-        /// The key's id.
+        /// The key's id, or an unambiguous active name.
         id: String,
         /// Select this actor when `id` is a name.
         #[arg(long)]
@@ -144,7 +144,7 @@ pub enum KeyCommand {
     },
     /// Remove a key's grant of a catalog (and clear it as the key's default).
     Ungrant {
-        /// The key's id.
+        /// The key's id, or an unambiguous active name.
         id: String,
         /// Select this actor when `id` is a name.
         #[arg(long)]
