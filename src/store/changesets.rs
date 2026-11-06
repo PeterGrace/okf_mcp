@@ -132,6 +132,8 @@ pub struct ListedRow {
     pub changeset: ChangesetRow,
     /// Its catalog's name (joined from `catalogs`).
     pub catalog: String,
+    /// The credential's grouping name; null only if its key row was deleted.
+    pub key_name: Option<String>,
     /// Its entries' paths, catalog-relative and sorted; empty for an empty
     /// changeset.
     pub paths: Vec<String>,
@@ -176,6 +178,7 @@ struct RawListed {
     #[sqlx(flatten)]
     changeset: RawChangeset,
     catalog: String,
+    key_name: Option<String>,
     paths: Vec<String>,
 }
 
@@ -530,15 +533,16 @@ pub async fn list_open(
     // Rust `None`) turns that filter off.
     let rows = sqlx::query_as::<_, RawListed>(
         "SELECT c.id, c.handle, c.catalog_id, c.key_id, c.actor, c.state, c.version, \
-         c.created_at, c.updated_at, k.name AS catalog, \
+         c.created_at, c.updated_at, k.name AS catalog, a.name AS key_name, \
          COALESCE(array_agg(e.path ORDER BY e.path) FILTER (WHERE e.path IS NOT NULL), \
          '{}') AS paths \
          FROM changesets c \
          JOIN catalogs k ON k.id = c.catalog_id \
+         LEFT JOIN api_keys a ON a.id = c.key_id \
          LEFT JOIN changeset_entries e ON e.changeset_id = c.id \
          WHERE c.state = 'open' AND c.catalog_id = ANY($1) \
          AND ($2::text IS NULL OR c.key_id = $2) \
-         GROUP BY c.id, k.name \
+         GROUP BY c.id, k.name, a.name \
          ORDER BY k.name, c.updated_at, c.id",
     )
     .bind(catalog_ids)
@@ -550,6 +554,7 @@ pub async fn list_open(
         .map(|raw| ListedRow {
             changeset: raw.changeset.into(),
             catalog: raw.catalog,
+            key_name: raw.key_name,
             paths: raw.paths,
         })
         .collect())
@@ -605,7 +610,6 @@ mod tests {
     use crate::db::test_db;
     use crate::store::catalogs;
     use crate::store::catalogs::tests::until_a_lock_is_awaited;
-    use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
     use chrono::{TimeDelta, TimeZone};
     use std::time::Duration;
 
@@ -621,14 +625,14 @@ mod tests {
     async fn setup(pool: &PgPool) -> i64 {
         let pg = catalogs::create(pool, "pg", "", now()).await.unwrap();
         for id in ["alice", "bob"] {
-            let new = NewKey {
+            crate::store::keys::insert_legacy_test_key(
+                pool,
                 id,
-                access: Access::Write,
-                grants: Grants::All,
-                default_catalog: None,
-                actor: id,
-            };
-            key_rows::create(pool, &new, now()).await.unwrap();
+                crate::store::keys::Access::Write,
+                id,
+                now(),
+            )
+            .await;
         }
         pg.id
     }
@@ -987,14 +991,14 @@ mod tests {
         let db = test_db().await;
         let catalog = catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
         // `changesets.key_id` is a foreign key: the key needs a row.
-        let new_key = NewKey {
-            id: "writer",
-            access: Access::Write,
-            grants: Grants::All,
-            default_catalog: None,
-            actor: "writer",
-        };
-        key_rows::create(&db.pool, &new_key, now()).await.unwrap();
+        crate::store::keys::insert_legacy_test_key(
+            &db.pool,
+            "writer",
+            crate::store::keys::Access::Write,
+            "writer",
+            now(),
+        )
+        .await;
         let row = opened(&db.pool, catalog.id, "writer", now()).await;
         let mut holder = db.pool.begin().await.unwrap();
         lock(&mut holder, row.id).await.unwrap();

@@ -429,7 +429,7 @@ mod tests {
     use crate::okf::workspace::StoredFile;
     use crate::store::changesets::{ChangesetState, EntryRow};
     use crate::store::import::{import, ImportOptions};
-    use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
+    use crate::store::keys as key_rows;
     use chrono::{DateTime, TimeDelta, Utc};
     use std::time::{Duration, Instant};
 
@@ -453,14 +453,8 @@ mod tests {
     }
 
     async fn new_key(pool: &PgPool, id: &str) -> String {
-        let new = NewKey {
-            id,
-            access: Access::Read,
-            grants: Grants::All,
-            default_catalog: None,
-            actor: "tester",
-        };
-        key_rows::create(pool, &new, Utc::now()).await.unwrap()
+        key_rows::insert_legacy_test_key(pool, id, key_rows::Access::Read, "tester", Utc::now())
+            .await
     }
 
     async fn app(pool: &PgPool) -> Arc<App> {

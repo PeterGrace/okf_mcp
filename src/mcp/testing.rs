@@ -17,7 +17,7 @@ use crate::mcp::context::ToolContext;
 use crate::store::catalogs;
 use crate::store::changesets::{self, ChangesetRow, EntryRow};
 use crate::store::import::{import, ImportOptions};
-use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
+use crate::store::keys::Access;
 
 /// An app and the database under it. Fields drop in declaration order: the
 /// app (and its pool) before the container.
@@ -146,16 +146,14 @@ pub(crate) fn principal(reach: &[&str], default: Option<&str>) -> Arc<Principal>
 /// # Panics
 /// If the store refuses it.
 pub(crate) async fn store_key(test: &TestApp, key_id: &str) {
-    let new = NewKey {
-        id: key_id,
-        access: Access::Admin,
-        grants: Grants::All,
-        default_catalog: None,
-        actor: key_id,
-    };
-    key_rows::create(test.app.pool(), &new, Utc::now())
-        .await
-        .expect("store the test key");
+    crate::store::keys::insert_legacy_test_key(
+        test.app.pool(),
+        key_id,
+        Access::Admin,
+        key_id,
+        Utc::now(),
+    )
+    .await;
 }
 
 /// A tool context for a `write` key reaching every catalog: the key's row

@@ -108,8 +108,8 @@ mod tests {
 
         // A key, for the changesets below and `key_catalogs` further down.
         sqlx::query(
-            "INSERT INTO api_keys (id, sha256, access, all_catalogs, default_catalog_id, \
-             actor, created_at) VALUES ('k1', $1, 'read', false, $2, 'a', $3)",
+            "INSERT INTO api_keys (id, name, sha256, access, all_catalogs, default_catalog_id, \
+             actor, created_at) VALUES ('k1', 'k1', $1, 'read', false, $2, 'a', $3)",
         )
         .bind(vec![0u8; 32])
         .bind(catalog)
@@ -213,5 +213,68 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(default_catalog, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn key_name_migration_preserves_existing_credentials_and_history() {
+        let db = pg_support::TestDb::start().await;
+        for migration in [
+            include_str!("../migrations/0001_schema.sql"),
+            include_str!("../migrations/0002_changeset_identity.sql"),
+            include_str!("../migrations/0003_changeset_handles.sql"),
+            include_str!("../migrations/0004_drop_changeset_labels.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&db.pool).await.unwrap();
+        }
+        let now = chrono::Utc::now();
+        let catalog: i64 = sqlx::query_scalar(
+            "INSERT INTO catalogs (name, created_at) VALUES ('pg', $1) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let secret = "okf_existing-holder-secret";
+        sqlx::query(
+            "INSERT INTO api_keys \
+             (id, sha256, access, all_catalogs, actor, created_at) \
+             VALUES ('legacy', $1, 'write', true, 'legacy-actor', $2)",
+        )
+        .bind(crate::keys::hash(secret).as_slice())
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO changesets \
+             (catalog_id, handle, key_id, actor, state, created_at, updated_at) \
+             VALUES ($1, 'existing-handle', 'legacy', 'legacy-actor', 'open', $2, $2)",
+        )
+        .bind(catalog)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!("../migrations/0005_key_names.sql"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let record = crate::store::keys::list(&db.pool).await.unwrap().remove(0);
+        assert_eq!(
+            (record.id.as_str(), record.name.as_str()),
+            ("legacy", "legacy")
+        );
+        assert!(crate::keys::matches(&record.sha256, secret));
+        let owner: (Option<String>, String) =
+            sqlx::query_as("SELECT key_id, actor FROM changesets WHERE handle = 'existing-handle'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            owner,
+            (Some("legacy".to_string()), "legacy-actor".to_string())
+        );
     }
 }

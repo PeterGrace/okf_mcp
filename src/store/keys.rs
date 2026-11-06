@@ -66,8 +66,8 @@ pub enum Grants<'a> {
 /// A key to create.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NewKey<'a> {
-    /// Unique id, `[A-Za-z0-9._-]+`.
-    pub id: &'a str,
+    /// Grouping name, `[A-Za-z0-9._-]+`.
+    pub name: &'a str,
     /// Its access level.
     pub access: Access,
     /// Its catalogs.
@@ -78,11 +78,20 @@ pub struct NewKey<'a> {
     pub actor: &'a str,
 }
 
+/// A newly issued credential. Its bearer secret is returned only once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedKey {
+    pub id: String,
+    pub key: String,
+}
+
 /// A stored key (never the key itself).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyRecord {
     /// Its id.
     pub id: String,
+    /// Its grouping name.
+    pub name: String,
     /// SHA-256 of the key.
     pub sha256: Vec<u8>,
     /// Its access level.
@@ -105,6 +114,7 @@ pub struct KeyRecord {
 #[derive(sqlx::FromRow)]
 struct KeyRow {
     id: String,
+    name: String,
     sha256: Vec<u8>,
     access: String,
     all_catalogs: bool,
@@ -115,10 +125,10 @@ struct KeyRow {
     revoked_at: Option<DateTime<Utc>>,
 }
 
-/// Is `id` a valid key id (the schema's `CHECK (id ~ '^[A-Za-z0-9._-]+$')`)?
-fn is_valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id
+/// Is `name` valid under the schema's `api_keys_name_check` constraint?
+fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
@@ -128,7 +138,7 @@ fn is_valid_id(id: &str) -> bool {
 ///
 /// # Arguments
 /// * `pool` - the database.
-/// * `new` - the key's id, access, grants, default catalog and actor.
+/// * `new` - the key's name, access, grants, default catalog and actor.
 /// * `now` - the creation time (server clock).
 ///
 /// # Returns
@@ -144,11 +154,20 @@ pub async fn create(
     new: &NewKey<'_>,
     now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
-    if !is_valid_id(new.id) {
+    Ok(create_with_id(pool, new, now).await?.key)
+}
+
+/// Creates a key and also returns its immutable generated id.
+pub async fn create_with_id(
+    pool: &PgPool,
+    new: &NewKey<'_>,
+    now: DateTime<Utc>,
+) -> Result<CreatedKey, OkfError> {
+    if !is_valid_name(new.name) {
         return Err(OkfError::Refused {
             reason: format!(
-                "key id {:?} must be letters, digits, '.', '_' and '-'",
-                new.id
+                "key name {:?} must be letters, digits, '.', '_' and '-'",
+                new.name
             ),
         });
     }
@@ -157,7 +176,7 @@ pub async fn create(
         return Err(OkfError::Refused {
             reason: format!(
                 "key {:?} must be granted a catalog, or every catalog",
-                new.id
+                new.name
             ),
         });
     }
@@ -185,50 +204,80 @@ pub async fn create(
         (None, None) => None,
     };
     let key = crate::keys::generate()?;
-    let inserted = sqlx::query(
+    let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO api_keys \
-         (id, sha256, access, all_catalogs, default_catalog_id, actor, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         (name, sha256, access, all_catalogs, default_catalog_id, actor, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
     )
-    .bind(new.id)
+    .bind(new.name)
     .bind(crate::keys::hash(&key).as_slice())
     .bind(new.access.as_str())
     .bind(matches!(new.grants, Grants::All))
     .bind(default_catalog_id)
     .bind(new.actor)
     .bind(now)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await;
-    match inserted {
-        Ok(_) => {}
-        // Only the primary key means a taken id; a violation of `sha256`'s
-        // UNIQUE (a SHA-256 collision) propagates as a database error.
+    // Only the live name/actor constraint is a user-facing duplicate. A
+    // `sha256` UNIQUE violation (a credential-hash collision) remains a
+    // database error rather than being mislabeled as a taken name.
+    let id = match inserted {
+        Ok(id) => id,
         Err(error)
             if is_unique_violation(&error)
                 && error
                     .as_database_error()
                     .and_then(|db_error| db_error.constraint())
-                    == Some("api_keys_pkey") =>
+                    == Some("api_keys_live_name_actor") =>
         {
             return Err(OkfError::Refused {
-                reason: format!("key {:?} already exists", new.id),
+                reason: format!(
+                    "an active key named {:?} with actor {:?} already exists",
+                    new.name, new.actor
+                ),
             })
         }
         Err(error) => return Err(error.into()),
-    }
+    };
     // One statement for every grant: `unnest` turns the bound array into rows.
     // A name given twice is one grant (`ON CONFLICT DO NOTHING`).
     sqlx::query(
         "INSERT INTO key_catalogs (key_id, catalog_id) \
          SELECT $1, unnest($2::bigint[]) ON CONFLICT DO NOTHING",
     )
-    .bind(new.id)
+    .bind(&id)
     .bind(&granted)
     .execute(&mut *tx)
     .await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
-    Ok(key)
+    Ok(CreatedKey { id, key })
+}
+
+/// Inserts a test-only legacy row whose immutable id is also its name.
+#[cfg(test)]
+pub(crate) async fn insert_legacy_test_key(
+    pool: &PgPool,
+    id: &str,
+    access: Access,
+    actor: &str,
+    now: DateTime<Utc>,
+) -> String {
+    let key = crate::keys::generate().expect("generate test key");
+    sqlx::query(
+        "INSERT INTO api_keys \
+         (id, name, sha256, access, all_catalogs, actor, created_at) \
+         VALUES ($1, $1, $2, $3, true, $4, $5)",
+    )
+    .bind(id)
+    .bind(crate::keys::hash(&key).as_slice())
+    .bind(access.as_str())
+    .bind(actor)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert legacy test key");
+    key
 }
 
 /// The ids of the catalogs called `names`, in the same order, in one query.
@@ -265,7 +314,7 @@ async fn catalog_ids(conn: &mut PgConnection, names: &[String]) -> Result<Vec<i6
 /// [`OkfError::Database`].
 pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
     let rows = sqlx::query_as::<_, KeyRow>(
-        "SELECT k.id, k.sha256, k.access, k.all_catalogs, d.name AS default_catalog, k.actor, \
+        "SELECT k.id, k.name, k.sha256, k.access, k.all_catalogs, d.name AS default_catalog, k.actor, \
                 k.created_at, k.revoked_at, \
                 COALESCE(array_agg(c.name ORDER BY c.name) FILTER (WHERE c.name IS NOT NULL), \
                          '{}'::text[]) AS catalogs \
@@ -273,7 +322,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
          LEFT JOIN catalogs d ON d.id = k.default_catalog_id \
          LEFT JOIN key_catalogs g ON g.key_id = k.id \
          LEFT JOIN catalogs c ON c.id = g.catalog_id \
-         GROUP BY k.id, d.name ORDER BY k.id",
+         GROUP BY k.id, d.name ORDER BY k.name, k.actor, k.created_at, k.id",
     )
     .fetch_all(pool)
     .await?;
@@ -281,6 +330,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
         .into_iter()
         .map(|row| KeyRecord {
             id: row.id,
+            name: row.name,
             sha256: row.sha256,
             access: Access::parse(&row.access).expect("the schema checks api_keys.access"),
             all_catalogs: row.all_catalogs,
@@ -304,11 +354,17 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
 /// # Errors
 /// [`OkfError::Refused`] if there is no such key or it is already revoked;
 /// [`OkfError::Database`].
-pub async fn revoke(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), OkfError> {
+pub async fn revoke_target(
+    pool: &PgPool,
+    target: &str,
+    actor: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
+    let id = resolve_active(&mut tx, target, actor).await?;
     let revoked =
         sqlx::query("UPDATE api_keys SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL")
-            .bind(id)
+            .bind(&id)
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -319,7 +375,12 @@ pub async fn revoke(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), O
     }
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(id)
+}
+
+/// Revokes a key selected by immutable id or an unambiguous live name.
+pub async fn revoke(pool: &PgPool, target: &str, now: DateTime<Utc>) -> Result<(), OkfError> {
+    revoke_target(pool, target, None, now).await.map(|_| ())
 }
 
 /// Grants a key a catalog, and bumps the administrative generation. Already
@@ -335,23 +396,34 @@ pub async fn revoke(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), O
 /// [`OkfError::Refused`] if there is no such key, it is revoked, or it already
 /// has every catalog (`--all`); [`OkfError::CatalogNotSelected`] if there is no such
 /// catalog; [`OkfError::Database`].
-pub async fn grant(pool: &PgPool, id: &str, catalog: &str) -> Result<(), OkfError> {
+pub async fn grant_target(
+    pool: &PgPool,
+    target: &str,
+    actor: Option<&str>,
+    catalog: &str,
+) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
     let catalog = catalogs::find(&mut *tx, catalog).await?;
-    require_named_grants(&mut tx, id).await?;
+    let id = resolve_active(&mut tx, target, actor).await?;
+    require_named_grants(&mut tx, &id).await?;
     let inserted = sqlx::query(
         "INSERT INTO key_catalogs (key_id, catalog_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
     )
-    .bind(id)
+    .bind(&id)
     .bind(catalog.id)
     .execute(&mut *tx)
     .await?;
     if inserted.rows_affected() == 0 {
-        return Ok(());
+        return Ok(id);
     }
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(id)
+}
+
+/// Grants a catalog to a key selected by immutable id or unambiguous name.
+pub async fn grant(pool: &PgPool, target: &str, catalog: &str) -> Result<(), OkfError> {
+    grant_target(pool, target, None, catalog).await.map(|_| ())
 }
 
 /// Removes a key's grant of a catalog; if it was the key's default catalog,
@@ -363,28 +435,111 @@ pub async fn grant(pool: &PgPool, id: &str, catalog: &str) -> Result<(), OkfErro
 ///
 /// # Errors
 /// As [`grant`].
-pub async fn ungrant(pool: &PgPool, id: &str, catalog: &str) -> Result<(), OkfError> {
+pub async fn ungrant_target(
+    pool: &PgPool,
+    target: &str,
+    actor: Option<&str>,
+    catalog: &str,
+) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
     let catalog = catalogs::find(&mut *tx, catalog).await?;
-    require_named_grants(&mut tx, id).await?;
+    let id = resolve_active(&mut tx, target, actor).await?;
+    require_named_grants(&mut tx, &id).await?;
     let deleted = sqlx::query("DELETE FROM key_catalogs WHERE key_id = $1 AND catalog_id = $2")
-        .bind(id)
+        .bind(&id)
         .bind(catalog.id)
         .execute(&mut *tx)
         .await?;
     let cleared = sqlx::query(
         "UPDATE api_keys SET default_catalog_id = NULL WHERE id = $1 AND default_catalog_id = $2",
     )
-    .bind(id)
+    .bind(&id)
     .bind(catalog.id)
     .execute(&mut *tx)
     .await?;
     if deleted.rows_affected() + cleared.rows_affected() == 0 {
-        return Ok(());
+        return Ok(id);
     }
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(id)
+}
+
+/// Removes a catalog grant from a key selected by id or unambiguous name.
+pub async fn ungrant(pool: &PgPool, target: &str, catalog: &str) -> Result<(), OkfError> {
+    ungrant_target(pool, target, None, catalog)
+        .await
+        .map(|_| ())
+}
+
+async fn resolve_active(
+    conn: &mut PgConnection,
+    target: &str,
+    actor: Option<&str>,
+) -> Result<String, OkfError> {
+    let exact: Option<(String, String)> =
+        sqlx::query_as("SELECT id, name FROM api_keys WHERE id = $1")
+            .bind(target)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if let Some((id, name)) = exact {
+        // Migration 0005 is the boundary: older rows have `id == name`,
+        // while every later id is generated by the database and callers can
+        // set only `name`. Legacy fixtures intentionally insert `id == name`.
+        // Those rows must use active-name resolution so a revoked credential
+        // cannot shadow its replacement and multiple actors stay ambiguous.
+        if id != name {
+            if actor.is_none() {
+                return Ok(id);
+            }
+            return Err(OkfError::Refused {
+                reason: format!(
+                    "--actor selects a key name and cannot be used with key id {target:?}"
+                ),
+            });
+        }
+    }
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM api_keys WHERE revoked_at IS NULL AND name = $1 \
+         AND ($2::text IS NULL OR actor = $2) \
+         ORDER BY actor, id",
+    )
+    .bind(target)
+    .bind(actor)
+    .fetch_all(&mut *conn)
+    .await?;
+    match ids.as_slice() {
+        [id] => Ok(id.clone()),
+        [] => {
+            // Only diagnose revoked names after looking for live replacements.
+            let revoked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM api_keys WHERE name = $1 \
+                 AND revoked_at IS NOT NULL AND ($2::text IS NULL OR actor = $2))",
+            )
+            .bind(target)
+            .bind(actor)
+            .fetch_one(&mut *conn)
+            .await?;
+            Err(OkfError::Refused {
+                reason: match (revoked, actor) {
+                    (true, Some(actor)) => {
+                        format!("key named {target:?} with actor {actor:?} is revoked")
+                    }
+                    (true, None) => format!("key {target:?} is revoked"),
+                    (false, Some(actor)) => {
+                        format!("no active key named {target:?} with actor {actor:?}")
+                    }
+                    (false, None) => format!("no active key or key id {target:?}"),
+                },
+            })
+        }
+        _ => Err(OkfError::Refused {
+            reason: format!(
+                "key name {target:?} is ambiguous; use its id or pass --actor (matching ids: {})",
+                ids.join(", ")
+            ),
+        }),
+    }
 }
 
 /// Refuses an unknown key id, a revoked key (as [`revoke`] does: its grants
@@ -421,9 +576,9 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap()
     }
 
-    fn new_key<'a>(id: &'a str, grants: Grants<'a>, default: Option<&'a str>) -> NewKey<'a> {
+    fn new_key<'a>(name: &'a str, grants: Grants<'a>, default: Option<&'a str>) -> NewKey<'a> {
         NewKey {
-            id,
+            name,
             access: Access::Write,
             grants,
             default_catalog: default,
@@ -464,7 +619,7 @@ mod tests {
         let keys = list(&db.pool).await.unwrap();
         assert_eq!(keys.len(), 1);
         let record = &keys[0];
-        assert_eq!(record.id, "laptop");
+        assert_eq!(record.name, "laptop");
         assert_eq!(record.access, Access::Write);
         assert!(!record.all_catalogs);
         assert_eq!(record.catalogs, ["pg", "work"]);
@@ -542,7 +697,7 @@ mod tests {
         revoke(&db.pool, "k", now()).await.unwrap();
 
         let record = &list(&db.pool).await.unwrap()[1];
-        assert_eq!(record.id, "k");
+        assert_eq!(record.name, "k");
         assert_eq!(record.catalogs, ["work"]);
         // Losing the default catalog's grant clears the default.
         assert_eq!(record.default_catalog, None);
@@ -556,7 +711,7 @@ mod tests {
         ));
         assert!(matches!(
             grant(&db.pool, "k", "pg").await,
-            Err(OkfError::Refused { reason }) if reason.contains("revoked")
+            Err(OkfError::Refused { reason }) if reason.contains("is revoked")
         ));
         assert!(matches!(
             ungrant(&db.pool, "k", "work").await,
@@ -599,5 +754,248 @@ mod tests {
             unknown_default,
             Err(OkfError::CatalogNotSelected { .. })
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn names_group_actors_and_revoked_pairs_can_be_reissued() {
+        let db = test_db().await;
+        let work_catalog = catalogs::create(&db.pool, "work", "", now()).await.unwrap();
+        let terminal = NewKey {
+            name: "claude",
+            access: Access::Write,
+            grants: Grants::All,
+            default_catalog: None,
+            actor: "claude-code-tui",
+        };
+        let web = NewKey {
+            actor: "claude-ai-web",
+            ..terminal
+        };
+
+        let first = create_with_id(&db.pool, &terminal, now()).await.unwrap();
+        let second = create_with_id(&db.pool, &web, now()).await.unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        let old_changeset = crate::store::changesets::open(
+            &mut tx,
+            work_catalog.id,
+            &first.id,
+            terminal.actor,
+            now(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query(
+            "INSERT INTO revisions \
+             (catalog_id, path, revision, op, content, executable, actor, changeset_id, \
+              message, created_at) \
+             VALUES ($1, 'owned.md', 1, 'create', $2, false, $3, $4, 'original publish', $5)",
+        )
+        .bind(work_catalog.id)
+        .bind(b"# Owned\n".as_slice())
+        .bind(terminal.actor)
+        .bind(old_changeset.id)
+        .bind(now())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_ne!(first.id, "claude");
+        assert_ne!(second.id, first.id);
+        assert!(matches!(
+            create(&db.pool, &terminal, now()).await,
+            Err(OkfError::Refused { reason }) if reason.contains("already exists")
+        ));
+        assert!(matches!(
+            revoke_target(&db.pool, "claude", None, now()).await,
+            Err(OkfError::Refused { reason }) if reason.contains("ambiguous")
+        ));
+        assert!(matches!(
+            grant_target(&db.pool, "claude", None, "work").await,
+            Err(OkfError::Refused { reason }) if reason.contains("ambiguous")
+        ));
+        assert!(matches!(
+            ungrant_target(&db.pool, "claude", None, "work").await,
+            Err(OkfError::Refused { reason }) if reason.contains("ambiguous")
+        ));
+
+        let revoked_id = revoke_target(&db.pool, "claude", Some("claude-code-tui"), now())
+            .await
+            .unwrap();
+        assert_eq!(revoked_id, first.id);
+        let replacement = create_with_id(&db.pool, &terminal, now()).await.unwrap();
+        assert_ne!(replacement.id, first.id);
+        let historical = crate::store::changesets::list_open(&db.pool, &[work_catalog.id], None)
+            .await
+            .unwrap();
+        let historical = historical
+            .iter()
+            .find(|row| row.changeset.handle == old_changeset.handle)
+            .unwrap();
+        assert_eq!(
+            historical.changeset.key_id.as_deref(),
+            Some(first.id.as_str())
+        );
+        assert_eq!(historical.key_name.as_deref(), Some("claude"));
+        assert_eq!(historical.changeset.actor, terminal.actor);
+        let revisions = crate::store::history::revisions(&db.pool, work_catalog.id, "owned.md", 20)
+            .await
+            .unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].actor, terminal.actor);
+        assert_eq!(revisions[0].message, "original publish");
+
+        let records = list(&db.pool).await.unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| record.name == "claude"));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.revoked_at.is_none())
+                .count(),
+            2
+        );
+        assert!(crate::keys::matches(
+            &records
+                .iter()
+                .find(|record| record.id == replacement.id)
+                .unwrap()
+                .sha256,
+            &replacement.key
+        ));
+        let cache = crate::auth::KeyCache::from_records(records);
+        assert!(
+            cache.find(&first.key).is_none(),
+            "the revoked key is refused"
+        );
+        assert!(
+            cache.find(&second.key).is_some(),
+            "the other actor still works"
+        );
+        assert!(
+            cache.find(&replacement.key).is_some(),
+            "the reissued key works"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exact_id_wins_over_a_colliding_group_name() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "work", "", now()).await.unwrap();
+        let work = ["work".to_string()];
+        let by_id = create_with_id(
+            &db.pool,
+            &NewKey {
+                name: "first-name",
+                access: Access::Write,
+                grants: Grants::Catalogs(&work),
+                default_catalog: None,
+                actor: "first",
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        let collision = NewKey {
+            name: &by_id.id,
+            access: Access::Write,
+            grants: Grants::Catalogs(&work),
+            default_catalog: None,
+            actor: "second",
+        };
+        create(&db.pool, &collision, now()).await.unwrap();
+
+        assert!(matches!(
+            grant_target(&db.pool, &by_id.id, Some("first"), "work").await,
+            Err(OkfError::Refused { reason }) if reason.contains("cannot be used with key id")
+        ));
+
+        grant_target(&db.pool, &by_id.id, None, "work")
+            .await
+            .unwrap();
+        ungrant_target(&db.pool, &by_id.id, None, "work")
+            .await
+            .unwrap();
+        let revoked = revoke_target(&db.pool, &by_id.id, None, now())
+            .await
+            .unwrap();
+        assert_eq!(revoked, by_id.id);
+        assert!(list(&db.pool)
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.name == collision.name && record.revoked_at.is_none()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_id_uses_active_name_resolution_after_rotation() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "work", "", now()).await.unwrap();
+        insert_legacy_test_key(&db.pool, "legacy", Access::Write, "terminal", now()).await;
+
+        let work = ["work".to_string()];
+        let web = create_with_id(
+            &db.pool,
+            &NewKey {
+                name: "legacy",
+                access: Access::Write,
+                grants: Grants::Catalogs(&work),
+                default_catalog: None,
+                actor: "web",
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            revoke_target(&db.pool, "legacy", None, now()).await,
+            Err(OkfError::Refused { reason }) if reason.contains("ambiguous")
+        ));
+
+        revoke_target(&db.pool, &web.id, None, now()).await.unwrap();
+        revoke_target(&db.pool, "legacy", Some("terminal"), now())
+            .await
+            .unwrap();
+        for actor in [None, Some("terminal")] {
+            assert!(matches!(
+                revoke_target(&db.pool, "legacy", actor, now()).await,
+                Err(OkfError::Refused { reason }) if reason.contains("is revoked")
+            ));
+        }
+        assert!(matches!(
+            revoke_target(&db.pool, "legacy", Some("unknown"), now()).await,
+            Err(OkfError::Refused { reason }) if reason.contains("no active key")
+        ));
+        let replacement = create_with_id(
+            &db.pool,
+            &NewKey {
+                name: "legacy",
+                access: Access::Write,
+                grants: Grants::Catalogs(&work),
+                default_catalog: None,
+                actor: "terminal",
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ungrant_target(&db.pool, "legacy", None, "work")
+                .await
+                .unwrap(),
+            replacement.id
+        );
+        assert_eq!(
+            grant_target(&db.pool, "legacy", None, "work")
+                .await
+                .unwrap(),
+            replacement.id
+        );
+        assert_eq!(
+            revoke_target(&db.pool, "legacy", None, now())
+                .await
+                .unwrap(),
+            replacement.id
+        );
     }
 }

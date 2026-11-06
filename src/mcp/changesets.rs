@@ -49,6 +49,8 @@ pub struct ListedChangeset {
     pub catalog: String,
     /// The key it belongs to; null once that key is deleted.
     pub key: Option<String>,
+    /// The key's grouping name; null once that key is deleted.
+    pub key_name: Option<String>,
     /// The actor of the key that opened it.
     pub actor: String,
     /// When it was opened.
@@ -132,6 +134,7 @@ pub(crate) async fn list_changesets(
             changeset: row.changeset.handle,
             catalog: row.catalog,
             key: row.changeset.key_id,
+            key_name: row.key_name,
             actor: row.changeset.actor,
             created: format_timestamp(row.changeset.created_at),
             last_change: format_timestamp(row.changeset.updated_at),
@@ -913,8 +916,13 @@ mod lifecycle_tests {
         assert_eq!(handles(&by_alice), [empty.as_str()]);
         let own = &by_alice.changesets[0];
         assert_eq!(
-            (own.catalog.as_str(), own.key.as_deref(), own.actor.as_str()),
-            ("pg", Some("alice"), "alice")
+            (
+                own.catalog.as_str(),
+                own.key_name.as_deref(),
+                own.key.as_deref(),
+                own.actor.as_str()
+            ),
+            ("pg", Some("alice"), Some("alice"), "alice")
         );
         assert!(own.paths.is_empty(), "an empty changeset is listed too");
         assert!(!own.idle);

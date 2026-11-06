@@ -126,20 +126,29 @@ pub enum KeyCommand {
     List,
     /// Revoke a key.
     Revoke {
-        /// The key's id.
+        /// The key's id, or an unambiguous active name.
         id: String,
+        /// Select this actor when `id` is a name.
+        #[arg(long)]
+        actor: Option<String>,
     },
     /// Grant a key a catalog.
     Grant {
-        /// The key's id.
+        /// The key's id, or an unambiguous active name.
         id: String,
+        /// Select this actor when `id` is a name.
+        #[arg(long)]
+        actor: Option<String>,
         /// The catalog.
         catalog: String,
     },
     /// Remove a key's grant of a catalog (and clear it as the key's default).
     Ungrant {
-        /// The key's id.
+        /// The key's id, or an unambiguous active name.
         id: String,
+        /// Select this actor when `id` is a name.
+        #[arg(long)]
+        actor: Option<String>,
         /// The catalog.
         catalog: String,
     },
@@ -150,8 +159,8 @@ pub enum KeyCommand {
 // variant (`Create(KeyCreateArgs)`) can hold.
 #[derive(Debug, Args)]
 pub struct KeyCreateArgs {
-    /// Unique id (`[A-Za-z0-9._-]+`).
-    pub id: String,
+    /// Grouping name (`[A-Za-z0-9._-]+`).
+    pub name: String,
     /// Access level.
     #[arg(long, value_enum)]
     pub access: Access,
@@ -170,7 +179,7 @@ pub struct KeyCreateArgs {
     /// The key's default catalog (must be granted).
     #[arg(long)]
     pub default: Option<String>,
-    /// The actor its writes are recorded as (default: the id).
+    /// The actor its writes are recorded as (default: the name).
     #[arg(long)]
     pub actor: Option<String>,
 }
@@ -431,51 +440,59 @@ async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyho
                 Grants::Catalogs(&args.catalogs)
             };
             let new = NewKey {
-                id: &args.id,
+                name: &args.name,
                 access: args.access,
                 grants,
                 default_catalog: args.default.as_deref(),
-                actor: args.actor.as_deref().unwrap_or(&args.id),
+                actor: args.actor.as_deref().unwrap_or(&args.name),
             };
-            let key = keys::create(pool, &new, clock.now()).await?;
-            println!("{key}");
-            eprintln!("store this key now: it is not shown again");
+            let created = keys::create_with_id(pool, &new, clock.now()).await?;
+            println!("{}", created.key);
+            eprintln!(
+                "key id: {}\nstore this key now: it is not shown again",
+                created.id
+            );
         }
         KeyCommand::List => {
             for key in keys::list(pool).await? {
-                let catalogs = if key.all_catalogs {
-                    "*".to_string()
-                } else {
-                    key.catalogs.join(",")
-                };
-                let state = if key.revoked_at.is_some() {
-                    "revoked"
-                } else {
-                    "active"
-                };
-                println!(
-                    "{}\t{}\t{state}\t{catalogs}\tdefault {}\t{}",
-                    key.id,
-                    key.access.as_str(),
-                    key.default_catalog.as_deref().unwrap_or("-"),
-                    key.actor
-                );
+                println!("{}", format_key_record(&key));
             }
         }
-        KeyCommand::Revoke { id } => {
-            keys::revoke(pool, &id, clock.now()).await?;
-            println!("revoked key {id}");
+        KeyCommand::Revoke { id, actor } => {
+            let resolved = keys::revoke_target(pool, &id, actor.as_deref(), clock.now()).await?;
+            println!("revoked key {resolved}");
         }
-        KeyCommand::Grant { id, catalog } => {
-            keys::grant(pool, &id, &catalog).await?;
-            println!("granted {catalog} to key {id}");
+        KeyCommand::Grant { id, actor, catalog } => {
+            let resolved = keys::grant_target(pool, &id, actor.as_deref(), &catalog).await?;
+            println!("granted {catalog} to key {resolved}");
         }
-        KeyCommand::Ungrant { id, catalog } => {
-            keys::ungrant(pool, &id, &catalog).await?;
-            println!("removed {catalog} from key {id}");
+        KeyCommand::Ungrant { id, actor, catalog } => {
+            let resolved = keys::ungrant_target(pool, &id, actor.as_deref(), &catalog).await?;
+            println!("removed {catalog} from key {resolved}");
         }
     }
     Ok(())
+}
+
+fn format_key_record(key: &keys::KeyRecord) -> String {
+    let catalogs = if key.all_catalogs {
+        "*".to_string()
+    } else {
+        key.catalogs.join(",")
+    };
+    let state = if key.revoked_at.is_some() {
+        "revoked"
+    } else {
+        "active"
+    };
+    format!(
+        "{}\t{}\t{}\t{}\t{state}\t{catalogs}\tdefault {}",
+        key.name,
+        key.actor,
+        key.id,
+        key.access.as_str(),
+        key.default_catalog.as_deref().unwrap_or("-")
+    )
 }
 
 /// Connects to the database and applies the migrations.
@@ -605,6 +622,7 @@ mod tests {
         let Some(Command::Key(KeyCommand::Create(args))) = parsed.command else {
             panic!("expected key create");
         };
+        assert_eq!(args.name, "k");
         assert_eq!(
             (args.access, args.catalogs, args.all),
             (
@@ -642,7 +660,7 @@ mod tests {
         let clock = fixed_now();
         let url = Some(db.url.clone());
         let create = KeyCommand::Create(KeyCreateArgs {
-            id: "k".to_string(),
+            name: "k".to_string(),
             access: Access::Read,
             catalogs: Vec::new(),
             all: true,
@@ -661,6 +679,7 @@ mod tests {
         .unwrap();
         let revoke = KeyCommand::Revoke {
             id: "k".to_string(),
+            actor: None,
         };
         run(cli(url, Command::Key(revoke)), Arc::clone(&clock))
             .await
@@ -673,6 +692,27 @@ mod tests {
                 .unwrap();
         // The actor defaults to the id.
         assert_eq!(rows, [("k".to_string(), true, true)]);
+    }
+
+    #[test]
+    fn key_list_columns_have_the_documented_order() {
+        let record = keys::KeyRecord {
+            id: "credential-id".to_string(),
+            name: "claude".to_string(),
+            sha256: Vec::new(),
+            access: Access::Write,
+            all_catalogs: false,
+            catalogs: vec!["pg".to_string(), "work".to_string()],
+            default_catalog: Some("pg".to_string()),
+            actor: "claude-code-tui".to_string(),
+            created_at: chrono::Utc::now(),
+            revoked_at: None,
+        };
+
+        assert_eq!(
+            format_key_record(&record),
+            "claude\tclaude-code-tui\tcredential-id\twrite\tactive\tpg,work\tdefault pg"
+        );
     }
 
     #[test]

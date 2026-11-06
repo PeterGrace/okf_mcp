@@ -405,16 +405,25 @@ with `--catalogs a,b` or every catalog, present and future, with `--all`:
 
 ```sh
 kubectl -n okf-mcp exec deploy/okf-mcp -- \
-    okf-mcp key create alice-laptop --access write --catalogs notes --default notes --actor alice
+    okf-mcp key create claude --access write --catalogs notes --default notes --actor claude-code-tui
+kubectl -n okf-mcp exec deploy/okf-mcp -- \
+    okf-mcp key create claude --access write --catalogs notes --default notes --actor claude-ai-web
 kubectl -n okf-mcp exec deploy/okf-mcp -- \
     okf-mcp key create ops-admin --access admin --all
 ```
 
-`key create` prints the key once; only its SHA-256 is stored. Put it straight
+The positional value is a grouping name, so the two `claude` credentials are
+listed together while retaining separate actors, grants, defaults and
+revocation. `key create` prints the key once and its immutable administration
+id on stderr; only the key's SHA-256 is stored. Put it straight
 into a password manager or a secret store. Never paste it into logs, tickets,
 chat or shell history (a leading space keeps a command out of history in most
-shells). `okf-mcp key list|revoke|grant|ungrant` manage keys afterwards; a
-revoked key stops working within `poll_interval`.
+shells). `key list` shows name, actor, id, access, grants and state, grouped by
+name. `revoke`, `grant` and `ungrant` accept an id, an unambiguous live name,
+or `NAME --actor ACTOR`; for example, `okf-mcp key grant claude work --actor
+claude-ai-web`. A revoked name/actor pair can be created again for rotation;
+the old row and its changeset history remain attached to the old id. A revoked
+key stops working within `poll_interval`.
 
 **Import a catalog**, from a `git archive` tarball (exactly the tracked files)
 or any `.tar.gz` that follows the import rules. Either copy it into the pod's
