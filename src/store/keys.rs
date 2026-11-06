@@ -448,26 +448,24 @@ async fn resolve_active(
     target: &str,
     actor: Option<&str>,
 ) -> Result<String, OkfError> {
-    if actor.is_some() {
-        let is_id: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1)")
+    let exact: Option<(String, String)> =
+        sqlx::query_as("SELECT id, name FROM api_keys WHERE id = $1")
             .bind(target)
-            .fetch_one(&mut *conn)
+            .fetch_optional(&mut *conn)
             .await?;
-        if is_id {
+    if let Some((id, name)) = exact {
+        // Before migration 0005 an id was also the human name. Those rows
+        // must use active-name resolution so a revoked legacy credential
+        // cannot shadow its replacement and multiple actors stay ambiguous.
+        if id != name {
+            if actor.is_none() {
+                return Ok(id);
+            }
             return Err(OkfError::Refused {
                 reason: format!(
                     "--actor selects a key name and cannot be used with key id {target:?}"
                 ),
             });
-        }
-    }
-    if actor.is_none() {
-        let exact: Option<String> = sqlx::query_scalar("SELECT id FROM api_keys WHERE id = $1")
-            .bind(target)
-            .fetch_optional(&mut *conn)
-            .await?;
-        if let Some(id) = exact {
-            return Ok(id);
         }
     }
     let ids: Vec<String> = sqlx::query_scalar(
@@ -878,5 +876,78 @@ mod tests {
             .unwrap()
             .iter()
             .any(|record| record.name == collision.id && record.revoked_at.is_none()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_id_uses_active_name_resolution_after_rotation() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "work", "", now()).await.unwrap();
+        let legacy_secret = crate::keys::generate().unwrap();
+        sqlx::query(
+            "INSERT INTO api_keys \
+             (id, name, sha256, access, all_catalogs, actor, created_at) \
+             VALUES ('legacy', 'legacy', $1, 'write', true, 'terminal', $2)",
+        )
+        .bind(crate::keys::hash(&legacy_secret).as_slice())
+        .bind(now())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let work = ["work".to_string()];
+        let web = create_with_id(
+            &db.pool,
+            &NewKey {
+                id: "legacy",
+                access: Access::Write,
+                grants: Grants::Catalogs(&work),
+                default_catalog: None,
+                actor: "web",
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            revoke_target(&db.pool, "legacy", None, now()).await,
+            Err(OkfError::Refused { reason }) if reason.contains("ambiguous")
+        ));
+
+        revoke_target(&db.pool, &web.id, None, now()).await.unwrap();
+        revoke_target(&db.pool, "legacy", Some("terminal"), now())
+            .await
+            .unwrap();
+        let replacement = create_with_id(
+            &db.pool,
+            &NewKey {
+                id: "legacy",
+                access: Access::Write,
+                grants: Grants::Catalogs(&work),
+                default_catalog: None,
+                actor: "terminal",
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ungrant_target(&db.pool, "legacy", None, "work")
+                .await
+                .unwrap(),
+            replacement.id
+        );
+        assert_eq!(
+            grant_target(&db.pool, "legacy", None, "work")
+                .await
+                .unwrap(),
+            replacement.id
+        );
+        assert_eq!(
+            revoke_target(&db.pool, "legacy", None, now())
+                .await
+                .unwrap(),
+            replacement.id
+        );
     }
 }
