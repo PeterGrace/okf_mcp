@@ -732,6 +732,20 @@ mod tests {
         .await
         .unwrap();
         tx.commit().await.unwrap();
+        sqlx::query(
+            "INSERT INTO revisions \
+             (catalog_id, path, revision, op, content, executable, actor, changeset_id, \
+              message, created_at) \
+             VALUES ($1, 'owned.md', 1, 'create', $2, false, $3, $4, 'original publish', $5)",
+        )
+        .bind(work_catalog.id)
+        .bind(b"# Owned\n".as_slice())
+        .bind(terminal.actor)
+        .bind(old_changeset.id)
+        .bind(now())
+        .execute(&db.pool)
+        .await
+        .unwrap();
         assert_ne!(first.id, "claude");
         assert_ne!(second.id, first.id);
         assert!(matches!(
@@ -770,6 +784,12 @@ mod tests {
         );
         assert_eq!(historical.key_name.as_deref(), Some("claude"));
         assert_eq!(historical.changeset.actor, terminal.actor);
+        let revisions = crate::store::history::revisions(&db.pool, work_catalog.id, "owned.md", 20)
+            .await
+            .unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].actor, terminal.actor);
+        assert_eq!(revisions[0].message, "original publish");
 
         let records = list(&db.pool).await.unwrap();
         assert_eq!(records.len(), 3);
