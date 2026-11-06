@@ -125,7 +125,7 @@ struct KeyRow {
     revoked_at: Option<DateTime<Utc>>,
 }
 
-/// Is `id` a valid key id (the schema's `CHECK (id ~ '^[A-Za-z0-9._-]+$')`)?
+/// Is `name` valid under the schema's `api_keys_name_check` constraint?
 fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
         && name
