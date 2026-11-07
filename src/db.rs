@@ -76,6 +76,13 @@ mod tests {
                 "changesets",
                 "documents",
                 "key_catalogs",
+                "maintenance_dispositions",
+                "maintenance_evidence",
+                "maintenance_findings",
+                "maintenance_requests",
+                "maintenance_runs",
+                "maintenance_state",
+                "maintenance_work",
                 "revisions",
                 "server_state",
             ]
@@ -85,6 +92,367 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(admin_generation, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn maintenance_schema_preserves_existing_rows_and_defaults_to_opt_out() {
+        let db = pg_support::TestDb::start().await;
+        for migration in [
+            include_str!("../migrations/0001_schema.sql"),
+            include_str!("../migrations/0002_changeset_identity.sql"),
+            include_str!("../migrations/0003_changeset_handles.sql"),
+            include_str!("../migrations/0004_drop_changeset_labels.sql"),
+            include_str!("../migrations/0005_key_names.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&db.pool).await.unwrap();
+        }
+        let now = chrono::Utc::now();
+        let catalog: i64 = sqlx::query_scalar(
+            "INSERT INTO catalogs (name, created_at) VALUES ('pg', $1) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, sha256, access, all_catalogs, actor, created_at) \
+             VALUES ('existing', 'existing', $1, 'write', true, 'author', $2)",
+        )
+        .bind(vec![1u8; 32])
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        for (path, content) in [("a.md", b"first".to_vec()), ("b.md", b"second".to_vec())] {
+            sqlx::query(
+                "INSERT INTO revisions (catalog_id, path, revision, op, content, executable, actor, message, created_at) \
+                 VALUES ($1, $2, 1, 'import', $3, false, 'author', 'initial', $4)",
+            )
+            .bind(catalog)
+            .bind(path)
+            .bind(&content)
+            .bind(now)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO documents (catalog_id, path, content, executable, revision, updated_at, updated_by) \
+                 VALUES ($1, $2, $3, false, 1, $4, 'author')",
+            )
+            .bind(catalog)
+            .bind(path)
+            .bind(content)
+            .bind(now)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        let documents =
+            "SELECT to_jsonb(d) FROM (SELECT * FROM documents ORDER BY catalog_id, path) d";
+        let revisions = "SELECT to_jsonb(r) FROM (SELECT * FROM revisions ORDER BY catalog_id, path, revision) r";
+        let documents_before: Vec<serde_json::Value> = sqlx::query_scalar(documents)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        let revisions_before: Vec<serde_json::Value> = sqlx::query_scalar(revisions)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        let credentials = "SELECT to_jsonb(k) FROM (SELECT * FROM api_keys ORDER BY id) k";
+        let credential_before: serde_json::Value = sqlx::query_scalar(credentials)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0006_maintenance.sql"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let existing_key_maintenance_report: bool =
+            sqlx::query_scalar("SELECT maintenance_report FROM api_keys WHERE id = 'existing'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(!existing_key_maintenance_report);
+        let credential_after: serde_json::Value = sqlx::query_scalar(credentials)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let mut expected_credential = credential_before;
+        expected_credential["maintenance_report"] = serde_json::json!(false);
+        assert_eq!(credential_after, expected_credential);
+        let documents_after: Vec<serde_json::Value> = sqlx::query_scalar(documents)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        let revisions_after: Vec<serde_json::Value> = sqlx::query_scalar(revisions)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(documents_before, documents_after);
+        assert_eq!(revisions_before, revisions_after);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn maintenance_schema_rejects_cross_catalog_and_duplicate_live_claims() {
+        let db = test_db().await;
+        let now = chrono::Utc::now();
+        let first: i64 = sqlx::query_scalar(
+            "INSERT INTO catalogs (name, created_at) VALUES ('first', $1) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let second: i64 = sqlx::query_scalar(
+            "INSERT INTO catalogs (name, created_at) VALUES ('second', $1) RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        for catalog in [first, second] {
+            sqlx::query(
+                "INSERT INTO revisions (catalog_id, path, revision, op, content, executable, actor, message, created_at) \
+                 VALUES ($1, 'a.md', 1, 'import', $2, false, 'a', 'm', $3)",
+            )
+            .bind(catalog)
+            .bind(b"a".to_vec())
+            .bind(now)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO maintenance_runs (id, catalog_id, credential_id, actor, state, deadline, created_at, primary_count) \
+                 VALUES ($1, $2, 'holder', 'a', 'running', $3, $3, 1)",
+            )
+            .bind(format!("run-{catalog}"))
+            .bind(catalog)
+            .bind(now)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        let insert_work = "INSERT INTO maintenance_work (id, run_id, catalog_id, path, revision, lanes, lease_token, lease_expires_at, attempted_at) \
+                           VALUES ($1, $2, $3, 'a.md', 1, ARRAY['changed'], $4, $5, $5)";
+        sqlx::query(insert_work)
+            .bind("work-one")
+            .bind(format!("run-{first}"))
+            .bind(first)
+            .bind("token-one")
+            .bind(now)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let duplicate_active_claim_insert = sqlx::query(insert_work)
+            .bind("work-two")
+            .bind(format!("run-{first}"))
+            .bind(first)
+            .bind("token-two")
+            .bind(now)
+            .execute(&db.pool)
+            .await;
+        assert!(duplicate_active_claim_insert.is_err());
+        let cross_catalog_work_insert = sqlx::query(insert_work)
+            .bind("bad-work")
+            .bind(format!("run-{second}"))
+            .bind(first)
+            .bind("token-three")
+            .bind(now)
+            .execute(&db.pool)
+            .await;
+        assert!(cross_catalog_work_insert.is_err());
+        sqlx::query(insert_work)
+            .bind("work-other")
+            .bind(format!("run-{second}"))
+            .bind(second)
+            .bind("token-other")
+            .bind(now)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO maintenance_findings (id, run_id, work_id, catalog_id, category, assertion, follow_up, uncertainty, relationship, external, created_at) \
+             VALUES ('finding-one', $1, 'work-one', $2, 'suggested_link', 'a', 'follow', 'unknown', 'direct_statement', '[]', $3)",
+        )
+        .bind(format!("run-{first}"))
+        .bind(first)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let cross_catalog_evidence_insert = sqlx::query(
+            "INSERT INTO maintenance_evidence (catalog_id, work_id, finding_id, ordinal, path, revision, excerpt) \
+             VALUES ($1, 'work-one', 'finding-one', 0, 'a.md', 1, 'a')",
+        )
+        .bind(second)
+        .execute(&db.pool)
+        .await;
+        assert!(cross_catalog_evidence_insert.is_err());
+        sqlx::query(
+            "INSERT INTO revisions (catalog_id, path, revision, op, content, executable, actor, message, created_at) \
+             VALUES ($1, 'only-second.md', 1, 'import', $2, false, 'a', 'm', $3)",
+        )
+        .bind(second)
+        .bind(b"a".to_vec())
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let cross_catalog_pin_insert = sqlx::query(
+            "INSERT INTO maintenance_evidence (catalog_id, work_id, ordinal, path, revision, excerpt) \
+             VALUES ($1, 'work-one', 0, 'only-second.md', 1, 'a')",
+        )
+        .bind(first)
+        .execute(&db.pool)
+        .await;
+        assert!(cross_catalog_pin_insert.is_err());
+        let cross_work_finding_insert = sqlx::query(
+            "INSERT INTO maintenance_evidence (catalog_id, work_id, finding_id, ordinal, path, revision, excerpt) \
+             VALUES ($1, $2, 'finding-one', 0, 'a.md', 1, 'a')",
+        )
+        .bind(second)
+        .bind("work-other")
+        .execute(&db.pool)
+        .await;
+        assert!(cross_work_finding_insert.is_err());
+        let cross_catalog_finding_insert = sqlx::query(
+            "INSERT INTO maintenance_findings (id, run_id, work_id, catalog_id, category, assertion, follow_up, uncertainty, relationship, external, created_at) \
+             VALUES ('bad-finding', $1, 'work-one', $2, 'suggested_link', 'a', 'follow', 'unknown', 'direct_statement', '[]', $3)",
+        )
+        .bind(format!("run-{second}"))
+        .bind(second)
+        .bind(now)
+        .execute(&db.pool)
+        .await;
+        assert!(cross_catalog_finding_insert.is_err());
+        let cross_catalog_disposition_insert = sqlx::query(
+            "INSERT INTO maintenance_dispositions (catalog_id, finding_id, disposition, rationale, credential_id, actor, created_at) \
+             VALUES ($1, 'finding-one', 'dismissed', 'reason', 'holder', 'a', $2)",
+        )
+        .bind(second)
+        .bind(now)
+        .execute(&db.pool)
+        .await;
+        assert!(cross_catalog_disposition_insert.is_err());
+        sqlx::query("UPDATE maintenance_work SET outcome = 'completed', ended_at = $1 WHERE id = 'work-one'")
+            .bind(now)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let second_attempt_after_terminal_insert = sqlx::query(insert_work)
+            .bind("work-two")
+            .bind(format!("run-{first}"))
+            .bind(first)
+            .bind("token-two")
+            .bind(now)
+            .execute(&db.pool)
+            .await;
+        assert!(second_attempt_after_terminal_insert.is_ok());
+        sqlx::query(
+            "INSERT INTO maintenance_evidence (catalog_id, work_id, finding_id, ordinal, path, revision, excerpt) \
+             VALUES ($1, 'work-one', 'finding-one', 0, 'a.md', 1, 'a')",
+        )
+        .bind(first)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let duplicate_ordinal = sqlx::query(
+            "INSERT INTO maintenance_evidence (catalog_id, work_id, finding_id, ordinal, path, revision, excerpt) \
+             VALUES ($1, 'work-one', 'finding-one', 0, 'a.md', 1, 'a')",
+        )
+        .bind(first)
+        .execute(&db.pool)
+        .await;
+        assert!(duplicate_ordinal.is_err());
+        sqlx::query("INSERT INTO maintenance_state (catalog_id, updated_at) VALUES ($1, $2)")
+            .bind(first)
+            .bind(now)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO maintenance_requests (catalog_id, credential_id, operation, idempotency_key, request, response) \
+             VALUES ($1, 'holder', 'submit', 'request-one', $2, $3)",
+        )
+        .bind(first)
+        .bind(serde_json::json!({"work_id": "work-one"}))
+        .bind(serde_json::json!({"outcome": "completed"}))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO maintenance_dispositions (catalog_id, finding_id, disposition, rationale, credential_id, actor, created_at) \
+             VALUES ($1, 'finding-one', 'dismissed', 'reason', 'holder', 'a', $2)",
+        )
+        .bind(first)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let populated: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM maintenance_runs WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_work WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_findings WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_evidence WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_dispositions WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_requests WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_state WHERE catalog_id = $1)",
+        )
+        .bind(first)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(populated, (1, 2, 1, 1, 1, 1, 1));
+        let revision_delete = sqlx::query(
+            "DELETE FROM revisions WHERE catalog_id = $1 AND path = 'a.md' AND revision = 1",
+        )
+        .bind(first)
+        .execute(&db.pool)
+        .await;
+        assert!(
+            revision_delete.is_err(),
+            "referenced revision must be retained"
+        );
+        let retained: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM revisions WHERE catalog_id = $1 AND path = 'a.md'), \
+             (SELECT count(*) FROM maintenance_work WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_findings WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_evidence WHERE catalog_id = $1)",
+        )
+        .bind(first)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, (1, 2, 1, 1));
+        let retained_history: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM maintenance_dispositions WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_requests WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_state WHERE catalog_id = $1)",
+        )
+        .bind(first)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_history, (1, 1, 1));
+        sqlx::query("DELETE FROM catalogs WHERE id = $1")
+            .bind(first)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let remaining: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM maintenance_runs WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_work WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_findings WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_evidence WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_dispositions WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_requests WHERE catalog_id = $1), \
+             (SELECT count(*) FROM maintenance_state WHERE catalog_id = $1)",
+        )
+        .bind(first)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, (0, 0, 0, 0, 0, 0, 0));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -261,12 +629,14 @@ mod tests {
             .await
             .unwrap();
 
-        let record = crate::store::keys::list(&db.pool).await.unwrap().remove(0);
-        assert_eq!(
-            (record.id.as_str(), record.name.as_str()),
-            ("legacy", "legacy")
-        );
-        assert!(crate::keys::matches(&record.sha256, secret));
+        // This fixture stops at 0005; current key readers require later columns.
+        let (id, name, sha256): (String, String, Vec<u8>) =
+            sqlx::query_as("SELECT id, name, sha256 FROM api_keys")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!((id.as_str(), name.as_str()), ("legacy", "legacy"));
+        assert!(crate::keys::matches(&sha256, secret));
         let owner: (Option<String>, String) =
             sqlx::query_as("SELECT key_id, actor FROM changesets WHERE handle = 'existing-handle'")
                 .fetch_one(&db.pool)

@@ -36,6 +36,8 @@ pub struct Principal {
     pub key_id: String,
     /// What it may do.
     pub access: Access,
+    /// Independent opt-in to submit maintenance reports.
+    pub maintenance_report: bool,
     /// Which catalogs it reaches.
     pub reach: Reach,
     /// Its default catalog (design "Catalog selection", step 3).
@@ -89,6 +91,20 @@ impl Principal {
         }
         Ok(())
     }
+
+    /// Requires read access to the catalog and the independent reporting flag.
+    ///
+    /// # Errors
+    /// As [`Self::require`], or [`OkfError::Forbidden`] when reporting is disabled.
+    pub fn require_maintenance_report(&self, catalog: &str) -> Result<(), OkfError> {
+        self.require(Access::Read, catalog)?;
+        if !self.maintenance_report {
+            return Err(OkfError::Forbidden {
+                reason: format!("key {:?} cannot submit maintenance reports", self.key_id),
+            });
+        }
+        Ok(())
+    }
 }
 
 // `From` is Rust's conversion trait: `Principal::from(record)` (or
@@ -103,6 +119,7 @@ impl From<KeyRecord> for Principal {
         Self {
             key_id: record.id,
             access: record.access,
+            maintenance_report: record.maintenance_report,
             reach,
             default_catalog: record.default_catalog,
             actor: record.actor,
@@ -281,6 +298,7 @@ mod tests {
             name: id.to_string(),
             sha256: keys::hash(key).to_vec(),
             access: Access::Read,
+            maintenance_report: false,
             all_catalogs: false,
             catalogs: vec!["pg".to_string()],
             default_catalog: Some("pg".to_string()),
@@ -327,6 +345,33 @@ mod tests {
         assert!(cache.find("short-key").is_none());
         assert_eq!(cache.by_hash.len(), 1);
         assert!(cache.find("no-such-key").is_none());
+    }
+
+    #[test]
+    fn maintenance_capability_does_not_imply_write() {
+        let mut reporter_record = record("reporter", "reporter-key", false);
+        reporter_record.maintenance_report = true;
+        let reporter = Principal::from(reporter_record);
+        assert!(reporter.require_maintenance_report("pg").is_ok());
+        assert!(reporter.require(Access::Write, "pg").is_err());
+        assert!(matches!(
+            reporter.require_maintenance_report("other"),
+            Err(OkfError::CatalogNotSelected { .. })
+        ));
+        let writer_without_flag = Principal {
+            access: Access::Write,
+            maintenance_report: false,
+            ..reporter.clone()
+        };
+        assert!(matches!(
+            writer_without_flag.require_maintenance_report("pg"),
+            Err(OkfError::Forbidden { .. })
+        ));
+        let admin_without_flag = Principal {
+            access: Access::Admin,
+            ..writer_without_flag
+        };
+        assert!(admin_without_flag.require_maintenance_report("pg").is_err());
     }
 
     #[test]
@@ -434,6 +479,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn maintenance_capability_change_refreshes_cache() {
+        use crate::store::{catalogs, keys as key_rows};
+        let db = crate::db::test_db().await;
+        catalogs::create(&db.pool, "pg", "", Utc::now())
+            .await
+            .unwrap();
+        let new = key_rows::NewKey {
+            name: "reporter",
+            access: Access::Read,
+            grants: key_rows::Grants::Catalogs(&["pg".to_string()]),
+            default_catalog: Some("pg"),
+            actor: "tester",
+            maintenance_report: true,
+        };
+        let created = key_rows::create_with_id(&db.pool, &new, Utc::now())
+            .await
+            .unwrap();
+        let app = crate::app::App::load(
+            db.pool.clone(),
+            crate::config::Config::default(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .await
+        .unwrap();
+        assert!(app.keys().find(&created.key).unwrap().maintenance_report);
+        let before = catalogs::admin_generation(&db.pool).await.unwrap();
+        assert_eq!(
+            key_rows::set_maintenance_report_target(&db.pool, &created.id, None, false)
+                .await
+                .unwrap(),
+            created.id
+        );
+        assert_eq!(
+            catalogs::admin_generation(&db.pool).await.unwrap(),
+            before + 1
+        );
+        assert!(app.keys().find(&created.key).unwrap().maintenance_report);
+        app.poll().await.unwrap();
+        let principal_after_poll = app.keys().find(&created.key).unwrap();
+        assert!(!principal_after_poll.maintenance_report);
+        assert!(principal_after_poll
+            .require_maintenance_report("pg")
+            .is_err());
+        key_rows::set_maintenance_report_target(&db.pool, &created.id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalogs::admin_generation(&db.pool).await.unwrap(),
+            before + 1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn keys_load_from_the_database_and_reload_after_a_revoke() {
         use crate::store::{catalogs, keys as key_rows};
         let db = crate::db::test_db().await;
@@ -444,6 +542,7 @@ mod tests {
         let new = key_rows::NewKey {
             name: "reader",
             access: Access::Read,
+            maintenance_report: false,
             grants: key_rows::Grants::Catalogs(&names),
             default_catalog: Some("pg"),
             actor: "tester",

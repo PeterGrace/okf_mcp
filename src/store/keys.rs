@@ -70,6 +70,8 @@ pub struct NewKey<'a> {
     pub name: &'a str,
     /// Its access level.
     pub access: Access,
+    /// Whether this key may submit maintenance reports.
+    pub maintenance_report: bool,
     /// Its catalogs.
     pub grants: Grants<'a>,
     /// Its default catalog; must be granted.
@@ -96,6 +98,8 @@ pub struct KeyRecord {
     pub sha256: Vec<u8>,
     /// Its access level.
     pub access: Access,
+    /// Whether this key may submit maintenance reports.
+    pub maintenance_report: bool,
     /// Granted every catalog.
     pub all_catalogs: bool,
     /// Granted catalogs by name, sorted (empty with `all_catalogs`).
@@ -117,6 +121,7 @@ struct KeyRow {
     name: String,
     sha256: Vec<u8>,
     access: String,
+    maintenance_report: bool,
     all_catalogs: bool,
     catalogs: Vec<String>,
     default_catalog: Option<String>,
@@ -206,12 +211,13 @@ pub async fn create_with_id(
     let key = crate::keys::generate()?;
     let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO api_keys \
-         (name, sha256, access, all_catalogs, default_catalog_id, actor, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+         (name, sha256, access, maintenance_report, all_catalogs, default_catalog_id, actor, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
     .bind(new.name)
     .bind(crate::keys::hash(&key).as_slice())
     .bind(new.access.as_str())
+    .bind(new.maintenance_report)
     .bind(matches!(new.grants, Grants::All))
     .bind(default_catalog_id)
     .bind(new.actor)
@@ -314,7 +320,7 @@ async fn catalog_ids(conn: &mut PgConnection, names: &[String]) -> Result<Vec<i6
 /// [`OkfError::Database`].
 pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
     let rows = sqlx::query_as::<_, KeyRow>(
-        "SELECT k.id, k.name, k.sha256, k.access, k.all_catalogs, d.name AS default_catalog, k.actor, \
+        "SELECT k.id, k.name, k.sha256, k.access, k.maintenance_report, k.all_catalogs, d.name AS default_catalog, k.actor, \
                 k.created_at, k.revoked_at, \
                 COALESCE(array_agg(c.name ORDER BY c.name) FILTER (WHERE c.name IS NOT NULL), \
                          '{}'::text[]) AS catalogs \
@@ -333,6 +339,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
             name: row.name,
             sha256: row.sha256,
             access: Access::parse(&row.access).expect("the schema checks api_keys.access"),
+            maintenance_report: row.maintenance_report,
             all_catalogs: row.all_catalogs,
             catalogs: row.catalogs,
             default_catalog: row.default_catalog,
@@ -341,6 +348,49 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
             revoked_at: row.revoked_at,
         })
         .collect())
+}
+
+/// Sets the independent maintenance-report capability on an active key.
+/// Resolves an exact immutable id before an unambiguous active name; an actor
+/// disambiguates a name, not an id. An unchanged value does not reload caches.
+///
+/// # Errors
+/// [`OkfError::Refused`] for a revoked, absent or ambiguous key;
+/// [`OkfError::Database`] for storage failures.
+pub async fn set_maintenance_report_target(
+    pool: &PgPool,
+    target: &str,
+    actor: Option<&str>,
+    enabled: bool,
+) -> Result<String, OkfError> {
+    let mut tx = pool.begin().await?;
+    let id = resolve_active(&mut tx, target, actor).await?;
+    let updated = sqlx::query(
+        "UPDATE api_keys SET maintenance_report = $2 \
+         WHERE id = $1 AND revoked_at IS NULL AND maintenance_report IS DISTINCT FROM $2",
+    )
+    .bind(&id)
+    .bind(enabled)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 0 {
+        bump_admin_generation(&mut tx).await?;
+    } else {
+        // `resolve_active` accepts an exact generated id even if revoked.
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1 AND revoked_at IS NULL)",
+        )
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !active {
+            return Err(OkfError::Refused {
+                reason: format!("key {id:?} is revoked"),
+            });
+        }
+    }
+    tx.commit().await?;
+    Ok(id)
 }
 
 /// Revokes a key: it authenticates nothing from then on (M4 notices within
@@ -580,6 +630,7 @@ mod tests {
         NewKey {
             name,
             access: Access::Write,
+            maintenance_report: false,
             grants,
             default_catalog: default,
             actor: "claude-code/test",
@@ -763,6 +814,7 @@ mod tests {
         let terminal = NewKey {
             name: "claude",
             access: Access::Write,
+            maintenance_report: false,
             grants: Grants::All,
             default_catalog: None,
             actor: "claude-code-tui",
@@ -887,6 +939,7 @@ mod tests {
             &NewKey {
                 name: "first-name",
                 access: Access::Write,
+                maintenance_report: false,
                 grants: Grants::Catalogs(&work),
                 default_catalog: None,
                 actor: "first",
@@ -898,6 +951,7 @@ mod tests {
         let collision = NewKey {
             name: &by_id.id,
             access: Access::Write,
+            maintenance_report: false,
             grants: Grants::Catalogs(&work),
             default_catalog: None,
             actor: "second",
@@ -938,6 +992,7 @@ mod tests {
             &NewKey {
                 name: "legacy",
                 access: Access::Write,
+                maintenance_report: false,
                 grants: Grants::Catalogs(&work),
                 default_catalog: None,
                 actor: "web",
@@ -970,6 +1025,7 @@ mod tests {
             &NewKey {
                 name: "legacy",
                 access: Access::Write,
+                maintenance_report: false,
                 grants: Grants::Catalogs(&work),
                 default_catalog: None,
                 actor: "terminal",

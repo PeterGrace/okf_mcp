@@ -1,0 +1,17 @@
+# Disabled example. Operator authorization and both review gates are required.
+endpoint = "https://catalog.example.invalid/mcp"
+catalog = "replace-with-catalog"
+claude_binary = "/opt/okf-maintenance/claude-2.1.319"
+expected_claude_version = "2.1.319 (Claude Code)"
+model = "replace-with-exact-provider-model-id"
+state_dir = "/var/lib/okf-maintenance"
+allow_model_upload = false
+acknowledge_inflight_budget_overshoot = false
+require_hard_billing_cap = false
+batch_size = 10
+max_invocations = 10
+# Leave 60 seconds before the service TimeoutStartSec=1800 cap.
+max_run_seconds = 1740
+invocation_microusd = 100000
+run_microusd = 1000000
+observed_token_stop = 100000

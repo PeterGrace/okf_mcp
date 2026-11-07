@@ -1,0 +1,1609 @@
+{
+  "maintenance_claim": {
+    "input": {
+      "required": [
+        "catalog",
+        "idempotency_key"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "idempotency_key": {
+          "type": "string"
+        },
+        "batch_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 50
+        }
+      },
+      "additionalProperties": false
+    },
+    "output": {
+      "required": [
+        "catalog",
+        "run_id",
+        "leases"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "leases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "run_id": {
+                "type": "string"
+              },
+              "work_id": {
+                "type": "string"
+              },
+              "token": {
+                "type": "string"
+              },
+              "pin": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 1
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "path",
+                  "revision"
+                ]
+              },
+              "reasons": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "changed",
+                    "aging"
+                  ]
+                }
+              },
+              "expires_at": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "run_id",
+              "work_id",
+              "token",
+              "pin",
+              "reasons",
+              "expires_at"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "maintenance_renew": {
+    "input": {
+      "required": [
+        "catalog",
+        "work_id",
+        "token",
+        "idempotency_key"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "work_id": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        },
+        "idempotency_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "output": {
+      "required": [
+        "catalog",
+        "run_id",
+        "work_id",
+        "token",
+        "pin",
+        "reasons",
+        "expires_at"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "work_id": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        },
+        "pin": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "revision"
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "changed",
+              "aging"
+            ]
+          }
+        },
+        "expires_at": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "maintenance_read_revision": {
+    "input": {
+      "required": [
+        "catalog",
+        "path",
+        "revision"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "int32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "output": {
+      "required": [
+        "catalog",
+        "pin",
+        "content",
+        "outdated"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "pin": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "revision"
+          ]
+        },
+        "content": {
+          "type": "string"
+        },
+        "outdated": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "maintenance_submit": {
+    "input": {
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "work_id": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        },
+        "idempotency_key": {
+          "type": "string"
+        },
+        "submission": {
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "type": "string",
+              "enum": [
+                "completed",
+                "inconclusive",
+                "failed"
+              ]
+            },
+            "assessment": {
+              "type": "string",
+              "enum": [
+                "supported_current",
+                "outdated",
+                "unverifiable",
+                "not_assessed"
+              ]
+            },
+            "summary": {
+              "type": "string"
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "pin": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "revision": {
+                        "type": "integer",
+                        "format": "int32",
+                        "minimum": 1
+                      }
+                    },
+                    "additionalProperties": false,
+                    "required": [
+                      "path",
+                      "revision"
+                    ]
+                  },
+                  "excerpt": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "pin",
+                  "excerpt"
+                ]
+              }
+            },
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "category": {
+                    "type": "string",
+                    "enum": [
+                      "suggested_link",
+                      "possible_duplicate",
+                      "conflicting_assertions",
+                      "potentially_outdated_information",
+                      "unverifiable_claim"
+                    ]
+                  },
+                  "assertion": {
+                    "type": "string"
+                  },
+                  "follow_up": {
+                    "type": "string"
+                  },
+                  "uncertainty": {
+                    "type": "string"
+                  },
+                  "relationship": {
+                    "type": "string",
+                    "enum": [
+                      "direct_statement",
+                      "inference",
+                      "external_observation"
+                    ]
+                  },
+                  "evidence": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "pin": {
+                          "type": "object",
+                          "properties": {
+                            "path": {
+                              "type": "string"
+                            },
+                            "revision": {
+                              "type": "integer",
+                              "format": "int32",
+                              "minimum": 1
+                            }
+                          },
+                          "additionalProperties": false,
+                          "required": [
+                            "path",
+                            "revision"
+                          ]
+                        },
+                        "excerpt": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "pin",
+                        "excerpt"
+                      ]
+                    }
+                  },
+                  "external": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "resource": {
+                          "type": "string"
+                        },
+                        "excerpt": {
+                          "type": "string"
+                        },
+                        "attribution": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "resource",
+                        "excerpt",
+                        "attribution"
+                      ]
+                    }
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "category",
+                  "assertion",
+                  "follow_up",
+                  "uncertainty",
+                  "relationship",
+                  "evidence",
+                  "external"
+                ]
+              }
+            },
+            "reported_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "outcome",
+            "assessment",
+            "summary",
+            "evidence",
+            "findings"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "catalog",
+        "work_id",
+        "token",
+        "idempotency_key",
+        "submission"
+      ]
+    },
+    "output": {
+      "required": [
+        "catalog",
+        "run_id",
+        "work_id",
+        "outcome",
+        "finding_ids",
+        "outdated"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "work_id": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "completed",
+            "inconclusive",
+            "failed",
+            "superseded"
+          ]
+        },
+        "finding_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "outdated": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "maintenance_close": {
+    "input": {
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "idempotency_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "catalog",
+        "run_id",
+        "state",
+        "rationale",
+        "idempotency_key"
+      ]
+    },
+    "output": {
+      "required": [
+        "catalog",
+        "id",
+        "state",
+        "actor",
+        "created_at",
+        "deadline",
+        "primary_count",
+        "completed_count",
+        "failed_count",
+        "inconclusive_count",
+        "superseded_count"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "actor": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "deadline": {
+          "type": "string"
+        },
+        "ended_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "primary_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "completed_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "failed_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "inconclusive_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "superseded_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "maintenance_list_runs": {
+    "input": {
+      "required": [
+        "catalog"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 200
+        }
+      },
+      "additionalProperties": false
+    },
+    "output": {
+      "required": [
+        "catalog",
+        "items"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "running",
+                  "completed",
+                  "failed",
+                  "cancelled"
+                ]
+              },
+              "actor": {
+                "type": "string"
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "deadline": {
+                "type": "string"
+              },
+              "ended_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "primary_count": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              },
+              "completed_count": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              },
+              "failed_count": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              },
+              "inconclusive_count": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              },
+              "superseded_count": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "id",
+              "state",
+              "actor",
+              "created_at",
+              "deadline",
+              "primary_count",
+              "completed_count",
+              "failed_count",
+              "inconclusive_count",
+              "superseded_count"
+            ]
+          }
+        },
+        "next_after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  },
+  "maintenance_get_run": {
+    "input": {
+      "required": [
+        "catalog",
+        "run_id"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "output": {
+      "required": [
+        "catalog",
+        "run",
+        "work"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "run": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "running",
+                "completed",
+                "failed",
+                "cancelled"
+              ]
+            },
+            "actor": {
+              "type": "string"
+            },
+            "created_at": {
+              "type": "string"
+            },
+            "deadline": {
+              "type": "string"
+            },
+            "ended_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "primary_count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "completed_count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "failed_count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "inconclusive_count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "superseded_count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "id",
+            "state",
+            "actor",
+            "created_at",
+            "deadline",
+            "primary_count",
+            "completed_count",
+            "failed_count",
+            "inconclusive_count",
+            "superseded_count"
+          ]
+        },
+        "work": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "pin": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 1
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "path",
+                  "revision"
+                ]
+              },
+              "reasons": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "changed",
+                    "aging"
+                  ]
+                }
+              },
+              "outcome": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "completed",
+                      "inconclusive",
+                      "failed",
+                      "superseded"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "assessment": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "supported_current",
+                      "outdated",
+                      "unverifiable",
+                      "not_assessed"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "summary": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "pin": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "type": "string"
+                        },
+                        "revision": {
+                          "type": "integer",
+                          "format": "int32",
+                          "minimum": 1
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "path",
+                        "revision"
+                      ]
+                    },
+                    "excerpt": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "pin",
+                    "excerpt"
+                  ]
+                }
+              },
+              "finding_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "id",
+              "pin",
+              "reasons",
+              "evidence",
+              "finding_ids"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "maintenance_list_findings": {
+    "input": {
+      "required": [
+        "catalog"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 200
+        }
+      },
+      "additionalProperties": false
+    },
+    "output": {
+      "required": [
+        "catalog",
+        "items"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "run_id": {
+                "type": "string"
+              },
+              "work_id": {
+                "type": "string"
+              },
+              "input": {
+                "type": "object",
+                "properties": {
+                  "category": {
+                    "type": "string",
+                    "enum": [
+                      "suggested_link",
+                      "possible_duplicate",
+                      "conflicting_assertions",
+                      "potentially_outdated_information",
+                      "unverifiable_claim"
+                    ]
+                  },
+                  "assertion": {
+                    "type": "string"
+                  },
+                  "follow_up": {
+                    "type": "string"
+                  },
+                  "uncertainty": {
+                    "type": "string"
+                  },
+                  "relationship": {
+                    "type": "string",
+                    "enum": [
+                      "direct_statement",
+                      "inference",
+                      "external_observation"
+                    ]
+                  },
+                  "evidence": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "pin": {
+                          "type": "object",
+                          "properties": {
+                            "path": {
+                              "type": "string"
+                            },
+                            "revision": {
+                              "type": "integer",
+                              "format": "int32",
+                              "minimum": 1
+                            }
+                          },
+                          "additionalProperties": false,
+                          "required": [
+                            "path",
+                            "revision"
+                          ]
+                        },
+                        "excerpt": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "pin",
+                        "excerpt"
+                      ]
+                    }
+                  },
+                  "external": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "resource": {
+                          "type": "string"
+                        },
+                        "excerpt": {
+                          "type": "string"
+                        },
+                        "attribution": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "resource",
+                        "excerpt",
+                        "attribution"
+                      ]
+                    }
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "category",
+                  "assertion",
+                  "follow_up",
+                  "uncertainty",
+                  "relationship",
+                  "evidence",
+                  "external"
+                ]
+              },
+              "actor": {
+                "type": "string"
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "disposition": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "accepted_for_follow_up",
+                  "dismissed",
+                  "needs_input"
+                ]
+              },
+              "dispositions": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "disposition": {
+                      "type": "string",
+                      "enum": [
+                        "open",
+                        "accepted_for_follow_up",
+                        "dismissed",
+                        "needs_input"
+                      ]
+                    },
+                    "rationale": {
+                      "type": "string"
+                    },
+                    "actor": {
+                      "type": "string"
+                    },
+                    "at": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "disposition",
+                    "rationale",
+                    "actor",
+                    "at"
+                  ]
+                }
+              },
+              "outdated": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "id",
+              "run_id",
+              "work_id",
+              "input",
+              "actor",
+              "created_at",
+              "disposition",
+              "dispositions",
+              "outdated"
+            ]
+          }
+        },
+        "next_after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  },
+  "maintenance_get_finding": {
+    "input": {
+      "required": [
+        "catalog",
+        "finding_id"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "finding_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "output": {
+      "required": [
+        "catalog",
+        "id",
+        "run_id",
+        "work_id",
+        "input",
+        "actor",
+        "created_at",
+        "disposition",
+        "dispositions",
+        "outdated"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "work_id": {
+          "type": "string"
+        },
+        "input": {
+          "type": "object",
+          "properties": {
+            "category": {
+              "type": "string",
+              "enum": [
+                "suggested_link",
+                "possible_duplicate",
+                "conflicting_assertions",
+                "potentially_outdated_information",
+                "unverifiable_claim"
+              ]
+            },
+            "assertion": {
+              "type": "string"
+            },
+            "follow_up": {
+              "type": "string"
+            },
+            "uncertainty": {
+              "type": "string"
+            },
+            "relationship": {
+              "type": "string",
+              "enum": [
+                "direct_statement",
+                "inference",
+                "external_observation"
+              ]
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "pin": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "revision": {
+                        "type": "integer",
+                        "format": "int32",
+                        "minimum": 1
+                      }
+                    },
+                    "additionalProperties": false,
+                    "required": [
+                      "path",
+                      "revision"
+                    ]
+                  },
+                  "excerpt": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "pin",
+                  "excerpt"
+                ]
+              }
+            },
+            "external": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "resource": {
+                    "type": "string"
+                  },
+                  "excerpt": {
+                    "type": "string"
+                  },
+                  "attribution": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "resource",
+                  "excerpt",
+                  "attribution"
+                ]
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "assertion",
+            "follow_up",
+            "uncertainty",
+            "relationship",
+            "evidence",
+            "external"
+          ]
+        },
+        "actor": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "open",
+            "accepted_for_follow_up",
+            "dismissed",
+            "needs_input"
+          ]
+        },
+        "dispositions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "disposition": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "accepted_for_follow_up",
+                  "dismissed",
+                  "needs_input"
+                ]
+              },
+              "rationale": {
+                "type": "string"
+              },
+              "actor": {
+                "type": "string"
+              },
+              "at": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "disposition",
+              "rationale",
+              "actor",
+              "at"
+            ]
+          }
+        },
+        "outdated": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "maintenance_dispose": {
+    "input": {
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "finding_id": {
+          "type": "string"
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "open",
+            "accepted_for_follow_up",
+            "dismissed",
+            "needs_input"
+          ]
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "idempotency_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "catalog",
+        "finding_id",
+        "disposition",
+        "rationale",
+        "idempotency_key"
+      ]
+    },
+    "output": {
+      "required": [
+        "catalog",
+        "id",
+        "run_id",
+        "work_id",
+        "input",
+        "actor",
+        "created_at",
+        "disposition",
+        "dispositions",
+        "outdated"
+      ],
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "work_id": {
+          "type": "string"
+        },
+        "input": {
+          "type": "object",
+          "properties": {
+            "category": {
+              "type": "string",
+              "enum": [
+                "suggested_link",
+                "possible_duplicate",
+                "conflicting_assertions",
+                "potentially_outdated_information",
+                "unverifiable_claim"
+              ]
+            },
+            "assertion": {
+              "type": "string"
+            },
+            "follow_up": {
+              "type": "string"
+            },
+            "uncertainty": {
+              "type": "string"
+            },
+            "relationship": {
+              "type": "string",
+              "enum": [
+                "direct_statement",
+                "inference",
+                "external_observation"
+              ]
+            },
+            "evidence": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "pin": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "revision": {
+                        "type": "integer",
+                        "format": "int32",
+                        "minimum": 1
+                      }
+                    },
+                    "additionalProperties": false,
+                    "required": [
+                      "path",
+                      "revision"
+                    ]
+                  },
+                  "excerpt": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "pin",
+                  "excerpt"
+                ]
+              }
+            },
+            "external": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "resource": {
+                    "type": "string"
+                  },
+                  "excerpt": {
+                    "type": "string"
+                  },
+                  "attribution": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "resource",
+                  "excerpt",
+                  "attribution"
+                ]
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "assertion",
+            "follow_up",
+            "uncertainty",
+            "relationship",
+            "evidence",
+            "external"
+          ]
+        },
+        "actor": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "open",
+            "accepted_for_follow_up",
+            "dismissed",
+            "needs_input"
+          ]
+        },
+        "dispositions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "disposition": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "accepted_for_follow_up",
+                  "dismissed",
+                  "needs_input"
+                ]
+              },
+              "rationale": {
+                "type": "string"
+              },
+              "actor": {
+                "type": "string"
+              },
+              "at": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "disposition",
+              "rationale",
+              "actor",
+              "at"
+            ]
+          }
+        },
+        "outdated": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

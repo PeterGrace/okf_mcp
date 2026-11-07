@@ -24,7 +24,21 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod http;
+pub mod investigator;
 pub mod keys;
+pub mod maintenance;
+#[cfg(test)]
+mod maintenance_contract_tests {
+    #[test]
+    fn new_id_is_random_hex() {
+        let first = crate::maintenance::types::new_id().unwrap();
+        assert_eq!(first.len(), 32);
+        assert!(first
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_ne!(first, crate::maintenance::types::new_id().unwrap());
+    }
+}
 pub mod mcp;
 pub mod ntp;
 pub mod okf;

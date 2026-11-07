@@ -1,0 +1,25 @@
+# Disabled example only: repository files do not install or enable a unit.
+[Unit]
+Description=Report-only OKF maintenance (operator authorized)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=okf-maintenance
+Group=okf-maintenance
+# Operator creates this file root-owned, mode 0600; never commit credentials.
+EnvironmentFile=/etc/okf-maintenance/credentials.env
+ExecStart=/opt/okf-maintenance/okf-maintenance run-once --config /etc/okf-maintenance/config.toml
+UMask=0077
+StateDirectory=okf-maintenance
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/okf-maintenance
+WorkingDirectory=/var/lib/okf-maintenance
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+MemoryMax=512M
+TimeoutStartSec=1800
+KillMode=control-group

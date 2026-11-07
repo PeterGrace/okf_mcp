@@ -11,6 +11,7 @@ mod documents;
 // public item is never flagged as dead code meanwhile.
 pub mod context;
 mod history;
+mod maintenance;
 mod reports;
 mod restructure;
 mod search;
@@ -77,6 +78,7 @@ impl OkfServer {
             + Self::publish_router()
             + Self::changes_router()
             + Self::restructure_router()
+            + Self::maintenance_router()
     }
 
     /// The context of the request rmcp handed a tool. The error is already a

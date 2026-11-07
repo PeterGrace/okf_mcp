@@ -54,7 +54,11 @@ largest uncompressed import, but a file that fails validation fails every
 subcommand). Every subcommand applies the embedded migrations first, so
 `migrate` is only needed as a separate deploy step. `okf-mcp --help` and
 `okf-mcp <command> --help` list the rest: `catalog list|delete`,
-`key list|revoke|grant|ungrant`, `import --replace`.
+`key list|revoke|grant|ungrant|maintenance-report`, `import --replace`.
+`key create --maintenance-report` opts a key into reporting independently of
+its access level; `key maintenance-report ID --enabled true|false [--actor ACTOR]`
+changes the flag. Reporting still requires catalog read access and never
+confers write access.
 
 `import` takes a `.tar.gz` file, `-` for one on stdin, or a directory. A
 `git archive` tarball imports exactly the checkout's tracked files, and a
@@ -68,6 +72,55 @@ positional value is a grouping name: several live credentials may share it
 when their actors differ. `revoke`, `grant` and `ungrant` accept the immutable
 id, an unambiguous live name, or `NAME --actor ACTOR`. A revoked name/actor
 pair can be issued again without changing the old credential's history.
+
+## Report-only maintenance
+
+Maintenance stores revision-pinned investigator reports separately from canonical
+content. It never edits, merges, splits or deletes concepts, writes verification
+stamps, or publishes changesets. `accepted_for_follow_up` records a decision,
+not an applied change. No automatic canonical edits or resident scheduler exist;
+external URLs are not fetched. Reported support is an attributed assessment, not
+server or human verification.
+
+The ten MCP tools are `maintenance_claim`, `maintenance_renew`,
+`maintenance_read_revision`, `maintenance_submit`, `maintenance_close`,
+`maintenance_list_runs`, `maintenance_get_run`, `maintenance_list_findings`,
+`maintenance_get_finding` and `maintenance_dispose`. Every call requires an
+explicit `catalog`, even on a connection with a default. Reporting permission
+is separate from ordinary Read/Write/Admin access; writers do not automatically
+become reporters.
+
+One claim opens one batch: default 10, range 1–50 primary concepts, 900-second
+leases and a 3,600-second run deadline. Explicit failed/inconclusive attempts
+retry after 86,400 seconds; expired leases can be reclaimed immediately.
+See [maintenance operations](docs/operations.md#report-only-maintenance) for
+permissions, exact limits, JSON pagination and a synthetic end-to-end workflow.
+Ordinary canonical exports omit reports; database backups include them. The
+secret scanner is heuristic, not proof that text contains no secret.
+
+### Optional report-only runner
+
+`okf-maintenance` is a separate, opt-in one-shot controller. `cargo run` still
+selects `okf-mcp`; select the runner explicitly:
+
+```sh
+cargo run --bin okf-maintenance -- --help
+cargo run --bin okf-maintenance -- evaluate --cases tests/fixtures/investigator/corpus/evaluation.json
+# Only after operator configuration and credential provisioning:
+# okf-maintenance preflight --config /etc/okf-maintenance/config.toml
+# okf-maintenance run-once --config /etc/okf-maintenance/config.toml
+```
+
+[Operator instructions](docs/operations.md#report-only-runner) describe consent,
+provider API authentication, privacy, recovery and exit status.
+[Examples](examples/maintenance/config.toml) have both consent flags **false**;
+the accompanying service/timer are disabled examples, not installed scheduling.
+Preflight checks version/help and MCP schemas, not paid-envelope compatibility or
+reporting grants. The only inspected real Claude CLI version is
+`2.1.319 (Claude Code)` (help/version only). Independent human review of the
+synthetic corpus and a separately authorized, sanitized one-item live smoke run
+remain mandatory before enabling scheduling. Generated fixture labels are not
+that human review. Exit 0 never establishes factual freshness.
 
 ## Running the server
 
@@ -90,6 +143,7 @@ poll_interval = "10s"              # how often to look for CLI changes
 session_idle_timeout = "2h"        # an idle MCP session is closed after this; also
                                    # when an untouched changeset counts as idle
 max_import_bytes = "64MiB"         # uncompressed total of an import
+maintenance_review_intervals = { pg = "30d" } # per-catalog; default 30d, minimum 1d
 time_server = "time.example.com"   # NTP server for the clock check (default: none)
 ```
 
