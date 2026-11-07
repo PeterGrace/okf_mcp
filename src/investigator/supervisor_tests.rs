@@ -74,6 +74,9 @@ impl Fixture {
             read_delay: 0,
             renew_latency: Duration::ZERO,
             deadline: 3600,
+            run_state: "running",
+            close_state: None,
+            response_patch: None,
             pause: true,
             bad_schema: false,
             large: false,
@@ -124,6 +127,24 @@ impl Fixture {
         j.reserved_microusd = 100_000;
         j.accounting_known = false;
         self.store.save(&j).unwrap();
+        if phase == Phase::ProposalReady {
+            j.work[0].phase = Phase::ProposalReady;
+            j.work[0].proposal = Some(Proposal {
+                summary: "Catalog only".into(),
+                findings: vec![],
+            });
+            let usage = ModelUsage {
+                input: 11,
+                output: 7,
+                cache_creation: 3,
+                cache_read: 5,
+                cost_microusd: 100_000,
+            };
+            j.work[0].usage = Some(usage.clone());
+            j.usage = usage;
+            j.accounting_known = true;
+            self.store.save(&j).unwrap();
+        }
     }
 }
 fn lease(i: usize, expiry: DateTime<Utc>) -> Lease {
@@ -149,6 +170,9 @@ struct FakeClient {
     read_delay: u64,
     renew_latency: Duration,
     deadline: i64,
+    run_state: &'static str,
+    close_state: Option<&'static str>,
+    response_patch: Option<(AllowedTool, Value)>,
     pause: bool,
     bad_schema: bool,
     large: bool,
@@ -166,8 +190,8 @@ impl FakeClient {
     fn report(&self, state: &str) -> Value {
         json!({"id":"run","state":state,"actor":"fixture","created_at":self.clock.utc.to_rfc3339(),
             "deadline":(self.clock.utc + chrono::Duration::seconds(self.deadline)).to_rfc3339(),
-            "ended_at":null,"reason":null,"primary_count":self.count,"completed_count":0,
-            "failed_count":0,"inconclusive_count":0,"superseded_count":0})
+            "ended_at":(state != "running").then(|| self.clock.now().to_rfc3339()),"reason":null,"primary_count":self.count,"completed_count":0,
+            "failed_count":if state == "running" { 0 } else { self.count },"inconclusive_count":0,"superseded_count":0})
     }
 }
 impl CatalogClient for FakeClient {
@@ -255,13 +279,23 @@ impl CatalogClient for FakeClient {
                 {
                     return Err(RunnerError::Permission);
                 }
-                self.report(request.args["state"].as_str().unwrap())
+                self.report(
+                    self.close_state
+                        .unwrap_or(request.args["state"].as_str().unwrap()),
+                )
             }
             AllowedTool::GetRun => {
                 if let Some(cancel) = self.cancel_on_get_run.take() {
                     cancel.cancel();
                 }
-                json!({"run":self.report("running"),"work":[]})
+                let terminal = self.run_state != "running";
+                let work: Vec<_> = (0..self.count).map(|index| {
+                    let lease = lease(index, self.clock.now());
+                    json!({"id":lease.work_id,"pin":lease.pin,"reasons":lease.reasons,
+                        "outcome":terminal.then_some("failed"),"assessment":terminal.then_some("not_assessed"),
+                        "summary":null,"evidence":[],"finding_ids":[]})
+                }).collect();
+                json!({"run":self.report(self.run_state),"work":work})
             }
             AllowedTool::GetConcept => {
                 tokio::time::sleep(Duration::from_secs(self.read_delay)).await;
@@ -279,6 +313,13 @@ impl CatalogClient for FakeClient {
         };
         if request.tool != AllowedTool::Search {
             value["catalog"] = json!("synthetic");
+        }
+        if let Some((tool, patch)) = &self.response_patch {
+            if *tool == request.tool {
+                for (name, field) in patch.as_object().unwrap() {
+                    value[name] = field.clone();
+                }
+            }
         }
         if let Some(key) = key {
             self.replay.insert(key, value.clone());
@@ -1001,6 +1042,357 @@ async fn investigator_supervisor_reconciled_interruption_never_starts_queued_mod
     assert_eq!(j.usage.input, 11);
     assert!(j.terminal);
 }
+#[tokio::test]
+async fn investigator_supervisor_authoritative_terminal_reconciles_without_receipts() {
+    for state in ["failed", "cancelled", "completed"] {
+        for phase in [
+            Phase::Claimed,
+            Phase::InvocationStarted,
+            Phase::ProposalReady,
+        ] {
+            let f = Fixture::new();
+            f.seed(phase);
+            let before = f.store.load().unwrap().unwrap();
+            let mut c = f.client(1);
+            c.run_state = state;
+            c.deadline = -1;
+            let i = FakeInference::new(0);
+            let s = run(&f, &mut c, i.clone()).await.unwrap();
+            assert_eq!(s.exit_code(), 4);
+            let j = f.store.load().unwrap().unwrap();
+            assert!(j.terminal, "authoritative {state} must release the journal");
+            assert!(j.work[0].phase == Phase::Abandoned);
+            assert!(j.receipts.is_empty());
+            assert_eq!(j.invocations, before.invocations);
+            assert_eq!(j.reserved_microusd, before.reserved_microusd);
+            assert_eq!(j.accounting_known, before.accounting_known);
+            assert_eq!(
+                serde_json::to_value(&j.usage).unwrap(),
+                serde_json::to_value(&before.usage).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&j.work[0].usage).unwrap(),
+                serde_json::to_value(&before.work[0].usage).unwrap()
+            );
+            assert_eq!(i.calls.load(Ordering::SeqCst), 0);
+            assert!(c.calls.iter().all(|(_, r)| r.tool == AllowedTool::GetRun));
+            // Reopen the lock/state as a restarted scheduler would. Only the next
+            // authorized invocation may replace the durably reconciled journal.
+            let config = f.config.clone();
+            let mut next = f.client(0);
+            drop(f.store);
+            let store = JournalStore::open(
+                &config.state_dir,
+                &config.binding("test-only-credential").unwrap(),
+            )
+            .unwrap();
+            let j = store.load().unwrap().unwrap();
+            assert!(j.terminal);
+            tokio::time::resume();
+            next.run_state = "completed";
+            let s = run_once(
+                &config,
+                &mut next,
+                i.clone(),
+                &store,
+                f.clock.as_ref(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(s.exit_code(), 0);
+            assert!(next.calls.iter().any(|(_, r)| r.tool == AllowedTool::Claim));
+            assert_eq!(i.calls.load(Ordering::SeqCst), 0);
+            tokio::time::resume();
+        }
+    }
+}
+
+#[tokio::test]
+async fn investigator_supervisor_expired_running_recovery_closes_without_renewal() {
+    for deadline in [false, true] {
+        for close_state in ["failed", "completed"] {
+            let f = Fixture::new();
+            f.seed(Phase::InvocationStarted);
+            let mut before = f.store.load().unwrap().unwrap();
+            if !deadline {
+                before.leases[0].expires_at =
+                    (f.clock.now() - chrono::Duration::seconds(1)).to_rfc3339();
+                f.store.save(&before).unwrap();
+            }
+            let mut c = f.client(1);
+            c.close_state = Some(close_state);
+            if deadline {
+                c.deadline = -1;
+            }
+            let i = FakeInference::new(0);
+            let s = run(&f, &mut c, i.clone()).await.unwrap();
+            assert_eq!(s.exit_code(), 4);
+            let j = f.store.load().unwrap().unwrap();
+            assert!(j.terminal, "expired running run needs acknowledged close");
+            assert!(j.pending.is_none());
+            assert!(j.receipts.is_empty());
+            assert!(j.work[0].phase == Phase::Abandoned);
+            assert_eq!(j.work[0].failure.as_deref(), Some("unknown_accounting"));
+            assert!(!j.accounting_known);
+            assert_eq!(j.invocations, before.invocations);
+            assert_eq!(j.reserved_microusd, before.reserved_microusd);
+            assert_eq!(i.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(c.calls.len(), 2);
+            assert!(c.calls[0].1.tool == AllowedTool::GetRun);
+            assert!(c.calls[1].1.tool == AllowedTool::Close);
+            tokio::time::resume();
+        }
+    }
+}
+
+#[tokio::test]
+async fn investigator_supervisor_terminal_read_follows_exact_submit_and_preserves_receipt() {
+    let f = Fixture::new();
+    f.seed(Phase::ProposalReady);
+    let mut j = f.store.load().unwrap().unwrap();
+    j.leases
+        .push(lease(1, f.clock.now() + chrono::Duration::seconds(900)));
+    j.work.push(WorkState {
+        work_id: "w1".into(),
+        phase: Phase::Claimed,
+        packet: None,
+        proposal: None,
+        usage: None,
+        failure: None,
+    });
+    let submission = to_submission(
+        j.work[0].packet.as_ref().unwrap(),
+        j.work[0].proposal.as_ref().unwrap(),
+    )
+    .unwrap();
+    j.work[0].phase = Phase::SubmissionPending;
+    j.pending = Some(PendingMutation::new(ToolRequest { tool: AllowedTool::Submit, args: json!({"work_id":"w0","token":"lease-0","submission":submission,"idempotency_key":"original-submit"}) }, "synthetic").unwrap());
+    f.store.save(&j).unwrap();
+    let mut c = f.client(2);
+    c.run_state = "cancelled";
+    let i = FakeInference::new(0);
+    let result = run(&f, &mut c, i.clone()).await.unwrap();
+    let after = f.store.load().unwrap().unwrap();
+    assert_eq!(result.exit_code(), 4);
+    assert_eq!(result.reported, 1);
+    assert_eq!(result.skipped, 1);
+    assert_eq!(c.calls.len(), 2);
+    assert!(c.calls[0].1.tool == AllowedTool::Submit);
+    assert_eq!(c.calls[0].1.args, j.pending.unwrap().request.args);
+    assert!(c.calls[1].1.tool == AllowedTool::GetRun);
+    assert!(after.work[0].phase == Phase::Reported);
+    assert!(after.work[1].phase == Phase::Abandoned);
+    assert!(after.terminal);
+    assert_eq!(after.receipts.len(), 1);
+    let mut acknowledged = c.replay["original-submit"].clone();
+    acknowledged.as_object_mut().unwrap().remove("catalog");
+    assert_eq!(
+        serde_json::to_value(&after.receipts[0]).unwrap(),
+        acknowledged
+    );
+    assert_eq!(after.invocations, j.invocations);
+    assert_eq!(after.reserved_microusd, j.reserved_microusd);
+    assert_eq!(
+        serde_json::to_value(&after.usage).unwrap(),
+        serde_json::to_value(&j.usage).unwrap()
+    );
+    assert!(after.accounting_known);
+    assert_eq!(i.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn investigator_supervisor_reconciliation_faults_reopen_without_repayment() {
+    use super::super::journal::{fail_save_after, Fault};
+    for state in ["failed", "cancelled", "completed", "running", "deadline"] {
+        for fault in [Fault::FileSync, Fault::Rename, Fault::DirectorySync] {
+            let boundaries = if matches!(state, "running" | "deadline") {
+                4
+            } else {
+                3
+            };
+            for boundary in 0..boundaries {
+                let f = Fixture::new();
+                f.seed(Phase::InvocationStarted);
+                let mut j = f.store.load().unwrap().unwrap();
+                j.leases[0].expires_at =
+                    (f.clock.now() - chrono::Duration::seconds(1)).to_rfc3339();
+                f.store.save(&j).unwrap();
+                let mut c = f.client(1);
+                c.run_state = if state == "deadline" {
+                    "running"
+                } else {
+                    state
+                };
+                if state == "deadline" {
+                    c.deadline = -1;
+                }
+                c.close_state = Some("failed");
+                fail_save_after(boundary, fault);
+                let i = FakeInference::new(0);
+                assert_eq!(
+                    run(&f, &mut c, i.clone()).await.err(),
+                    Some(RunnerError::Io)
+                );
+                let snapshot = f.store.load().unwrap().unwrap();
+                let pending = snapshot.pending.clone();
+                let calls = c.calls.len();
+                let config = f.config.clone();
+                drop(f.store);
+                let store = JournalStore::open(
+                    &config.state_dir,
+                    &config.binding("test-only-credential").unwrap(),
+                )
+                .unwrap();
+                tokio::time::resume();
+                c.pause = true;
+                if snapshot.terminal {
+                    // Visible directory-sync failures must be confirmed durable,
+                    // not turned into another recovery invocation in this test.
+                    store.save(&snapshot).unwrap();
+                } else {
+                    let result = run_once(
+                        &config,
+                        &mut c,
+                        i.clone(),
+                        &store,
+                        f.clock.as_ref(),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(result.exit_code(), 4);
+                    if let Some(pending) = pending {
+                        assert_eq!(c.calls[calls].1.args, pending.request.args);
+                        assert!(c.calls[calls].1.tool == pending.request.tool);
+                    }
+                    tokio::time::resume();
+                }
+                let after = store.load().unwrap().unwrap();
+                assert!(after.terminal, "{state} boundary {boundary}");
+                assert!(after.receipts.is_empty());
+                assert!(!after.accounting_known);
+                assert_eq!(after.invocations, 1);
+                assert_eq!(after.reserved_microusd, 100_000);
+                assert_eq!(after.work[0].failure.as_deref(), Some("unknown_accounting"));
+                assert_eq!(i.calls.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn investigator_supervisor_non_failure_close_still_rejects_mismatched_terminal_state() {
+    for (requested, actual) in [("completed", "cancelled"), ("cancelled", "completed")] {
+        let f = Fixture::new();
+        f.seed(Phase::InvocationStarted);
+        let mut j = f.store.load().unwrap().unwrap();
+        j.pending = Some(PendingMutation::new(ToolRequest { tool: AllowedTool::Close, args: json!({"run_id":"run","state":requested,"rationale":"synthetic close","idempotency_key":"close-check"}) }, "synthetic").unwrap());
+        f.store.save(&j).unwrap();
+        let mut c = f.client(1);
+        let mut response = c.report(actual);
+        response["catalog"] = json!("synthetic");
+        c.replay.insert("close-check".into(), response);
+        let i = FakeInference::new(0);
+        assert_eq!(run(&f, &mut c, i.clone()).await.unwrap().exit_code(), 4);
+        let after = f.store.load().unwrap().unwrap();
+        assert!(!after.terminal);
+        assert_eq!(
+            after.pending.unwrap().request.args,
+            j.pending.unwrap().request.args
+        );
+        assert!(after.receipts.is_empty());
+        assert_eq!(i.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(c.calls.len(), 1);
+        tokio::time::resume();
+    }
+}
+
+#[tokio::test]
+async fn investigator_supervisor_terminal_responses_validate_id_catalog_state_and_deadline() {
+    for tool in [AllowedTool::GetRun, AllowedTool::Close] {
+        for field in ["id", "catalog", "state", "deadline"] {
+            let f = Fixture::new();
+            f.seed(Phase::InvocationStarted);
+            let mut before = f.store.load().unwrap().unwrap();
+            before.leases[0].expires_at =
+                (f.clock.now() - chrono::Duration::seconds(1)).to_rfc3339();
+            f.store.save(&before).unwrap();
+            let mut c = f.client(1);
+            c.run_state = if tool == AllowedTool::GetRun {
+                "completed"
+            } else {
+                "running"
+            };
+            c.close_state = Some("cancelled");
+            let invalid = match field {
+                "id" => json!("wrong-run"),
+                "catalog" => json!("foreign"),
+                "state" => json!("unknown"),
+                _ => json!("not-a-timestamp"),
+            };
+            let mut patch = json!({});
+            if tool == AllowedTool::GetRun && field != "catalog" {
+                let mut report = c.report("completed");
+                report[field] = invalid;
+                patch["run"] = report;
+            } else {
+                patch[field] = invalid;
+            }
+            c.response_patch = Some((tool, patch));
+            let i = FakeInference::new(0);
+            let result = run(&f, &mut c, i.clone()).await.unwrap();
+            assert_eq!(result.exit_code(), 4);
+            let after = f.store.load().unwrap().unwrap();
+            assert!(!after.terminal, "{field}");
+            assert!(after.work[0].phase == Phase::InvocationStarted);
+            assert_eq!(after.pending.is_some(), tool == AllowedTool::Close);
+            assert!(after.receipts.is_empty());
+            assert_eq!(after.invocations, before.invocations);
+            assert_eq!(after.reserved_microusd, before.reserved_microusd);
+            assert!(!after.accounting_known);
+            assert_eq!(i.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                c.calls.len(),
+                if tool == AllowedTool::Close { 2 } else { 1 }
+            );
+            tokio::time::resume();
+        }
+    }
+}
+
+#[tokio::test]
+async fn investigator_supervisor_reconciliation_errors_keep_pending_and_fail_closed() {
+    for tool in [AllowedTool::GetRun, AllowedTool::Close] {
+        for error in [
+            RunnerError::Permission,
+            RunnerError::Contract,
+            RunnerError::Transport,
+        ] {
+            let f = Fixture::new();
+            f.seed(Phase::InvocationStarted);
+            let mut j = f.store.load().unwrap().unwrap();
+            j.leases[0].expires_at = (f.clock.now() - chrono::Duration::seconds(1)).to_rfc3339();
+            f.store.save(&j).unwrap();
+            let mut c = f.client(1);
+            c.fail = Some((tool, error));
+            let i = FakeInference::new(0);
+            let s = run(&f, &mut c, i.clone()).await.unwrap();
+            let after = f.store.load().unwrap().unwrap();
+            assert_eq!(s.exit_code(), 4);
+            assert!(!after.terminal);
+            assert!(after.receipts.is_empty());
+            assert_eq!(after.pending.is_some(), tool == AllowedTool::Close);
+            assert_eq!(i.calls.load(Ordering::SeqCst), 0);
+            assert!(c
+                .calls
+                .iter()
+                .all(|(_, r)| matches!(r.tool, AllowedTool::GetRun | AllowedTool::Close)));
+            tokio::time::resume();
+        }
+    }
+}
+
 #[tokio::test]
 async fn investigator_supervisor_expired_renewal_replay_never_authorizes_work() {
     let f = Fixture::new();

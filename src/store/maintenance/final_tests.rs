@@ -454,7 +454,38 @@ async fn maintenance_final_completed_close_acknowledges_without_rewriting_histor
         )
         .await
         .is_err());
-        for state in [RunState::Running, RunState::Failed, RunState::Cancelled] {
+        let failure_key = format!("failure-{run}");
+        for at in [t0() + Duration::seconds(1), t0() + Duration::days(2)] {
+            let acknowledged = runs::close(
+                &db.pool,
+                catalog,
+                &actor("one"),
+                run,
+                RunState::Failed,
+                "terminal reconciliation",
+                false,
+                &failure_key,
+                at,
+            )
+            .await
+            .unwrap();
+            assert_eq!(acknowledged, before.run);
+            assert_eq!(runs::get_run(&db.pool, catalog, run).await.unwrap(), before);
+        }
+        assert!(runs::close(
+            &db.pool,
+            catalog,
+            &actor("other"),
+            run,
+            RunState::Failed,
+            "terminal reconciliation",
+            false,
+            &failure_key,
+            t0(),
+        )
+        .await
+        .is_err());
+        for state in [RunState::Running, RunState::Cancelled] {
             assert!(runs::close(
                 &db.pool,
                 catalog,

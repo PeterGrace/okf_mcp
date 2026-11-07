@@ -555,6 +555,11 @@ Report get/list responses contain no lease tokens.
 item also completes a running run automatically. Closing failed/cancelled
 invalidates outstanding leases and releases work for a later run. Empty claims
 complete immediately. History and completed work survive closure/recovery.
+An authorized `state: failed` close against an already terminal run acknowledges
+its actual `completed`, `cancelled` or `failed` state idempotently; it does not
+rewrite the state, terminal time/reason, or work history. This also covers another
+caller terminalizing the run between lookup and close. Ownership and reporting/Write
+checks still apply before replay. The acknowledgment is not a submission receipt.
 
 ### Limits, evidence and retries
 
@@ -873,7 +878,11 @@ renewal, submit or close replays its exact normalized payload and idempotency ke
 Crash after `invocation_started` means potentially spent money: recover reports and
 close without another model call in that run. Invocation count, reservations and
 known usage survive restart; the recovery process has a fresh bounded local wall
-window but remains subject to the original server deadline/lease authority. Only a
+window. New work/submission remains subject to the original server deadline/lease
+authority. After exact pending replay, an authoritative terminal read abandons
+unreported local work without inventing receipts. Expired unfinished running work
+uses a journaled failure-close acknowledgment, not renewal or inference; that
+recovery close does not require a live lease or unexpired server deadline. Only a
 durable terminal run permits a later fresh run's spending window. Do not infer
 permission to retry from an apparently idle process or a missing response.
 The first stop reason remains immutable for reporting (for example, `transport`

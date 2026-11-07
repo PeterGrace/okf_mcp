@@ -64,6 +64,8 @@ impl Fixture {
             journal: self.config.state_dir.join("journal.json"),
             calls: vec![],
             lose_submit: 0,
+            lose_close: 0,
+            pause_after_lookup: None,
             block_submit: false,
             foreign_response: false,
             inference_started: Arc::new(AtomicBool::new(false)),
@@ -119,6 +121,8 @@ struct WireClient {
     journal: PathBuf,
     calls: Vec<WireCall>,
     lose_submit: u32,
+    lose_close: u32,
+    pause_after_lookup: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     block_submit: bool,
     foreign_response: bool,
     inference_started: Arc<AtomicBool>,
@@ -186,8 +190,19 @@ impl CatalogClient for WireClient {
             response: value.clone(),
             after_inference,
         });
+        if request.tool == AllowedTool::GetRun {
+            if let Some((looked_up, resume)) = self.pause_after_lookup.take() {
+                assert_eq!(value["run"]["state"], "running");
+                looked_up.notify_one();
+                resume.notified().await;
+            }
+        }
         if request.tool == AllowedTool::Submit && self.lose_submit > 0 {
             self.lose_submit -= 1;
+            return Err(RunnerError::Transport);
+        }
+        if request.tool == AllowedTool::Close && self.lose_close > 0 {
+            self.lose_close -= 1;
             return Err(RunnerError::Transport);
         }
         Ok(value)
@@ -638,6 +653,362 @@ async fn investigator_lost_response_replay_and_historical_superseded() {
         assert!(before == canonical(&server, &key, &observer).await);
     }
 }
+#[tokio::test(flavor = "multi_thread")]
+async fn investigator_authoritative_terminal_and_expired_runs_release_journal() {
+    for mode in ["failed", "cancelled", "completed", "lease", "deadline"] {
+        let server = server(false).await;
+        let key = server.reporter_key("runner", &["pg", "other"]).await;
+        let observer = server.client(&key, None).await.unwrap();
+        let f = Fixture::new(&key);
+        let mut client = f.client(&server, &key).await;
+        f.claim(&mut client).await;
+        let mut journal = f.store.load().unwrap().unwrap();
+        let run_id = journal.run_id.clone().unwrap();
+        if matches!(mode, "lease" | "completed") {
+            let expiry = chrono::Utc::now() - chrono::Duration::seconds(1);
+            sqlx::query("UPDATE maintenance_work SET lease_expires_at=$2 WHERE run_id=$1")
+                .bind(&run_id)
+                .bind(expiry)
+                .execute(&server.db.pool)
+                .await
+                .unwrap();
+            journal.leases[0].expires_at = expiry.to_rfc3339();
+            f.store.save(&journal).unwrap();
+        }
+        if mode == "deadline" {
+            sqlx::query("UPDATE maintenance_runs SET deadline=$2 WHERE id=$1")
+                .bind(&run_id)
+                .bind(chrono::Utc::now() - chrono::Duration::seconds(1))
+                .execute(&server.db.pool)
+                .await
+                .unwrap();
+        }
+        if matches!(mode, "failed" | "cancelled" | "completed") {
+            // An independent authorized caller terminalizes the run. The runner
+            // has no submission receipt and must not synthesize one from this.
+            let result = call(&observer, "maintenance_close", json!({"catalog":"pg","run_id":run_id,"state":mode,"rationale":"synthetic external close","idempotency_key":"external-close"})).await;
+            assert_ne!(result.is_error, Some(true));
+        }
+        let before = canonical(&server, &key, &observer).await;
+        let calls = client.calls.len();
+        let model = FakeInference::new(false, None, client.inference_started.clone());
+        let result = run_once(
+            &f.config,
+            &mut client,
+            model.clone(),
+            &f.store,
+            &SystemClock,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.exit_code(), 4, "{mode}");
+        assert_eq!(result.reported + result.failed + result.inconclusive, 0);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+        let after = f.store.load().unwrap().unwrap();
+        assert!(after.terminal, "{mode}");
+        assert!(after.pending.is_none());
+        assert!(after.work[0].phase == Phase::Abandoned);
+        assert!(after.receipts.is_empty());
+        let recovery = &client.calls[calls..];
+        assert_eq!(recovery[0].name, "maintenance_get_run");
+        assert!(recovery
+            .iter()
+            .all(|c| matches!(c.name, "maintenance_get_run" | "maintenance_close")));
+        assert_eq!(
+            recovery.len(),
+            if matches!(mode, "lease" | "deadline") {
+                2
+            } else {
+                1
+            }
+        );
+        if mode == "lease" {
+            // Real close recovers the expired lease and acknowledges completed,
+            // despite the failed close request. Neither is a submit receipt.
+            assert_eq!(recovery[1].args["state"], "failed");
+            assert_eq!(recovery[1].response["state"], "completed");
+        }
+        if matches!(mode, "completed" | "cancelled" | "failed") {
+            let history: Value =
+                sqlx::query_scalar("SELECT to_jsonb(r) FROM maintenance_runs r WHERE id=$1")
+                    .bind(&run_id)
+                    .fetch_one(&server.db.pool)
+                    .await
+                    .unwrap();
+            let work_history = work(&server, &run_id).await;
+            let args = json!({"catalog":"pg","run_id":run_id,"state":"failed","rationale":"synthetic terminal acknowledgment","idempotency_key":"terminal-ack"});
+            let ack = call(&observer, "maintenance_close", args.clone()).await;
+            assert_ne!(ack.is_error, Some(true));
+            assert_eq!(structured(&ack)["state"], mode);
+            let replay = call(&observer, "maintenance_close", args.clone()).await;
+            assert_eq!(structured(&ack), structured(&replay));
+            let recorded: Value =
+                sqlx::query_scalar("SELECT to_jsonb(r) FROM maintenance_runs r WHERE id=$1")
+                    .bind(&run_id)
+                    .fetch_one(&server.db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(recorded, history);
+            assert_eq!(work(&server, &run_id).await, work_history);
+            let foreign_key = server.reporter_key("foreign", &["pg"]).await;
+            let foreign = server.client(&foreign_key, None).await.unwrap();
+            assert_eq!(
+                call(&foreign, "maintenance_close", args).await.is_error,
+                Some(true)
+            );
+            if mode != "failed" {
+                let mismatch = call(&observer, "maintenance_close", json!({"catalog":"pg","run_id":run_id,"state":if mode == "completed" { "cancelled" } else { "completed" },"rationale":"unsupported mismatch","idempotency_key":"mismatched-close"})).await;
+                assert_eq!(mismatch.is_error, Some(true));
+            }
+        }
+        assert!(before == canonical(&server, &key, &observer).await);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn investigator_expired_close_lost_ack_replays_after_restart() {
+    for deadline in [false, true] {
+        let server = server(false).await;
+        let key = server.reporter_key("runner", &["pg", "other"]).await;
+        let f = Fixture::new(&key);
+        let mut client = f.client(&server, &key).await;
+        f.claim(&mut client).await;
+        let mut j = f.store.load().unwrap().unwrap();
+        let run_id = j.run_id.clone().unwrap();
+        let expiry = chrono::Utc::now() - chrono::Duration::seconds(1);
+        if deadline {
+            sqlx::query("UPDATE maintenance_runs SET deadline=$2 WHERE id=$1")
+                .bind(&run_id)
+                .bind(expiry)
+                .execute(&server.db.pool)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("UPDATE maintenance_work SET lease_expires_at=$2 WHERE run_id=$1")
+                .bind(&run_id)
+                .bind(expiry)
+                .execute(&server.db.pool)
+                .await
+                .unwrap();
+            j.leases[0].expires_at = expiry.to_rfc3339();
+            f.store.save(&j).unwrap();
+        }
+        client.lose_close = 3;
+        let model = FakeInference::new(false, None, client.inference_started.clone());
+        let first = run_once(
+            &f.config,
+            &mut client,
+            model.clone(),
+            &f.store,
+            &SystemClock,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.exit_code(), 4);
+        let interrupted = f.store.load().unwrap().unwrap();
+        assert!(!interrupted.terminal);
+        assert!(interrupted.receipts.is_empty());
+        let pending = interrupted.pending.unwrap().request;
+        assert!(pending.tool == AllowedTool::Close);
+        let calls = client.calls.len();
+        drop(f.store);
+        let store =
+            JournalStore::open(&f.config.state_dir, &f.config.binding(&key).unwrap()).unwrap();
+        let resumed = run_once(
+            &f.config,
+            &mut client,
+            model.clone(),
+            &store,
+            &SystemClock,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.exit_code(), 4);
+        let after = store.load().unwrap().unwrap();
+        assert!(after.terminal);
+        assert!(after.pending.is_none());
+        assert!(after.receipts.is_empty());
+        assert_eq!(client.calls.len(), calls + 1);
+        assert_eq!(client.calls[calls].args, pending.args);
+        assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+        let requests: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM maintenance_requests WHERE operation='close'")
+                .fetch_one(&server.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(requests, 1, "close replay must acknowledge once");
+        let rows = work(&server, &run_id).await;
+        assert_eq!(rows[0]["outcome"], "failed");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn investigator_terminalization_after_lookup_acknowledges_exact_failure_close() {
+    for state in ["completed", "cancelled", "failed"] {
+        for known in [false, true] {
+            let server = server(false).await;
+            let key = server.reporter_key("runner", &["pg", "other"]).await;
+            let observer = server.client(&key, None).await.unwrap();
+            let f = Fixture::new(&key);
+            let mut client = f.client(&server, &key).await;
+            f.claim(&mut client).await;
+            let mut j = f.store.load().unwrap().unwrap();
+            let run_id = j.run_id.clone().unwrap();
+            let lease = j.leases[0].clone();
+            j.work[0].phase = Phase::PacketReady;
+            j.work[0].packet = Some(Packet {
+                work_id: lease.work_id.clone(),
+                reasons: lease.reasons.clone(),
+                primary_id: "s0".into(),
+                sources: vec![okf_mcp::investigator::types::Source {
+                    id: "s0".into(),
+                    pin: lease.pin.clone(),
+                    text: "Synthetic evidence".into(),
+                }],
+            });
+            f.store.save(&j).unwrap();
+            j.work[0].phase = Phase::InvocationStarted;
+            j.invocations = 1;
+            j.reserved_microusd = 100_000;
+            j.accounting_known = false;
+            f.store.save(&j).unwrap();
+            if known {
+                let usage = ModelUsage {
+                    input: 10,
+                    output: 5,
+                    cache_creation: 2,
+                    cache_read: 3,
+                    cost_microusd: 50_000,
+                };
+                j.work[0].phase = Phase::ProposalReady;
+                j.work[0].proposal = Some(okf_mcp::investigator::types::Proposal {
+                    summary: "Synthetic proposal".into(),
+                    findings: vec![],
+                });
+                j.work[0].usage = Some(usage.clone());
+                j.usage = usage;
+                j.accounting_known = true;
+            }
+            // Inside the local safety margin but still live on the server. The
+            // independent actor, not expiry, must terminalize after the lookup.
+            j.leases[0].expires_at =
+                (chrono::Utc::now() + chrono::Duration::seconds(20)).to_rfc3339();
+            f.store.save(&j).unwrap();
+            let looked_up = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            client.pause_after_lookup = Some((looked_up.clone(), resume.clone()));
+            client.lose_close = 3;
+            let model = FakeInference::new(false, None, client.inference_started.clone());
+            let running = run_once(
+                &f.config,
+                &mut client,
+                model.clone(),
+                &f.store,
+                &SystemClock,
+                CancellationToken::new(),
+            );
+            let terminalize = async {
+                tokio::time::timeout(std::time::Duration::from_secs(15), looked_up.notified())
+                    .await
+                    .unwrap();
+                let result = if state == "completed" {
+                    call(&observer, "maintenance_submit", json!({"catalog":"pg","work_id":lease.work_id,"token":lease.token,"idempotency_key":"external-submit","submission":{"outcome":"completed","assessment":"not_assessed","summary":"Independent synthetic report","evidence":[{"pin":lease.pin,"excerpt":"type: Note"}],"findings":[],"reported_tokens":null}})).await
+                } else {
+                    call(&observer, "maintenance_close", json!({"catalog":"pg","run_id":run_id,"state":state,"rationale":"Independent terminalization","idempotency_key":"external-close"})).await
+                };
+                assert_ne!(result.is_error, Some(true));
+                let history: Value =
+                    sqlx::query_scalar("SELECT to_jsonb(r) FROM maintenance_runs r WHERE id=$1")
+                        .bind(&run_id)
+                        .fetch_one(&server.db.pool)
+                        .await
+                        .unwrap();
+                assert_eq!(history["state"], state);
+                let work_history = work(&server, &run_id).await;
+                resume.notify_one();
+                (history, work_history)
+            };
+            let (first, history) = tokio::join!(running, terminalize);
+            assert_eq!(first.unwrap().exit_code(), 4);
+            assert_eq!(
+                client.lose_close, 0,
+                "all three committed acknowledgments were lost"
+            );
+            let interrupted = f.store.load().unwrap().unwrap();
+            assert!(!interrupted.terminal);
+            let pending = interrupted.pending.clone().unwrap().request;
+            assert!(pending.tool == AllowedTool::Close);
+            assert_eq!(pending.args["state"], "failed");
+            let calls = client.calls.len();
+            drop(f.store);
+            let store =
+                JournalStore::open(&f.config.state_dir, &f.config.binding(&key).unwrap()).unwrap();
+            client.lose_close = 0;
+            let resumed = run_once(
+                &f.config,
+                &mut client,
+                model.clone(),
+                &store,
+                &SystemClock,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resumed.exit_code(), 4);
+            assert_eq!(resumed.reported + resumed.failed + resumed.inconclusive, 0);
+            let after = store.load().unwrap().unwrap();
+            assert!(after.terminal, "{state}, known usage {known}");
+            assert!(after.pending.is_none());
+            assert!(after.receipts.is_empty());
+            assert!(after.work[0].phase == Phase::Abandoned);
+            assert_eq!(after.invocations, j.invocations);
+            assert_eq!(after.reserved_microusd, j.reserved_microusd);
+            assert_eq!(after.accounting_known, known);
+            assert_eq!(
+                serde_json::to_value(&after.usage).unwrap(),
+                serde_json::to_value(&j.usage).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&after.work[0].usage).unwrap(),
+                serde_json::to_value(&j.work[0].usage).unwrap()
+            );
+            if !known {
+                assert_eq!(after.work[0].failure.as_deref(), Some("unknown_accounting"));
+            }
+            assert_eq!(client.calls.len(), calls + 1);
+            assert_eq!(client.calls[calls].args, pending.args);
+            assert_eq!(client.calls[calls].response["state"], state);
+            assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+            assert!(client
+                .calls
+                .iter()
+                .skip(1)
+                .all(|c| matches!(c.name, "maintenance_get_run" | "maintenance_close")));
+            let recorded: Value =
+                sqlx::query_scalar("SELECT to_jsonb(r) FROM maintenance_runs r WHERE id=$1")
+                    .bind(&run_id)
+                    .fetch_one(&server.db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                recorded, history.0,
+                "terminal metadata must remain immutable"
+            );
+            assert_eq!(work(&server, &run_id).await, history.1);
+            let acknowledgments: i64 = sqlx::query_scalar("SELECT count(*) FROM maintenance_requests WHERE operation='close' AND idempotency_key=$1").bind(pending.args["idempotency_key"].as_str().unwrap()).fetch_one(&server.db.pool).await.unwrap();
+            assert_eq!(acknowledgments, 1);
+            drop(store);
+            let confirmed =
+                JournalStore::open(&f.config.state_dir, &f.config.binding(&key).unwrap()).unwrap();
+            assert!(confirmed.load().unwrap().unwrap().terminal);
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn investigator_distinct_catalog_guesses_and_response_mismatch_fail_closed() {
     let server = server(false).await;

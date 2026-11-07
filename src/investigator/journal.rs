@@ -189,6 +189,24 @@ fn validate_binding(binding: &Binding) -> Result<(), RunnerError> {
 }
 
 impl Journal {
+    /// Only after an authoritative terminal read or acknowledged close, with no
+    /// ambiguous mutation left. Abandonment is not a submission receipt.
+    pub(super) fn mark_terminal(&mut self) -> Result<(), RunnerError> {
+        if self.pending.is_some() {
+            return Err(RunnerError::Journal);
+        }
+        for work in &mut self.work {
+            if work.phase != Phase::Reported {
+                if work.phase == Phase::InvocationStarted && work.usage.is_none() {
+                    work.failure = Some("unknown_accounting".into());
+                }
+                work.phase = Phase::Abandoned;
+            }
+        }
+        self.terminal = true;
+        Ok(())
+    }
+
     pub fn new(binding: Binding) -> Self {
         Self {
             schema_version: 1,

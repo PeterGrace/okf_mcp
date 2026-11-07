@@ -528,8 +528,9 @@ pub async fn renew(
 
 /// Closes a run or acknowledges its automatic completion without changing history.
 ///
-/// A completed acknowledgement records the caller's idempotent receipt, preserving
-/// the original terminal time and reason. Ownership is checked before replay.
+/// A failure close acknowledges any already-terminal run without changing its
+/// state, time, reason, or work. Completed acknowledgments remain supported.
+/// Ownership is checked before replay; acknowledgments record an idempotent receipt.
 ///
 /// # Errors
 /// Refuses foreign runs without operator permission, incomplete completion, or invalid state.
@@ -605,7 +606,8 @@ pub async fn close(
         };
         sqlx::query("UPDATE maintenance_runs SET state=$3, ended_at=$4, end_reason=$5 WHERE catalog_id=$1 AND id=$2")
             .bind(catalog_id).bind(run_id).bind(target).bind(now).bind(rationale).execute(&mut *tx).await?;
-    } else if !(status == "completed" && desired == RunState::Completed)
+    } else if !(desired == RunState::Failed
+        || status == "completed" && desired == RunState::Completed)
         && (status != "failed" || now < row.try_get::<DateTime<Utc>, _>("deadline")?)
     {
         tx.commit().await?;

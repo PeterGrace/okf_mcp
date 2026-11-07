@@ -289,7 +289,7 @@ impl<C: CatalogClient> Controller<'_, C> {
             }
         }
         let now = self.clock.now() + chrono::Duration::seconds(SAFETY);
-        if self.deadline.is_some_and(|end| now >= end) {
+        if !recovering && self.deadline.is_some_and(|end| now >= end) {
             return Err(RunnerError::Budget);
         }
         if !recovering {
@@ -381,7 +381,7 @@ impl<C: CatalogClient> Controller<'_, C> {
                     if Instant::now() >= self.local_deadline { return Err(RunnerError::Budget); }
                     if !self.cleanup && self.child.as_ref().is_some_and(|c| !c.task.is_finished() && Instant::now() >= c.until) { return Err(RunnerError::Child); }
                     let margin = now + chrono::Duration::seconds(SAFETY);
-                    if deadline.is_some_and(|d| margin >= d) { return Err(RunnerError::Budget); }
+                    if !recovering && deadline.is_some_and(|d| margin >= d) { return Err(RunnerError::Budget); }
                     if !recovering && leases.iter().any(|d| margin >= *d) { return Err(RunnerError::LeaseLost); }
                     if renew.is_some_and(|d| Instant::now() >= d) { return Ok(None); }
                 }
@@ -518,18 +518,22 @@ impl<C: CatalogClient> Controller<'_, C> {
                 self.journal.receipts.push(receipt);
             }
             AllowedTool::Close => {
-                if value["id"] != args["run_id"] || value["state"] != args["state"] {
+                // Failure-close acknowledges existing terminal history, including
+                // independent completion/cancellation after our running lookup.
+                let deadline = timestamp(value["deadline"].as_str().ok_or(RunnerError::Contract)?)?;
+                let recovered_terminal = args["state"] == "failed"
+                    && matches!(
+                        value["state"].as_str(),
+                        Some("completed" | "cancelled" | "failed")
+                    )
+                    || value["state"] == "failed" && self.clock.now() >= deadline;
+                if value["id"] != args["run_id"]
+                    || value["state"] != args["state"] && !recovered_terminal
+                {
                     return Err(RunnerError::Contract);
                 }
-                self.journal.terminal = true;
-                for w in &mut self.journal.work {
-                    if w.phase != Phase::Reported {
-                        if w.phase == Phase::InvocationStarted && w.usage.is_none() {
-                            w.failure = Some("unknown_accounting".into());
-                        }
-                        w.phase = Phase::Abandoned;
-                    }
-                }
+                self.journal.pending = None;
+                self.journal.mark_terminal()?;
             }
             _ => return Err(RunnerError::Contract),
         }
@@ -632,16 +636,48 @@ impl<C: CatalogClient> Controller<'_, C> {
                 .as_str()
                 .ok_or(RunnerError::Contract)?,
         )?);
-        if !matches!(
-            report["run"]["state"].as_str(),
-            Some("running" | "completed")
-        ) {
-            return Err(RunnerError::LeaseLost);
+        match report["run"]["state"].as_str() {
+            Some("failed" | "cancelled" | "completed") => {
+                if report["run"]["state"] != "completed"
+                    || self.journal.work.iter().any(|w| w.phase != Phase::Reported)
+                {
+                    self.stop(RunnerError::LeaseLost)?;
+                }
+                self.journal.mark_terminal()?;
+                self.save()?;
+                return self
+                    .journal
+                    .stop_reason
+                    .as_deref()
+                    .and_then(failure_kind)
+                    .map_or(Ok(()), Err);
+            }
+            Some("running") => {}
+            _ => return Err(RunnerError::Contract),
         }
-        if report["run"]["state"] == "completed"
-            && self.journal.work.iter().any(|w| w.phase != Phase::Reported)
-        {
-            return Err(RunnerError::LeaseLost);
+        // No renewal or submission under expired authority. A journaled close
+        // does not require a live lease; its acknowledgment alone releases state.
+        let margin = self.clock.now() + chrono::Duration::seconds(SAFETY);
+        let expired_deadline = self.deadline.is_some_and(|end| margin >= end);
+        let expired_lease = self
+            .active_leases()
+            .map(|l| timestamp(&l.expires_at))
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|end| margin >= *end);
+        if expired_deadline || expired_lease {
+            let reason = if expired_deadline {
+                RunnerError::Budget
+            } else {
+                RunnerError::LeaseLost
+            };
+            self.stop(reason)?;
+            self.prepare(
+                AllowedTool::Close,
+                json!({"run_id":self.journal.run_id,"state":"failed","rationale":kind(reason)}),
+            )?;
+            self.replay(true).await?;
+            return Err(reason);
         }
         if recovering {
             let ids: Vec<_> = self.active_leases().map(|l| l.work_id.clone()).collect();
