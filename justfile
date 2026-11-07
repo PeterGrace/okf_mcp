@@ -10,3 +10,10 @@ lint:
 
 test:
     cargo test
+
+# Prepare locally; ship through a PR, then publish the merged commit's tag.
+release-prepare patchlevel:
+    bash scripts/release-prepare.sh {{quote(patchlevel)}}
+
+release-ship:
+    bash scripts/release-ship.sh
