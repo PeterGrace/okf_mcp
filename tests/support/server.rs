@@ -188,6 +188,7 @@ impl TestServer {
         let new = NewKey {
             name: id,
             access,
+            maintenance_report: false,
             grants,
             default_catalog: default,
             actor: id,
@@ -195,6 +196,23 @@ impl TestServer {
         let key = keys::create(&self.db.pool, &new, Utc::now())
             .await
             .expect("create key");
+        self.app.poll().await.expect("poll");
+        key
+    }
+
+    /// Creates a read-only maintenance reporter and refreshes the key cache.
+    pub async fn reporter_key(&self, name: &str, catalogs: &[&str]) -> String {
+        let key = self.key(name, Access::Read, catalogs, None).await;
+        let id = self
+            .app
+            .keys()
+            .find(&key)
+            .expect("created principal")
+            .key_id
+            .clone();
+        keys::set_maintenance_report_target(&self.db.pool, &id, None, true)
+            .await
+            .expect("enable reporting");
         self.app.poll().await.expect("poll");
         key
     }

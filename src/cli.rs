@@ -60,7 +60,7 @@ pub enum Command {
     // A nested subcommand: `okf-mcp catalog create ...`.
     #[command(subcommand)]
     Catalog(CatalogCommand),
-    /// Create, list, revoke, grant or ungrant API keys.
+    /// Create, list, revoke, grant, ungrant or configure reporting on API keys.
     #[command(subcommand)]
     Key(KeyCommand),
     /// Import a directory or a .tar.gz into an existing catalog.
@@ -124,6 +124,17 @@ pub enum KeyCommand {
     Create(KeyCreateArgs),
     /// List keys (never the keys themselves).
     List,
+    /// Set a key's independent maintenance-report capability.
+    MaintenanceReport {
+        /// The key's immutable id, or an unambiguous active name.
+        id: String,
+        /// Enable or disable maintenance reporting.
+        #[arg(long, required = true, action = clap::ArgAction::Set)]
+        enabled: bool,
+        /// Select this actor when `id` is a name.
+        #[arg(long)]
+        actor: Option<String>,
+    },
     /// Revoke a key.
     Revoke {
         /// The key's id, or an unambiguous active name.
@@ -164,6 +175,9 @@ pub struct KeyCreateArgs {
     /// Access level.
     #[arg(long, value_enum)]
     pub access: Access,
+    /// Permit maintenance reporting (does not grant write access).
+    #[arg(long)]
+    pub maintenance_report: bool,
     /// Granted catalogs, comma-separated.
     // Exactly one of `--catalogs` and `--all`: clap refuses both or neither.
     #[arg(
@@ -442,6 +456,7 @@ async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyho
             let new = NewKey {
                 name: &args.name,
                 access: args.access,
+                maintenance_report: args.maintenance_report,
                 grants,
                 default_catalog: args.default.as_deref(),
                 actor: args.actor.as_deref().unwrap_or(&args.name),
@@ -457,6 +472,11 @@ async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyho
             for key in keys::list(pool).await? {
                 println!("{}", format_key_record(&key));
             }
+        }
+        KeyCommand::MaintenanceReport { id, enabled, actor } => {
+            let resolved =
+                keys::set_maintenance_report_target(pool, &id, actor.as_deref(), enabled).await?;
+            println!("key {resolved} maintenance_report {enabled}");
         }
         KeyCommand::Revoke { id, actor } => {
             let resolved = keys::revoke_target(pool, &id, actor.as_deref(), clock.now()).await?;
@@ -486,12 +506,13 @@ fn format_key_record(key: &keys::KeyRecord) -> String {
         "active"
     };
     format!(
-        "{}\t{}\t{}\t{}\t{state}\t{catalogs}\tdefault {}",
+        "{}\t{}\t{}\t{}\t{state}\t{catalogs}\tdefault {}\tmaintenance_report {}",
         key.name,
         key.actor,
         key.id,
         key.access.as_str(),
-        key.default_catalog.as_deref().unwrap_or("-")
+        key.default_catalog.as_deref().unwrap_or("-"),
+        key.maintenance_report
     )
 }
 
@@ -662,6 +683,7 @@ mod tests {
         let create = KeyCommand::Create(KeyCreateArgs {
             name: "k".to_string(),
             access: Access::Read,
+            maintenance_report: false,
             catalogs: Vec::new(),
             all: true,
             default: None,
@@ -694,6 +716,211 @@ mod tests {
         assert_eq!(rows, [("k".to_string(), true, true)]);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn maintenance_capability_cli_resolves_actor_and_reissued_names() {
+        let db = crate::db::pg_support::TestDb::start().await;
+        let clock = fixed_now();
+        let url = Some(db.url.clone());
+        for actor in ["terminal", "web"] {
+            let parsed = Cli::try_parse_from([
+                "okf-mcp",
+                "key",
+                "create",
+                "shared",
+                "--access",
+                "read",
+                "--all",
+                "--actor",
+                actor,
+                "--maintenance-report",
+            ])
+            .unwrap();
+            let Some(Command::Key(command)) = parsed.command else {
+                panic!("expected key create")
+            };
+            run(cli(url.clone(), Command::Key(command)), Arc::clone(&clock))
+                .await
+                .unwrap();
+        }
+        let records = keys::list(&db.pool).await.unwrap();
+        assert!(records.iter().all(|record| record.maintenance_report));
+        let old_id = records
+            .iter()
+            .find(|record| record.actor == "terminal")
+            .unwrap()
+            .id
+            .clone();
+        assert_ne!(
+            old_id,
+            records
+                .iter()
+                .find(|record| record.actor == "web")
+                .unwrap()
+                .id
+        );
+        let without_flag = Cli::try_parse_from([
+            "okf-mcp", "key", "create", "ordinary", "--access", "admin", "--all",
+        ])
+        .unwrap();
+        let Some(Command::Key(ordinary)) = without_flag.command else {
+            panic!("expected key create")
+        };
+        run(cli(url.clone(), Command::Key(ordinary)), Arc::clone(&clock))
+            .await
+            .unwrap();
+        assert!(
+            !keys::list(&db.pool)
+                .await
+                .unwrap()
+                .iter()
+                .find(|record| record.name == "ordinary")
+                .unwrap()
+                .maintenance_report
+        );
+        assert!(Cli::try_parse_from([
+            "okf-mcp",
+            "key",
+            "maintenance-report",
+            "shared",
+            "--enabled",
+            "maybe"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["okf-mcp", "key", "maintenance-report", "shared"]).is_err());
+        let toggle = |target: &str, actor: Option<&str>, enabled: &str| {
+            let mut args = vec![
+                "okf-mcp",
+                "key",
+                "maintenance-report",
+                target,
+                "--enabled",
+                enabled,
+            ];
+            if let Some(actor) = actor {
+                args.extend(["--actor", actor]);
+            }
+            let Some(Command::Key(command)) = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected key maintenance-report")
+            };
+            command
+        };
+        assert!(run(
+            cli(url.clone(), Command::Key(toggle("shared", None, "false"))),
+            Arc::clone(&clock)
+        )
+        .await
+        .is_err());
+        run(
+            cli(
+                url.clone(),
+                Command::Key(toggle("shared", Some("terminal"), "false")),
+            ),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
+        let records = keys::list(&db.pool).await.unwrap();
+        assert!(
+            !records
+                .iter()
+                .find(|record| record.id == old_id)
+                .unwrap()
+                .maintenance_report
+        );
+        assert!(
+            records
+                .iter()
+                .find(|record| record.actor == "web")
+                .unwrap()
+                .maintenance_report
+        );
+        assert!(
+            format_key_record(records.iter().find(|record| record.id == old_id).unwrap())
+                .ends_with("\tmaintenance_report false")
+        );
+        run(
+            cli(
+                url.clone(),
+                Command::Key(KeyCommand::Revoke {
+                    id: old_id.clone(),
+                    actor: None,
+                }),
+            ),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
+        let parsed = Cli::try_parse_from([
+            "okf-mcp", "key", "create", "shared", "--access", "read", "--all", "--actor",
+            "terminal",
+        ])
+        .unwrap();
+        let Some(Command::Key(command)) = parsed.command else {
+            panic!("expected key create")
+        };
+        run(cli(url.clone(), Command::Key(command)), Arc::clone(&clock))
+            .await
+            .unwrap();
+        let records = keys::list(&db.pool).await.unwrap();
+        let replacement = records
+            .iter()
+            .find(|record| record.actor == "terminal" && record.revoked_at.is_none())
+            .unwrap();
+        let revoked_credential_id = old_id;
+        let replacement_credential_id = &replacement.id;
+        assert_ne!(revoked_credential_id, *replacement_credential_id);
+        assert!(!replacement.maintenance_report);
+        assert!(run(
+            cli(
+                url.clone(),
+                Command::Key(toggle(&revoked_credential_id, None, "true"))
+            ),
+            Arc::clone(&clock)
+        )
+        .await
+        .is_err());
+        run(
+            cli(
+                url.clone(),
+                Command::Key(toggle("shared", Some("terminal"), "true")),
+            ),
+            Arc::clone(&clock),
+        )
+        .await
+        .unwrap();
+        let records = keys::list(&db.pool).await.unwrap();
+        assert!(
+            records
+                .iter()
+                .find(|record| record.id == *replacement_credential_id)
+                .unwrap()
+                .maintenance_report
+        );
+        assert!(
+            !records
+                .iter()
+                .find(|record| record.id == revoked_credential_id)
+                .unwrap()
+                .maintenance_report
+        );
+        assert!(
+            records
+                .iter()
+                .find(|record| record.actor == "web")
+                .unwrap()
+                .maintenance_report
+        );
+        assert!(run(
+            cli(
+                url,
+                Command::Key(toggle(replacement_credential_id, Some("terminal"), "false"))
+            ),
+            clock
+        )
+        .await
+        .is_err());
+    }
+
     #[test]
     fn key_list_columns_have_the_documented_order() {
         let record = keys::KeyRecord {
@@ -701,6 +928,7 @@ mod tests {
             name: "claude".to_string(),
             sha256: Vec::new(),
             access: Access::Write,
+            maintenance_report: false,
             all_catalogs: false,
             catalogs: vec!["pg".to_string(), "work".to_string()],
             default_catalog: Some("pg".to_string()),
@@ -711,7 +939,7 @@ mod tests {
 
         assert_eq!(
             format_key_record(&record),
-            "claude\tclaude-code-tui\tcredential-id\twrite\tactive\tpg,work\tdefault pg"
+            "claude\tclaude-code-tui\tcredential-id\twrite\tactive\tpg,work\tdefault pg\tmaintenance_report false"
         );
     }
 

@@ -2,12 +2,15 @@
 //! milestone reads the fields it uses (M7 added `time_server`). Unknown keys
 //! are ignored, so one file serves every version of the server.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
 use std::time::Duration;
 
 use bytesize::ByteSize;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+use crate::store::catalogs;
 
 use crate::error::OkfError;
 
@@ -63,6 +66,9 @@ pub struct Config {
     /// The NTP server the clock check measures against (`host`, `host:port`
     /// or an address); none means no check (design "Time").
     pub time_server: Option<String>,
+    /// Review cadence overrides keyed by catalog name.
+    #[serde(deserialize_with = "deserialize_maintenance_intervals")]
+    pub maintenance_review_intervals: BTreeMap<String, Duration>,
 }
 
 impl Default for Config {
@@ -77,11 +83,39 @@ impl Default for Config {
             poll_interval: DEFAULT_POLL_INTERVAL,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             time_server: None,
+            maintenance_review_intervals: BTreeMap::new(),
         }
     }
 }
 
+fn deserialize_maintenance_intervals<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct HumanDuration(#[serde(with = "humantime_serde")] Duration);
+
+    let values = BTreeMap::<String, HumanDuration>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .map(|(name, value)| (name, value.0))
+        .collect())
+}
+
 impl Config {
+    /// Review cadence for a catalog, defaulting to 30 days.
+    #[must_use]
+    pub fn maintenance_review_interval(&self, catalog: &str) -> chrono::Duration {
+        let interval = self
+            .maintenance_review_intervals
+            .get(catalog)
+            .copied()
+            .unwrap_or(Duration::from_secs(2_592_000));
+        chrono::Duration::from_std(interval).expect("validated maintenance interval fits chrono")
+    }
+
     /// Parses a configuration file's text. It does not call
     /// [`Config::validate`]; [`Config::load`] does, so a caller that parses
     /// text itself must validate the result before serving with it.
@@ -137,6 +171,23 @@ impl Config {
             }
             if trimmed != server {
                 return Err("time_server has surrounding whitespace; remove it".to_string());
+            }
+        }
+        for (name, interval) in &self.maintenance_review_intervals {
+            if !catalogs::is_valid_name(name) {
+                return Err(format!(
+                    "maintenance_review_intervals: invalid catalog name {name:?}"
+                ));
+            }
+            if *interval < Duration::from_secs(86_400) {
+                return Err(format!(
+                    "maintenance_review_intervals.{name} must be at least 1 day"
+                ));
+            }
+            if chrono::Duration::from_std(*interval).is_err() {
+                return Err(format!(
+                    "maintenance_review_intervals.{name} exceeds supported duration"
+                ));
             }
         }
         Ok(())
@@ -279,6 +330,40 @@ mod tests {
             );
             assert!(error.to_string().contains(needle), "{text}: {error}");
         }
+    }
+
+    #[test]
+    fn maintenance_review_interval_is_per_catalog() {
+        let default = Config::default();
+        assert_eq!(
+            default.maintenance_review_interval("pg").num_seconds(),
+            2_592_000
+        );
+        let config =
+            Config::from_toml("[maintenance_review_intervals]\npg = \"14d\"\nother = \"1d\"\n")
+                .unwrap();
+        assert_eq!(
+            config.maintenance_review_interval("pg").num_seconds(),
+            1_209_600
+        );
+        assert_eq!(
+            config.maintenance_review_interval("other").num_seconds(),
+            86_400
+        );
+        assert_eq!(
+            config.maintenance_review_interval("missing").num_seconds(),
+            2_592_000
+        );
+        assert_eq!(config.validate(), Ok(()));
+        assert!(
+            Config::from_toml("[maintenance_review_intervals]\npg = \"not-duration\"\n").is_err()
+        );
+        let too_short =
+            Config::from_toml("[maintenance_review_intervals]\npg = \"86399s\"\n").unwrap();
+        assert!(too_short.validate().is_err());
+        let invalid_name =
+            Config::from_toml("[maintenance_review_intervals]\n\"Bad_Name\" = \"1d\"\n").unwrap();
+        assert!(invalid_name.validate().is_err());
     }
 
     #[test]

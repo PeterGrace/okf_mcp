@@ -1,0 +1,1 @@
+{"type":"result","subtype":"success","is_error":false,"structured_output":{"summary":"Synthetic test proposal, not captured from Claude","findings":[]},"total_cost_usd":0.1,"usage":{"input_tokens":11,"output_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":5},"synthetic_provenance":"Hand-authored target contract; no live envelope compatibility claim"}

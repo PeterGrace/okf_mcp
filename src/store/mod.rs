@@ -9,4 +9,5 @@ pub mod export;
 pub mod history;
 pub mod import;
 pub mod keys;
+pub mod maintenance;
 pub mod publish;

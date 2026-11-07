@@ -109,9 +109,21 @@ pub(crate) fn principal_as(
     reach: &[&str],
     default: Option<&str>,
 ) -> Arc<Principal> {
+    principal_with_reporting(key_id, access, reach, default, false)
+}
+
+/// Builds a test principal, explicitly opting into maintenance reporting.
+pub(crate) fn principal_with_reporting(
+    key_id: &str,
+    access: Access,
+    reach: &[&str],
+    default: Option<&str>,
+    maintenance_report: bool,
+) -> Arc<Principal> {
     Arc::new(Principal {
         key_id: key_id.to_string(),
         access,
+        maintenance_report,
         reach: if reach.is_empty() {
             Reach::All
         } else {

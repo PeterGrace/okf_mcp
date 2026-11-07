@@ -1,0 +1,21 @@
+{
+  "claim": {
+    "run_id": "run-1",
+    "leases": [{
+      "run_id": "run-1", "work_id": "work-1", "token": "fixture-private-lease",
+      "pin": {"path": "/example.md", "revision": 1},
+      "reasons": ["changed"], "expires_at": "2026-11-07T12:00:00Z"
+    }]
+  },
+  "packet": {
+    "work_id": "work-1", "reasons": ["changed"], "primary_id": "source-1",
+    "sources": [{"id": "source-1", "pin": {"path": "/example.md", "revision": 1}, "text": "fixture-sensitive-source"}]
+  },
+  "proposal": {"summary": "fixture-sensitive-proposal", "findings": []},
+  "usage": {"input": 10, "output": 5, "cache_creation": 0, "cache_read": 0, "cost_microusd": 20},
+  "submit": {
+    "work_id": "work-1", "token": "fixture-private-lease", "idempotency_key": "submit-key",
+    "submission": {"outcome": "inconclusive", "assessment": "unverifiable", "summary": "fixture-sensitive-summary", "evidence": [], "findings": [], "reported_tokens": 15}
+  },
+  "receipt": {"run_id": "run-1", "work_id": "work-1", "outcome": "inconclusive", "finding_ids": [], "outdated": false}
+}

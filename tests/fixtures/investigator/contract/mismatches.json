@@ -1,0 +1,7 @@
+[
+  {"tool":"maintenance_renew", "schema":"inputSchema", "pointer":"/required", "value":["catalog","work_id","idempotency_key"]},
+  {"tool":"maintenance_claim", "schema":"inputSchema", "pointer":"/properties/catalog/type", "value":"integer"},
+  {"tool":"maintenance_close", "schema":"inputSchema", "pointer":"/properties/state/enum", "value":["running","completed"]},
+  {"tool":"maintenance_submit", "schema":"inputSchema", "pointer":"/$defs/Assessment/enum", "value":[]},
+  {"tool":"maintenance_read_revision", "schema":"outputSchema", "pointer":"/required", "value":[]}
+]
