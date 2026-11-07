@@ -1027,6 +1027,64 @@ async fn maintenance_reissued_key_name_cannot_use_old_lease() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn maintenance_claim_replay_ignores_review_interval_change() {
+    let db = test_db().await;
+    let catalog = setup(&db.pool, &["a.md"]).await;
+    let first = runs::claim(
+        &db.pool,
+        catalog,
+        &actor("one"),
+        "same",
+        1,
+        Duration::days(30),
+        t0(),
+    )
+    .await
+    .unwrap();
+    let replay = runs::claim(
+        &db.pool,
+        catalog,
+        &actor("one"),
+        "same",
+        1,
+        Duration::days(14),
+        t0() + Duration::seconds(901),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay, first);
+    assert_eq!(replay.leases[0].expires_at, first.leases[0].expires_at);
+    assert!(runs::claim(
+        &db.pool,
+        catalog,
+        &actor("one"),
+        "same",
+        2,
+        Duration::days(14),
+        t0() + Duration::seconds(901),
+    )
+    .await
+    .is_err());
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM maintenance_runs WHERE catalog_id=$1")
+        .bind(catalog)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let work: i64 = sqlx::query_scalar("SELECT count(*) FROM maintenance_work WHERE catalog_id=$1")
+        .bind(catalog)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM maintenance_requests WHERE catalog_id=$1")
+            .bind(catalog)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!((runs, work, receipts), (1, 1, 1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn maintenance_claim_replay_conflict_preserves_original_lease() {
     let db = test_db().await;
     let catalog = setup(&db.pool, &["a.md"]).await;

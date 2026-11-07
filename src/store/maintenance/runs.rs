@@ -332,7 +332,7 @@ pub async fn claim(
             "maintenance review interval must be at least one day",
         ));
     }
-    let payload = json!({"limit": limit, "review_interval_seconds": review_interval.num_seconds()});
+    let payload = json!({"limit": limit});
     let mut tx = pool.begin().await?;
     lock(&mut tx, catalog_id, now).await?;
     if let Some(previous) = replay(
