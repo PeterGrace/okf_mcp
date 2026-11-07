@@ -1036,8 +1036,8 @@ take the server out of service. Alert on the `error` log line, not on
 
 ## 8. Upgrades
 
-1. Release a new version: bump `version` in `Cargo.toml`, merge, and push a
-   `v<version>` tag. The image workflow publishes `:<version>`.
+1. Release a new version with `just release-prepare <patchlevel>` and
+   `just release-ship` (below). The image workflow publishes `:<version>`.
 2. Change the image tag in the Deployment (in your GitOps repository, if you
    use one).
 3. The Deployment recreates the pod: the old one stops, the new one runs any
@@ -1051,6 +1051,91 @@ take the server out of service. Alert on the `error` log line, not on
   and one per milestone.
 - **Changesets survive** an upgrade: they are in the database. Open MCP
   sessions do not; clients reconnect and carry on with the same handles.
+
+### Preparing and shipping a release
+
+Prerequisites: Bash, Python 3.11+ (standard library only), Git, just, the usual
+Rust/build/test prerequisites, `cargo install cargo-release --version 0.25.18
+--locked`, and authenticated GitHub CLI (`gh auth login`) with permission to
+push a branch and merge its PR. `origin` must name this repository on github.com
+(HTTPS or SSH), with exactly one resolved fetch URL and one matching resolved
+push URL; extra URLs are rejected before any release push. Use a full-history
+clone with the previous release tags fetched; notes are computed from the
+reachable stable tags and committed history. Do not run releases concurrently.
+
+```sh
+git switch main
+git pull --ff-only
+just release-prepare patch   # required: patch, minor, major, or exact 1.2.3
+just release-ship
+```
+
+Preparation requires a clean `main` exactly equal to fetched `origin/main`.
+It rejects non-stable or non-increasing versions and existing local or remote
+version tags before changing versioned files. cargo-release bumps `Cargo.toml`
+and `Cargo.lock`; its hook updates the four pinned image version mentions in
+this document, writes `changelog/<UTC-timestamp>-release-v<version>.md` from
+committed history since the latest reachable stable tag, and runs `just fmt`,
+`just lint`, and `just test`. These checks respect `RUST_TEST_THREADS` if set.
+One local `chore: Release v<version>` commit and a marked annotated version tag
+are created. Nothing is pushed or published to crates.io.
+
+Shipping checks that `HEAD` is that prepared, single-parent commit and its
+annotated tag matches the package version. A published tag is always refused.
+Before opening or reusing `release/v<version>`'s PR, it reruns the three local
+checks. **There is no PR CI configured:** this is local validation, not a claim
+that absent CI passed. The script does not wait for nonexistent checks. A
+conflicting remote release branch, ambiguous/closed PR, API failure, or main
+moving before merge stops shipping without cleanup. Branch creation uses an
+empty expected-ref lease: it can create a missing branch only, never overwrite
+an existing one, even if another actor creates it concurrently.
+
+The PR is merged with its expected head commit guarded by `gh`. Before any tag
+publication, the script fetches main and verifies the merge's parents are the
+original base and prepared commit, its tree equals the locally validated tree,
+and it is on main. A concurrent main change incorporated into the merge is
+therefore refused, even if it would leave the same tree. Only then may the
+unpublished preparation tag be moved locally to the actual merge commit and
+pushed (no remote ref is force-updated). Both pushes explicitly disable
+follow-tags, even when `push.followTags=true`; unrelated local tags stay local.
+The tag push specifies its full source and destination, so `remote.origin.push`
+mappings cannot redirect publication. No branches are automatically deleted.
+The existing tag workflow builds and publishes the **server image only**; it
+does not package the maintenance runner, create a GitHub release, update a
+`latest` image, or deploy anything. Check the image workflow separately after
+shipping; tag-push success does not prove image publication succeeded.
+
+#### Failures and retries
+
+There is no destructive rollback. Inspect `git status`, `git diff`, local tags,
+remote refs, and the PR before taking further action. Preparation failures can
+leave changed manifests/examples, new notes, staged files, or a local release
+commit/tag if a later step failed. Do not rerun preparation on that dirty or
+ahead-of-origin state. Preserve any wanted work and manually clean up only the
+release artifacts you have identified; return main to origin/main before
+preparing afresh. Never delete or replace a published tag.
+
+If shipping stops after a branch push or PR creation, rerun `just release-ship`;
+it reuses the matching branch/PR. If the merge succeeded but its API response or
+the tag push failed, rerun the same command: it validates the already merged PR
+and retries the unpublished tag, including when the local tag was already moved.
+Later commits on main do not invalidate that verified merge. Local main stays
+at the prepared commit throughout, so retries retain the original identity.
+After successful publication, fast-forward it manually with `git fetch origin
+main` and `git merge --ff-only origin/main`. An already published tag causes a
+retry to refuse, not to retag or republish.
+
+If main moved before the release merged, or the merged tree/parents differ,
+manual reconciliation is required; no tag is published. Review the PR and
+coordinate a fresh release rather than forcing a tag or branch. The scripts
+never close a PR, delete a branch, reset main, or discard changes for you.
+
+The release integration matrix uses throwaway repositories, synthetic bare
+origins, actual just dispatch and cargo-release, and fake GitHub/check commands:
+
+```sh
+python3 -B -m unittest discover -s scripts -p 'test_release.py' -v
+```
 
 ## 9. Backup and restore
 
