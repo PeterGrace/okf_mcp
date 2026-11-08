@@ -382,6 +382,17 @@ pub struct AddSourceParams {
     pub changeset: String,
 }
 
+/// `remove_source`'s arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct RemoveSourceParams {
+    /// The concept, with or without `.md`, e.g. `/infra/ntp` or `/infra/ntp.md`.
+    pub path: String,
+    /// The id of the entry to remove; no footnote in the body may still cite it.
+    pub id: String,
+    /// The changeset to write to: the handle `open_changeset` returned.
+    pub changeset: String,
+}
+
 /// `log`'s arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct LogParams {
@@ -556,6 +567,34 @@ pub(crate) async fn add_source(
     .await
 }
 
+/// Removes an entry from `sources` by id (the server's inverse of
+/// `okf.py source`), deleting the key when none are left.
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the concept and the entry's id.
+///
+/// # Returns
+/// The write's report.
+///
+/// # Errors
+/// As [`stamp`]; [`OkfError::Refused`] when no entry has the id, or a
+/// footnote in the body still cites it.
+pub(crate) async fn remove_source(
+    ctx: &ToolContext,
+    params: RemoveSourceParams,
+) -> Result<WriteReport, OkfError> {
+    let RemoveSourceParams {
+        path,
+        id,
+        changeset,
+    } = params;
+    apply(ctx, &changeset, None, move |ws, op_ctx| {
+        ops::remove_source(ws, op_ctx, &path, &id)
+    })
+    .await
+}
+
 /// `okf.py log`: adds a bullet under today's (UTC) heading in `log.md`.
 /// Its replay op is stored on the `log.md` entry.
 ///
@@ -694,6 +733,23 @@ impl OkfServer {
     ) -> Result<Json<WriteReport>, CallToolResult> {
         let ctx = self.context(&parts)?;
         reply(add_source(&ctx, params).await)
+    }
+
+    /// The `remove_source` tool.
+    #[tool(
+        description = "Remove the entry with `id` from a concept's `sources`, deleting the key \
+                       when none are left, in the changeset `changeset` names (open one with \
+                       open_changeset). Refused while a footnote in the body still cites it (its \
+                       label is the id, or its definition names the id, title or resource): \
+                       remove the citation first. Write access."
+    )]
+    async fn remove_source(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<RemoveSourceParams>,
+    ) -> Result<Json<WriteReport>, CallToolResult> {
+        let ctx = self.context(&parts)?;
+        reply(remove_source(&ctx, params).await)
     }
 
     /// The `log` tool.
@@ -1106,14 +1162,29 @@ mod bookkeeping_tests {
         )
         .await
         .unwrap();
-        let last = add_source(
+        for (id, resource) in [
+            ("runbook", "https://example.com/runbook"),
+            ("spare", "https://example.com/spare"),
+        ] {
+            add_source(
+                &ctx,
+                AddSourceParams {
+                    path: path(),
+                    id: id.to_string(),
+                    resource: resource.to_string(),
+                    title: Some("Runbook".to_string()),
+                    author: None,
+                    changeset: handle.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let last = remove_source(
             &ctx,
-            AddSourceParams {
+            RemoveSourceParams {
                 path: path(),
-                id: "runbook".to_string(),
-                resource: "https://example.com/runbook".to_string(),
-                title: Some("Runbook".to_string()),
-                author: None,
+                id: "spare".to_string(),
                 changeset: handle.clone(),
             },
         )
@@ -1134,6 +1205,7 @@ mod bookkeeping_tests {
             "{text}"
         );
         assert!(text.contains("https://example.com/runbook"), "{text}");
+        assert!(!text.contains("spare"), "{text}");
         // Frontmatter edits carry no replay: they conflict on a stale base.
         assert_eq!(last.touched, ["/a.md"]);
         assert_eq!(entry(&test, &last.changeset, "a.md").await.replay, None);
@@ -1183,9 +1255,22 @@ mod bookkeeping_tests {
         .await
         .unwrap_err();
 
+        // `a.md` has no sources, so no id is there to remove.
+        let no_source = remove_source(
+            &ctx,
+            RemoveSourceParams {
+                path: "/a.md".to_string(),
+                id: "runbook".to_string(),
+                changeset: handle.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+
         assert_eq!(outcome.kind(), "Refused", "{outcome}");
         assert_eq!(unlisted.kind(), "Refused", "{unlisted}");
         assert_eq!(none_queued.kind(), "Refused", "{none_queued}");
+        assert_eq!(no_source.kind(), "Refused", "{no_source}");
         // `apply` rolls back on an op error: the changeset holds nothing.
         let row = changeset_row(&test, &handle).await;
         assert!(changesets::entries(test.app.pool(), row.id)
@@ -1233,12 +1318,13 @@ mod bookkeeping_tests {
             "question",
             "unquestion",
             "add_source",
+            "remove_source",
             "log",
             "index",
         ] {
             assert!(names.contains(&name), "{name} is registered");
         }
-        assert_eq!(names.len(), 7, "{names:?}");
+        assert_eq!(names.len(), 8, "{names:?}");
         assert!(kind.contains("default Update"), "{kind}");
         for tool in &tools {
             let output = tool.output_schema.as_ref().expect("an output schema");

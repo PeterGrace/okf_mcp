@@ -455,8 +455,8 @@ pub fn set_frontmatter(
     checked_key(key)?;
     if MANAGED_KEYS.contains(&key) {
         return Err(refused(format!(
-            "{key} has its own tool (stamp, review, question, unquestion, add_source); \
-             set_frontmatter does not write it"
+            "{key} has its own tool (stamp, review, question, unquestion, add_source, \
+             remove_source); set_frontmatter does not write it"
         )));
     }
     let value = value.filter(|v| !v.is_null());
@@ -1094,8 +1094,8 @@ mod tests {
             assert_eq!(
                 refusal(error),
                 format!(
-                    "{key} has its own tool (stamp, review, question, unquestion, add_source); \
-                     set_frontmatter does not write it"
+                    "{key} has its own tool (stamp, review, question, unquestion, add_source, \
+                     remove_source); set_frontmatter does not write it"
                 )
             );
         }
