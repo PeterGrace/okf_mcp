@@ -89,3 +89,25 @@ in `src/okf/yaml.rs`.
 - `overlay`: `past_its_capacity_the_cache_drops_the_least_recently_used`,
   `concurrent_first_reads_build_one_overlay` (fails without the build lock).
 - `config`: both new keys read, default, and refuse zero.
+
+## Review fixes (PR #197)
+
+- **A cancelled waiter no longer leaves a `KeyedLocks` entry.** Cleanup
+  used `Arc::strong_count`, but a waiter's clone lives inside its pending
+  `lock_owned` future, before any guard exists. If the holder left while a
+  waiter was queued and the waiter was then cancelled (a timeout, a client
+  disconnect), the entry stayed forever. Each entry now keeps an explicit
+  `users` count; a `Registration` taken under the map lock *before* the
+  wait gives the count back on drop, so cancellation cleans up. Test:
+  `a_waiter_cancelled_after_the_holder_leaves_removes_the_entry` (failed
+  before).
+- **A write no longer waits on a read's overlay build.** A read took the
+  build lock and then waited for a pooled connection; a write, already
+  holding its transaction's connection, then waited for that build lock. On
+  a full pool the two waited on each other until the read's acquire timed
+  out. `Overlays::get` now takes a `&PgPool` and is the only path that takes
+  the build lock; the new `Overlays::get_in` (a write's transaction) reads
+  on its own connection and never waits for it. A read and a write may then
+  build the same overlay twice; `store` keeps the newer. Test:
+  `a_write_does_not_wait_for_a_read_building_on_a_full_pool` (timed out
+  before).

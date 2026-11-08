@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use sqlx::PgExecutor;
+use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::catalog::{CatalogState, Loaded};
 use crate::error::OkfError;
@@ -225,15 +225,14 @@ impl Overlays {
         }
     }
 
-    /// The overlay of `changeset` on `state`'s current published state:
-    /// the cached one if it was built at this `version` and `generation`,
-    /// else a new one (its entries read now). Concurrent misses on one
-    /// changeset build it once: the others wait, then find it cached.
+    /// The overlay of `changeset` on `state`'s current published state,
+    /// for a read: the cached one if it was built at this `version` and
+    /// `generation`, else a new one (its entries read now from `pool`).
+    /// Concurrent misses on one changeset build it once: the others wait,
+    /// then find it cached.
     ///
     /// # Arguments
-    /// * `executor` - where to read the entries: the pool for a read, the
-    ///   write's own transaction for a write (`&mut *tx`), so a write that
-    ///   holds the changeset's row lock needs no second connection.
+    /// * `pool` - where to read the entries.
     /// * `state` - the changeset's catalog.
     /// * `changeset` - an open changeset, as just read.
     ///
@@ -242,12 +241,9 @@ impl Overlays {
     ///
     /// # Errors
     /// [`OkfError::Database`] reading the entries; as [`build_overlay`].
-    // `impl PgExecutor<'_>` takes a `&PgPool` or a `&mut PgConnection`
-    // alike (a pool, a connection or a transaction), like a duck-typed
-    // "anything with execute()" argument in Python, checked at compile time.
     pub async fn get(
         &self,
-        executor: impl PgExecutor<'_>,
+        pool: &PgPool,
         state: &CatalogState,
         changeset: &ChangesetRow,
     ) -> Result<Arc<Overlay>, OkfError> {
@@ -256,10 +252,54 @@ impl Overlays {
             return Ok(overlay);
         }
         // `_building` is held (and other reads of this changeset wait) until
-        // this function returns.
+        // this function returns. It is taken before a pooled connection, so
+        // the builder may wait for one while holding it; that is why
+        // `get_in`, whose caller already holds a connection, never waits on
+        // it (it would close a cycle with a builder waiting for that
+        // connection).
         let _building = self.builds.lock(changeset.id).await;
         // Read the state again: a build that finished while this one waited
         // may be the overlay wanted, and the published state may have moved.
+        self.lookup_or_build(pool, state, changeset).await
+    }
+
+    /// As [`Overlays::get`], for a write that holds a connection (its
+    /// transaction, with the changeset's row locked): reads the entries on
+    /// it and never waits for a read's build, so a full pool cannot stall
+    /// the two on each other. A read building at the same time may build the
+    /// same overlay too; `store` keeps the newer.
+    ///
+    /// # Arguments
+    /// * `conn` - the write's transaction (`&mut *tx`), so a write needs no
+    ///   second connection.
+    /// * `state` - the changeset's catalog.
+    /// * `changeset` - the changeset, as read under its row lock.
+    ///
+    /// # Returns
+    /// The overlay, shared.
+    ///
+    /// # Errors
+    /// [`OkfError::Database`] reading the entries; as [`build_overlay`].
+    pub async fn get_in(
+        &self,
+        conn: &mut PgConnection,
+        state: &CatalogState,
+        changeset: &ChangesetRow,
+    ) -> Result<Arc<Overlay>, OkfError> {
+        self.lookup_or_build(conn, state, changeset).await
+    }
+
+    /// The cached overlay if current, else one built from entries read on
+    /// `executor` and cached.
+    // `impl PgExecutor<'_>` takes a `&PgPool` or a `&mut PgConnection`
+    // alike, like a duck-typed "anything with execute()" argument in Python,
+    // checked at compile time.
+    async fn lookup_or_build(
+        &self,
+        executor: impl PgExecutor<'_>,
+        state: &CatalogState,
+        changeset: &ChangesetRow,
+    ) -> Result<Arc<Overlay>, OkfError> {
         let base = state.current();
         let now = Instant::now();
         if let Some(overlay) = self.lookup(changeset, base.generation(), now) {
@@ -651,6 +691,65 @@ mod tests {
             overlays[0].snapshot().get("a.md").unwrap().text(),
             "# One\n"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_does_not_wait_for_a_read_building_on_a_full_pool() {
+        // Arrange: a writer's transaction holds one connection and the test
+        // holds every other, so a read's build waits for a connection while
+        // it holds the changeset's build lock.
+        let test = app_with(&[("pg", &[("a.md", "# A\n")])], Config::default()).await;
+        store_key(&test, "writer").await;
+        let ctx = context(
+            &test,
+            principal_as("writer", Access::Write, &[], Some("pg")),
+            None,
+        );
+        let handle = open(&ctx).await;
+        let edit = PendingEdit {
+            path: "a.md",
+            text: Some("# One\n"),
+            at: Utc::now(),
+        };
+        let row = Arc::new(pending_entry(&test, &handle, &edit).await);
+        let pool = test.app.pool();
+        let mut tx = pool.begin().await.unwrap();
+        let size = pool.options().get_max_connections();
+        let mut held = Vec::with_capacity(size as usize);
+        for _ in 1..size {
+            held.push(pool.acquire().await.unwrap());
+        }
+        let read = {
+            let (app, row) = (Arc::clone(&test.app), Arc::clone(&row));
+            tokio::spawn(async move {
+                let state = app.catalog("pg").unwrap();
+                app.overlays().get(app.pool(), &state, &row).await
+            })
+        };
+        // Wait until the read holds the build lock (its entry exists).
+        while test.app.overlays().builds.len() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Act: well inside sqlx's 30 s acquire timeout, which a write
+        // waiting on the read's build lock would run the read into.
+        let state = test.app.catalog("pg").unwrap();
+        let written = tokio::time::timeout(
+            Duration::from_secs(10),
+            test.app.overlays().get_in(&mut tx, &state, &row),
+        )
+        .await;
+        drop(tx);
+        let read = tokio::time::timeout(Duration::from_secs(10), read).await;
+
+        // Assert
+        let written = written.expect("the write is not held up").unwrap();
+        assert_eq!(written.snapshot().get("a.md").unwrap().text(), "# One\n");
+        read.expect("the read finishes once the write lets go")
+            .unwrap()
+            .unwrap();
+        drop(held);
     }
 
     #[tokio::test(flavor = "multi_thread")]

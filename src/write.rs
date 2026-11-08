@@ -147,10 +147,13 @@ where
         }
         Some(locked) => locked,
     };
-    // Read under the row lock, in this transaction (`&mut *tx` reborrows
+    // Read under the row lock, in this transaction (`&mut tx` reborrows
     // it): no other write can change the entries meanwhile, so the overlay
     // holds every committed entry, and no second connection is needed.
-    let overlay = app.overlays().get(&mut *tx, &state, &changeset_row).await?;
+    let overlay = app
+        .overlays()
+        .get_in(&mut tx, &state, &changeset_row)
+        .await?;
     let mut existing: HashMap<String, EntryRow> = changesets::entries(&mut *tx, changeset_row.id)
         .await?
         .into_iter()
