@@ -15,6 +15,7 @@ use crate::catalog::CatalogState;
 use crate::error::OkfError;
 use crate::mcp::context::{is_broken_overlay, require_selected, Pinned, ToolContext};
 use crate::mcp::{reply, OkfServer};
+use crate::okf::outline::{Outline, OutlineHeading};
 use crate::okf::paths::{basename, escapes_root, normpath};
 use crate::okf::snapshot::{Frontmatter, Snapshot, SnapshotDoc};
 use crate::okf::yaml::Value;
@@ -34,9 +35,19 @@ pub struct GetConceptParams {
     // `#[serde(default)]` makes the field optional: absent means `false`.
     #[serde(default)]
     pub links: bool,
-    /// Also return the file verbatim.
+    /// Also return the file verbatim, when the body is within the server's
+    /// limit or with `full`.
     #[serde(default)]
     pub raw: bool,
+    /// Return only this section, its subsections included: a heading's
+    /// anchor slug, as the outline and a link's `#fragment` give it (an
+    /// exact slug wins), or else its text (case-insensitive). Works at any
+    /// size.
+    pub section: Option<String>,
+    /// Return the whole body (and `raw`) even when it is over the server's
+    /// limit, for a deliberate full read.
+    #[serde(default)]
+    pub full: bool,
     /// Read through this changeset's drafts (its handle); its catalog must be one this call reads.
     pub changeset: Option<String>,
 }
@@ -83,10 +94,30 @@ pub struct Concept {
     pub frontmatter: serde_json::Value,
     /// Why the frontmatter does not parse, when it does not.
     pub frontmatter_error: Option<String>,
-    /// The text after the frontmatter.
-    pub body: String,
-    /// The file verbatim (with `raw`).
-    // Left out of the JSON entirely (not `null`) when not asked for.
+    /// Lines in the body (the text after the frontmatter).
+    pub lines: usize,
+    /// Characters (Unicode code points) in the body; over the server's
+    /// limit, the body is outlined unless `full` is passed.
+    pub chars: usize,
+    /// The body is over the server's limit and `full` was not passed: it is
+    /// not returned whole (`outline` instead, or only the `section`), and
+    /// `raw` is left out.
+    pub truncated: bool,
+    /// How to read more, when `truncated`.
+    // Left out of the JSON entirely (not `null`) when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The body; with `section`, only that section. Absent when outlined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Every heading with its slug, level, line and section size, in place
+    /// of a body that is over the limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline: Option<Vec<OutlineHeading>>,
+    /// The section returned (with `section`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<OutlineHeading>,
+    /// The file verbatim (with `raw`, within the limit or with `full`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
     /// Outbound links, in-page links left out (with `links`).
@@ -162,16 +193,51 @@ fn frontmatter_json(doc: &SnapshotDoc) -> (serde_json::Value, Option<String>) {
 /// * `catalog` - the catalog's name.
 /// * `snapshot` - its snapshot, for the links' targets and the backlinks.
 /// * `doc` - the concept.
-/// * `params` - the call's arguments (`links`, `raw`).
+/// * `params` - the call's arguments (`links`, `raw`, `section`, `full`).
+/// * `limit` - the server's outline threshold, in characters of the body.
 ///
 /// # Returns
-/// The concept, with links and the raw text only when asked for.
+/// The concept, with links and the raw text only when asked for. A body
+/// over `limit` is replaced by its outline (and `raw` left out) unless
+/// `full`; with `section`, the body is that section at any size.
+///
+/// # Errors
+/// [`OkfError::Refused`] if `section` names no heading (the message lists
+/// them) or several (it lists their slugs).
 fn concept(
     catalog: &str,
     snapshot: &Snapshot,
     doc: &SnapshotDoc,
     params: &GetConceptParams,
-) -> Concept {
+    limit: usize,
+) -> Result<Concept, OkfError> {
+    let whole = doc.doc().body();
+    let chars = whole.chars().count();
+    // `str::lines`, as `search` counts: a final unterminated line counts.
+    let lines = whole.lines().count();
+    let within = params.full || chars <= limit;
+    let (body, section, outline) = match params.section.as_deref() {
+        Some(want) => {
+            let (entry, text) = Outline::of(doc.text()).section(want)?;
+            (Some(text), Some(entry), None)
+        }
+        None if within => (Some(whole), None, None),
+        None => (None, None, Some(Outline::of(doc.text()).entries())),
+    };
+    let note = (!within).then(|| {
+        let returned = if section.is_some() {
+            "only the section is returned"
+        } else {
+            "only its outline is returned"
+        };
+        format!(
+            "The body is {chars} characters, over this server's limit of {limit}, so \
+             {returned}, without `raw`. Pass `section` (a heading's text or slug from the \
+             outline) to read one section, or `full: true` for the whole body. To add to it, \
+             edit_document with an `old_str` anchored on a heading. A concept this large may \
+             be worth splitting (split_concept)."
+        )
+    });
     let (frontmatter, frontmatter_error) = frontmatter_json(doc);
     // `bool::then(closure)` is `Some(closure())` when true, else `None`, so
     // the links are only computed when asked for.
@@ -205,17 +271,23 @@ fn concept(
             })
             .collect()
     });
-    Concept {
+    Ok(Concept {
         catalog: catalog.to_string(),
         path: format!("/{}", doc.path()),
         title: doc.title().map(str::to_string),
         frontmatter,
         frontmatter_error,
-        body: doc.doc().body(),
-        raw: params.raw.then(|| doc.raw()),
+        lines,
+        chars,
+        truncated: !within,
+        note,
+        body,
+        outline,
+        section,
+        raw: (params.raw && within).then(|| doc.raw()),
         links,
         backlinks,
-    }
+    })
 }
 
 /// Finds a concept in the read set.
@@ -235,7 +307,8 @@ fn concept(
 /// one holds a document at that path that is not a concept; the first
 /// catalog's overlay error ([`is_broken_overlay`]) if no catalog resolves
 /// it and one's pending changeset does not apply; any other error from
-/// [`ToolContext::view`] (a database error, `Busy`), at once.
+/// [`ToolContext::view`] (a database error, `Busy`), at once; as
+/// [`concept`] for `section`.
 pub(crate) async fn get_concept(
     ctx: &ToolContext,
     params: GetConceptParams,
@@ -255,7 +328,8 @@ pub(crate) async fn get_concept(
                 let doc = snapshot
                     .get(&path)
                     .expect("resolve_concept returns only paths the snapshot holds");
-                return Ok(concept(state.name(), snapshot, doc, &params));
+                let limit = ctx.app().config().concept_outline_chars;
+                return concept(state.name(), snapshot, doc, &params, limit);
             }
             Err(OkfError::NotFound { .. }) => {}
             // Keep looking, but report this if nothing better turns up.
@@ -398,10 +472,16 @@ impl OkfServer {
     // `ToolResult<...>`, so the macro sees `Json<...>` and emits an output
     // schema.
     #[tool(
-        description = "Get a concept: its frontmatter as JSON and its body. With `links`, its \
-                       resolved outbound links (target, title, description, broken) and its \
-                       backlinks; with `raw`, the file verbatim. Without `catalog`, the first \
-                       selected catalog that has it answers. With `changeset` (a handle from \
+        description = "Get a concept: its frontmatter as JSON, its body and the body's size \
+                       (`lines`, `chars`). A body over the server's limit (20,000 characters \
+                       by default) comes back as an `outline` instead, with `truncated: true` \
+                       and a `note`: each heading's text, slug, level, line and section size. \
+                       `section` (a heading's slug, which wins, or its text) returns just that \
+                       section with its subsections, at any size; `full: true` returns the whole body anyway. \
+                       With `links`, its resolved outbound links (target, title, description, \
+                       broken) and its backlinks; with `raw`, the file verbatim, but only \
+                       within the limit or with `full`. Without `catalog`, the first selected \
+                       catalog that has it answers. With `changeset` (a handle from \
                        open_changeset), its catalog reads through that changeset's drafts."
     )]
     async fn get_concept(
@@ -452,6 +532,8 @@ mod tests {
             catalog: None,
             links: false,
             raw: false,
+            section: None,
+            full: false,
             changeset: None,
         }
     }
@@ -491,9 +573,11 @@ mod tests {
         assert_eq!(concept.frontmatter["title"], "Hub");
         assert_eq!(concept.frontmatter_error, None);
         assert_eq!(
-            concept.body,
-            "See [leaf](leaf.md) and [gone](gone.md). [Top](#hub).\n"
+            concept.body.as_deref(),
+            Some("See [leaf](leaf.md) and [gone](gone.md). [Top](#hub).\n")
         );
+        assert_eq!((concept.lines, concept.chars), (1, 54));
+        assert!(!concept.truncated && concept.note.is_none() && concept.outline.is_none());
         assert_eq!(concept.raw.as_deref(), Some(HUB));
         let links = concept.links.unwrap();
         // `[Top](#hub)` is an in-page link, so it is left out.
@@ -557,7 +641,7 @@ mod tests {
         assert!(found.links.is_none() && found.backlinks.is_none() && found.raw.is_none());
         // Fields not asked for are left out of the JSON, not sent as null.
         let json = serde_json::to_value(&found).unwrap();
-        assert!(["raw", "links", "backlinks"]
+        assert!(["raw", "links", "backlinks", "note", "outline", "section"]
             .iter()
             .all(|key| json.get(key).is_none()));
         assert_eq!(first.catalog, "pg");
@@ -570,8 +654,198 @@ mod tests {
         );
         assert_eq!(invalid.frontmatter, serde_json::Value::Null);
         assert!(invalid.frontmatter_error.is_some());
-        assert_eq!(invalid.body, "Body\n");
+        assert_eq!(invalid.body.as_deref(), Some("Body\n"));
         assert!(matches!(not_in_pg, OkfError::NotFound { .. }));
+    }
+
+    /// A body with a repeated heading, and the frontmatter before it.
+    const BIG_HEAD: &str = "---\ntype: Note\ntitle: Big\ndescription: A big one.\n---\n";
+    const BIG_BODY: &str = "# Big\n\nIntro.\n\n## Notes\nFirst.\n\n### Detail\nDeep.\n\n\
+                            ## Notes\nSecond.\n\n## Last\nEnd.\n";
+
+    /// A server whose outline limit is `limit`, with `BIG_HEAD` and
+    /// `BIG_BODY` published as `pg`'s `big.md`.
+    async fn big_server(limit: usize) -> crate::mcp::testing::TestApp {
+        let config = Config {
+            concept_outline_chars: limit,
+            ..Config::default()
+        };
+        let text = format!("{BIG_HEAD}{BIG_BODY}");
+        app_with(&[("pg", &[("big.md", text.as_str())])], config).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_body_at_the_limit_is_whole_and_one_character_over_is_outlined() {
+        let at = big_server(BIG_BODY.len()).await;
+        let over = big_server(BIG_BODY.len() - 1).await;
+        let mut params = concept_params("big");
+        params.raw = true;
+
+        let whole = get_concept(
+            &context(&at, principal(&[], Some("pg")), None),
+            params.clone(),
+        )
+        .await
+        .unwrap();
+        let outlined = get_concept(&context(&over, principal(&[], Some("pg")), None), params)
+            .await
+            .unwrap();
+
+        assert_eq!(whole.body.as_deref(), Some(BIG_BODY));
+        assert_eq!(whole.raw, Some(format!("{BIG_HEAD}{BIG_BODY}")));
+        assert!(!whole.truncated && whole.outline.is_none() && whole.note.is_none());
+        assert_eq!((whole.lines, whole.chars), (15, BIG_BODY.len()));
+        // Over the limit: the frontmatter, title and size, and an outline
+        // in place of the body and `raw`.
+        assert!(outlined.truncated);
+        assert_eq!((outlined.body, outlined.raw), (None, None));
+        assert_eq!(outlined.title.as_deref(), Some("Big"));
+        assert_eq!(outlined.frontmatter["description"], "A big one.");
+        assert_eq!((outlined.lines, outlined.chars), (15, BIG_BODY.len()));
+        let outline: Vec<(String, usize, usize, usize)> = outlined
+            .outline
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.slug, h.level, h.line, h.lines))
+            .collect();
+        assert_eq!(
+            outline,
+            [
+                ("big".to_string(), 1, 6, 15),
+                ("notes".to_string(), 2, 10, 5),
+                ("detail".to_string(), 3, 13, 2),
+                ("notes-1".to_string(), 2, 16, 2),
+                ("last".to_string(), 2, 19, 2),
+            ]
+        );
+        let note = outlined.note.unwrap();
+        assert!(
+            note.contains(&format!(
+                "over this server's limit of {}",
+                BIG_BODY.len() - 1
+            )) && note.contains("`section`")
+                && note.contains("`full: true`"),
+            "{note}"
+        );
+        assert!(outlined.section.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_returns_the_whole_body_and_raw_over_the_limit() {
+        let test = big_server(10).await;
+        let ctx = context(&test, principal(&[], Some("pg")), None);
+        let mut params = concept_params("big");
+        params.full = true;
+        params.raw = true;
+
+        let concept = get_concept(&ctx, params).await.unwrap();
+
+        assert_eq!(concept.body.as_deref(), Some(BIG_BODY));
+        assert_eq!(concept.raw, Some(format!("{BIG_HEAD}{BIG_BODY}")));
+        assert!(!concept.truncated && concept.outline.is_none() && concept.note.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn section_by_text_or_slug_returns_it_with_its_subsections() {
+        let test = big_server(10).await;
+        let ctx = context(&test, principal(&[], Some("pg")), None);
+        let section = |want: &str| GetConceptParams {
+            section: Some(want.to_string()),
+            raw: true,
+            ..concept_params("big")
+        };
+
+        let by_slug = get_concept(&ctx, section("notes")).await.unwrap();
+        let second = get_concept(&ctx, section("#notes-1")).await.unwrap();
+        let by_text = get_concept(&ctx, section("## LAST")).await.unwrap();
+        let repeated = get_concept(&ctx, section("Notes")).await.unwrap_err();
+        let unknown = get_concept(&ctx, section("Nowhere")).await.unwrap_err();
+
+        assert_eq!(
+            by_slug.body.as_deref(),
+            Some("## Notes\nFirst.\n\n### Detail\nDeep.\n")
+        );
+        let entry = by_slug.section.as_ref().unwrap();
+        assert_eq!((entry.slug.as_str(), entry.line), ("notes", 10));
+        // Over the limit, a section still comes back, but `raw` does not.
+        assert!(by_slug.truncated && by_slug.raw.is_none() && by_slug.outline.is_none());
+        assert!(by_slug
+            .note
+            .unwrap()
+            .contains("only the section is returned"));
+        assert_eq!(second.body.as_deref(), Some("## Notes\nSecond.\n"));
+        assert_eq!(by_text.body.as_deref(), Some("## Last\nEnd.\n"));
+        assert_eq!(repeated.kind(), "Refused");
+        assert!(
+            repeated
+                .to_string()
+                .contains("pass the anchor slug instead: notes, notes-1"),
+            "{repeated}"
+        );
+        assert_eq!(unknown.kind(), "Refused");
+        let listed = unknown.to_string();
+        assert!(
+            listed.contains("no heading 'Nowhere'") && listed.contains("### Detail"),
+            "{listed}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn section_within_the_limit_keeps_raw() {
+        let test = big_server(BIG_BODY.len()).await;
+        let ctx = context(&test, principal(&[], Some("pg")), None);
+        let params = GetConceptParams {
+            section: Some("last".to_string()),
+            raw: true,
+            ..concept_params("big")
+        };
+
+        let concept = get_concept(&ctx, params).await.unwrap();
+
+        assert_eq!(concept.body.as_deref(), Some("## Last\nEnd.\n"));
+        assert_eq!(concept.raw, Some(format!("{BIG_HEAD}{BIG_BODY}")));
+        assert!(!concept.truncated && concept.note.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_outline_and_a_section_read_through_a_changesets_drafts() {
+        let test = big_server(10).await;
+        store_key(&test, "alice").await;
+        let alice = context(
+            &test,
+            principal_as("alice", Access::Write, &[], Some("pg")),
+            None,
+        );
+        let handle = open(&alice).await;
+        let drafted = format!("{BIG_HEAD}{BIG_BODY}## Added\nNew.\n");
+        let edit = PendingEdit {
+            path: "big.md",
+            text: Some(&drafted),
+            at: Utc::now(),
+        };
+        pending_entry(&test, &handle, &edit).await;
+        let added = GetConceptParams {
+            section: Some("added".to_string()),
+            ..through("big", &handle)
+        };
+
+        let outlined = get_concept(&alice, through("big", &handle)).await.unwrap();
+        let section = get_concept(&alice, added).await.unwrap();
+        let published = get_concept(&alice, concept_params("big")).await.unwrap();
+
+        let slugs: Vec<String> = outlined
+            .outline
+            .unwrap()
+            .into_iter()
+            .map(|h| h.slug)
+            .collect();
+        assert_eq!(slugs.last().map(String::as_str), Some("added"));
+        assert_eq!(section.body.as_deref(), Some("## Added\nNew.\n"));
+        assert!(published
+            .outline
+            .unwrap()
+            .iter()
+            .all(|heading| heading.slug != "added"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

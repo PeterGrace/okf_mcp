@@ -520,7 +520,7 @@ async fn investigator_client_protocol_fields_not_quoted_catalogs() {
             .is_err());
     }
     assert!(fake.state.calls.lock().unwrap().is_empty());
-    *fake.state.result.lock().unwrap() = json!({"content":[],"structuredContent":{"catalog":"pg","path":"/x.md","body":"catalog: other","frontmatter":{"catalog":"quoted-other","nested":{"catalogs":["other"]}}}});
+    *fake.state.result.lock().unwrap() = json!({"content":[],"structuredContent":{"catalog":"pg","path":"/x.md","lines":1,"chars":14,"truncated":false,"body":"catalog: other","frontmatter":{"catalog":"quoted-other","nested":{"catalogs":["other"]}}}});
     assert!(client
         .call(request(AllowedTool::GetConcept, json!({"path":"/x.md"})))
         .await

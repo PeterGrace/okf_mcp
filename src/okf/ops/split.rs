@@ -15,6 +15,9 @@
 //!   `set_frontmatter`'s [`OkfError::Refused`], before anything is read;
 //!   `okf.py` writes `type: ""` (or the blank quoted), a concept without a
 //!   usable type, which `create_concept` and `set_frontmatter` refuse;
+//! - where several headings share a text, the first one's slug (`notes`)
+//!   picks it; `okf.py` matches the text first and refuses, though its
+//!   message offers that slug;
 //!
 //! and where `okf.py` crashes:
 //! - a parent `status` that is a list or mapping is written as Python's
@@ -341,12 +344,18 @@ pub fn split_concept(
 }
 
 /// Port of `find_section`: the heading `want` names, by its text
-/// (case-insensitive) or, failing that, by its anchor slug.
+/// (case-insensitive) or, failing that, by its anchor slug. Where several
+/// headings share the text, a `want` equal to one's slug picks it (`okf.py`
+/// refuses, though its message offers that slug). `get_concept`'s `section`
+/// resolves headings with it too.
 ///
 /// # Errors
 /// [`OkfError::Refused`]: no match (the message lists every heading), or
 /// several (the message lists their slugs).
-fn find_section<'h>(sections: &'h [Heading], want: &str) -> Result<&'h Heading, OkfError> {
+pub(crate) fn find_section<'h>(
+    sections: &'h [Heading],
+    want: &str,
+) -> Result<&'h Heading, OkfError> {
     // `want.strip().lstrip("#").strip()`, then lower-cased.
     let wanted = py_strip(py_strip(want).trim_start_matches('#')).to_lowercase();
     let by_text: Vec<&Heading> = sections
@@ -359,6 +368,22 @@ fn find_section<'h>(sections: &'h [Heading], want: &str) -> Result<&'h Heading, 
             .iter()
             .filter(|heading| heading.slug == slug)
             .collect()
+    } else if by_text.len() > 1 {
+        // Several headings share the text: a `want` that is exactly one's
+        // slug (as written, so `Notes` stays ambiguous) picks it. Without
+        // this the first one's slug (`notes`), which the refusal below
+        // offers, would match them all again by text.
+        let slug = py_strip(want).trim_start_matches('#');
+        let by_slug: Vec<&Heading> = by_text
+            .iter()
+            .copied()
+            .filter(|heading| heading.slug == slug)
+            .collect();
+        if by_slug.is_empty() {
+            by_text
+        } else {
+            by_slug
+        }
     } else {
         by_text
     };
@@ -892,6 +917,21 @@ mod tests {
                 "Split out of [P](/a/p.md); see it for the surrounding context.\n\ny\n",
             )
         );
+    }
+
+    #[test]
+    fn the_first_repeated_heading_is_chosen_by_the_slug_the_refusal_offers() {
+        let parent = "---\ntype: Note\ntitle: P\n---\n## Notes\n\nx\n\n## Notes\n\ny\n";
+        let workspace = MemWorkspace::from_files([("a/index.md", "# A\n"), ("a/p.md", parent)]);
+        let args = Split {
+            concept: "a/p.md",
+            ..split("notes", "a/n.md")
+        };
+
+        split_concept(&workspace, &ctx(), &args).unwrap();
+
+        assert!(text(&workspace, "a/n.md").ends_with("\nx\n"));
+        assert!(text(&workspace, "a/p.md").contains("\n\ny\n"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 [
   {
     "name": "get_concept",
-    "description": "Get a concept: its frontmatter as JSON and its body. With `links`, its resolved outbound links (target, title, description, broken) and its backlinks; with `raw`, the file verbatim. Without `catalog`, the first selected catalog that has it answers. With `changeset` (a handle from open_changeset), its catalog reads through that changeset's drafts.",
+    "description": "Get a concept: its frontmatter as JSON, its body and the body's size (`lines`, `chars`). A body over the server's limit (20,000 characters by default) comes back as an `outline` instead, with `truncated: true` and a `note`: each heading's text, slug, level, line and section size. `section` (a heading's slug, which wins, or its text) returns just that section with its subsections, at any size; `full: true` returns the whole body anyway. With `links`, its resolved outbound links (target, title, description, broken) and its backlinks; with `raw`, the file verbatim, but only within the limit or with `full`. Without `catalog`, the first selected catalog that has it answers. With `changeset` (a handle from open_changeset), its catalog reads through that changeset's drafts.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "required": [
@@ -25,7 +25,19 @@
           "default": false
         },
         "raw": {
-          "description": "Also return the file verbatim.",
+          "description": "Also return the file verbatim, when the body is within the server's\nlimit or with `full`.",
+          "type": "boolean",
+          "default": false
+        },
+        "section": {
+          "description": "Return only this section, its subsections included: a heading's\nanchor slug, as the outline and a link's `#fragment` give it (an\nexact slug wins), or else its text (case-insensitive). Works at any\nsize.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "full": {
+          "description": "Return the whole body (and `raw`) even when it is over the server's\nlimit, for a deliberate full read.",
           "type": "boolean",
           "default": false
         },
@@ -42,6 +54,52 @@
     "outputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "$defs": {
+        "OutlineHeading": {
+          "description": "One heading of an outline, and the size of its section.",
+          "type": "object",
+          "properties": {
+            "heading": {
+              "description": "The heading text.",
+              "type": "string"
+            },
+            "slug": {
+              "description": "Its anchor slug, as a link's `#fragment` names it; `section` takes it.",
+              "type": "string"
+            },
+            "level": {
+              "description": "1 to 6.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "line": {
+              "description": "1-based file line of the heading.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "lines": {
+              "description": "Lines in the section, its heading and subsections included.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "chars": {
+              "description": "Characters (Unicode code points) in the section, as `section`\nreturns it.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "heading",
+            "slug",
+            "level",
+            "line",
+            "lines",
+            "chars"
+          ]
+        },
         "OutboundLink": {
           "description": "A link out of the concept.",
           "type": "object",
@@ -120,7 +178,9 @@
         "catalog",
         "path",
         "frontmatter",
-        "body"
+        "lines",
+        "chars",
+        "truncated"
       ],
       "type": "object",
       "properties": {
@@ -149,12 +209,59 @@
             "null"
           ]
         },
+        "lines": {
+          "description": "Lines in the body (the text after the frontmatter).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "chars": {
+          "description": "Characters (Unicode code points) in the body; over the server's\nlimit, the body is outlined unless `full` is passed.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "truncated": {
+          "description": "The body is over the server's limit and `full` was not passed: it is\nnot returned whole (`outline` instead, or only the `section`), and\n`raw` is left out.",
+          "type": "boolean"
+        },
+        "note": {
+          "description": "How to read more, when `truncated`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "body": {
-          "description": "The text after the frontmatter.",
-          "type": "string"
+          "description": "The body; with `section`, only that section. Absent when outlined.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outline": {
+          "description": "Every heading with its slug, level, line and section size, in place\nof a body that is over the limit.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/OutlineHeading"
+          }
+        },
+        "section": {
+          "description": "The section returned (with `section`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OutlineHeading"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "raw": {
-          "description": "The file verbatim (with `raw`).",
+          "description": "The file verbatim (with `raw`, within the limit or with `full`).",
           "type": [
             "string",
             "null"

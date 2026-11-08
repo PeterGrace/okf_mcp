@@ -79,6 +79,7 @@ unknown keys are ignored, so one file serves every version.
 | `maintenance_review_intervals` | `{}` (30 days per catalog) | Per-catalog review durations, e.g. `{ pg = "30d" }`; each must be at least one day |
 | `max_import_bytes` | `"64MiB"` | The largest uncompressed import (`MiB` is binary, `MB` decimal, or a number of bytes). The import route caps the request body at this plus 0.1% and 64 KiB of gzip slack |
 | `time_server` | none | The NTP server for the clock check (`host`, `host:port` or an address). Without it there is no check |
+| `concept_outline_chars` | `20000` | `get_concept` returns an outline of the headings, not the body, for a body longer than this many characters, unless the call passes `full` or `section` |
 
 The server refuses to start (and every subcommand refuses to run) with a zero
 `poll_interval` or `session_idle_timeout`, an empty `allowed_hosts` or a blank
@@ -96,6 +97,7 @@ session_idle_timeout = "2h"
 poll_interval = "10s"
 max_import_bytes = "64MiB"
 maintenance_review_intervals = { pg = "30d" }
+concept_outline_chars = 20000
 ```
 
 - **IPv6:** on an IPv6 or dual-stack cluster, listen on `[::]:8080`. Linux

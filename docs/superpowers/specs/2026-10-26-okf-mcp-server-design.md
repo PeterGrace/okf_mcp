@@ -169,6 +169,7 @@ session_idle_timeout = "2h"
 time_server = "time.example.com"
 poll_interval = "10s"
 max_import_bytes = "64MiB"   # uncompressed total of an import
+concept_outline_chars = 20000 # get_concept outlines a longer body
 ```
 
 Each milestone reads only its own fields (M3: `max_import_bytes`; M4: the rest except
@@ -332,7 +333,7 @@ naming it).
 |---|---|---|
 | `list_catalogs` | none | Catalogs the key can reach (name, description, file count, last change); this connection's selection and default write target, or why there is none |
 | `search` | `query`, `catalogs?`, `type?`, `tags?`, `status?`, `limit?` (default 20, at most 200), `changeset?` | Ranked hits across catalogs: catalog, path, title, description, snippet, and the concept's size (`lines` and `chars` of the whole file, frontmatter included, as a read returns it; a changeset read gives the draft's size). A catalog whose overlay cannot be built is listed in `skipped` (catalog and error) and the others still answer. Every whitespace-separated term must occur (case-insensitive substring) in some field; the tier is the best field holding the whole query, else the best holding a term (fields, best first: title/alias, tag, description, body); deprecated concepts last; ties by catalog order, then path. The `tags` filter matches whole tags only, while free text matches tags by substring: the tool description must say so |
-| `get_concept` | `path`, `links?`, `raw?`, `changeset?` | Frontmatter as JSON and the body; with `links`, resolved outbound links (path, title, description, broken flag) and inbound backlinks; with `raw`, the file verbatim |
+| `get_concept` | `path`, `links?`, `raw?`, `section?`, `full?`, `changeset?` | Frontmatter as JSON, the body and its size (`lines`, `chars`); with `links`, resolved outbound links (path, title, description, broken flag) and inbound backlinks; with `raw`, the file verbatim. A body over `concept_outline_chars` (default 20,000) is returned as an `outline` (each heading's text, slug, level, file line, and its section's lines and characters) with `truncated` and a `note`, and `raw` is left out; `full` returns everything anyway. `section` (a heading's anchor slug, which wins, else its text, case-insensitive) returns that section with its subsections at any size; an unknown or ambiguous one is `Refused`, listing the headings or the matching slugs (issue #186) |
 | `read_document` | `path?` (default `/index.md`), `changeset?` | Raw text of an `index.md`, `log.md` or `AGENTS.md` |
 | `open_questions` | `changeset?` | Every queued `open_questions` entry, grouped by concept, 1-based |
 | `oldest` | `n?` (default 5), `open_questions_only?`, `changeset?` | Port of `oldest --json` |

@@ -6,6 +6,7 @@ pub mod analysis;
 pub mod doc;
 pub mod markdown;
 pub mod ops;
+pub mod outline;
 pub mod paths;
 // `pub(crate)`: visible anywhere inside this crate, invisible to users of the
 // library (like a leading-underscore module in Python, but enforced).
