@@ -8,8 +8,12 @@ use std::io::Write;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 use sqlx::postgres::PgPoolOptions;
 use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+use testcontainers_modules::testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
+
+// Only the Postgres helper: `#[path]` compiles that one file as a module,
+// without the HTTP server helpers in `support/mod.rs`.
+#[path = "support/pg.rs"]
+mod pg;
 
 /// Installs the copied key and certificate as the `postgres` user's
 /// (Postgres refuses a key it does not own, and the copy is root's), then
@@ -78,7 +82,21 @@ fn server_certificate(ca: &Ca) -> (String, String) {
     (certificate.pem(), key.serialize_pem())
 }
 
-/// Starts `postgres:17-alpine` with TLS on, serving `certificate` and `key`.
+/// A request for `postgres:17-alpine` with TLS on, serving `certificate`
+/// and `key`.
+///
+/// # Arguments
+/// * `certificate` - the server certificate (PEM).
+/// * `key` - its private key (PEM).
+fn tls_request(certificate: &str, key: &str) -> ContainerRequest<Postgres> {
+    pg::postgres_17()
+        .with_copy_to("/tmp/server.crt", certificate.as_bytes().to_vec())
+        .with_copy_to("/tmp/server.key", key.as_bytes().to_vec())
+        .with_cmd(["sh", "-c", START_WITH_TLS])
+}
+
+/// Starts `postgres:17-alpine` with TLS on, serving `certificate` and `key`,
+/// through the shared helper, so a failed start leaves no container behind.
 ///
 /// # Arguments
 /// * `certificate` - the server certificate (PEM).
@@ -86,15 +104,8 @@ fn server_certificate(ca: &Ca) -> (String, String) {
 ///
 /// # Returns
 /// The container (dropping it stops the container) and its host port.
-async fn postgres_with_tls(certificate: String, key: String) -> (ContainerAsync<Postgres>, u16) {
-    let container = Postgres::default()
-        .with_tag("17-alpine")
-        .with_copy_to("/tmp/server.crt", certificate.into_bytes())
-        .with_copy_to("/tmp/server.key", key.into_bytes())
-        .with_cmd(["sh", "-c", START_WITH_TLS])
-        .start()
-        .await
-        .expect("start postgres with TLS (is docker reachable?)");
+async fn postgres_with_tls(certificate: &str, key: &str) -> (ContainerAsync<Postgres>, u16) {
+    let container = pg::start_with_retry(|| tls_request(certificate, key)).await;
     let port = container
         .get_host_port_ipv4(5432)
         .await
@@ -124,7 +135,7 @@ fn verify_full_url(port: u16, root: &std::path::Path) -> String {
 async fn verify_full_connects_encrypted_to_a_server_its_ca_signed() {
     let ca = new_ca("okf-mcp test CA");
     let (certificate, key) = server_certificate(&ca);
-    let (_container, port) = postgres_with_tls(certificate, key).await;
+    let (_container, port) = postgres_with_tls(&certificate, &key).await;
     let root = pem_file(&ca.pem);
 
     let pool = PgPoolOptions::new()
@@ -146,7 +157,7 @@ async fn verify_full_refuses_a_server_another_ca_signed() {
     let ca = new_ca("okf-mcp test CA");
     let stranger = new_ca("okf-mcp stranger CA");
     let (certificate, key) = server_certificate(&ca);
-    let (_container, port) = postgres_with_tls(certificate, key).await;
+    let (_container, port) = postgres_with_tls(&certificate, &key).await;
     let root = pem_file(&stranger.pem);
 
     let refused = PgPoolOptions::new()
@@ -164,4 +175,28 @@ async fn verify_full_refuses_a_server_another_ca_signed() {
         error.to_string().contains("UnknownIssuer"),
         "refused for another reason than the certificate's issuer: {error} ({error:?})"
     );
+}
+
+/// A customized start (copied files, a command) that times out leaves no
+/// container behind: Docker created it and copied the files before the
+/// timeout fired, so without the cleanup it would leak.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timed_out_tls_start_leaves_no_container() {
+    use testcontainers_modules::testcontainers::core::error::WaitContainerError;
+    use testcontainers_modules::testcontainers::TestcontainersError;
+
+    let ca = new_ca("okf-mcp timeout CA");
+    let (certificate, key) = server_certificate(&ca);
+    let label = pg::unique_start_label();
+    let request = tls_request(&certificate, &key).with_startup_timeout(std::time::Duration::ZERO);
+
+    let started = pg::start_labelled(request, &label).await;
+
+    assert!(matches!(
+        started,
+        Err(TestcontainersError::WaitContainer(
+            WaitContainerError::StartupTimeout
+        ))
+    ));
+    assert!(pg::labelled_containers(&label).await.unwrap().is_empty());
 }

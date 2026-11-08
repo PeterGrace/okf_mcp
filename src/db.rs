@@ -647,4 +647,53 @@ mod tests {
             (Some("legacy".to_string()), "legacy-actor".to_string())
         );
     }
+
+    /// The leak behind issue #187, made deterministic: a zero startup timeout
+    /// expires after Docker created the container but before testcontainers
+    /// returned a handle, so testcontainers alone leaves it behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timed_out_start_leaks_without_cleanup_and_remove_labelled_reaps_it() {
+        use testcontainers_modules::testcontainers::runners::AsyncRunner;
+        use testcontainers_modules::testcontainers::ImageExt;
+
+        let label = pg_support::unique_start_label();
+        let started = pg_support::postgres_17()
+            .with_label(pg_support::START_LABEL, &label)
+            .with_startup_timeout(std::time::Duration::ZERO)
+            .start()
+            .await;
+
+        assert!(started.is_err(), "a zero startup timeout must fail");
+        assert_eq!(
+            pg_support::labelled_containers(&label).await.unwrap().len(),
+            1
+        );
+        assert_eq!(pg_support::remove_labelled(&label).await.unwrap(), 1);
+        assert!(pg_support::labelled_containers(&label)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timed_out_start_labelled_leaves_no_container() {
+        use testcontainers_modules::testcontainers::core::error::WaitContainerError;
+        use testcontainers_modules::testcontainers::{ImageExt, TestcontainersError};
+
+        let label = pg_support::unique_start_label();
+        let request = pg_support::postgres_17().with_startup_timeout(std::time::Duration::ZERO);
+
+        let started = pg_support::start_labelled(request, &label).await;
+
+        assert!(matches!(
+            started,
+            Err(TestcontainersError::WaitContainer(
+                WaitContainerError::StartupTimeout
+            ))
+        ));
+        assert!(pg_support::labelled_containers(&label)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 }
