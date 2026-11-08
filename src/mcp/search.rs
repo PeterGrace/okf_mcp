@@ -172,7 +172,10 @@ impl OkfServer {
                        Every term of `query` must occur, as a case-insensitive substring, in \
                        a concept's title or aliases, tags, description or body; free text \
                        matches tags by substring. The `tags` filter matches whole tags only. \
-                       Returns catalog, path, title, description and a snippet, best first. With \
+                       Returns catalog, path, title, description, a snippet and the \
+                       concept's size (`lines` and `chars` of the whole file, as a read \
+                       returns it), best first: check the size before a `get_concept`, \
+                       since a large concept stays in context once read. With \
                        `changeset` (a handle from open_changeset), its catalog is searched \
                        through that changeset's drafts, and is listed in `skipped` if they \
                        cannot be applied."
@@ -370,5 +373,62 @@ mod tests {
         assert!(query.contains("tags by substring"), "{query}");
         let output = tool.output_schema.as_ref().expect("an output schema");
         assert_eq!(output["type"], "object");
+        assert!(description.contains("`lines` and `chars`"), "{description}");
+    }
+
+    #[test]
+    fn the_output_schema_documents_each_hit_s_size() {
+        let tools = OkfServer::search_router().list_all();
+        let tool = tools.iter().find(|tool| tool.name == "search").unwrap();
+        let output = tool.output_schema.as_ref().expect("an output schema");
+        // schemars puts `CatalogHit` (with `SearchHit` flattened in) under
+        // `$defs`, and lists non-`Option` fields as required.
+        let hit = &output["$defs"]["CatalogHit"];
+
+        for field in ["lines", "chars"] {
+            let property = &hit["properties"][field];
+            assert_eq!(property["type"], "integer", "{field}: {property}");
+            let description = property["description"].as_str().unwrap_or_default();
+            assert!(description.contains("whole file"), "{field}: {description}");
+            assert!(
+                hit["required"].as_array().unwrap().contains(&field.into()),
+                "{field}: {hit}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hit_read_through_a_changeset_has_the_draft_s_size() {
+        let test = app_with(&[("pg", &[("router.md", TAGGED)])], Config::default()).await;
+        store_key(&test, "writer").await;
+        let ctx = context(
+            &test,
+            principal_as("writer", Access::Write, &[], Some("pg")),
+            None,
+        );
+        let handle = open(&ctx).await;
+        let draft = "---\ntype: Service\ntitle: Router\n---\nRoutes.\nAnd \u{e9}dits.\nThird.\n";
+        let edit = PendingEdit {
+            path: "router.md",
+            text: Some(draft),
+            at: Utc::now(),
+        };
+        pending_entry(&test, &handle, &edit).await;
+        let mut through = params("routes", &[]);
+        through.changeset = Some(handle);
+
+        let published = run(&ctx, params("routes", &[])).await.unwrap();
+        let drafted = run(&ctx, through).await.unwrap();
+
+        let size = |result: &SearchResult| (result.hits[0].hit.lines, result.hits[0].hit.chars);
+        assert_eq!(
+            size(&published),
+            (TAGGED.lines().count(), TAGGED.chars().count())
+        );
+        assert_eq!(size(&published), (6, 67));
+        // The draft has one line more than the published file, and its `\u{e9}`
+        // is two bytes but one character.
+        assert_eq!(size(&drafted), (7, draft.chars().count()));
+        assert_eq!((draft.chars().count(), draft.len()), (62, 63));
     }
 }

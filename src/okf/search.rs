@@ -190,6 +190,13 @@ pub struct SearchHit {
     /// any term, stripped and cut to 160 characters; `None` for an empty
     /// query or when no body line matches.
     pub snippet: Option<String>,
+    /// Lines in the concept's whole file, frontmatter included: about what
+    /// a `get_concept` or `read_document` of it puts in context. A last line
+    /// without a trailing newline counts; an empty file has 0.
+    pub lines: usize,
+    /// Characters (Unicode code points, not bytes) in the whole file,
+    /// frontmatter included, counted with `\r\n` line endings read as `\n`.
+    pub chars: usize,
     /// The ranking key ([`search_catalogs`] merges catalogs by it); not
     /// serialized.
     #[serde(skip)]
@@ -350,11 +357,17 @@ fn hit(doc: &SnapshotDoc, fields: &SearchFields, rank: SearchRank, query: &Prepa
         .and_then(|d| d.get("description"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    let text = doc.text();
     SearchHit {
         path: format!("/{}", doc.path()),
         title: doc.title().map(str::to_string),
         description,
-        snippet: snippet(split_frontmatter(doc.text()).1, &fields.body, query),
+        snippet: snippet(split_frontmatter(text).1, &fields.body, query),
+        // Measured only for the (at most `limit`) hits, not every match.
+        // `str::lines` splits on `\n` (and `\r\n`) and does not count an
+        // empty piece after a final newline, as `wc -l` would not either.
+        lines: text.lines().count(),
+        chars: text.chars().count(),
         rank,
     }
 }
@@ -555,8 +568,51 @@ mod tests {
         let hits = search(&snapshot(), &SearchQuery::new("retired"));
         assert_eq!(
             serde_json::to_string(&hits[0]).unwrap(),
-            r#"{"path":"/infra/old-ntp.md","title":"Old NTP server","description":null,"snippet":"Retired."}"#
+            r#"{"path":"/infra/old-ntp.md","title":"Old NTP server","description":null,"snippet":"Retired.","lines":6,"chars":72}"#
         );
+    }
+
+    #[test]
+    fn hits_measure_the_whole_file_with_or_without_frontmatter() {
+        let with_frontmatter = "---\ntitle: \u{c9}t\u{e9}\n---\nBody \u{e9}t\u{e9}.\nMore.";
+        let without = "# \u{c9}t\u{e9}\n\nBody \u{e9}t\u{e9}.\n";
+        let snapshot = Snapshot::build(&MemWorkspace::from_files([
+            ("a.md", with_frontmatter),
+            ("b.md", without),
+        ]))
+        .unwrap();
+
+        let hits = search(&snapshot, &SearchQuery::new("body"));
+
+        let sizes: Vec<(&str, usize, usize)> = hits
+            .iter()
+            .map(|h| (h.path.as_str(), h.lines, h.chars))
+            .collect();
+        // a.md: 5 lines, the last unterminated; b.md: 3 lines. Characters
+        // are code points, so each accented letter counts once.
+        assert_eq!(
+            sizes,
+            [
+                ("/a.md", 5, with_frontmatter.chars().count()),
+                ("/b.md", 3, without.chars().count()),
+            ]
+        );
+        assert_eq!(with_frontmatter.chars().count(), 34);
+        assert_eq!(without.chars().count(), 17);
+    }
+
+    #[test]
+    fn crlf_line_endings_count_as_one_character() {
+        let snapshot = Snapshot::build(&MemWorkspace::from_files([(
+            "a.md",
+            "---\r\ntitle: A\r\n---\r\nBody.\r\n",
+        )]))
+        .unwrap();
+
+        let hits = search(&snapshot, &SearchQuery::new("body"));
+
+        // As the LF file "---\ntitle: A\n---\nBody.\n": 4 lines, 23 characters.
+        assert_eq!((hits[0].lines, hits[0].chars), (4, 23));
     }
 
     #[test]
