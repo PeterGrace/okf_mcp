@@ -7,7 +7,7 @@
 //! changeset's overlay under one, so concurrent first reads build it once.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -15,9 +15,18 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 #[derive(Debug, Default)]
 pub struct KeyedLocks {
     // A `std` mutex: held only to look up, insert or remove an entry, never
-    // across `.await`. Each entry is shared (`Arc`) by its holder and every
-    // waiter, so its strong count says whether anyone still needs it.
-    locks: Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>,
+    // across `.await`.
+    locks: Mutex<HashMap<i64, Entry>>,
+}
+
+/// One key's mutex and how many callers hold or wait for it.
+#[derive(Debug, Default)]
+struct Entry {
+    mutex: Arc<AsyncMutex<()>>,
+    // An explicit count rather than `Arc::strong_count`: the clone a waiter
+    // hands to `lock_owned` lives inside that pending future, whose drop
+    // order on cancellation the cleanup must not depend on.
+    users: usize,
 }
 
 /// Holds one key's lock; dropping it releases the lock and, if nobody else
@@ -25,10 +34,20 @@ pub struct KeyedLocks {
 #[derive(Debug)]
 #[must_use = "the lock is released as soon as the guard is dropped"]
 pub struct KeyedGuard<'a> {
+    // Fields drop in declaration order: the lock is released before the
+    // registration tidies the map.
+    _held: OwnedMutexGuard<()>,
+    _registration: Registration<'a>,
+}
+
+/// One caller's count on a key's entry, from before it waits until its
+/// guard is dropped. Created before the `.await`, so a waiter cancelled
+/// mid-wait (its future dropped, as on a timeout or a client disconnect)
+/// still gives its count back.
+#[derive(Debug)]
+struct Registration<'a> {
     owner: &'a KeyedLocks,
     key: i64,
-    // `Option` so `drop` can release the lock before tidying the map.
-    guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl KeyedLocks {
@@ -41,6 +60,8 @@ impl KeyedLocks {
     }
 
     /// Waits for `key`'s lock, in arrival order (tokio's mutex is fair).
+    /// Cancel-safe: dropping the returned future before it completes leaves
+    /// no entry behind.
     ///
     /// # Arguments
     /// * `key` - what to lock (a changeset id).
@@ -48,39 +69,44 @@ impl KeyedLocks {
     /// # Returns
     /// The guard; the lock is held until it is dropped.
     pub async fn lock(&self, key: i64) -> KeyedGuard<'_> {
-        // The clone is taken under the map lock, so `KeyedGuard::drop` (which
-        // checks the count under the same lock) never removes an entry that
-        // someone is about to wait on.
-        let mutex = Arc::clone(self.map().entry(key).or_default());
-        let guard = mutex.lock_owned().await;
+        let (registration, mutex) = self.register(key);
+        let held = mutex.lock_owned().await;
         KeyedGuard {
-            owner: self,
-            key,
-            guard: Some(guard),
+            _held: held,
+            _registration: registration,
         }
+    }
+
+    /// Counts one more user of `key`'s entry (creating it) and clones its
+    /// mutex, both under the map lock.
+    fn register(&self, key: i64) -> (Registration<'_>, Arc<AsyncMutex<()>>) {
+        let mut map = self.map();
+        let entry = map.entry(key).or_default();
+        entry.users += 1;
+        let mutex = Arc::clone(&entry.mutex);
+        (Registration { owner: self, key }, mutex)
     }
 
     /// The number of keys with an entry (held or waited for).
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.map().len()
     }
 
-    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<i64, Arc<AsyncMutex<()>>>> {
+    fn map(&self) -> MutexGuard<'_, HashMap<i64, Entry>> {
         self.locks.lock().expect("keyed lock map poisoned")
     }
 }
 
-impl Drop for KeyedGuard<'_> {
+impl Drop for Registration<'_> {
     fn drop(&mut self) {
-        // Release first: the guard owns one count on the entry's `Arc`.
-        drop(self.guard.take());
         let mut map = self.owner.map();
-        // Only the map's own count left: no holder and no waiter.
-        if map
-            .get(&self.key)
-            .is_some_and(|mutex| Arc::strong_count(mutex) == 1)
-        {
+        // Give this caller's count back; remove the entry once nobody uses it.
+        let unused = map.get_mut(&self.key).is_some_and(|entry| {
+            entry.users -= 1;
+            entry.users == 0
+        });
+        if unused {
             map.remove(&self.key);
         }
     }
@@ -140,5 +166,30 @@ mod tests {
         // Assert
         assert_eq!(len_with_waiter, 1, "the waiter's entry is kept");
         assert_eq!(locks.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_waiter_cancelled_after_the_holder_leaves_removes_the_entry() {
+        // Arrange: A holds the key; B is polled once, into the wait queue.
+        let locks = KeyedLocks::new();
+        let first = locks.lock(3).await;
+        let mut waiting = Box::pin(locks.lock(3));
+        // `biased` polls the arms in order: `waiting` once, then the ready
+        // arm wins, leaving `waiting` queued but not dropped.
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("the key is held"),
+            () = std::future::ready(()) => {}
+        }
+
+        // Act: A leaves (B is still a user), then B is cancelled before it
+        // is polled again.
+        drop(first);
+        let len_with_waiter = locks.len();
+        drop(waiting);
+
+        // Assert
+        assert_eq!(len_with_waiter, 1, "the waiter's entry is kept");
+        assert_eq!(locks.len(), 0, "the cancelled waiter's entry is removed");
     }
 }
