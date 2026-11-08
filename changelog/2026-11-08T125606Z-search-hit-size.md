@@ -13,9 +13,12 @@ large `get_concept` or go to `sprawl` and `edit_document` instead.
   universal-newline text, so a `\r\n` ending counts as one character.
   `lines` counts like `wc -l` plus a final unterminated line (Rust's
   `str::lines`); `chars` counts Unicode code points, not bytes.
-- The sizes are computed only for the hits returned (at most `limit`), from
-  the text the snapshot already holds, so a search does no extra I/O and the
-  per-document search index is unchanged.
+- The sizes are computed only when a hit is built, from the text the
+  snapshot already holds, so a search does no extra I/O and the per-document
+  search index is unchanged. Each catalog builds at most `limit` hits before
+  the merge cuts the combined list to `limit`, so a search across several
+  catalogs measures at most `catalogs x limit` documents; each of those hits
+  already scans its body for the snippet, so this adds the same order of work.
 - A search through a changeset reports the draft's size, since it runs over
   the changeset's overlay snapshot.
 - The `search` tool description names the new fields and suggests checking

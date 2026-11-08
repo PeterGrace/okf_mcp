@@ -363,7 +363,9 @@ fn hit(doc: &SnapshotDoc, fields: &SearchFields, rank: SearchRank, query: &Prepa
         title: doc.title().map(str::to_string),
         description,
         snippet: snippet(split_frontmatter(text).1, &fields.body, query),
-        // Measured only for the (at most `limit`) hits, not every match.
+        // Measured only for this catalog's (at most `limit`) hits, not every
+        // match; `search_catalogs` merges several catalogs' hits and then cuts
+        // to `limit`, so it measures at most catalogs x limit documents.
         // `str::lines` splits on `\n` (and `\r\n`) and does not count an
         // empty piece after a final newline, as `wc -l` would not either.
         lines: text.lines().count(),
