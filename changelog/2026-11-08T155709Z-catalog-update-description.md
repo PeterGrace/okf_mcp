@@ -37,6 +37,10 @@ the old text, and the only fix was to delete and re-create the catalog
 
 - Store: replaces the text, returns the old one, leaves `generation`,
   bumps `admin_generation`; refuses an unknown catalog without a bump.
+- Store, concurrency (from review): two updates queued behind a held row
+  lock each return the text they replaced, so one reports the other's.
+  Without `FOR UPDATE` in the subquery both report the original text, and
+  the test fails (checked by removing it).
 - CLI: `update` parses, with an empty `--description`; `--description` is
   required.
 - Poll: a new description reaches the loaded `CatalogState` at the next

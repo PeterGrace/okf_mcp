@@ -383,6 +383,40 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_updates_each_return_the_text_they_replaced() {
+        let db = test_db().await;
+        create(&db.pool, "pg", "start", now()).await.unwrap();
+        // Hold the row so both updates queue behind it and then race.
+        let mut holder = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM catalogs WHERE name = 'pg' FOR UPDATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let spawn_update = |text: &'static str| {
+            let pool = db.pool.clone();
+            tokio::spawn(async move { update_description(&pool, "pg", text).await })
+        };
+        let first = spawn_update("one");
+        let second = spawn_update("two");
+        until_locks_are_awaited(&db.pool, 2).await;
+
+        holder.commit().await.unwrap();
+        let mut previous = [
+            first.await.unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
+        ];
+        let last = find(&db.pool, "pg").await.unwrap().description;
+
+        // One update replaced "start"; the other replaced the first's text.
+        // Without the row lock in the subquery, both could report "start".
+        previous.sort();
+        let winner_first = if last == "one" { "two" } else { "one" };
+        let mut expected = ["start".to_string(), winner_first.to_string()];
+        expected.sort();
+        assert_eq!(previous, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn update_description_refuses_an_unknown_catalog() {
         let db = test_db().await;
 
@@ -502,18 +536,23 @@ pub(crate) mod tests {
     /// Waits until some backend is blocked on a lock, so a test knows the
     /// spawned delete (or import) has reached the point it should wait at.
     pub(crate) async fn until_a_lock_is_awaited(pool: &PgPool) {
+        until_locks_are_awaited(pool, 1).await;
+    }
+
+    /// Waits until at least `count` lock requests are blocked.
+    async fn until_locks_are_awaited(pool: &PgPool, count: i64) {
         for _ in 0..200 {
             let waiting: i64 =
                 sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")
                     .fetch_one(pool)
                     .await
                     .unwrap();
-            if waiting > 0 {
+            if waiting >= count {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        panic!("no backend ever waited on a lock");
+        panic!("fewer than {count} lock requests were ever blocked");
     }
 
     #[tokio::test(flavor = "multi_thread")]
