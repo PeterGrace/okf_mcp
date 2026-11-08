@@ -297,7 +297,7 @@ impl CatalogClient for FakeClient {
             }
             AllowedTool::GetConcept => {
                 tokio::time::sleep(Duration::from_secs(self.read_delay)).await;
-                json!({"catalog":"synthetic","path":request.args["path"],"title":"Fixture","frontmatter":{"aliases":["one","two","three","four"]},"frontmatter_error":null,"body":"Evidence","raw":if self.large { "x".repeat(65_537) } else { "Evidence".into() },"links":[],"backlinks":[]})
+                json!({"catalog":"synthetic","path":request.args["path"],"title":"Fixture","frontmatter":{"aliases":["one","two","three","four"]},"frontmatter_error":null,"lines":1,"chars":8,"truncated":false,"body":"Evidence","raw":if self.large { "x".repeat(65_537) } else { "Evidence".into() },"links":[],"backlinks":[]})
             }
             AllowedTool::ReadRevision => {
                 tokio::time::sleep(Duration::from_secs(self.read_delay)).await;

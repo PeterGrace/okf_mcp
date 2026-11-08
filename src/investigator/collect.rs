@@ -89,9 +89,11 @@ impl Collector {
             return Err(RunnerError::Contract);
         }
         let (tool, args) = match &self.stage {
+            // `full`: evidence is the whole file (`raw`), which the server
+            // leaves out of a concept over its outline limit without it.
             Stage::Primary => (
                 AllowedTool::GetConcept,
-                json!({"path":self.primary.path,"raw":true,"links":true}),
+                json!({"path":self.primary.path,"raw":true,"full":true,"links":true}),
             ),
             Stage::PrimaryPin(_) => (
                 AllowedTool::ReadRevision,
@@ -114,7 +116,7 @@ impl Collector {
             }
             Stage::Neighbor(path) => (
                 AllowedTool::GetConcept,
-                json!({"path":path,"raw":true,"links":false}),
+                json!({"path":path,"raw":true,"full":true,"links":false}),
             ),
             Stage::History { path, .. } => (AllowedTool::History, json!({"path":path,"limit":1})),
             Stage::NeighborPin { pin, .. } => (

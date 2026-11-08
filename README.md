@@ -143,6 +143,7 @@ poll_interval = "10s"              # how often to look for CLI changes
 session_idle_timeout = "2h"        # an idle MCP session is closed after this; also
                                    # when an untouched changeset counts as idle
 max_import_bytes = "64MiB"         # uncompressed total of an import
+concept_outline_chars = 20000      # get_concept outlines a longer body
 maintenance_review_intervals = { pg = "30d" } # per-catalog; default 30d, minimum 1d
 time_server = "time.example.com"   # NTP server for the clock check (default: none)
 ```
@@ -209,7 +210,7 @@ a `LintFailed` error and `a.md` in `lint`'s result, on purpose.
 |---|---|
 | `list_catalogs` | The catalogs the key reaches, and this connection's selection |
 | `search` | Ranked search across the selected catalogs (`query`, `catalogs`, `type`, `tags`, `status`, `limit` up to 200) |
-| `get_concept` | A concept's frontmatter and body; with `links`, its links and backlinks; with `raw`, the file |
+| `get_concept` | A concept's frontmatter, body and size; with `links`, its links and backlinks; with `raw`, the file. A body over `concept_outline_chars` comes back as an outline of its headings; `section` returns one section (by heading text or slug), `full` the whole body |
 | `read_document` | The text of an `index.md`, `log.md` or `AGENTS.md` (default `/index.md`) |
 | `history` | A document's revisions, newest first (`limit` up to 200) |
 | `open_questions` | Every queued `open_questions` entry, by concept |

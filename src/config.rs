@@ -31,6 +31,9 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// How long an MCP session may sit idle before it is closed.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// The default `get_concept` outline threshold: bodies over 20,000 characters.
+pub const DEFAULT_CONCEPT_OUTLINE_CHARS: usize = 20_000;
+
 /// Settings read from the configuration file.
 // `#[serde(default)]` fills every missing key from `Default::default()`.
 // serde ignores keys the struct does not name unless told otherwise
@@ -69,6 +72,9 @@ pub struct Config {
     /// Review cadence overrides keyed by catalog name.
     #[serde(deserialize_with = "deserialize_maintenance_intervals")]
     pub maintenance_review_intervals: BTreeMap<String, Duration>,
+    /// `get_concept` returns an outline instead of a body longer than this
+    /// many characters (Unicode code points), unless asked for `full`.
+    pub concept_outline_chars: usize,
 }
 
 impl Default for Config {
@@ -84,6 +90,7 @@ impl Default for Config {
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             time_server: None,
             maintenance_review_intervals: BTreeMap::new(),
+            concept_outline_chars: DEFAULT_CONCEPT_OUTLINE_CHARS,
         }
     }
 }
@@ -242,6 +249,7 @@ mod tests {
             config.session_idle_timeout,
             Duration::from_secs(2 * 60 * 60)
         );
+        assert_eq!(config.concept_outline_chars, 20_000);
     }
 
     #[test]
@@ -253,6 +261,7 @@ mod tests {
                     poll_interval = \"90s\"\n\
                     session_idle_timeout = \"30m\"\n\
                     time_server = \"ntp.example\"\n\
+                    concept_outline_chars = 500\n\
                     a_later_key = true\n";
 
         let config = Config::from_toml(text).unwrap();
@@ -264,6 +273,7 @@ mod tests {
         assert_eq!(config.poll_interval, Duration::from_secs(90));
         assert_eq!(config.session_idle_timeout, Duration::from_secs(30 * 60));
         assert_eq!(config.time_server.as_deref(), Some("ntp.example"));
+        assert_eq!(config.concept_outline_chars, 500);
     }
 
     #[test]

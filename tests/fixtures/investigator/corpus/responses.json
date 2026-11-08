@@ -1,5 +1,5 @@
 {
-  "concept": {"catalog":"synthetic","path":"/infra/alpha.md","title":"Alpha","frontmatter":{"title":"Alpha","aliases":["Alpha","Twin"]},"frontmatter_error":null,"body":"Alpha runs locally.\r\n","raw":"---\r\ntitle: Alpha\r\n---\r\nAlpha runs locally.\r\n","links":[{"line":5,"target":"/infra/z-linked.md","fragment":null,"title":"Alpha twin","description":null,"broken":false}],"backlinks":[]},
+  "concept": {"catalog":"synthetic","path":"/infra/alpha.md","title":"Alpha","frontmatter":{"title":"Alpha","aliases":["Alpha","Twin"]},"frontmatter_error":null,"lines":1,"chars":21,"truncated":false,"body":"Alpha runs locally.\r\n","raw":"---\r\ntitle: Alpha\r\n---\r\nAlpha runs locally.\r\n","links":[{"line":5,"target":"/infra/z-linked.md","fragment":null,"title":"Alpha twin","description":null,"broken":false}],"backlinks":[]},
   "history": {"catalog":"synthetic","path":"/infra/z-linked.md","revisions":[{"revision":3,"op":"update","actor":"fixture","message":"synthetic","at":"2026-11-07T00:00:00Z"}]},
   "search": {"hits":[{"catalog":"synthetic","path":"/infra/a-lexical.md","title":"Alpha","description":null,"snippet":"Copied assertion","lines":4,"chars":48}],"skipped":[]},
   "revision": {"catalog":"synthetic","pin":{"path":"/infra/alpha.md","revision":7},"content":"---\r\ntitle: Alpha\r\n---\r\nAlpha runs locally.\r\n","outdated":false}
