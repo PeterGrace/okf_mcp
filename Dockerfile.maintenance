@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1
+# Separate runner image; the server image and release recipes stay unchanged.
+# Like Dockerfile, base tags intentionally receive Debian security updates.
+FROM rust:1.99.1-slim-bookworm AS build
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY migrations ./migrations
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked --bin okf-maintenance \
+    && cp target/release/okf-maintenance /usr/local/bin/okf-maintenance
+
+FROM debian:bookworm-slim AS native
+RUN test "$(dpkg --print-architecture)" = amd64 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+# Official 2.1.319 manifest digest; never execute an installer or resolve latest.
+RUN curl --fail --silent --show-error --location --proto "=https" --tlsv1.2 \
+        https://downloads.claude.ai/claude-code-releases/2.1.319/linux-x64/claude \
+        --output /tmp/claude \
+    && echo "dabafec82ca1319fa43d8be36a10fc61b1d11821cb98ad5df04ad95e199b8eed  /tmp/claude" | sha256sum -c - \
+    && install -m 0755 /tmp/claude /usr/local/bin/claude-2.1.319
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libstdc++6 libgcc-s1 libatomic1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 okf \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home --home-dir /tmp --shell /usr/sbin/nologin okf
+COPY --from=build /usr/local/bin/okf-maintenance /usr/local/bin/okf-maintenance
+COPY --from=native /usr/local/bin/claude-2.1.319 /usr/local/bin/claude-2.1.319
+COPY --chmod=0755 scripts/maintenance-entrypoint.sh /usr/local/bin/maintenance-entrypoint
+ENV HOME=/tmp TMPDIR=/tmp
+WORKDIR /tmp
+USER 10001:10001
+# Build-time probes cannot reach a provider, even with a misbehaving executable.
+RUN --network=none test "$(/usr/local/bin/claude-2.1.319 --version)" = "2.1.319 (Claude Code)" \
+    && /usr/local/bin/claude-2.1.319 --help > /dev/null \
+    && /usr/local/bin/okf-maintenance --version \
+    && /usr/local/bin/okf-maintenance --help > /dev/null
+ENTRYPOINT ["/usr/local/bin/maintenance-entrypoint"]
+CMD ["--help"]
