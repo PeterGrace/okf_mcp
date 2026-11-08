@@ -653,13 +653,11 @@ mod tests {
     /// returned a handle, so testcontainers alone leaves it behind.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_timed_out_start_leaks_without_cleanup_and_remove_labelled_reaps_it() {
-        use testcontainers_modules::postgres::Postgres;
         use testcontainers_modules::testcontainers::runners::AsyncRunner;
         use testcontainers_modules::testcontainers::ImageExt;
 
         let label = pg_support::unique_start_label();
-        let started = Postgres::default()
-            .with_tag("17-alpine")
+        let started = pg_support::postgres_17()
             .with_label(pg_support::START_LABEL, &label)
             .with_startup_timeout(std::time::Duration::ZERO)
             .start()
@@ -678,13 +676,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_timed_out_start_postgres_leaves_no_container() {
+    async fn a_timed_out_start_labelled_leaves_no_container() {
         use testcontainers_modules::testcontainers::core::error::WaitContainerError;
-        use testcontainers_modules::testcontainers::TestcontainersError;
+        use testcontainers_modules::testcontainers::{ImageExt, TestcontainersError};
 
         let label = pg_support::unique_start_label();
+        let request = pg_support::postgres_17().with_startup_timeout(std::time::Duration::ZERO);
 
-        let started = pg_support::start_postgres(&label, std::time::Duration::ZERO).await;
+        let started = pg_support::start_labelled(request, &label).await;
 
         assert!(matches!(
             started,

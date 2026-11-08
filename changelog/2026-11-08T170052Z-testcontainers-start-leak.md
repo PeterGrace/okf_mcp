@@ -21,24 +21,33 @@ its `Drop` removes the container. The leaked containers sit in the
 
 - `tests/support/pg.rs`: each start labels its container
   `okf-mcp.test-start=<pid>-<counter>`, a value no other start uses, even
-  across concurrent test binaries. `start_postgres` force-removes every
+  across concurrent test binaries. `start_labelled` force-removes every
   container with that label (anonymous volumes too) when the start fails,
   and then returns the start's error. A 404 or 409 from Docker (the
   container is already gone, or testcontainers' own `Drop` is removing it)
-  is not an error. `TestDb::start` retries a failed start once with a fresh
-  label, and panics if the retry fails too.
+  is not an error. `start_with_retry` retries a failed start once with a
+  fresh label, and panics if the retry fails too. It takes a function that
+  builds the request (from `postgres_17()`), because a request is consumed
+  by its start. `TestDb::start` uses it.
+- `tests/tls.rs` (from review): the TLS tests used to start their customized
+  container (copied certificate and key, a custom command) directly, without
+  the label or the cleanup. They now build it with `tls_request` and start it
+  through `start_with_retry`. No test starts Postgres any other way now.
 - The Docker calls go through testcontainers' `bollard` re-export, so no
   new dependency.
 
-## Tests (`src/db.rs`)
+## Tests
 
 - `a_timed_out_start_leaks_without_cleanup_and_remove_labelled_reaps_it`:
   a plain testcontainers start with a zero startup timeout fails and leaves
   exactly one labelled container. This is the bug, made deterministic.
   `remove_labelled` then removes it.
-- `a_timed_out_start_postgres_leaves_no_container`: the same forced
-  timeout through `start_postgres` returns `StartupTimeout` and leaves no
+- `a_timed_out_start_labelled_leaves_no_container`: the same forced
+  timeout through `start_labelled` returns `StartupTimeout` and leaves no
   labelled container.
+- `tests/tls.rs` `a_timed_out_tls_start_leaves_no_container`: the same for
+  the customized TLS request, whose files Docker copies in before the
+  timeout fires.
 - After a full `just test` run, `docker ps -a --filter
   label=okf-mcp.test-start` lists nothing.
 

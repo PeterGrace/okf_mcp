@@ -9,8 +9,10 @@
 //! A start that fails after Docker created the container (the start times
 //! out under load, or Docker refuses it with "endpoint ... already exists")
 //! returns no [`ContainerAsync`], so nothing would remove it. Every container
-//! therefore carries a label unique to its start, and [`start_postgres`]
-//! removes whatever has that label when the start fails.
+//! therefore carries a label unique to its start, and [`start_labelled`]
+//! removes whatever has that label when the start fails. Tests that need a
+//! customized container (`tests/tls.rs`) start it through
+//! [`start_with_retry`] too.
 
 // Each crate that includes this file uses a different part of it (the CLI
 // tests need `url`, the unit tests only `pool`).
@@ -28,14 +30,16 @@ use testcontainers_modules::testcontainers::bollard::query_parameters::{
 };
 use testcontainers_modules::testcontainers::bollard::Docker;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt, TestcontainersError};
+use testcontainers_modules::testcontainers::{
+    ContainerAsync, ContainerRequest, ImageExt, TestcontainersError,
+};
 
 /// The label key whose value identifies one start of a test container.
 pub const START_LABEL: &str = "okf-mcp.test-start";
 
 /// How long one start may take before it counts as failed (testcontainers'
 /// own default).
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Attempts per [`TestDb::start`]: one retry covers a transient Docker
 /// refusal or a start that timed out under load.
@@ -59,7 +63,7 @@ impl TestDb {
     /// If Docker is unreachable or the container does not start twice: a
     /// test environment problem, reported at once.
     pub async fn start() -> Self {
-        let container = start_with_retry().await;
+        let container = start_with_retry(postgres_17).await;
         let host = container.get_host().await.expect("container host");
         let port = container
             .get_host_port_ipv4(5432)
@@ -79,14 +83,28 @@ impl TestDb {
     }
 }
 
-/// Starts a container, retrying a failed start with a fresh label.
+/// A request for Postgres 17 (Alpine), the image every test database uses;
+/// callers add their own settings (files, command) before starting it.
+pub fn postgres_17() -> ContainerRequest<Postgres> {
+    Postgres::default().with_tag("17-alpine")
+}
+
+/// Starts the container `request` builds, through [`start_labelled`] with
+/// [`STARTUP_TIMEOUT`], retrying a failed start once with a fresh label.
+///
+/// # Arguments
+/// * `request` - builds the container request; called once per attempt,
+///   because a request is consumed by its start and cannot be cloned.
 ///
 /// # Panics
 /// If every attempt fails (the last error is reported).
-async fn start_with_retry() -> ContainerAsync<Postgres> {
+pub async fn start_with_retry(
+    request: impl Fn() -> ContainerRequest<Postgres>,
+) -> ContainerAsync<Postgres> {
     let mut attempt = 1;
     loop {
-        match start_postgres(&unique_start_label(), STARTUP_TIMEOUT).await {
+        let labelled = request().with_startup_timeout(STARTUP_TIMEOUT);
+        match start_labelled(labelled, &unique_start_label()).await {
             Ok(container) => return container,
             Err(error) if attempt < START_ATTEMPTS => {
                 tracing::warn!("postgres container start failed, retrying: {error}");
@@ -107,27 +125,22 @@ pub fn unique_start_label() -> String {
     format!("{}-{start}", std::process::id())
 }
 
-/// Starts Postgres 17 labelled `START_LABEL=label`; on failure, removes any
+/// Starts `request` labelled `START_LABEL=label`; on failure, removes any
 /// container the attempt left behind before returning the error.
 ///
 /// # Arguments
+/// * `request` - the configured container (image, files, command, startup
+///   timeout).
 /// * `label` - this start's [`START_LABEL`] value ([`unique_start_label`]).
-/// * `startup_timeout` - how long the start may take.
 ///
 /// # Errors
 /// The start's error, or, if the cleanup also failed, that error wrapped as
 /// [`TestcontainersError::Other`] (naming both).
-pub async fn start_postgres(
+pub async fn start_labelled(
+    request: ContainerRequest<Postgres>,
     label: &str,
-    startup_timeout: Duration,
 ) -> Result<ContainerAsync<Postgres>, TestcontainersError> {
-    let start_error = match Postgres::default()
-        .with_tag("17-alpine")
-        .with_label(START_LABEL, label)
-        .with_startup_timeout(startup_timeout)
-        .start()
-        .await
-    {
+    let start_error = match request.with_label(START_LABEL, label).start().await {
         Ok(container) => return Ok(container),
         Err(error) => error,
     };
