@@ -96,6 +96,47 @@ pub async fn create(
     Ok(catalog)
 }
 
+/// Replaces a catalog's description and bumps the administrative
+/// generation, in one transaction. The catalog's `generation` is left alone:
+/// its content did not change, so its snapshot is not rebuilt.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `name` - the catalog's name.
+/// * `description` - the new free text (empty is allowed, as for `create`).
+///
+/// # Returns
+/// The description it had before.
+///
+/// # Errors
+/// [`OkfError::CatalogNotSelected`] if there is no such catalog;
+/// [`OkfError::Database`] otherwise.
+pub async fn update_description(
+    pool: &PgPool,
+    name: &str,
+    description: &str,
+) -> Result<String, OkfError> {
+    let mut tx = pool.begin().await?;
+    // A subquery reads the row as it was before the `UPDATE` (one
+    // statement sees one snapshot), so this returns the old text; the row
+    // lock the `UPDATE` takes keeps two updates from both reading the same.
+    let previous: Option<String> = sqlx::query_scalar(
+        "UPDATE catalogs c SET description = $2 \
+         FROM (SELECT id, description FROM catalogs WHERE name = $1 FOR UPDATE) old \
+         WHERE c.id = old.id RETURNING old.description",
+    )
+    .bind(name)
+    .bind(description)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let previous = previous.ok_or_else(|| OkfError::CatalogNotSelected {
+        catalog: name.to_string(),
+    })?;
+    bump_admin_generation(&mut tx).await?;
+    tx.commit().await?;
+    Ok(previous)
+}
+
 /// Every catalog, by name.
 ///
 /// # Arguments
@@ -320,6 +361,75 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn update_description_replaces_it_and_returns_the_old_text() {
+        let db = test_db().await;
+        let pg = create(&db.pool, "pg", "copy", now()).await.unwrap();
+
+        let previous = update_description(&db.pool, "pg", "source of truth")
+            .await
+            .unwrap();
+        let cleared = update_description(&db.pool, "pg", "").await.unwrap();
+
+        assert_eq!(
+            (previous.as_str(), cleared.as_str()),
+            ("copy", "source of truth")
+        );
+        let row = find(&db.pool, "pg").await.unwrap();
+        assert_eq!(
+            (row.description.as_str(), row.generation),
+            ("", pg.generation)
+        );
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_updates_each_return_the_text_they_replaced() {
+        let db = test_db().await;
+        create(&db.pool, "pg", "start", now()).await.unwrap();
+        // Hold the row so both updates queue behind it and then race.
+        let mut holder = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM catalogs WHERE name = 'pg' FOR UPDATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let spawn_update = |text: &'static str| {
+            let pool = db.pool.clone();
+            tokio::spawn(async move { update_description(&pool, "pg", text).await })
+        };
+        let first = spawn_update("one");
+        let second = spawn_update("two");
+        until_locks_are_awaited(&db.pool, 2).await;
+
+        holder.commit().await.unwrap();
+        let mut previous = [
+            first.await.unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
+        ];
+        let last = find(&db.pool, "pg").await.unwrap().description;
+
+        // One update replaced "start"; the other replaced the first's text.
+        // Without the row lock in the subquery, both could report "start".
+        previous.sort();
+        let winner_first = if last == "one" { "two" } else { "one" };
+        let mut expected = ["start".to_string(), winner_first.to_string()];
+        expected.sort();
+        assert_eq!(previous, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_description_refuses_an_unknown_catalog() {
+        let db = test_db().await;
+
+        let outcome = update_description(&db.pool, "nope", "x").await;
+
+        assert!(matches!(
+            outcome,
+            Err(OkfError::CatalogNotSelected { catalog }) if catalog == "nope"
+        ));
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn bad_and_duplicate_names_are_refused() {
         let db = test_db().await;
         create(&db.pool, "pg", "", now()).await.unwrap();
@@ -426,18 +536,23 @@ pub(crate) mod tests {
     /// Waits until some backend is blocked on a lock, so a test knows the
     /// spawned delete (or import) has reached the point it should wait at.
     pub(crate) async fn until_a_lock_is_awaited(pool: &PgPool) {
+        until_locks_are_awaited(pool, 1).await;
+    }
+
+    /// Waits until at least `count` lock requests are blocked.
+    async fn until_locks_are_awaited(pool: &PgPool, count: i64) {
         for _ in 0..200 {
             let waiting: i64 =
                 sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")
                     .fetch_one(pool)
                     .await
                     .unwrap();
-            if waiting > 0 {
+            if waiting >= count {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        panic!("no backend ever waited on a lock");
+        panic!("fewer than {count} lock requests were ever blocked");
     }
 
     #[tokio::test(flavor = "multi_thread")]
