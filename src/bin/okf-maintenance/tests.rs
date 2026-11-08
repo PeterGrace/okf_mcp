@@ -115,10 +115,7 @@ impl CatalogClient for FakeClient {
         if self.mode == "schema" {
             return Ok(vec![]);
         }
-        Ok(serde_json::from_str(include_str!(
-            "../../../tests/fixtures/investigator/contract/tools.json"
-        ))
-        .unwrap())
+        Ok(serde_json::from_str(include_str!("../../investigator/contract_tools.json")).unwrap())
     }
     async fn call(&mut self, request: ToolRequest) -> Result<Value, RunnerError> {
         self.seen.calls.lock().unwrap().push(request.tool);

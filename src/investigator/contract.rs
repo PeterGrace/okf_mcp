@@ -25,10 +25,7 @@ pub(crate) const ALLOWED: [AllowedTool; 9] = [
 
 // Captured from OkfServer::tools(), not an invented protocol version/hash.
 static CONTRACTS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
-    serde_json::from_str(include_str!(
-        "../../tests/fixtures/investigator/contract/tools.json"
-    ))
-    .expect("checked-in tool contracts")
+    serde_json::from_str(include_str!("contract_tools.json")).expect("checked-in tool contracts")
 });
 
 /// Require each allowed tool exactly once and compare structural input/output contracts.
@@ -363,6 +360,26 @@ mod tests {
     fn investigator_contract_rejects_missing_or_changed_tools() {
         let tools = OkfServer::tools().list_all();
         assert!(validate_tools(&tools).is_ok());
+        assert_eq!(CONTRACTS.len(), ALLOWED.len());
+        for allowed in ALLOWED {
+            assert_eq!(
+                tools
+                    .iter()
+                    .filter(|tool| tool.name == allowed.name())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                serde_json::to_value(expected(allowed)).unwrap(),
+                serde_json::to_value(
+                    tools
+                        .iter()
+                        .find(|tool| tool.name == allowed.name())
+                        .unwrap()
+                )
+                .unwrap()
+            );
+        }
         let mut missing = tools.clone();
         missing.retain(|t| t.name != "maintenance_submit");
         assert!(validate_tools(&missing).is_err());
@@ -549,9 +566,8 @@ mod tests {
             ]
             .contains(&t.name.as_ref())
         });
-        std::fs::create_dir_all("tests/fixtures/investigator/contract").unwrap();
         std::fs::write(
-            "tests/fixtures/investigator/contract/tools.json",
+            "src/investigator/contract_tools.json",
             serde_json::to_string_pretty(&tools).unwrap(),
         )
         .unwrap();

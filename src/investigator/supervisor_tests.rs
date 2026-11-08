@@ -206,10 +206,8 @@ impl CatalogClient for FakeClient {
             self.list_failures -= 1;
             return Err(RunnerError::Transport);
         }
-        let mut tools: Vec<Tool> = serde_json::from_str(include_str!(
-            "../../tests/fixtures/investigator/contract/tools.json"
-        ))
-        .unwrap();
+        let mut tools: Vec<Tool> =
+            serde_json::from_str(include_str!("contract_tools.json")).unwrap();
         if self.bad_schema {
             tools.clear();
         }
