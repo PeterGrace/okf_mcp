@@ -604,6 +604,16 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_concept_has_no_lines_or_characters() {
+        let snapshot = Snapshot::build(&MemWorkspace::from_files([("empty.md", "")])).unwrap();
+
+        let hits = search(&snapshot, &SearchQuery::new(""));
+
+        assert_eq!(paths(&hits), ["/empty.md"]);
+        assert_eq!((hits[0].lines, hits[0].chars), (0, 0));
+    }
+
+    #[test]
     fn crlf_line_endings_count_as_one_character() {
         let snapshot = Snapshot::build(&MemWorkspace::from_files([(
             "a.md",
