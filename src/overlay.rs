@@ -5,7 +5,9 @@
 //! applied and a full snapshot of the result (about 10 ms for the real
 //! catalog), built on a blocking thread. [`Overlays`] caches one per
 //! changeset, valid while the changeset's `version` and the published
-//! `generation` stay the same; no incremental snapshot.
+//! `generation` stay the same; no incremental snapshot. The cache holds at
+//! most `overlay_cache_size` overlays (the least recently used goes first),
+//! and builds each changeset's overlay once however many reads ask at once.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -13,10 +15,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use sqlx::PgExecutor;
+use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::catalog::{CatalogState, Loaded};
 use crate::error::OkfError;
+use crate::keyed_lock::KeyedLocks;
 use crate::mcp::blocking;
 use crate::okf::analysis::lint::{lint, CommitTimes, LintReport};
 use crate::okf::snapshot::Snapshot;
@@ -195,33 +198,41 @@ struct Cached {
 #[derive(Debug)]
 pub struct Overlays {
     idle: Duration,
+    capacity: usize,
     // A `std` mutex: held for a lookup or an insert, never across `.await`.
     cached: Mutex<HashMap<i64, Cached>>,
+    // One build at a time per changeset: a read that misses waits for a
+    // build already running, then finds its result cached.
+    builds: KeyedLocks,
 }
 
 impl Overlays {
-    /// An empty cache whose entries are dropped after `idle` without use.
+    /// An empty cache whose entries are dropped after `idle` without use,
+    /// holding at most `capacity` of them.
     ///
     /// # Arguments
     /// * `idle` - `session_idle_timeout`.
+    /// * `capacity` - `overlay_cache_size` (at least 1).
     ///
     /// # Returns
     /// The cache.
-    pub fn new(idle: Duration) -> Self {
+    pub fn new(idle: Duration, capacity: usize) -> Self {
         Self {
             idle,
+            capacity,
             cached: Mutex::new(HashMap::new()),
+            builds: KeyedLocks::new(),
         }
     }
 
-    /// The overlay of `changeset` on `state`'s current published state:
-    /// the cached one if it was built at this `version` and `generation`,
-    /// else a new one (its entries read now).
+    /// The overlay of `changeset` on `state`'s current published state,
+    /// for a read: the cached one if it was built at this `version` and
+    /// `generation`, else a new one (its entries read now from `pool`).
+    /// Concurrent misses on one changeset build it once: the others wait,
+    /// then find it cached.
     ///
     /// # Arguments
-    /// * `executor` - where to read the entries: the pool for a read, the
-    ///   write's own transaction for a write (`&mut *tx`), so a write that
-    ///   holds the changeset's row lock needs no second connection.
+    /// * `pool` - where to read the entries.
     /// * `state` - the changeset's catalog.
     /// * `changeset` - an open changeset, as just read.
     ///
@@ -230,10 +241,60 @@ impl Overlays {
     ///
     /// # Errors
     /// [`OkfError::Database`] reading the entries; as [`build_overlay`].
-    // `impl PgExecutor<'_>` takes a `&PgPool` or a `&mut PgConnection`
-    // alike (a pool, a connection or a transaction), like a duck-typed
-    // "anything with execute()" argument in Python, checked at compile time.
     pub async fn get(
+        &self,
+        pool: &PgPool,
+        state: &CatalogState,
+        changeset: &ChangesetRow,
+    ) -> Result<Arc<Overlay>, OkfError> {
+        if let Some(overlay) = self.lookup(changeset, state.current().generation(), Instant::now())
+        {
+            return Ok(overlay);
+        }
+        // `_building` is held (and other reads of this changeset wait) until
+        // this function returns. It is taken before a pooled connection, so
+        // the builder may wait for one while holding it; that is why
+        // `get_in`, whose caller already holds a connection, never waits on
+        // it (it would close a cycle with a builder waiting for that
+        // connection).
+        let _building = self.builds.lock(changeset.id).await;
+        // Read the state again: a build that finished while this one waited
+        // may be the overlay wanted, and the published state may have moved.
+        self.lookup_or_build(pool, state, changeset).await
+    }
+
+    /// As [`Overlays::get`], for a write that holds a connection (its
+    /// transaction, with the changeset's row locked): reads the entries on
+    /// it and never waits for a read's build, so a full pool cannot stall
+    /// the two on each other. A read building at the same time may build the
+    /// same overlay too; `store` keeps the newer.
+    ///
+    /// # Arguments
+    /// * `conn` - the write's transaction (`&mut *tx`), so a write needs no
+    ///   second connection.
+    /// * `state` - the changeset's catalog.
+    /// * `changeset` - the changeset, as read under its row lock.
+    ///
+    /// # Returns
+    /// The overlay, shared.
+    ///
+    /// # Errors
+    /// [`OkfError::Database`] reading the entries; as [`build_overlay`].
+    pub async fn get_in(
+        &self,
+        conn: &mut PgConnection,
+        state: &CatalogState,
+        changeset: &ChangesetRow,
+    ) -> Result<Arc<Overlay>, OkfError> {
+        self.lookup_or_build(conn, state, changeset).await
+    }
+
+    /// The cached overlay if current, else one built from entries read on
+    /// `executor` and cached.
+    // `impl PgExecutor<'_>` takes a `&PgPool` or a `&mut PgConnection`
+    // alike, like a duck-typed "anything with execute()" argument in Python,
+    // checked at compile time.
+    async fn lookup_or_build(
         &self,
         executor: impl PgExecutor<'_>,
         state: &CatalogState,
@@ -294,15 +355,31 @@ impl Overlays {
     }
 
     /// Caches `overlay`, unless a newer one for the same changeset is there
-    /// (a slower build finishing last), first dropping every idle entry.
+    /// (a slower build finishing last), first dropping every idle entry;
+    /// then, past `capacity`, drops the least recently used other entry.
     fn store(&self, overlay: Arc<Overlay>, now: Instant) {
         let mut cached = self.lock();
         self.drop_idle(&mut cached, now);
+        let id = overlay.changeset_id;
         let newer_cached = cached
-            .get(&overlay.changeset_id)
+            .get(&id)
             .is_some_and(|entry| built_at(&entry.overlay) > built_at(&overlay));
-        if !newer_cached {
-            cached.insert(overlay.changeset_id, Cached { overlay, used: now });
+        if newer_cached {
+            return;
+        }
+        cached.insert(id, Cached { overlay, used: now });
+        // One insert adds at most one entry, so one eviction restores the
+        // bound. A linear scan: the cache is small (`overlay_cache_size`),
+        // and an ordered index would cost every lookup an update.
+        if cached.len() > self.capacity {
+            let oldest = cached
+                .iter()
+                .filter(|(key, _)| **key != id)
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                cached.remove(&oldest);
+            }
         }
     }
 
@@ -512,7 +589,7 @@ mod tests {
             }
         };
         let (newer, older, other) = (build(1, 2).await, build(1, 1).await, build(2, 1).await);
-        let overlays = Overlays::new(Duration::from_secs(60));
+        let overlays = Overlays::new(Duration::from_secs(60), 64);
         let start = Instant::now();
         let later = start + Duration::from_secs(61);
 
@@ -538,6 +615,141 @@ mod tests {
         assert!(stale_dropped, "an out-of-date entry is dropped on lookup");
         assert!(after_idle.is_none());
         assert!(overlays.lock().is_empty(), "a lookup drops idle entries");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn past_its_capacity_the_cache_drops_the_least_recently_used() {
+        // Arrange: three changesets' overlays, a cache that holds two.
+        let test = app_with(&[("pg", &[("a.md", "# A\n")])], Config::default()).await;
+        let base = test.app.catalog("pg").unwrap().current();
+        let generation = base.generation();
+        let mut built = Vec::with_capacity(3);
+        for id in 1..=3 {
+            let row = changeset(id, 1);
+            let overlay = build_overlay(Arc::clone(&base), &row, Vec::new()).await;
+            built.push(Arc::new(overlay.unwrap()));
+        }
+        let overlays = Overlays::new(Duration::from_secs(60), 2);
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+
+        // Act: 1 is used after 2, so 2 is the least recently used when 3
+        // arrives.
+        overlays.store(Arc::clone(&built[0]), at(0));
+        overlays.store(Arc::clone(&built[1]), at(1));
+        let first_used = overlays.lookup(&changeset(1, 1), generation, at(2));
+        overlays.store(Arc::clone(&built[2]), at(3));
+
+        // Assert
+        assert!(first_used.is_some());
+        let mut kept: Vec<i64> = overlays.lock().keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [1, 3], "2 was the least recently used");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_first_reads_build_one_overlay() {
+        // Arrange
+        let test = app_with(&[("pg", &[("a.md", "# A\n")])], Config::default()).await;
+        store_key(&test, "writer").await;
+        let ctx = context(
+            &test,
+            principal_as("writer", Access::Write, &[], Some("pg")),
+            None,
+        );
+        let handle = open(&ctx).await;
+        let edit = PendingEdit {
+            path: "a.md",
+            text: Some("# One\n"),
+            at: Utc::now(),
+        };
+        let row = Arc::new(pending_entry(&test, &handle, &edit).await);
+
+        // Act: eight reads that all miss the empty cache at once.
+        let reads: Vec<_> = (0..8)
+            .map(|_| {
+                let (app, row) = (Arc::clone(&test.app), Arc::clone(&row));
+                tokio::spawn(async move {
+                    let state = app.catalog("pg").unwrap();
+                    app.overlays().get(app.pool(), &state, &row).await.unwrap()
+                })
+            })
+            .collect();
+        let mut overlays = Vec::with_capacity(reads.len());
+        for read in reads {
+            overlays.push(read.await.unwrap());
+        }
+
+        // Assert: every read got the one overlay built.
+        assert!(
+            overlays
+                .iter()
+                .all(|overlay| Arc::ptr_eq(overlay, &overlays[0])),
+            "one build, shared"
+        );
+        assert_eq!(
+            overlays[0].snapshot().get("a.md").unwrap().text(),
+            "# One\n"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_does_not_wait_for_a_read_building_on_a_full_pool() {
+        // Arrange: a writer's transaction holds one connection and the test
+        // holds every other, so a read's build waits for a connection while
+        // it holds the changeset's build lock.
+        let test = app_with(&[("pg", &[("a.md", "# A\n")])], Config::default()).await;
+        store_key(&test, "writer").await;
+        let ctx = context(
+            &test,
+            principal_as("writer", Access::Write, &[], Some("pg")),
+            None,
+        );
+        let handle = open(&ctx).await;
+        let edit = PendingEdit {
+            path: "a.md",
+            text: Some("# One\n"),
+            at: Utc::now(),
+        };
+        let row = Arc::new(pending_entry(&test, &handle, &edit).await);
+        let pool = test.app.pool();
+        let mut tx = pool.begin().await.unwrap();
+        let size = pool.options().get_max_connections();
+        let mut held = Vec::with_capacity(size as usize);
+        for _ in 1..size {
+            held.push(pool.acquire().await.unwrap());
+        }
+        let read = {
+            let (app, row) = (Arc::clone(&test.app), Arc::clone(&row));
+            tokio::spawn(async move {
+                let state = app.catalog("pg").unwrap();
+                app.overlays().get(app.pool(), &state, &row).await
+            })
+        };
+        // Wait until the read holds the build lock (its entry exists).
+        while test.app.overlays().builds.len() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Act: well inside sqlx's 30 s acquire timeout, which a write
+        // waiting on the read's build lock would run the read into.
+        let state = test.app.catalog("pg").unwrap();
+        let written = tokio::time::timeout(
+            Duration::from_secs(10),
+            test.app.overlays().get_in(&mut tx, &state, &row),
+        )
+        .await;
+        drop(tx);
+        let read = tokio::time::timeout(Duration::from_secs(10), read).await;
+
+        // Assert
+        let written = written.expect("the write is not held up").unwrap();
+        assert_eq!(written.snapshot().get("a.md").unwrap().text(), "# One\n");
+        read.expect("the read finishes once the write lets go")
+            .unwrap()
+            .unwrap();
+        drop(held);
     }
 
     #[tokio::test(flavor = "multi_thread")]

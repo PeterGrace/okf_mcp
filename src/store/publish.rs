@@ -146,7 +146,7 @@ pub async fn publish(
     if entries.is_empty() {
         return Ok(PublishReport::default());
     }
-    let base = current_base(app, state, &mut tx).await?;
+    let base = current_base(state, &mut tx).await?;
 
     // Step 3: base revisions against the documents as stored now.
     let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
@@ -210,7 +210,6 @@ pub async fn publish(
 /// As [`CatalogState::refresh`]; [`OkfError::Busy`] if the snapshot still
 /// does not match (only a refresh failing silently could cause it).
 async fn current_base(
-    app: &App,
     state: &CatalogState,
     conn: &mut PgConnection,
 ) -> Result<Arc<Loaded>, OkfError> {
@@ -219,14 +218,10 @@ async fn current_base(
         .fetch_one(&mut *conn)
         .await?;
     // The advisory lock keeps every other import and publish out, so the
-    // refresh (on its own connection) builds exactly this generation.
-    // That is a second pooled connection while this transaction holds the
-    // first. Publishes of one catalog are serialized by the in-process
-    // mutex, so only many catalogs publishing at once on a small pool (8
-    // by default) could exhaust it, until sqlx's acquire timeout fails a
-    // publish (design "Publish").
+    // refresh builds exactly this generation, and it reads on this
+    // transaction's connection: a publish never holds a second one.
     if state.current().generation() < generation {
-        state.refresh(app.pool()).await?;
+        state.refresh_locked(conn).await?;
     }
     let base = state.current();
     if base.generation() == generation {

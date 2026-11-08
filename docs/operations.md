@@ -80,9 +80,12 @@ unknown keys are ignored, so one file serves every version.
 | `max_import_bytes` | `"64MiB"` | The largest uncompressed import (`MiB` is binary, `MB` decimal, or a number of bytes). The import route caps the request body at this plus 0.1% and 64 KiB of gzip slack |
 | `time_server` | none | The NTP server for the clock check (`host`, `host:port` or an address). Without it there is no check |
 | `concept_outline_chars` | `20000` | `get_concept` returns an outline of the headings, not the body, for a body longer than this many characters, unless the call passes `full` or `section` |
+| `database_max_connections` | `16` | The most database connections one process opens (`serve` and every subcommand). Writers queued on one changeset wait without one; the writer whose turn it is, a publish, and a read that builds an overlay each hold one |
+| `overlay_cache_size` | `64` | The most changeset overlays (an open changeset's view of its catalog) kept in memory; past it, the least recently used is dropped and rebuilt on its next read |
 
 The server refuses to start (and every subcommand refuses to run) with a zero
-`poll_interval` or `session_idle_timeout`, an empty `allowed_hosts` or a blank
+`poll_interval`, `session_idle_timeout`, `database_max_connections` or
+`overlay_cache_size`, an empty `allowed_hosts` or a blank
 entry in it, or a `time_server` that is blank or has surrounding whitespace.
 `maintenance_review_intervals` also rejects invalid catalog names, malformed
 durations, durations below 86,400 seconds and durations beyond the supported
@@ -98,6 +101,8 @@ poll_interval = "10s"
 max_import_bytes = "64MiB"
 maintenance_review_intervals = { pg = "30d" }
 concept_outline_chars = 20000
+database_max_connections = 16
+overlay_cache_size = 64
 ```
 
 - **IPv6:** on an IPv6 or dual-stack cluster, listen on `[::]:8080`. Linux
@@ -129,7 +134,8 @@ reads the same file as the server, with no extra flags.
 
 - **One database and its owner role**, for example `okf_mcp` owned by
   `okf_mcp`. The server needs no superuser and no extension. The pool opens up
-  to 8 connections.
+  to `database_max_connections` (16 by default) connections; keep the
+  database's `max_connections` above that times the number of replicas.
 - **Migrations** are embedded in the binary and run on every start, by `serve`
   and by every subcommand. `okf-mcp migrate` applies them and exits, for a
   separate deploy step if you want one. They are forward-only: a binary older

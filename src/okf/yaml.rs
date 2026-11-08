@@ -15,6 +15,12 @@
 //! - Null-key consequences: `{null: a, "null": b}` is a duplicate-key error
 //!   here, and `block_item` on a null-key map writes `- "null": a` where
 //!   Python writes `- None: a`.
+//! - A block-list item whose first key is quoted (`- "n": a`) is a mapping
+//!   here, as in YAML; Python reads it as a string and then fails on the
+//!   `: `, so it cannot read back what its own `block_item` writes.
+//! - `block_item` quotes a plain key that a block key cannot start with
+//!   (`- "...": a`, a key starting with `.`); Python writes it bare, which no
+//!   block mapping reads back.
 //! - `"\U00110000"` is a "bad escape" error where Python raises an uncaught
 //!   `ValueError`.
 //! - Flow collections nested more than `MAX_FLOW_DEPTH` (128) levels deep are an
@@ -554,7 +560,9 @@ fn parse_seq(content: &[NumberedLine<'_>], indent: usize) -> Result<Value, YamlE
             continue;
         }
         let offset = indent + 1 + indent_of(rest);
-        if !item.starts_with(['[', '{', '"', '\'']) && MAP_KEY.is_match(item) {
+        // A quoted item is a mapping only if a `:` follows the closing quote
+        // (`- "a": b`); `MAP_KEY` matches no other quoted text.
+        if !item.starts_with(['[', '{']) && MAP_KEY.is_match(item) {
             // `- key: value`: a mapping whose first key shares the dash's line.
             let first = format!("{}{item}", " ".repeat(offset));
             let mut lines = vec![(number, first.as_str())];
@@ -742,6 +750,21 @@ pub fn flow_value(value: &Value) -> String {
     }
 }
 
+/// A key as a block mapping writes it: plain when [`MAP_KEY`] reads it back
+/// unquoted, else double-quoted (a key that needs quotes anyway, or a plain
+/// one starting with a character a block key cannot, such as `.`).
+fn block_key(key: &str) -> String {
+    let plain = scalar(key, ScalarStyle::Block);
+    let reads_back = MAP_KEY
+        .captures(&format!("{plain}:"))
+        .is_some_and(|caps| caps[1] == plain);
+    if reads_back {
+        plain
+    } else {
+        double_quote(key)
+    }
+}
+
 /// Renders one block-list item as lines (no trailing newlines).
 ///
 /// A mapping of scalars becomes `- k: v` with continuation keys aligned
@@ -771,7 +794,7 @@ pub fn block_item(value: &Value, indent: usize) -> Vec<String> {
                         .as_str()
                         .map(|s| scalar(s, ScalarStyle::Block))
                         .unwrap_or_default();
-                    let line = format!("{lead}{}: {rendered}", scalar(k, ScalarStyle::Block));
+                    let line = format!("{lead}{}: {rendered}", block_key(k));
                     py_rstrip(&line).to_string()
                 })
                 .collect()
@@ -1069,6 +1092,42 @@ mod tests {
         assert_eq!(block_item(&s("q"), 0), vec!["- q"]);
         assert_eq!(block_item(&Value::Seq(vec![s("a")]), 2), vec!["  - [a]"]);
         assert_eq!(block_item(&Value::Null, 2), vec!["  - null"]);
+    }
+
+    #[test]
+    fn a_block_item_map_with_an_awkward_key_parses_back() {
+        // Arrange: a first key that needs quotes, and a plain one a block
+        // key cannot start with.
+        let quoted = map(&[("*a", s("b")), ("id", s("x"))]);
+        let dotted = map(&[("...", s("b"))]);
+
+        // Act
+        let quoted_lines = block_item(&quoted, 2);
+        let dotted_lines = block_item(&dotted, 0);
+
+        // Assert: block lines, which parse back to the same map.
+        assert_eq!(quoted_lines, vec!["  - \"*a\": b", "    id: x"]);
+        assert_eq!(dotted_lines, vec!["- \"...\": b"]);
+        for (lines, value) in [(&quoted_lines, &quoted), (&dotted_lines, &dotted)] {
+            // `(number, text)` pairs, as the frontmatter parser numbers lines.
+            let numbered: Vec<NumberedLine<'_>> = lines
+                .iter()
+                .enumerate()
+                .map(|(i, line)| (i + 1, line.as_str()))
+                .collect();
+            let parsed = parse_node(&numbered).unwrap();
+            assert_eq!(parsed, Value::Seq(vec![value.clone()]), "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_block_item_is_a_string_unless_a_colon_follows_it() {
+        let parsed = parse_node(&lines(&["- \"a: b\"", "- 'c'", "- \"d\": e"])).unwrap();
+
+        assert_eq!(
+            parsed,
+            Value::Seq(vec![s("a: b"), s("c"), map(&[("d", s("e"))])])
+        );
     }
 
     #[test]

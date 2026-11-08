@@ -144,6 +144,8 @@ session_idle_timeout = "2h"        # an idle MCP session is closed after this; a
                                    # when an untouched changeset counts as idle
 max_import_bytes = "64MiB"         # uncompressed total of an import
 concept_outline_chars = 20000      # get_concept outlines a longer body
+database_max_connections = 16      # database pool size, per process
+overlay_cache_size = 64            # open changesets' views kept in memory
 maintenance_review_intervals = { pg = "30d" } # per-catalog; default 30d, minimum 1d
 time_server = "time.example.com"   # NTP server for the clock check (default: none)
 ```

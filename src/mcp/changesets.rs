@@ -1257,6 +1257,56 @@ mod publish_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_publish_on_a_stale_snapshot_needs_one_connection() {
+        // Arrange: an import moves the database past the server's snapshot
+        // (no refresh), and every pooled connection but one is taken.
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
+        body(&ctx, &handle, "/a.md", "Edited.\n").await;
+        let options = ImportOptions {
+            replace: true,
+            actor: "t",
+            now: Utc::now(),
+        };
+        let republished = files(&[
+            ("a.md", NOTE),
+            ("hub.md", HUB),
+            ("infra/index.md", "# Infra\n"),
+            ("infra/x.md", X),
+            ("infra/y.md", Y),
+            ("log.md", "# Log\n"),
+            ("z.md", "# Z\n"),
+        ]);
+        import(test.app.pool(), "pg", republished, &options)
+            .await
+            .unwrap();
+        let state = test.app.catalog("pg").unwrap();
+        let stale = state.current().generation();
+        let size = test.app.pool().options().get_max_connections();
+        let mut held = Vec::with_capacity(size as usize);
+        for _ in 1..size {
+            held.push(test.app.pool().acquire().await.unwrap());
+        }
+
+        // Act: well inside sqlx's 30 s acquire timeout, which a publish
+        // waiting for a second connection would run into.
+        let published = tokio::time::timeout(
+            Duration::from_secs(10),
+            publish_as(&ctx, &handle, "on a stale snapshot"),
+        )
+        .await
+        .expect("the publish needs no second connection");
+        drop(held);
+
+        // Assert
+        assert!(published.unwrap().report.published);
+        assert!(state.current().generation() > stale);
+        assert!(state.current().snapshot().get("z.md").is_some());
+        assert!(published_text(&test, "a.md").ends_with("Edited.\n"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_stale_free_edit_conflicts_and_leaves_the_changeset_open() {
         let test = pg().await;
         let first = writer(&test, "writer-a", "pg").await;

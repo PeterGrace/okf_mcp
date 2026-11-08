@@ -19,15 +19,19 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 ///
 /// # Arguments
 /// * `url` - a `postgres://` or `postgresql://` URL (CNPG's generated secret).
+/// * `max_connections` - the pool size (`database_max_connections`).
 ///
 /// # Returns
-/// A pool of up to 8 connections. `async fn` returns a future: the caller
-/// `.await`s it, like a Python coroutine.
+/// A pool of up to `max_connections` connections. `async fn` returns a
+/// future: the caller `.await`s it, like a Python coroutine.
 ///
 /// # Errors
 /// [`OkfError::Database`] if the URL is malformed or the server is unreachable.
-pub async fn connect(url: &str) -> Result<PgPool, OkfError> {
-    let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
+pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, OkfError> {
+    let pool = PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect(url)
+        .await?;
     Ok(pool)
 }
 
