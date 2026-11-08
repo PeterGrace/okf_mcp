@@ -1,8 +1,9 @@
 //! Edit operations on a catalog: Rust ports of `okf.py`'s concept commands
 //! (`stamp`, `review`, `question`, `unquestion`, `source`), its bookkeeping
 //! (`log`, `index`, Task 3), the server's content edits (`create_concept`,
-//! `edit_document`, `replace_body`, `set_frontmatter`) and `remove_source`, and the restructuring
-//! edits (M6): `rewrite_links` (`relink`), `move_concept`, `split_concept` and `delete_concept`.
+//! `edit_document`, `replace_body`, `set_frontmatter`) and `remove_source`,
+//! and the restructuring edits (M6): `rewrite_links` (`relink`),
+//! `move_concept`, `split_concept` and `delete_concept`.
 //!
 //! Every op is a pure function over a [`Workspace`]: it reads through it,
 //! writes the files it changes with [`Workspace::write_atomic`], and returns
