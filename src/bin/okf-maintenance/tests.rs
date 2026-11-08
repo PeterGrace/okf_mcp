@@ -144,7 +144,7 @@ impl CatalogClient for FakeClient {
                 json!({"pin":{"path":"/fixture.md","revision":1},"content":"Synthetic evidence","outdated":false})
             }
             AllowedTool::GetConcept => {
-                json!({"catalog":"synthetic","path":"/fixture.md","title":"Fixture","frontmatter":{},"frontmatter_error":null,"body":"Synthetic evidence","raw":"Synthetic evidence","links":[],"backlinks":[]})
+                json!({"catalog":"synthetic","path":"/fixture.md","title":"Fixture","frontmatter":{},"frontmatter_error":null,"lines":1,"chars":18,"truncated":false,"body":"Synthetic evidence","raw":"Synthetic evidence","links":[],"backlinks":[]})
             }
             AllowedTool::Search => json!({"hits":[],"skipped":[]}),
             AllowedTool::Submit => {
