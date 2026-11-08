@@ -7,15 +7,17 @@
 //! never wait on the database.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::error::OkfError;
 use crate::okf::analysis::lint::{lint, CommitTimes, LintReport};
 use crate::okf::snapshot::Snapshot;
 use crate::okf::workspace::{MemWorkspace, StoredFile};
+use crate::store::documents::DocumentRow;
 use crate::store::{catalogs, documents};
 
 /// The catalog's current generation, or `None` if the row is gone.
@@ -214,15 +216,70 @@ impl CatalogState {
     /// [`OkfError::CatalogNotSelected`] if the catalog was deleted;
     /// [`OkfError::Database`]; a workspace error as for [`CatalogState::load`].
     pub async fn refresh(&self, pool: &PgPool) -> Result<bool, OkfError> {
+        let generation = self.generation_in(pool).await?;
+        self.refresh_to(generation, || build(pool, self.id, &self.name))
+            .await
+    }
+
+    /// [`CatalogState::refresh`] on the caller's connection, for a caller
+    /// that holds the catalog's advisory lock ([`catalogs::lock`]) in its
+    /// transaction, so no import or publish can change the catalog while
+    /// this reads it: a publish refreshing a stale snapshot needs no second
+    /// pooled connection.
+    ///
+    /// # Arguments
+    /// * `conn` - the lock holder's transaction (`&mut tx`).
+    ///
+    /// # Returns
+    /// Whether a new snapshot was swapped in.
+    ///
+    /// # Errors
+    /// As [`CatalogState::refresh`].
+    pub(crate) async fn refresh_locked(&self, conn: &mut PgConnection) -> Result<bool, OkfError> {
+        let generation = self.generation_in(&mut *conn).await?;
+        let id = self.id;
+        self.refresh_to(generation, || async move {
+            let rows = documents::published(&mut *conn, id).await?;
+            assemble(generation, rows).await
+        })
+        .await
+    }
+
+    /// The catalog's generation in the database.
+    ///
+    /// # Errors
+    /// [`OkfError::CatalogNotSelected`] if the catalog was deleted;
+    /// [`OkfError::Database`].
+    async fn generation_in(&self, executor: impl PgExecutor<'_>) -> Result<i64, OkfError> {
         let generation: Option<i64> = sqlx::query_scalar(GENERATION)
             .bind(self.id)
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await?;
-        let Some(generation) = generation else {
-            return Err(OkfError::CatalogNotSelected {
-                catalog: self.name.clone(),
-            });
-        };
+        // `ok_or_else` turns `None` into the error, built only when needed.
+        generation.ok_or_else(|| OkfError::CatalogNotSelected {
+            catalog: self.name.clone(),
+        })
+    }
+
+    /// Swaps in the snapshot `load` builds, unless the current one already
+    /// reached `generation` (before or after waiting for another rebuild).
+    ///
+    /// # Arguments
+    /// * `generation` - the database's generation, as just read.
+    /// * `load` - builds the snapshot; called at most once.
+    ///
+    /// # Returns
+    /// Whether a new snapshot was swapped in.
+    ///
+    /// # Errors
+    /// `load`'s error.
+    // `F: FnOnce() -> Fut` with `Fut: Future`: `load` is an async closure,
+    // like passing a coroutine function in Python, called only if needed.
+    async fn refresh_to<F, Fut>(&self, generation: i64, load: F) -> Result<bool, OkfError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Loaded, OkfError>>,
+    {
         // Generations only grow, so `<=` means "already this new or newer".
         if generation <= self.current().generation {
             return Ok(false);
@@ -236,7 +293,7 @@ impl CatalogState {
         }
         // Swaps happen only under `rebuilding`, so this build, which read a
         // generation at least as new as `generation`, is newer than `current`.
-        let loaded = build(pool, self.id, &self.name).await?;
+        let loaded = load().await?;
         // A statement-long write lock, taken after the last `.await`: the
         // `std` lock is never held across one.
         *self.current.write().expect("catalog state lock poisoned") = Arc::new(loaded);
@@ -270,6 +327,15 @@ async fn build(pool: &PgPool, catalog_id: i64, name: &str) -> Result<Loaded, Okf
     };
     let rows = documents::published(&mut *tx, catalog_id).await?;
     tx.commit().await?;
+    assemble(generation, rows).await
+}
+
+/// Builds the snapshot of a catalog's live documents at `generation`, on a
+/// blocking thread.
+///
+/// # Errors
+/// A workspace or snapshot error.
+async fn assemble(generation: i64, rows: Vec<DocumentRow>) -> Result<Loaded, OkfError> {
     // Before `rows` moves into the closure below: it borrows the rows.
     let commit_times = documents::commit_times(&rows);
     let files = rows.len();

@@ -20,6 +20,7 @@ use crate::clock_check::{self, ClockStatus};
 use crate::config::Config;
 use crate::error::OkfError;
 use crate::http::sessions::SessionKeys;
+use crate::keyed_lock::KeyedLocks;
 use crate::overlay::Overlays;
 use crate::store::{catalogs, changesets};
 
@@ -50,6 +51,9 @@ pub struct App {
     sessions: SessionKeys,
     // Each open changeset's overlay, cached (M5 Decision 6).
     overlays: Overlays,
+    // Each changeset's writers, queued in this process before they take a
+    // pooled connection (`write::apply`).
+    write_queue: KeyedLocks,
     // As in `CatalogState`: the lock is held only to clone or swap the `Arc`.
     catalogs: RwLock<Arc<Catalogs>>,
     // The `admin_generation` the key cache was loaded at. Written only under
@@ -113,7 +117,7 @@ impl App {
             }
         }
         let sessions = SessionKeys::new(config.session_idle_timeout);
-        let overlays = Overlays::new(config.session_idle_timeout);
+        let overlays = Overlays::new(config.session_idle_timeout, config.overlay_cache_size);
         Ok(Arc::new(Self {
             pool,
             config,
@@ -121,6 +125,7 @@ impl App {
             keys,
             sessions,
             overlays,
+            write_queue: KeyedLocks::new(),
             catalogs: RwLock::new(Arc::new(loaded)),
             admin_generation: AtomicI64::new(admin_generation),
             polling: tokio::sync::Mutex::new(broken),
@@ -162,6 +167,16 @@ impl App {
     /// Every open changeset's cached overlay, shared by every tool call.
     pub fn overlays(&self) -> &Overlays {
         &self.overlays
+    }
+
+    /// The per-changeset write queue: `write::apply` holds a changeset's
+    /// lock here before it begins its transaction, so writers waiting their
+    /// turn on one changeset hold no pooled connection.
+    ///
+    /// # Returns
+    /// The locks, keyed by changeset id.
+    pub fn write_queue(&self) -> &KeyedLocks {
+        &self.write_queue
     }
 
     /// The last clock check, if any (`/healthz` shows it).

@@ -34,6 +34,12 @@ pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 
 /// The default `get_concept` outline threshold: bodies over 20,000 characters.
 pub const DEFAULT_CONCEPT_OUTLINE_CHARS: usize = 20_000;
 
+/// The default database pool size.
+pub const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 16;
+
+/// The default number of changeset overlays kept in memory.
+pub const DEFAULT_OVERLAY_CACHE_SIZE: usize = 64;
+
 /// Settings read from the configuration file.
 // `#[serde(default)]` fills every missing key from `Default::default()`.
 // serde ignores keys the struct does not name unless told otherwise
@@ -75,6 +81,13 @@ pub struct Config {
     /// `get_concept` returns an outline instead of a body longer than this
     /// many characters (Unicode code points), unless asked for `full`.
     pub concept_outline_chars: usize,
+    /// The most database connections one process opens (every command,
+    /// `serve` included). A write holds one for its transaction, and a read
+    /// that builds an overlay holds one to read the changeset's entries.
+    pub database_max_connections: u32,
+    /// The most changeset overlays kept in memory; past it, the least
+    /// recently used one is dropped (and rebuilt if read again).
+    pub overlay_cache_size: usize,
 }
 
 impl Default for Config {
@@ -91,6 +104,8 @@ impl Default for Config {
             time_server: None,
             maintenance_review_intervals: BTreeMap::new(),
             concept_outline_chars: DEFAULT_CONCEPT_OUTLINE_CHARS,
+            database_max_connections: DEFAULT_DATABASE_MAX_CONNECTIONS,
+            overlay_cache_size: DEFAULT_OVERLAY_CACHE_SIZE,
         }
     }
 }
@@ -151,13 +166,20 @@ impl Config {
     /// "accept any `Host`"), or a blank entry in it (which no `Host` matches,
     /// so every request would get 403 with no hint why), or a blank
     /// `time_server` or one with surrounding whitespace (which the lookup
-    /// would fail on every check, seen only as a `warn`).
+    /// would fail on every check, seen only as a `warn`), or a zero
+    /// `database_max_connections` or `overlay_cache_size`.
     pub fn validate(&self) -> Result<(), String> {
         if self.poll_interval.is_zero() {
             return Err("poll_interval must be more than zero".to_string());
         }
         if self.session_idle_timeout.is_zero() {
             return Err("session_idle_timeout must be more than zero".to_string());
+        }
+        if self.database_max_connections == 0 {
+            return Err("database_max_connections must be more than zero".to_string());
+        }
+        if self.overlay_cache_size == 0 {
+            return Err("overlay_cache_size must be more than zero".to_string());
         }
         if self.allowed_hosts.is_empty() {
             return Err(
@@ -250,6 +272,8 @@ mod tests {
             Duration::from_secs(2 * 60 * 60)
         );
         assert_eq!(config.concept_outline_chars, 20_000);
+        assert_eq!(config.database_max_connections, 16);
+        assert_eq!(config.overlay_cache_size, 64);
     }
 
     #[test]
@@ -262,6 +286,8 @@ mod tests {
                     session_idle_timeout = \"30m\"\n\
                     time_server = \"ntp.example\"\n\
                     concept_outline_chars = 500\n\
+                    database_max_connections = 32\n\
+                    overlay_cache_size = 8\n\
                     a_later_key = true\n";
 
         let config = Config::from_toml(text).unwrap();
@@ -274,6 +300,8 @@ mod tests {
         assert_eq!(config.session_idle_timeout, Duration::from_secs(30 * 60));
         assert_eq!(config.time_server.as_deref(), Some("ntp.example"));
         assert_eq!(config.concept_outline_chars, 500);
+        assert_eq!(config.database_max_connections, 32);
+        assert_eq!(config.overlay_cache_size, 8);
     }
 
     #[test]
@@ -321,6 +349,8 @@ mod tests {
             ("poll_interval = \"0s\"\n", "poll_interval"),
             ("session_idle_timeout = \"0s\"\n", "session_idle_timeout"),
             ("allowed_hosts = []\n", "allowed_hosts"),
+            ("database_max_connections = 0\n", "database_max_connections"),
+            ("overlay_cache_size = 0\n", "overlay_cache_size"),
             (
                 "allowed_hosts = [\"\"]\n",
                 "allowed_hosts has a blank entry",

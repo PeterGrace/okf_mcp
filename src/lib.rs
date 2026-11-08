@@ -7,7 +7,7 @@
 //! (`auth`), which catalogs a call acts on (`selection`), the catalog store
 //! (`store`), the write path every write tool goes through (`write`), the
 //! configuration file (`config`), the server's shared state and poll loop
-//! (`app`), the MCP handler and its tools (`mcp`), the SNTP client (`ntp`)
+//! (`app`), per-changeset async locks (`keyed_lock`), the MCP handler and its tools (`mcp`), the SNTP client (`ntp`)
 //! and the clock check that uses it (`clock_check`), the HTTP router and
 //! server (`http`), the
 //! command line (`cli`), errors, and the clock.
@@ -25,6 +25,7 @@ pub mod db;
 pub mod error;
 pub mod http;
 pub mod investigator;
+pub mod keyed_lock;
 pub mod keys;
 pub mod maintenance;
 #[cfg(test)]

@@ -61,7 +61,9 @@ struct Touched {
 /// Writes to one changeset run one at a time: each holds the changeset's
 /// row lock ([`changesets::lock`]) from before it reads the overlay until it
 /// commits, so the overlay it edits holds every earlier write. The overlay's
-/// cached `version` is never used as a concurrency token.
+/// cached `version` is never used as a concurrency token. In this process
+/// they queue first on [`crate::app::App::write_queue`], so a queued writer
+/// holds no pooled connection.
 ///
 /// # Arguments
 /// * `ctx` - the call's context: key and catalogs.
@@ -116,6 +118,11 @@ where
     // Owned, so the blocking closure can take it.
     let by = by.unwrap_or(&ctx.principal().actor).to_string();
 
+    // Writers of one changeset take turns here first, holding no pooled
+    // connection while they wait; only the one whose turn it is takes a
+    // connection and then the row lock (which still orders writers in other
+    // processes, and publish and discard). `_queued` is held until return.
+    let _queued = app.write_queue().lock(row.id).await;
     // Dropping `tx` without `commit()` (any `?` below) rolls everything back:
     // a refused edit leaves no entry behind.
     let mut tx = app.pool().begin().await?;
@@ -509,6 +516,47 @@ mod tests {
             count(&test, "SELECT count(*) FROM changeset_entries").await,
             0
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writers_queued_on_one_changeset_hold_no_connection() {
+        // Arrange: something else holds the changeset's row, so its writers
+        // must wait.
+        let test = pg().await;
+        store_key(&test, "writer-a").await;
+        let connection = || {
+            context(
+                &test,
+                principal_as("writer-a", Access::Write, &[], Some("pg")),
+                None,
+            )
+        };
+        let handle = open(&connection()).await;
+        let row = changeset_row(&test, &handle).await;
+        let mut holder = test.app.pool().begin().await.unwrap();
+        changesets::lock(&mut holder, row.id).await.unwrap();
+
+        // Act: three writers on that changeset at once.
+        let writers: Vec<_> = ["a.md", "b.md", "c.md"]
+            .into_iter()
+            .map(|path| {
+                let (ctx, handle) = (connection(), handle.clone());
+                tokio::spawn(async move { write(&ctx, &handle, path, "# X\n".to_string()).await })
+            })
+            .collect();
+        until_a_lock_is_awaited(test.app.pool()).await;
+        // Time for the other two to reach the database, if they were going to.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let blocked = count(&test, "SELECT count(*) FROM pg_locks WHERE NOT granted").await;
+        holder.rollback().await.unwrap();
+        for writer in writers {
+            writer.await.unwrap().unwrap();
+        }
+
+        // Assert: one writer waited on the row (holding a connection); the
+        // other two waited in the queue, without one. All three landed.
+        assert_eq!(blocked, 1);
+        assert_eq!(entries(&test, &handle).await.len(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]

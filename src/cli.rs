@@ -225,7 +225,7 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
         .unwrap_or_else(|| Command::Serve(ServeArgs::default()))
     {
         Command::Serve(args) => {
-            let pool = connect(cli.database_url.as_deref()).await?;
+            let pool = connect(cli.database_url.as_deref(), &config).await?;
             // `mut`: the flag may override the file.
             let mut config = config;
             if let Some(listen) = args.listen {
@@ -247,15 +247,15 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
                 .context("serve")?;
         }
         Command::Migrate => {
-            connect(cli.database_url.as_deref()).await?;
+            connect(cli.database_url.as_deref(), &config).await?;
             println!("migrations applied");
         }
         Command::Catalog(command) => {
-            let pool = connect(cli.database_url.as_deref()).await?;
+            let pool = connect(cli.database_url.as_deref(), &config).await?;
             run_catalog(&pool, command, clock.as_ref()).await?;
         }
         Command::Key(command) => {
-            let pool = connect(cli.database_url.as_deref()).await?;
+            let pool = connect(cli.database_url.as_deref(), &config).await?;
             run_key(&pool, command, clock.as_ref()).await?;
         }
         Command::Import {
@@ -266,7 +266,7 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
         } => {
             // Connect first: a missing or unreachable database fails before a
             // large tarball (or stdin) is read.
-            let pool = connect(cli.database_url.as_deref()).await?;
+            let pool = connect(cli.database_url.as_deref(), &config).await?;
             let limit = config.max_import_bytes.as_u64();
             // Reading files is blocking I/O: run it on a blocking thread, as
             // `import` does for its snapshot, so the runtime's threads stay free.
@@ -282,7 +282,7 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Export { catalog, output } => {
-            let pool = connect(cli.database_url.as_deref()).await?;
+            let pool = connect(cli.database_url.as_deref(), &config).await?;
             // Build the archive in memory first: no `StdoutLock` is held across
             // `.await` (which would make this future impossible to
             // `tokio::spawn`), and an unknown catalog leaves no file behind.
@@ -531,9 +531,11 @@ fn format_key_record(key: &keys::KeyRecord) -> String {
 }
 
 /// Connects to the database and applies the migrations.
-async fn connect(url: Option<&str>) -> anyhow::Result<PgPool> {
+async fn connect(url: Option<&str>, config: &Config) -> anyhow::Result<PgPool> {
     let url = url.context("no database: set DATABASE_URL or pass --database-url")?;
-    let pool = db::connect(url).await.context("connect to the database")?;
+    let pool = db::connect(url, config.database_max_connections)
+        .await
+        .context("connect to the database")?;
     db::migrate(&pool).await?;
     Ok(pool)
 }

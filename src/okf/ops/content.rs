@@ -552,6 +552,88 @@ mod tests {
         workspace.read_to_string(path).unwrap()
     }
 
+    /// Strings the YAML renderer must quote, escape or keep out of a
+    /// block key: indicators, line breaks, control and invisible
+    /// characters, document markers, and surrounding whitespace.
+    const AWKWARD: [&str; 36] = [
+        "",
+        " ",
+        "\n",
+        "\r",
+        "\r\n",
+        "a\n---\nb",
+        "\t",
+        "#",
+        "- x",
+        "a: b",
+        "{",
+        "[",
+        "'",
+        "\"",
+        "\u{0}",
+        "\u{85}",
+        "\u{2028}",
+        "\u{feff}",
+        "x\u{7}",
+        "\\",
+        "  lead",
+        "trail  ",
+        "?",
+        "*a",
+        "&a",
+        "!t",
+        "|",
+        ">",
+        "%",
+        "@",
+        "`",
+        ",",
+        "a #b",
+        "---",
+        "...",
+        "\u{1b}",
+    ];
+
+    #[test]
+    fn create_concept_writes_frontmatter_that_parses_back_for_awkward_text() {
+        // Every shape `key_lines` renders differently: a scalar, a flow
+        // list, a flow map, a block list of maps (the shape that once wrote
+        // `- "*a": b`, which `parse_checked` refused), and nested lists.
+        let shapes = |text: &str| {
+            [
+                json!(text),
+                json!([text]),
+                json!({ text: text }),
+                json!([{ text: text }]),
+                json!([[text]]),
+                json!([{ text: [text] }]),
+                json!({ "k": { text: text } }),
+            ]
+        };
+        for (i, text) in AWKWARD.iter().enumerate() {
+            for (j, shape) in shapes(text).into_iter().enumerate() {
+                // Arrange
+                let ws = MemWorkspace::from_files([("index.md", ROOT_INDEX)]);
+                let frontmatter = object(json!({ "type": "Note", "x_value": shape }));
+                let path = format!("p{i}-{j}");
+
+                // Act
+                let created = create_concept(&ws, &ctx(), &concept(&path, &frontmatter, "B\n"));
+
+                // Assert
+                let shown = format!("{text:?} as shape {j}");
+                created.unwrap_or_else(|error| panic!("{shown}: {error}"));
+                let written = read(&ws, &format!("{path}.md"));
+                let parsed = Doc::from_text(&path, &written).parse_checked().unwrap();
+                assert_eq!(
+                    parsed["x_value"],
+                    yaml_value(&frontmatter["x_value"]),
+                    "{shown}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn create_concept_renders_frontmatter_in_key_order() {
         let ws = MemWorkspace::from_files([("index.md", ROOT_INDEX)]);
