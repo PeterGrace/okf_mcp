@@ -98,25 +98,35 @@ impl<'t> Outline<'t> {
     /// One section: its heading's entry and its text, subsections included.
     ///
     /// # Arguments
-    /// * `want` - the heading's text (case-insensitive, leading `#`s
-    ///   ignored) or, failing that, its anchor slug (a leading `#` allowed).
+    /// * `want` - a heading's anchor slug, exactly as the outline gives it
+    ///   (a leading `#` allowed); else its text (case-insensitive, leading
+    ///   `#`s ignored), as `split_concept` matches it.
     ///
     /// # Returns
     /// The entry and the section's lines, each ending in `\n`.
     ///
     /// # Errors
     /// [`OkfError::Refused`], as `split_concept` words it: no heading
-    /// matches (the message lists every heading), or several do (it lists
-    /// their slugs, which tell them apart).
+    /// matches (the message lists every heading), or several share the text
+    /// (it lists their slugs, which tell them apart).
     pub fn section(&self, want: &str) -> Result<(OutlineHeading, String), OkfError> {
-        let hit = find_section(&self.found, want)?;
-        // `find_section` returns a reference into `found`; `position` turns
-        // it back into its index (heading lines are unique).
-        let k = self
-            .found
-            .iter()
-            .position(|heading| heading.index == hit.index)
-            .expect("find_section returns one of the headings it was given");
+        // Slugs are unique, so an exact one picks its heading even where
+        // another heading's text spells it (`# Hello World` is
+        // `hello-world`, though `# hello-world` reads the same as text).
+        let slug = py_strip(want).trim_start_matches('#');
+        let k = match self.found.iter().position(|heading| heading.slug == slug) {
+            Some(k) => k,
+            None => {
+                let hit = find_section(&self.found, want)?;
+                // `find_section` returns a reference into `found`;
+                // `position` turns it back into its index (heading lines
+                // are unique).
+                self.found
+                    .iter()
+                    .position(|heading| heading.index == hit.index)
+                    .expect("find_section returns one of the headings it was given")
+            }
+        };
         let entry = self.entry(k);
         let lines = &self.body[self.found[k].index..self.ends[k]];
         let mut text = String::with_capacity(entry.chars);
@@ -230,6 +240,30 @@ mod tests {
         assert_eq!(text, "## Notes\nFirst.\n\n### Detail\nDeep.\n");
         assert_eq!(fenced, "## Notes\nSecond.\n\n```\n# not a heading\n```\n");
         assert_eq!(by_text, "### Detail\nDeep.\n");
+    }
+
+    #[test]
+    fn every_slug_in_the_outline_reads_its_own_section() {
+        // The second heading's text is the first one's slug.
+        let outline = Outline::of("# Hello World\nFirst.\n# hello-world\nSecond.\n");
+
+        let entries = outline.entries();
+
+        assert_eq!(entries[0].slug, "hello-world");
+        assert_eq!(outline.section("hello-world").unwrap().0.line, 1);
+        assert_eq!(outline.section("#hello-world").unwrap().0.line, 1);
+        for doc in [DOC, "# Hello World\nFirst.\n# hello-world\nSecond.\n"] {
+            let outline = Outline::of(doc);
+            for entry in outline.entries() {
+                let (found, _) = outline.section(&entry.slug).unwrap();
+                assert_eq!(found, entry, "{}", entry.slug);
+            }
+        }
+        // Text still reaches a heading no slug names.
+        assert_eq!(
+            outline.section("HELLO WORLD").unwrap().1,
+            "# Hello World\nFirst.\n"
+        );
     }
 
     #[test]

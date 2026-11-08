@@ -17,8 +17,11 @@ needs.
   and an `outline`: each heading's text, slug, level, 1-based file line, and
   its section's `lines` and `chars`. A body exactly at the limit is returned
   as before.
-- `section` (new parameter): a heading's text (case-insensitive) or its
-  anchor slug, the same slug a link's `#fragment` uses. It returns that
+- `section` (new parameter): a heading's anchor slug, the same slug the
+  outline and a link's `#fragment` use, or else its text (case-insensitive).
+  An exact slug wins, so every slug the outline gives reads its own section
+  even where another heading's text spells it: `hello-world` reads
+  `# Hello World`, not a later `# hello-world`. It returns that
   section, subsections included, in `body`, and its outline entry in
   `section`, at any size. A section runs to the next heading of the same or
   a higher level, less trailing blank lines. An unknown heading is

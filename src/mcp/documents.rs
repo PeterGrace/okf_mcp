@@ -39,9 +39,10 @@ pub struct GetConceptParams {
     /// limit or with `full`.
     #[serde(default)]
     pub raw: bool,
-    /// Return only this section, its subsections included: a heading's text
-    /// (case-insensitive) or its anchor slug, as in a link's `#fragment`.
-    /// Works at any size.
+    /// Return only this section, its subsections included: a heading's
+    /// anchor slug, as the outline and a link's `#fragment` give it (an
+    /// exact slug wins), or else its text (case-insensitive). Works at any
+    /// size.
     pub section: Option<String>,
     /// Return the whole body (and `raw`) even when it is over the server's
     /// limit, for a deliberate full read.
@@ -475,8 +476,8 @@ impl OkfServer {
                        (`lines`, `chars`). A body over the server's limit (20,000 characters \
                        by default) comes back as an `outline` instead, with `truncated: true` \
                        and a `note`: each heading's text, slug, level, line and section size. \
-                       `section` (a heading's text or slug) returns just that section with its \
-                       subsections, at any size; `full: true` returns the whole body anyway. \
+                       `section` (a heading's slug, which wins, or its text) returns just that \
+                       section with its subsections, at any size; `full: true` returns the whole body anyway. \
                        With `links`, its resolved outbound links (target, title, description, \
                        broken) and its backlinks; with `raw`, the file verbatim, but only \
                        within the limit or with `full`. Without `catalog`, the first selected \

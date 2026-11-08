@@ -1,7 +1,7 @@
 [
   {
     "name": "get_concept",
-    "description": "Get a concept: its frontmatter as JSON, its body and the body's size (`lines`, `chars`). A body over the server's limit (20,000 characters by default) comes back as an `outline` instead, with `truncated: true` and a `note`: each heading's text, slug, level, line and section size. `section` (a heading's text or slug) returns just that section with its subsections, at any size; `full: true` returns the whole body anyway. With `links`, its resolved outbound links (target, title, description, broken) and its backlinks; with `raw`, the file verbatim, but only within the limit or with `full`. Without `catalog`, the first selected catalog that has it answers. With `changeset` (a handle from open_changeset), its catalog reads through that changeset's drafts.",
+    "description": "Get a concept: its frontmatter as JSON, its body and the body's size (`lines`, `chars`). A body over the server's limit (20,000 characters by default) comes back as an `outline` instead, with `truncated: true` and a `note`: each heading's text, slug, level, line and section size. `section` (a heading's slug, which wins, or its text) returns just that section with its subsections, at any size; `full: true` returns the whole body anyway. With `links`, its resolved outbound links (target, title, description, broken) and its backlinks; with `raw`, the file verbatim, but only within the limit or with `full`. Without `catalog`, the first selected catalog that has it answers. With `changeset` (a handle from open_changeset), its catalog reads through that changeset's drafts.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "required": [
@@ -30,7 +30,7 @@
           "default": false
         },
         "section": {
-          "description": "Return only this section, its subsections included: a heading's text\n(case-insensitive) or its anchor slug, as in a link's `#fragment`.\nWorks at any size.",
+          "description": "Return only this section, its subsections included: a heading's\nanchor slug, as the outline and a link's `#fragment` give it (an\nexact slug wins), or else its text (case-insensitive). Works at any\nsize.",
           "type": [
             "string",
             "null"
