@@ -56,7 +56,7 @@ pub enum Command {
     Serve(ServeArgs),
     /// Apply the schema migrations and exit.
     Migrate,
-    /// Create, list or delete catalogs.
+    /// Create, update, list or delete catalogs.
     // A nested subcommand: `okf-mcp catalog create ...`.
     #[command(subcommand)]
     Catalog(CatalogCommand),
@@ -103,6 +103,15 @@ pub enum CatalogCommand {
         name: String,
         /// Free text.
         #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// Change an existing catalog's description. A running server shows the
+    /// new text within one `poll_interval`.
+    Update {
+        /// Its name.
+        name: String,
+        /// The new free text (may be empty).
+        #[arg(long)]
         description: String,
     },
     /// List catalogs.
@@ -418,6 +427,11 @@ async fn run_catalog(
             let catalog = catalogs::create(pool, &name, &description, clock.now()).await?;
             println!("created catalog {}", catalog.name);
         }
+        CatalogCommand::Update { name, description } => {
+            let previous = catalogs::update_description(pool, &name, &description).await?;
+            // `{:?}` quotes the text, so an empty description shows as `""`.
+            println!("updated catalog {name} description: {previous:?} -> {description:?}");
+        }
         CatalogCommand::List => {
             for catalog in catalogs::list(pool).await? {
                 println!(
@@ -597,6 +611,16 @@ mod tests {
             Some(Command::Catalog(CatalogCommand::Create { ref name, ref description }))
                 if name == "pg" && description == "D"
         ));
+        let parsed =
+            Cli::try_parse_from(["okf-mcp", "catalog", "update", "pg", "--description", ""])
+                .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Catalog(CatalogCommand::Update { ref name, ref description }))
+                if name == "pg" && description.is_empty()
+        ));
+        // `--description` is what `update` changes, so it is required.
+        assert!(Cli::try_parse_from(["okf-mcp", "catalog", "update", "pg"]).is_err());
         let parsed =
             Cli::try_parse_from(["okf-mcp", "catalog", "delete", "pg", "--force"]).unwrap();
         assert!(matches!(

@@ -53,7 +53,7 @@ server" (the subcommands read only `max_import_bytes`, default `64MiB`, the
 largest uncompressed import, but a file that fails validation fails every
 subcommand). Every subcommand applies the embedded migrations first, so
 `migrate` is only needed as a separate deploy step. `okf-mcp --help` and
-`okf-mcp <command> --help` list the rest: `catalog list|delete`,
+`okf-mcp <command> --help` list the rest: `catalog update|list|delete`,
 `key list|revoke|grant|ungrant|maintenance-report`, `import --replace`.
 `key create --maintenance-report` opts a key into reporting independently of
 its access level; `key maintenance-report ID --enabled true|false [--actor ACTOR]`

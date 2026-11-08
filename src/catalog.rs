@@ -97,7 +97,11 @@ impl Loaded {
 pub struct CatalogState {
     id: i64,
     name: String,
-    description: String,
+    // Not part of the snapshot: `catalog update` changes it without a
+    // publish, and the poll loop copies it in from the catalog row
+    // ([`CatalogState::set_description`]). `Arc<str>` is a shared, immutable
+    // string, so a reader takes a pointer copy, not a copy of the text.
+    description: RwLock<Arc<str>>,
     // `RwLock<Arc<_>>`: the lock is held only to clone or replace the `Arc`
     // (a pointer copy plus a reference count), never while a snapshot is read
     // or built. It is `std`'s lock, not tokio's: it is never held across an
@@ -136,7 +140,7 @@ impl CatalogState {
         Ok(Self {
             id: catalog.id,
             name: catalog.name,
-            description: catalog.description,
+            description: RwLock::new(Arc::from(catalog.description)),
             current: RwLock::new(Arc::new(loaded)),
             rebuilding: tokio::sync::Mutex::new(()),
             publishing: tokio::sync::Mutex::new(()),
@@ -153,9 +157,27 @@ impl CatalogState {
         &self.name
     }
 
-    /// The catalog's description (`catalog create --description`).
-    pub fn description(&self) -> &str {
-        &self.description
+    /// The catalog's description (`catalog create` or `catalog update`
+    /// `--description`), as of the last load or poll.
+    ///
+    /// # Returns
+    /// A shared handle to the text (cheap to clone; derefs to `&str`).
+    pub fn description(&self) -> Arc<str> {
+        Arc::clone(&self.description.read().expect("description lock poisoned"))
+    }
+
+    /// Replaces the description held in memory, leaving the snapshot alone.
+    /// The poll loop calls it with each catalog row's description.
+    ///
+    /// # Arguments
+    /// * `description` - the catalog row's description.
+    pub fn set_description(&self, description: &str) {
+        // The read lock first: on almost every pass nothing changed, and
+        // then no write lock (and no allocation) is taken.
+        if *self.description() == *description {
+            return;
+        }
+        *self.description.write().expect("description lock poisoned") = Arc::from(description);
     }
 
     /// The current loaded state. Cheap: it clones an `Arc` (bumps a
@@ -351,7 +373,7 @@ mod tests {
             .await
             .unwrap();
         let empty = CatalogState::load(&db.pool, "pg").await.unwrap();
-        assert_eq!(empty.description(), "pgrace's world");
+        assert_eq!(&*empty.description(), "pgrace's world");
         assert_eq!(empty.current().files(), 0);
         assert_eq!(empty.current().last_change(), None);
         let imported = Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap();

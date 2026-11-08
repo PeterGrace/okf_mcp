@@ -407,6 +407,15 @@ kubectl -n okf-mcp exec deploy/okf-mcp -- \
     okf-mcp catalog create notes --description "Team notes"
 ```
 
+**Change a catalog's description** (what `list_catalogs` tells agents, for
+example when a catalog becomes the source of truth). It prints the old and
+new text; an unknown catalog is refused, and an empty description is allowed:
+
+```sh
+kubectl -n okf-mcp exec deploy/okf-mcp -- \
+    okf-mcp catalog update notes --description "Team notes; the source of truth"
+```
+
 **Create keys.** Access is `read`, `write` or `admin`; grant named catalogs
 with `--catalogs a,b` or every catalog, present and future, with `--all`.
 Reporting is independently opt-in via `key create --maintenance-report`: it
@@ -465,9 +474,10 @@ git -C ~/notes archive --format=tar.gz HEAD |
         https://okf-mcp.example.com/catalogs/notes/import
 ```
 
-The server picks up a catalog created or imported from the command line
-within `poll_interval` (`/healthz`'s `catalogs` counts it once it is loaded);
-an import through the HTTP route is visible at once.
+The server picks up a catalog created, updated or imported from the command
+line within `poll_interval` (`/healthz`'s `catalogs` counts it once it is
+loaded; a description change does not rebuild the catalog's snapshot); an
+import through the HTTP route is visible at once.
 
 `okf-mcp export` inside the pod must write under `/tmp` (or to `-`, stdout),
 the only writable path:

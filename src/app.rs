@@ -254,6 +254,9 @@ impl App {
             let existing = current.get(&row.name).filter(|state| state.id() == row.id);
             let state = match existing {
                 Some(state) => {
+                    // Outside the snapshot, so a `catalog update` shows
+                    // without a rebuild.
+                    state.set_description(&row.description);
                     if row.generation > state.current().generation() && !failed_before {
                         if let Err(error) = state.refresh(&self.pool).await {
                             // The old snapshot stays in place.
@@ -598,6 +601,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn poll_picks_up_a_new_description_without_a_rebuild() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "pg", "copy", Utc::now())
+            .await
+            .unwrap();
+        let app = app(&db.pool).await;
+        let pg = app.catalog("pg").unwrap();
+        let before = pg.current();
+
+        catalogs::update_description(&db.pool, "pg", "source of truth")
+            .await
+            .unwrap();
+        app.poll().await.unwrap();
+
+        assert_eq!(&*pg.description(), "source of truth");
+        // `Arc::ptr_eq`: the very same snapshot object, so nothing was rebuilt.
+        assert!(Arc::ptr_eq(&before, &app.catalog("pg").unwrap().current()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn poll_reloads_a_catalog_created_again_under_the_same_name() {
         let db = test_db().await;
         catalogs::create(&db.pool, "pg", "first", Utc::now())
@@ -614,7 +637,7 @@ mod tests {
 
         let pg = app.catalog("pg").unwrap();
         assert_ne!(pg.id(), first_id);
-        assert_eq!(pg.description(), "second");
+        assert_eq!(&*pg.description(), "second");
     }
 
     #[tokio::test(flavor = "multi_thread")]

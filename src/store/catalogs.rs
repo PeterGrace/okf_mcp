@@ -96,6 +96,47 @@ pub async fn create(
     Ok(catalog)
 }
 
+/// Replaces a catalog's description and bumps the administrative
+/// generation, in one transaction. The catalog's `generation` is left alone:
+/// its content did not change, so its snapshot is not rebuilt.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `name` - the catalog's name.
+/// * `description` - the new free text (empty is allowed, as for `create`).
+///
+/// # Returns
+/// The description it had before.
+///
+/// # Errors
+/// [`OkfError::CatalogNotSelected`] if there is no such catalog;
+/// [`OkfError::Database`] otherwise.
+pub async fn update_description(
+    pool: &PgPool,
+    name: &str,
+    description: &str,
+) -> Result<String, OkfError> {
+    let mut tx = pool.begin().await?;
+    // A subquery reads the row as it was before the `UPDATE` (one
+    // statement sees one snapshot), so this returns the old text; the row
+    // lock the `UPDATE` takes keeps two updates from both reading the same.
+    let previous: Option<String> = sqlx::query_scalar(
+        "UPDATE catalogs c SET description = $2 \
+         FROM (SELECT id, description FROM catalogs WHERE name = $1 FOR UPDATE) old \
+         WHERE c.id = old.id RETURNING old.description",
+    )
+    .bind(name)
+    .bind(description)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let previous = previous.ok_or_else(|| OkfError::CatalogNotSelected {
+        catalog: name.to_string(),
+    })?;
+    bump_admin_generation(&mut tx).await?;
+    tx.commit().await?;
+    Ok(previous)
+}
+
 /// Every catalog, by name.
 ///
 /// # Arguments
@@ -317,6 +358,41 @@ pub(crate) mod tests {
             Err(OkfError::CatalogNotSelected { catalog }) if catalog == "nope"
         ));
         assert_eq!(admin_generation(&db.pool).await.unwrap(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_description_replaces_it_and_returns_the_old_text() {
+        let db = test_db().await;
+        let pg = create(&db.pool, "pg", "copy", now()).await.unwrap();
+
+        let previous = update_description(&db.pool, "pg", "source of truth")
+            .await
+            .unwrap();
+        let cleared = update_description(&db.pool, "pg", "").await.unwrap();
+
+        assert_eq!(
+            (previous.as_str(), cleared.as_str()),
+            ("copy", "source of truth")
+        );
+        let row = find(&db.pool, "pg").await.unwrap();
+        assert_eq!(
+            (row.description.as_str(), row.generation),
+            ("", pg.generation)
+        );
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_description_refuses_an_unknown_catalog() {
+        let db = test_db().await;
+
+        let outcome = update_description(&db.pool, "nope", "x").await;
+
+        assert!(matches!(
+            outcome,
+            Err(OkfError::CatalogNotSelected { catalog }) if catalog == "nope"
+        ));
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
