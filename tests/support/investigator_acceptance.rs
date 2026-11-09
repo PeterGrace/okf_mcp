@@ -509,12 +509,13 @@ async fn investigator_aging_cancel_and_failed_validation_preserve_canonical() {
                 .await
                 .unwrap();
             assert_eq!(findings, 0);
+            // A rejected proposal fails only its item; the run itself completes.
             assert_eq!(
                 result.reason,
                 if mode == "cancel" {
                     "cancelled"
                 } else {
-                    "invalid_proposal"
+                    "completed"
                 }
             );
         }

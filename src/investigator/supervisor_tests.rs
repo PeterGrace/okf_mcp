@@ -350,6 +350,7 @@ struct FakeInference {
     delay: u64,
     error: Option<RunnerError>,
     invalid: bool,
+    invalid_first: bool,
     invalid_second: bool,
     cost: u64,
     started: tokio::sync::Notify,
@@ -367,6 +368,7 @@ impl FakeInference {
             delay,
             error: None,
             invalid: false,
+            invalid_first: false,
             invalid_second: false,
             cost: 100_000,
             started: tokio::sync::Notify::new(),
@@ -411,7 +413,10 @@ impl Inference for FakeInference {
         }
         Ok(ModelResult {
             proposal: Proposal {
-                summary: if self.invalid || (self.invalid_second && call > 0) {
+                summary: if self.invalid
+                    || (self.invalid_first && call == 0)
+                    || (self.invalid_second && call > 0)
+                {
                     "x".repeat(262_145)
                 } else {
                     "Catalog only".into()
@@ -539,12 +544,79 @@ async fn investigator_supervisor_known_invalid_proposal_preserves_usage() {
     let mut i = FakeInference::new(0);
     Arc::get_mut(&mut i).unwrap().invalid = true;
     let s = run(&f, &mut c, i).await.unwrap();
+    // Each rejected proposal fails only its own item; the run still investigates both.
     assert_eq!(s.exit_code(), 4);
     assert!(s.accounting_known);
+    assert_eq!(s.failed, 2);
+    assert_eq!(s.reason, "completed");
     let j = f.store.load().unwrap().unwrap();
-    assert_eq!(j.usage.cost_microusd, 100_000);
-    assert_eq!(j.usage.input, 11);
-    assert_eq!(j.invocations, 1);
+    assert_eq!(j.usage.cost_microusd, 200_000);
+    assert_eq!(j.usage.input, 22);
+    assert_eq!(j.invocations, 2);
+}
+#[tokio::test]
+async fn investigator_supervisor_invalid_proposal_fails_only_its_item() {
+    let f = Fixture::new();
+    let mut c = f.client(2);
+    let mut i = FakeInference::new(0);
+    Arc::get_mut(&mut i).unwrap().invalid_first = true;
+    let s = run(&f, &mut c, i.clone()).await.unwrap();
+    assert_eq!(i.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(s.reported, 1);
+    assert_eq!(s.failed, 1);
+    assert_eq!(s.skipped, 0);
+    assert_eq!(s.reason, "completed");
+    assert_eq!(s.exit_code(), 4);
+    let j = f.store.load().unwrap().unwrap();
+    assert_eq!(j.work[0].failure.as_deref(), Some("invalid_proposal"));
+    assert_eq!(j.work[1].failure, None);
+    assert!(j.terminal);
+    let outcomes: Vec<_> = c
+        .calls
+        .iter()
+        .filter(|(_, r)| r.tool == AllowedTool::Submit)
+        .map(|(_, r)| r.args["submission"]["outcome"].clone())
+        .collect();
+    assert_eq!(outcomes, [json!("failed"), json!("completed")]);
+}
+#[tokio::test]
+async fn investigator_supervisor_recovered_invalid_proposal_is_not_a_run_stop() {
+    let f = Fixture::new();
+    f.seed(Phase::InvocationStarted);
+    let mut j = f.store.load().unwrap().unwrap();
+    let usage = ModelUsage {
+        input: 11,
+        output: 7,
+        cache_creation: 3,
+        cache_read: 5,
+        cost_microusd: 100_000,
+    };
+    j.work[0].phase = Phase::ProposalReady;
+    j.work[0].proposal = Some(Proposal {
+        summary: "x".repeat(262_145),
+        findings: vec![],
+    });
+    j.work[0].usage = Some(usage.clone());
+    j.work[0].failure = Some("invalid_proposal".into());
+    j.usage = usage;
+    j.accounting_known = true;
+    f.store.save(&j).unwrap();
+    let mut c = f.client(1);
+    let i = FakeInference::new(0);
+    let s = run(&f, &mut c, i.clone()).await.unwrap();
+    assert_eq!(i.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(s.failed, 1);
+    assert_eq!(s.reason, "completed");
+    let submit = c
+        .calls
+        .iter()
+        .find(|(_, r)| r.tool == AllowedTool::Submit)
+        .unwrap();
+    assert_eq!(submit.1.args["submission"]["outcome"], "failed");
+    assert!(c
+        .calls
+        .iter()
+        .any(|(_, r)| r.tool == AllowedTool::Close && r.args["rationale"] == "completed"));
 }
 #[tokio::test]
 async fn investigator_supervisor_unknown_stop_closes_completed_server_run() {
@@ -1588,16 +1660,18 @@ async fn investigator_supervisor_invalid_second_result_never_erases_prior_usage(
     let s = run(&f, &mut c, i.clone()).await.unwrap();
     assert_eq!(s.exit_code(), 4);
     assert!(s.accounting_known);
-    assert_eq!(i.calls.load(Ordering::SeqCst), 2);
+    // Rejected proposals no longer stop the run, so all three items are invoked.
+    assert_eq!(i.calls.load(Ordering::SeqCst), 3);
     assert_eq!(s.reported, 1);
     assert_eq!(s.failed, 2);
     let j = f.store.load().unwrap().unwrap();
-    assert_eq!(j.invocations, 2);
-    assert_eq!(j.reserved_microusd, 200_000);
-    assert_eq!(j.usage.cost_microusd, 200_000);
-    assert_eq!(j.usage.input, 22);
-    assert_eq!(j.usage.output, 14);
+    assert_eq!(j.invocations, 3);
+    assert_eq!(j.reserved_microusd, 300_000);
+    assert_eq!(j.usage.cost_microusd, 300_000);
+    assert_eq!(j.usage.input, 33);
+    assert_eq!(j.usage.output, 21);
     assert_eq!(j.work[1].failure.as_deref(), Some("invalid_proposal"));
+    assert_eq!(j.work[2].failure.as_deref(), Some("invalid_proposal"));
 }
 #[tokio::test]
 async fn investigator_supervisor_renewal_durable_faults_preserve_exact_replay() {
