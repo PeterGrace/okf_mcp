@@ -328,6 +328,7 @@ Bookkeeping (`write`), ports of `okf.py`'s commands with its exact output:
 | `question` | Queues one open question |
 | `unquestion` | Removes one, by 1-based number or exact text |
 | `add_source` | Appends a `sources` entry (`id`, `resource`, `title`, `author`) |
+| `remove_source` | Removes a `sources` entry by `id`, deleting the key when none are left; refused while a footnote still cites it (not in `okf.py`) |
 | `log` | `* **<kind>:** <text>` under today's date in `log.md`, the only way to write it (`kind`: `Update`, `Creation`, `Change`, `Import`) |
 | `index` | Lists a concept in its folder's `index.md` |
 

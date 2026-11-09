@@ -1,5 +1,7 @@
 //! The concept commands `stamp`, `review`, `question`, `unquestion` and
 //! `source` (`okf.py:653-750`): textual edits of one concept's frontmatter.
+//! [`remove_source`] has no `okf.py` counterpart: it is the server's own
+//! inverse of `source`.
 //!
 //! Divergences from `okf.py` (none reachable from the parity script):
 //! - `unquestion` reads only ASCII digits as an index; Python's `isdigit`
@@ -11,6 +13,7 @@ use indexmap::IndexMap;
 
 use crate::clock::format_timestamp;
 use crate::error::OkfError;
+use crate::okf::markdown::{footnote_paragraphs, footnote_refs};
 use crate::okf::ops::{
     load_concept, refused, save, stamp_value, LoadedConcept, OpContext, OpOutcome, SourceEntry,
     StampField,
@@ -376,6 +379,133 @@ pub fn source(
     Ok(outcome)
 }
 
+/// Does `text` hold `token` with no word character (letter, digit, `_`,
+/// `-`) on either side? So id `s1` matches "see s1." but not "s12".
+fn contains_token(text: &str, token: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    // `match_indices` yields each occurrence's byte offset, like `re.finditer`.
+    text.match_indices(token).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + token.len()..].chars().next();
+        !before.is_some_and(word) && !after.is_some_and(word)
+    })
+}
+
+/// The label of a footnote in `body` that cites `source`, if any: one
+/// labelled with its id (referenced or defined), or one whose definition
+/// (every paragraph of it) holds its id as a token, or its title or resource.
+///
+/// Stricter than `split_concept`'s choice of sources to carry, which also
+/// counts the id as a bare substring: a false match there copies one extra
+/// source, but here it would refuse a removal for good.
+fn citing_footnote(body: &str, source: &IndexMap<String, Value>, id: &str) -> Option<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    // A definition's later indented paragraphs cite too, so read it as
+    // markdown does, not with `okf.py`'s blank-line cut-off.
+    let defs = footnote_paragraphs(&lines);
+    if defs.contains_key(id) || footnote_refs(body).contains(id) {
+        return Some(id.to_string());
+    }
+    let needles: Vec<&str> = ["title", "resource"]
+        .iter()
+        .filter_map(|key| source.get(*key).and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .collect();
+    defs.into_iter()
+        .find(|(_, indexes)| {
+            let text: String = indexes
+                .iter()
+                .map(|&i| lines[i])
+                .collect::<Vec<_>>()
+                .join("\n");
+            contains_token(&text, id) || needles.iter().any(|needle| text.contains(needle))
+        })
+        .map(|(label, _)| label)
+}
+
+/// Removes the `sources` entry with id `id`, deleting the key when none are
+/// left; refused while a footnote in the body still cites it.
+///
+/// # Arguments
+/// * `workspace`, `concept` - as for [`stamp`]; `_ctx` is unused.
+/// * `id` - the entry's `id`.
+///
+/// # Returns
+/// The outcome, message `<path>: removed source <id>` (plus
+/// ` (key deleted, none left)` for the last one).
+///
+/// # Errors
+/// [`OkfError::Shape`] when `sources` is not a list; [`OkfError::Refused`]
+/// when no entry has this id, or a footnote cites it (the message names the
+/// footnote); as [`stamp`] when loading the concept.
+pub fn remove_source(
+    workspace: &dyn Workspace,
+    _ctx: &OpContext<'_>,
+    concept: &str,
+    id: &str,
+) -> Result<OpOutcome, OkfError> {
+    let LoadedConcept {
+        path,
+        mut doc,
+        data,
+    } = load_concept(workspace, concept)?;
+    let sources = list_or_nothing(&path, &data, SOURCES)?;
+    let found = sources
+        .iter()
+        .enumerate()
+        .find_map(|(index, source)| match source {
+            Value::Map(map) if map.get("id").and_then(Value::as_str) == Some(id) => {
+                Some((index, map))
+            }
+            Value::Null | Value::Str(_) | Value::Seq(_) | Value::Map(_) => None,
+        });
+    let Some((index, entry)) = found else {
+        return Err(refused(format!(
+            "{path} has no source with id {}",
+            py_repr_str(id)
+        )));
+    };
+    if let Some(label) = citing_footnote(&doc.body(), entry, id) {
+        return Err(refused(format!(
+            "footnote [^{label}] in {path} still cites source {}; \
+             remove or rewrite the citation first",
+            py_repr_str(id)
+        )));
+    }
+    let last = sources.len() == 1;
+    if last {
+        doc.delete_block(SOURCES);
+    } else {
+        match doc.seq_items(SOURCES) {
+            Some(items) if items.spans.len() == sources.len() => {
+                doc.remove_lines(items.spans[index].clone());
+            }
+            // A flow list (`sources: [ ... ]`) has no per-item lines, so it
+            // is rewritten as a block list of the remaining entries.
+            _ => {
+                let mut lines = vec![format!("{SOURCES}:")];
+                lines.extend(
+                    sources
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != index)
+                        .flat_map(|(_, source)| block_item(source, 2)),
+                );
+                doc.set_block(SOURCES, lines);
+            }
+        }
+    }
+    let mut outcome = OpOutcome::default();
+    save(workspace, &doc, &mut outcome)?;
+    let left = if last {
+        " (key deleted, none left)"
+    } else {
+        ""
+    };
+    outcome.message = format!("{path}: removed source {id}{left}");
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,5 +826,153 @@ mod tests {
             "s.md already has a source with id 'one'"
         );
         assert!(matches!(scalar, OkfError::Shape { ref key, .. } if key == "sources"));
+    }
+
+    #[test]
+    fn remove_source_drops_a_block_item_and_its_continuation_lines() {
+        let ws = MemWorkspace::from_files([(
+            "s.md",
+            concat!(
+                "---\ntype: Note\nsources:\n  - id: one\n    resource: r1\n",
+                "  - id: two\n    resource: r2\n    title: Two\n---\nCited.[^one]\n\n",
+                "[^one]: r1\n",
+            ),
+        )]);
+
+        let outcome = remove_source(&ws, &ctx(), "s", "two").unwrap();
+
+        assert_eq!(
+            read(&ws, "s.md"),
+            "---\ntype: Note\nsources:\n  - id: one\n    resource: r1\n---\nCited.[^one]\n\n\
+             [^one]: r1\n"
+        );
+        assert_eq!(outcome.touched, ["s.md"]);
+        assert_eq!(outcome.message, "s.md: removed source two");
+    }
+
+    #[test]
+    fn remove_source_deletes_the_key_with_the_last_entry() {
+        let ws = MemWorkspace::from_files([(
+            "s.md",
+            "---\ntype: Note\nsources:\n  - { id: one, resource: r }\nstatus: draft\n---\nBody\n",
+        )]);
+
+        let outcome = remove_source(&ws, &ctx(), "s", "one").unwrap();
+
+        assert_eq!(
+            read(&ws, "s.md"),
+            "---\ntype: Note\nstatus: draft\n---\nBody\n"
+        );
+        assert_eq!(
+            outcome.message,
+            "s.md: removed source one (key deleted, none left)"
+        );
+    }
+
+    #[test]
+    fn remove_source_rewrites_a_flow_list_as_a_block_list() {
+        let ws = MemWorkspace::from_files([(
+            "s.md",
+            "---\ntype: Note\nsources: [{ id: a, resource: ra }, { id: b, resource: rb }]\n---\n",
+        )]);
+
+        remove_source(&ws, &ctx(), "s", "a").unwrap();
+
+        let text = read(&ws, "s.md");
+        assert!(
+            text.starts_with("---\ntype: Note\nsources:\n  - "),
+            "{text}"
+        );
+        assert!(text.contains("rb") && !text.contains("ra"), "{text}");
+    }
+
+    #[test]
+    fn remove_source_refuses_a_cited_entry_and_names_the_footnote() {
+        let body = concat!(
+            "---\ntype: Note\nsources:\n",
+            "  - { id: lab, resource: r0 }\n",
+            "  - { id: s1, resource: https://example.com/doc, title: Runbook }\n",
+            "  - { id: s2, resource: r2 }\n",
+            "  - { id: s3, resource: r3 }\n",
+            "---\nA[^lab] B[^x] C[^y] D[^z]\n\n",
+            "[^x]: The https://example.com/doc page.\n",
+            "[^y]: See the\n    Runbook\n",
+            "[^z]: See s2, section 4.\n",
+        );
+        let ws = MemWorkspace::from_files([("s.md", body)]);
+
+        let by_label = refusal(remove_source(&ws, &ctx(), "s", "lab").unwrap_err());
+        let by_resource = refusal(remove_source(&ws, &ctx(), "s", "s1").unwrap_err());
+        let by_id = refusal(remove_source(&ws, &ctx(), "s", "s2").unwrap_err());
+        remove_source(&ws, &ctx(), "s", "s3").unwrap();
+
+        assert_eq!(
+            by_label,
+            "footnote [^lab] in s.md still cites source 'lab'; \
+             remove or rewrite the citation first"
+        );
+        assert!(by_resource.starts_with("footnote [^x] "), "{by_resource}");
+        assert!(by_id.starts_with("footnote [^z] "), "{by_id}");
+        // `s3` matched nothing (and `s2` in [^z] is not `s3`): it went.
+        assert!(!read(&ws, "s.md").contains("r3"));
+    }
+
+    #[test]
+    fn remove_source_counts_a_title_on_a_continuation_line() {
+        let ws = MemWorkspace::from_files([(
+            "s.md",
+            "---\ntype: Note\nsources:\n  - { id: s, resource: r, title: Runbook }\n---\n\
+             [^n]: See the\n    Runbook\n",
+        )]);
+
+        let refused = refusal(remove_source(&ws, &ctx(), "s", "s").unwrap_err());
+
+        assert!(refused.starts_with("footnote [^n] "), "{refused}");
+    }
+
+    #[test]
+    fn remove_source_counts_a_later_paragraph_of_a_footnote() {
+        let text = concat!(
+            "---\ntype: Note\nsources:\n  - { id: s1, resource: https://example.com/doc }\n",
+            "---\nText[^n].\n\n[^n]: Background.\n\n    See https://example.com/doc.\n",
+        );
+        let ws = MemWorkspace::from_files([("s.md", text)]);
+
+        let refused = refusal(remove_source(&ws, &ctx(), "s", "s1").unwrap_err());
+
+        assert!(refused.starts_with("footnote [^n] "), "{refused}");
+        assert_eq!(read(&ws, "s.md"), text);
+    }
+
+    #[test]
+    fn remove_source_refuses_an_unknown_id_and_a_scalar() {
+        let ws = MemWorkspace::from_files([
+            (
+                "s.md",
+                "---\ntype: Note\nsources:\n  - { id: one, resource: r }\n---\n",
+            ),
+            ("e.md", "---\ntype: Note\n---\n"),
+            ("x.md", "---\ntype: Note\nsources: nope\n---\n"),
+        ]);
+
+        let unknown = refusal(remove_source(&ws, &ctx(), "s", "two").unwrap_err());
+        let empty = refusal(remove_source(&ws, &ctx(), "e", "one").unwrap_err());
+        let scalar = remove_source(&ws, &ctx(), "x", "one").unwrap_err();
+
+        assert_eq!(unknown, "s.md has no source with id 'two'");
+        assert_eq!(empty, "e.md has no source with id 'one'");
+        assert!(matches!(scalar, OkfError::Shape { ref key, .. } if key == "sources"));
+    }
+
+    #[test]
+    fn contains_token_needs_a_word_boundary_on_both_sides() {
+        assert!(contains_token("see s1.", "s1"));
+        assert!(contains_token("s1", "s1"));
+        assert!(!contains_token("see s12", "s1"));
+        assert!(!contains_token("as1", "s1"));
+        assert!(!contains_token("s1-b", "s1"));
+        // A multibyte neighbour is a char, not a byte: no slicing panic.
+        assert!(!contains_token("\u{e9}s1", "s1"));
+        assert!(contains_token("\u{2014}s1\u{2014}", "s1"));
     }
 }
