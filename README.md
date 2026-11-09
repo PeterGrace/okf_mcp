@@ -461,6 +461,8 @@ key's actor.
   pushed to GHCR on a `v*` tag.
 - `docs/operations.md` - the operator guide.
 - `docs/superpowers/` - the design and the per-milestone plans.
+- `skills/` - Claude Code skills for daily catalog maintenance
+  ([`skills/README.md`](skills/README.md)).
 - `changelog/` - one dated note per change.
 
 ## Using the library
