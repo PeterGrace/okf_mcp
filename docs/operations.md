@@ -887,9 +887,15 @@ a hard raw-HTTP allocation limit. Use controller `MemoryMax=512M` as illustrated
 An OOM kill is a recoverable crash, not a clean report or proof of zero spending.
 
 Reservations are saved before invocation; every started call consumes a call slot.
-Missing/invalid cost or any token class means unknown accounting, not zero. Invalid
-output, nonzero child exit and unknown accounting stop further inference; valid
-already-submitted reports remain. Ambiguous/failed reservations are not refunded.
+Missing/invalid cost or any token class means unknown accounting, not zero. Nonzero
+child exit and unknown accounting stop further inference; valid already-submitted
+reports remain. A proposal that fails a check fails only its own item: its failed
+report's summary reads `Proposal rejected: <site>: <check>` (for example
+`Proposal rejected: finding 1 evidence 1: excerpt is not a substring of s1`), so
+`maintenance_get_run` shows why without cluster access. The same reason is kept in
+the journal's `rejection` field and logged once to stderr at warn level. It names
+only indices, packet source ids and the check, never excerpt or source text.
+Ambiguous/failed reservations are not refunded.
 The CLI budget flag, USD reservations and observed token totals are stopping
 thresholds, **not hard in-flight billing/token guarantees**. A request may overshoot;
 provider-enforced quotas or a separately approved enforcing gateway are required
@@ -932,8 +938,10 @@ acknowledged terminal cleanup without any new inference even after that historic
 transport stop. A current permission, protocol or transport failure still blocks
 cleanup; unresolved requests are never discarded or acknowledged locally by guess.
 
-The owned CLI installs a global no-op tracing subscriber **before runtime/SDK
-activity**, regardless of `RUST_LOG`. This removes the inherited rmcp logging hazard:
+The owned CLI installs a global tracing subscriber **before runtime/SDK
+activity**, regardless of `RUST_LOG`, with a fixed filter that passes only the
+`okf_maintenance::rejection` warn line described above; everything else is dropped.
+This removes the inherited rmcp logging hazard:
 rmcp can trace full protocol payloads, source bodies and tokens. There is no verbose
 dependency override. Library embedders must establish their own safe logging policy;
 the library does not globally reconfigure its host. Never enable prompt/protocol

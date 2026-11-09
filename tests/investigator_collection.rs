@@ -1,7 +1,7 @@
 use okf_mcp::investigator::{
     collect::{render_prompt, CollectStep, Collector},
     error::RunnerError,
-    proposal::{proposal_schema, to_submission},
+    proposal::{proposal_schema, to_submission, RejectionSite},
     types::{
         AllowedTool, Packet, Proposal, ProposedEvidence, ProposedFinding, Source, ToolRequest,
     },
@@ -488,4 +488,161 @@ fn investigator_prompt_and_proposal_scan_every_uploaded_field() {
         assert!(to_submission(&packet("Alpha runs locally.\r\n"), &q).is_err());
     }
     assert!(drive(|r| response(r, &secret, "neighbor")).is_err());
+}
+
+/// A packet with a second source on a different path, for comparison findings.
+fn twin_packet() -> Packet {
+    let mut p = packet("Alpha runs locally.\r\n");
+    p.sources.push(Source {
+        id: "s1".into(),
+        pin: RevisionPin {
+            path: "/infra/beta.md".into(),
+            revision: 2,
+        },
+        text: "Beta runs remotely.\n".into(),
+    });
+    p
+}
+
+#[test]
+fn investigator_proposal_rejection_names_site_and_check() {
+    use RejectionSite::{Evidence, Finding, Packet as AtPacket, Proposal as Whole, Summary};
+    let secret = ["ghp_", "Ab3dEf7hIj9kLm2nOp4qRs6tUv8wXy0z1234"].concat();
+    let at = |finding, evidence| Evidence { finding, evidence };
+    type Case = (
+        fn(&mut Packet, &mut Proposal, &str),
+        RejectionSite,
+        &'static str,
+    );
+    let cases: [Case; 20] = [
+        (
+            |p, _, _| p.primary_id = "s9".into(),
+            AtPacket,
+            "evidence packet is invalid",
+        ),
+        (
+            |_, q, _| q.findings = vec![q.findings[0].clone(); 21],
+            Whole,
+            "more than 20 findings",
+        ),
+        (|_, q, s| q.summary = s.into(), Summary, "secret detected"),
+        (
+            |_, q, _| q.summary = "x".repeat(262_145),
+            Whole,
+            "maintenance report exceeds byte or finding limits",
+        ),
+        (
+            |_, q, _| q.findings[0].relationship = Relationship::ExternalObservation,
+            Finding(0),
+            "external_observation is not allowed",
+        ),
+        (
+            |_, q, _| q.findings[0].evidence = vec![q.findings[0].evidence[0].clone(); 21],
+            Finding(0),
+            "more than 20 evidence entries",
+        ),
+        (
+            |_, q, s| q.findings[0].assertion = s.into(),
+            Finding(0),
+            "secret detected in assertion",
+        ),
+        (
+            |_, q, s| q.findings[0].follow_up = s.into(),
+            Finding(0),
+            "secret detected in follow_up",
+        ),
+        (
+            |_, q, s| q.findings[0].uncertainty = s.into(),
+            Finding(0),
+            "secret detected in uncertainty",
+        ),
+        (
+            |_, q, _| q.findings[0].evidence.clear(),
+            Finding(0),
+            "findings require catalog evidence and at most 20 combined evidence entries",
+        ),
+        (
+            |_, q, _| {
+                q.findings.push(q.findings[0].clone());
+                q.findings[1].category = Category::ConflictingAssertions;
+                let repeat = q.findings[1].evidence[0].clone();
+                q.findings[1].evidence.push(repeat);
+            },
+            Finding(1),
+            "comparison findings require two distinct concept paths",
+        ),
+        (
+            |_, q, s| q.findings[0].evidence[0].source_id = s.into(),
+            at(0, 0),
+            "secret detected in source_id",
+        ),
+        (
+            |_, q, s| q.findings[0].evidence[0].excerpt = s.into(),
+            at(0, 0),
+            "secret detected in excerpt",
+        ),
+        (
+            |_, q, _| q.findings[0].evidence[0].source_id = "s7".into(),
+            at(0, 0),
+            "unknown source_id s7",
+        ),
+        (
+            |_, q, _| q.findings[0].evidence[0].source_id = "Alpha runs locally".into(),
+            at(0, 0),
+            "unknown source_id",
+        ),
+        (
+            |_, q, _| q.findings[0].evidence[0].excerpt.clear(),
+            at(0, 0),
+            "excerpt is empty",
+        ),
+        (
+            |_, q, _| q.findings[0].evidence[0].excerpt = "a".repeat(2049),
+            at(0, 0),
+            "excerpt exceeds 2048 bytes",
+        ),
+        (
+            |_, q, _| q.findings[0].evidence[0].excerpt = "Alpha runs locally.\n".into(),
+            at(0, 0),
+            "excerpt is not a substring of s0",
+        ),
+        (
+            |_, q, _| {
+                q.findings[0].evidence.push(ProposedEvidence {
+                    source_id: "s1".into(),
+                    excerpt: "Beta runs\nremotely.".into(),
+                });
+            },
+            at(0, 1),
+            "excerpt is not a substring of s1",
+        ),
+        (
+            |_, q, _| {
+                q.findings.push(q.findings[0].clone());
+                q.findings.push(q.findings[0].clone());
+                q.findings[2].evidence[0].source_id = "s3".into();
+            },
+            at(2, 0),
+            "unknown source_id s3",
+        ),
+    ];
+    for (mutate, site, check) in cases {
+        let (mut p, mut q) = (twin_packet(), proposal());
+        mutate(&mut p, &mut q, &secret);
+        let rejection = to_submission(&p, &q).unwrap_err();
+        assert_eq!((rejection.site(), rejection.check()), (site, check));
+        let text = rejection.to_string();
+        assert_eq!(text, format!("{site}: {check}"));
+        assert!(!text.contains(&secret) && !text.contains("Alpha"), "{text}");
+        assert_eq!(RunnerError::from(rejection), RunnerError::InvalidProposal);
+    }
+    let rendered = [
+        (at(1, 1), "finding 1 evidence 1"),
+        (Finding(4), "finding 4"),
+        (Summary, "summary"),
+    ];
+    for (site, text) in rendered {
+        assert_eq!(site.to_string(), text);
+    }
+    assert!(to_submission(&twin_packet(), &proposal()).is_ok());
 }

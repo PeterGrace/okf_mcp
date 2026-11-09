@@ -103,6 +103,7 @@ impl Fixture {
                 proposal: None,
                 usage: None,
                 failure: None,
+                rejection: None,
             })
             .collect();
         journal.leases = claimed.leases;

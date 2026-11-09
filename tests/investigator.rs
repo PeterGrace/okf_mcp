@@ -392,6 +392,7 @@ mod journal_process {
                 proposal: None,
                 usage: None,
                 failure: None,
+                rejection: None,
             })
             .collect();
         state.leases = result.leases;

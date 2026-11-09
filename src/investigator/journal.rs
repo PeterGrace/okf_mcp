@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, path::Path};
 
 use super::{
+    collect::clean,
     contract,
     error::RunnerError,
     types::{AllowedTool, Binding, ModelUsage, Packet, Proposal, ToolRequest},
@@ -68,6 +69,11 @@ pub struct WorkState {
     pub proposal: Option<Proposal>,
     pub usage: Option<ModelUsage>,
     pub failure: Option<String>,
+    /// Why the proposal was rejected, beside `failure: invalid_proposal`: a
+    /// rendered `ProposalRejection` (indices and check names only). Optional,
+    /// so journals written before it existed still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<String>,
 }
 
 impl Phase {
@@ -119,6 +125,15 @@ fn valid_failure(value: &str) -> bool {
             | "cancelled"
             | "io"
     )
+}
+
+/// A rejection is short, single-line and secret-free, so it can go verbatim
+/// into a Submit summary and a log line.
+fn valid_rejection(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.chars().any(char::is_control)
+        && clean(value).is_ok()
 }
 
 fn unresolved(work: &WorkState) -> bool {
@@ -262,6 +277,11 @@ impl Journal {
                 if !valid_failure(failure) {
                     return Err(bad);
                 }
+            }
+            if work.rejection.as_deref().is_some_and(|rejection| {
+                work.failure.as_deref() != Some("invalid_proposal") || !valid_rejection(rejection)
+            }) {
+                return Err(bad);
             }
             if work
                 .packet
@@ -1245,6 +1265,7 @@ mod tests {
             proposal: None,
             usage: None,
             failure: None,
+            rejection: None,
         });
         (state, fixture)
     }
@@ -1553,6 +1574,31 @@ mod tests {
             store.save(&close).unwrap();
             store.save(&Journal::new(binding())).unwrap();
             assert!(store.load().unwrap().unwrap().run_id.is_none());
+        }
+    }
+
+    #[test]
+    fn investigator_journal_rejection_requires_invalid_proposal_and_clean_text() {
+        let (mut state, _) = claimed_state();
+        assert!(!serde_json::to_string(&state).unwrap().contains("rejection"));
+        state.work[0].failure = Some("invalid_proposal".into());
+        state.work[0].rejection = Some("finding 0 evidence 1: unknown source_id s7".into());
+        let round: Journal = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(round.validate(&binding()).is_ok());
+        assert_eq!(round.work[0].rejection, state.work[0].rejection);
+        let secret = ["ghp_", "Ab3dEf7hIj9kLm2nOp4qRs6tUv8wXy0z1234"].concat();
+        for (failure, rejection) in [
+            (None, "finding 0: excerpt is empty".to_owned()),
+            (Some("child"), "finding 0: excerpt is empty".to_owned()),
+            (Some("invalid_proposal"), String::new()),
+            (Some("invalid_proposal"), "finding 0:\nexcerpt".to_owned()),
+            (Some("invalid_proposal"), "x".repeat(257)),
+            (Some("invalid_proposal"), format!("summary: {secret}")),
+        ] {
+            let mut bad = state.clone();
+            bad.work[0].failure = failure.map(Into::into);
+            bad.work[0].rejection = Some(rejection);
+            assert!(bad.validate(&binding()).is_err());
         }
     }
 
