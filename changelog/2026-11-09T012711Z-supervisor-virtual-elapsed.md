@@ -16,8 +16,9 @@ wait plus the virtual time the test meant to bound, and the bounds left only
 2 s of slack (92 s for the 90 s child timeout, 22 s for the 20 s deadlines).
 
 The issue's guess (tokio auto-advancing virtual time while waiting on the
-child) does not apply: the supervisor does no real I/O after the pause, and
-readiness completes before it.
+child) does not explain this failure: readiness completes before the pause,
+and in these three tests the fake client and fake inference do no real I/O
+after it.
 
 ## Changed
 
@@ -35,5 +36,5 @@ timeout test fails with `start.elapsed()` and passes with `virtual_elapsed`.
 
 ## Not covered
 
-The issue also saw 9 doctests fail under the same load. That is a separate
-symptom and is not addressed here.
+The issue also saw 9 doctests fail under the same load. They may be a
+separate symptom; they were not investigated here.
