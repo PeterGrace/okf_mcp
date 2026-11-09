@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 
 use crate::clock::format_timestamp;
 use crate::error::OkfError;
-use crate::okf::markdown::{footnote_defs, footnote_refs};
+use crate::okf::markdown::{footnote_paragraphs, footnote_refs};
 use crate::okf::ops::{
     load_concept, refused, save, stamp_value, LoadedConcept, OpContext, OpOutcome, SourceEntry,
     StampField,
@@ -393,14 +393,16 @@ fn contains_token(text: &str, token: &str) -> bool {
 
 /// The label of a footnote in `body` that cites `source`, if any: one
 /// labelled with its id (referenced or defined), or one whose definition
-/// holds its id as a token, or its title or resource.
+/// (every paragraph of it) holds its id as a token, or its title or resource.
 ///
 /// Stricter than `split_concept`'s choice of sources to carry, which also
 /// counts the id as a bare substring: a false match there copies one extra
 /// source, but here it would refuse a removal for good.
 fn citing_footnote(body: &str, source: &IndexMap<String, Value>, id: &str) -> Option<String> {
     let lines: Vec<&str> = body.lines().collect();
-    let defs = footnote_defs(&lines);
+    // A definition's later indented paragraphs cite too, so read it as
+    // markdown does, not with `okf.py`'s blank-line cut-off.
+    let defs = footnote_paragraphs(&lines);
     if defs.contains_key(id) || footnote_refs(body).contains(id) {
         return Some(id.to_string());
     }
@@ -926,6 +928,20 @@ mod tests {
         let refused = refusal(remove_source(&ws, &ctx(), "s", "s").unwrap_err());
 
         assert!(refused.starts_with("footnote [^n] "), "{refused}");
+    }
+
+    #[test]
+    fn remove_source_counts_a_later_paragraph_of_a_footnote() {
+        let text = concat!(
+            "---\ntype: Note\nsources:\n  - { id: s1, resource: https://example.com/doc }\n",
+            "---\nText[^n].\n\n[^n]: Background.\n\n    See https://example.com/doc.\n",
+        );
+        let ws = MemWorkspace::from_files([("s.md", text)]);
+
+        let refused = refusal(remove_source(&ws, &ctx(), "s", "s1").unwrap_err());
+
+        assert!(refused.starts_with("footnote [^n] "), "{refused}");
+        assert_eq!(read(&ws, "s.md"), text);
     }
 
     #[test]

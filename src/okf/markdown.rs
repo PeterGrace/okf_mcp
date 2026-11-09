@@ -334,24 +334,48 @@ pub fn anchors_in(text: &str) -> BTreeSet<String> {
 }
 
 /// Footnote definitions: label to the line indexes of its definition and
-/// indented continuation lines, in first-definition order.
+/// indented continuation lines, in first-definition order. A blank line
+/// ends a definition, as in `okf.py` (see [`footnote_paragraphs`] for the
+/// markdown reading, where it need not).
 pub fn footnote_defs(lines: &[&str]) -> IndexMap<String, Vec<usize>> {
+    collect_footnotes(lines, false)
+}
+
+/// Like [`footnote_defs`], but a definition runs on across blank lines into
+/// later indented paragraphs, as a markdown renderer reads it: in
+/// `"[^n]: One.\n\n    Two."` both paragraphs belong to `n`. The blank
+/// lines themselves are not listed.
+///
+/// # Examples
+/// ```
+/// use okf_mcp::okf::markdown::footnote_paragraphs;
+/// let defs = footnote_paragraphs(&["[^n]: One.", "", "    Two.", "Text."]);
+/// assert_eq!(defs.get("n"), Some(&vec![0, 2]));
+/// ```
+pub fn footnote_paragraphs(lines: &[&str]) -> IndexMap<String, Vec<usize>> {
+    collect_footnotes(lines, true)
+}
+
+/// The one walk behind [`footnote_defs`] and [`footnote_paragraphs`];
+/// `across_blank` says whether a blank line keeps the current definition open.
+fn collect_footnotes(lines: &[&str], across_blank: bool) -> IndexMap<String, Vec<usize>> {
     let mut defs: IndexMap<String, Vec<usize>> = IndexMap::new();
     let mut current: Option<String> = None;
     for (index, line) in lines.iter().enumerate() {
+        let blank = py_strip(line).is_empty();
         if let Some(caps) = FOOTNOTE_DEF.captures(line) {
             // Indexing is safe: group 1 is mandatory in FOOTNOTE_DEF.
             let label = caps[1].to_string();
             defs.entry(label.clone()).or_default().push(index);
             current = Some(label);
         } else if current.is_some()
+            && !blank
             && (line.starts_with("    ") || line.starts_with('\t'))
-            && !py_strip(line).is_empty()
         {
             if let Some(lines) = current.as_deref().and_then(|label| defs.get_mut(label)) {
                 lines.push(index);
             }
-        } else {
+        } else if !(blank && across_blank) {
             current = None;
         }
     }
@@ -571,6 +595,29 @@ mod tests {
         assert_eq!(defs["a"], [2, 3]);
         assert_eq!(defs["b"], [4]);
         assert_eq!(defs.len(), 2);
+    }
+
+    #[test]
+    fn footnote_paragraphs_run_across_blank_lines_but_defs_do_not() {
+        let lines = [
+            "[^a]: first",
+            "",
+            "    second",
+            "",
+            "[^b]: other",
+            "",
+            "not indented",
+            "    code, not b's",
+        ];
+
+        let defs = footnote_defs(&lines);
+        let paragraphs = footnote_paragraphs(&lines);
+
+        assert_eq!(defs["a"], [0]);
+        assert_eq!(paragraphs["a"], [0, 2]);
+        // A non-indented line still ends the definition.
+        assert_eq!(paragraphs["b"], [4]);
+        assert_eq!(defs["b"], [4]);
     }
 
     #[test]
