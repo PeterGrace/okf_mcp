@@ -108,7 +108,8 @@ null. Keep findings with no disposition or whose latest disposition is `open` or
    `stamp`/`add_source` provenance); a reason it is not an issue; or a backlog
    entry (what's wrong, why it matters, where, a possible fix, the date, a link).
 5. **Ask** with AskUserQuestion, one finding per prompt: **Apply**, **Explain**,
-   **Defer**, **Skip**, **Quit**. A free-text answer revises the proposal and the
+   **Defer**, **Skip** (the tool allows four options); answering "quit" under
+   Other is **Quit**. Any other free-text answer revises the proposal and the
    finding is asked again.
 
 **Execute:**
