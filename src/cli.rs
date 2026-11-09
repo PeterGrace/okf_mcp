@@ -26,7 +26,7 @@ use crate::db;
 use crate::http;
 use crate::store::catalogs;
 use crate::store::export;
-use crate::store::import::{self, ImportOptions};
+use crate::store::import::{self, ImportOptions, ImportScope};
 use crate::store::keys::{self, Access, Grants, NewKey};
 
 /// `okf-mcp`: an MCP server for OKF knowledge catalogs.
@@ -72,11 +72,21 @@ pub enum Command {
         /// Replace a non-empty catalog's contents (write the differences).
         #[arg(long)]
         replace: bool,
+        /// Replace only repository machinery (AGENTS.md, tools/, install/,
+        /// ...): the source's other files are ignored and the catalog's
+        /// concepts are left as they are.
+        #[arg(long, requires = "replace")]
+        only_machinery: bool,
+        /// Refuse unless the catalog is still at this generation, the one
+        /// `okf-mcp export` reported for the source.
+        #[arg(long, value_name = "N")]
+        expect_generation: Option<i64>,
         /// Recorded as the revisions' actor.
         #[arg(long, default_value = "okf-mcp/import")]
         actor: String,
     },
-    /// Export a catalog's live documents as a .tar.gz.
+    /// Export a catalog's live documents as a .tar.gz, and report its
+    /// generation on stderr.
     Export {
         /// The catalog.
         catalog: String,
@@ -262,6 +272,8 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
             catalog,
             source,
             replace,
+            only_machinery,
+            expect_generation,
             actor,
         } => {
             // Connect first: a missing or unreachable database fails before a
@@ -275,6 +287,12 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
                 .context("the import reader stopped")??;
             let options = ImportOptions {
                 replace,
+                scope: if only_machinery {
+                    ImportScope::Machinery
+                } else {
+                    ImportScope::Everything
+                },
+                expect_generation,
                 actor: &actor,
                 now: clock.now(),
             };
@@ -286,11 +304,13 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
             // Build the archive in memory first: no `StdoutLock` is held across
             // `.await` (which would make this future impossible to
             // `tokio::spawn`), and an unknown catalog leaves no file behind.
-            let tarball = export::export(&pool, &catalog, Vec::new()).await?;
+            let (tarball, generation) = export::export(&pool, &catalog, Vec::new()).await?;
             // Writing is blocking I/O: run it on a blocking thread.
             tokio::task::spawn_blocking(move || write_output(&output, &tarball))
                 .await
                 .context("the export writer stopped")??;
+            // stderr, since the archive itself may be on stdout.
+            eprintln!("exported catalog {catalog:?} at generation {generation}");
         }
     }
     Ok(())
@@ -975,9 +995,36 @@ mod tests {
 
         assert!(matches!(
             parsed.command,
-            Some(Command::Import { ref catalog, ref source, replace: true, ref actor })
+            Some(Command::Import { ref catalog, ref source, replace: true, ref actor, .. })
                 if catalog == "pg" && source.as_os_str() == "-" && actor == "okf-mcp/import"
         ));
+    }
+
+    #[test]
+    fn import_parses_the_machinery_scope_and_the_generation_guard() {
+        let parsed = Cli::try_parse_from([
+            "okf-mcp",
+            "import",
+            "pg",
+            "-",
+            "--replace",
+            "--only-machinery",
+            "--expect-generation",
+            "7",
+        ])
+        .unwrap();
+        let without_replace =
+            Cli::try_parse_from(["okf-mcp", "import", "pg", "-", "--only-machinery"]);
+
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Import {
+                only_machinery: true,
+                expect_generation: Some(7),
+                ..
+            })
+        ));
+        assert!(without_replace.is_err(), "--only-machinery needs --replace");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1000,6 +1047,8 @@ mod tests {
             catalog: "pg".to_string(),
             source: dir.path().to_path_buf(),
             replace: false,
+            only_machinery: false,
+            expect_generation: None,
             actor: "test".to_string(),
         };
 
@@ -1041,6 +1090,8 @@ mod tests {
             catalog: "pg".to_string(),
             source,
             replace: false,
+            only_machinery: false,
+            expect_generation: None,
             actor: "test".to_string(),
         };
 
@@ -1075,6 +1126,8 @@ mod tests {
             catalog: "pg".to_string(),
             source: PathBuf::from("/nonexistent-okf-import.tar.gz"),
             replace: false,
+            only_machinery: false,
+            expect_generation: None,
             actor: "test".to_string(),
         };
 
@@ -1114,6 +1167,8 @@ mod tests {
             catalog: "pg".to_string(),
             source: dir.path().to_path_buf(),
             replace: false,
+            only_machinery: false,
+            expect_generation: None,
             actor: "test".to_string(),
         };
         run(cli(Some(db.url.clone()), import), Arc::clone(&clock))

@@ -15,7 +15,7 @@ use chrono::Utc;
 use okf_mcp::archive::{self, Files};
 use okf_mcp::db;
 use okf_mcp::okf::workspace::StoredFile;
-use okf_mcp::store::import::{import, ImportOptions, ImportReport};
+use okf_mcp::store::import::{import, ImportOptions, ImportReport, ImportScope};
 use okf_mcp::store::{catalogs, export};
 use support::pg::TestDb;
 
@@ -32,15 +32,19 @@ async fn round_trip(files: &Files) -> (Files, ImportReport) {
         .unwrap();
     let first = ImportOptions {
         replace: false,
+        scope: ImportScope::Everything,
+        expect_generation: None,
         actor: "test/roundtrip",
         now: Utc::now(),
     };
     import(&db.pool, "rt", files.clone(), &first).await.unwrap();
 
-    let tarball = export::export(&db.pool, "rt", Vec::new()).await.unwrap();
+    let (tarball, _generation) = export::export(&db.pool, "rt", Vec::new()).await.unwrap();
     let exported = archive::read_tarball(tarball.as_slice(), u64::MAX).unwrap();
     let again = ImportOptions {
         replace: true,
+        scope: ImportScope::Everything,
+        expect_generation: None,
         actor: "test/roundtrip",
         now: Utc::now(),
     };
@@ -76,7 +80,7 @@ async fn the_synthetic_corpus_round_trips() {
     let (exported, again) = round_trip(&files).await;
 
     assert_eq!(exported, files);
-    assert_eq!((again.added, again.updated, again.deleted), (0, 0, 0));
+    assert!(again.added.is_empty() && again.updated.is_empty() && again.deleted.is_empty());
     assert_eq!(again.unchanged, files.len());
 }
 
@@ -112,6 +116,6 @@ async fn the_real_catalog_round_trips() {
     let (exported, again) = round_trip(&files).await;
 
     assert_eq!(exported, files);
-    assert_eq!((again.added, again.updated, again.deleted), (0, 0, 0));
+    assert!(again.added.is_empty() && again.updated.is_empty() && again.deleted.is_empty());
     assert_eq!(again.unchanged, files.len());
 }

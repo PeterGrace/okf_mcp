@@ -7,7 +7,7 @@ use crate::db::test_db;
 use crate::maintenance::select::select;
 use crate::maintenance::types::*;
 use crate::okf::workspace::StoredFile;
-use crate::store::import::{import, ImportOptions};
+use crate::store::import::{import, ImportOptions, ImportScope};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn maintenance_final_candidate_queries_are_constant_with_growth() {
@@ -168,6 +168,8 @@ async fn replacement_import_race(submit: bool) {
             .into(),
             &ImportOptions {
                 replace: true,
+                scope: ImportScope::Everything,
+                expect_generation: None,
                 actor: "importer",
                 now: t0() + Duration::seconds(1),
             },
@@ -244,7 +246,8 @@ async fn replacement_import_race(submit: bool) {
         "wrong lock order: {waiting}"
     );
     worked.unwrap();
-    assert_eq!((imported.updated, imported.deleted), (1, 1));
+    assert_eq!(imported.updated, ["b.md"]);
+    assert_eq!(imported.deleted.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

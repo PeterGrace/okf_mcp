@@ -9,10 +9,25 @@ use sqlx::{PgConnection, PgPool};
 use crate::archive::Files;
 use crate::error::OkfError;
 use crate::okf::analysis::lint::{lint, LintReport};
+use crate::okf::rules::is_machinery;
 use crate::okf::snapshot::Snapshot;
 use crate::okf::workspace::{MemWorkspace, StoredFile};
 use crate::store::catalogs;
 use crate::store::documents::{self, Derived, DocumentWrite, RevisionRecord};
+
+/// Which of a catalog's paths an import replaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImportScope {
+    /// Every path: the catalog becomes exactly the imported files.
+    #[default]
+    Everything,
+    /// Only repository machinery ([`is_machinery`]): the incoming files'
+    /// machinery replaces the catalog's, the incoming concepts and other
+    /// non-machinery files are ignored, and the catalog's own stay as they
+    /// are. This is how machinery, read-only to every write tool, is updated
+    /// without reverting a concept published since the files were exported.
+    Machinery,
+}
 
 /// How to import.
 // `<'a>` is a lifetime parameter: the options borrow `actor` from the caller
@@ -21,22 +36,28 @@ use crate::store::documents::{self, Derived, DocumentWrite, RevisionRecord};
 pub struct ImportOptions<'a> {
     /// Replace a non-empty catalog's contents (write the differences).
     pub replace: bool,
+    /// The paths replaced.
+    pub scope: ImportScope,
+    /// Refuse unless the catalog is at this generation (the one its export
+    /// reported), so a publish since the export is not silently reverted.
+    pub expect_generation: Option<i64>,
     /// Recorded as `updated_by` and the revisions' `actor`.
     pub actor: &'a str,
     /// The time of every row written, and lint's "now" (server clock).
     pub now: DateTime<Utc>,
 }
 
-/// What an import did.
+/// What an import did. The path lists are sorted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ImportReport {
     /// New paths (or paths whose document had been deleted).
-    pub added: usize,
+    pub added: Vec<String>,
     /// Live documents whose content or execute bit changed.
-    pub updated: usize,
-    /// Live documents missing from the import, now deleted.
-    pub deleted: usize,
-    /// Live documents imported unchanged.
+    pub updated: Vec<String>,
+    /// Live documents missing from the import (in its scope), now deleted.
+    pub deleted: Vec<String>,
+    /// How many live documents were imported unchanged (with
+    /// [`ImportScope::Machinery`], every concept counts here).
     pub unchanged: usize,
     /// Lint of the imported files (reported, never refused on).
     pub lint: LintReport,
@@ -64,7 +85,7 @@ impl ExistingRow {
     }
 }
 
-/// The incoming files with their snapshot and lint, from [`analyze`].
+/// The files to import with their snapshot and lint, from [`analyze`].
 struct Analyzed {
     files: Files,
     snapshot: Snapshot,
@@ -78,13 +99,19 @@ struct Analyzed {
 /// live documents missing from `files` become tombstones with `delete`
 /// revisions (message `import`), and unchanged files keep their revision.
 /// A path that had been deleted continues its revision numbers. The
-/// catalog's `generation` is bumped when anything was written.
+/// catalog's `generation` is bumped when anything was written. With
+/// [`ImportScope::Machinery`] only machinery paths are compared and written
+/// (the files imported are the catalog's live non-machinery documents plus
+/// the incoming machinery), so a concept published meanwhile is kept.
+///
+/// The files are checked, snapshotted and linted under the catalog's lock,
+/// because the machinery scope's snapshot includes the catalog's documents.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `catalog` - the catalog's name (it must exist: `okf-mcp catalog create`).
 /// * `files` - the files, from [`crate::archive`].
-/// * `options` - replace, actor and time.
+/// * `options` - replace, scope, expected generation, actor and time.
 ///
 /// # Returns
 /// The counts and the lint report.
@@ -94,8 +121,8 @@ struct Analyzed {
 /// [`OkfError::InvalidPath`] if `files` holds paths no workspace can (see
 /// [`MemWorkspace::from_stored`]); [`OkfError::CatalogNotSelected`] for an
 /// unknown catalog, or one deleted while the import waited for its lock;
-/// [`OkfError::Refused`] for a non-empty catalog without `replace`;
-/// [`OkfError::Database`].
+/// [`OkfError::Refused`] for a non-empty catalog without `replace`, or one
+/// not at `expect_generation`; [`OkfError::Database`].
 pub async fn import(
     pool: &PgPool,
     catalog: &str,
@@ -103,6 +130,42 @@ pub async fn import(
     options: &ImportOptions<'_>,
 ) -> Result<ImportReport, OkfError> {
     let now = options.now;
+    // Dropping `tx` without `commit()` (any `?` or early `return`) rolls back.
+    let mut tx = pool.begin().await?;
+    let found = catalogs::find(&mut *tx, catalog).await?;
+    catalogs::lock(&mut tx, found.id).await?;
+    // A delete holding the lock may have removed (or replaced) the catalog
+    // while this import waited; look again now that nothing else can. The
+    // second look is also the generation no publish can move any more.
+    let locked = catalogs::find(&mut *tx, catalog).await?;
+    if locked.id != found.id {
+        return Err(OkfError::CatalogNotSelected {
+            catalog: catalog.to_string(),
+        });
+    }
+    if let Some(expected) = options.expect_generation {
+        if locked.generation != expected {
+            return Err(OkfError::Refused {
+                reason: format!(
+                    "catalog {catalog:?} is at generation {}, not {expected}: it changed \
+                     since the export; export it again",
+                    locked.generation
+                ),
+            });
+        }
+    }
+    let existing = existing_rows(&mut tx, found.id).await?;
+    if !options.replace && existing.values().any(ExistingRow::is_live) {
+        return Err(OkfError::Refused {
+            reason: format!(
+                "catalog {catalog:?} is not empty; pass --replace to replace its contents"
+            ),
+        });
+    }
+    let files = match options.scope {
+        ImportScope::Everything => files,
+        ImportScope::Machinery => with_catalog_documents(files, &existing),
+    };
     // Building a snapshot and linting it is CPU work (rayon across
     // documents): run it on a blocking thread so the async runtime's threads
     // stay free. `move` hands `files` to the closure, which hands it back.
@@ -121,26 +184,8 @@ pub async fn import(
         lint,
         ..ImportReport::default()
     };
-
-    // Dropping `tx` without `commit()` (any `?` or early `return`) rolls back.
-    let mut tx = pool.begin().await?;
-    let found = catalogs::find(&mut *tx, catalog).await?;
-    catalogs::lock(&mut tx, found.id).await?;
-    // A delete holding the lock may have removed (or replaced) the catalog
-    // while this import waited; look again now that nothing else can.
-    if catalogs::find(&mut *tx, catalog).await?.id != found.id {
-        return Err(OkfError::CatalogNotSelected {
-            catalog: catalog.to_string(),
-        });
-    }
-    let existing = existing_rows(&mut tx, found.id).await?;
-    if !options.replace && existing.values().any(ExistingRow::is_live) {
-        return Err(OkfError::Refused {
-            reason: format!(
-                "catalog {catalog:?} is not empty; pass --replace to replace its contents"
-            ),
-        });
-    }
+    // `Files` is a `BTreeMap`, so its paths, and the lists built from them,
+    // come out sorted.
     for (path, file) in &files {
         let previous = existing.get(path);
         if previous.is_some_and(|row| row.is_live_with(file)) {
@@ -160,14 +205,19 @@ pub async fn import(
         documents::write_document(&mut tx, &write, file, &derived).await?;
         documents::record_revision(&mut tx, &write, &RevisionRecord::import(Some(file))).await?;
         if previous.is_some_and(ExistingRow::is_live) {
-            report.updated += 1;
+            report.updated.push(path.clone());
         } else {
-            report.added += 1;
+            report.added.push(path.clone());
         }
     }
-    let missing = existing
+    // With the machinery scope, every live non-machinery row is in `files`,
+    // so only machinery can be missing.
+    let mut missing: Vec<&ExistingRow> = existing
         .values()
-        .filter(|row| row.is_live() && !files.contains_key(&row.path));
+        .filter(|row| row.is_live() && !files.contains_key(&row.path))
+        .collect();
+    // `existing` is a `HashMap`, in no particular order.
+    missing.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     for row in missing {
         let write = DocumentWrite {
             catalog_id: found.id,
@@ -178,9 +228,9 @@ pub async fn import(
         };
         documents::delete_document(&mut tx, &write).await?;
         documents::record_revision(&mut tx, &write, &RevisionRecord::import(None)).await?;
-        report.deleted += 1;
+        report.deleted.push(row.path.clone());
     }
-    if report.added + report.updated + report.deleted > 0 {
+    if !(report.added.is_empty() && report.updated.is_empty() && report.deleted.is_empty()) {
         sqlx::query("UPDATE catalogs SET generation = generation + 1 WHERE id = $1")
             .bind(found.id)
             .execute(&mut *tx)
@@ -188,6 +238,33 @@ pub async fn import(
     }
     tx.commit().await?;
     Ok(report)
+}
+
+/// The incoming machinery plus the catalog's live non-machinery documents:
+/// what the catalog holds after a [`ImportScope::Machinery`] import.
+///
+/// # Arguments
+/// * `incoming` - the imported files; their non-machinery paths are dropped.
+/// * `existing` - the catalog's rows, from [`existing_rows`].
+///
+/// # Returns
+/// The files to import.
+fn with_catalog_documents(mut incoming: Files, existing: &HashMap<String, ExistingRow>) -> Files {
+    // `retain` is an in-place filter, like
+    // `{k: v for k, v in d.items() if is_machinery(k)}` without a new dict.
+    incoming.retain(|path, _| is_machinery(path));
+    let kept = existing
+        .values()
+        .filter(|row| row.is_live() && !is_machinery(&row.path))
+        .map(|row| {
+            let file = StoredFile {
+                content: row.content.clone(),
+                executable: row.executable,
+            };
+            (row.path.clone(), file)
+        });
+    incoming.extend(kept);
+    incoming
 }
 
 /// Refuses markdown that is not text, then builds and lints the snapshot of
@@ -253,6 +330,8 @@ mod tests {
     fn options(replace: bool, now: DateTime<Utc>) -> ImportOptions<'static> {
         ImportOptions {
             replace,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "test/import",
             now,
         }
@@ -303,14 +382,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            (
-                report.added,
-                report.updated,
-                report.deleted,
-                report.unchanged
-            ),
-            (4, 0, 0, 0)
+            report.added,
+            ["a.md", "img/logo.png", "index.md", "tools/run.sh"]
         );
+        assert!(report.updated.is_empty() && report.deleted.is_empty());
+        assert_eq!(report.unchanged, 0);
         // a.md links to a missing b.md: reported, not refused.
         assert!(report.lint.errors.iter().any(|f| f.rule == "broken-link"));
         type DerivedRow = (
@@ -400,7 +476,12 @@ mod tests {
                 report.deleted,
                 report.unchanged
             ),
-            (1, 1, 1, 1)
+            (
+                vec!["new.md".to_string()],
+                vec!["change.md".to_string()],
+                vec!["drop.md".to_string()],
+                1
+            )
         );
         assert_eq!(
             rows(&db.pool).await,
@@ -463,18 +544,121 @@ mod tests {
 
         assert_eq!(
             (recreated.added, recreated.unchanged),
-            (1, 1),
+            (vec!["a.md".to_string()], 1),
             "a revived tombstone counts as added"
         );
         assert_eq!(
             rows(&db.pool).await[0],
             ("a.md".to_string(), 3, false, b"3".to_vec())
         );
-        assert_eq!(
-            (again.added, again.updated, again.deleted, again.unchanged),
-            (0, 0, 0, 2)
-        );
+        assert!(again.added.is_empty() && again.updated.is_empty() && again.deleted.is_empty());
+        assert_eq!(again.unchanged, 2);
         assert_eq!(generation(&db.pool).await, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_machinery_import_replaces_machinery_and_keeps_every_concept() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        let exported = files(&[
+            ("a.md", CONCEPT, false),
+            ("AGENTS.md", b"# Old rules\n", false),
+            ("tools/old.sh", b"old\n", true),
+        ]);
+        import(&db.pool, "pg", exported.clone(), &options(false, at(1)))
+            .await
+            .unwrap();
+        // Published after the export: `b.md` is new and `a.md` changed.
+        let published = files(&[
+            ("a.md", b"# A, edited\nSee [b](b.md).\n", false),
+            ("AGENTS.md", b"# Old rules\n", false),
+            ("b.md", b"# B\n", false),
+            ("tools/old.sh", b"old\n", true),
+        ]);
+        import(&db.pool, "pg", published, &options(true, at(2)))
+            .await
+            .unwrap();
+        // The export with new machinery overlaid: its `a.md` is stale and it
+        // has no `b.md`.
+        let mut overlaid = exported;
+        overlaid.remove("tools/old.sh");
+        overlaid.extend(files(&[
+            ("AGENTS.md", b"# New rules\n", false),
+            ("tools/new.sh", b"new\n", true),
+        ]));
+        let machinery = ImportOptions {
+            scope: ImportScope::Machinery,
+            ..options(true, at(3))
+        };
+
+        let report = import(&db.pool, "pg", overlaid, &machinery).await.unwrap();
+
+        assert_eq!(report.added, ["tools/new.sh"]);
+        assert_eq!(report.updated, ["AGENTS.md"]);
+        assert_eq!(report.deleted, ["tools/old.sh"]);
+        assert_eq!(report.unchanged, 2, "both concepts are kept as published");
+        // The snapshot linted holds the catalog's concepts: `a.md`'s link to
+        // `b.md` resolves.
+        assert!(!report.lint.errors.iter().any(|f| f.rule == "broken-link"));
+        let live: Vec<(String, Vec<u8>)> = rows(&db.pool)
+            .await
+            .into_iter()
+            .filter(|(_, _, deleted, _)| !deleted)
+            .map(|(path, _, _, content)| (path, content))
+            .collect();
+        assert_eq!(
+            live,
+            [
+                ("AGENTS.md".to_string(), b"# New rules\n".to_vec()),
+                (
+                    "a.md".to_string(),
+                    b"# A, edited\nSee [b](b.md).\n".to_vec()
+                ),
+                ("b.md".to_string(), b"# B\n".to_vec()),
+                ("tools/new.sh".to_string(), b"new\n".to_vec()),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_import_expecting_another_generation_is_refused() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        import(
+            &db.pool,
+            "pg",
+            files(&[("a.md", b"1", false)]),
+            &options(false, at(1)),
+        )
+        .await
+        .unwrap();
+        let guarded = |generation| ImportOptions {
+            expect_generation: Some(generation),
+            ..options(true, at(2))
+        };
+
+        let stale = import(
+            &db.pool,
+            "pg",
+            files(&[("a.md", b"stale", false)]),
+            &guarded(0),
+        )
+        .await;
+        let current = import(&db.pool, "pg", files(&[("a.md", b"2", false)]), &guarded(1))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            stale,
+            Err(OkfError::Refused { ref reason })
+                if reason.contains("generation 1, not 0")
+        ));
+        assert_eq!(current.updated, ["a.md"]);
+        assert_eq!(
+            rows(&db.pool).await,
+            [("a.md".to_string(), 2, false, b"2".to_vec())]
+        );
+        assert_eq!(generation(&db.pool).await, 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -499,7 +683,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!((report.updated, report.unchanged), (1, 0));
+        assert_eq!(
+            (report.updated, report.unchanged),
+            (vec!["run.sh".to_string()], 0)
+        );
         let history: Vec<(i32, bool)> =
             sqlx::query_as("SELECT revision, executable FROM revisions ORDER BY revision")
                 .fetch_all(&db.pool)

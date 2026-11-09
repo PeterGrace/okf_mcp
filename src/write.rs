@@ -363,7 +363,7 @@ mod tests {
     };
     use crate::okf::workspace::Workspace;
     use crate::store::catalogs::tests::until_a_lock_is_awaited;
-    use crate::store::import::{import, ImportOptions};
+    use crate::store::import::{import, ImportOptions, ImportScope};
     use std::collections::BTreeMap;
     use std::time::Duration;
 
@@ -620,6 +620,8 @@ mod tests {
         // the server notices.
         let options = ImportOptions {
             replace: true,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "t",
             now: Utc::now(),
         };

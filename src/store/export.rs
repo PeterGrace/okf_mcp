@@ -24,7 +24,8 @@ use crate::store::{catalogs, documents};
 /// * `out` - where to write (a `Vec<u8>`, a file, an HTTP body buffer).
 ///
 /// # Returns
-/// `out`, with the archive finished.
+/// `out`, with the archive finished, and the catalog generation the archive
+/// holds (for `import --expect-generation`).
 ///
 /// # Errors
 /// [`OkfError::CatalogNotSelected`] for an unknown catalog;
@@ -32,7 +33,7 @@ use crate::store::{catalogs, documents};
 // `W: Write + Send + 'static`: `out` moves to a blocking thread, so it must
 // be safe to send there (`Send`) and must not borrow anything that thread
 // could outlive (`'static`). `Vec<u8>` and `File` both qualify.
-pub async fn export<W>(pool: &PgPool, catalog: &str, out: W) -> Result<W, OkfError>
+pub async fn export<W>(pool: &PgPool, catalog: &str, out: W) -> Result<(W, i64), OkfError>
 where
     W: Write + Send + 'static,
 {
@@ -49,7 +50,7 @@ where
     tx.commit().await?;
     // `move` hands `rows` and `out` to the closure; `ExportFile`s borrow from
     // `rows` inside it, so nothing is copied.
-    tokio::task::spawn_blocking(move || {
+    let archive = tokio::task::spawn_blocking(move || {
         let files: Vec<ExportFile<'_>> = rows
             .iter()
             .map(|row| ExportFile {
@@ -64,7 +65,8 @@ where
     .await
     // A panic in the blocking task is re-raised here, as if it ran inline
     // (as `import` does).
-    .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))
+    .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))?;
+    Ok((archive, catalog.generation))
 }
 
 #[cfg(test)]
@@ -73,7 +75,7 @@ mod tests {
     use crate::archive::Files;
     use crate::db::test_db;
     use crate::okf::workspace::StoredFile;
-    use crate::store::import::{import, ImportOptions};
+    use crate::store::import::{import, ImportOptions, ImportScope};
     use chrono::{TimeZone, Utc};
 
     fn stored(content: &[u8], executable: bool) -> StoredFile {
@@ -94,6 +96,8 @@ mod tests {
         files.insert("gone.md".into(), stored(b"# Gone\n", false));
         let options = ImportOptions {
             replace: false,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "t",
             now,
         };
@@ -107,6 +111,8 @@ mod tests {
         files.insert("a.md".into(), stored(b"# A, again\n", false));
         let options = ImportOptions {
             replace: true,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "t",
             now: later,
         };
@@ -114,8 +120,10 @@ mod tests {
             .await
             .unwrap();
 
-        let tarball = export(&db.pool, "pg", Vec::new()).await.unwrap();
+        let (tarball, generation) = export(&db.pool, "pg", Vec::new()).await.unwrap();
 
+        // Two imports wrote, so the archive holds generation 2.
+        assert_eq!(generation, 2);
         // The tombstone is not exported; everything else reads back exactly.
         assert_eq!(
             archive::read_tarball(tarball.as_slice(), u64::MAX).unwrap(),
@@ -149,12 +157,13 @@ mod tests {
             .await
             .unwrap();
 
-        let tarball = export(&db.pool, "pg", Vec::new()).await.unwrap();
+        let (tarball, generation) = export(&db.pool, "pg", Vec::new()).await.unwrap();
         let unknown = export(&db.pool, "nope", Vec::new()).await;
 
         assert!(archive::read_tarball(tarball.as_slice(), u64::MAX)
             .unwrap()
             .is_empty());
+        assert_eq!(generation, 0);
         assert!(matches!(unknown, Err(OkfError::CatalogNotSelected { .. })));
     }
 }

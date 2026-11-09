@@ -442,7 +442,7 @@ mod tests {
     };
     use crate::okf::workspace::Workspace;
     use crate::store::changesets::ChangesetState;
-    use crate::store::import::{import, ImportOptions};
+    use crate::store::import::{import, ImportOptions, ImportScope};
     use crate::store::keys::Access;
 
     fn entry(path: &str, text: Option<&str>) -> EntryRow {
@@ -528,6 +528,8 @@ mod tests {
         let after_edit = overlays.get(pool, &state, &second_row).await.unwrap();
         let options = ImportOptions {
             replace: true,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "t",
             now: Utc::now(),
         };
