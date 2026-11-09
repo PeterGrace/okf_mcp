@@ -704,8 +704,10 @@ impl<C: CatalogClient> Controller<'_, C> {
             .journal
             .work
             .iter()
-            .filter_map(|w| w.failure.as_deref().and_then(failure_kind))
-            .next()
+            .filter_map(|w| w.failure.as_deref())
+            // A rejected proposal is a per-item failure, not a run stop.
+            .filter(|failure| *failure != kind(RunnerError::InvalidProposal))
+            .find_map(failure_kind)
         {
             return Err(error);
         }
@@ -859,7 +861,9 @@ impl<C: CatalogClient> Controller<'_, C> {
             .is_err();
             let work = &mut self.journal.work[index];
             // ProposalReady stores decoded results, including a rejected proposal
-            // tagged with failure. Such a proposal is never submitted as findings.
+            // tagged with failure. Such a proposal is never submitted as findings:
+            // `submit` reports that one item as failed and the run moves on, since
+            // a bad proposal says nothing about the next item's packet.
             work.phase = Phase::ProposalReady;
             work.proposal = Some(result.proposal);
             work.usage = Some(result.usage);
@@ -867,9 +871,6 @@ impl<C: CatalogClient> Controller<'_, C> {
             self.journal.usage = totals;
             self.journal.accounting_known = true;
             self.save()?;
-            if invalid {
-                return Err(RunnerError::InvalidProposal);
-            }
             self.observed_budget()
         } else {
             self.journal.work[index].failure = Some("unknown_accounting".into());
