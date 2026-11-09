@@ -14,6 +14,9 @@ struct TestClock {
     start: Instant,
     utc: DateTime<Utc>,
     jump: AtomicI64,
+    /// When `FakeClient::list_tools` first froze tokio time. Everything before it
+    /// (fixture setup, the real CLI readiness queued on the process lock) is wall time.
+    paused_at: std::sync::OnceLock<Instant>,
 }
 impl TestClock {
     fn new() -> Self {
@@ -21,7 +24,15 @@ impl TestClock {
             start: Instant::now(),
             utc: "2026-11-07T00:00:00Z".parse().unwrap(),
             jump: AtomicI64::new(0),
+            paused_at: std::sync::OnceLock::new(),
         }
+    }
+    /// Virtual time since the clock froze, free of the load-dependent wall-time setup.
+    fn virtual_elapsed(&self) -> Duration {
+        self.paused_at
+            .get()
+            .expect("tokio time must be paused before measuring virtual time")
+            .elapsed()
     }
 }
 impl Clock for TestClock {
@@ -199,6 +210,8 @@ impl CatalogClient for FakeClient {
         // Real fake-CLI readiness finishes before deterministic virtual-time work.
         if self.pause {
             tokio::time::pause();
+            // Only the first pause anchors virtual time; later runs re-pause after resume.
+            let _ = self.clock.paused_at.set(Instant::now());
             self.pause = false;
         }
         self.lists += 1;
@@ -665,7 +678,7 @@ async fn investigator_supervisor_lower_server_deadline_stops_child() {
     let s = run(&f, &mut c, i.clone()).await.unwrap();
     assert_eq!(s.reason, "budget");
     assert_eq!(s.exit_code(), 4);
-    assert!(f.clock.start.elapsed() < Duration::from_secs(22));
+    assert!(f.clock.virtual_elapsed() < Duration::from_secs(22));
     assert_eq!(i.reaped.load(Ordering::SeqCst), 1);
     assert!(!c
         .calls
@@ -694,7 +707,7 @@ async fn investigator_supervisor_local_deadline_is_monotonic() {
         .iter()
         .any(|(_, r)| matches!(r.tool, AllowedTool::Submit | AllowedTool::Close)));
     assert!(!f.store.load().unwrap().unwrap().terminal);
-    assert!(f.clock.start.elapsed() < Duration::from_secs(22));
+    assert!(f.clock.virtual_elapsed() < Duration::from_secs(22));
     assert_eq!(i.reaped.load(Ordering::SeqCst), 1);
     assert_eq!(s.exit_code(), 4);
 }
@@ -1448,7 +1461,7 @@ async fn investigator_supervisor_child_timeout_is_not_a_model_retry() {
     assert!(!s.accounting_known);
     assert_eq!(i.calls.load(Ordering::SeqCst), 1);
     assert_eq!(i.reaped.load(Ordering::SeqCst), 1);
-    assert!(f.clock.start.elapsed() < Duration::from_secs(92));
+    assert!(f.clock.virtual_elapsed() < Duration::from_secs(92));
     assert_eq!(f.store.load().unwrap().unwrap().reserved_microusd, 100_000);
 }
 
