@@ -236,12 +236,67 @@ fn upload_timed_out() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use axum::body::Body;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::io::ReaderStream;
     // `oneshot` sends one request through a router without a socket.
     use tower::ServiceExt;
 
+    use crate::archive::{write_tarball, ExportFile};
     use crate::config::Config;
-    use crate::mcp::testing::{app_with, principal};
+    use crate::mcp::testing::{app_with, principal, TestApp};
+    use crate::store::catalogs;
+
+    /// A key with `admin` on every catalog.
+    fn admin() -> Arc<Principal> {
+        Arc::new(Principal {
+            access: Access::Admin,
+            ..(*principal(&[], None)).clone()
+        })
+    }
+
+    /// The import routes over `test`'s app, with `caller` as the auth
+    /// layer's principal (added by hand).
+    fn router(test: &TestApp, caller: Arc<Principal>) -> Router {
+        routes(&test.app)
+            .layer(Extension(caller))
+            .with_state(Arc::clone(&test.app))
+    }
+
+    /// A valid archive of one document, `index.md`.
+    fn tarball() -> Vec<u8> {
+        let index = ExportFile {
+            path: "index.md",
+            content: b"# Index\n",
+            executable: false,
+            modified: chrono::Utc::now(),
+        };
+        write_tarball(Vec::new(), &[index]).expect("tarball")
+    }
+
+    /// A response's status and its body as JSON.
+    async fn status_and_json(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// `pg`'s generation and live document count in the database.
+    async fn stored(test: &TestApp) -> (i64, i64) {
+        let catalog = catalogs::find(test.app.pool(), "pg").await.unwrap();
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM documents WHERE catalog_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(catalog.id)
+        .fetch_one(test.app.pool())
+        .await
+        .unwrap();
+        (catalog.generation, live)
+    }
 
     /// An import of `size` zero bytes into `pg` by `caller`, through the
     /// routes alone (the auth layer's principal added by hand), with a 1 KiB
@@ -252,13 +307,14 @@ mod tests {
             ..Config::default()
         };
         let test = app_with(&[("pg", &[])], config).await;
-        let router = routes(&test.app)
-            .layer(Extension(caller))
-            .with_state(Arc::clone(&test.app));
         let request = Request::post("/catalogs/pg/import")
             .body(Body::from(vec![0u8; size]))
             .expect("request");
-        router.oneshot(request).await.unwrap().status()
+        router(&test, caller)
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
     }
 
     #[tokio::test]
@@ -280,18 +336,117 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_key_is_checked_before_the_body_is_read() {
         let reader = principal(&[], None);
-        let admin = Arc::new(Principal {
-            access: Access::Admin,
-            ..(*principal(&[], None)).clone()
-        });
         let oversized = body_limit(1024) + 1;
 
         let as_reader = import_status(reader, oversized).await;
-        let as_admin = import_status(admin, oversized).await;
+        let as_admin = import_status(admin(), oversized).await;
 
         // A body read first would have made both 413.
         assert_eq!(as_reader, StatusCode::FORBIDDEN);
         assert_eq!(as_admin, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // Paused time (after the database is up, which needs real time): with
+    // nothing else to do, the runtime jumps the clock to the next timer, so
+    // the 120-second deadline passes at once. A paused clock needs the
+    // single-threaded runtime, `#[tokio::test]`'s default.
+    #[tokio::test]
+    async fn a_slow_upload_is_503_and_imports_nothing() {
+        let test = app_with(&[("pg", &[])], Config::default()).await;
+        let archive = tarball();
+        let (head, tail) = archive.split_at(archive.len() / 2);
+        // An in-memory pipe: the request body reads `reader` as `writer`
+        // sends, so the upload arrives as slowly as the writer makes it.
+        let (mut writer, reader) = tokio::io::duplex(archive.len());
+        writer.write_all(head).await.unwrap();
+        // `tail` is copied into the task (`to_vec`): a spawned task must own
+        // what it uses (`'static`), as it may outlive this function.
+        let tail = tail.to_vec();
+        tokio::time::pause();
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+            writer.write_all(&tail).await
+        });
+        let body = Body::from_stream(ReaderStream::new(reader));
+        let request = Request::post("/catalogs/pg/import")
+            .body(body)
+            .expect("request");
+
+        let response = router(&test, admin()).oneshot(request).await.unwrap();
+        let (status, json) = status_and_json(response).await;
+        // The rest of the upload, a second after the deadline, finds the
+        // body dropped: the route stopped reading it.
+        let late = sender.await.unwrap();
+        tokio::time::resume();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["error"], "Timeout");
+        assert!(late.is_err(), "the late bytes were read: {late:?}");
+        assert_eq!(stored(&test).await, (0, 0));
+        assert_eq!(test.app.catalog("pg").unwrap().current().files(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refresh_failing_after_a_committed_import_still_reports_the_import() {
+        let test = app_with(&[("pg", &[])], Config::default()).await;
+        let state = test.app.catalog("pg").unwrap();
+        let loaded_at = state.current().generation();
+        // The fault: the import's generation bump (its last write, in its
+        // transaction) also stores a row no workspace accepts, so the import
+        // commits and the refresh after it fails to build the snapshot.
+        sqlx::raw_sql(
+            "CREATE FUNCTION break_the_refresh() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+                 INSERT INTO documents (catalog_id, path, content, executable, revision, \
+                                        updated_at, updated_by) \
+                 VALUES (NEW.id, '../escape.md', '', false, 1, now(), 'test'); \
+                 RETURN NULL; \
+             END $$; \
+             CREATE TRIGGER break_the_refresh AFTER UPDATE OF generation ON catalogs \
+                 FOR EACH ROW EXECUTE FUNCTION break_the_refresh();",
+        )
+        .execute(test.app.pool())
+        .await
+        .unwrap();
+        let import = || {
+            let request = Request::post("/catalogs/pg/import")
+                .body(Body::from(tarball()))
+                .expect("request");
+            router(&test, admin()).oneshot(request)
+        };
+
+        let (status, report) = status_and_json(import().await.unwrap()).await;
+        let after_import = stored(&test).await;
+        let snapshot_after_import = state.current().generation();
+        // A retry of the same upload: the catalog is no longer empty.
+        let (retry_status, retry) = status_and_json(import().await.unwrap()).await;
+        // Repair the data by hand, then let the poll loop's next pass retry
+        // the refresh.
+        sqlx::raw_sql(
+            "DROP TRIGGER break_the_refresh ON catalogs; \
+             DELETE FROM documents WHERE path = '../escape.md';",
+        )
+        .execute(test.app.pool())
+        .await
+        .unwrap();
+        test.app.poll().await.unwrap();
+
+        // Reported as the import it was, not as a failure.
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(report["added"], serde_json::json!(["index.md"]));
+        // Committed: one generation on, with the imported document and the
+        // trigger's row live; the snapshot was not swapped in.
+        assert_eq!(after_import, (loaded_at + 1, 2));
+        assert_eq!(snapshot_after_import, loaded_at);
+        assert_eq!(retry_status, StatusCode::CONFLICT);
+        assert_eq!(
+            retry["message"],
+            "catalog \"pg\" is not empty; add ?replace=true to replace its contents"
+        );
+        // The poll pass swapped the import in.
+        let current = state.current();
+        assert_eq!(current.generation(), loaded_at + 1);
+        assert_eq!(current.files(), 1);
     }
 
     #[test]
