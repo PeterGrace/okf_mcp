@@ -662,6 +662,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn an_import_that_waited_for_a_publish_checks_the_generation_it_left() {
+        let db = test_db().await;
+        let catalog = catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        import(
+            &db.pool,
+            "pg",
+            files(&[("a.md", b"1", false)]),
+            &options(false, at(1)),
+        )
+        .await
+        .unwrap();
+        // Hold the catalog's lock, as a publish in progress would.
+        let mut holder = db.pool.begin().await.unwrap();
+        catalogs::lock(&mut holder, catalog.id).await.unwrap();
+        let pool = db.pool.clone();
+        // Expects generation 1, the one the catalog is at when it starts.
+        let waiting = tokio::spawn(async move {
+            let guarded = ImportOptions {
+                expect_generation: Some(1),
+                ..options(true, at(3))
+            };
+            import(&pool, "pg", files(&[("a.md", b"stale", false)]), &guarded).await
+        });
+        catalogs::tests::until_a_lock_is_awaited(&db.pool).await;
+
+        // The publish the import waited behind: a new revision of `a.md` and
+        // generation 2, as `store::publish` writes them.
+        sqlx::query(
+            "UPDATE documents SET content = 'published', revision = 2 \
+             WHERE catalog_id = $1 AND path = 'a.md'",
+        )
+        .bind(catalog.id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO revisions (catalog_id, path, revision, op, content, executable, actor, \
+             message, created_at) \
+             VALUES ($1, 'a.md', 2, 'update', 'published', false, 'publisher', 'edit', $2)",
+        )
+        .bind(catalog.id)
+        .bind(at(2))
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE catalogs SET generation = generation + 1 WHERE id = $1")
+            .bind(catalog.id)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        holder.commit().await.unwrap();
+        let result = waiting.await.unwrap();
+
+        assert!(matches!(
+            result,
+            Err(OkfError::Refused { ref reason })
+                if reason.contains("generation 2, not 1")
+        ));
+        assert_eq!(
+            rows(&db.pool).await,
+            [("a.md".to_string(), 2, false, b"published".to_vec())]
+        );
+        let history: Vec<(i32, String)> =
+            sqlx::query_as("SELECT revision, actor FROM revisions ORDER BY revision")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            history,
+            [(1, "test/import".to_string()), (2, "publisher".to_string())]
+        );
+        assert_eq!(generation(&db.pool).await, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_changed_execute_bit_is_an_update() {
         let db = test_db().await;
         catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
