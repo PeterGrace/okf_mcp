@@ -129,19 +129,20 @@ Rules:
 - `idempotency_key`: `daily-<finding_id>-<YYYYMMDD>-<choice>`.
 - `by: "claude-code/<model id>"` on every `stamp`, `review`, `create_concept` and
   `split_concept`.
-- On a publish Conflict, re-read the named documents, redo the edit in a fresh
-  changeset and publish once more; if that fails, dispose `needs_input` with the
-  error and continue.
+- On a publish Conflict, `discard` the refused changeset (it stays open), re-read
+  the named documents, redo the edit in a fresh changeset and publish once more; if
+  that fails, `discard` the retry, dispose `needs_input` with the error and continue.
 - Findings that touch the same concept are still handled one at a time; each
   re-check sees the previous publish.
 - Dates in prose and keys come from `date -u`.
 
 ### Step 2: sprawl
 
-Call `sprawl` (`n` large enough to cover every concept over the threshold printed in
-its header). Backlog-type concepts are exempt. For the worst remaining concept,
-invoke `okf-reorganize` with its path, stating that the mode is interactive. After
-it returns, re-run `sprawl` and take the next concept still over the threshold.
+Take the candidates from `lint`'s `sprawl` warnings, whose messages carry the score
+and the cutoff (the `sprawl` result has no cutoff field). Backlog-type concepts are
+exempt. For the highest-scoring concept, invoke `okf-reorganize` with its path,
+stating that the mode is interactive. After it returns, re-run `lint` and take the
+next `sprawl` warning still left.
 Concepts the owner chose to leave are not offered again in this pass.
 
 ### Step 3: links
@@ -171,7 +172,8 @@ the owner's answer.
 Find the backlog concepts: `search` with `type: Backlog`, plus any the catalog's
 AGENTS.md names. For each entry, make a cheap read-only check of whether it has
 been fixed (the linked concept's current text; the live system when documented).
-Propose **Remove** (edit plus `log`) when it looks fixed, otherwise **Keep**;
+Propose **Remove** (its own changeset: edit, `log`, `lint`, `publish`; counted only
+once published) when it looks fixed, otherwise **Keep**;
 **Skip rest** moves on. Never remove an entry without the owner's answer.
 
 ## Errors

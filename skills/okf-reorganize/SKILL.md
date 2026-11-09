@@ -49,7 +49,9 @@ sources, volatile headings or `**Lead-in.**` paragraphs (as of, current
 state, outage, change log, open items, trap, fix, stuck, ...) and distinct
 dates. Under it are the split candidates: volatile sections, sections
 holding a fifth of the body, and volatile lead-in paragraphs, with line
-numbers. `lint` warns above the threshold printed in the header.
+numbers. `lint` warns with rule `sprawl` above a fixed cutoff, which its
+message prints ("sprawl score 17.8 > 16"); the `sprawl` result itself
+has no cutoff field.
 Concepts of type `Backlog` (e.g. `/projects/backlog.md`) grow by
 design and are exempt: the ranking skips them, and naming one shows its
 score marked exempt. Don't reorganize them with this skill.
@@ -161,9 +163,11 @@ finish with the edit tools:
 6. **Record.** `log` (kind `Change`): "Reorganized `/infra/x.md`: moved
    … to …, … (okf-reorganize)."
 7. **Publish.** Show the owner `pending_changes` if the plan changed along
-   the way, then `publish` with "Reorganize <hub>: <what moved where>". On
-   a `Conflict` that a redo in a fresh changeset doesn't clear, stop and
-   tell the user.
+   the way, then `publish` with "Reorganize <hub>: <what moved where>". A
+   refused publish leaves the changeset open: on a `Conflict`, `discard`
+   it, re-read the documents named, and redo the work in a fresh
+   changeset. If that doesn't clear it, `discard` the retry too, then stop
+   and tell the user.
 
 ## 5. Autonomous: record the proposal only
 

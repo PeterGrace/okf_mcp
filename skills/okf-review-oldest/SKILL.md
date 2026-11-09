@@ -189,8 +189,10 @@ session.
    partial): ...".
 3. Check with `pending_changes`, then `publish` with a message such as
    "Review <concept>: <outcome>". If it reports lint errors you didn't
-   cause, or a `Conflict` that a fresh changeset doesn't clear, stop and
-   tell the user.
+   cause, stop and tell the user. A refused publish leaves the changeset
+   open: on a `Conflict`, `discard` it, re-read the documents named and
+   redo the work in a fresh changeset; if that fails too, `discard` the
+   retry, then stop and tell the user.
 4. Report to the user: which concept, the outcome, what changed, what
    couldn't be checked and why, any questions queued, and any problems
    found in the real system.

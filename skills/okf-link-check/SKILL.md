@@ -88,5 +88,6 @@ Skip candidates that aren't real references; there's no need to record them.
 3. Check with `pending_changes`, then `publish` with a message saying what
    was linked. It lints the changed files and refuses on errors such as
    broken links. On a `Conflict`, someone changed a document you edited:
-   re-read it, redo the edit in a fresh changeset and publish again; if it
-   still fails, stop and tell the user.
+   the refused changeset stays open, so `discard` it, re-read the
+   document, redo the edit in a fresh changeset and publish again; if it
+   still fails, `discard` the retry too, then stop and tell the user.

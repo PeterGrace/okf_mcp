@@ -111,21 +111,24 @@ oldest first. Announce the count and how many runs they came from.
 
 - Dispose only after `publish` succeeds.
 - `idempotency_key`: `daily-<finding_id>-<YYYYMMDD>-<choice>`.
-- On a publish Conflict, re-read the documents it names, redo the edit in a
-  fresh changeset and publish once more. If that fails too, dispose
-  `needs_input` with the error as rationale, `discard` the changeset, and
-  move on.
+- On a publish Conflict, the refused changeset stays open: `discard` it
+  first, so step 6 never offers its stale edits. Then re-read the
+  documents the Conflict names, redo the edit in a fresh changeset and
+  publish once more. If that fails too, `discard` the retry as well,
+  dispose `needs_input` with the error as rationale, and move on.
 - Two findings on the same concept are still handled one at a time; the
   second re-check sees the first publish.
 - Every backlog entry added (Defer) is said explicitly in the summary.
 
 ## 2. Sprawl
 
-Call `sprawl` with `n: 200`; keep the concepts above the threshold its
-header prints. Backlog-type concepts are exempt. For the worst remaining
-concept, invoke the `okf-reorganize` skill (Skill tool) with its path, and
-tell it the mode is interactive. When it returns, call `sprawl` again and
-take the next concept still above the threshold. Don't offer again, in
+The candidates are the concepts `lint` (no changeset) warns about with
+rule `sprawl`; each message gives the score and the cutoff ("sprawl score
+17.8 > 16"). `sprawl` itself reports scores but no cutoff. Backlog-type
+concepts are exempt and `lint` doesn't flag them. Take the highest score
+first: invoke the `okf-reorganize` skill (Skill tool) with its path, and
+tell it the mode is interactive. When it returns, run `lint` again and
+take the highest-scoring `sprawl` warning still left. Don't offer again, in
 this pass, a concept the owner chose to leave.
 
 ## 3. Links
@@ -159,9 +162,11 @@ Find the backlog concepts: `search` with an empty query and
 unfixed problems (often a short hub that links area concepts). For each
 entry, check cheaply whether it has since been fixed: the linked
 concept's current text, and the live system where access is documented.
-If it looks fixed, ask **Remove** (delete the entry with `edit_document`,
-`log` the fix), **Keep**, **Skip rest**, **Quit**. Never remove an entry
-without the owner's answer.
+If it looks fixed, ask **Remove**, **Keep**, **Skip rest**, **Quit**.
+Never remove an entry without the owner's answer. Remove is, per entry:
+`open_changeset`; delete the entry with `edit_document`; `log` the fix;
+`lint` with the handle; `publish` (handling a Conflict as in step 1).
+Count it as removed only after the publish succeeds.
 
 ## Errors
 
