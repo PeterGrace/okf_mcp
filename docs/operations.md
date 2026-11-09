@@ -894,7 +894,8 @@ report's summary reads `Proposal rejected: <site>: <check>` (for example
 `Proposal rejected: finding 1 evidence 1: excerpt is not a substring of s1`), so
 `maintenance_get_run` shows why without cluster access. The same reason is kept in
 the journal's `rejection` field and logged once to stderr at warn level. It names
-only indices, packet source ids and the check, never excerpt or source text. Ambiguous/failed reservations are not refunded.
+only indices, packet source ids and the check, never excerpt or source text.
+Ambiguous/failed reservations are not refunded.
 The CLI budget flag, USD reservations and observed token totals are stopping
 thresholds, **not hard in-flight billing/token guarantees**. A request may overshoot;
 provider-enforced quotas or a separately approved enforcing gateway are required
@@ -939,7 +940,8 @@ cleanup; unresolved requests are never discarded or acknowledged locally by gues
 
 The owned CLI installs a global tracing subscriber **before runtime/SDK
 activity**, regardless of `RUST_LOG`, with a fixed filter that passes only the
-`okf_maintenance::rejection` warn line described above; everything else is dropped. This removes the inherited rmcp logging hazard:
+`okf_maintenance::rejection` warn line described above; everything else is dropped.
+This removes the inherited rmcp logging hazard:
 rmcp can trace full protocol payloads, source bodies and tokens. There is no verbose
 dependency override. Library embedders must establish their own safe logging policy;
 the library does not globally reconfigure its host. Never enable prompt/protocol
