@@ -895,6 +895,10 @@ report's summary reads `Proposal rejected: <site>: <check>` (for example
 `maintenance_get_run` shows why without cluster access. The same reason is kept in
 the journal's `rejection` field and logged once to stderr at warn level. It names
 only indices, packet source ids and the check, never excerpt or source text.
+The runner matches a model excerpt with whitespace tolerance: each run of ASCII
+whitespace in it matches any nonempty run in the source, so a quote joined across
+a hard line wrap still matches. The report stores the exact source span, so the
+server's exact-substring rule above still holds.
 Ambiguous/failed reservations are not refunded.
 The CLI budget flag, USD reservations and observed token totals are stopping
 thresholds, **not hard in-flight billing/token guarantees**. A request may overshoot;

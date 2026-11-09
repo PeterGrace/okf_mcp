@@ -241,7 +241,7 @@ fn investigator_proposal_rejects_inventions_and_reuses_s1_limits() {
         let mut q = proposal();
         match mode {
             0 => q.findings[0].evidence[0].source_id = "s999".into(),
-            1 => q.findings[0].evidence[0].excerpt = "Alpha runs locally.\n".into(),
+            1 => q.findings[0].evidence[0].excerpt = "Alpha runs locally?".into(),
             2 => q.findings[0].relationship = Relationship::ExternalObservation,
             3 => q.findings[0].category = Category::PossibleDuplicate,
             4 => q.findings = vec![q.findings[0].clone(); 21],
@@ -597,12 +597,15 @@ fn investigator_proposal_rejection_names_site_and_check() {
             "excerpt is empty",
         ),
         (
-            |_, q, _| q.findings[0].evidence[0].excerpt = "a".repeat(2049),
+            |p, q, _| {
+                p.sources[0].text = "a".repeat(2049);
+                q.findings[0].evidence[0].excerpt = "a".repeat(2049);
+            },
             at(0, 0),
             "excerpt exceeds 2048 bytes",
         ),
         (
-            |_, q, _| q.findings[0].evidence[0].excerpt = "Alpha runs locally.\n".into(),
+            |_, q, _| q.findings[0].evidence[0].excerpt = "Alpha runs locally!".into(),
             at(0, 0),
             "excerpt is not a substring of s0",
         ),
@@ -610,7 +613,7 @@ fn investigator_proposal_rejection_names_site_and_check() {
             |_, q, _| {
                 q.findings[0].evidence.push(ProposedEvidence {
                     source_id: "s1".into(),
-                    excerpt: "Beta runs\nremotely.".into(),
+                    excerpt: "beta runs remotely.".into(),
                 });
             },
             at(0, 1),
@@ -645,4 +648,70 @@ fn investigator_proposal_rejection_names_site_and_check() {
         assert_eq!(site.to_string(), text);
     }
     assert!(to_submission(&twin_packet(), &proposal()).is_ok());
+}
+
+/// Runs `excerpt` against a one-source packet holding `text` and returns the
+/// stored excerpt, or `None` if the proposal was rejected.
+fn stored_excerpt(text: &str, excerpt: &str) -> Option<String> {
+    let mut q = proposal();
+    q.findings[0].evidence[0].excerpt = excerpt.into();
+    to_submission(&packet(text), &q)
+        .ok()
+        .map(|s| s.findings[0].evidence[0].excerpt.clone())
+}
+
+#[test]
+fn investigator_proposal_excerpt_tolerates_whitespace_and_stores_source_span() {
+    // Run 7542030: the model joined a hard-wrapped line with a space.
+    let fios = "Uplink with a\n**dynamic** IPv4 address and IPv6 from Verizon.\n";
+    let quote = "with a **dynamic** IPv4 address and IPv6 from Verizon.";
+    let stored = stored_excerpt(fios, quote).expect("wrapped quote is accepted");
+    assert_eq!(
+        stored,
+        "with a\n**dynamic** IPv4 address and IPv6 from Verizon."
+    );
+    for (text, excerpt, expected) in [
+        ("a  \t b", "a b", "a  \t b"),
+        ("a b", "a \t\r\n b", "a b"),
+        ("one\r\ntwo", "one\ntwo", "one\r\ntwo"),
+        ("one\ntwo", "one\r\ntwo", "one\ntwo"),
+        (
+            "caf\u{e9}\n\n  na\u{ef}ve",
+            "caf\u{e9} na\u{ef}ve",
+            "caf\u{e9}\n\n  na\u{ef}ve",
+        ),
+        ("x  y\n\nz", "y ", "y\n\n"),
+        // The first tolerant match wins when no verbatim quote exists.
+        ("p\nq then p\tq", "p q", "p\nq"),
+        // A verbatim quote is preferred over an earlier tolerant match.
+        ("p\nq then p q", "p q", "p q"),
+    ] {
+        let stored = stored_excerpt(text, excerpt);
+        assert_eq!(stored.as_deref(), Some(expected), "{excerpt:?} in {text:?}");
+        let stored = stored.expect("asserted above");
+        assert!(text.contains(&stored), "stored excerpt is source text");
+    }
+}
+
+#[test]
+fn investigator_proposal_excerpt_rejects_non_whitespace_differences() {
+    let text = "Ports 80\u{2013}443 are open.\nSee Alpha.";
+    for excerpt in [
+        "Ports 80-443 are open.",
+        "ports 80\u{2013}443 are open.",
+        "Ports 80\u{2013}443 are open!",
+        "Ports80\u{2013}443 are open.",
+        "open. See Alpha. More",
+    ] {
+        assert_eq!(stored_excerpt(text, excerpt), None, "{excerpt:?}");
+    }
+}
+
+#[test]
+fn investigator_proposal_excerpt_bound_applies_to_stored_span() {
+    let text = format!("a{}b", " ".repeat(3000));
+    let mut q = proposal();
+    q.findings[0].evidence[0].excerpt = "a b".into();
+    let rejection = to_submission(&packet(&text), &q).expect_err("span exceeds 2048 bytes");
+    assert_eq!(rejection.check(), "excerpt exceeds 2048 bytes");
 }

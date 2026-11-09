@@ -188,6 +188,79 @@ fn locate(submission: &Submission, error: OkfError) -> ProposalRejection {
         .unwrap_or_else(|| ProposalRejection::new(RejectionSite::Proposal, report_check(error)))
 }
 
+/// Yields `(byte offset, char)` for `text` with every run of ASCII whitespace
+/// folded to one `' '` at the run's first byte. Nothing else changes: no case
+/// folding and no Unicode normalization.
+fn fold_whitespace(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    // `move` hands `previous_was_space` to the closure, which mutates it as
+    // state between calls (like a generator's local in Python).
+    let mut previous_was_space = false;
+    text.char_indices().filter_map(move |(offset, c)| {
+        let space = c.is_ascii_whitespace();
+        let keep = !(space && previous_was_space);
+        previous_was_space = space;
+        keep.then_some((offset, if space { ' ' } else { c }))
+    })
+}
+
+/// A source with its whitespace folded, plus a map back to the original.
+#[derive(Clone)]
+struct FoldedSource {
+    /// The source after [`fold_whitespace`].
+    text: String,
+    /// For each byte of `text`, the original offset of the char it belongs to,
+    /// then a final entry holding the original length.
+    starts: Vec<usize>,
+}
+
+impl FoldedSource {
+    /// Folds `text` once, in time and memory linear in its length.
+    fn new(text: &str) -> Self {
+        let mut folded = String::with_capacity(text.len());
+        let mut starts = Vec::with_capacity(text.len() + 1);
+        for (offset, c) in fold_whitespace(text) {
+            folded.push(c);
+            starts.extend(std::iter::repeat_n(offset, c.len_utf8()));
+        }
+        starts.push(text.len());
+        Self {
+            text: folded,
+            starts,
+        }
+    }
+}
+
+/// Finds `excerpt` in `text`, treating each run of ASCII whitespace in the
+/// excerpt as matching any nonempty run in the source, and returns the exact
+/// source span. A verbatim quote is preferred; otherwise the first tolerant
+/// match wins. `folded` supplies the folded source only when it is needed.
+///
+/// Both searches are `str::find` (two-way, linear time); no pattern is ever
+/// compiled from model text.
+///
+/// # Arguments
+/// * `text` - the source text the excerpt must come from.
+/// * `excerpt` - the model's excerpt; must be nonempty.
+/// * `folded` - returns `text` folded by [`FoldedSource::new`].
+///
+/// # Returns
+/// `Some(span)` where `span` is a slice of `text`, or `None` if no match.
+fn source_span<'a>(
+    text: &'a str,
+    excerpt: &str,
+    folded: impl FnOnce() -> &'a FoldedSource,
+) -> Option<&'a str> {
+    if let Some(start) = text.find(excerpt) {
+        return text.get(start..start + excerpt.len());
+    }
+    let folded = folded();
+    let needle: String = fold_whitespace(excerpt).map(|(_, c)| c).collect();
+    let at = folded.text.find(&needle)?;
+    // `starts[at + needle.len()]` is where the next folded char begins in the
+    // source, so a trailing whitespace run is kept whole.
+    text.get(*folded.starts.get(at)?..*folded.starts.get(at + needle.len())?)
+}
+
 /// Converts proposals without ever asserting current-world verification.
 /// Aging wins over Changed, including combined lanes. All S1 shape, byte,
 /// comparison and primary-context checks run on the fully mapped submission.
@@ -211,6 +284,7 @@ pub fn to_submission(
     }
     clean(&proposal.summary).map_err(|_| ProposalRejection::new(Summary, "secret detected"))?;
     let mut findings = Vec::with_capacity(proposal.findings.len());
+    let mut folded: Vec<Option<FoldedSource>> = vec![None; packet.sources.len()];
     for (f, finding) in proposal.findings.iter().enumerate() {
         let reject = |check: &'static str| ProposalRejection::new(Finding(f), check);
         if finding.relationship == Relationship::ExternalObservation {
@@ -239,10 +313,10 @@ pub fn to_submission(
             };
             clean(&item.source_id).map_err(|_| reject("secret detected in source_id".into()))?;
             clean(&item.excerpt).map_err(|_| reject("secret detected in excerpt".into()))?;
-            let source = packet
+            let index = packet
                 .sources
                 .iter()
-                .find(|source| source.id == item.source_id)
+                .position(|source| source.id == item.source_id)
                 .ok_or_else(|| {
                     reject(if is_source_label(&item.source_id) {
                         format!("unknown source_id {}", item.source_id).into()
@@ -250,20 +324,22 @@ pub fn to_submission(
                         "unknown source_id".into()
                     })
                 })?;
+            let source = &packet.sources[index];
             if item.excerpt.is_empty() {
                 return Err(reject("excerpt is empty".into()));
             }
-            if item.excerpt.len() > 2048 {
+            // `get_or_insert_with` folds each source at most once per proposal,
+            // and only when some excerpt is not a verbatim quote of it.
+            let span = source_span(&source.text, &item.excerpt, || {
+                folded[index].get_or_insert_with(|| FoldedSource::new(&source.text))
+            })
+            .ok_or_else(|| reject(format!("excerpt is not a substring of {}", source.id).into()))?;
+            if span.len() > 2048 {
                 return Err(reject("excerpt exceeds 2048 bytes".into()));
-            }
-            if !source.text.contains(&item.excerpt) {
-                return Err(reject(
-                    format!("excerpt is not a substring of {}", source.id).into(),
-                ));
             }
             evidence.push(Evidence {
                 pin: source.pin.clone(),
-                excerpt: item.excerpt.clone(),
+                excerpt: span.to_owned(),
             });
         }
         findings.push(FindingInput {
@@ -309,4 +385,55 @@ pub fn to_submission(
     validate::submission_for_work(&submission, &primary.pin, &packet.reasons)
         .map_err(|error| locate(&submission, error))?;
     Ok(submission)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs [`source_span`] with a freshly folded source.
+    fn span<'a>(text: &'a str, excerpt: &str, folded: &'a FoldedSource) -> Option<&'a str> {
+        source_span(text, excerpt, || folded)
+    }
+
+    #[test]
+    fn fold_whitespace_collapses_runs_and_keeps_offsets() {
+        let folded: Vec<(usize, char)> = fold_whitespace("a \t\r\nb\u{e9} c").collect();
+        assert_eq!(
+            folded,
+            vec![
+                (0, 'a'),
+                (1, ' '),
+                (5, 'b'),
+                (6, '\u{e9}'),
+                (8, ' '),
+                (9, 'c')
+            ]
+        );
+    }
+
+    #[test]
+    fn folded_source_maps_every_byte_and_the_end() {
+        let source = FoldedSource::new("\u{e9}  x");
+        assert_eq!(source.text, "\u{e9} x");
+        assert_eq!(source.starts, vec![0, 0, 2, 4, 5]);
+    }
+
+    #[test]
+    fn source_span_returns_exact_slices() {
+        let text = "keep\n  this\ttext";
+        let folded = FoldedSource::new(text);
+        assert_eq!(span(text, "keep this text", &folded), Some(text));
+        assert_eq!(span(text, "this", &folded), Some("this"));
+        assert_eq!(span(text, " this ", &folded), Some("\n  this\t"));
+        assert_eq!(span(text, "keepthis", &folded), None);
+        assert_eq!(span(text, "Keep this", &folded), None);
+    }
+
+    #[test]
+    fn source_span_skips_folding_for_verbatim_quotes() {
+        let text = "verbatim";
+        let found = source_span(text, "batim", || unreachable!("no fold needed"));
+        assert_eq!(found, Some("batim"));
+    }
 }
