@@ -16,7 +16,7 @@ use crate::db::pg_support::TestDb;
 use crate::mcp::context::ToolContext;
 use crate::store::catalogs;
 use crate::store::changesets::{self, ChangesetRow, EntryRow};
-use crate::store::import::{import, ImportOptions};
+use crate::store::import::{import, ImportOptions, ImportScope};
 use crate::store::keys::Access;
 
 /// An app and the database under it. Fields drop in declaration order: the
@@ -79,6 +79,8 @@ pub(crate) async fn app_at(
             .expect("create the test catalog");
         let options = ImportOptions {
             replace: false,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "tester",
             now: imported,
         };

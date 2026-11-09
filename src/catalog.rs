@@ -385,7 +385,7 @@ mod tests {
     use crate::db::test_db;
     use crate::okf::workspace::Workspace;
     use crate::store::catalogs;
-    use crate::store::import::{import, ImportOptions};
+    use crate::store::import::{import, ImportOptions, ImportScope};
     use chrono::{TimeDelta, TimeZone};
 
     fn files(entries: &[(&str, &[u8])]) -> Files {
@@ -404,6 +404,8 @@ mod tests {
     async fn import_into(pool: &PgPool, entries: &[(&str, &[u8])], replace: bool) {
         let options = ImportOptions {
             replace,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "t",
             now: Utc::now(),
         };
@@ -445,6 +447,8 @@ mod tests {
         let imported = Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap();
         let options = ImportOptions {
             replace: false,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "t",
             now: imported,
         };
@@ -578,6 +582,8 @@ mod tests {
             "---\ntype: Note\ngenerated: { by: t, at: 2026-11-02T11:00:00Z }\n---\nBody\n";
         let options = ImportOptions {
             replace: false,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "t",
             now: imported,
         };

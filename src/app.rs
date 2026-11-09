@@ -446,7 +446,7 @@ mod tests {
     use crate::mcp::testing::app_with;
     use crate::okf::workspace::StoredFile;
     use crate::store::changesets::{ChangesetState, EntryRow};
-    use crate::store::import::{import, ImportOptions};
+    use crate::store::import::{import, ImportOptions, ImportScope};
     use crate::store::keys as key_rows;
     use chrono::{DateTime, TimeDelta, Utc};
     use std::time::{Duration, Instant};
@@ -464,6 +464,8 @@ mod tests {
             .collect();
         let options = ImportOptions {
             replace,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "tester",
             now: Utc::now(),
         };

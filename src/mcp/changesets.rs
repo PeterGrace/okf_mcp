@@ -972,7 +972,7 @@ mod publish_tests {
     use crate::mcp::writes::{replace_body, ReplaceBodyParams};
     use crate::okf::ops::{self, LogKind};
     use crate::store::changesets::{self, ChangesetState, EntryRow};
-    use crate::store::import::{import, ImportOptions};
+    use crate::store::import::{import, ImportOptions, ImportScope};
     use crate::store::keys::Access;
     use crate::store::publish::PublishedRevision;
     use crate::store::{catalogs, history};
@@ -1266,6 +1266,8 @@ mod publish_tests {
         body(&ctx, &handle, "/a.md", "Edited.\n").await;
         let options = ImportOptions {
             replace: true,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "t",
             now: Utc::now(),
         };
@@ -1455,6 +1457,8 @@ mod publish_tests {
         ];
         let options = ImportOptions {
             replace: true,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "cli",
             now: Utc::now(),
         };
@@ -1712,7 +1716,7 @@ mod changes_tests {
         create_concept, replace_body, CreateConceptParams, ReplaceBodyParams,
     };
     use crate::store::changesets::{self, ChangesetState};
-    use crate::store::import::{import, ImportOptions};
+    use crate::store::import::{import, ImportOptions, ImportScope};
 
     const NOTE: &str = "---\ntype: Note\ntitle: A\ndescription: A note.\n---\n# A\n";
     const NOTE_B: &str = "---\ntype: Note\ntitle: B\ndescription: B note.\n---\n# B\n";
@@ -1731,6 +1735,8 @@ mod changes_tests {
     async fn republish(test: &TestApp, entries: &[(&str, &str)]) {
         let options = ImportOptions {
             replace: true,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "tester",
             now: Utc::now(),
         };

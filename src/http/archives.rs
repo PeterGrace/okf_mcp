@@ -18,7 +18,7 @@ use crate::error::OkfError;
 use crate::http::{timeout_layer, AppError, REQUEST_TIMEOUT};
 use crate::mcp::blocking;
 use crate::store::export::export;
-use crate::store::import::{import, ImportOptions};
+use crate::store::import::{import, ImportOptions, ImportScope};
 use crate::store::keys::Access;
 
 /// The two routes, for the keyed part of the router.
@@ -92,7 +92,8 @@ async fn export_catalog(
     // `?` returns early with the error, converted to `AppError` by `From`.
     principal.require(Access::Read, &name)?;
     // M3's export builds the whole tarball in memory (a `Vec<u8>`).
-    let bytes = export(app.pool(), &name, Vec::new()).await?;
+    // The generation is for the command line's `import --expect-generation`.
+    let (bytes, _generation) = export(app.pool(), &name, Vec::new()).await?;
     // `name` is a catalog that exists, so it is `[a-z0-9-]+` and safe in a header.
     let disposition = format!("attachment; filename=\"{name}.tar.gz\"");
     let headers = [
@@ -175,13 +176,16 @@ async fn import_catalog(
     };
     let options = ImportOptions {
         replace: query.replace,
+        scope: ImportScope::Everything,
+        expect_generation: None,
         actor: &principal.actor,
         now: app.clock().now(),
     };
     let report = import(app.pool(), &name, files, &options)
         .await
-        // `store::import`'s only refusal is a non-empty catalog without
-        // `replace`; its hint names the CLI flag, so say what HTTP needs.
+        // Without `expect_generation`, `store::import`'s only refusal is a
+        // non-empty catalog without `replace`; its hint names the CLI flag,
+        // so say what HTTP needs.
         .map_err(|error| match error {
             OkfError::Refused { .. } => OkfError::Refused {
                 reason: format!(

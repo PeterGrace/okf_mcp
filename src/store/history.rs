@@ -102,7 +102,7 @@ mod tests {
     use crate::archive::files;
     use crate::db::test_db;
     use crate::store::catalogs;
-    use crate::store::import::{import, ImportOptions};
+    use crate::store::import::{import, ImportOptions, ImportScope};
     use chrono::Utc;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -114,6 +114,8 @@ mod tests {
         for (version, replace) in [("one", false), ("two", true)] {
             let options = ImportOptions {
                 replace,
+                scope: ImportScope::Everything,
+                expect_generation: None,
                 actor: "tester",
                 now: Utc::now(),
             };
@@ -123,6 +125,8 @@ mod tests {
         }
         let options = ImportOptions {
             replace: true,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "tester",
             now: Utc::now(),
         };
@@ -160,6 +164,8 @@ mod tests {
         for (entries, replace) in rounds {
             let options = ImportOptions {
                 replace,
+                scope: ImportScope::Everything,
+                expect_generation: None,
                 actor: "tester",
                 now: Utc::now(),
             };

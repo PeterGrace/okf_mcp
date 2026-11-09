@@ -17,7 +17,7 @@ use okf_mcp::clock::SystemClock;
 use okf_mcp::config::Config;
 use okf_mcp::okf::workspace::StoredFile;
 use okf_mcp::store::catalogs;
-use okf_mcp::store::import::{import, ImportOptions};
+use okf_mcp::store::import::{import, ImportOptions, ImportScope};
 use okf_mcp::store::keys::{self, Access, Grants, NewKey};
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
@@ -103,6 +103,8 @@ impl TestServer {
                 .expect("create catalog");
             let options = ImportOptions {
                 replace: false,
+                scope: ImportScope::Everything,
+                expect_generation: None,
                 actor: "tester",
                 now: Utc::now(),
             };

@@ -237,7 +237,7 @@ async fn import_needs_admin_refuses_a_full_catalog_without_replace_and_is_read_a
     assert_eq!(as_reader, 403);
     assert_eq!(unknown, 404);
     assert_eq!(first_status, 200);
-    assert_eq!(report["added"], 2);
+    assert_eq!(report["added"], serde_json::json!(["a.md", "index.md"]));
     assert_eq!(again_status, 409);
     assert!(conflict["message"]
         .as_str()

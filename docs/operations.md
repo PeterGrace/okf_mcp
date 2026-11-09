@@ -492,6 +492,29 @@ the only writable path:
 kubectl -n okf-mcp exec deploy/okf-mcp -- okf-mcp export notes - > notes.tar.gz
 ```
 
+It reports the generation the archive holds on stderr (`exported catalog
+"notes" at generation 42`). The import report (JSON on stdout, or the HTTP
+route's body) lists the `added`, `updated` and `deleted` paths and counts the
+`unchanged` ones.
+
+**Update machinery** (`AGENTS.md`, `tools/`, `install/` and the rest that the
+write tools refuse) with `--replace --only-machinery`. Only the source's
+machinery is compared and written; its other files are ignored and the
+catalog's concepts stay as they are, so a concept published meanwhile is
+kept. The source can be the catalog's template checkout or an export with
+new machinery overlaid:
+
+```sh
+git -C ~/notes-template archive --format=tar.gz HEAD |
+    kubectl -n okf-mcp exec -i deploy/okf-mcp -- \
+        okf-mcp import notes - --replace --only-machinery
+```
+
+A full `--replace` from an edited export reverts whatever was published
+after the export. Pass the generation the export reported as
+`--expect-generation 42`, and the import is refused, writing nothing, if the
+catalog has moved since; export again and redo the edit.
+
 **Connect a harness.** The MCP URL is `https://okf-mcp.example.com/mcp`, with
 the key in `Authorization: Bearer <key>`. For Claude Code:
 

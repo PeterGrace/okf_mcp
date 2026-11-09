@@ -590,6 +590,12 @@ snapshot.
    write the differences as `import` revisions (unchanged files keep their revision;
    missing ones are deleted, with `delete` revisions whose message is `import`).
    Without `--replace`, importing into a non-empty catalog is refused.
+   `--only-machinery` (with `--replace`) limits the comparison and the writes to
+   machinery paths: the incoming non-machinery files are ignored and the catalog's are
+   kept (step 2 then snapshots the catalog's documents with the incoming machinery,
+   under the catalog's lock). `--expect-generation N` refuses the import unless the
+   catalog is at generation `N`, which `okf-mcp export` reports on stderr. The report
+   lists the added, updated and deleted paths and counts the unchanged ones.
 4. Rebuild the snapshot.
 
 ### Export

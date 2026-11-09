@@ -131,7 +131,7 @@ fn every_analysis_runs_on_a_real_catalog() {
 async fn storage_round_trip_on_a_real_catalog() {
     use okf_mcp::archive;
     use okf_mcp::catalog::CatalogState;
-    use okf_mcp::store::import::{import, ImportOptions};
+    use okf_mcp::store::import::{import, ImportOptions, ImportScope};
     use okf_mcp::store::{catalogs, export};
 
     let root = std::env::var_os("OKF_PARITY_CATALOG").expect("set OKF_PARITY_CATALOG");
@@ -152,13 +152,15 @@ async fn storage_round_trip_on_a_real_catalog() {
     let started = Instant::now();
     let options = ImportOptions {
         replace: false,
+        scope: ImportScope::Everything,
+        expect_generation: None,
         actor: "smoke",
         now: Utc::now(),
     };
     let report = import(&db.pool, "pg", files, &options).await.unwrap();
     eprintln!(
         "import: {} added, lint {} errors / {} warnings in {:?}",
-        report.added,
+        report.added.len(),
         report.lint.errors.len(),
         report.lint.warnings.len(),
         started.elapsed()
@@ -196,7 +198,7 @@ async fn storage_round_trip_on_a_real_catalog() {
     });
 
     let started = Instant::now();
-    let tarball = export::export(&db.pool, "pg", Vec::new()).await.unwrap();
+    let (tarball, _generation) = export::export(&db.pool, "pg", Vec::new()).await.unwrap();
     eprintln!("export: {} bytes in {:?}", tarball.len(), started.elapsed());
 }
 

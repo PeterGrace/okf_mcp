@@ -14,7 +14,7 @@ use okf_mcp::{
         types::{AllowedTool, ModelRequest, ModelResult, ModelUsage, Packet, ToolRequest},
     },
     maintenance::types::{ClaimResult, WorkOutcome},
-    store::import::{import, ImportOptions},
+    store::import::{import, ImportOptions, ImportScope},
 };
 use rmcp::model::{CallToolRequestParams, Tool};
 use serde_json::{json, Value};
@@ -292,6 +292,8 @@ async fn server(aging: bool) -> TestServer {
         data,
         &ImportOptions {
             replace: false,
+            scope: ImportScope::Everything,
+            expect_generation: None,
             actor: "fixture",
             now: chrono::Utc::now() - chrono::Duration::days(1),
         },
@@ -570,6 +572,8 @@ async fn investigator_lost_response_replay_and_historical_superseded() {
                 data,
                 &ImportOptions {
                     replace: true,
+                    scope: ImportScope::Everything,
+                    expect_generation: None,
                     actor: "fixture",
                     now: chrono::Utc::now(),
                 },
