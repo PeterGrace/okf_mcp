@@ -31,6 +31,10 @@ use crate::{
     },
 };
 
+/// Tracing target of the one line the CLI lets through: a rejected proposal's
+/// reason (indices and check names only). Every other target stays silent.
+pub const REJECTION_LOG_TARGET: &str = "okf_maintenance::rejection";
+
 const HEARTBEAT: Duration = Duration::from_secs(60);
 const RPC: Duration = Duration::from_secs(10);
 const SAFETY: i64 = 30;
@@ -463,6 +467,7 @@ impl<C: CatalogClient> Controller<'_, C> {
                         proposal: None,
                         usage: None,
                         failure: None,
+                        rejection: None,
                     })
                     .collect();
                 for l in &claim.leases {
@@ -851,15 +856,24 @@ impl<C: CatalogClient> Controller<'_, C> {
             .as_ref()
             .and_then(|r| add_usage(&self.journal.usage, &r.usage));
         if let (Some(result), Some(totals)) = (result, totals) {
-            let invalid = to_submission(
+            let rejection = to_submission(
                 self.journal.work[index]
                     .packet
                     .as_ref()
                     .ok_or(RunnerError::Journal)?,
                 &result.proposal,
             )
-            .is_err();
+            .err()
+            .map(|rejection| rejection.to_string());
             let work = &mut self.journal.work[index];
+            if let Some(reason) = &rejection {
+                tracing::warn!(
+                    target: REJECTION_LOG_TARGET,
+                    work_id = %work.work_id,
+                    %reason,
+                    "maintenance proposal rejected"
+                );
+            }
             // ProposalReady stores decoded results, including a rejected proposal
             // tagged with failure. Such a proposal is never submitted as findings:
             // `submit` reports that one item as failed and the run moves on, since
@@ -867,7 +881,8 @@ impl<C: CatalogClient> Controller<'_, C> {
             work.phase = Phase::ProposalReady;
             work.proposal = Some(result.proposal);
             work.usage = Some(result.usage);
-            work.failure = invalid.then(|| "invalid_proposal".into());
+            work.failure = rejection.is_some().then(|| "invalid_proposal".into());
+            work.rejection = rejection;
             self.journal.usage = totals;
             self.journal.accounting_known = true;
             self.save()?;
@@ -894,7 +909,7 @@ impl<C: CatalogClient> Controller<'_, C> {
                 work.proposal.as_ref().ok_or(RunnerError::Journal)?,
             )?
         } else {
-            generic()
+            generic(work.rejection.as_deref())
         };
         let lease = self
             .journal
@@ -998,11 +1013,16 @@ fn add_usage(a: &ModelUsage, b: &ModelUsage) -> Option<ModelUsage> {
         cost_microusd: a.cost_microusd.checked_add(b.cost_microusd)?,
     })
 }
-fn generic() -> Submission {
+/// The failed submission for work without a usable proposal. A journaled
+/// rejection reason (indices and check names only) becomes its summary.
+fn generic(rejection: Option<&str>) -> Submission {
     Submission {
         outcome: WorkOutcome::Failed,
         assessment: Assessment::NotAssessed,
-        summary: "Investigation stopped without a usable assessment".into(),
+        summary: rejection.map_or_else(
+            || "Investigation stopped without a usable assessment".into(),
+            |reason| format!("Proposal rejected: {reason}"),
+        ),
         evidence: vec![],
         findings: vec![],
         reported_tokens: None,

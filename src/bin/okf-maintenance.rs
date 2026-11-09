@@ -1,4 +1,5 @@
-//! Report-only operator CLI. Dependency tracing is deliberately disabled.
+//! Report-only operator CLI. Dependency tracing is deliberately disabled; only
+//! the proposal-rejection line reaches stderr.
 
 use std::{future::Future, io::Write, path::PathBuf, process::ExitCode, sync::Arc};
 
@@ -18,6 +19,8 @@ use okf_mcp::{
     },
 };
 use tokio_util::sync::CancellationToken;
+use tracing::Level;
+use tracing_subscriber::{filter::Targets, layer::SubscriberExt, Layer};
 
 #[derive(Parser)]
 #[command(
@@ -244,7 +247,14 @@ async fn until_signal<T>(
 fn quiet_logging() -> Result<(), RunnerError> {
     // rmcp can trace complete protocol messages, including evidence and tokens.
     // Never use EnvFilter/RUST_LOG or offer a dependency-verbose override here.
-    tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default())
+    // The fixed filter passes exactly one target, the supervisor's rejection
+    // line, whose fields hold only work ids, indices and check names. Spans
+    // of other targets are filtered out too, so none of their fields print.
+    let rejections = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_filter(Targets::new().with_target(supervisor::REJECTION_LOG_TARGET, Level::WARN));
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(rejections))
         .map_err(|_| RunnerError::Config)
 }
 

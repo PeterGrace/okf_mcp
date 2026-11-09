@@ -2,11 +2,14 @@
 
 pub use super::types::{Proposal, ProposedEvidence, ProposedFinding};
 
+use std::{borrow::Cow, fmt};
+
 use super::{
     collect::{bounded_packet, clean},
     error::RunnerError,
     types::Packet,
 };
+use crate::error::OkfError;
 use crate::maintenance::{
     types::{Assessment, Evidence, FindingInput, Lane, Relationship, Submission, WorkOutcome},
     validate,
@@ -71,40 +74,192 @@ pub fn proposal_schema() -> Value {
     })
 }
 
+/// Where a rejected proposal failed. Indices are 0-based, as in the JSON arrays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionSite {
+    /// The evidence packet the proposal answers, not the model's output.
+    Packet,
+    /// The proposal or the mapped submission as a whole.
+    Proposal,
+    /// The proposal's `summary`.
+    Summary,
+    /// One finding, by index.
+    Finding(usize),
+    /// One evidence entry of one finding, by indices.
+    Evidence {
+        /// Index of the finding.
+        finding: usize,
+        /// Index of the evidence entry within that finding.
+        evidence: usize,
+    },
+}
+
+impl fmt::Display for RejectionSite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Packet => f.write_str("packet"),
+            Self::Proposal => f.write_str("proposal"),
+            Self::Summary => f.write_str("summary"),
+            Self::Finding(finding) => write!(f, "finding {finding}"),
+            Self::Evidence { finding, evidence } => {
+                write!(f, "finding {finding} evidence {evidence}")
+            }
+        }
+    }
+}
+
+/// Why [`to_submission`] rejected a proposal: the site and the failed check.
+///
+/// The rendered text (`Display`) holds only indices, packet source ids and
+/// fixed check names, never excerpt, source or summary text, so it is safe
+/// to journal, log and submit.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{site}: {check}")]
+pub struct ProposalRejection {
+    site: RejectionSite,
+    // `Cow` (clone-on-write) holds either a `&'static str` check name or an
+    // owned `String` for checks that name a source id, without always allocating.
+    check: Cow<'static, str>,
+}
+
+impl ProposalRejection {
+    fn new(site: RejectionSite, check: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            site,
+            check: check.into(),
+        }
+    }
+
+    /// Where the proposal failed.
+    pub fn site(&self) -> RejectionSite {
+        self.site
+    }
+
+    /// The failed check, e.g. `excerpt is not a substring of s1`.
+    pub fn check(&self) -> &str {
+        &self.check
+    }
+}
+
+impl From<ProposalRejection> for RunnerError {
+    fn from(_: ProposalRejection) -> Self {
+        Self::InvalidProposal
+    }
+}
+
+/// A source id is echoed only when it has the packet's own `s<digits>` form;
+/// anything else is model text and stays unquoted.
+fn is_source_label(id: &str) -> bool {
+    id.strip_prefix('s').is_some_and(|digits| {
+        (1..=3).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// Fixed check text for an S1 validation error; secret text is never echoed.
+fn report_check(error: OkfError) -> Cow<'static, str> {
+    match error {
+        // Every `Refused` reason in `maintenance::validate` is a fixed literal.
+        OkfError::Refused { reason } => Cow::Owned(reason),
+        OkfError::SecretDetected { .. } => Cow::Borrowed("secret detected"),
+        _ => Cow::Borrowed("report validation failed"),
+    }
+}
+
+/// Attributes an S1 failure to the first finding that fails on its own, so a
+/// rejection names the finding rather than the whole report.
+fn locate(submission: &Submission, error: OkfError) -> ProposalRejection {
+    submission
+        .findings
+        .iter()
+        .enumerate()
+        .find_map(|(index, finding)| {
+            let alone = Submission {
+                outcome: WorkOutcome::Failed,
+                assessment: Assessment::NotAssessed,
+                summary: String::new(),
+                evidence: vec![],
+                findings: vec![finding.clone()],
+                reported_tokens: None,
+            };
+            validate::submission(&alone)
+                .err()
+                .map(|e| ProposalRejection::new(RejectionSite::Finding(index), report_check(e)))
+        })
+        .unwrap_or_else(|| ProposalRejection::new(RejectionSite::Proposal, report_check(error)))
+}
+
 /// Converts proposals without ever asserting current-world verification.
 /// Aging wins over Changed, including combined lanes. All S1 shape, byte,
 /// comparison and primary-context checks run on the fully mapped submission.
-pub fn to_submission(packet: &Packet, proposal: &Proposal) -> Result<Submission, RunnerError> {
-    let invalid = |_| RunnerError::InvalidProposal;
-    let packet = bounded_packet(packet).map_err(invalid)?;
+///
+/// # Errors
+/// [`ProposalRejection`] naming the first failed check and where it failed.
+/// It converts into [`RunnerError::InvalidProposal`] with `?`.
+pub fn to_submission(
+    packet: &Packet,
+    proposal: &Proposal,
+) -> Result<Submission, ProposalRejection> {
+    use RejectionSite::{Evidence as AtEvidence, Finding, Packet as AtPacket, Summary};
+    let packet = bounded_packet(packet)
+        .map_err(|_| ProposalRejection::new(AtPacket, "evidence packet is invalid"))?;
     let primary = &packet.sources[0];
     if proposal.findings.len() > 20 {
-        return Err(RunnerError::InvalidProposal);
+        return Err(ProposalRejection::new(
+            RejectionSite::Proposal,
+            "more than 20 findings",
+        ));
     }
-    clean(&proposal.summary).map_err(invalid)?;
-    let mut findings = Vec::new();
-    for finding in &proposal.findings {
-        if finding.relationship == Relationship::ExternalObservation || finding.evidence.len() > 20
-        {
-            return Err(RunnerError::InvalidProposal);
+    clean(&proposal.summary).map_err(|_| ProposalRejection::new(Summary, "secret detected"))?;
+    let mut findings = Vec::with_capacity(proposal.findings.len());
+    for (f, finding) in proposal.findings.iter().enumerate() {
+        let reject = |check: &'static str| ProposalRejection::new(Finding(f), check);
+        if finding.relationship == Relationship::ExternalObservation {
+            return Err(reject("external_observation is not allowed"));
         }
-        for text in [&finding.assertion, &finding.follow_up, &finding.uncertainty] {
-            clean(text).map_err(invalid)?;
+        if finding.evidence.len() > 20 {
+            return Err(reject("more than 20 evidence entries"));
         }
-        let mut evidence = Vec::new();
-        for item in &finding.evidence {
-            clean(&item.source_id).map_err(invalid)?;
-            clean(&item.excerpt).map_err(invalid)?;
+        for (text, check) in [
+            (&finding.assertion, "secret detected in assertion"),
+            (&finding.follow_up, "secret detected in follow_up"),
+            (&finding.uncertainty, "secret detected in uncertainty"),
+        ] {
+            clean(text).map_err(|_| reject(check))?;
+        }
+        let mut evidence = Vec::with_capacity(finding.evidence.len());
+        for (e, item) in finding.evidence.iter().enumerate() {
+            let reject = |check: Cow<'static, str>| {
+                ProposalRejection::new(
+                    AtEvidence {
+                        finding: f,
+                        evidence: e,
+                    },
+                    check,
+                )
+            };
+            clean(&item.source_id).map_err(|_| reject("secret detected in source_id".into()))?;
+            clean(&item.excerpt).map_err(|_| reject("secret detected in excerpt".into()))?;
             let source = packet
                 .sources
                 .iter()
                 .find(|source| source.id == item.source_id)
-                .ok_or(RunnerError::InvalidProposal)?;
-            if item.excerpt.is_empty()
-                || item.excerpt.len() > 2048
-                || !source.text.contains(&item.excerpt)
-            {
-                return Err(RunnerError::InvalidProposal);
+                .ok_or_else(|| {
+                    reject(if is_source_label(&item.source_id) {
+                        format!("unknown source_id {}", item.source_id).into()
+                    } else {
+                        "unknown source_id".into()
+                    })
+                })?;
+            if item.excerpt.is_empty() {
+                return Err(reject("excerpt is empty".into()));
+            }
+            if item.excerpt.len() > 2048 {
+                return Err(reject("excerpt exceeds 2048 bytes".into()));
+            }
+            if !source.text.contains(&item.excerpt) {
+                return Err(reject(
+                    format!("excerpt is not a substring of {}", source.id).into(),
+                ));
             }
             evidence.push(Evidence {
                 pin: source.pin.clone(),
@@ -152,6 +307,6 @@ pub fn to_submission(packet: &Packet, proposal: &Proposal) -> Result<Submission,
         reported_tokens: None,
     };
     validate::submission_for_work(&submission, &primary.pin, &packet.reasons)
-        .map_err(|_| RunnerError::InvalidProposal)?;
+        .map_err(|error| locate(&submission, error))?;
     Ok(submission)
 }

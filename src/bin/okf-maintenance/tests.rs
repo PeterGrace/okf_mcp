@@ -2,9 +2,12 @@ use super::*;
 use okf_mcp::{
     investigator::{
         journal::{Journal, PendingMutation},
-        types::{AllowedTool, ModelRequest, ModelResult, ModelUsage, Proposal, ToolRequest},
+        types::{
+            AllowedTool, ModelRequest, ModelResult, ModelUsage, Proposal, ProposedEvidence,
+            ProposedFinding, ToolRequest,
+        },
     },
-    maintenance::types::{Lane, Lease, RevisionPin},
+    maintenance::types::{Category, Lane, Lease, Relationship, RevisionPin},
 };
 use rmcp::model::Tool;
 use serde_json::{json, Value};
@@ -17,6 +20,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+/// The rejection reason the "rejected" scenario's proposal must produce.
+const REJECTION: &str = "finding 0 evidence 0: unknown source_id s7";
 
 #[derive(Default)]
 struct Seen {
@@ -88,7 +94,7 @@ impl FakeClient {
         let now = chrono::Utc::now();
         json!({"id":"run", "state":state,"actor":"fixture", "created_at":now.to_rfc3339(),
             "deadline":(now + chrono::Duration::seconds(3600)).to_rfc3339(),
-            "ended_at":null,"reason":null,"primary_count":if self.mode == "aging" || self.mode == "signal" {1} else {0},
+            "ended_at":null,"reason":null,"primary_count":if matches!(self.mode.as_str(), "aging" | "signal" | "rejected") {1} else {0},
             "completed_count":0,"failed_count":0,"inconclusive_count":0,"superseded_count":0})
     }
 }
@@ -133,7 +139,7 @@ impl CatalogClient for FakeClient {
         }
         let mut value = match request.tool {
             AllowedTool::Claim => {
-                json!({"run_id":"run", "leases":if self.mode == "aging" || self.mode == "signal" { vec![Lease {
+                json!({"run_id":"run", "leases":if matches!(self.mode.as_str(), "aging" | "signal" | "rejected") { vec![Lease {
                 run_id:"run".into(),work_id:"work".into(),token:"LEASE_CANARY".into(),
                 pin:RevisionPin {path:"/fixture.md".into(), revision:1}, reasons:vec![Lane::Aging],
                 expires_at:(chrono::Utc::now()+chrono::Duration::seconds(900)).to_rfc3339(),
@@ -148,6 +154,13 @@ impl CatalogClient for FakeClient {
             }
             AllowedTool::Search => json!({"hits":[],"skipped":[]}),
             AllowedTool::Submit => {
+                if self.mode == "rejected" {
+                    assert_eq!(request.args["submission"]["outcome"], "failed");
+                    assert_eq!(
+                        request.args["submission"]["summary"],
+                        format!("Proposal rejected: {REJECTION}")
+                    );
+                }
                 if self.mode == "aging" {
                     assert_eq!(request.args["submission"]["outcome"], "inconclusive");
                     assert_eq!(request.args["submission"]["assessment"], "unverifiable");
@@ -178,10 +191,25 @@ impl Inference for FakeModel {
             std::fs::write(self.root.join("reaped"), "completed").unwrap();
             return Err(RunnerError::Cancelled);
         }
+        let findings = if self.mode == "rejected" {
+            vec![ProposedFinding {
+                category: Category::UnverifiableClaim,
+                assertion: "Fixture claim".into(),
+                follow_up: "Ask owner".into(),
+                uncertainty: "Unverified".into(),
+                relationship: Relationship::DirectStatement,
+                evidence: vec![ProposedEvidence {
+                    source_id: "s7".into(),
+                    excerpt: "EXCERPT_CANARY".into(),
+                }],
+            }]
+        } else {
+            vec![]
+        };
         Ok(ModelResult {
             proposal: Proposal {
                 summary: "Catalog only".into(),
-                findings: vec![],
+                findings,
             },
             usage: ModelUsage {
                 input: 1,
@@ -250,6 +278,28 @@ fn investigator_cli_empty_and_aging_exit_0() {
 fn investigator_cli_quiet_sdk_and_child_stderr() {
     scenario("preflight");
     scenario("childfail");
+}
+#[test]
+fn investigator_cli_logs_only_the_rejection_reason() {
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let output = child("rejected", root.path()).output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("test result: ok"));
+    // One line, at warn, naming the work item and the reason; no canaries,
+    // no excerpt text and nothing from rmcp or reqwest.
+    let lines: Vec<_> = stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "{stderr}");
+    for needle in [
+        "WARN",
+        "maintenance proposal rejected",
+        "work_id=work",
+        REJECTION,
+    ] {
+        assert!(lines[0].contains(needle), "{stderr}");
+    }
+    assert!(!stderr.contains("CANARY") && !stdout.contains("CANARY"));
 }
 #[test]
 fn investigator_cli_signals_await_cleanup() {
@@ -525,7 +575,7 @@ fn cli_scenario() {
             let summary: RunSummary = serde_json::from_slice(&output).unwrap();
             assert_eq!(
                 status,
-                if mode == "partial" || mode == "signal" {
+                if matches!(mode.as_str(), "partial" | "signal" | "rejected") {
                     4
                 } else {
                     0
@@ -535,6 +585,10 @@ fn cli_scenario() {
             if mode == "aging" {
                 assert_eq!(summary.inconclusive, 1);
                 assert_eq!(summary.invocations, 1);
+            }
+            if mode == "rejected" {
+                assert_eq!(summary.failed, 1);
+                assert_eq!(summary.reason, "completed");
             }
             if mode == "empty" {
                 assert_eq!(summary.reason, "empty");

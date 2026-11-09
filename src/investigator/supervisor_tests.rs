@@ -113,6 +113,7 @@ impl Fixture {
             proposal: None,
             usage: None,
             failure: None,
+            rejection: None,
         }];
         self.store.save(&j).unwrap();
         if phase == Phase::Claimed {
@@ -569,15 +570,23 @@ async fn investigator_supervisor_invalid_proposal_fails_only_its_item() {
     assert_eq!(s.exit_code(), 4);
     let j = f.store.load().unwrap().unwrap();
     assert_eq!(j.work[0].failure.as_deref(), Some("invalid_proposal"));
+    let reason = "proposal: maintenance report exceeds byte or finding limits";
+    assert_eq!(j.work[0].rejection.as_deref(), Some(reason));
     assert_eq!(j.work[1].failure, None);
+    assert_eq!(j.work[1].rejection, None);
     assert!(j.terminal);
-    let outcomes: Vec<_> = c
+    let submissions: Vec<_> = c
         .calls
         .iter()
         .filter(|(_, r)| r.tool == AllowedTool::Submit)
-        .map(|(_, r)| r.args["submission"]["outcome"].clone())
+        .map(|(_, r)| &r.args["submission"])
         .collect();
-    assert_eq!(outcomes, [json!("failed"), json!("completed")]);
+    assert_eq!(submissions[0]["outcome"], "failed");
+    assert_eq!(
+        submissions[0]["summary"],
+        format!("Proposal rejected: {reason}")
+    );
+    assert_eq!(submissions[1]["outcome"], "completed");
 }
 #[tokio::test]
 async fn investigator_supervisor_recovered_invalid_proposal_is_not_a_run_stop() {
@@ -613,6 +622,11 @@ async fn investigator_supervisor_recovered_invalid_proposal_is_not_a_run_stop() 
         .find(|(_, r)| r.tool == AllowedTool::Submit)
         .unwrap();
     assert_eq!(submit.1.args["submission"]["outcome"], "failed");
+    // A journal written before rejections were recorded keeps the generic summary.
+    assert_eq!(
+        submit.1.args["submission"]["summary"],
+        "Investigation stopped without a usable assessment"
+    );
     assert!(c
         .calls
         .iter()
@@ -1111,6 +1125,7 @@ async fn investigator_supervisor_reconciled_interruption_never_starts_queued_mod
         proposal: None,
         usage: None,
         failure: None,
+        rejection: None,
     });
     f.store.save(&j).unwrap();
     let mut c = f.client(2);
@@ -1243,6 +1258,7 @@ async fn investigator_supervisor_terminal_read_follows_exact_submit_and_preserve
         proposal: None,
         usage: None,
         failure: None,
+        rejection: None,
     });
     let submission = to_submission(
         j.work[0].packet.as_ref().unwrap(),
