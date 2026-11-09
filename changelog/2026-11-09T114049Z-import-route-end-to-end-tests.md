@@ -36,7 +36,8 @@ dependency.
 
 Each test fails when the behaviour it covers is broken. With the upload
 deadline raised tenfold, the slow upload is no longer answered 503. With
-the refresh error returned rather than logged, the import is answered 500.
+the refresh error returned rather than logged, the import is answered 400
+(the error for the bad row's path) instead of 200.
 
 ## Note
 
