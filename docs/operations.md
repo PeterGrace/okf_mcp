@@ -1172,7 +1172,8 @@ Concepts are rendered to HTML on the server (`src/render.rs`):
 - a link to a missing document is struck through.
 
 A body over `concept_outline_chars` is shown as its outline until you
-choose "Load the whole body".
+choose "Load the whole body" or follow a section link, which loads the
+whole body and scrolls to that heading.
 
 | Method | Path | Access | Notes |
 |---|---|---|---|

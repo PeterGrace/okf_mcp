@@ -5545,7 +5545,10 @@ export async function render(main, rest) {
         return;
     }
     if (DOCUMENTS.has(where.path.split('/').pop())) await showDocument(view, where);
-    else await showConcept(view, where, false);
+    // A section route asks for the whole body: over concept_outline_chars the
+    // server sends only the outline, and the heading to scroll to would be
+    // missing (every navigation, an outline click included, renders afresh).
+    else await showConcept(view, where, where.section !== null);
 }
 
 // A folder without index.md: its documents, as links.
@@ -6037,7 +6040,11 @@ Expected: FAIL. Without `js/pages/browse.js` in the manifest, the router shows "
 Run: `just test-ui`
 Expected: the four browse journeys pass with no skip line: `the_tree_opens_a_concept_and_a_link_in_its_body_opens_the_next`, `raw_html_and_script_links_in_a_concept_render_as_text`, `the_links_tab_shows_backlinks_and_a_revision_opens_its_diff` and `search_finds_alpha_and_opens_it`.
 
-> **Corrected (issue #219, 2026-11-10).** Five browse journeys: `tests/ui_e2e/browse.rs` also has `switching_catalogs_while_browsing_opens_the_new_root_once` (a key on `main` and `other`; after three Browse renders, one switch to `other` opens `#/browse/other` and fetches its tree exactly once). This task is the first caller of `api::context` and `Ui::wait_hidden`, so it removes their `#[allow(dead_code)]` (see the issue #216 notes under Task 1). `docs/operations.md` also says that switching catalogs while browsing opens the new catalog's root. The other tasks' journeys pass too. `drive()` fails a journey on any console error, so the hostile concept also proves that no CSP violation fired.
+> **Corrected (issue #219, 2026-11-10).** Five browse journeys: `tests/ui_e2e/browse.rs` also has `switching_catalogs_while_browsing_opens_the_new_root_once` (a key on `main` and `other`; after three Browse renders, one switch to `other` opens `#/browse/other` and fetches its tree exactly once). Tasks 2 and 3 merged first and already removed the `#[allow(dead_code)]` attributes (see the issue #216 notes under Task 1), so this task changes none. `docs/operations.md` also says that switching catalogs while browsing opens the new catalog's root.
+
+> **Corrected (issue #219, 2026-11-10; review of PR #227).** Two navigation fixes:
+> - **Section routes:** `render()` calls `showConcept(view, where, where.section !== null)`, corrected inline above. A section route asks for the whole body, so an outline link on a concept over `concept_outline_chars` reaches its heading. The journey `a_section_link_on_a_long_concept_loads_the_body_and_reaches_the_heading` covers it.
+> - **Fragments:** in `src/render.rs`, a link's `#fragment` goes through `section_slug` (`py_unquote`, then lowercase, as `src/okf/analysis/links.rs` reads fragments) before `browse_route`, so an encoded fragment is not encoded twice. The path stays literal, as `resolve_link` and the catalog's link checks read it. The unit test is `encoded_fragments_are_decoded_once_and_paths_stay_literal`. Read `src/render.rs` for the code, since the renderer listing above predates it. The other tasks' journeys pass too. `drive()` fails a journey on any console error, so the hostile concept also proves that no CSP violation fired.
 
 - [ ] **Step 10: Docs and changelog**
 
