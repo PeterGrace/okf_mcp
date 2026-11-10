@@ -13,3 +13,4 @@ mod health;
 mod keys;
 mod login;
 mod maintenance;
+mod smoke;
