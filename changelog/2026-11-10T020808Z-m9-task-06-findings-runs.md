@@ -30,9 +30,9 @@ Issue #221, Task 6 of `docs/superpowers/plans/2026-11-09-okf-mcp-m9-web-console.
   findings, after sign-in, on a catalog switch, on both pages' loads and
   after every decision.
 - Tests: the store test
-  `maintenance_findings_filter_and_count_by_current_disposition`, five API
-  tests (access matrix, filter and counts, idempotent retry, bad requests, run
-  report), and the journeys
+  `maintenance_findings_filter_and_count_by_current_disposition`, six API
+  tests (access matrix, filter and counts, idempotent retry, bad requests, a
+  reporter key refused a decision and an unknown catalog, run report), and the journeys
   `a_writer_dismisses_a_finding_and_its_state_changes` and
   `a_reader_sees_the_run_and_its_work_but_cannot_decide`.
 - `docs/operations.md`, "Web console": a "Findings and runs" subsection;

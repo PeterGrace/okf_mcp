@@ -190,7 +190,7 @@ async fn counts(
 
 #[cfg(test)]
 mod tests {
-    use chrono::Duration;
+    use chrono::{Duration, Utc};
     use serde_json::json;
 
     use crate::http::api::testing::{app, assert_matrix, keys, send, Row};
@@ -198,6 +198,7 @@ mod tests {
         Actor, Assessment, Category, Evidence, FindingInput, Relationship, Submission, WorkOutcome,
     };
     use crate::mcp::testing::TestApp;
+    use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
     use crate::store::maintenance::{reports as finding_store, runs as run_store};
 
     const BASE: &str = "/api/v1/catalogs/main/maintenance";
@@ -409,6 +410,49 @@ mod tests {
         )
         .await;
         assert_eq!(status.as_u16(), 422);
+    }
+
+    #[tokio::test]
+    async fn a_reporter_cannot_decide_and_an_unknown_catalog_is_404() {
+        let test = app().await;
+        let (_, finding) = seed(&test).await;
+        let keys = keys(&test).await;
+        // A read-level key with the reporting flag, as the runner holds.
+        let grants = ["main".to_owned()];
+        let reporter = key_rows::create_with_id(
+            test.app.pool(),
+            &NewKey {
+                name: "runner",
+                access: Access::Read,
+                maintenance_report: true,
+                grants: Grants::Catalogs(&grants),
+                default_catalog: Some("main"),
+                actor: "runner",
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("create a reporter key")
+        .key;
+        test.app.poll().await.expect("poll the reporter in");
+        let (status, body) = send(
+            &test,
+            "POST",
+            &format!("{BASE}/findings/{finding}/disposition"),
+            Some(&reporter),
+            Some(dispose_body("dismissed", "Not mine to decide.", "reporter")),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 403, "{body}");
+        let missing = "/api/v1/catalogs/missing/maintenance";
+        for uri in [
+            format!("{missing}/runs"),
+            format!("{missing}/findings"),
+            format!("{missing}/counts"),
+        ] {
+            let (status, _) = send(&test, "GET", &uri, Some(&keys.admin), None).await;
+            assert_eq!(status.as_u16(), 404, "{uri}");
+        }
     }
 
     #[tokio::test]

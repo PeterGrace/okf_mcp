@@ -8321,7 +8321,7 @@ async fn counts(
 Run: `cargo test --lib http::api::maintenance -- --test-threads=6 && cargo test --test maintenance -- --test-threads=6`
 Expected: PASS: `maintenance_routes_follow_the_tools_access`, `the_filter_and_the_counts_follow_the_current_disposition`, `a_retried_disposition_replays_and_a_changed_one_is_refused`, `bad_maintenance_requests_are_refused`, `a_run_lists_its_work_and_findings`. The MCP maintenance tests are unchanged and still pass (the tool now delegates).
 
-> **Corrected (issue #221, 2026-11-10).** The tests and the area passed as written. The open check "an `app_with` catalog can be claimed for maintenance" holds: `seed` claims one of `MAIN`'s two `type: system` concepts through `run_store::claim` and submits it with the synthetic credential `reporter`, which no `api_keys` row has.
+> **Corrected (issue #221, 2026-11-10).** The tests and the area passed as written. A sixth test, `a_reporter_cannot_decide_and_an_unknown_catalog_is_404`, backs two sentences of the docs that the matrix did not: a read-level key with the reporting flag gets 403 from the disposition route, and a catalog that does not exist is 404 (the matrix's stranger covers only an unreached one). The open check "an `app_with` catalog can be claimed for maintenance" holds: `seed` claims one of `MAIN`'s two `type: system` concepts through `run_store::claim` and submits it with the synthetic credential `reporter`, which no `api_keys` row has.
 
 - [ ] **Step 7: The Findings and Runs pages**
 
