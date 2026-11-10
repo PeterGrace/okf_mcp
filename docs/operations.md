@@ -1097,6 +1097,27 @@ browser out at its next request.
 curl -s -H "Authorization: Bearer $OKF_MCP_KEY" https://okf-mcp.example.com/api/v1/whoami
 ```
 
+### Health
+
+| Method and path | Key | Does |
+|---|---|---|
+| `GET /api/v1/catalogs/{catalog}/health` | read | `{catalog, lint_errors, lint_warnings, sprawl, orphans, broken_links, oldest, open_questions}`. `sprawl` counts `lint`'s `sprawl` warnings; `oldest` is the stalest concept's `oldest` row (its newest `generated`, `verified` or `reviewed` stamp; `null` without concepts); links are counted without mentions |
+| `GET /api/v1/catalogs/{catalog}/reports/{report}` | read | `report` is `lint`, `sprawl`, `links`, `oldest` or `questions`; the body is that tool's result unchanged. `?n=` for `oldest` and `sprawl` (default 20, clamped to 1..=200; the MCP tools default to 5), `?mentions=false` for `links`. Another name is 404 `NotFound` |
+
+A catalog the key does not reach, or that does not exist, is 404 on both.
+
+```sh
+curl -s -H "Authorization: Bearer $OKF_MCP_KEY" \
+    "https://okf-mcp.example.com/api/v1/catalogs/main/reports/oldest?n=10"
+```
+
+The Health page is the console's landing page. Its five tiles are these
+counts for the selected catalog (lint errors with the warning count, sprawling
+concepts, orphans with the broken-link count, the oldest stamp, open
+questions). The switcher below them shows one report at a time as a sortable
+table, and a row opens its concept in Browse. Refresh reloads the counts and
+the reports.
+
 ### Browse and search
 
 Browse (`#/browse/<catalog>/<path>`) shows a catalog's tree beside one

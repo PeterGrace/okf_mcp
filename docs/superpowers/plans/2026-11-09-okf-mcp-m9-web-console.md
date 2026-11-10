@@ -3473,6 +3473,8 @@ async fn report(
 Run: `cargo test --lib http::api::health -- --test-threads=6`
 Expected: PASS: `health_counts_match_the_reports`, `reports_are_the_tool_results_with_bounded_row_counts`, `bad_report_requests_are_refused`, `health_routes_need_a_key_that_reaches_the_catalog`.
 
+> **Corrected (issue #218, 2026-11-10).** A fifth test, `row_limits_default_to_20_and_clamp_to_1_through_200`, builds a `main` of 201 concepts and checks `oldest` and `sprawl` return 20 rows without `n`, 1 for `n=0`, and 200 for `n=200` and `n=201`. The three-concept fixture could not tell the default or the upper clamp apart from wrong values (review of PR #225).
+
 - [ ] **Step 5: The Health page**
 
 `src/http/ui/js/pages/health.js`. Ids and attributes the journey uses:
@@ -3747,6 +3749,8 @@ Expected: `health_tiles_match_the_api_and_a_row_opens_its_concept` passes with T
   | GET | `/api/v1/catalogs/{catalog}/reports/{report}` | read | `report` is `lint`, `sprawl`, `links`, `oldest` or `questions`; the body is that tool's result unchanged. `?n=` for `oldest` and `sprawl` (default 20, clamped to 1..=200; the MCP tools default to 5), `?mentions=false` for `links`. Another name is 404 `NotFound`. |
 
   Then one paragraph: the Health page is the console's landing page; its tiles are these counts, the switcher shows one report, and a row opens its concept in Browse.
+
+  > **Corrected (issue #218, 2026-11-10).** `docs/operations.md`'s merged "API reference" table has three columns (`Method and path | Key | Does`), not the four above. The Health rows use that shape, in their own `### Health` subsection placed before "Testing the console", so each area's subsection sits beside the others and a merge keeps both sides. Tasks 2 and 4 to 7: write your rows the same way.
 - `README.md`, "Web console": add "The Health page shows lint, sprawl, link, staleness and open-question counts, with each report one click away."
 - `changelog/<date -u +%Y-%m-%dT%H%M%SZ>-m9-task-03-health.md`: Added (the two routes, `HealthCounts`, the Health page, the journey); Notes (unknown report is 404; `?n=` default 20 vs the tools' 5; sprawl counted from lint).
 
@@ -9270,6 +9274,8 @@ Depends on Tasks 1 to 7. The rollout steps wait for pgrace's go-ahead.
 - Modify: `README.md` (status line and the "Web console" section, checked against what shipped)
 - Modify: `docs/operations.md` (the complete "Web console" API table; the upgrade note)
 - Modify: `docs/superpowers/specs/2026-11-09-okf-webui-design.md` (deviations 1 to 5; a closing "What M9 shipped differently" section)
+
+  > **Corrected (issue #218, 2026-11-10).** Also reconcile the spec's "Delivery" phase 3 sentence ("Until phase 4 lands, report rows link to the raw document endpoint"): Health's rows link to Browse through `browseHash` from the start, and the router shows "Not available yet" until Task 4 lands, as "Task dependencies" decided. No raw document endpoint exists under `/api/v1` (review of PR #225).
 - Create: `changelog/<ts>-m9-web-console.md` (milestone changelog) and the release entry `just release-prepare` writes
 
 - [ ] **Step 1: Check the docs against the code**
