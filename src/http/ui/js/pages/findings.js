@@ -35,22 +35,25 @@ const outdatedPill = finding => (finding.outdated ? [' ', pill('outdated', 'erro
 
 // Sets #findings-badge to the selected catalog's open findings: hidden at 0,
 // or when the count cannot be read. main.js calls it after sign-in and on a
-// catalog switch; this page calls it on load and after every decision. Each
-// call reads the counts afresh, so a late answer is still current unless the
-// catalog changed meanwhile, which the check after the await covers.
+// catalog switch; this page calls it on load and after every decision.
+// Answers can arrive out of order, so only the newest call may touch the
+// badge, and only while the catalog and the signed-in identity it asked for
+// are still current; an older call's success or failure is dropped.
+let badgeTicket = 0;
 export async function refreshFindingsBadge() {
     const badge = document.getElementById('findings-badge');
-    const catalog = store.catalog;
     if (!badge) return;
-    if (!catalog || !store.whoami) { badge.hidden = true; return; }
+    const mine = ++badgeTicket;
+    const catalog = store.catalog;
+    const identity = store.whoami;
+    if (!catalog || !identity) { badge.hidden = true; return; }
+    let counts = null;
     try {
-        const counts = await api.get(maintenancePath(catalog, '/counts'), { quiet: true });
-        if (catalog !== store.catalog) return;   // switched meanwhile: the newer call wins
-        badge.textContent = String(counts.open);
-        badge.hidden = counts.open === 0;
-    } catch {
-        badge.hidden = true;
-    }
+        counts = await api.get(maintenancePath(catalog, '/counts'), { quiet: true });
+    } catch { /* unreadable: hidden below, if still the newest call */ }
+    if (mine !== badgeTicket || catalog !== store.catalog || identity !== store.whoami) return;
+    if (counts) badge.textContent = String(counts.open);
+    badge.hidden = !counts || counts.open === 0;
 }
 
 // A retry key. randomUUID needs a secure context (https or localhost);
@@ -173,11 +176,20 @@ export async function render(main, rest) {
 
     // A function declaration is hoisted, so it can be referenced above; it
     // first runs at the `await load(true)` below, after `table` and `more` exist.
+    // A reset drops the old cursor at once, so "Load more" cannot append a
+    // page of the previous filter while the new first page is pending; an
+    // append needs a cursor, which only a completed load of this filter sets.
     async function load(reset) {
+        if (reset) {
+            next = null;
+            more.hidden = true;
+        } else if (!next) {
+            return;
+        }
         const mine = ++ticket;
         const query = new URLSearchParams({ limit: String(PAGE_SIZE) });
         if (filter !== 'all') query.set('disposition', filter);
-        if (!reset && next) query.set('after', next);
+        if (!reset) query.set('after', next);
         try {
             const page = await api.get(`${maintenancePath(catalog, '/findings')}?${query}`);
             if (mine !== ticket) return;
