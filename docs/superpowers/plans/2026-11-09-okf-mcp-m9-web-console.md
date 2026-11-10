@@ -3747,6 +3747,8 @@ Expected: `health_tiles_match_the_api_and_a_row_opens_its_concept` passes with T
   | GET | `/api/v1/catalogs/{catalog}/reports/{report}` | read | `report` is `lint`, `sprawl`, `links`, `oldest` or `questions`; the body is that tool's result unchanged. `?n=` for `oldest` and `sprawl` (default 20, clamped to 1..=200; the MCP tools default to 5), `?mentions=false` for `links`. Another name is 404 `NotFound`. |
 
   Then one paragraph: the Health page is the console's landing page; its tiles are these counts, the switcher shows one report, and a row opens its concept in Browse.
+
+  > **Corrected (issue #218, 2026-11-10).** `docs/operations.md`'s merged "API reference" table has three columns (`Method and path | Key | Does`), not the four above. The Health rows use that shape, in their own `### Health` subsection placed before "Testing the console", so each area's subsection sits beside the others and a merge keeps both sides. Tasks 2 and 4 to 7: write your rows the same way.
 - `README.md`, "Web console": add "The Health page shows lint, sprawl, link, staleness and open-question counts, with each report one click away."
 - `changelog/<date -u +%Y-%m-%dT%H%M%SZ>-m9-task-03-health.md`: Added (the two routes, `HealthCounts`, the Health page, the journey); Notes (unknown report is 404; `?n=` default 20 vs the tools' 5; sprawl counted from lint).
 

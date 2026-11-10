@@ -285,6 +285,9 @@ hides what the key cannot do. The key stays in that browser's `localStorage`
 until you sign out (or only in memory for the page's lifetime, where storage
 is blocked), so sign out on a shared machine.
 
+The Health page shows lint, sprawl, link, staleness and open-question counts,
+with each report one click away.
+
 Every console action is an `/api/v1` call with the same bearer key, so
 anything the console does can be scripted:
 
