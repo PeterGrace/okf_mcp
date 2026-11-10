@@ -2778,7 +2778,7 @@ function isMine(key) {
 
 const COLUMNS = [
     { key: 'name', label: 'Name', sort: key => key.name,
-      render: key => h('span', { 'data-test': `key-${key.name}` }, key.name, isMine(key) ? [' ', pill('you', 'info')] : null) },
+      render: key => h('span', { class: 'key-name', 'data-test': `key-${key.name}` }, key.name, isMine(key) ? [' ', pill('you', 'info')] : null) },
     { key: 'actor', label: 'Actor', class: 'mono', sort: key => key.actor },
     { key: 'access', label: 'Access', sort: key => LEVELS.indexOf(key.access),
       render: key => pill(key.access, ACCESS_KIND[key.access]) },
@@ -2987,6 +2987,9 @@ Append to `src/http/ui/styles.css`:
 
 ```css
 /* API keys (Task 2): drawer facts, grant list, the one-time secret */
+/* One line box: a wrapped name leaves a gap at its centre, where a click
+   lands on the cell instead of the name. */
+.key-name { white-space: nowrap; }
 dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1rem; margin: 0 0 1rem; }
 dl.facts dt { color: var(--fg-muted); font-size: .8rem; }
 dl.facts dd { margin: 0; }
@@ -2994,11 +2997,11 @@ dl.facts dd { margin: 0; }
 .grant-list li { display: flex; gap: .5rem; align-items: center; padding: .15rem 0; }
 .inline-form { display: flex; gap: .5rem; align-items: center; }
 .inline-form select, .inline-form button { width: auto; margin: 0; }
-.drawer-actions { display: flex; gap: .5rem; margin-top: 1rem; }
-.drawer-actions button { width: auto; margin: 0; }
 pre.secret { white-space: pre-wrap; word-break: break-all; }
 .warn-text { color: var(--warn); font-weight: 600; }
 ```
+
+> **Corrected (issue #217, 2026-11-10).** Two changes to this step as first planned. The block no longer carries `.drawer-actions`: Task 1's `styles.css` already has it (with `flex-wrap`), so a second copy only overrode it. The name cell's span has `class: 'key-name'` and `.key-name { white-space: nowrap; }`: at the journeys' 800 px viewport the eight-column table wrapped `console-self you` onto two lines, the centre of the span fell between them on the bare cell, and rustwright refused the click with `Actionability(NotReceivingEvents)`.
 
 - [ ] **Step 6: Browser journeys (failing first)**
 
@@ -3094,6 +3097,8 @@ Run: `just test-ui`
 Expected: PASS, including `an_admin_creates_a_key_sees_its_secret_once_and_signs_in_with_it`, `revoking_the_signed_in_key_returns_the_browser_to_login` and `a_read_key_never_sees_the_keys_page`, with no skip lines.
 
 - [ ] **Step 8: Docs and changelog**
+
+> **Corrected (issue #217, 2026-11-10).** The rows below went into the "API keys" subsection's own table, in Task 1's column layout (`Method and path | Key | Does`), not into the shared "API reference" table, so parallel tasks do not edit the same table. The example uses `okf-mcp.example.com`, as Task 1's does.
 
 `docs/operations.md`, section "Web console": add subsection "API keys", saying that the page and its API are for admin keys only; that an admin key manages only the keys inside its reach (a key that reaches every catalog manages every key; one scoped to catalogs manages the keys whose every catalog it reaches, and no all-catalogs key); that a new key or a grant may name only catalogs the caller reaches, and `all` needs an all-catalogs caller; that the secret is in the `POST` response only; and that a revoke or grant takes effect on the next request. API reference rows:
 
@@ -9149,14 +9154,12 @@ async function discardOne(row, reload) {
 
 Element ids and `data-test` attributes the journey uses: `#changesets-table`, `[data-test=changeset-handle]`, `#changeset-diff`, `#changeset-discard`, `#changesets-refresh`, and Task 1's `#confirm-ok`.
 
-Append to `src/http/ui/styles.css` (`.drawer-actions` is also in Task 2's block; when both land, keep one copy):
+Append to `src/http/ui/styles.css` (`.drawer-actions` is already in Task 1's block, so this one does not repeat it; corrected in issue #217):
 
 ```css
 /* Changesets (Task 7) */
 .diff-file { margin-bottom: 1rem; }
 .diff-file h3 { margin: 0 0 .35rem; }
-.drawer-actions { display: flex; gap: .5rem; margin-top: 1rem; }
-.drawer-actions button { width: auto; margin: 0; }
 ```
 
 - [ ] **Step 7: Browser journey (failing first)**

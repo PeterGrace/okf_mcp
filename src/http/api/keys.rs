@@ -1,15 +1,695 @@
-//! `/api/v1/keys` (web console design, "API": Keys). Filled in by M9 Task 2.
+//! `/api/v1/keys` (web console design, "API": Keys): what `okf-mcp key ...`
+//! does, over HTTP. The handlers call the same `store::keys` functions the
+//! CLI calls, always by immutable key id.
+//!
+//! Access (M9 Task 2, "Security decisions"):
+//! - every route needs an admin key;
+//! - an admin manages only keys inside its reach: all of them if it reaches
+//!   every catalog, else the keys that are not all-catalogs keys and whose
+//!   every catalog it reaches. Any other key is a 404, like an unknown id;
+//! - a new key, or a grant, may name only catalogs the caller reaches, and
+//!   `all: true` needs a caller that reaches every catalog;
+//! - no response but `POST /keys` holds a secret, and none holds a hash.
 
 use std::sync::Arc;
 
-use axum::Router;
+use axum::extract::{Path, State};
+use axum::routing::{get, patch, post, put};
+use axum::{Extension, Json, Router};
+use serde::{Deserialize, Serialize};
 
 use crate::app::App;
+use crate::auth::{Principal, Reach};
+use crate::clock::format_timestamp;
+use crate::error::OkfError;
+use crate::http::api::require_admin;
+use crate::http::AppError;
+use crate::store::keys::{self as key_rows, Access, Grants, KeyRecord, NewKey};
+
+/// One key as the API shows it: never its secret or its hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct KeyView {
+    /// Its immutable id (the `{id}` of the other routes).
+    pub id: String,
+    /// Its grouping name.
+    pub name: String,
+    /// The actor its writes are recorded as.
+    pub actor: String,
+    /// `read`, `write` or `admin`.
+    pub access: &'static str,
+    /// Whether it may submit maintenance reports.
+    pub maintenance_report: bool,
+    /// Granted every catalog, present and future.
+    pub all_catalogs: bool,
+    /// Granted catalogs, sorted (empty with `all_catalogs`).
+    pub catalogs: Vec<String>,
+    /// Its default catalog.
+    pub default_catalog: Option<String>,
+    /// When it was created (`2026-11-09T12:00:00Z`).
+    pub created_at: String,
+    /// When it was revoked, if it was.
+    pub revoked_at: Option<String>,
+}
+
+impl From<KeyRecord> for KeyView {
+    fn from(record: KeyRecord) -> Self {
+        // Destructuring names every field: `sha256: _` drops the hash on
+        // purpose, and a field added to `KeyRecord` later fails to compile
+        // here until someone decides whether the API may show it.
+        let KeyRecord {
+            id,
+            name,
+            sha256: _,
+            access,
+            maintenance_report,
+            all_catalogs,
+            catalogs,
+            default_catalog,
+            actor,
+            created_at,
+            revoked_at,
+        } = record;
+        Self {
+            id,
+            name,
+            actor,
+            access: access.as_str(),
+            maintenance_report,
+            all_catalogs,
+            catalogs,
+            default_catalog,
+            created_at: format_timestamp(created_at),
+            // `Option::map` with a function name applies it to the value, if any.
+            revoked_at: revoked_at.map(format_timestamp),
+        }
+    }
+}
+
+/// `GET /keys`' answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct KeyList {
+    /// The keys the caller manages, revoked ones included, in the store's
+    /// order (name, actor, creation).
+    pub keys: Vec<KeyView>,
+}
+
+/// `POST /keys`' answer: the new key and, this once, its secret.
+// `Debug` is written by hand (not derived) so that a stray `{:?}` in a log
+// line can never print the secret.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CreatedKeyView {
+    /// The new key.
+    pub key: KeyView,
+    /// The bearer secret. It is not stored and cannot be shown again.
+    pub secret: String,
+}
+
+impl std::fmt::Debug for CreatedKeyView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreatedKeyView")
+            .field("key", &self.key)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `POST /keys`' body. `deny_unknown_fields` turns a misspelt field into a
+/// 422 instead of silently ignoring it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateKeyBody {
+    /// Grouping name, `[A-Za-z0-9._-]+`.
+    name: String,
+    /// `read`, `write` or `admin`. A string, because `Access` has no serde
+    /// derive; parsed with `Access::parse`.
+    access: String,
+    /// Grant every catalog, present and future.
+    #[serde(default)]
+    all: bool,
+    /// The catalogs to grant (without `all`).
+    #[serde(default)]
+    catalogs: Vec<String>,
+    /// The default catalog (empty or absent: none).
+    default_catalog: Option<String>,
+    /// The actor (empty or absent: the name, as the CLI does).
+    actor: Option<String>,
+    /// May submit maintenance reports.
+    #[serde(default)]
+    maintenance_report: bool,
+}
+
+/// `PATCH /keys/{id}`'s body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateKeyBody {
+    /// The new maintenance-report flag.
+    maintenance_report: bool,
+}
 
 /// This area's routes.
-///
-/// # Returns
-/// An empty router until Task 2 fills it in.
 pub(crate) fn routes() -> Router<Arc<App>> {
     Router::new()
+        .route("/keys", get(list_keys).post(create_key))
+        .route("/keys/{id}", patch(update_key))
+        .route("/keys/{id}/revoke", post(revoke_key))
+        .route(
+            "/keys/{id}/catalogs/{catalog}",
+            put(grant_catalog).delete(ungrant_catalog),
+        )
+}
+
+/// Whether `principal` may see and change `record` (module doc, "Access").
+///
+/// # Returns
+/// `true` for a caller reaching every catalog; otherwise `true` only for a
+/// key that is not an all-catalogs key and whose every grant the caller reaches.
+fn manages(principal: &Principal, record: &KeyRecord) -> bool {
+    match &principal.reach {
+        Reach::All => true,
+        Reach::Catalogs(_) => {
+            !record.all_catalogs
+                && record
+                    .catalogs
+                    .iter()
+                    .all(|catalog| principal.reaches(catalog))
+        }
+    }
+}
+
+/// The key with exactly this id, if `principal` is an admin that manages it.
+///
+/// # Errors
+/// [`OkfError::Forbidden`] below admin; [`OkfError::NotFound`] for an
+/// unknown id or a key the caller does not manage (worded alike);
+/// [`OkfError::Database`].
+async fn managed(app: &App, principal: &Principal, id: &str) -> Result<KeyRecord, OkfError> {
+    require_admin(principal)?;
+    key_rows::list(app.pool())
+        .await?
+        .into_iter()
+        .find(|record| record.id == id && manages(principal, record))
+        .ok_or_else(|| OkfError::NotFound {
+            path: format!("keys/{id}"),
+        })
+}
+
+/// Reloads the key cache at once (plan Decision 12), then answers with the
+/// key as it now is. The change is already committed, so a failed reload is
+/// logged, not returned: the background poll retries within `poll_interval`.
+///
+/// # Errors
+/// As [`managed`].
+async fn changed(app: &App, principal: &Principal, id: &str) -> Result<Json<KeyView>, AppError> {
+    if let Err(error) = app.poll().await {
+        tracing::error!(%error, "reloading after a key change failed; the next poll retries");
+    }
+    Ok(Json(managed(app, principal, id).await?.into()))
+}
+
+/// `GET /keys`: the keys the caller manages.
+///
+/// # Errors
+/// 403 below admin; 500 if the keys cannot be read.
+async fn list_keys(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+) -> Result<Json<KeyList>, AppError> {
+    require_admin(&principal)?;
+    let keys = key_rows::list(app.pool())
+        .await?
+        .into_iter()
+        .filter(|record| manages(&principal, record))
+        .map(KeyView::from)
+        .collect();
+    Ok(Json(KeyList { keys }))
+}
+
+/// `POST /keys`: creates a key and returns its secret, once.
+///
+/// # Errors
+/// 403 below admin, or `all: true` from a caller that does not reach every
+/// catalog; 404 for a catalog the caller does not reach (or that does not
+/// exist); 400 for an unknown `access`; 409 for a bad or taken name, no
+/// catalogs, `all` together with `catalogs`, or an ungranted default.
+async fn create_key(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Json(body): Json<CreateKeyBody>,
+) -> Result<Json<CreatedKeyView>, AppError> {
+    require_admin(&principal)?;
+    let access = Access::parse(&body.access).ok_or_else(|| OkfError::InvalidPath {
+        path: "access".to_string(),
+        reason: format!("must be read, write or admin, not {:?}", body.access),
+    })?;
+    let grants = if body.all {
+        if !body.catalogs.is_empty() {
+            return Err(OkfError::Refused {
+                reason: "give `all` or `catalogs`, not both".to_string(),
+            }
+            .into());
+        }
+        if !matches!(principal.reach, Reach::All) {
+            return Err(OkfError::Forbidden {
+                reason: "only a key that reaches every catalog may create one that does"
+                    .to_string(),
+            }
+            .into());
+        }
+        Grants::All
+    } else {
+        for catalog in &body.catalogs {
+            principal.require(Access::Admin, catalog)?;
+        }
+        Grants::Catalogs(&body.catalogs)
+    };
+    // `filter` turns `Some("")` (an empty form field) into `None`.
+    let default_catalog = body
+        .default_catalog
+        .as_deref()
+        .filter(|name| !name.is_empty());
+    if let Some(name) = default_catalog {
+        principal.require(Access::Admin, name)?;
+    }
+    let actor = body
+        .actor
+        .as_deref()
+        .map(str::trim)
+        .filter(|actor| !actor.is_empty())
+        .unwrap_or(&body.name);
+    let new = NewKey {
+        name: &body.name,
+        access,
+        maintenance_report: body.maintenance_report,
+        grants,
+        default_catalog,
+        actor,
+    };
+    let created = key_rows::create_with_id(app.pool(), &new, app.clock().now()).await?;
+    let Json(key) = changed(&app, &principal, &created.id).await?;
+    Ok(Json(CreatedKeyView {
+        key,
+        secret: created.key,
+    }))
+}
+
+/// `PATCH /keys/{id}`: sets the maintenance-report flag.
+///
+/// # Errors
+/// 403 below admin; 404 for a key the caller does not manage; 409 for a
+/// revoked key.
+async fn update_key(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateKeyBody>,
+) -> Result<Json<KeyView>, AppError> {
+    let target = managed(&app, &principal, &id).await?;
+    key_rows::set_maintenance_report_target(app.pool(), &target.id, None, body.maintenance_report)
+        .await?;
+    changed(&app, &principal, &target.id).await
+}
+
+/// `POST /keys/{id}/revoke`: the key authenticates nothing from its next
+/// request on (the handler reloads the key cache).
+///
+/// # Errors
+/// 403 below admin; 404 for a key the caller does not manage; 409 if it is
+/// already revoked.
+async fn revoke_key(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(id): Path<String>,
+) -> Result<Json<KeyView>, AppError> {
+    let target = managed(&app, &principal, &id).await?;
+    key_rows::revoke_target(app.pool(), &target.id, None, app.clock().now()).await?;
+    changed(&app, &principal, &target.id).await
+}
+
+/// `PUT /keys/{id}/catalogs/{catalog}`: grants a catalog (already granted:
+/// no change).
+///
+/// # Errors
+/// 403 below admin; 404 for a catalog the caller does not reach or a key it
+/// does not manage; 409 for a revoked or all-catalogs key.
+async fn grant_catalog(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    // Two path parameters arrive as a tuple, in the order of the pattern.
+    Path((id, catalog)): Path<(String, String)>,
+) -> Result<Json<KeyView>, AppError> {
+    require_admin(&principal)?;
+    principal.require(Access::Admin, &catalog)?;
+    let target = managed(&app, &principal, &id).await?;
+    key_rows::grant_target(app.pool(), &target.id, None, &catalog).await?;
+    changed(&app, &principal, &target.id).await
+}
+
+/// `DELETE /keys/{id}/catalogs/{catalog}`: removes a grant, and the default
+/// if it was that catalog (not granted: no change).
+///
+/// # Errors
+/// As [`grant_catalog`].
+async fn ungrant_catalog(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path((id, catalog)): Path<(String, String)>,
+) -> Result<Json<KeyView>, AppError> {
+    require_admin(&principal)?;
+    principal.require(Access::Admin, &catalog)?;
+    let target = managed(&app, &principal, &id).await?;
+    key_rows::ungrant_target(app.pool(), &target.id, None, &catalog).await?;
+    changed(&app, &principal, &target.id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use serde_json::json;
+
+    use crate::http::api::testing::{app, assert_matrix, keys, send, Row};
+    use crate::mcp::testing::TestApp;
+    use crate::store::keys::{self as key_rows, Access, CreatedKey, Grants, NewKey};
+
+    /// Creates a key straight in the store, as `okf-mcp key create` would,
+    /// and polls so the server knows it.
+    async fn stored(test: &TestApp, name: &str, access: Access, grants: Grants<'_>) -> CreatedKey {
+        let new = NewKey {
+            name,
+            access,
+            maintenance_report: false,
+            grants,
+            default_catalog: None,
+            actor: name,
+        };
+        let created = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
+            .await
+            .expect("create a key");
+        test.app.poll().await.expect("poll the key in");
+        created
+    }
+
+    fn main_only() -> Vec<String> {
+        vec!["main".to_string()]
+    }
+
+    #[tokio::test]
+    async fn key_routes_need_an_admin_that_reaches_the_key() {
+        let test = app().await;
+        let main = main_only();
+        let first = stored(&test, "target-one", Access::Read, Grants::Catalogs(&main))
+            .await
+            .id;
+        let second = stored(&test, "target-two", Access::Read, Grants::Catalogs(&main))
+            .await
+            .id;
+        // Rows run read, write, stranger, admin; only admin succeeds, last.
+        // `first` is revoked by its last row, so its other rows come before.
+        assert_matrix(
+            &test,
+            &[
+                Row {
+                    method: "GET",
+                    uri: "/api/v1/keys".into(),
+                    body: None,
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 200,
+                },
+                Row {
+                    method: "POST",
+                    uri: "/api/v1/keys".into(),
+                    body: Some(json!({"name": "made", "access": "read",
+                                        "catalogs": ["main"], "default_catalog": "main"})),
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 404,
+                },
+                Row {
+                    method: "PUT",
+                    uri: format!("/api/v1/keys/{first}/catalogs/main"),
+                    body: None,
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 404,
+                },
+                Row {
+                    method: "PATCH",
+                    uri: format!("/api/v1/keys/{first}"),
+                    body: Some(json!({"maintenance_report": true})),
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 404,
+                },
+                Row {
+                    method: "POST",
+                    uri: format!("/api/v1/keys/{first}/revoke"),
+                    body: None,
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 404,
+                },
+                Row {
+                    method: "DELETE",
+                    uri: format!("/api/v1/keys/{second}/catalogs/main"),
+                    body: None,
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 404,
+                },
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_returns_the_secret_once_and_the_new_key_works() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let body = json!({"name": "fresh", "access": "write", "catalogs": ["main"],
+                          "default_catalog": "main", "actor": "agent/fresh"});
+        let (status, created) =
+            send(&test, "POST", "/api/v1/keys", Some(&keys.admin), Some(body)).await;
+        assert_eq!(status.as_u16(), 200, "{created}");
+        let secret = created["secret"].as_str().expect("a secret").to_string();
+        assert!(secret.starts_with(crate::keys::KEY_PREFIX));
+        assert_eq!(created["key"]["name"], "fresh");
+        assert_eq!(created["key"]["actor"], "agent/fresh");
+        assert_eq!(created["key"]["access"], "write");
+        assert_eq!(created["key"]["catalogs"], json!(["main"]));
+        assert!(created["key"].get("sha256").is_none());
+
+        // The poll after the change means the key works on the next request.
+        let (status, me) = send(&test, "GET", "/api/v1/whoami", Some(&secret), None).await;
+        assert_eq!(status.as_u16(), 200);
+        assert_eq!(me["name"], "fresh");
+
+        // The list never shows a secret or a hash.
+        let (_, listed) = send(&test, "GET", "/api/v1/keys", Some(&keys.admin), None).await;
+        let text = listed.to_string();
+        assert!(!text.contains(&secret));
+        assert!(!text.contains("sha256"));
+        let names: Vec<&str> = listed["keys"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .filter_map(|key| key["name"].as_str())
+            .collect();
+        assert!(names.contains(&"fresh"), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn the_actor_defaults_to_the_name() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let body = json!({"name": "plain", "access": "read", "catalogs": ["main"]});
+        let (status, created) =
+            send(&test, "POST", "/api/v1/keys", Some(&keys.admin), Some(body)).await;
+        assert_eq!(status.as_u16(), 200, "{created}");
+        assert_eq!(created["key"]["actor"], "plain");
+        assert_eq!(created["key"]["default_catalog"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn create_stays_within_the_callers_reach() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let root = stored(&test, "root", Access::Admin, Grants::All).await;
+        let post = |body: serde_json::Value, key: String| {
+            let test = &test;
+            async move { send(test, "POST", "/api/v1/keys", Some(&key), Some(body)).await }
+        };
+        // A catalog the admin does not reach looks like an unknown one.
+        let (status, _) = post(
+            json!({"name": "x1", "access": "read", "catalogs": ["other"]}),
+            keys.admin.clone(),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 404);
+        // Only a key that reaches every catalog may make one that does.
+        let (status, _) = post(
+            json!({"name": "x2", "access": "read", "all": true}),
+            keys.admin.clone(),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 403);
+        let (status, _) = post(
+            json!({"name": "x3", "access": "read", "all": true}),
+            root.key.clone(),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200);
+        // Bad input.
+        let (status, body) = post(
+            json!({"name": "x4", "access": "owner", "catalogs": ["main"]}),
+            keys.admin.clone(),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 400);
+        assert_eq!(body["error"], "InvalidPath");
+        let (status, _) = post(
+            json!({"name": "bad name", "access": "read", "catalogs": ["main"]}),
+            keys.admin.clone(),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 409);
+        let (status, _) = post(
+            json!({"name": "x5", "access": "read", "all": true, "catalogs": ["main"]}),
+            root.key.clone(),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 409);
+        let (status, _) = post(
+            json!({"name": "x6", "access": "read", "catalogs": ["main"], "extra": 1}),
+            keys.admin.clone(),
+        )
+        .await;
+        assert_eq!(
+            status.as_u16(),
+            422,
+            "unknown fields are refused by the Json extractor"
+        );
+
+        // The scoped admin does not see the all-catalogs keys; root sees every key.
+        let names = |listed: &serde_json::Value| -> Vec<String> {
+            listed["keys"]
+                .as_array()
+                .expect("a list")
+                .iter()
+                .filter_map(|key| key["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        let (_, scoped) = send(&test, "GET", "/api/v1/keys", Some(&keys.admin), None).await;
+        let scoped = names(&scoped);
+        assert!(
+            !scoped
+                .iter()
+                .any(|name| name == "root" || name == "x3" || name == "stranger"),
+            "{scoped:?}"
+        );
+        let (_, everything) = send(&test, "GET", "/api/v1/keys", Some(&root.key), None).await;
+        let everything = names(&everything);
+        assert!(
+            ["root", "x3", "stranger", "admin"]
+                .iter()
+                .all(|name| everything.iter().any(|n| n == name)),
+            "{everything:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_and_ungrant_stay_within_reach() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let root = stored(&test, "root", Access::Admin, Grants::All).await;
+        let main = main_only();
+        let target = stored(&test, "target", Access::Read, Grants::Catalogs(&main))
+            .await
+            .id;
+
+        // The scoped admin cannot grant a catalog it does not reach.
+        let uri = format!("/api/v1/keys/{target}/catalogs/other");
+        let (status, _) = send(&test, "PUT", &uri, Some(&keys.admin), None).await;
+        assert_eq!(status.as_u16(), 404);
+        // Root can; then the key reaches beyond the scoped admin, who loses it.
+        let (status, granted) = send(&test, "PUT", &uri, Some(&root.key), None).await;
+        assert_eq!(status.as_u16(), 200, "{granted}");
+        assert_eq!(granted["catalogs"], json!(["main", "other"]));
+        let main_uri = format!("/api/v1/keys/{target}/catalogs/main");
+        let (status, _) = send(&test, "DELETE", &main_uri, Some(&keys.admin), None).await;
+        assert_eq!(status.as_u16(), 404);
+        // Root takes `other` away again.
+        let (status, ungranted) = send(&test, "DELETE", &uri, Some(&root.key), None).await;
+        assert_eq!(status.as_u16(), 200);
+        assert_eq!(ungranted["catalogs"], json!(["main"]));
+        // An unknown catalog, and an unknown key id.
+        let (status, _) = send(
+            &test,
+            "PUT",
+            &format!("/api/v1/keys/{target}/catalogs/nope"),
+            Some(&root.key),
+            None,
+        )
+        .await;
+        assert_eq!(status.as_u16(), 404);
+        let (status, _) = send(
+            &test,
+            "PUT",
+            "/api/v1/keys/no-such-id/catalogs/main",
+            Some(&root.key),
+            None,
+        )
+        .await;
+        assert_eq!(status.as_u16(), 404);
+        // A name is not an id: `{id}` never falls back to name resolution.
+        let (status, _) = send(
+            &test,
+            "POST",
+            "/api/v1/keys/target/revoke",
+            Some(&root.key),
+            None,
+        )
+        .await;
+        assert_eq!(status.as_u16(), 404);
+    }
+
+    #[tokio::test]
+    async fn reporting_and_revoke_take_effect_at_once() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let main = main_only();
+        let target = stored(&test, "target", Access::Read, Grants::Catalogs(&main)).await;
+
+        let (status, patched) = send(
+            &test,
+            "PATCH",
+            &format!("/api/v1/keys/{}", target.id),
+            Some(&keys.admin),
+            Some(json!({"maintenance_report": true})),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200);
+        assert_eq!(patched["maintenance_report"], true);
+        let (_, me) = send(&test, "GET", "/api/v1/whoami", Some(&target.key), None).await;
+        assert_eq!(me["maintenance_report"], true);
+
+        let revoke = format!("/api/v1/keys/{}/revoke", target.id);
+        let (status, revoked) = send(&test, "POST", &revoke, Some(&keys.admin), None).await;
+        assert_eq!(status.as_u16(), 200);
+        assert!(revoked["revoked_at"].is_string());
+        let (status, _) = send(&test, "GET", "/api/v1/whoami", Some(&target.key), None).await;
+        assert_eq!(
+            status.as_u16(),
+            401,
+            "the revoked key is refused on its next request"
+        );
+        let (status, _) = send(&test, "POST", &revoke, Some(&keys.admin), None).await;
+        assert_eq!(status.as_u16(), 409, "already revoked");
+    }
 }
