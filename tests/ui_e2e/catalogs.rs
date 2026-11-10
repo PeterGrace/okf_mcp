@@ -205,3 +205,123 @@ async fn an_import_reports_its_counts_and_a_stale_generation_is_refused() {
         generation + 1
     );
 }
+
+/// Delays every export `fetch` by 1.5 s, so a journey can act while one is
+/// in flight.
+const DELAY_EXPORTS: &str = "() => {
+    const real = window.fetch;
+    window.fetch = (url, options) => String(url).includes('/export')
+        ? new Promise(done => setTimeout(done, 1500)).then(() => real.call(window, url, options))
+        : real.call(window, url, options);
+    return true;
+}";
+
+/// Delays every `XMLHttpRequest` send (the import upload) by 1.5 s and
+/// counts them in `window.importPosts`.
+const DELAY_UPLOADS: &str = "() => {
+    const send = XMLHttpRequest.prototype.send;
+    window.importPosts = 0;
+    XMLHttpRequest.prototype.send = function (body) {
+        window.importPosts += 1;
+        setTimeout(() => send.call(this, body), 1500);
+    };
+    return true;
+}";
+
+/// Whether each of `selectors` is disabled, in order.
+fn disabled(ui: &Ui, selectors: &[&str]) -> Vec<bool> {
+    let states = ui.eval(
+        "(selectors) => selectors.map(selector => document.querySelector(selector).disabled)",
+        json!(selectors),
+    );
+    serde_json::from_value(states).expect("a list of booleans")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_export_or_import_in_flight_locks_the_catalog_and_admits_no_second_import() {
+    let server = TestServer::start(
+        vec![
+            (
+                "main",
+                files(&[("index.md", "# Main\n"), ("systems/alpha.md", ALPHA)]),
+            ),
+            ("other", files(&[("index.md", "# Other\n")])),
+        ],
+        Config::default(),
+    )
+    .await;
+    let key = server
+        .key(
+            "console-busy",
+            Access::Admin,
+            &["main", "other"],
+            Some("main"),
+        )
+        .await;
+    let generation = server
+        .app
+        .catalog("main")
+        .expect("main")
+        .current()
+        .generation();
+    let first = STANDARD.encode(tarball(&[("index.md", "# Main\n\nFirst.\n")]));
+    let second = STANDARD.encode(tarball(&[("index.md", "# Main\n\nSecond.\n")]));
+    let controls = ["#transfer-catalog", "#export-btn", "#import-btn"];
+    drive(server.base.clone(), move |ui| {
+        ui.login(&key);
+        ui.open("/transfer/main");
+        ui.wait_text("#transfer-generation", &format!("generation {generation}"));
+
+        // An export in flight: the picker cannot move to `other` under it,
+        // and the file it hands over is named for the catalog it fetched.
+        ui.eval(DELAY_EXPORTS, json!(null));
+        ui.click("#export-btn");
+        assert_eq!(disabled(ui, &controls), [true, true, true]);
+        ui.wait_visible("#export-link");
+        let download = ui.eval(
+            "() => document.querySelector('#export-link').download",
+            json!(null),
+        );
+        assert_eq!(download, json!("main.tar.gz"));
+        assert_eq!(disabled(ui, &controls[..2]), [false, false]);
+
+        // An import in flight: choosing another file does not unlock Import,
+        // and a click on it sends nothing.
+        ui.eval(DELAY_UPLOADS, json!(null));
+        ui.eval(
+            CHOOSE_FILE,
+            json!({ "name": "first.tar.gz", "data": first }),
+        );
+        ui.click("#import-replace");
+        ui.click("#import-btn");
+        ui.eval(
+            CHOOSE_FILE,
+            json!({ "name": "second.tar.gz", "data": second }),
+        );
+        assert_eq!(disabled(ui, &controls), [true, true, true]);
+        let posts = ui.eval(
+            "() => { document.querySelector('#import-btn').click(); return window.importPosts; }",
+            json!(null),
+        );
+        assert_eq!(posts, json!(1));
+        ui.wait_visible("#import-report");
+        ui.wait_text(
+            "#transfer-generation",
+            &format!("generation {}", generation + 1),
+        );
+        let posts = ui.eval("() => window.importPosts", json!(null));
+        assert_eq!(posts, json!(1));
+        // Done: the second file may be imported now.
+        assert_eq!(disabled(ui, &controls), [false, false, false]);
+    })
+    .await;
+    assert_eq!(
+        server
+            .app
+            .catalog("main")
+            .expect("main")
+            .current()
+            .generation(),
+        generation + 1
+    );
+}

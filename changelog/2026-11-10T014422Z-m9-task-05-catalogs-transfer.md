@@ -38,7 +38,7 @@ Issue #220, Task 5 of `docs/superpowers/plans/2026-11-09-okf-mcp-m9-web-console.
 - Tests: `only_machinery_replaces_machinery_and_keeps_the_concepts`,
   `an_import_expecting_another_generation_is_409_and_imports_nothing`
   (`archives.rs`); the access matrix and five behaviour tests in
-  `api/catalogs.rs`; three browser journeys in `tests/ui_e2e/catalogs.rs`.
+  `api/catalogs.rs`; four browser journeys in `tests/ui_e2e/catalogs.rs`.
 - Docs: `docs/operations.md` "Catalogs and import/export" subsection, the
   route table, section 9's HTTP import options with a guarded machinery-only
   `curl`, and the 409 troubleshooting row; `README.md`'s import row, the 409
@@ -62,5 +62,11 @@ Issue #220, Task 5 of `docs/superpowers/plans/2026-11-09-okf-mcp-m9-web-console.
   (read), import (admin; `{}` is not gzip, so 400 past the key check), create
   (403 for every catalog-scoped key), update and delete (admin; the stranger
   404). The delete row runs last.
+- After review (PR #228), the Import & export page runs one export or import
+  at a time: the catalog picker, Export and Import are disabled while one is
+  in flight, a file chosen meanwhile does not unlock Import, and each
+  operation names its own catalog in its URL, file name and messages. The
+  journey `an_export_or_import_in_flight_locks_the_catalog_and_admits_no_second_import`
+  delays the export and the upload to check it.
 - The pages check `main.isConnected` after awaits before closing the drawer
   or handing over a download (plan "Corrected (issue #220)" notes).

@@ -65,6 +65,10 @@ export async function render(main, rest) {
         return;
     }
     let file = null;
+    // One export or import at a time. While one runs, the catalog picker and
+    // both buttons stay disabled, so its target cannot change under it and a
+    // second mutation cannot start; each also keeps its catalog in a local.
+    let busy = false;
     const current = () => catalogs.find(c => c.name === chosen);
 
     const picker = h('select', { id: 'transfer-catalog' }, catalogs.map(c => h('option', { value: c.name }, c.name)));
@@ -80,21 +84,23 @@ export async function render(main, rest) {
     const exportOut = h('span', { id: 'export-out' });
     const exportButton = h('button', { type: 'button', id: 'export-btn' }, 'Export .tar.gz');
     exportButton.addEventListener('click', async () => {
-        exportButton.disabled = true;
+        if (busy) return;
+        const target = chosen;
+        setBusy(true);
         try {
-            const response = await api.get(`/catalogs/${enc(chosen)}/export`, { raw: true });
+            const response = await api.get(`/catalogs/${enc(target)}/export`, { raw: true });
             const blob = await response.blob();
             // Navigated away meanwhile: hand nothing over, and leave the
             // object URL slot to the newer render.
             if (!main.isConnected) return;
             forget();
             exportUrl = URL.createObjectURL(blob);
-            const link = h('a', { id: 'export-link', href: exportUrl, download: `${chosen}.tar.gz`,
-                                  dataset: { size: String(blob.size) } }, `Save ${chosen}.tar.gz again`);
+            const link = h('a', { id: 'export-link', href: exportUrl, download: `${target}.tar.gz`,
+                                  dataset: { size: String(blob.size) } }, `Save ${target}.tar.gz again`);
             exportOut.replaceChildren(link, h('span', { class: 'muted small' }, ` ${blob.size} bytes`));
             link.click();
         } catch { /* toasted */ } finally {
-            exportButton.disabled = false;
+            setBusy(false);
         }
     });
 
@@ -108,29 +114,44 @@ export async function render(main, rest) {
     const drop = fileDrop({
         accept: '.tar.gz,.tgz,application/gzip',
         label: 'Drop a .tar.gz here, or choose one.',
-        onFile: chosenFile => { file = chosenFile; importButton.disabled = false; clear(result); },
+        onFile: chosenFile => {
+            file = chosenFile;
+            // A file chosen during an import waits for it: the running
+            // import's button state and result panel stay its own.
+            if (busy) return;
+            importButton.disabled = false;
+            clear(result);
+        },
     });
+    function setBusy(value) {
+        busy = value;
+        picker.disabled = value;
+        exportButton.disabled = value;
+        importButton.disabled = value || !file;
+    }
     importButton.addEventListener('click', async () => {
-        if (!file) return;
+        if (!file || busy) return;
+        const target = chosen;
+        const sending = file;
         const query = new URLSearchParams();
         if (replace.checked) query.set('replace', 'true');
         if (machinery.checked) query.set('only_machinery', 'true');
         if (generation.value.trim() !== '') query.set('expect_generation', generation.value.trim());
-        importButton.disabled = true;
+        setBusy(true);
         progress.hidden = false;
         progress.value = 0;
         clear(result);
         try {
-            const report = await upload(`/catalogs/${enc(chosen)}/import?${query}`, file,
+            const report = await upload(`/catalogs/${enc(target)}/import?${query}`, sending,
                 fraction => { progress.value = Math.round(fraction * 100); });
             result.append(reportPanel(report));
-            toast(`Imported into ${chosen}.`, 'ok');
+            toast(`Imported into ${target}.`, 'ok');
             try { catalogs = (await api.get('/catalogs')).catalogs; showGeneration(); } catch { /* toasted */ }
         } catch (error) {
             result.append(errorPanel(error));
             toast(error.status === 0 ? error.message : 'The import was refused.', 'error');
         } finally {
-            importButton.disabled = false;
+            setBusy(false);
             progress.hidden = true;
         }
     });
