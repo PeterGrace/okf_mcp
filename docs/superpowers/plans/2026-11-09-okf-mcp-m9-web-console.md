@@ -579,8 +579,9 @@ Create `src/http/api/identity.rs` with its tests at the bottom:
 ```rust
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::http::api::testing::{app, assert_matrix, keys, send, Row};
+    // `oneshot` sends one request through a router without a socket.
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn whoami_describes_the_calling_key() {
@@ -633,7 +634,7 @@ mod tests {
 }
 ```
 
-(`tower::ServiceExt` must be in scope for `.oneshot`; add `use tower::ServiceExt;` inside the test module.)
+> **Corrected (issue #216, 2026-11-10).** The module has no `use super::*;`: nothing in it uses the parent's items, so the import was an unused-import warning. `use tower::ServiceExt;` (for `.oneshot`) is written in.
 
 Create `src/http/ui.rs`'s tests (bottom of the file from Step 4):
 
@@ -776,6 +777,9 @@ async fn api_headers(mut response: Response) -> Response {
 /// # Arguments
 /// * `app` - the application.
 /// * `principal` - the calling key, from `require_key`.
+// Its first callers arrive with Tasks 3 to 7; until then the compiler would
+// warn that it is unused. Whichever of them merges first removes this attribute.
+#[allow(dead_code)]
 pub(crate) fn context(app: &Arc<App>, principal: Arc<Principal>) -> ToolContext {
     ToolContext::new(Arc::clone(app), principal, None)
 }
@@ -798,6 +802,8 @@ pub(crate) fn require_admin(principal: &Principal) -> Result<(), OkfError> {
 ```
 
 > Check `OkfError::Forbidden`'s field type when implementing (`reason: String` per the error list). Adjust `.into()` if it differs.
+
+> **Corrected (issue #216, 2026-11-10).** `OkfError::Forbidden { reason: String }` is as written. `context` carries the same `#[allow(dead_code)]` as `require_admin`: nothing in Task 1 calls it, and clippy's `-D warnings` refuses the dead-code warning. The first of Tasks 3 to 7 to call it removes the attribute (Task 2 calls only `require_admin`, so it removes that one if it merges before Task 5).
 
 Each area stub (`keys.rs`, `health.rs`, `browse.rs`, `search.rs`, `maintenance.rs`, `changesets.rs`). Here is the content for `keys.rs`; each other file says its own area and spec section:
 
@@ -1804,6 +1810,9 @@ impl Ui {
     }
 
     /// Waits until `selector` is absent or hidden.
+    // Its first callers arrive with Tasks 2 to 7 (a closed drawer or dialog);
+    // until then the compiler would warn that it is unused.
+    #[allow(dead_code)]
     pub fn wait_hidden(&self, selector: &str) {
         self.poll(selector, || !self.page.is_visible(selector).unwrap_or(false));
     }
@@ -2009,6 +2018,8 @@ test-ui:
 
 Run: `just test-ui`
 Expected: 6 passed, with no skip lines. (`a_slow_page_render_never_lands_in_a_newer_page` relies on `evaluate` awaiting a returned promise, as Playwright's does; if rustwright 0.3.0 does not, poll a `window` flag the function sets instead.)
+
+> **Corrected (issue #216, 2026-11-10).** Checked: rustwright 0.3.0's `evaluate` awaits a returned promise (it sends `awaitPromise: true`), and the journey passes as written, so no fallback is needed. `wait_hidden` carries `#[allow(dead_code)]` (no Task 1 journey calls it, and the test crate is linted with `-D warnings`); the first task whose journey calls it removes the attribute. A probe journey confirmed that `assert_no_console_errors` fails on both a `console.error` and a CSP violation.
 
 - [ ] **Step 9: Docs and changelog**
 

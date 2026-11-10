@@ -1048,6 +1048,65 @@ can reload systemd and explicitly start the timer. To persist activation across
 boots, they must deliberately add an appropriate install target or wants-link;
 this repository does not do so. Do not start it merely because full tests passed.
 
+## Web console
+
+The server also serves a browser console and the JSON API it runs on, on
+the same port as `/mcp`:
+
+| Route | Key | Does |
+|---|---|---|
+| `GET /` | none | Redirects (303) to `/ui/` |
+| `GET /ui`, `GET /ui/` | none | `/ui` redirects (308) to `/ui/`, which serves the console's shell |
+| `GET /ui/*` | none | The console's static files, embedded in the binary at build time; an unknown file is 404 |
+| `GET /ui/manifest.json` | none | `{"pages": [...]}`: the console pages this build has |
+| `/api/v1/*` | bearer key | The JSON API; each endpoint checks the level it needs |
+
+The console's files hold no catalog data, so they need no key. Every
+`/ui/` response carries:
+
+- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`
+- `X-Content-Type-Options: nosniff`
+- `Referrer-Policy: no-referrer`
+- `Cache-Control: no-cache` on each file (the browser revalidates on every load)
+
+Google Fonts (`fonts.googleapis.com` for the stylesheet, `fonts.gstatic.com`
+for the fonts) is the only third-party origin the console loads from. Behind
+a proxy that adds its own CSP, keep these sources or the fonts fall back to
+the system ones.
+
+Every `/api/v1` response carries `Cache-Control: no-store` and
+`X-Content-Type-Options: nosniff`. The API uses the same bearer keys and the
+same errors as the other routes: 401 without a valid key (plain text, with
+`WWW-Authenticate: Bearer`), and otherwise `{"error": ..., "message": ...}`
+with the statuses in the README's "Routes". An unknown `/api/v1` path is 404,
+key or not.
+
+You sign in to the console by pasting an API key. The console keeps it in
+that browser's `localStorage` (in memory only, where storage is blocked) until
+you sign out, so sign out on a shared machine; anyone who can run script in
+that browser profile can read it. A refused key (revoked, say) signs the
+browser out at its next request.
+
+### API reference
+
+| Method and path | Key | Does |
+|---|---|---|
+| `GET /api/v1/whoami` | any | The calling key: `key_id`, `name`, `actor`, `access`, `maintenance_report`, `all_catalogs`, `catalogs` (the loaded catalogs it reaches, sorted) and `default_catalog`. Never the key or its hash |
+
+```sh
+curl -s -H "Authorization: Bearer $OKF_MCP_KEY" https://okf-mcp.example.com/api/v1/whoami
+```
+
+### Testing the console
+
+`just test-ui` runs the browser journeys (`tests/ui_e2e`) against a real
+server in headless Chromium, driven by `rustwright`. They need Docker (for
+the throwaway Postgres) and Chromium. `rustwright` finds Chromium through
+`RUSTWRIGHT_CHROMIUM` (the binary's path), `CHROME`, `CHROMIUM`, the
+Playwright cache, then `PATH`; without one, each journey prints a skip line
+and passes. A journey fails on any script error, unhandled rejection or CSP
+violation in the page.
+
 ## 7. Health and time
 
 `GET /healthz` needs no key:

@@ -108,3 +108,6 @@ tokio = { version = "1.54", features = ["test-util"] }
 tokio-util = { version = "0.7.20", features = ["io"] }
 # `ServiceExt::oneshot`, to call an axum router in tests without a socket.
 tower = { version = "0.5.3", features = ["util"] }
+# Browser end-to-end tests of the web console (tests/ui_e2e): a native Rust
+# Chromium driver (no Node). Its API is blocking; call it from spawn_blocking.
+rustwright = "0.3.0"

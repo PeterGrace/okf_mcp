@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>okf console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap">
+    <link rel="stylesheet" href="/ui/vendor/pico.min.css">
+    <link rel="stylesheet" href="/ui/styles.css">
+    <script type="module" src="/ui/js/main.js"></script>
+</head>
+<body>
+    <section id="login" class="login-card" hidden>
+        <h1 class="brand">okf</h1>
+        <p class="muted">Paste an API key to continue. It stays in this browser until you sign out.</p>
+        <form id="login-form">
+            <label>API key
+                <input type="password" name="key" autocomplete="off" required>
+            </label>
+            <button type="submit">Sign in</button>
+        </form>
+        <p id="login-error" class="error" hidden></p>
+    </section>
+
+    <div id="app" class="shell" hidden>
+        <nav class="sidebar" aria-label="Sections">
+            <div class="brand-block">
+                <span class="brand">okf</span>
+                <span class="brand-sub">Catalog console</span>
+            </div>
+            <label class="catalog-switch">Catalog
+                <select id="catalog-select"></select>
+            </label>
+            <a class="nav-link" data-nav="health" href="#/health">Health</a>
+            <a class="nav-link" data-nav="browse" href="#/browse">Browse</a>
+            <a class="nav-link" data-nav="search" href="#/search">Search</a>
+            <div class="nav-group">
+                <span class="nav-group-label">Maintenance</span>
+                <a class="nav-link" data-nav="findings" href="#/findings">Findings <span id="findings-badge" class="nav-badge" hidden></span></a>
+                <a class="nav-link" data-nav="runs" href="#/runs">Runs</a>
+                <a class="nav-link" data-nav="changesets" href="#/changesets">Changesets</a>
+            </div>
+            <div class="nav-group" data-need="admin">
+                <span class="nav-group-label">Administer</span>
+                <a class="nav-link" data-nav="catalogs" href="#/catalogs">Catalogs</a>
+                <a class="nav-link" data-nav="transfer" href="#/transfer">Import &amp; export</a>
+                <a class="nav-link" data-nav="keys" href="#/keys">API keys</a>
+            </div>
+            <div class="sidebar-footer">
+                <span id="whoami" class="mono small"></span>
+                <div class="footer-actions">
+                    <button id="theme-toggle" class="text-btn" type="button">Theme</button>
+                    <button id="signout" class="text-btn" type="button">Sign out</button>
+                </div>
+            </div>
+        </nav>
+        <main id="main"></main>
+    </div>
+
+    <div id="drawer-scrim" class="drawer-scrim" hidden></div>
+    <aside id="drawer" class="drawer" aria-label="Details" hidden></aside>
+    <div id="toasts" aria-live="polite"></div>
+</body>
+</html>
