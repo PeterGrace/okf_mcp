@@ -3,7 +3,8 @@
 # Like Dockerfile, base tags intentionally receive Debian security updates.
 FROM rust:1.99.1-slim-bookworm AS build
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+# build.rs embeds the web console (src/http/ui) that the library includes.
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY migrations ./migrations
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

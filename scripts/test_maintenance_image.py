@@ -60,7 +60,8 @@ class Packaging(unittest.TestCase):
         self.assertIn("FROM rust:1.99.1-slim-bookworm", dockerfile)
         self.assertIn("cargo build --release --locked --bin okf-maintenance", dockerfile)
         self.assertNotRegex(dockerfile, r"COPY\s+\.\s")
-        for path in ("Cargo.toml", "Cargo.lock", "src", "migrations"):
+        # build.rs generates the console asset table (src/http/ui.rs includes it).
+        for path in ("Cargo.toml", "Cargo.lock", "build.rs", "src", "migrations"):
             self.assertRegex(dockerfile, rf"(?m)^COPY .*\b{re.escape(path)}\b")
         self.assertNotRegex(dockerfile, r"(?m)^COPY .*\b(?:tests|fixtures|\.superpowers)\b")
         self.assertIn(f"/usr/local/bin/okf-maintenance {RUNNER}", dockerfile)
