@@ -171,7 +171,7 @@ The M4 to M8 plans' "Conventions for every task" apply unchanged:
 - **Every `/catalogs/...` route names its catalog segment `{catalog}`,** for consistency (axum 0.8.9 accepts different names at one position, checked by compiling, but one name keeps the areas readable). Concept and document paths are a trailing `{*path}`. A wildcard must be the last segment, so the sub-resource goes before the path (`/catalogs/{catalog}/history/{*path}`), never after it.
 
 **Front-end shape** (every page):
-- `src/http/ui/js/pages/<name>.js` exports `async function render(main, rest)`. `main` is the emptied `<main>` element; `rest` holds the hash segments after the page name.
+- `src/http/ui/js/pages/<name>.js` exports `async function render(main, rest)`. `main` is this navigation's own fresh container inside `<main>` (the router's `mount`); `rest` holds the hash segments after the page name. A page writes only into `main`. After any `await`, before touching anything outside `main` (the drawer, the nav badge, `location`), it checks `main.isConnected` and returns if false: the user has navigated away and the router has detached that container. Never look `#main` up globally.
 - DOM only through `h()` and `textContent`. Raw HTML only for server-rendered `body_html`, and only in Task 4.
 - Every `api` call is awaited inside `try`/`catch` (or with `.catch(() => {})` when the default toast is enough), so no `ApiError` becomes an unhandled rejection.
 - Element ids and `data-test` attributes used by the browser journeys are listed in the task.
@@ -188,7 +188,7 @@ The M4 to M8 plans' "Conventions for every task" apply unchanged:
 
 Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. PR bodies end with the Claude Code attribution line.
 
-The code in this plan has not been compiled. If an implementation has to differ, fix this plan in the same PR (inline, or with a dated `> **Corrected (issue #N).**` note), then grep later tasks for the changed symbol.
+Apart from Tasks 1 and 4, which were built and run in a scratch copy of the repository while drafting (see "Self-review"), the code in this plan has not been compiled; even those may need adjusting on the real tree. If an implementation has to differ, fix this plan in the same PR (inline, or with a dated `> **Corrected (issue #N).**` note), then grep later tasks for the changed symbol.
 
 ## Interfaces shared across tasks
 
@@ -241,6 +241,7 @@ export const store = { whoami, key, catalog, theme, can(level) }   // can('read'
 // src/http/ui/js/core/drawer.js    export function openDrawer(title, subtitle, ...content) -> body element; export function closeDrawer()
 // src/http/ui/js/core/format.js    export function ago(iso); export function when(iso); export function count(n, noun)
 // src/http/ui/js/core/router.js    export function go(hash); export function route(); export function start()
+//                                  export async function mount(render, rest)   // fresh per-navigation container
 //                                  export function browseHash(catalog, path = '', section = null)
 // src/http/ui/js/core/shell.js     export async function refreshIdentity()   // re-reads whoami; rebuilds the switcher and data-need gating
 // src/http/ui/js/components/list-table.js
@@ -1263,23 +1264,31 @@ export function pill(text, kind = 'muted') {
 `src/http/ui/js/core/store.js`:
 
 ```js
-// Browser-side state: the signed-in key and preferences in localStorage, the
-// whoami answer in memory. Storage can be unavailable (private windows), so
-// every access is guarded and the console still works for the session.
+// Browser-side state: the signed-in key and preferences, the whoami answer.
+// Values live in memory; localStorage only persists them across reloads.
+// Storage can be unavailable or throw (private windows, blocked site data),
+// and then the console still works for this page's lifetime.
 
 const KEY = 'okf.key';
 const CATALOG = 'okf.catalog';
 const THEME = 'okf.theme';
 const LEVELS = ['read', 'write', 'admin'];
+const memory = new Map();
 
 function read(name) {
-    try { return localStorage.getItem(name); } catch { return null; }
+    if (!memory.has(name)) {
+        let stored = null;
+        try { stored = localStorage.getItem(name); } catch { /* unavailable: memory only */ }
+        memory.set(name, stored);
+    }
+    return memory.get(name);
 }
 function write(name, value) {
+    memory.set(name, value ?? null);
     try {
         if (value === null || value === undefined) localStorage.removeItem(name);
         else localStorage.setItem(name, value);
-    } catch { /* storage unavailable: keep going without persistence */ }
+    } catch { /* unavailable: the value lives in memory only */ }
 }
 
 export const store = {
@@ -1419,12 +1428,17 @@ export function count(n, noun) {
 
 ```js
 // Hash routing: '#/<page>/<rest...>' loads js/pages/<page>.js and calls its
-// render(main, rest). /ui/manifest.json says which pages this build has, so
+// render(view, rest). /ui/manifest.json says which pages this build has, so
 // a nav link to a page not built yet is hidden, never a 404.
-import { h, clear } from './dom.js';
+//
+// Each navigation renders into its own fresh container (`view`), and the
+// previous one is detached from #main. A render still awaiting an API answer
+// when the user moves on therefore writes into a detached element, never
+// into the newer page. Pages check `view.isConnected` after an await before
+// touching anything outside `view` (the drawer, the nav badge).
+import { h } from './dom.js';
 
 let pages = new Set();
-let ticket = 0;
 let started = false;
 const DEFAULTS = ['health', 'browse', 'keys'];
 
@@ -1447,19 +1461,27 @@ export function go(hash) {
     else location.hash = hash;
 }
 
+// Replaces #main's content with a fresh view and runs render(view, rest) in it.
+// Exported for the router journey in tests/ui_e2e/login.rs.
+export async function mount(render, rest) {
+    const view = h('div', { class: 'view' });
+    document.getElementById('main').replaceChildren(view);
+    await render(view, rest);
+}
+
 export async function route() {
-    const mine = ++ticket;   // a newer navigation wins over a slower older one
     let { page, rest } = parse(location.hash);
     if (!page) page = DEFAULTS.find(name => pages.has(name)) ?? '';
     document.querySelectorAll('.nav-link').forEach(link => link.classList.toggle('active', link.dataset.nav === page));
-    const main = clear(document.getElementById('main'));
     if (!pages.has(page)) {
-        main.append(h('h1', {}, page ? 'Not available yet' : 'Welcome'),
-            h('p', { class: 'muted' }, page ? `This build has no ${page} page.` : 'No pages are installed in this build yet.'));
+        await mount(view => view.append(h('h1', {}, page ? 'Not available yet' : 'Welcome'),
+            h('p', { class: 'muted' }, page ? `This build has no ${page} page.` : 'No pages are installed in this build yet.')), rest);
         return;
     }
+    const placeholder = location.hash;
     const module = await import(`../pages/${page}.js`);
-    if (mine === ticket) await module.render(main, rest);
+    if (location.hash !== placeholder) return;   // the user moved on while it loaded
+    await mount(module.render, rest);
 }
 
 export async function start() {
@@ -1903,6 +1925,54 @@ async fn a_read_key_sees_no_administer_group_and_stays_signed_in() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_in_works_when_storage_throws() {
+    let server = server().await;
+    let key = server.key("console-nostorage", Access::Read, &["main"], Some("main")).await;
+    drive(server.base.clone(), move |ui| {
+        ui.open("");
+        ui.wait_visible("#login");
+        // Every storage call now throws, as with blocked site data.
+        ui.eval(
+            "() => { for (const m of ['getItem', 'setItem', 'removeItem']) \
+             Storage.prototype[m] = () => { throw new DOMException('denied', 'SecurityError'); }; }",
+            serde_json::json!(null),
+        );
+        ui.fill("#login-form input[name=key]", &key);
+        ui.click("#login-form button[type=submit]");
+        ui.wait_visible("#app");
+        ui.wait_text("#whoami", "read");
+        ui.click("#theme-toggle"); // a preference write must not throw either
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_page_render_never_lands_in_a_newer_page() {
+    let server = server().await;
+    let key = server.key("console-router", Access::Read, &["main"], Some("main")).await;
+    drive(server.base.clone(), move |ui| {
+        ui.login(&key);
+        // Two navigations through the real router: the first render is
+        // still awaiting when the second runs, then appends late.
+        let result = ui.eval(
+            "async () => { \
+               const router = await import('/ui/js/core/router.js'); \
+               let release; \
+               const slow = router.mount(async view => { \
+                 await new Promise(resolve => { release = resolve; }); \
+                 view.append(Object.assign(document.createElement('p'), { id: 'stale' })); }, []); \
+               await router.mount(async view => { \
+                 view.append(Object.assign(document.createElement('p'), { id: 'fresh' })); }, []); \
+               release(); await slow; \
+               return [!!document.getElementById('stale'), !!document.getElementById('fresh')]; }",
+            serde_json::json!(null),
+        );
+        assert_eq!(result, serde_json::json!([false, true]));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_theme_toggle_flips_and_persists() {
     let server = server().await;
     let key = server.key("console-theme", Access::Read, &["main"], Some("main")).await;
@@ -1938,7 +2008,7 @@ test-ui:
 ```
 
 Run: `just test-ui`
-Expected: 4 passed, with no skip lines.
+Expected: 6 passed, with no skip lines. (`a_slow_page_render_never_lands_in_a_newer_page` relies on `evaluate` awaiting a returned promise, as Playwright's does; if rustwright 0.3.0 does not, poll a `window` flag the function sets instead.)
 
 - [ ] **Step 9: Docs and changelog**
 
@@ -9178,4 +9248,5 @@ Tasks 2, 3, 5, 6 and 7 have not been compiled. Their facts are cited against the
 - `Option<Disposition>` in `Query` (Task 6);
 - `clippy::large_enum_variant` on Task 3's `Report`;
 - that an `app_with` catalog can be claimed for maintenance (Task 6);
-- `is_visible` inside a closed `<details>` (Task 4 checks `details.open` instead).
+- `is_visible` inside a closed `<details>` (Task 4 checks `details.open` instead);
+- that rustwright's `evaluate` awaits a returned promise (Task 1's router journey).
