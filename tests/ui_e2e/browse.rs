@@ -229,3 +229,66 @@ async fn switching_catalogs_while_browsing_opens_the_new_root_once() {
     })
     .await;
 }
+
+/// Where the `deep` heading's top is in the viewport, polled for up to 120
+/// frames until it is in view (the page renders after its request and
+/// scrolls in a `requestAnimationFrame`); `top` is `null` while it is missing.
+const DEEP_TOP: &str = "() => new Promise(done => { let frames = 0; const look = () => { \
+    const heading = document.querySelector(\"#markdown-body [data-slug='deep']\"); \
+    const top = heading ? heading.getBoundingClientRect().top : null; \
+    const truncated = document.querySelector('#concept-truncated') !== null; \
+    const inView = top !== null && top >= -2 && top < innerHeight; \
+    if ((inView && !truncated) || ++frames > 120) done({ top, truncated, height: innerHeight }); \
+    else requestAnimationFrame(look); }; look(); })";
+
+/// Asserts the `deep` heading is rendered, with the whole body, and scrolled
+/// into view.
+fn assert_deep_in_view(ui: &crate::harness::Ui) {
+    ui.wait_visible("#markdown-body h2[data-slug='deep']");
+    let place = ui.eval(DEEP_TOP, json!(null));
+    assert_eq!(place["truncated"], json!(false), "the whole body: {place}");
+    let top = place["top"].as_f64().expect("the heading's top");
+    let height = place["height"].as_f64().expect("the viewport height");
+    assert!((-2.0..height).contains(&top), "deep is in view: {place}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_section_link_on_a_long_concept_loads_the_body_and_reaches_the_heading() {
+    // Enough paragraphs to push `## Deep` well below the first screen.
+    let filler = "A paragraph of filler text.\n\n".repeat(120);
+    let long = format!(
+        "---\ntype: note\ntitle: Long\n---\n# Long\n\n## Top\n\n{filler}## Deep\n\nFound.\n"
+    );
+    let config = Config {
+        concept_outline_chars: 200,
+        ..Config::default()
+    };
+    let server = TestServer::start(
+        vec![(
+            "main",
+            files(&[("index.md", "# Main\n"), ("notes/long.md", long.as_str())]),
+        )],
+        config,
+    )
+    .await;
+    let key = server
+        .key("browse-long", Access::Read, &["main"], Some("main"))
+        .await;
+    drive(server.base.clone(), move |ui| {
+        let deep_link = "#outline a[href='#/browse/main/notes/long.md/deep']";
+        ui.login(&key);
+        // Over the limit: only the outline, until a section link is followed.
+        ui.open("/browse/main/notes/long.md");
+        ui.wait_visible("#concept-truncated");
+        ui.click(deep_link);
+        assert_deep_in_view(ui);
+        // After "Load the whole body", a section link keeps the whole body.
+        ui.open("/browse/main/notes/long.md");
+        ui.wait_visible("#concept-full");
+        ui.click("#concept-full");
+        ui.wait_visible("#markdown-body");
+        ui.click(deep_link);
+        assert_deep_in_view(ui);
+    })
+    .await;
+}

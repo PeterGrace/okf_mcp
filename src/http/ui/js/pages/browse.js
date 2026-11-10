@@ -66,7 +66,10 @@ export async function render(main, rest) {
         return;
     }
     if (DOCUMENTS.has(where.path.split('/').pop())) await showDocument(view, where);
-    else await showConcept(view, where, false);
+    // A section route asks for the whole body: over concept_outline_chars the
+    // server sends only the outline, and the heading to scroll to would be
+    // missing (every navigation, an outline click included, renders afresh).
+    else await showConcept(view, where, where.section !== null);
 }
 
 // A folder without index.md: its documents, as links.
