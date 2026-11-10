@@ -25,7 +25,7 @@ changesets and the routes in detail.
   | `GET /healthz` | none | The database's state, the catalog count and the last clock check (section 7) |
   | `POST/GET/DELETE /mcp` | any key (`read`, `write` or `admin`) | MCP streamable HTTP; each tool checks its own level and the key's catalog grants |
   | `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as a `.tar.gz` |
-  | `POST /catalogs/{name}/import[?replace=true]` | `admin` on the catalog | Imports an uploaded `.tar.gz` |
+  | `POST /catalogs/{name}/import[?replace=true&only_machinery=true&expect_generation=N]` | `admin` on the catalog | Imports an uploaded `.tar.gz` |
 
   Keys are bearer tokens (`Authorization: Bearer <key>`). Only `/healthz` is
   open, and it names no catalog, host or secret.
@@ -472,7 +472,8 @@ git -C ~/notes archive --format=tar.gz HEAD |
 ```
 
 or post it to the HTTP route with an `admin` key (`?replace=true` to replace
-a non-empty catalog):
+a non-empty catalog, `?only_machinery=true` for `--only-machinery` and
+`?expect_generation=N` for `--expect-generation N`, both described below):
 
 ```sh
 git -C ~/notes archive --format=tar.gz HEAD |
@@ -513,7 +514,13 @@ git -C ~/notes-template archive --format=tar.gz HEAD |
 A full `--replace` from an edited export reverts whatever was published
 after the export. Pass the generation the export reported as
 `--expect-generation 42`, and the import is refused, writing nothing, if the
-catalog has moved since; export again and redo the edit.
+catalog has moved since; export again and redo the edit. Over HTTP, the
+same guarded machinery-only import is:
+
+```sh
+curl -sf -H "Authorization: Bearer $OKF_MCP_KEY" --data-binary @notes.tar.gz \
+    "https://okf-mcp.example.com/api/v1/catalogs/notes/import?replace=true&only_machinery=true&expect_generation=12"
+```
 
 **Connect a harness.** The MCP URL is `https://okf-mcp.example.com/mcp`, with
 the key in `Authorization: Bearer <key>`. For Claude Code:
@@ -1192,6 +1199,44 @@ last. For example:
     curl -H "Authorization: Bearer $OKF_MCP_KEY" \
         "http://127.0.0.1:8080/api/v1/catalogs/main/revisions/2/systems/alpha.md"
 
+### Catalogs and import/export
+
+| Method and path | Key | Does |
+|---|---|---|
+| `GET /api/v1/catalogs` | any | The catalogs the key reaches, by name: `name`, `description`, `files`, `concepts`, `generation` (of the loaded snapshot, what `expect_generation` compares against) and `last_change` (`null` when empty) |
+| `POST /api/v1/catalogs` | admin, every catalog | `{name, description}` (`description` optional). 201 with the new catalog's summary; 409 for an invalid or taken name; 403 for a key granted named catalogs, since it would not reach the new one |
+| `PATCH /api/v1/catalogs/{catalog}` | admin | `{description}`. Answers `{name, previous, description}` |
+| `DELETE /api/v1/catalogs/{catalog}[?force=true]` | admin | Deletes the catalog with its documents, history, changesets and grants; answers `{name}`. 409 while an open changeset holds unpublished changes, unless `force=true` |
+| `GET /api/v1/catalogs/{catalog}/export` | read | The same handler and 120 s timeout as `/catalogs/{name}/export` |
+| `POST /api/v1/catalogs/{catalog}/import[?replace=true&only_machinery=true&expect_generation=N]` | admin | The same handler, body cap and upload deadline as `/catalogs/{name}/import` |
+
+A catalog the key does not reach, or that does not exist, is 404 on every
+route but the list and the create.
+
+- Catalog changes take effect at once: the handler polls after each one, so
+  the next request (and the console's catalog switcher) sees it.
+- Catalog rows record no actor, as with `okf-mcp catalog`; the server's log
+  line for each change names the key id and its actor.
+- `only_machinery=true` is `--only-machinery`: only the archive's machinery
+  is compared and written. On a non-empty catalog it needs `replace=true`,
+  as on the command line.
+- A stale `expect_generation` is 409, with a message that says to export
+  again; nothing is imported. Both import paths take these options.
+
+```sh
+curl -s -H "Authorization: Bearer $OKF_MCP_KEY" https://okf-mcp.example.com/api/v1/catalogs
+```
+
+The Catalogs page lists the catalogs with their counts. An admin opens a row
+to change its description or delete it (typing its name to confirm, with a
+force box for unpublished changes); an admin key that reaches every catalog
+also gets New catalog. The Import & export page exports the selected catalog
+as a `.tar.gz` download, and, for an admin, uploads one with the import
+options, a progress bar and the import report (or the refusal and its
+problems). It pre-fills the expected generation from `GET /api/v1/catalogs`,
+so an import is refused if the catalog moved since the page loaded; clear the
+field to skip the check.
+
 ### Changesets
 
 The Changesets page (`/ui/#/changesets`) lists the selected catalog's open
@@ -1552,7 +1597,7 @@ curl -sf -H "Authorization: Bearer $OKF_MCP_KEY" -o notes.tar.gz \
 | 404 on an archive route | The catalog doesn't exist or the key isn't granted it (never 403, so a key can't probe which catalogs exist) |
 | 403 on an archive route | The key reaches the catalog but its level is too low: import needs `admin` |
 | 413 on import | The body is over `max_import_bytes` plus slack (a plain-text axum rejection), or, if the answer comes from nginx, over the ingress's `proxy-body-size`. Raise both together |
-| 409 on import | The catalog is not empty: add `?replace=true` (or `--replace` on the command line) |
+| 409 on import | The catalog is not empty: add `?replace=true` (or `--replace` on the command line). Or, with `?expect_generation=N`, the catalog has moved since that export: export it again |
 | `/healthz` is 503 and the pod is not ready | The database did not answer within 2 seconds: check the `Cluster`'s state, the `okf-mcp-db-app` secret and network policies |
 | The pod never becomes ready on an IPv6 cluster | `listen` is `0.0.0.0:8080`; set `"[::]:8080"` |
 | The server exits with a configuration error | The file failed validation; the message names the file and the key |
