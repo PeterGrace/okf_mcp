@@ -290,6 +290,10 @@ anything the console does can be scripted:
 
     curl -s -H "Authorization: Bearer $OKF_MCP_KEY" http://127.0.0.1:8080/api/v1/whoami
 
+Browse shows a catalog's tree, each concept rendered (raw HTML in a concept
+is shown as text, never run), its links, history and revision diffs, and
+Search searches every catalog the key reaches.
+
 The routes, the security headers and the API reference are in
 [`docs/operations.md`](docs/operations.md#web-console).
 

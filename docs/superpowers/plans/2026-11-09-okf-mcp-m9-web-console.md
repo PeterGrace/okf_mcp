@@ -5485,6 +5485,9 @@ import { tree } from '../components/tree.js';
 // Read through /documents; everything else is a concept.
 const DOCUMENTS = new Set(['index.md', 'log.md', 'AGENTS.md']);
 
+// The shell keeps one #catalog-select for the page's lifetime (it only
+// replaces its options), so one listener, added on the first render, serves
+// every later render: a flag rather than a listener per navigation.
 let switcherHooked = false;
 
 function locate(rest) {
@@ -5581,7 +5584,7 @@ async function showConcept(view, where, full) {
         tabs: [
             { value: 'content', label: 'Content', build: () => content(concept, where, () => showConcept(view, where, true)) },
             { value: 'links', label: 'Links', build: () => linksTab(where) },
-            { value: 'history', label: 'History', build: () => historyTab(where) },
+            { value: 'history', label: 'History', build: () => historyTab(view, where) },
             { value: 'raw', label: 'Raw', build: () => rawTab(concept.raw, concept.note) },
         ],
     });
@@ -5601,7 +5604,7 @@ async function showDocument(view, where) {
         extra: null,
         tabs: [
             { value: 'content', label: 'Content', build: () => content({ body_html: documentRead.body_html, outline: [] }, where, null) },
-            { value: 'history', label: 'History', build: () => historyTab(where) },
+            { value: 'history', label: 'History', build: () => historyTab(view, where) },
             { value: 'raw', label: 'Raw', build: () => rawTab(documentRead.text, null) },
         ],
     });
@@ -5682,7 +5685,7 @@ async function linksTab(where) {
     return h('div', {}, h('h2', {}, 'Links out'), out, h('h2', {}, 'Backlinks'), back);
 }
 
-async function historyTab(where) {
+async function historyTab(view, where) {
     let data;
     try {
         data = await api.get(`${base(where)}/history/${encPath(where.path)}`);
@@ -5695,19 +5698,22 @@ async function historyTab(where) {
         { key: 'actor', label: 'Actor', class: 'mono' },
         { key: 'message', label: 'Message' },
         { key: 'at', label: 'When', render: row => ago(row.at), sort: row => row.at },
-    ], data.revisions, { onRow: row => openRevision(where, row), empty: 'No revisions.' });
+    ], data.revisions, { onRow: row => openRevision(view, where, row), empty: 'No revisions.' });
     table.id = 'history';
     return table;
 }
 
 // One revision in the drawer: its diff from the revision before, and its text.
-async function openRevision(where, row) {
+// The drawer is outside this page's container, so it opens only while the
+// page is still shown (view is inside it, and detached with it).
+async function openRevision(view, where, row) {
     let revision;
     try {
         revision = await api.get(`${base(where)}/revisions/${row.revision}/${encPath(where.path)}`);
     } catch {
         return;
     }
+    if (!view.isConnected) return;
     const lines = revision.diff.split('\n').map(line => h('span', {
         class: line.startsWith('+') && !line.startsWith('+++') ? 'add'
             : line.startsWith('-') && !line.startsWith('---') ? 'del' : null,
@@ -5725,6 +5731,8 @@ function rawTab(raw, note) {
     return h('pre', { class: 'raw', id: 'concept-raw' }, raw);
 }
 ```
+
+> **Corrected (issue #219, 2026-11-10).** Drafted before Task 1's per-navigation containers. `historyTab` and `openRevision` now take `view` (the page's `#browse-view`, inside `main`), and `openRevision` returns without opening the drawer when `view.isConnected` is false after its request, per "Front-end shape". The `#catalog-select` listener stays behind the module-level `switcherHooked` flag: the shell keeps one `<select>` for the page's lifetime (`refreshIdentity` replaces only its options), so one listener serves every render, and the journey `switching_catalogs_while_browsing_opens_the_new_root_once` fails if a listener is added per render. The code above is corrected inline.
 
 `src/http/ui/js/pages/search.js`:
 
@@ -6015,7 +6023,9 @@ Expected: FAIL. Without `js/pages/browse.js` in the manifest, the router shows "
 - [ ] **Step 9: Run the journeys**
 
 Run: `just test-ui`
-Expected: the four browse journeys pass with no skip line: `the_tree_opens_a_concept_and_a_link_in_its_body_opens_the_next`, `raw_html_and_script_links_in_a_concept_render_as_text`, `the_links_tab_shows_backlinks_and_a_revision_opens_its_diff` and `search_finds_alpha_and_opens_it`. The other tasks' journeys pass too. `drive()` fails a journey on any console error, so the hostile concept also proves that no CSP violation fired.
+Expected: the four browse journeys pass with no skip line: `the_tree_opens_a_concept_and_a_link_in_its_body_opens_the_next`, `raw_html_and_script_links_in_a_concept_render_as_text`, `the_links_tab_shows_backlinks_and_a_revision_opens_its_diff` and `search_finds_alpha_and_opens_it`.
+
+> **Corrected (issue #219, 2026-11-10).** Five browse journeys: `tests/ui_e2e/browse.rs` also has `switching_catalogs_while_browsing_opens_the_new_root_once` (a key on `main` and `other`; after three Browse renders, one switch to `other` opens `#/browse/other` and fetches its tree exactly once). This task is the first caller of `api::context` and `Ui::wait_hidden`, so it removes their `#[allow(dead_code)]` (see the issue #216 notes under Task 1). `docs/operations.md` also says that switching catalogs while browsing opens the new catalog's root. The other tasks' journeys pass too. `drive()` fails a journey on any console error, so the hostile concept also proves that no CSP violation fired.
 
 - [ ] **Step 10: Docs and changelog**
 
