@@ -44,6 +44,7 @@ pub mod mcp;
 pub mod ntp;
 pub mod okf;
 pub mod overlay;
+pub mod render;
 pub mod selection;
 pub mod store;
 pub mod write;

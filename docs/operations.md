@@ -1159,6 +1159,46 @@ questions). The switcher below them shows one report at a time as a sortable
 table, and a row opens its concept in Browse. Refresh reloads the counts and
 the reports.
 
+### Browse and search
+
+Browse (`#/browse/<catalog>/<path>`) shows a catalog's tree beside one
+document, with tabs Content, Links, History and Raw. A history row opens
+the revision's diff in a drawer. Choosing another catalog in the switcher
+while browsing opens that catalog's root `index.md`. Search
+(`#/search/<query>`) searches every catalog the key reaches.
+
+Concepts are rendered to HTML on the server (`src/render.rs`):
+
+- raw HTML in a document is shown as text, never run;
+- links may use only `http`, `https` and `mailto`, or point at a document
+  of the same catalog, which opens in the console; every other link
+  (`javascript:`, `data:`, a path leaving the catalog, a link to a file
+  that is not markdown) is shown as plain text;
+- an outside image is shown as a link to it, because the console's CSP
+  loads no outside images;
+- a link to a missing document is struck through.
+
+A body over `concept_outline_chars` is shown as its outline until you
+choose "Load the whole body" or follow a section link, which loads the
+whole body and scrolls to that heading.
+
+| Method | Path | Access | Notes |
+|---|---|---|---|
+| GET | `/api/v1/catalogs/{catalog}/tree` | read | Every concept, `index.md` and `log.md`, and the root `AGENTS.md`: `path`, `kind`, `title`. |
+| GET | `/api/v1/catalogs/{catalog}/concepts/{path}?full=` | read | `get_concept` with `raw`, plus `body_html` and the whole `outline`. Over `concept_outline_chars` without `full=true`: no `body`, `raw` or `body_html`. |
+| GET | `/api/v1/catalogs/{catalog}/links/{path}` | read | Outbound `links` and `backlinks`, as `get_concept` with `links`. |
+| GET | `/api/v1/catalogs/{catalog}/history/{path}?limit=` | read | The `history` tool. |
+| GET | `/api/v1/catalogs/{catalog}/revisions/{n}/{path}` | read | `text` at revision `n` (null for a deletion or non-text bytes) and a unified `diff` from revision `n-1`. |
+| GET | `/api/v1/catalogs/{catalog}/documents/{path}` | read | `read_document` (any `index.md` or `log.md`, the root `AGENTS.md`) plus `body_html`. |
+| GET | `/api/v1/search?q=&catalogs=&limit=` | read | The `search` tool. `catalogs` is comma-separated and defaults to every catalog the key reaches; a named catalog it does not reach is a 404. |
+
+The per-document routes put their kind before the path (`/links/{path}`,
+not `/concepts/{path}/links`), because the path is a wildcard and must come
+last. For example:
+
+    curl -H "Authorization: Bearer $OKF_MCP_KEY" \
+        "http://127.0.0.1:8080/api/v1/catalogs/main/revisions/2/systems/alpha.md"
+
 ### Catalogs and import/export
 
 | Method and path | Key | Does |
