@@ -5,7 +5,7 @@
 **Goal:** A browser console for `okf-mcp`, plus the JSON API it runs on. The console covers API key management, catalog health dashboards, catalog administration with `.tar.gz` import and export, maintenance findings and runs, changeset housekeeping, and read-only browsing and search. Everything the console does is also a documented `/api/v1` call.
 
 **Architecture:**
-- **One binary, one port.** `/api/v1/*` is nested inside the existing keyed router, so the existing `require_key` bearer middleware covers it. `/ui/*` serves a static single-page app (vanilla ES modules, Pico CSS) without a key.
+- **One binary, one port.** `/api/v1/*` is nested beside the existing keyed router and applies the existing `require_key` bearer middleware itself, inside its header layer (corrected in issue #216). `/ui/*` serves a static single-page app (vanilla ES modules, Pico CSS) without a key.
 - **Embedded assets.** `build.rs` embeds every file under `src/http/ui/` at build time, so adding a page needs no Rust edit.
 - **Thin handlers.** API handlers build the same `ToolContext` the MCP tools build and call the existing `pub(crate)` tool functions, or the `store::*` functions the CLI calls. Behaviour cannot drift from MCP or the CLI.
 - **Rendering stays in Rust.** Markdown is rendered to escaped HTML with `pulldown-cmark`, and diffs and reports are computed in Rust. The JS only fetches, displays, filters and sorts.
@@ -613,16 +613,36 @@ mod tests {
     async fn api_responses_are_not_cached_or_sniffed() {
         let test = app().await;
         let keys = keys(&test).await;
-        let request = axum::http::Request::builder()
-            .uri("/api/v1/whoami")
-            .header("authorization", format!("Bearer {}", keys.read))
-            .body(axum::body::Body::empty())
-            .expect("request");
-        let response = crate::http::router(std::sync::Arc::clone(&test.app),
-            &tokio_util::sync::CancellationToken::new())
-            .oneshot(request).await.expect("response");
-        assert_eq!(response.headers()["cache-control"], "no-store");
-        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let valid = format!("Bearer {}", keys.read);
+        // A good key, no key, an unknown key, and an unknown path: the
+        // refusals carry the headers too, since `require_key` runs inside them.
+        for (uri, authorization, want) in [
+            ("/api/v1/whoami", Some(valid.as_str()), 200),
+            ("/api/v1/whoami", None, 401),
+            ("/api/v1/whoami", Some("Bearer okf_not-a-real-key"), 401),
+            ("/api/v1/nothing-here", None, 404),
+        ] {
+            let mut request = axum::http::Request::builder().uri(uri);
+            if let Some(value) = authorization {
+                request = request.header("authorization", value);
+            }
+            let request = request.body(axum::body::Body::empty()).expect("request");
+            let response = crate::http::router(
+                std::sync::Arc::clone(&test.app),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .oneshot(request)
+            .await
+            .expect("response");
+            let headers = response.headers();
+            let case = format!("{uri} with {authorization:?}");
+            assert_eq!(response.status().as_u16(), want, "{case}");
+            assert_eq!(headers["cache-control"], "no-store", "{case}");
+            assert_eq!(headers["x-content-type-options"], "nosniff", "{case}");
+            if want == 401 {
+                assert_eq!(headers["www-authenticate"], "Bearer", "{case}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -719,13 +739,13 @@ Expected: it does not compile, because `src/http/api` and `src/http/ui.rs` are n
 
 use std::sync::Arc;
 
-use axum::http::{header, HeaderValue};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::Response;
 use axum::Router;
 
 use crate::app::App;
-use crate::auth::Principal;
+use crate::auth::{require_key, Principal};
 use crate::error::OkfError;
 use crate::mcp::context::ToolContext;
 use crate::store::keys::Access;
@@ -741,13 +761,15 @@ mod search;
 #[cfg(test)]
 pub(crate) mod testing;
 
-/// Every API route, for nesting at `/api/v1` inside the keyed router.
+/// Every API route, for nesting at `/api/v1`, behind `require_key`.
 ///
 /// # Arguments
-/// * `app` - the application (the import route's body limit comes from its config).
+/// * `app` - the application (its key cache for `require_key`; the import
+///   route's body limit comes from its config).
 ///
 /// # Returns
-/// A router whose responses all carry `Cache-Control: no-store` and `nosniff`.
+/// A router whose responses all carry `Cache-Control: no-store` and
+/// `nosniff`, the 401 for a missing or unknown key included.
 pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
     Router::new()
         .merge(identity::routes())
@@ -758,6 +780,18 @@ pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
         .merge(catalogs::routes(app))
         .merge(maintenance::routes())
         .merge(changesets::routes())
+        // `route_layer` covers the routes merged above and runs only when one
+        // matched, so an unknown API path stays 404 rather than 401.
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(app.keys()),
+            require_key,
+        ))
+        // Its own fallback, so an unknown API path is answered here (404,
+        // without a key check) and gets the headers below; without one, the
+        // outer router's fallback would answer it.
+        .fallback(|| async { StatusCode::NOT_FOUND })
+        // A plain `layer` wraps everything above, `require_key` and the
+        // fallback included, so the 401 and the 404 get these headers too.
         .layer(middleware::map_response(api_headers))
 }
 
@@ -987,14 +1021,14 @@ async fn security_headers(mut response: Response) -> Response {
 }
 ```
 
-`src/http/mod.rs`: add `pub(crate) mod api;` and `mod ui;` beside `mod archives;`. In `router()`, nest the API inside `keyed` before its `route_layer`, and merge the console beside `health`:
+> **Corrected (issue #216, 2026-11-10).** As first planned, the API was nested inside `keyed`, under `keyed`'s `require_key`. That put `require_key` outside `api_headers`, so a 401 from `/api/v1` lacked `no-store` and `nosniff` (review of PR #224). `api::routes(app)` now applies `require_key` itself as a `route_layer`, adds its own 404 fallback, and puts `api_headers` outside both. `router()` nests it beside `keyed` rather than inside it. The signature is unchanged. Later tasks still only merge into `routes()` above the `route_layer`, so every endpoint they add is keyed.
+
+`src/http/mod.rs`: add `pub(crate) mod api;` and `mod ui;` beside `mod archives;`. In `router()`, merge the console beside `health` and nest the API beside `keyed` (it applies `require_key` itself):
 
 ```rust
     let keyed = Router::new()
         .merge(mcp)
         .merge(archives::routes(&app))
-        // Nested before `route_layer`, so require_key covers every API route.
-        .nest("/api/v1", api::routes(&app))
         .route_layer(middleware::from_fn_with_state(keys, require_key));
     let health = Router::new()
         .route("/healthz", get(healthz))
@@ -1002,11 +1036,14 @@ async fn security_headers(mut response: Response) -> Response {
     Router::new()
         .merge(health)
         .merge(ui::routes())
+        // The API applies `require_key` itself, inside its header layer, so
+        // even its 401 carries `no-store` and `nosniff`.
+        .nest("/api/v1", api::routes(&app))
         .merge(keyed)
         // (TraceLayer and with_state unchanged)
 ```
 
-`an_unknown_api_path_is_404_not_401` and `whoami_needs_any_key` prove two things: that `route_layer` covers the nested routes, and that it leaves unmatched paths as 404.
+`an_unknown_api_path_is_404_not_401` and `whoami_needs_any_key` prove two things: that `route_layer` covers the API routes, and that it leaves unmatched paths as 404. `api_responses_are_not_cached_or_sniffed` checks the headers on a 200, both 401s (no key, an unknown key) and the 404.
 
 - [ ] **Step 5: Create the front end**
 

@@ -214,8 +214,6 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     let keyed = Router::new()
         .merge(mcp)
         .merge(archives::routes(&app))
-        // Nested before `route_layer`, so require_key covers every API route.
-        .nest("/api/v1", api::routes(&app))
         .route_layer(middleware::from_fn_with_state(keys, require_key));
     let health = Router::new()
         .route("/healthz", get(healthz))
@@ -223,6 +221,9 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     Router::new()
         .merge(health)
         .merge(ui::routes())
+        // The API applies `require_key` itself, inside its header layer, so
+        // even its 401 carries `no-store` and `nosniff`.
+        .nest("/api/v1", api::routes(&app))
         .merge(keyed)
         // One `info` line per response (status, latency) in a span naming the
         // method and URI. The default span records no headers, so a bearer key

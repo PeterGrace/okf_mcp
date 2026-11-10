@@ -114,20 +114,36 @@ mod tests {
     async fn api_responses_are_not_cached_or_sniffed() {
         let test = app().await;
         let keys = keys(&test).await;
-        let request = axum::http::Request::builder()
-            .uri("/api/v1/whoami")
-            .header("authorization", format!("Bearer {}", keys.read))
-            .body(axum::body::Body::empty())
-            .expect("request");
-        let response = crate::http::router(
-            std::sync::Arc::clone(&test.app),
-            &tokio_util::sync::CancellationToken::new(),
-        )
-        .oneshot(request)
-        .await
-        .expect("response");
-        assert_eq!(response.headers()["cache-control"], "no-store");
-        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let valid = format!("Bearer {}", keys.read);
+        // A good key, no key, an unknown key, and an unknown path: the
+        // refusals carry the headers too, since `require_key` runs inside them.
+        for (uri, authorization, want) in [
+            ("/api/v1/whoami", Some(valid.as_str()), 200),
+            ("/api/v1/whoami", None, 401),
+            ("/api/v1/whoami", Some("Bearer okf_not-a-real-key"), 401),
+            ("/api/v1/nothing-here", None, 404),
+        ] {
+            let mut request = axum::http::Request::builder().uri(uri);
+            if let Some(value) = authorization {
+                request = request.header("authorization", value);
+            }
+            let request = request.body(axum::body::Body::empty()).expect("request");
+            let response = crate::http::router(
+                std::sync::Arc::clone(&test.app),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .oneshot(request)
+            .await
+            .expect("response");
+            let headers = response.headers();
+            let case = format!("{uri} with {authorization:?}");
+            assert_eq!(response.status().as_u16(), want, "{case}");
+            assert_eq!(headers["cache-control"], "no-store", "{case}");
+            assert_eq!(headers["x-content-type-options"], "nosniff", "{case}");
+            if want == 401 {
+                assert_eq!(headers["www-authenticate"], "Bearer", "{case}");
+            }
+        }
     }
 
     #[tokio::test]
