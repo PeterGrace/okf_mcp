@@ -1237,6 +1237,28 @@ problems). It pre-fills the expected generation from `GET /api/v1/catalogs`,
 so an import is refused if the catalog moved since the page loaded; clear the
 field to skip the check.
 
+### Changesets
+
+The Changesets page (`/ui/#/changesets`) lists the selected catalog's open
+changesets: a key sees its own, an admin every key's. It marks the idle ones
+(no change within `session_idle_timeout`), and a row opens the changeset's
+pending diff in a drawer, with Discard. These are the `list_changesets`,
+`pending_changes` and `discard` tools over HTTP, with the same rules: the
+diff is for the key that opened the changeset or an admin (a read key opens
+none, so it sees none), and another key's handle answers 404, as an unknown
+one does, never 403.
+
+| Method and path | Key | Does |
+|---|---|---|
+| `GET /api/v1/changesets?catalog=` | read | The key's own open changesets; an admin's: every key's. `catalog` is optional (absent or empty: every catalog the key reaches; an unreached one is 404). As `list_changesets`: `changeset`, `catalog`, `key`, `key_name`, `actor`, `created`, `last_change`, `idle`, `paths` |
+| `GET /api/v1/changesets/{handle}/diff` | owner or admin | As `pending_changes`: `{catalog, changeset, files}`, each file with its unified `diff`. 404 for another key's handle; 409 once published or discarded |
+| `DELETE /api/v1/changesets/{handle}` | write (owner) or admin | As `discard` without `paths`: drops every entry and closes the handle for good (`{catalog, changeset, removed, closed}`). 404 for another key's handle; 409 once published or discarded |
+
+```sh
+curl -s -X DELETE -H "Authorization: Bearer $OKF_MCP_KEY" \
+    https://okf-mcp.example.com/api/v1/changesets/$HANDLE
+```
+
 ### Testing the console
 
 `just test-ui` runs the browser journeys (`tests/ui_e2e`) against a real

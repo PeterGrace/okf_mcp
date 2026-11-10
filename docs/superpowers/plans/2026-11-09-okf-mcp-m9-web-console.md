@@ -256,7 +256,7 @@ export function confirmDialog({ title, message, action, danger, typed }) -> Prom
 ```rust
 // tests/ui_e2e/harness.rs
 pub struct Ui { pub base: String, pub page: rustwright::Page, /* browser kept alive */ }
-pub async fn drive<F: FnOnce(&Ui) + Send + 'static>(base: String, journey: F); // skips without Chromium
+pub async fn drive<F: FnOnce(&Ui) + Send + 'static>(base: String, journey: F) -> bool; // false: skipped (no Chromium); corrected in issue #222
 impl Ui {
     pub fn open(&self, route: &str);                 // goto {base}/ui/#{route}
     pub fn login(&self, key: &str);                  // login form, then waits for #app
@@ -9110,7 +9110,7 @@ import { confirmDialog } from '../components/confirm.js';
 
 const COLUMNS = [
     { key: 'changeset', label: 'Handle', class: 'mono',
-      render: row => h('span', { 'data-test': 'changeset-handle' }, row.changeset) },
+      render: row => h('span', { class: 'changeset-handle', 'data-test': 'changeset-handle' }, row.changeset) },
     { key: 'catalog', label: 'Catalog', class: 'mono', sort: row => row.catalog },
     { key: 'owner', label: 'Owner', sort: row => row.key_name ?? '',
       render: row => [row.key_name ?? '(deleted key)', ' ', h('span', { class: 'muted small mono' }, row.actor)] },
@@ -9124,7 +9124,7 @@ const COLUMNS = [
 export async function render(main) {
     const catalog = store.catalog;
     const scope = store.can('admin') ? "Every key's open changesets" : "Your key's open changesets";
-    const table = listTable(COLUMNS, [], { onRow: row => show(row, load), empty: 'No open changesets.' });
+    const table = listTable(COLUMNS, [], { onRow: row => show(main, row, load), empty: 'No open changesets.' });
     table.id = 'changesets-table';
     main.append(
         h('header', { class: 'page-head' },
@@ -9144,31 +9144,36 @@ export async function render(main) {
     await load();
 }
 
-// One changeset's drawer: its diff (loaded on open) and Discard.
-async function show(row, reload) {
+// One changeset's drawer: its diff (loaded on open) and Discard. `main` is
+// the page's view: once it is detached, the user has moved on and the
+// drawer is no longer this page's to fill.
+async function show(main, row, reload) {
     const diff = h('div', { id: 'changeset-diff' }, h('p', { class: 'muted' }, 'Loading the diff...'));
     const discardButton = store.can('write')
-        ? h('button', { type: 'button', id: 'changeset-discard', class: 'danger', onclick: () => discardOne(row, reload) }, 'Discard')
+        ? h('button', { type: 'button', id: 'changeset-discard', class: 'danger', onclick: () => discardOne(main, row, reload) }, 'Discard')
         : null;
     openDrawer(row.changeset,
         `${row.catalog} - ${row.key_name ?? 'deleted key'} (${row.actor}) - last change ${ago(row.last_change)}`,
         row.idle ? h('p', {}, pill('idle', 'warn'), ' No change within the idle timeout.') : null,
         diff,
         h('div', { class: 'drawer-actions' }, discardButton));
+    let content;
     try {
         const pending = await api.get(`/changesets/${enc(row.changeset)}/diff`);
-        diff.replaceChildren(...(pending.files.length
+        content = pending.files.length
             ? pending.files.map(file => h('section', { class: 'diff-file' },
                 h('h3', { class: 'mono small' }, `${file.change} ${file.path}`, ' ', file.stale ? pill('stale', 'warn') : null),
                 // The diff is a text child (a text node, like textContent), never markup.
                 h('pre', { class: 'diff' }, file.diff)))
-            : [h('p', { class: 'muted' }, 'No pending files: the changeset is empty.')]));
+            : [h('p', { class: 'muted' }, 'No pending files: the changeset is empty.')];
     } catch (error) {
-        diff.replaceChildren(h('p', { class: 'error' }, `The diff could not be loaded: ${error.message}`));
+        content = [h('p', { class: 'error' }, `The diff could not be loaded: ${error.message}`)];
     }
+    if (!main.isConnected) return;
+    diff.replaceChildren(...content);
 }
 
-async function discardOne(row, reload) {
+async function discardOne(main, row, reload) {
     const ok = await confirmDialog({
         title: 'Discard this changeset?',
         message: `${count(row.paths.length, 'pending file')} in ${row.catalog} will be dropped, and the handle ${row.changeset} closed for good. This cannot be undone.`,
@@ -9177,6 +9182,7 @@ async function discardOne(row, reload) {
     if (!ok) return;
     try {
         const result = await api.del(`/changesets/${enc(row.changeset)}`);
+        if (!main.isConnected) return;
         closeDrawer();
         toast(`Discarded ${count(result.removed, 'file')} from ${result.changeset}.`, 'ok');
         await reload();
@@ -9192,7 +9198,11 @@ Append to `src/http/ui/styles.css` (`.drawer-actions` is already in Task 1's blo
 /* Changesets (Task 7) */
 .diff-file { margin-bottom: 1rem; }
 .diff-file h3 { margin: 0 0 .35rem; }
+/* A block box, so a handle wrapped at its hyphens is one click target. */
+.changeset-handle { display: inline-block; }
 ```
+
+> **Corrected (issue #222, 2026-11-10).** Two changes to this step as first planned, both corrected inline above. (1) Drafted before Task 1's per-navigation containers: `show` and `discardOne` now take the page's `main`, and return without touching the drawer when `main.isConnected` is false after their request, per "Front-end shape". (2) The handle cell's span has `class: 'changeset-handle'` and `.changeset-handle { display: inline-block; }`. A UUID handle wraps at its hyphens in the seven-column table at the journeys' 800 px viewport; the centre of the inline span's bounding box then fell on the bare cell, and rustwright refused the click with `Actionability(NotReceivingEvents)` (as Task 2's `key-name`, issue #217). An inline block keeps wrapping but is one rectangle. The Rust tests in Step 2 build their matrix rows through a small `row(method, uri, [read, write, admin, stranger])` helper, for rustfmt; the rows are as listed. The journey in Step 7 also waits for `#drawer` to close after the discard.
 
 - [ ] **Step 7: Browser journey (failing first)**
 
@@ -9231,23 +9241,37 @@ async fn an_admin_discards_a_changeset_from_the_console() {
     structured(&edited);
 
     let shown = handle.clone();
-    drive(server.base.clone(), move |ui| {
+    let ran = drive(server.base.clone(), move |ui| {
         ui.login(&key);
         ui.open("/changesets");
         ui.wait_text("#changesets-table", &shown);
         ui.click("[data-test=changeset-handle]");
         ui.wait_text("#changeset-diff", "+Alpha runs well.");
+        // Cancelling the confirmation sends nothing: the drawer stays open,
+        // and the discard below succeeds (a discarded handle would be 409).
+        ui.click("#changeset-discard");
+        ui.click("#confirm-cancel");
+        ui.wait_hidden("#confirm-cancel");
+        ui.wait_visible("#changeset-discard");
+        assert!(ui.text("#changeset-diff").contains("+Alpha runs well."));
         ui.click("#changeset-discard");
         ui.click("#confirm-ok");
         ui.wait_text("#changesets-table", "No open changesets");
+        ui.wait_hidden("#drawer");
     })
     .await;
+    if !ran {
+        // Skipped (no Chromium): the changeset is still open, as it should be.
+        return;
+    }
 
     // The server agrees: nothing is open any more.
     let listed = call(&client, "list_changesets", json!({})).await;
     assert_eq!(structured(&listed)["changesets"], json!([]));
 }
 ```
+
+> **Corrected (issue #222, 2026-11-10; review of PR #229).** `drive` now returns whether the journey ran (`false` when no Chromium is found). As first planned, the MCP check after `drive` ran even when the journey was skipped, so the test failed without Chromium instead of skipping. A journey that checks server state after `drive` returns early on `false`. Callers that check nothing afterwards may ignore the value. The journey also cancels one Discard first and checks that the drawer stays open; the discard after it would be 409 had the cancelled one gone through.
 
 `tests/ui_e2e/main.rs`: add `mod changesets;`.
 
@@ -9260,6 +9284,8 @@ Run: `just test-ui`
 Expected: PASS, including `an_admin_discards_a_changeset_from_the_console`, with no skip lines.
 
 - [ ] **Step 9: Docs and changelog**
+
+> **Corrected (issue #222, 2026-11-10).** As issue #218's note under Task 3 says, the rows below went into the `### Changesets` subsection's own three-column table (`Method and path | Key | Does`), placed before "Testing the console", with a `curl` example on `okf-mcp.example.com`.
 
 `docs/operations.md`, section "Web console": add subsection "Changesets", saying that the page lists the selected catalog's open changesets (a key sees its own, an admin every key's), highlights idle ones (no change within `session_idle_timeout`), shows a changeset's diff, and discards it; that these are the `list_changesets`, `pending_changes` and `discard` tools over HTTP, with the same rules; and that another key's handle answers 404. API reference rows:
 

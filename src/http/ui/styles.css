@@ -202,3 +202,9 @@ pre.diff .del { color: var(--error); }
 .list-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .danger-zone { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border); }
 #import-progress { margin: .75rem 0; }
+
+/* Changesets (Task 7) */
+.diff-file { margin-bottom: 1rem; }
+.diff-file h3 { margin: 0 0 .35rem; }
+/* A block box, so a handle wrapped at its hyphens is one click target. */
+.changeset-handle { display: inline-block; }
