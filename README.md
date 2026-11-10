@@ -242,6 +242,9 @@ only).
 | `POST/GET/DELETE /mcp` | any | MCP streamable HTTP |
 | `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as `application/gzip`, `Content-Disposition: attachment; filename="<name>.tar.gz"` |
 | `POST /catalogs/{name}/import[?replace=true]` | `admin` on the catalog | Imports the uploaded `.tar.gz` and answers with the import report |
+| `GET /` | none | Redirects (303) to the web console, `/ui/` |
+| `GET /ui/*` | none | The web console's static files ("Web console" below) |
+| `/api/v1/*` | any (each endpoint checks its level) | The console's JSON API (`docs/operations.md`, "Web console") |
 
 ```sh
 curl -s http://127.0.0.1:8080/healthz
@@ -273,6 +276,22 @@ snapshot refresh after it have no deadline, so a committed import always gets
 its report, and the next read sees the new snapshot. `/healthz` and the export
 time out after 120 s with 503; `/mcp` has no timeout, since its `GET` is a
 long-lived event stream.
+
+## Web console
+
+`/ui/` is a browser console for the server, and `/` redirects there. Sign in
+by pasting an API key: the console acts with exactly that key's access and
+hides what the key cannot do. The key stays in that browser's `localStorage`
+until you sign out (or only in memory for the page's lifetime, where storage
+is blocked), so sign out on a shared machine.
+
+Every console action is an `/api/v1` call with the same bearer key, so
+anything the console does can be scripted:
+
+    curl -s -H "Authorization: Bearer $OKF_MCP_KEY" http://127.0.0.1:8080/api/v1/whoami
+
+The routes, the security headers and the API reference are in
+[`docs/operations.md`](docs/operations.md#web-console).
 
 ## Writing
 
@@ -507,6 +526,7 @@ The report structs derive `serde::Serialize`; their JSON has `okf.py
     OKF_PARITY_CATALOG=~/repos/pg_knowledge_catalog \
         cargo test --release --test smoke -- --ignored --nocapture   # timings
     UPDATE_GOLDEN=1 cargo test --test parity -- --ignored regenerate_goldens
+    just test-ui                                 # the web console's browser journeys
 
 `cargo test` needs Docker: every test that touches the database starts its own
 throwaway `postgres:17-alpine` container (via `testcontainers`) and removes it
@@ -520,6 +540,12 @@ on its float `sum()`) and `okf.py` (`OKF_PY`, default
 `~/repos/pg_knowledge_catalog/tools/okf.py`). The real catalog is read in
 place and never copied into this repository. `#[ignore]` marks a test that
 plain `cargo test` skips; `-- --ignored` runs only those.
+
+The browser journeys (`tests/ui_e2e`, run by `just test-ui` and by plain
+`cargo test`) drive headless Chromium through `rustwright`. They need Docker
+too, and find Chromium through `RUSTWRIGHT_CHROMIUM`, `CHROME`, `CHROMIUM`,
+the Playwright cache or `PATH`; without one, each journey prints a skip line
+and passes.
 
 Before a push, also run `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings` and

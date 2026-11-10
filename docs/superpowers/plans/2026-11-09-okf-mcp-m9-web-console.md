@@ -5,7 +5,7 @@
 **Goal:** A browser console for `okf-mcp`, plus the JSON API it runs on. The console covers API key management, catalog health dashboards, catalog administration with `.tar.gz` import and export, maintenance findings and runs, changeset housekeeping, and read-only browsing and search. Everything the console does is also a documented `/api/v1` call.
 
 **Architecture:**
-- **One binary, one port.** `/api/v1/*` is nested inside the existing keyed router, so the existing `require_key` bearer middleware covers it. `/ui/*` serves a static single-page app (vanilla ES modules, Pico CSS) without a key.
+- **One binary, one port.** `/api/v1/*` is nested beside the existing keyed router and applies the existing `require_key` bearer middleware itself, inside its header layer (corrected in issue #216). `/ui/*` serves a static single-page app (vanilla ES modules, Pico CSS) without a key.
 - **Embedded assets.** `build.rs` embeds every file under `src/http/ui/` at build time, so adding a page needs no Rust edit.
 - **Thin handlers.** API handlers build the same `ToolContext` the MCP tools build and call the existing `pub(crate)` tool functions, or the `store::*` functions the CLI calls. Behaviour cannot drift from MCP or the CLI.
 - **Rendering stays in Rust.** Markdown is rendered to escaped HTML with `pulldown-cmark`, and diffs and reports are computed in Rust. The JS only fetches, displays, filters and sorts.
@@ -579,8 +579,9 @@ Create `src/http/api/identity.rs` with its tests at the bottom:
 ```rust
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::http::api::testing::{app, assert_matrix, keys, send, Row};
+    // `oneshot` sends one request through a router without a socket.
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn whoami_describes_the_calling_key() {
@@ -612,16 +613,36 @@ mod tests {
     async fn api_responses_are_not_cached_or_sniffed() {
         let test = app().await;
         let keys = keys(&test).await;
-        let request = axum::http::Request::builder()
-            .uri("/api/v1/whoami")
-            .header("authorization", format!("Bearer {}", keys.read))
-            .body(axum::body::Body::empty())
-            .expect("request");
-        let response = crate::http::router(std::sync::Arc::clone(&test.app),
-            &tokio_util::sync::CancellationToken::new())
-            .oneshot(request).await.expect("response");
-        assert_eq!(response.headers()["cache-control"], "no-store");
-        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let valid = format!("Bearer {}", keys.read);
+        // A good key, no key, an unknown key, and an unknown path: the
+        // refusals carry the headers too, since `require_key` runs inside them.
+        for (uri, authorization, want) in [
+            ("/api/v1/whoami", Some(valid.as_str()), 200),
+            ("/api/v1/whoami", None, 401),
+            ("/api/v1/whoami", Some("Bearer okf_not-a-real-key"), 401),
+            ("/api/v1/nothing-here", None, 404),
+        ] {
+            let mut request = axum::http::Request::builder().uri(uri);
+            if let Some(value) = authorization {
+                request = request.header("authorization", value);
+            }
+            let request = request.body(axum::body::Body::empty()).expect("request");
+            let response = crate::http::router(
+                std::sync::Arc::clone(&test.app),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .oneshot(request)
+            .await
+            .expect("response");
+            let headers = response.headers();
+            let case = format!("{uri} with {authorization:?}");
+            assert_eq!(response.status().as_u16(), want, "{case}");
+            assert_eq!(headers["cache-control"], "no-store", "{case}");
+            assert_eq!(headers["x-content-type-options"], "nosniff", "{case}");
+            if want == 401 {
+                assert_eq!(headers["www-authenticate"], "Bearer", "{case}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -633,7 +654,7 @@ mod tests {
 }
 ```
 
-(`tower::ServiceExt` must be in scope for `.oneshot`; add `use tower::ServiceExt;` inside the test module.)
+> **Corrected (issue #216, 2026-11-10).** The module has no `use super::*;`: nothing in it uses the parent's items, so the import was an unused-import warning. `use tower::ServiceExt;` (for `.oneshot`) is written in.
 
 Create `src/http/ui.rs`'s tests (bottom of the file from Step 4):
 
@@ -718,13 +739,13 @@ Expected: it does not compile, because `src/http/api` and `src/http/ui.rs` are n
 
 use std::sync::Arc;
 
-use axum::http::{header, HeaderValue};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::Response;
 use axum::Router;
 
 use crate::app::App;
-use crate::auth::Principal;
+use crate::auth::{require_key, Principal};
 use crate::error::OkfError;
 use crate::mcp::context::ToolContext;
 use crate::store::keys::Access;
@@ -740,13 +761,15 @@ mod search;
 #[cfg(test)]
 pub(crate) mod testing;
 
-/// Every API route, for nesting at `/api/v1` inside the keyed router.
+/// Every API route, for nesting at `/api/v1`, behind `require_key`.
 ///
 /// # Arguments
-/// * `app` - the application (the import route's body limit comes from its config).
+/// * `app` - the application (its key cache for `require_key`; the import
+///   route's body limit comes from its config).
 ///
 /// # Returns
-/// A router whose responses all carry `Cache-Control: no-store` and `nosniff`.
+/// A router whose responses all carry `Cache-Control: no-store` and
+/// `nosniff`, the 401 for a missing or unknown key included.
 pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
     Router::new()
         .merge(identity::routes())
@@ -757,6 +780,18 @@ pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
         .merge(catalogs::routes(app))
         .merge(maintenance::routes())
         .merge(changesets::routes())
+        // `route_layer` covers the routes merged above and runs only when one
+        // matched, so an unknown API path stays 404 rather than 401.
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(app.keys()),
+            require_key,
+        ))
+        // Its own fallback, so an unknown API path is answered here (404,
+        // without a key check) and gets the headers below; without one, the
+        // outer router's fallback would answer it.
+        .fallback(|| async { StatusCode::NOT_FOUND })
+        // A plain `layer` wraps everything above, `require_key` and the
+        // fallback included, so the 401 and the 404 get these headers too.
         .layer(middleware::map_response(api_headers))
 }
 
@@ -776,6 +811,9 @@ async fn api_headers(mut response: Response) -> Response {
 /// # Arguments
 /// * `app` - the application.
 /// * `principal` - the calling key, from `require_key`.
+// Its first callers arrive with Tasks 3 to 7; until then the compiler would
+// warn that it is unused. Whichever of them merges first removes this attribute.
+#[allow(dead_code)]
 pub(crate) fn context(app: &Arc<App>, principal: Arc<Principal>) -> ToolContext {
     ToolContext::new(Arc::clone(app), principal, None)
 }
@@ -798,6 +836,8 @@ pub(crate) fn require_admin(principal: &Principal) -> Result<(), OkfError> {
 ```
 
 > Check `OkfError::Forbidden`'s field type when implementing (`reason: String` per the error list). Adjust `.into()` if it differs.
+
+> **Corrected (issue #216, 2026-11-10).** `OkfError::Forbidden { reason: String }` is as written. `context` carries the same `#[allow(dead_code)]` as `require_admin`: nothing in Task 1 calls it, and clippy's `-D warnings` refuses the dead-code warning. The first of Tasks 3 to 7 to call it removes the attribute (Task 2 calls only `require_admin`, so it removes that one if it merges before Task 5).
 
 Each area stub (`keys.rs`, `health.rs`, `browse.rs`, `search.rs`, `maintenance.rs`, `changesets.rs`). Here is the content for `keys.rs`; each other file says its own area and spec section:
 
@@ -981,14 +1021,14 @@ async fn security_headers(mut response: Response) -> Response {
 }
 ```
 
-`src/http/mod.rs`: add `pub(crate) mod api;` and `mod ui;` beside `mod archives;`. In `router()`, nest the API inside `keyed` before its `route_layer`, and merge the console beside `health`:
+> **Corrected (issue #216, 2026-11-10).** As first planned, the API was nested inside `keyed`, under `keyed`'s `require_key`. That put `require_key` outside `api_headers`, so a 401 from `/api/v1` lacked `no-store` and `nosniff` (review of PR #224). `api::routes(app)` now applies `require_key` itself as a `route_layer`, adds its own 404 fallback, and puts `api_headers` outside both. `router()` nests it beside `keyed` rather than inside it. The signature is unchanged. Later tasks still only merge into `routes()` above the `route_layer`, so every endpoint they add is keyed.
+
+`src/http/mod.rs`: add `pub(crate) mod api;` and `mod ui;` beside `mod archives;`. In `router()`, merge the console beside `health` and nest the API beside `keyed` (it applies `require_key` itself):
 
 ```rust
     let keyed = Router::new()
         .merge(mcp)
         .merge(archives::routes(&app))
-        // Nested before `route_layer`, so require_key covers every API route.
-        .nest("/api/v1", api::routes(&app))
         .route_layer(middleware::from_fn_with_state(keys, require_key));
     let health = Router::new()
         .route("/healthz", get(healthz))
@@ -996,11 +1036,14 @@ async fn security_headers(mut response: Response) -> Response {
     Router::new()
         .merge(health)
         .merge(ui::routes())
+        // The API applies `require_key` itself, inside its header layer, so
+        // even its 401 carries `no-store` and `nosniff`.
+        .nest("/api/v1", api::routes(&app))
         .merge(keyed)
         // (TraceLayer and with_state unchanged)
 ```
 
-`an_unknown_api_path_is_404_not_401` and `whoami_needs_any_key` prove two things: that `route_layer` covers the nested routes, and that it leaves unmatched paths as 404.
+`an_unknown_api_path_is_404_not_401` and `whoami_needs_any_key` prove two things: that `route_layer` covers the API routes, and that it leaves unmatched paths as 404. `api_responses_are_not_cached_or_sniffed` checks the headers on a 200, both 401s (no key, an unknown key) and the 404.
 
 - [ ] **Step 5: Create the front end**
 
@@ -1656,6 +1699,19 @@ async function enter() {
     await start();
 }
 
+// enter(), but a failure never leaves a blank page: a refused key is already
+// back on the login card (the 401 handler), and any other failure (the
+// server down, a 500) shows the card with the reason. The stored key is
+// kept, so a reload retries with it.
+async function enterOrRecover() {
+    try {
+        await enter();
+    } catch (error) {
+        if (error instanceof ApiError && error.status === 401) return;
+        showLogin(`The console could not load: ${error.message}. Reload to retry, or sign in again.`);
+    }
+}
+
 setUnauthorizedHandler(() => {
     store.key = null;
     store.whoami = null;
@@ -1673,7 +1729,7 @@ $('#login-form').addEventListener('submit', async event => {
     }
     store.key = key;
     event.target.reset();
-    await enter();
+    await enterOrRecover();
 });
 $('#signout').addEventListener('click', () => {
     store.key = null;
@@ -1694,9 +1750,11 @@ $('#drawer-scrim').addEventListener('click', closeDrawer);
 addEventListener('keydown', event => { if (event.key === 'Escape') closeDrawer(); });
 
 applyTheme(store.theme);
-if (store.key) enter().catch(() => {});
+if (store.key) enterOrRecover();
 else showLogin();
 ```
+
+> **Corrected (issue #216, 2026-11-10).** As first planned, boot ran `enter().catch(() => {})`. A stored key whose first `/whoami` failed with anything but a 401 (a 500, the server unreachable) then left both `#login` and `#app` hidden: a blank page (review of PR #224). `enterOrRecover()` shows the login card with the reason and keeps the stored key, and sign-in uses it too. `enter()` is unchanged, so Task 6's edit (`refreshFindingsBadge();` after `await start();` in `enter()`) still applies as written. The journey `a_failed_start_with_a_stored_key_shows_the_login_card` covers it.
 
 - [ ] **Step 6: Run the API and asset tests**
 
@@ -1804,6 +1862,9 @@ impl Ui {
     }
 
     /// Waits until `selector` is absent or hidden.
+    // Its first callers arrive with Tasks 2 to 7 (a closed drawer or dialog);
+    // until then the compiler would warn that it is unused.
+    #[allow(dead_code)]
     pub fn wait_hidden(&self, selector: &str) {
         self.poll(selector, || !self.page.is_visible(selector).unwrap_or(false));
     }
@@ -1866,10 +1927,12 @@ impl Ui {
 `tests/ui_e2e/login.rs`:
 
 ```rust
-//! Signing in and out, a refused key, the theme toggle, and what a read key sees.
+//! Signing in and out, a refused key, the theme toggle, what a read key
+//! sees, and a start that fails with a stored key.
 
 use okf_mcp::config::Config;
 use okf_mcp::store::keys::Access;
+use rustwright::GotoOptions;
 
 use crate::harness::drive;
 use crate::support::server::{files, TestServer};
@@ -1991,6 +2054,30 @@ async fn the_theme_toggle_flips_and_persists() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_start_with_a_stored_key_shows_the_login_card() {
+    let server = server().await;
+    let key = server
+        .key("console-boot", Access::Read, &["main"], Some("main"))
+        .await;
+    let app = std::sync::Arc::clone(&server.app);
+    // The journey runs on a blocking thread; this handle lets it run one
+    // async call (closing the pool) on the test's runtime.
+    let runtime = tokio::runtime::Handle::current();
+    drive(server.base.clone(), move |ui| {
+        ui.login(&key);
+        ui.wait_text("#whoami", "read");
+        // The key stays stored, but the next /whoami fails with a 500: the
+        // key cache is in memory, and listing key names needs the database.
+        runtime.block_on(app.pool().close());
+        ui.page.reload(GotoOptions::default()).expect("reload");
+        ui.wait_visible("#login");
+        ui.wait_text("#login-error", "could not load");
+        assert!(!ui.page.is_visible("#app").expect("visible"));
+    })
+    .await;
+}
 ```
 
 Run: `cargo test --test ui_e2e` before Steps 4 and 5 exist (or with `src/http/ui/js/main.js` empty).
@@ -2008,7 +2095,9 @@ test-ui:
 ```
 
 Run: `just test-ui`
-Expected: 6 passed, with no skip lines. (`a_slow_page_render_never_lands_in_a_newer_page` relies on `evaluate` awaiting a returned promise, as Playwright's does; if rustwright 0.3.0 does not, poll a `window` flag the function sets instead.)
+Expected: 7 passed, with no skip lines (6 as first planned; the seventh, `a_failed_start_with_a_stored_key_shows_the_login_card`, was added in issue #216). (`a_slow_page_render_never_lands_in_a_newer_page` relies on `evaluate` awaiting a returned promise, as Playwright's does; if rustwright 0.3.0 does not, poll a `window` flag the function sets instead.)
+
+> **Corrected (issue #216, 2026-11-10).** Checked: rustwright 0.3.0's `evaluate` awaits a returned promise (it sends `awaitPromise: true`), and the journey passes as written, so no fallback is needed. `wait_hidden` carries `#[allow(dead_code)]` (no Task 1 journey calls it, and the test crate is linted with `-D warnings`); the first task whose journey calls it removes the attribute. A probe journey confirmed that `assert_no_console_errors` fails on both a `console.error` and a CSP violation.
 
 - [ ] **Step 9: Docs and changelog**
 

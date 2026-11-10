@@ -1,9 +1,12 @@
-//! The HTTP server (design "Process and routes"): `/healthz`, `/mcp`, and
-//! the archive routes (`archives`), with request tracing, timeouts and the
+//! The HTTP server (design "Process and routes"): `/healthz`, `/mcp`, the
+//! archive routes (`archives`), the JSON API under `/api/v1` (`api`) and the
+//! web console under `/ui/` (`ui`), with request tracing, timeouts and the
 //! key layer, and on `/mcp` the session binding (`sessions`).
 
+pub(crate) mod api;
 mod archives;
 pub mod sessions;
+mod ui;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -217,6 +220,10 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
         .layer(timeout_layer());
     Router::new()
         .merge(health)
+        .merge(ui::routes())
+        // The API applies `require_key` itself, inside its header layer, so
+        // even its 401 carries `no-store` and `nosniff`.
+        .nest("/api/v1", api::routes(&app))
         .merge(keyed)
         // One `info` line per response (status, latency) in a span naming the
         // method and URI. The default span records no headers, so a bearer key

@@ -1,7 +1,7 @@
 //! Authorized, report-only maintenance MCP tools.
 
-mod reports;
-mod work;
+pub(crate) mod reports;
+pub(crate) mod work;
 
 use axum::http::request::Parts;
 use rmcp::handler::server::tool::Extension;

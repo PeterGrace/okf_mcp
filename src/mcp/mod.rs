@@ -3,18 +3,18 @@
 //! [`context::ToolContext`] from the HTTP request rmcp hands it and calls a
 //! plain function, which the module's tests call directly.
 
-mod catalogs;
-mod changesets;
-mod documents;
+pub(crate) mod catalogs;
+pub(crate) mod changesets;
+pub(crate) mod documents;
 // `pub` (not `pub(crate)`): the context's helpers, like `ToolResult`,
 // `tool_error` and `reply` below, are used by later tool modules, and a
 // public item is never flagged as dead code meanwhile.
 pub mod context;
-mod history;
-mod maintenance;
-mod reports;
+pub(crate) mod history;
+pub(crate) mod maintenance;
+pub(crate) mod reports;
 mod restructure;
-mod search;
+pub(crate) mod search;
 #[cfg(test)]
 pub(crate) mod testing;
 mod writes;
