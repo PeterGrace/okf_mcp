@@ -1096,6 +1096,14 @@ browser out at its next request.
 
 ### API reference
 
+The API has 31 endpoints. The identity endpoint is below, and each area's
+endpoints are in its own subsection: [API keys](#api-keys) (6),
+[Health](#health) (2), [Browse and search](#browse-and-search) (7),
+[Catalogs and import/export](#catalogs-and-importexport) (6),
+[Findings and runs](#findings-and-runs) (6) and [Changesets](#changesets) (3).
+Each area's tests check every endpoint against the access matrix (no key,
+read, write, admin, and an admin key that does not reach the catalog).
+
 | Method and path | Key | Does |
 |---|---|---|
 | `GET /api/v1/whoami` | any | The calling key: `key_id`, `name`, `actor`, `access`, `maintenance_report`, `all_catalogs`, `catalogs` (the loaded catalogs it reaches, sorted) and `default_catalog`. Never the key or its hash |
@@ -1182,22 +1190,27 @@ A body over `concept_outline_chars` is shown as its outline until you
 choose "Load the whole body" or follow a section link, which loads the
 whole body and scrolls to that heading.
 
-| Method | Path | Access | Notes |
-|---|---|---|---|
-| GET | `/api/v1/catalogs/{catalog}/tree` | read | Every concept, `index.md` and `log.md`, and the root `AGENTS.md`: `path`, `kind`, `title`. |
-| GET | `/api/v1/catalogs/{catalog}/concepts/{path}?full=` | read | `get_concept` with `raw`, plus `body_html` and the whole `outline`. Over `concept_outline_chars` without `full=true`: no `body`, `raw` or `body_html`. |
-| GET | `/api/v1/catalogs/{catalog}/links/{path}` | read | Outbound `links` and `backlinks`, as `get_concept` with `links`. |
-| GET | `/api/v1/catalogs/{catalog}/history/{path}?limit=` | read | The `history` tool. |
-| GET | `/api/v1/catalogs/{catalog}/revisions/{n}/{path}` | read | `text` at revision `n` (null for a deletion or non-text bytes) and a unified `diff` from revision `n-1`. |
-| GET | `/api/v1/catalogs/{catalog}/documents/{path}` | read | `read_document` (any `index.md` or `log.md`, the root `AGENTS.md`) plus `body_html`. |
-| GET | `/api/v1/search?q=&catalogs=&limit=` | read | The `search` tool. `catalogs` is comma-separated and defaults to every catalog the key reaches; a named catalog it does not reach is a 404. |
+| Method and path | Key | Does |
+|---|---|---|
+| `GET /api/v1/catalogs/{catalog}/tree` | read | Every concept, `index.md` and `log.md`, and the root `AGENTS.md`: `path`, `kind`, `title` |
+| `GET /api/v1/catalogs/{catalog}/concepts/{path}?full=` | read | `get_concept` with `raw`, plus `body_html` and the whole `outline`. Over `concept_outline_chars` without `full=true`: no `body`, `raw` or `body_html` |
+| `GET /api/v1/catalogs/{catalog}/links/{path}` | read | Outbound `links` and `backlinks`, as `get_concept` with `links` |
+| `GET /api/v1/catalogs/{catalog}/history/{path}?limit=` | read | The `history` tool |
+| `GET /api/v1/catalogs/{catalog}/revisions/{n}/{path}` | read | `text` at revision `n` (null for a deletion or non-text bytes) and a unified `diff` from revision `n-1` |
+| `GET /api/v1/catalogs/{catalog}/documents/{path}` | read | `read_document` (any `index.md` or `log.md`, the root `AGENTS.md`) plus `body_html` |
+| `GET /api/v1/search?q=&catalogs=&limit=` | read | The `search` tool. `catalogs` is comma-separated and defaults to every catalog the key reaches; a named catalog it does not reach is a 404 |
+
+A catalog the key does not reach, or that does not exist, is 404 on all
+seven.
 
 The per-document routes put their kind before the path (`/links/{path}`,
 not `/concepts/{path}/links`), because the path is a wildcard and must come
 last. For example:
 
-    curl -H "Authorization: Bearer $OKF_MCP_KEY" \
-        "http://127.0.0.1:8080/api/v1/catalogs/main/revisions/2/systems/alpha.md"
+```sh
+curl -s -H "Authorization: Bearer $OKF_MCP_KEY" \
+    https://okf-mcp.example.com/api/v1/catalogs/main/revisions/2/systems/alpha.md
+```
 
 ### Catalogs and import/export
 
@@ -1296,7 +1309,14 @@ the throwaway Postgres) and Chromium. `rustwright` finds Chromium through
 `RUSTWRIGHT_CHROMIUM` (the binary's path), `CHROME`, `CHROMIUM`, the
 Playwright cache, then `PATH`; without one, each journey prints a skip line
 and passes. A journey fails on any script error, unhandled rejection or CSP
-violation in the page.
+violation in the page. `tests/ui_e2e/smoke.rs` visits every page as an admin;
+each page also has its own journeys.
+
+On some distributions `chromium-browser` on `PATH` is a stub that installs a
+snap package and cannot launch headless. If journeys fail at launch, leave
+`RUSTWRIGHT_CHROMIUM` unset and install a Playwright Chromium (the
+Playwright cache comes before `PATH`), or point the variable at a real
+Chromium binary, never at the stub.
 
 ## 7. Health and time
 
@@ -1354,6 +1374,11 @@ take the server out of service. Alert on the `error` log line, not on
   and one per milestone.
 - **Changesets survive** an upgrade: they are in the database. Open MCP
   sessions do not; clients reconnect and carry on with the same handles.
+- **0.12.0 (web console)** adds no migration and no setting. It serves
+  `/ui/` and `/api/v1/` on the existing port, and `/` now redirects to
+  `/ui/` (it was 404). The ingress above routes them with no change. A proxy
+  that sets its own `Content-Security-Policy` must keep the console's sources
+  ("Web console").
 
 ### Preparing and shipping a release
 
@@ -1634,3 +1659,5 @@ curl -sf -H "Authorization: Bearer $OKF_MCP_KEY" -o notes.tar.gz \
 | TLS errors at startup (`UnknownIssuer`, a name mismatch) | `PGSSLROOTCERT` names the wrong CA, or the URL's host is not one the certificate names (with CloudNativePG, use the `-rw` service from the `-app` secret's `uri`). Check that the URL names no `sslmode` or `sslrootcert` |
 | `clock.ok` is false | Read the pod's `warn` line, "the clock check failed": often the name doesn't resolve from the pod, or UDP port 123 is blocked. `time_server` can be an address |
 | Database tests fail locally with TLS errors | `PGSSLMODE=verify-full` is exported in your shell; unset it |
+| `just test-ui` fails to launch Chromium | `RUSTWRIGHT_CHROMIUM` (or `CHROME`, `CHROMIUM`, or `PATH`'s `chromium-browser`) names a snap stub that cannot run headless. Unset it so rustwright uses the Playwright cache, or name a real Chromium ("Testing the console") |
+| The console's fonts fall back, or the console logs CSP violations behind a proxy | The proxy adds its own `Content-Security-Policy`. Keep the console's sources ("Web console") |

@@ -6,7 +6,9 @@ shared MCP server (design:
 
 Status: every milestone of the design is delivered: 1 (core library), 2
 (analysis), 3 (storage), 4 (read-only server), 5 (writes), 6 (restructuring)
-and 7 (deployment).
+and 7 (deployment). Milestone 9 added the web console at `/ui/` and its JSON
+API at `/api/v1` ("Web console" below; design:
+`docs/superpowers/specs/2026-11-09-okf-webui-design.md`).
 
 Deployed: `https://okf-mcp.k.vsix.me` (every route but `/healthz` needs a
 bearer key), from the image `ghcr.io/petergrace/okf-mcp`, with its database

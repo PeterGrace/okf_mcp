@@ -9416,6 +9416,8 @@ There must be no console errors. Run `just test-ui`, expecting every journey to 
 - **Spec:** record deviations 1 to 13 from this plan in place, and add "What M9 shipped differently", listing every `> **Corrected (issue #N).**` note in this plan.
 - **`changelog/<ts>-m9-web-console.md`:** summarize Tasks 1 to 7 with their PR numbers.
 
+> **Corrected (issue #223, 2026-11-10).** Steps 1 to 3 and 5 shipped in one PR (part of #223); Step 4, the release, follows separately after pgrace's go-ahead. Step 1 found every one of the 31 `/api/v1` routes documented and in its area's `assert_matrix` test. `docs/operations.md` keeps one table per area (issue #218's note) rather than one combined table: "API reference" gained an overview that names each area's subsection and its endpoint count, the Browse and search table moved to the shared three-column shape, and the 0.12.0 upgrade note and two troubleshooting rows (a snap-stub Chromium; a proxy's own CSP) were added. The smoke journey navigates by the sidebar links (`a[data-nav=...]`), clicks Export to show `#export-link`, and finds the admin's key as `[data-test=key-<name>]`. Step 5's `cargo test --release --test smoke -- --ignored` needs `OKF_PARITY_CATALOG` (a catalog checkout) and was not run.
+
 - [ ] **Step 4: Prepare the release**
 
 Run `just release-prepare minor` (0.11.2 to 0.12.0). Follow `docs/operations.md` "Preparing and shipping a release": open the release PR and get it reviewed. **Stop and ask pgrace** before merging it, before `just release-ship` (tag and image), and before any rollout.
