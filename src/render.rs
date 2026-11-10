@@ -26,6 +26,7 @@ use pulldown_cmark::{Options, Parser, Tag, TagEnd};
 
 use crate::okf::markdown::{body_split, headings, resolve_link, slugify};
 use crate::okf::paths::escapes_root;
+use crate::okf::pystr::py_unquote;
 use crate::okf::workspace::Workspace;
 
 /// The prefix of every heading's `id`.
@@ -340,7 +341,7 @@ fn destination(link_type: LinkType, url: &str, page: &Page<'_>) -> Destination {
     }
     if let Some(fragment) = url.strip_prefix('#') {
         return Destination::Route {
-            href: browse_route(page.catalog, page.path, Some(fragment)),
+            href: browse_route(page.catalog, page.path, Some(&section_slug(fragment))),
             broken: false,
         };
     }
@@ -351,11 +352,29 @@ fn destination(link_type: LinkType, url: &str, page: &Page<'_>) -> Destination {
     if escapes_root(&resolved.path) || !resolved.path.ends_with(".md") {
         return Destination::Text;
     }
-    let fragment = url.split_once('#').map(|(_, fragment)| fragment);
+    // The path stays literal, as `resolve_link` and the catalog's link
+    // checks read it; only the fragment is decoded (see `section_slug`).
+    let fragment = url
+        .split_once('#')
+        .map(|(_, fragment)| section_slug(fragment));
     Destination::Route {
-        href: browse_route(page.catalog, &resolved.path, fragment),
+        href: browse_route(page.catalog, &resolved.path, fragment.as_deref()),
         broken: !page.workspace.is_file(&resolved.path),
     }
+}
+
+/// The heading slug a link's `#fragment` names, read as the catalog's link
+/// check reads it (`src/okf/analysis/links.rs`): percent-decoded once, then
+/// lowercased. Decoding here keeps [`browse_route`] from encoding an
+/// already-encoded fragment a second time (`%C3%A9` would become `%25C3%25A9`).
+///
+/// # Arguments
+/// * `fragment` - the text after `#`, as written in the link.
+///
+/// # Returns
+/// The slug to put in the console route.
+fn section_slug(fragment: &str) -> String {
+    py_unquote(fragment).to_lowercase()
 }
 
 /// The console route of a document, and optionally one of its sections:
@@ -599,6 +618,37 @@ mod tests {
         );
         assert!(html.contains("<del>old</del>"), "{html}");
         assert!(html.contains(r#"type="checkbox""#), "{html}");
+    }
+
+    #[test]
+    fn encoded_fragments_are_decoded_once_and_paths_stay_literal() {
+        let files = MemWorkspace::from_files([
+            ("systems/alpha.md", "# Alpha\n"),
+            ("systems/beta.md", "# Beta\n\n## Caf\u{e9}\n"),
+            ("systems/a b.md", "# A b\n"),
+            ("systems/a%20b.md", "# Literal\n"),
+        ]);
+        let html = to_html(
+            "[Cafe](beta.md#caf%C3%A9) [Here](#Caf%C3%A9) [Upper](beta.md#CONFIG) \
+             [Encoded](a%20b.md)\n",
+            &Page::new("main", "systems/alpha.md", &files),
+        );
+
+        for href in [
+            "#/browse/main/systems/beta.md/caf%C3%A9",
+            "#/browse/main/systems/alpha.md/caf%C3%A9",
+            "#/browse/main/systems/beta.md/config",
+            // The file named `a%20b.md`, as the catalog's link check reads
+            // the link: `%` is encoded once, so the router decodes it back.
+            "#/browse/main/systems/a%2520b.md",
+        ] {
+            assert!(
+                html.contains(&format!("href=\"{href}\"")),
+                "{href} in {html}"
+            );
+        }
+        assert!(!html.contains("%25C3"), "no double encoding: {html}");
+        assert!(!html.contains(BROKEN_LINK_TITLE), "{html}");
     }
 
     #[test]
