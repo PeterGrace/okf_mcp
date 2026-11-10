@@ -83,9 +83,6 @@ async fn api_headers(mut response: Response) -> Response {
 ///
 /// # Returns
 /// A context acting as `principal`.
-// Its first callers arrive with Tasks 3 to 7; until then the compiler would
-// warn that it is unused. Whichever of them merges first removes this attribute.
-#[allow(dead_code)]
 pub(crate) fn context(app: &Arc<App>, principal: Arc<Principal>) -> ToolContext {
     ToolContext::new(Arc::clone(app), principal, None)
 }
