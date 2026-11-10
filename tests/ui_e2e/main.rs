@@ -5,6 +5,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod browse;
 mod harness;
 mod health;
 mod keys;

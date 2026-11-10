@@ -148,3 +148,39 @@ dl.facts dd { margin: 0; }
 .inline-form select, .inline-form button { width: auto; margin: 0; }
 pre.secret { white-space: pre-wrap; word-break: break-all; }
 .warn-text { color: var(--warn); font-weight: 600; }
+
+/* browse and search (M9 task 4) */
+.browse { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 1.5rem; align-items: start; }
+.browse-tree { position: sticky; top: 1rem; max-height: calc(100vh - 2rem); overflow-y: auto; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: .75rem; font-size: .85rem; }
+.tree ul { list-style: none; margin: 0; padding: 0 0 0 .75rem; }
+.tree > ul { padding-left: 0; }
+.tree li { list-style: none; margin: 0; padding: 0; }
+.tree details { margin: 0; }
+.tree summary { cursor: pointer; color: var(--fg-muted); padding: .15rem .4rem; }
+.tree-link { display: block; padding: .15rem .4rem; border-radius: var(--radius-sm); color: var(--fg); text-decoration: none;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-link:hover { background: var(--surface-2); }
+.tree-link.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.outline { border-left: 2px solid var(--border); padding-left: .75rem; margin-bottom: 1rem; font-size: .85rem; }
+.outline ul { list-style: none; margin: 0; padding: 0; }
+.outline li { list-style: none; margin: 0; }
+.outline .level-3 { padding-left: .75rem; }
+.outline .level-4, .outline .level-5, .outline .level-6 { padding-left: 1.5rem; }
+.markdown { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem 1.5rem; }
+.markdown pre { background: var(--surface-2); padding: .75rem; border-radius: var(--radius-sm); overflow-x: auto; }
+.markdown table { width: auto; }
+.markdown a[title="Not in this catalog"] { color: var(--error); text-decoration: line-through; }
+pre.raw { white-space: pre-wrap; word-break: break-word; background: var(--surface-2); padding: .75rem;
+    border-radius: var(--radius-sm); font-size: .8rem; }
+pre.diff .add { color: var(--ok); }
+pre.diff .del { color: var(--error); }
+.hits { padding-left: 1.25rem; }
+.hit { margin-bottom: .9rem; }
+.hit-title { font-weight: 600; }
+.hit p { margin: .15rem 0 0; }
+.snippet { font-family: var(--font-mono); }
+@media (max-width: 960px) {
+    .browse { grid-template-columns: 1fr; }
+    .browse-tree { position: static; max-height: none; }
+}

@@ -297,6 +297,10 @@ Admins manage API keys at `/ui/#/keys` (or `/api/v1/keys`) without a shell
 on the server: list, create (the secret is shown once), revoke, grant and
 ungrant catalogs, and the maintenance-report flag.
 
+Browse shows a catalog's tree, each concept rendered (raw HTML in a concept
+is shown as text, never run), its links, history and revision diffs, and
+Search searches every catalog the key reaches.
+
 The routes, the security headers and the API reference are in
 [`docs/operations.md`](docs/operations.md#web-console).
 
