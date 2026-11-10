@@ -241,7 +241,7 @@ only).
 | `GET /healthz` | none | `{"database": "ok", "catalogs": N, "clock": ...}`: 200, or 503 when the database does not answer within 2 s; `clock` is the last clock check (`docs/operations.md`, "Health and time") |
 | `POST/GET/DELETE /mcp` | any | MCP streamable HTTP |
 | `GET /catalogs/{name}/export` | `read` on the catalog | The catalog as `application/gzip`, `Content-Disposition: attachment; filename="<name>.tar.gz"` |
-| `POST /catalogs/{name}/import[?replace=true]` | `admin` on the catalog | Imports the uploaded `.tar.gz` and answers with the import report |
+| `POST /catalogs/{name}/import[?replace=true&only_machinery=true&expect_generation=N]` | `admin` on the catalog | Imports the uploaded `.tar.gz` and answers with the import report |
 | `GET /` | none | Redirects (303) to the web console, `/ui/` |
 | `GET /ui/*` | none | The web console's static files ("Web console" below) |
 | `/api/v1/*` | any (each endpoint checks its level) | The console's JSON API (`docs/operations.md`, "Web console") |
@@ -267,7 +267,10 @@ The import checks the key before it reads the upload. It then reads and checks
 the tarball (400 with every problem for an unreadable or rule-breaking
 archive), and only then looks the catalog up, so a key granted every catalog
 that posts a bad archive to an unknown one gets 400, not 404. It answers 409
-for a non-empty catalog without `?replace=true` (the message says to add it).
+for a non-empty catalog without `?replace=true` (the message says to add it),
+or when `?expect_generation=N` no longer matches (the message says to export
+again). `?only_machinery=true` replaces only repository machinery, as
+`--only-machinery` does.
 A body over `max_import_bytes` plus a little gzip slack is 413, axum's
 plain-text rejection rather than the error JSON. Only the upload is bounded:
 if reading and checking it takes more than 120 s the answer is 503 with
@@ -287,6 +290,10 @@ is blocked), so sign out on a shared machine.
 
 The Health page shows lint, sprawl, link, staleness and open-question counts,
 with each report one click away.
+
+Catalogs can be created, described, deleted, imported and exported from the
+console's Administer group, with no archive piped through a shell on the
+server.
 
 Every console action is an `/api/v1` call with the same bearer key, so
 anything the console does can be scripted:
