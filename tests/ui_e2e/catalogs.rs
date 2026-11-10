@@ -54,7 +54,8 @@ fn tarball(entries: &[(&str, &str)]) -> Vec<u8> {
 /// The catalog switcher's options.
 fn switcher(ui: &Ui) -> Vec<String> {
     let values = ui.eval(
-        "() => [...document.querySelectorAll('#catalog-select option')].map(option => option.value)",
+        "() => [...document.querySelectorAll('#catalog-select option')] \
+         .map(option => option.value)",
         json!(null),
     );
     serde_json::from_value(values).expect("a list of names")

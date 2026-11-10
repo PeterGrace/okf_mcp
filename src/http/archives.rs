@@ -166,8 +166,9 @@ struct ImportQuery {
 /// 403 ([`OkfError::Forbidden`]) for a key below `admin`; 400
 /// ([`OkfError::ImportRefused`]) for an unreadable or rule-breaking archive;
 /// 409 ([`OkfError::Refused`]) for a non-empty catalog without
-/// `?replace=true`, or one no longer at `expect_generation`; 500 for a database failure. A refresh that fails after
-/// the import committed is logged, not returned.
+/// `?replace=true`, or one no longer at `expect_generation`; 500 for a
+/// database failure. A refresh that fails after the import committed is
+/// logged, not returned.
 async fn import_catalog(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
