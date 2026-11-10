@@ -135,6 +135,20 @@ pre.diff { background: var(--surface-2); padding: .75rem; border-radius: var(--r
     main { padding: 1rem; }
 }
 
+/* API keys (Task 2): drawer facts, grant list, the one-time secret */
+/* One line box: a wrapped name leaves a gap at its centre, where a click
+   lands on the cell instead of the name. */
+.key-name { white-space: nowrap; }
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1rem; margin: 0 0 1rem; }
+dl.facts dt { color: var(--fg-muted); font-size: .8rem; }
+dl.facts dd { margin: 0; }
+.grant-list { list-style: none; padding: 0; margin: 0 0 .75rem; }
+.grant-list li { display: flex; gap: .5rem; align-items: center; padding: .15rem 0; }
+.inline-form { display: flex; gap: .5rem; align-items: center; }
+.inline-form select, .inline-form button { width: auto; margin: 0; }
+pre.secret { white-space: pre-wrap; word-break: break-all; }
+.warn-text { color: var(--warn); font-weight: 600; }
+
 /* catalogs and import/export (M9 task 5) */
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
     padding: 1rem 1.25rem; margin-bottom: 1rem; }

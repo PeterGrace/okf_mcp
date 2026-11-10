@@ -1104,6 +1104,40 @@ browser out at its next request.
 curl -s -H "Authorization: Bearer $OKF_MCP_KEY" https://okf-mcp.example.com/api/v1/whoami
 ```
 
+### API keys
+
+The API keys page (`/ui/#/keys`) and its API manage keys without a shell on
+the server, as `okf-mcp key ...` does. Both are for admin keys only: a read
+or write key gets 403 from the API, and the console hides the page.
+
+An admin key manages only the keys inside its reach. One that reaches every
+catalog manages every key. One scoped to catalogs manages the keys whose
+every catalog it reaches, and no all-catalogs key; any other key answers 404,
+as an unknown id does. A new key or a grant may name only catalogs the
+caller reaches, and `all` needs a caller that reaches every catalog. Paths
+take a key's immutable id, never its name.
+
+The secret is in the `POST /api/v1/keys` response only: it is not stored and
+cannot be shown again, and no other response holds a secret or a hash. A
+revoke, grant, ungrant or reporting change takes effect on the key's next
+request (the server reloads its keys at once). Key changes made here record
+no audit actor, as with the CLI.
+
+| Method and path | Key | Does |
+|---|---|---|
+| `GET /api/v1/keys` | admin | The keys the caller manages, revoked ones included: `id`, `name`, `actor`, `access`, `maintenance_report`, `all_catalogs`, `catalogs`, `default_catalog`, `created_at`, `revoked_at`. Never a secret or hash |
+| `POST /api/v1/keys` | admin | Body `{name, access: "read"\|"write"\|"admin", all, catalogs, default_catalog, actor, maintenance_report}` (`actor` defaults to `name`). Answers `{key, secret}`. 400 for a bad `access`, 403 for `all` from a scoped caller, 404 for an unreached catalog, 409 for a bad or taken name, no catalogs, or `all` with `catalogs`, 422 for an unknown field |
+| `PATCH /api/v1/keys/{id}` | admin | Body `{maintenance_report: bool}`. 409 for a revoked key |
+| `POST /api/v1/keys/{id}/revoke` | admin | Refused from the key's next request on. 409 if already revoked |
+| `PUT /api/v1/keys/{id}/catalogs/{catalog}` | admin | Grants a catalog. 404 for an unreached catalog or an unmanaged key; 409 for a revoked or all-catalogs key |
+| `DELETE /api/v1/keys/{id}/catalogs/{catalog}` | admin | Removes a grant, and the default if it was that catalog. Errors as for the grant |
+
+```sh
+curl -fsS -H "Authorization: Bearer $OKF_MCP_KEY" -H 'Content-Type: application/json' \
+    -d '{"name":"ci-reader","access":"read","catalogs":["main"],"default_catalog":"main"}' \
+    https://okf-mcp.example.com/api/v1/keys
+```
+
 ### Health
 
 | Method and path | Key | Does |
