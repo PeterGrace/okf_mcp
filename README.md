@@ -293,6 +293,10 @@ anything the console does can be scripted:
 
     curl -s -H "Authorization: Bearer $OKF_MCP_KEY" http://127.0.0.1:8080/api/v1/whoami
 
+Admins manage API keys at `/ui/#/keys` (or `/api/v1/keys`) without a shell
+on the server: list, create (the secret is shown once), revoke, grant and
+ungrant catalogs, and the maintenance-report flag.
+
 The routes, the security headers and the API reference are in
 [`docs/operations.md`](docs/operations.md#web-console).
 

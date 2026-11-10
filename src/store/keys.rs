@@ -363,8 +363,32 @@ pub async fn set_maintenance_report_target(
     actor: Option<&str>,
     enabled: bool,
 ) -> Result<String, OkfError> {
+    set_maintenance_report_with(pool, Selector::Resolve { target, actor }, enabled).await
+}
+
+/// As [`set_maintenance_report_target`], but for exactly the key with this immutable id, never a
+/// name: the row is locked in the change's own transaction, so a key
+/// replaced since the caller looked it up cannot be changed instead. The
+/// web API's key routes use this.
+///
+/// # Errors
+/// As [`set_maintenance_report_target`]; [`OkfError::Refused`] if there is no key with this id.
+pub async fn set_maintenance_report_by_id(
+    pool: &PgPool,
+    id: &str,
+    enabled: bool,
+) -> Result<String, OkfError> {
+    set_maintenance_report_with(pool, Selector::Exact(id), enabled).await
+}
+
+/// The body of [`set_maintenance_report_target`] and [`set_maintenance_report_by_id`].
+async fn set_maintenance_report_with(
+    pool: &PgPool,
+    selector: Selector<'_>,
+    enabled: bool,
+) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
-    let id = resolve_active(&mut tx, target, actor).await?;
+    let id = select(&mut tx, selector).await?;
     let updated = sqlx::query(
         "UPDATE api_keys SET maintenance_report = $2 \
          WHERE id = $1 AND revoked_at IS NULL AND maintenance_report IS DISTINCT FROM $2",
@@ -410,8 +434,28 @@ pub async fn revoke_target(
     actor: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
+    revoke_with(pool, Selector::Resolve { target, actor }, now).await
+}
+
+/// As [`revoke_target`], but for exactly the key with this immutable id, never a
+/// name: the row is locked in the change's own transaction, so a key
+/// replaced since the caller looked it up cannot be changed instead. The
+/// web API's key routes use this.
+///
+/// # Errors
+/// As [`revoke_target`]; [`OkfError::Refused`] if there is no key with this id.
+pub async fn revoke_by_id(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<String, OkfError> {
+    revoke_with(pool, Selector::Exact(id), now).await
+}
+
+/// The body of [`revoke_target`] and [`revoke_by_id`].
+async fn revoke_with(
+    pool: &PgPool,
+    selector: Selector<'_>,
+    now: DateTime<Utc>,
+) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
-    let id = resolve_active(&mut tx, target, actor).await?;
+    let id = select(&mut tx, selector).await?;
     let revoked =
         sqlx::query("UPDATE api_keys SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL")
             .bind(&id)
@@ -452,9 +496,29 @@ pub async fn grant_target(
     actor: Option<&str>,
     catalog: &str,
 ) -> Result<String, OkfError> {
+    grant_with(pool, Selector::Resolve { target, actor }, catalog).await
+}
+
+/// As [`grant_target`], but for exactly the key with this immutable id, never a
+/// name: the row is locked in the change's own transaction, so a key
+/// replaced since the caller looked it up cannot be changed instead. The
+/// web API's key routes use this.
+///
+/// # Errors
+/// As [`grant_target`]; [`OkfError::Refused`] if there is no key with this id.
+pub async fn grant_by_id(pool: &PgPool, id: &str, catalog: &str) -> Result<String, OkfError> {
+    grant_with(pool, Selector::Exact(id), catalog).await
+}
+
+/// The body of [`grant_target`] and [`grant_by_id`].
+async fn grant_with(
+    pool: &PgPool,
+    selector: Selector<'_>,
+    catalog: &str,
+) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
     let catalog = catalogs::find(&mut *tx, catalog).await?;
-    let id = resolve_active(&mut tx, target, actor).await?;
+    let id = select(&mut tx, selector).await?;
     require_named_grants(&mut tx, &id).await?;
     let inserted = sqlx::query(
         "INSERT INTO key_catalogs (key_id, catalog_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -491,9 +555,29 @@ pub async fn ungrant_target(
     actor: Option<&str>,
     catalog: &str,
 ) -> Result<String, OkfError> {
+    ungrant_with(pool, Selector::Resolve { target, actor }, catalog).await
+}
+
+/// As [`ungrant_target`], but for exactly the key with this immutable id, never a
+/// name: the row is locked in the change's own transaction, so a key
+/// replaced since the caller looked it up cannot be changed instead. The
+/// web API's key routes use this.
+///
+/// # Errors
+/// As [`ungrant_target`]; [`OkfError::Refused`] if there is no key with this id.
+pub async fn ungrant_by_id(pool: &PgPool, id: &str, catalog: &str) -> Result<String, OkfError> {
+    ungrant_with(pool, Selector::Exact(id), catalog).await
+}
+
+/// The body of [`ungrant_target`] and [`ungrant_by_id`].
+async fn ungrant_with(
+    pool: &PgPool,
+    selector: Selector<'_>,
+    catalog: &str,
+) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
     let catalog = catalogs::find(&mut *tx, catalog).await?;
-    let id = resolve_active(&mut tx, target, actor).await?;
+    let id = select(&mut tx, selector).await?;
     require_named_grants(&mut tx, &id).await?;
     let deleted = sqlx::query("DELETE FROM key_catalogs WHERE key_id = $1 AND catalog_id = $2")
         .bind(&id)
@@ -520,6 +604,40 @@ pub async fn ungrant(pool: &PgPool, target: &str, catalog: &str) -> Result<(), O
     ungrant_target(pool, target, None, catalog)
         .await
         .map(|_| ())
+}
+
+/// How a key change names its key.
+#[derive(Debug, Clone, Copy)]
+enum Selector<'a> {
+    /// An exact generated id, else an unambiguous active name (the CLI's
+    /// rules, [`resolve_active`]).
+    Resolve {
+        /// The id or name.
+        target: &'a str,
+        /// Narrows a name to one actor.
+        actor: Option<&'a str>,
+    },
+    /// Exactly this id, whatever its shape.
+    Exact(&'a str),
+}
+
+/// The id `selector` names, inside the change's transaction.
+async fn select(conn: &mut PgConnection, selector: Selector<'_>) -> Result<String, OkfError> {
+    match selector {
+        Selector::Resolve { target, actor } => resolve_active(conn, target, actor).await,
+        Selector::Exact(id) => {
+            // `FOR UPDATE` locks the row until the transaction ends, so a
+            // concurrent revoke or grant of it waits for this change.
+            let found: Option<String> =
+                sqlx::query_scalar("SELECT id FROM api_keys WHERE id = $1 FOR UPDATE")
+                    .bind(id)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+            found.ok_or_else(|| OkfError::Refused {
+                reason: format!("no key {id:?}"),
+            })
+        }
+    }
 }
 
 async fn resolve_active(
@@ -978,6 +1096,60 @@ mod tests {
             .unwrap()
             .iter()
             .any(|record| record.name == collision.name && record.revoked_at.is_none()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn by_id_changes_never_reach_a_legacy_keys_replacement() {
+        // The web API's interleaving: it reads a legacy key (id == name) and
+        // checks its reach, another admin rotates that key, then the change
+        // runs with the id it read. The rotation's replacement shares the name
+        // and actor, so name resolution would pick it; by id nothing may.
+        let db = test_db().await;
+        for name in ["work", "extra"] {
+            catalogs::create(&db.pool, name, "", now()).await.unwrap();
+        }
+        insert_legacy_test_key(&db.pool, "legacy", Access::Write, "terminal", now()).await;
+        let snapshot = list(&db.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "legacy")
+            .expect("the legacy key");
+
+        revoke_by_id(&db.pool, &snapshot.id, now()).await.unwrap();
+        let work = ["work".to_string()];
+        let replacement = create_with_id(
+            &db.pool,
+            &NewKey {
+                actor: "terminal",
+                ..new_key("legacy", Grants::Catalogs(&work), None)
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let refused = |result: Result<String, OkfError>| {
+            assert!(
+                matches!(result, Err(OkfError::Refused { .. })),
+                "{result:?}"
+            );
+        };
+        refused(revoke_by_id(&db.pool, &snapshot.id, now()).await);
+        refused(set_maintenance_report_by_id(&db.pool, &snapshot.id, true).await);
+        refused(grant_by_id(&db.pool, &snapshot.id, "extra").await);
+        refused(ungrant_by_id(&db.pool, &snapshot.id, "work").await);
+        refused(revoke_by_id(&db.pool, "no-such-id", now()).await);
+
+        let after = list(&db.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == replacement.id)
+            .expect("the replacement");
+        assert_eq!(after.revoked_at, None);
+        assert!(!after.maintenance_report);
+        assert_eq!(after.catalogs, vec!["work".to_string()]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
