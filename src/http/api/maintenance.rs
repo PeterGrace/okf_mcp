@@ -445,13 +445,21 @@ mod tests {
         .await;
         assert_eq!(status.as_u16(), 403, "{body}");
         let missing = "/api/v1/catalogs/missing/maintenance";
-        for uri in [
-            format!("{missing}/runs"),
-            format!("{missing}/findings"),
-            format!("{missing}/counts"),
+        let decision = dispose_body("dismissed", "No such catalog.", "missing");
+        for (method, uri, body) in [
+            ("GET", format!("{missing}/runs"), None),
+            ("GET", format!("{missing}/runs/{finding}"), None),
+            ("GET", format!("{missing}/findings"), None),
+            ("GET", format!("{missing}/findings/{finding}"), None),
+            ("GET", format!("{missing}/counts"), None),
+            (
+                "POST",
+                format!("{missing}/findings/{finding}/disposition"),
+                Some(decision),
+            ),
         ] {
-            let (status, _) = send(&test, "GET", &uri, Some(&keys.admin), None).await;
-            assert_eq!(status.as_u16(), 404, "{uri}");
+            let (status, _) = send(&test, method, &uri, Some(&keys.admin), body).await;
+            assert_eq!(status.as_u16(), 404, "{method} {uri}");
         }
     }
 
