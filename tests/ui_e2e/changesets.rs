@@ -41,7 +41,7 @@ async fn an_admin_discards_a_changeset_from_the_console() {
     structured(&edited);
 
     let shown = handle.clone();
-    drive(server.base.clone(), move |ui| {
+    let ran = drive(server.base.clone(), move |ui| {
         ui.login(&key);
         ui.open("/changesets");
         ui.wait_text("#changesets-table", &shown);
@@ -53,6 +53,10 @@ async fn an_admin_discards_a_changeset_from_the_console() {
         ui.wait_hidden("#drawer");
     })
     .await;
+    if !ran {
+        // Skipped (no Chromium): the changeset is still open, as it should be.
+        return;
+    }
 
     // The server agrees: nothing is open any more.
     let listed = call(&client, "list_changesets", json!({})).await;

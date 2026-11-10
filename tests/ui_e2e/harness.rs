@@ -23,14 +23,19 @@ pub struct Ui {
 /// Runs `journey` in a fresh headless Chromium, then fails it on any console
 /// error (script errors and CSP violations are logged as errors by main.js).
 /// Returns without running when no Chromium is installed.
-pub async fn drive<F>(base: String, journey: F)
+///
+/// # Returns
+/// Whether the journey ran: `false` when it was skipped. A test that checks
+/// server state the journey changed returns early on `false`, so it skips
+/// too rather than failing on the unchanged state.
+pub async fn drive<F>(base: String, journey: F) -> bool
 where
     F: FnOnce(&Ui) + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
         if chromium().executable_path().is_none() {
             eprintln!("skipping browser journey: no Chromium found (set RUSTWRIGHT_CHROMIUM)");
-            return;
+            return false;
         }
         let browser = chromium()
             .launch(LaunchOptions::default().headless(true))
@@ -44,9 +49,10 @@ where
         };
         journey(&ui);
         ui.assert_no_console_errors();
+        true
     })
     .await
-    .expect("the journey thread panicked");
+    .expect("the journey thread panicked")
 }
 
 impl Ui {

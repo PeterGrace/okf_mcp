@@ -256,7 +256,7 @@ export function confirmDialog({ title, message, action, danger, typed }) -> Prom
 ```rust
 // tests/ui_e2e/harness.rs
 pub struct Ui { pub base: String, pub page: rustwright::Page, /* browser kept alive */ }
-pub async fn drive<F: FnOnce(&Ui) + Send + 'static>(base: String, journey: F); // skips without Chromium
+pub async fn drive<F: FnOnce(&Ui) + Send + 'static>(base: String, journey: F) -> bool; // false: skipped (no Chromium); corrected in issue #222
 impl Ui {
     pub fn open(&self, route: &str);                 // goto {base}/ui/#{route}
     pub fn login(&self, key: &str);                  // login form, then waits for #app
@@ -9241,7 +9241,7 @@ async fn an_admin_discards_a_changeset_from_the_console() {
     structured(&edited);
 
     let shown = handle.clone();
-    drive(server.base.clone(), move |ui| {
+    let ran = drive(server.base.clone(), move |ui| {
         ui.login(&key);
         ui.open("/changesets");
         ui.wait_text("#changesets-table", &shown);
@@ -9253,12 +9253,18 @@ async fn an_admin_discards_a_changeset_from_the_console() {
         ui.wait_hidden("#drawer");
     })
     .await;
+    if !ran {
+        // Skipped (no Chromium): the changeset is still open, as it should be.
+        return;
+    }
 
     // The server agrees: nothing is open any more.
     let listed = call(&client, "list_changesets", json!({})).await;
     assert_eq!(structured(&listed)["changesets"], json!([]));
 }
 ```
+
+> **Corrected (issue #222, 2026-11-10; review of PR #229).** `drive` now returns whether the journey ran (`false` when no Chromium is found). As first planned, the MCP check after `drive` ran even when the journey was skipped, so the test failed without Chromium instead of skipping. A journey that checks server state after `drive` returns early on `false`. Callers that check nothing afterwards may ignore the value.
 
 `tests/ui_e2e/main.rs`: add `mod changesets;`.
 
