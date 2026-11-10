@@ -239,6 +239,7 @@ async fn report(
 mod tests {
     use serde_json::json;
 
+    use super::{DEFAULT_ROWS, MAX_ROWS};
     use crate::config::Config;
     use crate::http::api::testing::{app, assert_matrix, keys, send, Row};
     use crate::mcp::testing::{app_with, TestApp};
@@ -332,6 +333,41 @@ mod tests {
         assert_eq!(quiet["summary"]["unlinked_mentions"], 0);
         let lint = get_ok(&test, &keys.read, &format!("{base}/lint")).await;
         assert_eq!(lint["pending"], false);
+    }
+
+    #[tokio::test]
+    async fn row_limits_default_to_20_and_clamp_to_1_through_200() {
+        // More concepts than MAX_ROWS, so every bound can be told apart.
+        let docs: Vec<(String, String)> = (0..=MAX_ROWS)
+            .map(|i| {
+                (
+                    format!("systems/c{i:03}.md"),
+                    format!("---\ntype: system\ntitle: C{i}\n---\n# C{i}\n\nConcept {i}.\n"),
+                )
+            })
+            .collect();
+        // `app_with` takes borrowed pairs; `as_str` borrows from `docs`,
+        // which outlives the slice (a Python list of tuples needs no such step).
+        let pairs: Vec<(&str, &str)> = docs
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let other: &[(&str, &str)] = &[("index.md", "# Other\n")];
+        let test = app_with(&[("main", &pairs), ("other", other)], Config::default()).await;
+        let keys = keys(&test).await;
+        let base = "/api/v1/catalogs/main/reports";
+        for (report, field) in [("oldest", "rows"), ("sprawl", "reports")] {
+            for (query, expected) in [
+                ("", DEFAULT_ROWS),
+                ("?n=0", 1),
+                ("?n=200", MAX_ROWS),
+                ("?n=201", MAX_ROWS),
+            ] {
+                let body = get_ok(&test, &keys.read, &format!("{base}/{report}{query}")).await;
+                let rows = body[field].as_array().expect("report rows").len();
+                assert_eq!(rows, expected, "{report}{query}");
+            }
+        }
     }
 
     #[tokio::test]
