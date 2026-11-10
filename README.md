@@ -311,6 +311,9 @@ Browse shows a catalog's tree, each concept rendered (raw HTML in a concept
 is shown as text, never run), its links, history and revision diffs, and
 Search searches every catalog the key reaches.
 
+Changesets an agent left open can be inspected (their pending diff) and
+discarded at `/ui/#/changesets`.
+
 The routes, the security headers and the API reference are in
 [`docs/operations.md`](docs/operations.md#web-console).
 
