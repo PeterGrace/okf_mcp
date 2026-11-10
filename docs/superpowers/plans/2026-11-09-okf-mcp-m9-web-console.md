@@ -2147,6 +2147,7 @@ Depends on Task 1. Parallel with Tasks 3 to 7.
 
 **Files:**
 - Modify: `src/http/api/keys.rs` (replaces Task 1's stub)
+- Modify: `src/store/keys.rs` (`*_by_id` key changes; corrected in issue #217)
 - Create: `src/http/ui/js/pages/keys.js`
 - Modify: `src/http/ui/styles.css` (append the "keys" block)
 - Create: `tests/ui_e2e/keys.rs`; Modify: `tests/ui_e2e/main.rs` (`mod keys;`)
@@ -2740,7 +2741,7 @@ async fn ungrant_catalog(
 }
 ```
 
-> **Corrected (issue #217, 2026-11-10).** Security decision 4 does not hold for a legacy row as written: for a row from before migration 0005 (`id == name`), `resolve_active` uses active-name resolution even given its exact id, so passing `&target.id` could revoke, re-flag or re-grant another live key of that name, one the caller may not manage. The handlers pass the target through `store_target(&KeyRecord) -> Result<(&str, Option<&str>), OkfError>` (`src/http/api/keys.rs`): a generated id goes as is with no actor; a legacy row goes with its own actor (live name and actor are unique), and a revoked legacy row is `Refused` (409) by the handler. The test `a_legacy_id_changes_only_its_own_key` covers it, making seven API tests.
+> **Corrected (issue #217, 2026-11-10).** Security decision 4 does not hold as written. For a row from before migration 0005 (`id == name`), `resolve_active` resolves the id by active name, so a `*_target` call with `&target.id` could revoke, re-flag or re-grant another live key of that name. That includes a replacement created between the handler's `managed` lookup and the store's transaction, which the caller may not manage (review of PR #226). `store::keys` therefore gains `set_maintenance_report_by_id(pool, id, enabled)`, `revoke_by_id(pool, id, now)`, `grant_by_id(pool, id, catalog)` and `ungrant_by_id(pool, id, catalog)`. They share their bodies with the `*_target` functions through a private `Selector` and lock exactly that row (`SELECT ... FOR UPDATE`), never falling back to a name. The handlers call these instead of `*_target(.., None, ..)`, and the revoked checks run on that row as before. Tests: `a_legacy_id_changes_only_its_own_key` (API) and `store::keys::tests::by_id_changes_never_reach_a_legacy_keys_replacement` (the lookup, rotate, mutate interleaving). Task 2 therefore also modifies `src/store/keys.rs`.
 
 > `&app` is a `&Arc<App>` and `&principal` a `&Arc<Principal>`; Rust's deref coercion passes them where `&App` and `&Principal` are expected, like Python duck typing but checked at compile time.
 

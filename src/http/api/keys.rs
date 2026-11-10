@@ -1,6 +1,8 @@
 //! `/api/v1/keys` (web console design, "API": Keys): what `okf-mcp key ...`
-//! does, over HTTP. The handlers call the same `store::keys` functions the
-//! CLI calls, always by immutable key id.
+//! does, over HTTP. The handlers use the same `store::keys` functions the CLI
+//! uses, in their `*_by_id` form: a change is made to exactly the key whose
+//! reach was checked, never to another one found by its name (a legacy id is
+//! also a name, and the CLI's `*_target` functions resolve it as one).
 //!
 //! Access (M9 Task 2, "Security decisions"):
 //! - every route needs an admin key;
@@ -194,34 +196,6 @@ async fn managed(app: &App, principal: &Principal, id: &str) -> Result<KeyRecord
         })
 }
 
-/// How the store's `*_target` functions must name `record` so that they
-/// change exactly that key.
-///
-/// The store resolves an exact generated id directly. A legacy row (from
-/// before migration 0005, whose id is also its name) it resolves by active
-/// name instead, which could reach another live key of that name (one the
-/// caller may not manage). Its actor narrows that to the one live key with
-/// this name and actor, which the store keeps unique, and a revoked legacy row
-/// is refused here, since by name it would resolve to its replacement.
-///
-/// # Returns
-/// The target and the actor to pass with it.
-///
-/// # Errors
-/// [`OkfError::Refused`] for a revoked legacy row, as the store refuses any
-/// change to a revoked key.
-fn store_target(record: &KeyRecord) -> Result<(&str, Option<&str>), OkfError> {
-    if record.id != record.name {
-        return Ok((&record.id, None));
-    }
-    if record.revoked_at.is_some() {
-        return Err(OkfError::Refused {
-            reason: format!("key {:?} is revoked", record.id),
-        });
-    }
-    Ok((&record.id, Some(&record.actor)))
-}
-
 /// Reloads the key cache at once (plan Decision 12), then answers with the
 /// key as it now is. The change is already committed, so a failed reload is
 /// logged, not returned: the background poll retries within `poll_interval`.
@@ -333,9 +307,7 @@ async fn update_key(
     Json(body): Json<UpdateKeyBody>,
 ) -> Result<Json<KeyView>, AppError> {
     let target = managed(&app, &principal, &id).await?;
-    let (selector, actor) = store_target(&target)?;
-    key_rows::set_maintenance_report_target(app.pool(), selector, actor, body.maintenance_report)
-        .await?;
+    key_rows::set_maintenance_report_by_id(app.pool(), &target.id, body.maintenance_report).await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -351,8 +323,7 @@ async fn revoke_key(
     Path(id): Path<String>,
 ) -> Result<Json<KeyView>, AppError> {
     let target = managed(&app, &principal, &id).await?;
-    let (selector, actor) = store_target(&target)?;
-    key_rows::revoke_target(app.pool(), selector, actor, app.clock().now()).await?;
+    key_rows::revoke_by_id(app.pool(), &target.id, app.clock().now()).await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -371,8 +342,7 @@ async fn grant_catalog(
     require_admin(&principal)?;
     principal.require(Access::Admin, &catalog)?;
     let target = managed(&app, &principal, &id).await?;
-    let (selector, actor) = store_target(&target)?;
-    key_rows::grant_target(app.pool(), selector, actor, &catalog).await?;
+    key_rows::grant_by_id(app.pool(), &target.id, &catalog).await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -389,8 +359,7 @@ async fn ungrant_catalog(
     require_admin(&principal)?;
     principal.require(Access::Admin, &catalog)?;
     let target = managed(&app, &principal, &id).await?;
-    let (selector, actor) = store_target(&target)?;
-    key_rows::ungrant_target(app.pool(), selector, actor, &catalog).await?;
+    key_rows::ungrant_by_id(app.pool(), &target.id, &catalog).await?;
     changed(&app, &principal, &target.id).await
 }
 
