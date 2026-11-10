@@ -7600,50 +7600,82 @@ Append to `src/store/maintenance/report_tests.rs` (it already imports `reports`,
 #[tokio::test(flavor = "multi_thread")]
 async fn maintenance_findings_filter_and_count_by_current_disposition() {
     let db = test_db().await;
-    let catalog = setup(&db.pool, &["a.md", "b.md"]).await;
-    let (_, first) = fixture(&db.pool, catalog, "first").await;
-    let (_, second) = fixture(&db.pool, catalog, "second").await;
+    let catalog = setup(&db.pool, &["a.md", "b.md", "c.md"]).await;
+    for key in ["first", "second", "third"] {
+        fixture(&db.pool, catalog, key).await;
+    }
     let ids = |page: &runs::Page<reports::FindingRecord>| {
-        page.items.iter().map(|finding| finding.id.clone()).collect::<Vec<_>>()
+        page.items
+            .iter()
+            .map(|finding| finding.id.clone())
+            .collect::<Vec<_>>()
     };
-    let human = actor("human");
-    reports::dispose(&db.pool, catalog, &human, &first, Disposition::Dismissed, "Not useful.", "dismiss", t0())
+    // Page order is (created_at, id), and the ids are random, so take the
+    // order from the store; then dismiss the middle one, so a non-matching
+    // finding sits between the two matching ones.
+    let all = reports::list_findings(&db.pool, catalog, None, 20)
         .await
         .unwrap();
+    let order = ids(&all);
+    let [before, middle, after] = <[String; 3]>::try_from(order.clone()).unwrap();
+    let human = actor("human");
+    let decide = |disposition, key| {
+        let (pool, human, middle) = (&db.pool, &human, &middle);
+        async move {
+            reports::dispose(
+                pool,
+                catalog,
+                human,
+                middle,
+                disposition,
+                "Decided.",
+                key,
+                t0(),
+            )
+            .await
+            .unwrap();
+        }
+    };
+    decide(Disposition::Dismissed, "dismiss").await;
     let open = reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Open))
         .await
         .unwrap();
-    assert_eq!(ids(&open), [second]);
+    assert_eq!(ids(&open), [before.clone(), after.clone()]);
     assert_eq!(open.next_after, None);
     let dismissed =
         reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Dismissed))
             .await
             .unwrap();
-    assert_eq!(ids(&dismissed), std::slice::from_ref(&first));
-    assert!(reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::NeedsInput))
-        .await
-        .unwrap()
-        .items
-        .is_empty());
+    assert_eq!(ids(&dismissed), std::slice::from_ref(&middle));
+    assert!(reports::list_findings_with(
+        &db.pool,
+        catalog,
+        None,
+        20,
+        Some(Disposition::NeedsInput)
+    )
+    .await
+    .unwrap()
+    .items
+    .is_empty());
     assert_eq!(
         reports::count_findings(&db.pool, catalog).await.unwrap(),
-        reports::FindingCounts { open: 1, accepted_for_follow_up: 0, dismissed: 1, needs_input: 0 }
+        reports::FindingCounts {
+            open: 2,
+            accepted_for_follow_up: 0,
+            dismissed: 1,
+            needs_input: 0
+        }
     );
 
-    // Only the last decision counts: reopening moves the finding back.
-    reports::dispose(&db.pool, catalog, &human, &first, Disposition::Open, "Reopened.", "reopen", t0())
-        .await
-        .unwrap();
-    let all = reports::list_findings(&db.pool, catalog, None, 20).await.unwrap();
-    let open = reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Open))
-        .await
-        .unwrap();
-    assert_eq!(open.items, all.items);
-    // A filtered page's cursor continues within the filter.
+    // The filter applies before the limit: one-row pages of Open skip the
+    // dismissed middle finding instead of returning an empty page for it,
+    // and the cursor (a matching finding) continues within the filter.
     let page = reports::list_findings_with(&db.pool, catalog, None, 1, Some(Disposition::Open))
         .await
         .unwrap();
-    assert_eq!(page.items, all.items[..1]);
+    assert_eq!(ids(&page), std::slice::from_ref(&before));
+    assert_eq!(page.next_after.as_deref(), Some(before.as_str()));
     let rest = reports::list_findings_with(
         &db.pool,
         catalog,
@@ -7653,11 +7685,33 @@ async fn maintenance_findings_filter_and_count_by_current_disposition() {
     )
     .await
     .unwrap();
-    assert_eq!(rest.items, all.items[1..]);
+    assert_eq!(ids(&rest), [after]);
     assert_eq!(rest.next_after, None);
+    // A cursor may be a finding outside the filter (it changed disposition
+    // since its page was read): Open after the dismissed middle is the last.
+    let from_middle = reports::list_findings_with(
+        &db.pool,
+        catalog,
+        Some(&middle),
+        20,
+        Some(Disposition::Open),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&from_middle), &order[2..]);
+
+    // Only the last decision counts: reopening moves the finding back.
+    decide(Disposition::Open, "reopen").await;
+    let open = reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Open))
+        .await
+        .unwrap();
+    assert_eq!(ids(&open), order);
     assert_eq!(
         reports::count_findings(&db.pool, catalog).await.unwrap(),
-        reports::FindingCounts { open: 2, ..Default::default() }
+        reports::FindingCounts {
+            open: 3,
+            ..Default::default()
+        }
     );
 }
 ```
@@ -7861,7 +7915,7 @@ pub async fn count_findings(pool: &PgPool, catalog_id: i64) -> Result<FindingCou
 Run: `cargo test --lib store::maintenance -- --test-threads=6`
 Expected: PASS: the new `maintenance_findings_filter_and_count_by_current_disposition` and every existing maintenance store test (`maintenance_report_pages_are_catalog_scoped` covers the unchanged unfiltered paging).
 
-> **Corrected (issue #221, 2026-11-10).** Step 1's two single-id assertions now read `[second]` and `std::slice::from_ref(&first)` (fixed inline above): `[x.clone()]` is clippy's `cloned_ref_to_slice_refs` under `-D warnings`. Step 2 built and passed as written, with one restructuring in `page_ids`: it matches on `listing` once, to pick the cursor query, the page query and the `$5` filter together, and binds `$5` only when the filter is `Some` (the findings case), rather than testing a `findings` flag three times. The signature, the SQL and the behaviour are the plan's. Read `src/store/maintenance/runs.rs`. The open check "`Option<Disposition>` in `Query`" holds: `?disposition=open` deserializes, and `?disposition=bogus` is 400 (`bad_maintenance_requests_are_refused`).
+> **Corrected (issue #221, 2026-11-10).** Step 1's test above is the shipped one (replaced inline after the review of PR #230). It seeds three findings (`setup` gains `c.md`), takes their order from the store (the ids are random and share `t0`), and dismisses the middle one. That way the one-row Open pages prove the filter applies before the limit, and a cursor outside the filter is exercised; the first draft paginated only after every finding was open again. Single-id assertions use `std::slice::from_ref`: `[x.clone()]` is clippy's `cloned_ref_to_slice_refs` under `-D warnings`. Step 2 built and passed as written, with one restructuring in `page_ids`: it matches on `listing` once, to pick the cursor query, the page query and the `$5` filter together, and binds `$5` only when the filter is `Some` (the findings case), rather than testing a `findings` flag three times. The signature, the SQL and the behaviour are the plan's. Read `src/store/maintenance/runs.rs`. The open check "`Option<Disposition>` in `Query`" holds: `?disposition=open` deserializes, and `?disposition=bogus` is 400 (`bad_maintenance_requests_are_refused`).
 
 - [ ] **Step 3: The tool-layer functions**
 
@@ -8560,6 +8614,8 @@ export async function render(main, rest) {
 
 > **Corrected (issue #221, 2026-11-10).** Three changes to the pages as written above. (1) `showFinding`, `openFinding` and `openRun` take the page's `main` and check `main.isConnected` after their awaits, before touching the drawer ("Front-end shape"): `openFinding`/`openRun` open no drawer, and a decision whose answer arrives after the user navigated away does not redraw it. `refreshFindingsBadge()` still runs after a decision, since it reads the counts afresh and checks the catalog itself. (2) The drawers' `<dl>` carry `class: 'facts'`, reusing Task 2's `dl.facts` rules, so the `.finding dl` / `.run dl` rules below were not added; only `.dispose-buttons` and `#findings-more` were. (3) The `#catalog-select` listener and `enter()` edits in `main.js` landed as written beside `enterOrRecover()`.
 
+> **Corrected (issue #221, 2026-11-10; review of PR #230).** Two async races in `findings.js` as written above are fixed; read the file. (1) `refreshFindingsBadge` takes a module-level ticket and updates or hides the badge only when it is still the newest call and the catalog and `store.whoami` it asked for are unchanged; as written, an older call's failure could hide a newer catalog's badge, and an older success could restore a stale count. (2) `load(true)` clears `next` and hides `#findings-more` before its request, and `load(false)` returns without a cursor; as written, "Load more" stayed live during a filter change and could append the previous filter's next page and supersede the reset. Step 8 gains a journey for each.
+
 `src/http/ui/js/pages/runs.js`:
 
 ```js
@@ -8797,6 +8853,8 @@ async fn a_reader_sees_the_run_and_its_work_but_cannot_decide() {
 `tests/ui_e2e/main.rs`: add `mod maintenance;` (keep the other tasks' lines).
 
 > **Corrected (issue #221, 2026-11-10).** Also update the trailing comment to the tasks still to come. Both journeys passed as written, run by `just test-ui` through rustwright's own discovery (the Playwright cache): a `/usr/bin/chromium-browser` that is a snap shim fails to launch, so do not point `RUSTWRIGHT_CHROMIUM` at it.
+
+> **Corrected (issue #221, 2026-11-10; review of PR #230).** `tests/ui_e2e/maintenance.rs` now seeds through `server_with(&[(catalog, concepts)])` and `report(client, catalog, concepts, per_work)`, and adds two delayed-response journeys that wrap the page's `fetch` to hold chosen answers: `an_older_badge_answer_never_overwrites_a_newer_one` (an older failure after a catalog switch, and an older success after a decision) and `a_filter_change_drops_the_old_pages_cursor_at_once` (220 open findings, a held Dismissed page, and a scripted click on the hidden "Load more"). Both fail against the code as first written.
 
 Run: `just test-ui`
 Expected: `a_writer_dismisses_a_finding_and_its_state_changes` and `a_reader_sees_the_run_and_its_work_but_cannot_decide` pass with Task 1's journeys, with no skip lines.

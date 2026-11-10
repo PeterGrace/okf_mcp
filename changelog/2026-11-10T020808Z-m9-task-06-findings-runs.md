@@ -33,8 +33,10 @@ Issue #221, Task 6 of `docs/superpowers/plans/2026-11-09-okf-mcp-m9-web-console.
   `maintenance_findings_filter_and_count_by_current_disposition`, six API
   tests (access matrix, filter and counts, idempotent retry, bad requests, a
   reporter key refused a decision and an unknown catalog, run report), and the journeys
-  `a_writer_dismisses_a_finding_and_its_state_changes` and
-  `a_reader_sees_the_run_and_its_work_but_cannot_decide`.
+  `a_writer_dismisses_a_finding_and_its_state_changes`,
+  `a_reader_sees_the_run_and_its_work_but_cannot_decide`,
+  `an_older_badge_answer_never_overwrites_a_newer_one` and
+  `a_filter_change_drops_the_old_pages_cursor_at_once`.
 - `docs/operations.md`, "Web console": a "Findings and runs" subsection;
   `README.md`: one sentence.
 
@@ -60,3 +62,12 @@ Issue #221, Task 6 of `docs/superpowers/plans/2026-11-09-okf-mcp-m9-web-console.
   disposition button rules.
 - The pages check `main.isConnected` after their awaits before opening or
   redrawing the drawer.
+- Review of PR #230: the badge refresh takes a ticket, so only the newest
+  call (for the still-selected catalog and identity) updates or hides the
+  badge. A filter change drops the old cursor and hides "Load more" before
+  its request, so an append can no longer mix the previous filter's pages
+  into the new one. Two delayed-response journeys cover these
+  (`an_older_badge_answer_never_overwrites_a_newer_one`,
+  `a_filter_change_drops_the_old_pages_cursor_at_once`). The store test now
+  interleaves a non-matching finding between matching ones, so it proves
+  the filter applies before the limit.
