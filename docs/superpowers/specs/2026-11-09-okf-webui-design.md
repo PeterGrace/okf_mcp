@@ -369,6 +369,8 @@ the file to read.
 - rustwright 0.3.0's `evaluate` awaits a returned promise, and the harness's
   `assert_no_console_errors` fails on both a `console.error` and a CSP
   violation (checked with a probe journey).
+- The router test module imports only `tower::ServiceExt` (no
+  `use super::*;`, which was an unused import).
 - Task 1 helpers no task had called yet (`api::context`, `require_admin`,
   `Ui::wait_hidden`) carried `#[allow(dead_code)]` until their first caller
   removed it.
@@ -411,6 +413,7 @@ the file to read.
 - Import & export runs one operation at a time: a busy flag locks the
   catalog picker, Export and Import, and each operation keeps its own
   catalog and file (`transfer.js`).
+- `tests/ui_e2e/main.rs` keeps its `mod` lines in alphabetical order.
 
 **Task 6, findings and runs (issue #221, PR #230):**
 
@@ -437,3 +440,5 @@ the file to read.
 - The harness's `drive` returns whether the journey ran, so a test that
   checks server state afterwards skips, not fails, without Chromium
   (`tests/ui_e2e/harness.rs`).
+- The changeset rows went into the `### Changesets` subsection's own
+  three-column table in `docs/operations.md`, with a `curl` example.
