@@ -6,9 +6,10 @@
 mod support;
 
 mod browse;
+mod catalogs;
 mod harness;
 mod health;
 mod keys;
 mod login;
 mod maintenance;
-// Tasks 5 and 7 add: mod catalogs; mod changesets;
+// Task 7 adds: mod changesets;

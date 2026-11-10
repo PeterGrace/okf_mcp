@@ -185,6 +185,24 @@ pre.diff .del { color: var(--error); }
     .browse-tree { position: static; max-height: none; }
 }
 
+/* catalogs and import/export (M9 task 5) */
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 1rem 1.25rem; margin-bottom: 1rem; }
+.panel h2, .panel h3 { margin-top: 0; }
+.panel-ok { border-left: 4px solid var(--ok); }
+.panel-error { border-left: 4px solid var(--error); }
+.panel button { width: auto; }
+.catalog-pick { display: flex; align-items: center; gap: .5rem; margin-bottom: 1rem; }
+.catalog-pick select { width: auto; margin: 0; font-family: var(--font-mono); }
+.upload-drop { border: 2px dashed var(--border-strong); border-radius: var(--radius); padding: 1rem;
+    text-align: center; margin-bottom: .75rem; }
+.upload-drop.over { border-color: var(--accent); background: var(--accent-soft); }
+.options { display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; align-items: center; margin-bottom: .5rem; }
+.options input[type=number] { width: 8rem; margin: 0; }
+.list-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.danger-zone { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+#import-progress { margin: .75rem 0; }
+
 /* Findings and runs (Task 6): the disposition buttons; drawer facts reuse dl.facts */
 .dispose-buttons { display: flex; flex-wrap: wrap; gap: .5rem; }
 .dispose-buttons button, #findings-more { width: auto; margin: .5rem 0 0; }
