@@ -1,7 +1,9 @@
-//! Signing in and out, a refused key, the theme toggle, and what a read key sees.
+//! Signing in and out, a refused key, the theme toggle, what a read key
+//! sees, and a start that fails with a stored key.
 
 use okf_mcp::config::Config;
 use okf_mcp::store::keys::Access;
+use rustwright::GotoOptions;
 
 use crate::harness::drive;
 use crate::support::server::{files, TestServer};
@@ -143,6 +145,30 @@ async fn the_theme_toggle_flips_and_persists() {
         ui.open("");
         ui.wait_visible("#app");
         assert_eq!(theme(ui), after);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_start_with_a_stored_key_shows_the_login_card() {
+    let server = server().await;
+    let key = server
+        .key("console-boot", Access::Read, &["main"], Some("main"))
+        .await;
+    let app = std::sync::Arc::clone(&server.app);
+    // The journey runs on a blocking thread; this handle lets it run one
+    // async call (closing the pool) on the test's runtime.
+    let runtime = tokio::runtime::Handle::current();
+    drive(server.base.clone(), move |ui| {
+        ui.login(&key);
+        ui.wait_text("#whoami", "read");
+        // The key stays stored, but the next /whoami fails with a 500: the
+        // key cache is in memory, and listing key names needs the database.
+        runtime.block_on(app.pool().close());
+        ui.page.reload(GotoOptions::default()).expect("reload");
+        ui.wait_visible("#login");
+        ui.wait_text("#login-error", "could not load");
+        assert!(!ui.page.is_visible("#app").expect("visible"));
     })
     .await;
 }

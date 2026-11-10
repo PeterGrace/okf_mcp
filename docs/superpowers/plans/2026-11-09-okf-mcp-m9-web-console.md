@@ -1699,6 +1699,19 @@ async function enter() {
     await start();
 }
 
+// enter(), but a failure never leaves a blank page: a refused key is already
+// back on the login card (the 401 handler), and any other failure (the
+// server down, a 500) shows the card with the reason. The stored key is
+// kept, so a reload retries with it.
+async function enterOrRecover() {
+    try {
+        await enter();
+    } catch (error) {
+        if (error instanceof ApiError && error.status === 401) return;
+        showLogin(`The console could not load: ${error.message}. Reload to retry, or sign in again.`);
+    }
+}
+
 setUnauthorizedHandler(() => {
     store.key = null;
     store.whoami = null;
@@ -1716,7 +1729,7 @@ $('#login-form').addEventListener('submit', async event => {
     }
     store.key = key;
     event.target.reset();
-    await enter();
+    await enterOrRecover();
 });
 $('#signout').addEventListener('click', () => {
     store.key = null;
@@ -1737,9 +1750,11 @@ $('#drawer-scrim').addEventListener('click', closeDrawer);
 addEventListener('keydown', event => { if (event.key === 'Escape') closeDrawer(); });
 
 applyTheme(store.theme);
-if (store.key) enter().catch(() => {});
+if (store.key) enterOrRecover();
 else showLogin();
 ```
+
+> **Corrected (issue #216, 2026-11-10).** As first planned, boot ran `enter().catch(() => {})`. A stored key whose first `/whoami` failed with anything but a 401 (a 500, the server unreachable) then left both `#login` and `#app` hidden: a blank page (review of PR #224). `enterOrRecover()` shows the login card with the reason and keeps the stored key, and sign-in uses it too. `enter()` is unchanged, so Task 6's edit (`refreshFindingsBadge();` after `await start();` in `enter()`) still applies as written. The journey `a_failed_start_with_a_stored_key_shows_the_login_card` covers it.
 
 - [ ] **Step 6: Run the API and asset tests**
 
@@ -1912,10 +1927,12 @@ impl Ui {
 `tests/ui_e2e/login.rs`:
 
 ```rust
-//! Signing in and out, a refused key, the theme toggle, and what a read key sees.
+//! Signing in and out, a refused key, the theme toggle, what a read key
+//! sees, and a start that fails with a stored key.
 
 use okf_mcp::config::Config;
 use okf_mcp::store::keys::Access;
+use rustwright::GotoOptions;
 
 use crate::harness::drive;
 use crate::support::server::{files, TestServer};
@@ -2037,6 +2054,30 @@ async fn the_theme_toggle_flips_and_persists() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_start_with_a_stored_key_shows_the_login_card() {
+    let server = server().await;
+    let key = server
+        .key("console-boot", Access::Read, &["main"], Some("main"))
+        .await;
+    let app = std::sync::Arc::clone(&server.app);
+    // The journey runs on a blocking thread; this handle lets it run one
+    // async call (closing the pool) on the test's runtime.
+    let runtime = tokio::runtime::Handle::current();
+    drive(server.base.clone(), move |ui| {
+        ui.login(&key);
+        ui.wait_text("#whoami", "read");
+        // The key stays stored, but the next /whoami fails with a 500: the
+        // key cache is in memory, and listing key names needs the database.
+        runtime.block_on(app.pool().close());
+        ui.page.reload(GotoOptions::default()).expect("reload");
+        ui.wait_visible("#login");
+        ui.wait_text("#login-error", "could not load");
+        assert!(!ui.page.is_visible("#app").expect("visible"));
+    })
+    .await;
+}
 ```
 
 Run: `cargo test --test ui_e2e` before Steps 4 and 5 exist (or with `src/http/ui/js/main.js` empty).
@@ -2054,7 +2095,7 @@ test-ui:
 ```
 
 Run: `just test-ui`
-Expected: 6 passed, with no skip lines. (`a_slow_page_render_never_lands_in_a_newer_page` relies on `evaluate` awaiting a returned promise, as Playwright's does; if rustwright 0.3.0 does not, poll a `window` flag the function sets instead.)
+Expected: 7 passed, with no skip lines (6 as first planned; the seventh, `a_failed_start_with_a_stored_key_shows_the_login_card`, was added in issue #216). (`a_slow_page_render_never_lands_in_a_newer_page` relies on `evaluate` awaiting a returned promise, as Playwright's does; if rustwright 0.3.0 does not, poll a `window` flag the function sets instead.)
 
 > **Corrected (issue #216, 2026-11-10).** Checked: rustwright 0.3.0's `evaluate` awaits a returned promise (it sends `awaitPromise: true`), and the journey passes as written, so no fallback is needed. `wait_hidden` carries `#[allow(dead_code)]` (no Task 1 journey calls it, and the test crate is linted with `-D warnings`); the first task whose journey calls it removes the attribute. A probe journey confirmed that `assert_no_console_errors` fails on both a `console.error` and a CSP violation.
 

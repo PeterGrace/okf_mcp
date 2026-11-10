@@ -36,6 +36,19 @@ async function enter() {
     await start();
 }
 
+// enter(), but a failure never leaves a blank page: a refused key is already
+// back on the login card (the 401 handler), and any other failure (the
+// server down, a 500) shows the card with the reason. The stored key is
+// kept, so a reload retries with it.
+async function enterOrRecover() {
+    try {
+        await enter();
+    } catch (error) {
+        if (error instanceof ApiError && error.status === 401) return;
+        showLogin(`The console could not load: ${error.message}. Reload to retry, or sign in again.`);
+    }
+}
+
 setUnauthorizedHandler(() => {
     store.key = null;
     store.whoami = null;
@@ -53,7 +66,7 @@ $('#login-form').addEventListener('submit', async event => {
     }
     store.key = key;
     event.target.reset();
-    await enter();
+    await enterOrRecover();
 });
 $('#signout').addEventListener('click', () => {
     store.key = null;
@@ -74,5 +87,5 @@ $('#drawer-scrim').addEventListener('click', closeDrawer);
 addEventListener('keydown', event => { if (event.key === 'Escape') closeDrawer(); });
 
 applyTheme(store.theme);
-if (store.key) enter().catch(() => {});
+if (store.key) enterOrRecover();
 else showLogin();
