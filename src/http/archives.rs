@@ -7,7 +7,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, MethodRouter};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 
@@ -31,21 +31,38 @@ use crate::store::keys::Access;
 /// the import with its body cap (and its own deadline, see
 /// [`import_catalog`]).
 pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
-    let limit = body_limit(app.config().max_import_bytes.as_u64());
     Router::new()
-        // The same timeout as `/healthz` (503 after `REQUEST_TIMEOUT`). A
-        // layer on one method router applies to that route only.
-        .route(
-            "/catalogs/{name}/export",
-            get(export_catalog).layer(timeout_layer()),
-        )
-        // No timeout layer: one firing after the import commits would answer
-        // 503 for an import that happened (and a retry would get 409). The
-        // handler bounds the upload itself instead.
-        .route(
-            "/catalogs/{name}/import",
-            post(import_catalog).layer(DefaultBodyLimit::max(limit)),
-        )
+        .route("/catalogs/{name}/export", export_route())
+        .route("/catalogs/{name}/import", import_route(app))
+}
+
+/// The export route's method router: [`export_catalog`] behind the request
+/// timeout (503 after [`REQUEST_TIMEOUT`], as for `/healthz`). Shared with
+/// `/api/v1`, so both paths behave the same; mount it on a path with one
+/// parameter, the catalog.
+///
+/// # Returns
+/// The `GET` method router.
+pub(crate) fn export_route() -> MethodRouter<Arc<App>> {
+    // A layer on one method router applies to that route only.
+    get(export_catalog).layer(timeout_layer())
+}
+
+/// The import route's method router: [`import_catalog`] with the body cap
+/// [`body_limit`] computes from `max_import_bytes`, and no timeout layer.
+/// One that fired after the import committed would answer 503 for an import
+/// that happened (and a retry would get 409), so the handler bounds the
+/// upload itself. Shared with `/api/v1`; mount it on a path with one
+/// parameter, the catalog.
+///
+/// # Arguments
+/// * `app` - the shared state (for `max_import_bytes`).
+///
+/// # Returns
+/// The `POST` method router.
+pub(crate) fn import_route(app: &App) -> MethodRouter<Arc<App>> {
+    let limit = body_limit(app.config().max_import_bytes.as_u64());
+    post(import_catalog).layer(DefaultBodyLimit::max(limit))
 }
 
 /// The request-body cap for an import whose decompressed tar stream may be
@@ -103,17 +120,29 @@ async fn export_catalog(
     Ok((headers, bytes).into_response())
 }
 
-/// `?replace=true` on an import.
+/// An import's query: `?replace=true&only_machinery=true&expect_generation=N`,
+/// the HTTP spelling of the CLI's `--replace`, `--only-machinery` and
+/// `--expect-generation N`. Booleans are `true` or `false`; anything else is
+/// axum's 400.
 #[derive(Debug, Default, Deserialize)]
 struct ImportQuery {
     /// Replace a non-empty catalog's documents.
     #[serde(default)]
     replace: bool,
+    /// Replace only repository machinery ([`ImportScope::Machinery`]); the
+    /// archive's other files are ignored and the catalog's concepts are
+    /// kept. A non-empty catalog also needs `replace`, as with the CLI.
+    #[serde(default)]
+    only_machinery: bool,
+    /// Refuse (409) unless the catalog is still at this generation, the one
+    /// its export had. A missing `Option` field deserializes as `None`.
+    expect_generation: Option<i64>,
 }
 
-/// `POST /catalogs/{name}/import[?replace=true]`: imports the uploaded
-/// `.tar.gz` as the key's actor, for a key with `admin` on the catalog, and
-/// swaps the new snapshot in before answering, so the next read sees it.
+/// `POST /catalogs/{name}/import[?replace=true&only_machinery=true&expect_generation=N]`:
+/// imports the uploaded `.tar.gz` as the key's actor, for a key with `admin`
+/// on the catalog, and swaps the new snapshot in before answering, so the
+/// next read sees it.
 ///
 /// The key is checked before the body is read, so a key that may not import
 /// cannot make the server buffer an upload. Reading and checking the upload
@@ -125,7 +154,7 @@ struct ImportQuery {
 /// * `app` - the shared state.
 /// * `principal` - the caller, from the auth layer.
 /// * `name` - the catalog, from the path.
-/// * `query` - `?replace=true`, if given.
+/// * `query` - the import options.
 /// * `request` - the rest of the request: its body is the tarball.
 ///
 /// # Returns
@@ -137,7 +166,7 @@ struct ImportQuery {
 /// 403 ([`OkfError::Forbidden`]) for a key below `admin`; 400
 /// ([`OkfError::ImportRefused`]) for an unreadable or rule-breaking archive;
 /// 409 ([`OkfError::Refused`]) for a non-empty catalog without
-/// `?replace=true`; 500 for a database failure. A refresh that fails after
+/// `?replace=true`, or one no longer at `expect_generation`; 500 for a database failure. A refresh that fails after
 /// the import committed is logged, not returned.
 async fn import_catalog(
     State(app): State<Arc<App>>,
@@ -176,21 +205,23 @@ async fn import_catalog(
     };
     let options = ImportOptions {
         replace: query.replace,
-        scope: ImportScope::Everything,
-        expect_generation: None,
+        scope: if query.only_machinery {
+            ImportScope::Machinery
+        } else {
+            ImportScope::Everything
+        },
+        expect_generation: query.expect_generation,
         actor: &principal.actor,
         now: app.clock().now(),
     };
     let report = import(app.pool(), &name, files, &options)
         .await
-        // Without `expect_generation`, `store::import`'s only refusal is a
-        // non-empty catalog without `replace`; its hint names the CLI flag,
-        // so say what HTTP needs.
+        // `store::import`'s "not empty" refusal names the CLI flag: say what
+        // HTTP needs instead. Its generation refusal ("... export it again")
+        // already fits and passes through unchanged.
         .map_err(|error| match error {
-            OkfError::Refused { .. } => OkfError::Refused {
-                reason: format!(
-                    "catalog {name:?} is not empty; add ?replace=true to replace its contents"
-                ),
+            OkfError::Refused { reason } => OkfError::Refused {
+                reason: reason.replace("pass --replace", "add ?replace=true"),
             },
             other => other,
         })?;
@@ -233,6 +264,29 @@ fn upload_timed_out() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
+/// A valid `.tar.gz` of `entries` (`(path, text)` pairs, none executable),
+/// for the tests here and in `http::api`.
+///
+/// # Panics
+/// If the archive cannot be written (it is built in memory, so it can't).
+#[cfg(test)]
+pub(crate) fn tarball_of(entries: &[(&str, &str)]) -> Vec<u8> {
+    use crate::archive::{write_tarball, ExportFile};
+    let modified = chrono::Utc::now();
+    let files: Vec<ExportFile<'_>> = entries
+        .iter()
+        // `&(path, text)` destructures each borrowed pair, copying out the
+        // two `&str`s (which are `Copy`).
+        .map(|&(path, text)| ExportFile {
+            path,
+            content: text.as_bytes(),
+            executable: false,
+            modified,
+        })
+        .collect();
+    write_tarball(Vec::new(), &files).expect("an in-memory tarball")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,7 +298,6 @@ mod tests {
     // `oneshot` sends one request through a router without a socket.
     use tower::ServiceExt;
 
-    use crate::archive::{write_tarball, ExportFile};
     use crate::config::Config;
     use crate::mcp::testing::{app_with, principal, TestApp};
     use crate::store::catalogs;
@@ -267,13 +320,7 @@ mod tests {
 
     /// A valid archive of one document, `index.md`.
     fn tarball() -> Vec<u8> {
-        let index = ExportFile {
-            path: "index.md",
-            content: b"# Index\n",
-            executable: false,
-            modified: chrono::Utc::now(),
-        };
-        write_tarball(Vec::new(), &[index]).expect("tarball")
+        tarball_of(&[("index.md", "# Index\n")])
     }
 
     /// A response's status and its body as JSON.
@@ -447,6 +494,87 @@ mod tests {
         let current = state.current();
         assert_eq!(current.generation(), loaded_at + 1);
         assert_eq!(current.files(), 1);
+    }
+
+    /// An admin's import into `test`'s `pg`, with `query` ("" or "?...").
+    async fn import_with(
+        test: &TestApp,
+        query: &str,
+        archive: Vec<u8>,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::post(format!("/catalogs/pg/import{query}"))
+            .body(Body::from(archive))
+            .expect("request");
+        status_and_json(router(test, admin()).oneshot(request).await.unwrap()).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_machinery_replaces_machinery_and_keeps_the_concepts() {
+        let test = app_with(
+            &[(
+                "pg",
+                &[
+                    ("index.md", "# Index\n"),
+                    ("AGENTS.md", "# Old\n"),
+                    ("a.md", "# A\n"),
+                ],
+            )],
+            Config::default(),
+        )
+        .await;
+        let archive = tarball_of(&[("AGENTS.md", "# New\n"), ("a.md", "# Overwritten\n")]);
+
+        let (status, report) =
+            import_with(&test, "?replace=true&only_machinery=true", archive).await;
+        let kept: Vec<u8> = sqlx::query_scalar(
+            "SELECT content FROM documents WHERE path = 'a.md' \
+             AND catalog_id = (SELECT id FROM catalogs WHERE name = 'pg')",
+        )
+        .fetch_one(test.app.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["updated"], serde_json::json!(["AGENTS.md"]));
+        assert_eq!(report["added"], serde_json::json!([]));
+        assert_eq!(report["deleted"], serde_json::json!([]));
+        assert_eq!(kept, b"# A\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_import_expecting_another_generation_is_409_and_imports_nothing() {
+        let test = app_with(&[("pg", &[("index.md", "# Index\n")])], Config::default()).await;
+        let before = stored(&test).await;
+        let stale = before.0 + 1;
+        let archive = || tarball_of(&[("index.md", "# Changed\n")]);
+
+        let (status, refused) = import_with(
+            &test,
+            &format!("?replace=true&expect_generation={stale}"),
+            archive(),
+        )
+        .await;
+        let after_refusal = stored(&test).await;
+        let (current_status, report) = import_with(
+            &test,
+            &format!("?replace=true&expect_generation={}", before.0),
+            archive(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(refused["error"], "Refused");
+        let message = refused["message"].as_str().unwrap();
+        // The generation refusal keeps its own words; only the "not empty"
+        // refusal is reworded for HTTP.
+        assert!(
+            message.contains(&format!("generation {}, not {stale}", before.0)),
+            "{message}"
+        );
+        assert!(message.contains("export it again"), "{message}");
+        assert_eq!(after_refusal, before);
+        assert_eq!(current_status, StatusCode::OK);
+        assert_eq!(report["updated"], serde_json::json!(["index.md"]));
     }
 
     #[test]

@@ -86,9 +86,6 @@ impl Ui {
     }
 
     /// Waits until `selector` is absent or hidden.
-    // Its first callers arrive with Tasks 2 to 7 (a closed drawer or dialog);
-    // until then the compiler would warn that it is unused.
-    #[allow(dead_code)]
     pub fn wait_hidden(&self, selector: &str) {
         self.poll(selector, || {
             !self.page.is_visible(selector).unwrap_or(false)

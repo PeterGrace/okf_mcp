@@ -6988,6 +6988,9 @@ export function upload(path, file, onProgress = () => {}) {
 
 `src/http/ui/js/pages/catalogs.js`:
 
+> **Corrected (issue #220, 2026-11-10).** The pages follow the per-navigation convention ("Front-end shape"), which this code predates. In `catalogs.js`, create and delete end in a `settled()` helper: it runs `refreshIdentity()` unconditionally (the switcher is shell state and must follow a change that committed), then returns if `!main.isConnected`, and only then closes the drawer and reloads the table. Saving a description returns before `closeDrawer()` when `!main.isConnected` (the drawer would be another page's). In `transfer.js`, the export returns after `response.blob()` when `!main.isConnected`, so a detached page hands over no download and leaves the module's object URL to the newer render. Read `src/http/ui/js/pages/catalogs.js` and `transfer.js`.
+
+
 ```js
 // Catalogs: the catalogs this key reaches. Admins edit descriptions and
 // delete; an admin key that reaches every catalog also creates them.
@@ -7289,7 +7292,9 @@ Append to `src/http/ui/styles.css`:
 
 - [ ] **Step 7: Browser journeys (failing first)**
 
-`tests/ui_e2e/main.rs`: add `mod catalogs;` after `mod login;` (keep the other tasks' lines).
+`tests/ui_e2e/main.rs`: add `mod catalogs;` (keep the other tasks' lines).
+
+> **Corrected (issue #220, 2026-11-10).** The merged `main.rs` keeps its `mod` lines in alphabetical order (Task 3 put `mod health;` before `mod login;`), so `mod catalogs;` goes first, before `mod harness;`. This task is the first caller of `api::require_admin` and `Ui::wait_hidden` and removes their `#[allow(dead_code)]` (Task 1's note); if Task 2 lands first with the same removal, keep the deletion.
 
 `tests/ui_e2e/catalogs.rs`:
 
@@ -7468,6 +7473,9 @@ Expected: PASS, with no skip lines: Task 1's 4 login journeys, the 3 journeys ab
 - [ ] **Step 9: Docs and changelog**
 
 - **`docs/operations.md`, "Web console":** add the subsection "Catalogs and import/export". Rows for the API reference table:
+
+  > **Corrected (issue #220, 2026-11-10).** As corrected for Task 3 (issue #218), the rows below use the merged three-column shape (`Method and path | Key | Does`) in their own `### Catalogs and import/export` subsection, placed before "Testing the console", with the same content. The 409 row of the troubleshooting table also names a stale `expect_generation`, and the section 9 curl example goes after the `--expect-generation` paragraph.
+
 
   | Method | Path | Access | Notes |
   |---|---|---|---|
