@@ -5,6 +5,7 @@ import { api, ApiError, setUnauthorizedHandler } from './core/api.js';
 import { start, route } from './core/router.js';
 import { closeDrawer } from './core/drawer.js';
 import { refreshIdentity } from './core/shell.js';
+import { refreshFindingsBadge } from './pages/findings.js';
 
 // Surface script errors and CSP violations as console errors: the browser
 // tests fail on any. An ApiError was already shown as a toast.
@@ -34,6 +35,7 @@ async function enter() {
     $('#login').hidden = true;
     $('#app').hidden = false;
     await start();
+    refreshFindingsBadge();
 }
 
 // enter(), but a failure never leaves a blank page: a refused key is already
@@ -82,6 +84,7 @@ $('#theme-toggle').addEventListener('click', () => {
 $('#catalog-select').addEventListener('change', event => {
     store.catalog = event.target.value;
     route();
+    refreshFindingsBadge();
 });
 $('#drawer-scrim').addEventListener('click', closeDrawer);
 addEventListener('keydown', event => { if (event.key === 'Escape') closeDrawer(); });

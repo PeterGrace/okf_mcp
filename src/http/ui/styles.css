@@ -203,6 +203,10 @@ pre.diff .del { color: var(--error); }
 .danger-zone { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border); }
 #import-progress { margin: .75rem 0; }
 
+/* Findings and runs (Task 6): the disposition buttons; drawer facts reuse dl.facts */
+.dispose-buttons { display: flex; flex-wrap: wrap; gap: .5rem; }
+.dispose-buttons button, #findings-more { width: auto; margin: .5rem 0 0; }
+
 /* Changesets (Task 7) */
 .diff-file { margin-bottom: 1rem; }
 .diff-file h3 { margin: 0 0 .35rem; }

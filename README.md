@@ -295,6 +295,9 @@ Catalogs can be created, described, deleted, imported and exported from the
 console's Administer group, with no archive piped through a shell on the
 server.
 
+Maintenance findings can be triaged (accepted, dismissed, needs input,
+reopened) and runs inspected from the browser.
+
 Every console action is an `/api/v1` call with the same bearer key, so
 anything the console does can be scripted:
 

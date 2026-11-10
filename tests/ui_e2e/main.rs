@@ -12,4 +12,4 @@ mod harness;
 mod health;
 mod keys;
 mod login;
-// Task 6 adds: mod maintenance;
+mod maintenance;

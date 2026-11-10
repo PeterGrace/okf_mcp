@@ -102,13 +102,36 @@ pub(crate) async fn maintenance_list_findings(
     ctx: &ToolContext,
     params: MaintenanceListFindingsParams,
 ) -> Result<MaintenanceResult<runs::Page<reports::FindingRecord>>, OkfError> {
+    maintenance_list_findings_by(ctx, params, None).await
+}
+
+/// `maintenance_list_findings`, narrowed to findings whose current
+/// disposition is `disposition` (the web console's filter; not an MCP
+/// argument, so the tool's schema is unchanged).
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `params` - the catalog and page.
+/// * `disposition` - keep only this current disposition; `None` for all.
+///
+/// # Returns
+/// One page of findings, with `/`-prefixed evidence paths.
+///
+/// # Errors
+/// As `maintenance_list_findings`.
+pub(crate) async fn maintenance_list_findings_by(
+    ctx: &ToolContext,
+    params: MaintenanceListFindingsParams,
+    disposition: Option<Disposition>,
+) -> Result<MaintenanceResult<runs::Page<reports::FindingRecord>>, OkfError> {
     let state = ctx.one(Some(&params.catalog))?;
     ctx.principal().require(Access::Read, state.name())?;
-    let mut result = reports::list_findings(
+    let mut result = reports::list_findings_with(
         ctx.app().pool(),
         state.id(),
         params.after.as_deref(),
         params.limit.unwrap_or(20),
+        disposition,
     )
     .await?;
     for finding in &mut result.items {
@@ -126,6 +149,28 @@ pub(crate) async fn maintenance_get_finding(
     let mut result = reports::get_finding(ctx.app().pool(), state.id(), &params.finding_id).await?;
     finding_paths(&mut result);
     Ok(MaintenanceResult::new(state.name(), result))
+}
+
+/// A catalog's findings counted by current disposition (the console's badge;
+/// not an MCP tool).
+///
+/// # Arguments
+/// * `ctx` - the call's context.
+/// * `catalog` - the catalog.
+///
+/// # Returns
+/// The counts, beside the catalog.
+///
+/// # Errors
+/// `CatalogNotSelected` for a catalog the key does not reach; database errors.
+pub(crate) async fn maintenance_finding_counts(
+    ctx: &ToolContext,
+    catalog: &str,
+) -> Result<MaintenanceResult<reports::FindingCounts>, OkfError> {
+    let state = ctx.one(Some(catalog))?;
+    ctx.principal().require(Access::Read, state.name())?;
+    let counts = reports::count_findings(ctx.app().pool(), state.id()).await?;
+    Ok(MaintenanceResult::new(state.name(), counts))
 }
 
 pub(crate) async fn maintenance_dispose(

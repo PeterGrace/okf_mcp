@@ -157,8 +157,42 @@ pub async fn list_findings(
     after: Option<&str>,
     limit: u32,
 ) -> Result<runs::Page<FindingRecord>, OkfError> {
+    list_findings_with(pool, catalog_id, after, limit, None).await
+}
+
+/// [`list_findings`], keeping only findings whose current disposition (the
+/// last appended, else `Open`) is `disposition` when it is set. `limit` and
+/// `next_after` count matching findings only; `after` may be any finding of
+/// the catalog, so a cursor survives its finding changing disposition.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `catalog_id` - the catalog.
+/// * `after` - the previous page's last finding ID, if any.
+/// * `limit` - page size, 1..=200.
+/// * `disposition` - keep only this current disposition; `None` for all.
+///
+/// # Returns
+/// One page of findings and the cursor for the next, if another matches.
+///
+/// # Errors
+/// As [`list_findings`].
+pub async fn list_findings_with(
+    pool: &PgPool,
+    catalog_id: i64,
+    after: Option<&str>,
+    limit: u32,
+    disposition: Option<Disposition>,
+) -> Result<runs::Page<FindingRecord>, OkfError> {
     let mut tx = runs::snapshot(pool).await?;
-    let ids = runs::page_ids(&mut tx, catalog_id, after, limit, true).await?;
+    let ids = runs::page_ids(
+        &mut tx,
+        catalog_id,
+        after,
+        limit,
+        runs::Listing::Findings(disposition),
+    )
+    .await?;
     let mut items = Vec::with_capacity(ids.items.len());
     for id in ids.items {
         items.push(finding(&mut tx, catalog_id, &id).await?);
@@ -168,6 +202,56 @@ pub async fn list_findings(
         items,
         next_after: ids.next_after,
     })
+}
+
+/// How many of a catalog's findings are in each current disposition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FindingCounts {
+    /// Open, including reopened.
+    pub open: i64,
+    /// Accepted for follow-up.
+    pub accepted_for_follow_up: i64,
+    /// Dismissed.
+    pub dismissed: i64,
+    /// Waiting for input.
+    pub needs_input: i64,
+}
+
+/// Counts a catalog's findings by current disposition, in one query.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `catalog_id` - the catalog.
+///
+/// # Returns
+/// The counts; every disposition without findings is 0.
+///
+/// # Errors
+/// Database errors; `Refused` for a stored disposition outside the four values.
+pub async fn count_findings(pool: &PgPool, catalog_id: i64) -> Result<FindingCounts, OkfError> {
+    // The inner select computes each finding's current disposition, the outer
+    // one groups them (grouping by a correlated subquery directly is refused).
+    let rows: Vec<(String, i64)> = sqlx::query_as(concat!(
+        "SELECT disposition, COUNT(*) FROM (SELECT ",
+        current_disposition!(),
+        " AS disposition FROM maintenance_findings f WHERE f.catalog_id=$1) current \
+         GROUP BY disposition"
+    ))
+    .bind(catalog_id)
+    .fetch_all(pool)
+    .await?;
+    let mut counts = FindingCounts::default();
+    for (text, n) in rows {
+        // `&mut counts.open` borrows one field for writing; `*slot = n` writes through it.
+        let slot = match runs::decode::<Disposition>(text)? {
+            Disposition::Open => &mut counts.open,
+            Disposition::AcceptedForFollowUp => &mut counts.accepted_for_follow_up,
+            Disposition::Dismissed => &mut counts.dismissed,
+            Disposition::NeedsInput => &mut counts.needs_input,
+        };
+        *slot = n;
+    }
+    Ok(counts)
 }
 
 /// Appends a human decision without applying it to canonical content.
@@ -253,7 +337,11 @@ fn stale() -> OkfError {
     }
 }
 
-fn enum_text(value: impl Serialize) -> Result<String, OkfError> {
+/// The `snake_case` text of a maintenance enum, as stored.
+///
+/// # Errors
+/// `Refused` when `value` does not serialize to a string.
+pub(super) fn enum_text(value: impl Serialize) -> Result<String, OkfError> {
     serde_json::to_value(value)
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))

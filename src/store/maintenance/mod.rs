@@ -1,5 +1,19 @@
 //! Transaction helpers shared by maintenance store mutations.
 
+/// SQL for a finding's current disposition: its last appended one, else
+/// `open`. The finding row must be aliased `f`. A macro rather than a
+/// `const`, so `concat!` can splice it into `&'static str` queries at
+/// compile time (a `const &str` cannot be concatenated that way). A
+/// `macro_rules!` macro is visible only to code after it in the file, child
+/// modules included, so it stays above the `mod` lines.
+macro_rules! current_disposition {
+    () => {
+        "COALESCE((SELECT d.disposition FROM maintenance_dispositions d \
+         WHERE d.catalog_id=f.catalog_id AND d.finding_id=f.id \
+         ORDER BY d.id DESC LIMIT 1),'open')"
+    };
+}
+
 pub mod candidates;
 pub mod evidence;
 pub mod reports;
