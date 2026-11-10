@@ -194,6 +194,34 @@ async fn managed(app: &App, principal: &Principal, id: &str) -> Result<KeyRecord
         })
 }
 
+/// How the store's `*_target` functions must name `record` so that they
+/// change exactly that key.
+///
+/// The store resolves an exact generated id directly. A legacy row (from
+/// before migration 0005, whose id is also its name) it resolves by active
+/// name instead, which could reach another live key of that name (one the
+/// caller may not manage). Its actor narrows that to the one live key with
+/// this name and actor, which the store keeps unique, and a revoked legacy row
+/// is refused here, since by name it would resolve to its replacement.
+///
+/// # Returns
+/// The target and the actor to pass with it.
+///
+/// # Errors
+/// [`OkfError::Refused`] for a revoked legacy row, as the store refuses any
+/// change to a revoked key.
+fn store_target(record: &KeyRecord) -> Result<(&str, Option<&str>), OkfError> {
+    if record.id != record.name {
+        return Ok((&record.id, None));
+    }
+    if record.revoked_at.is_some() {
+        return Err(OkfError::Refused {
+            reason: format!("key {:?} is revoked", record.id),
+        });
+    }
+    Ok((&record.id, Some(&record.actor)))
+}
+
 /// Reloads the key cache at once (plan Decision 12), then answers with the
 /// key as it now is. The change is already committed, so a failed reload is
 /// logged, not returned: the background poll retries within `poll_interval`.
@@ -305,7 +333,8 @@ async fn update_key(
     Json(body): Json<UpdateKeyBody>,
 ) -> Result<Json<KeyView>, AppError> {
     let target = managed(&app, &principal, &id).await?;
-    key_rows::set_maintenance_report_target(app.pool(), &target.id, None, body.maintenance_report)
+    let (selector, actor) = store_target(&target)?;
+    key_rows::set_maintenance_report_target(app.pool(), selector, actor, body.maintenance_report)
         .await?;
     changed(&app, &principal, &target.id).await
 }
@@ -322,7 +351,8 @@ async fn revoke_key(
     Path(id): Path<String>,
 ) -> Result<Json<KeyView>, AppError> {
     let target = managed(&app, &principal, &id).await?;
-    key_rows::revoke_target(app.pool(), &target.id, None, app.clock().now()).await?;
+    let (selector, actor) = store_target(&target)?;
+    key_rows::revoke_target(app.pool(), selector, actor, app.clock().now()).await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -341,7 +371,8 @@ async fn grant_catalog(
     require_admin(&principal)?;
     principal.require(Access::Admin, &catalog)?;
     let target = managed(&app, &principal, &id).await?;
-    key_rows::grant_target(app.pool(), &target.id, None, &catalog).await?;
+    let (selector, actor) = store_target(&target)?;
+    key_rows::grant_target(app.pool(), selector, actor, &catalog).await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -358,7 +389,8 @@ async fn ungrant_catalog(
     require_admin(&principal)?;
     principal.require(Access::Admin, &catalog)?;
     let target = managed(&app, &principal, &id).await?;
-    key_rows::ungrant_target(app.pool(), &target.id, None, &catalog).await?;
+    let (selector, actor) = store_target(&target)?;
+    key_rows::ungrant_target(app.pool(), selector, actor, &catalog).await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -691,5 +723,82 @@ mod tests {
         );
         let (status, _) = send(&test, "POST", &revoke, Some(&keys.admin), None).await;
         assert_eq!(status.as_u16(), 409, "already revoked");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_id_changes_only_its_own_key() {
+        let test = app().await;
+        let root = stored(&test, "root", Access::Admin, Grants::All).await;
+        // A pre-0005 row, id == name, and a newer live key of the same name.
+        key_rows::insert_legacy_test_key(
+            test.app.pool(),
+            "legacy",
+            Access::Write,
+            "terminal",
+            Utc::now(),
+        )
+        .await;
+        let new = NewKey {
+            name: "legacy",
+            access: Access::Read,
+            maintenance_report: false,
+            grants: Grants::Catalogs(&main_only()),
+            default_catalog: None,
+            actor: "web",
+        };
+        let web = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
+            .await
+            .expect("create the newer key");
+        test.app.poll().await.expect("poll the keys in");
+        let state = |listed: &serde_json::Value, id: &str| -> serde_json::Value {
+            listed["keys"]
+                .as_array()
+                .expect("a list")
+                .iter()
+                .find(|key| key["id"] == id)
+                .map(|key| key["revoked_at"].clone())
+                .expect("the key is listed")
+        };
+
+        // By name alone the store would call this ambiguous; by id it is one key.
+        let (status, body) = send(
+            &test,
+            "POST",
+            "/api/v1/keys/legacy/revoke",
+            Some(&root.key),
+            None,
+        )
+        .await;
+        assert_eq!(status.as_u16(), 200, "{body}");
+        let (_, listed) = send(&test, "GET", "/api/v1/keys", Some(&root.key), None).await;
+        assert!(state(&listed, "legacy").is_string());
+        assert!(
+            state(&listed, &web.id).is_null(),
+            "the newer key stays live"
+        );
+
+        // Revoked, the legacy id must not resolve to a live key of its name and actor.
+        let replacement = NewKey {
+            actor: "terminal",
+            ..new
+        };
+        let replacement = key_rows::create_with_id(test.app.pool(), &replacement, Utc::now())
+            .await
+            .expect("create the replacement");
+        test.app.poll().await.expect("poll the keys in");
+        let (status, _) = send(
+            &test,
+            "POST",
+            "/api/v1/keys/legacy/revoke",
+            Some(&root.key),
+            None,
+        )
+        .await;
+        assert_eq!(status.as_u16(), 409);
+        let (_, listed) = send(&test, "GET", "/api/v1/keys", Some(&root.key), None).await;
+        assert!(
+            state(&listed, &replacement.id).is_null(),
+            "the replacement stays live"
+        );
     }
 }

@@ -2740,6 +2740,8 @@ async fn ungrant_catalog(
 }
 ```
 
+> **Corrected (issue #217, 2026-11-10).** Security decision 4 does not hold for a legacy row as written: for a row from before migration 0005 (`id == name`), `resolve_active` uses active-name resolution even given its exact id, so passing `&target.id` could revoke, re-flag or re-grant another live key of that name, one the caller may not manage. The handlers pass the target through `store_target(&KeyRecord) -> Result<(&str, Option<&str>), OkfError>` (`src/http/api/keys.rs`): a generated id goes as is with no actor; a legacy row goes with its own actor (live name and actor are unique), and a revoked legacy row is `Refused` (409) by the handler. The test `a_legacy_id_changes_only_its_own_key` covers it, making seven API tests.
+
 > `&app` is a `&Arc<App>` and `&principal` a `&Arc<Principal>`; Rust's deref coercion passes them where `&App` and `&Principal` are expected, like Python duck typing but checked at compile time.
 
 - [ ] **Step 4: Run the tests to make sure they pass**
