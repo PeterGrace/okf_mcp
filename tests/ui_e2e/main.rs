@@ -6,6 +6,7 @@
 mod support;
 
 mod browse;
+mod changesets;
 mod harness;
 mod health;
 mod keys;

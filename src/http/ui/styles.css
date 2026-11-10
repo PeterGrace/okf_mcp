@@ -184,3 +184,9 @@ pre.diff .del { color: var(--error); }
     .browse { grid-template-columns: 1fr; }
     .browse-tree { position: static; max-height: none; }
 }
+
+/* Changesets (Task 7) */
+.diff-file { margin-bottom: 1rem; }
+.diff-file h3 { margin: 0 0 .35rem; }
+/* A block box, so a handle wrapped at its hyphens is one click target. */
+.changeset-handle { display: inline-block; }
