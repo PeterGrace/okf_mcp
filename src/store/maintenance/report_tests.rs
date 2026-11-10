@@ -889,38 +889,53 @@ async fn maintenance_report_terminal_and_running_work_without_findings() {
 #[tokio::test(flavor = "multi_thread")]
 async fn maintenance_findings_filter_and_count_by_current_disposition() {
     let db = test_db().await;
-    let catalog = setup(&db.pool, &["a.md", "b.md"]).await;
-    let (_, first) = fixture(&db.pool, catalog, "first").await;
-    let (_, second) = fixture(&db.pool, catalog, "second").await;
+    let catalog = setup(&db.pool, &["a.md", "b.md", "c.md"]).await;
+    for key in ["first", "second", "third"] {
+        fixture(&db.pool, catalog, key).await;
+    }
     let ids = |page: &runs::Page<reports::FindingRecord>| {
         page.items
             .iter()
             .map(|finding| finding.id.clone())
             .collect::<Vec<_>>()
     };
+    // Page order is (created_at, id), and the ids are random, so take the
+    // order from the store; then dismiss the middle one, so a non-matching
+    // finding sits between the two matching ones.
+    let all = reports::list_findings(&db.pool, catalog, None, 20)
+        .await
+        .unwrap();
+    let order = ids(&all);
+    let [before, middle, after] = <[String; 3]>::try_from(order.clone()).unwrap();
     let human = actor("human");
-    reports::dispose(
-        &db.pool,
-        catalog,
-        &human,
-        &first,
-        Disposition::Dismissed,
-        "Not useful.",
-        "dismiss",
-        t0(),
-    )
-    .await
-    .unwrap();
+    let decide = |disposition, key| {
+        let (pool, human, middle) = (&db.pool, &human, &middle);
+        async move {
+            reports::dispose(
+                pool,
+                catalog,
+                human,
+                middle,
+                disposition,
+                "Decided.",
+                key,
+                t0(),
+            )
+            .await
+            .unwrap();
+        }
+    };
+    decide(Disposition::Dismissed, "dismiss").await;
     let open = reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Open))
         .await
         .unwrap();
-    assert_eq!(ids(&open), [second]);
+    assert_eq!(ids(&open), [before.clone(), after.clone()]);
     assert_eq!(open.next_after, None);
     let dismissed =
         reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Dismissed))
             .await
             .unwrap();
-    assert_eq!(ids(&dismissed), std::slice::from_ref(&first));
+    assert_eq!(ids(&dismissed), std::slice::from_ref(&middle));
     assert!(reports::list_findings_with(
         &db.pool,
         catalog,
@@ -935,38 +950,21 @@ async fn maintenance_findings_filter_and_count_by_current_disposition() {
     assert_eq!(
         reports::count_findings(&db.pool, catalog).await.unwrap(),
         reports::FindingCounts {
-            open: 1,
+            open: 2,
             accepted_for_follow_up: 0,
             dismissed: 1,
             needs_input: 0
         }
     );
 
-    // Only the last decision counts: reopening moves the finding back.
-    reports::dispose(
-        &db.pool,
-        catalog,
-        &human,
-        &first,
-        Disposition::Open,
-        "Reopened.",
-        "reopen",
-        t0(),
-    )
-    .await
-    .unwrap();
-    let all = reports::list_findings(&db.pool, catalog, None, 20)
-        .await
-        .unwrap();
-    let open = reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Open))
-        .await
-        .unwrap();
-    assert_eq!(open.items, all.items);
-    // A filtered page's cursor continues within the filter.
+    // The filter applies before the limit: one-row pages of Open skip the
+    // dismissed middle finding instead of returning an empty page for it,
+    // and the cursor (a matching finding) continues within the filter.
     let page = reports::list_findings_with(&db.pool, catalog, None, 1, Some(Disposition::Open))
         .await
         .unwrap();
-    assert_eq!(page.items, all.items[..1]);
+    assert_eq!(ids(&page), std::slice::from_ref(&before));
+    assert_eq!(page.next_after.as_deref(), Some(before.as_str()));
     let rest = reports::list_findings_with(
         &db.pool,
         catalog,
@@ -976,12 +974,31 @@ async fn maintenance_findings_filter_and_count_by_current_disposition() {
     )
     .await
     .unwrap();
-    assert_eq!(rest.items, all.items[1..]);
+    assert_eq!(ids(&rest), [after]);
     assert_eq!(rest.next_after, None);
+    // A cursor may be a finding outside the filter (it changed disposition
+    // since its page was read): Open after the dismissed middle is the last.
+    let from_middle = reports::list_findings_with(
+        &db.pool,
+        catalog,
+        Some(&middle),
+        20,
+        Some(Disposition::Open),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&from_middle), &order[2..]);
+
+    // Only the last decision counts: reopening moves the finding back.
+    decide(Disposition::Open, "reopen").await;
+    let open = reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Open))
+        .await
+        .unwrap();
+    assert_eq!(ids(&open), order);
     assert_eq!(
         reports::count_findings(&db.pool, catalog).await.unwrap(),
         reports::FindingCounts {
-            open: 2,
+            open: 3,
             ..Default::default()
         }
     );
