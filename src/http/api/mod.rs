@@ -95,9 +95,6 @@ pub(crate) fn context(app: &Arc<App>, principal: Arc<Principal>) -> ToolContext 
 ///
 /// # Errors
 /// [`OkfError::Forbidden`] for a read or write key.
-// Its first callers arrive with Tasks 2 and 5; until then the compiler would
-// warn that it is unused. Whichever of them merges first removes this attribute.
-#[allow(dead_code)]
 pub(crate) fn require_admin(principal: &Principal) -> Result<(), OkfError> {
     if principal.access >= Access::Admin {
         Ok(())

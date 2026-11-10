@@ -2147,6 +2147,7 @@ Depends on Task 1. Parallel with Tasks 3 to 7.
 
 **Files:**
 - Modify: `src/http/api/keys.rs` (replaces Task 1's stub)
+- Modify: `src/store/keys.rs` (`*_by_id` key changes; corrected in issue #217)
 - Create: `src/http/ui/js/pages/keys.js`
 - Modify: `src/http/ui/styles.css` (append the "keys" block)
 - Create: `tests/ui_e2e/keys.rs`; Modify: `tests/ui_e2e/main.rs` (`mod keys;`)
@@ -2740,6 +2741,8 @@ async fn ungrant_catalog(
 }
 ```
 
+> **Corrected (issue #217, 2026-11-10).** Security decision 4 does not hold as written. For a row from before migration 0005 (`id == name`), `resolve_active` resolves the id by active name, so a `*_target` call with `&target.id` could revoke, re-flag or re-grant another live key of that name. That includes a replacement created between the handler's `managed` lookup and the store's transaction, which the caller may not manage (review of PR #226). `store::keys` therefore gains `set_maintenance_report_by_id(pool, id, enabled)`, `revoke_by_id(pool, id, now)`, `grant_by_id(pool, id, catalog)` and `ungrant_by_id(pool, id, catalog)`. They share their bodies with the `*_target` functions through a private `Selector` and lock exactly that row (`SELECT ... FOR UPDATE`), never falling back to a name. The handlers call these instead of `*_target(.., None, ..)`, and the revoked checks run on that row as before. Tests: `a_legacy_id_changes_only_its_own_key` (API) and `store::keys::tests::by_id_changes_never_reach_a_legacy_keys_replacement` (the lookup, rotate, mutate interleaving). Task 2 therefore also modifies `src/store/keys.rs`.
+
 > `&app` is a `&Arc<App>` and `&principal` a `&Arc<Principal>`; Rust's deref coercion passes them where `&App` and `&Principal` are expected, like Python duck typing but checked at compile time.
 
 - [ ] **Step 4: Run the tests to make sure they pass**
@@ -2778,7 +2781,7 @@ function isMine(key) {
 
 const COLUMNS = [
     { key: 'name', label: 'Name', sort: key => key.name,
-      render: key => h('span', { 'data-test': `key-${key.name}` }, key.name, isMine(key) ? [' ', pill('you', 'info')] : null) },
+      render: key => h('span', { class: 'key-name', 'data-test': `key-${key.name}` }, key.name, isMine(key) ? [' ', pill('you', 'info')] : null) },
     { key: 'actor', label: 'Actor', class: 'mono', sort: key => key.actor },
     { key: 'access', label: 'Access', sort: key => LEVELS.indexOf(key.access),
       render: key => pill(key.access, ACCESS_KIND[key.access]) },
@@ -2987,6 +2990,9 @@ Append to `src/http/ui/styles.css`:
 
 ```css
 /* API keys (Task 2): drawer facts, grant list, the one-time secret */
+/* One line box: a wrapped name leaves a gap at its centre, where a click
+   lands on the cell instead of the name. */
+.key-name { white-space: nowrap; }
 dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1rem; margin: 0 0 1rem; }
 dl.facts dt { color: var(--fg-muted); font-size: .8rem; }
 dl.facts dd { margin: 0; }
@@ -2994,11 +3000,11 @@ dl.facts dd { margin: 0; }
 .grant-list li { display: flex; gap: .5rem; align-items: center; padding: .15rem 0; }
 .inline-form { display: flex; gap: .5rem; align-items: center; }
 .inline-form select, .inline-form button { width: auto; margin: 0; }
-.drawer-actions { display: flex; gap: .5rem; margin-top: 1rem; }
-.drawer-actions button { width: auto; margin: 0; }
 pre.secret { white-space: pre-wrap; word-break: break-all; }
 .warn-text { color: var(--warn); font-weight: 600; }
 ```
+
+> **Corrected (issue #217, 2026-11-10).** Two changes to this step as first planned. The block no longer carries `.drawer-actions`: Task 1's `styles.css` already has it (with `flex-wrap`), so a second copy only overrode it. The name cell's span has `class: 'key-name'` and `.key-name { white-space: nowrap; }`: at the journeys' 800 px viewport the eight-column table wrapped `console-self you` onto two lines, the centre of the span fell between them on the bare cell, and rustwright refused the click with `Actionability(NotReceivingEvents)`.
 
 - [ ] **Step 6: Browser journeys (failing first)**
 
@@ -3094,6 +3100,8 @@ Run: `just test-ui`
 Expected: PASS, including `an_admin_creates_a_key_sees_its_secret_once_and_signs_in_with_it`, `revoking_the_signed_in_key_returns_the_browser_to_login` and `a_read_key_never_sees_the_keys_page`, with no skip lines.
 
 - [ ] **Step 8: Docs and changelog**
+
+> **Corrected (issue #217, 2026-11-10).** The rows below went into the "API keys" subsection's own table, in Task 1's column layout (`Method and path | Key | Does`), not into the shared "API reference" table, so parallel tasks do not edit the same table. The example uses `okf-mcp.example.com`, as Task 1's does.
 
 `docs/operations.md`, section "Web console": add subsection "API keys", saying that the page and its API are for admin keys only; that an admin key manages only the keys inside its reach (a key that reaches every catalog manages every key; one scoped to catalogs manages the keys whose every catalog it reaches, and no all-catalogs key); that a new key or a grant may name only catalogs the caller reaches, and `all` needs an all-catalogs caller; that the secret is in the `POST` response only; and that a revoke or grant takes effect on the next request. API reference rows:
 
@@ -9163,14 +9171,12 @@ async function discardOne(row, reload) {
 
 Element ids and `data-test` attributes the journey uses: `#changesets-table`, `[data-test=changeset-handle]`, `#changeset-diff`, `#changeset-discard`, `#changesets-refresh`, and Task 1's `#confirm-ok`.
 
-Append to `src/http/ui/styles.css` (`.drawer-actions` is also in Task 2's block; when both land, keep one copy):
+Append to `src/http/ui/styles.css` (`.drawer-actions` is already in Task 1's block, so this one does not repeat it; corrected in issue #217):
 
 ```css
 /* Changesets (Task 7) */
 .diff-file { margin-bottom: 1rem; }
 .diff-file h3 { margin: 0 0 .35rem; }
-.drawer-actions { display: flex; gap: .5rem; margin-top: 1rem; }
-.drawer-actions button { width: auto; margin: 0; }
 ```
 
 - [ ] **Step 7: Browser journey (failing first)**
