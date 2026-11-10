@@ -677,7 +677,7 @@ fn pending_files(
 /// not UTF-8; a one-line note for a deletion of a path that is not
 /// published now (deleted by someone else since the entry was made), or for
 /// pending bytes equal to the published ones.
-fn unified_diff(path: &str, published: Option<&[u8]>, pending: Option<&[u8]>) -> String {
+pub(crate) fn unified_diff(path: &str, published: Option<&[u8]>, pending: Option<&[u8]>) -> String {
     if published.is_none() && pending.is_none() {
         return format!(
             "No published {path} to delete: it was deleted after this entry was made\n"

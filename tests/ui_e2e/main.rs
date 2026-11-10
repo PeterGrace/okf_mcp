@@ -5,9 +5,10 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod browse;
 mod harness;
 mod health;
 mod keys;
 mod login;
 mod maintenance;
-// Tasks 4, 5 and 7 add: mod browse; mod catalogs; mod changesets;
+// Tasks 5 and 7 add: mod catalogs; mod changesets;
