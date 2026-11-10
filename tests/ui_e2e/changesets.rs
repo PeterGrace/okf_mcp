@@ -47,6 +47,13 @@ async fn an_admin_discards_a_changeset_from_the_console() {
         ui.wait_text("#changesets-table", &shown);
         ui.click("[data-test=changeset-handle]");
         ui.wait_text("#changeset-diff", "+Alpha runs well.");
+        // Cancelling the confirmation sends nothing: the drawer stays open,
+        // and the discard below succeeds (a discarded handle would be 409).
+        ui.click("#changeset-discard");
+        ui.click("#confirm-cancel");
+        ui.wait_hidden("#confirm-cancel");
+        ui.wait_visible("#changeset-discard");
+        assert!(ui.text("#changeset-diff").contains("+Alpha runs well."));
         ui.click("#changeset-discard");
         ui.click("#confirm-ok");
         ui.wait_text("#changesets-table", "No open changesets");

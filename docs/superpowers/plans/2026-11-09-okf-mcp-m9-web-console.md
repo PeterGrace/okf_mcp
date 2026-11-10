@@ -9247,6 +9247,13 @@ async fn an_admin_discards_a_changeset_from_the_console() {
         ui.wait_text("#changesets-table", &shown);
         ui.click("[data-test=changeset-handle]");
         ui.wait_text("#changeset-diff", "+Alpha runs well.");
+        // Cancelling the confirmation sends nothing: the drawer stays open,
+        // and the discard below succeeds (a discarded handle would be 409).
+        ui.click("#changeset-discard");
+        ui.click("#confirm-cancel");
+        ui.wait_hidden("#confirm-cancel");
+        ui.wait_visible("#changeset-discard");
+        assert!(ui.text("#changeset-diff").contains("+Alpha runs well."));
         ui.click("#changeset-discard");
         ui.click("#confirm-ok");
         ui.wait_text("#changesets-table", "No open changesets");
@@ -9264,7 +9271,7 @@ async fn an_admin_discards_a_changeset_from_the_console() {
 }
 ```
 
-> **Corrected (issue #222, 2026-11-10; review of PR #229).** `drive` now returns whether the journey ran (`false` when no Chromium is found). As first planned, the MCP check after `drive` ran even when the journey was skipped, so the test failed without Chromium instead of skipping. A journey that checks server state after `drive` returns early on `false`. Callers that check nothing afterwards may ignore the value.
+> **Corrected (issue #222, 2026-11-10; review of PR #229).** `drive` now returns whether the journey ran (`false` when no Chromium is found). As first planned, the MCP check after `drive` ran even when the journey was skipped, so the test failed without Chromium instead of skipping. A journey that checks server state after `drive` returns early on `false`. Callers that check nothing afterwards may ignore the value. The journey also cancels one Discard first and checks that the drawer stays open; the discard after it would be 409 had the cancelled one gone through.
 
 `tests/ui_e2e/main.rs`: add `mod changesets;`.
 
