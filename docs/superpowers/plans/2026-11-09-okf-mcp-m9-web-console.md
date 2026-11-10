@@ -7588,13 +7588,13 @@ async fn maintenance_findings_filter_and_count_by_current_disposition() {
     let open = reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Open))
         .await
         .unwrap();
-    assert_eq!(ids(&open), [second.clone()]);
+    assert_eq!(ids(&open), [second]);
     assert_eq!(open.next_after, None);
     let dismissed =
         reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Dismissed))
             .await
             .unwrap();
-    assert_eq!(ids(&dismissed), [first.clone()]);
+    assert_eq!(ids(&dismissed), std::slice::from_ref(&first));
     assert!(reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::NeedsInput))
         .await
         .unwrap()
@@ -7835,6 +7835,8 @@ pub async fn count_findings(pool: &PgPool, catalog_id: i64) -> Result<FindingCou
 
 Run: `cargo test --lib store::maintenance -- --test-threads=6`
 Expected: PASS: the new `maintenance_findings_filter_and_count_by_current_disposition` and every existing maintenance store test (`maintenance_report_pages_are_catalog_scoped` covers the unchanged unfiltered paging).
+
+> **Corrected (issue #221, 2026-11-10).** Step 1's two single-id assertions now read `[second]` and `std::slice::from_ref(&first)` (fixed inline above): `[x.clone()]` is clippy's `cloned_ref_to_slice_refs` under `-D warnings`. Step 2 built and passed as written, with one restructuring in `page_ids`: it matches on `listing` once, to pick the cursor query, the page query and the `$5` filter together, and binds `$5` only when the filter is `Some` (the findings case), rather than testing a `findings` flag three times. The signature, the SQL and the behaviour are the plan's. Read `src/store/maintenance/runs.rs`. The open check "`Option<Disposition>` in `Query`" holds: `?disposition=open` deserializes, and `?disposition=bogus` is 400 (`bad_maintenance_requests_are_refused`).
 
 - [ ] **Step 3: The tool-layer functions**
 
@@ -8319,6 +8321,8 @@ async fn counts(
 Run: `cargo test --lib http::api::maintenance -- --test-threads=6 && cargo test --test maintenance -- --test-threads=6`
 Expected: PASS: `maintenance_routes_follow_the_tools_access`, `the_filter_and_the_counts_follow_the_current_disposition`, `a_retried_disposition_replays_and_a_changed_one_is_refused`, `bad_maintenance_requests_are_refused`, `a_run_lists_its_work_and_findings`. The MCP maintenance tests are unchanged and still pass (the tool now delegates).
 
+> **Corrected (issue #221, 2026-11-10).** The tests and the area passed as written. The open check "an `app_with` catalog can be claimed for maintenance" holds: `seed` claims one of `MAIN`'s two `type: system` concepts through `run_store::claim` and submits it with the synthetic credential `reporter`, which no `api_keys` row has.
+
 - [ ] **Step 7: The Findings and Runs pages**
 
 Ids and attributes the journeys use:
@@ -8528,6 +8532,8 @@ export async function render(main, rest) {
 ```
 
 `load` is a function declaration, so it can be called above where it is written. It only runs after `table` and `more` exist: the first call is the `await load(true)` near the end.
+
+> **Corrected (issue #221, 2026-11-10).** Three changes to the pages as written above. (1) `showFinding`, `openFinding` and `openRun` take the page's `main` and check `main.isConnected` after their awaits, before touching the drawer ("Front-end shape"): `openFinding`/`openRun` open no drawer, and a decision whose answer arrives after the user navigated away does not redraw it. `refreshFindingsBadge()` still runs after a decision, since it reads the counts afresh and checks the catalog itself. (2) The drawers' `<dl>` carry `class: 'facts'`, reusing Task 2's `dl.facts` rules, so the `.finding dl` / `.run dl` rules below were not added; only `.dispose-buttons` and `#findings-more` were. (3) The `#catalog-select` listener and `enter()` edits in `main.js` landed as written beside `enterOrRecover()`.
 
 `src/http/ui/js/pages/runs.js`:
 
@@ -8765,12 +8771,16 @@ async fn a_reader_sees_the_run_and_its_work_but_cannot_decide() {
 
 `tests/ui_e2e/main.rs`: add `mod maintenance;` (keep the other tasks' lines).
 
+> **Corrected (issue #221, 2026-11-10).** Also update the trailing comment to the tasks still to come. Both journeys passed as written, run by `just test-ui` through rustwright's own discovery (the Playwright cache): a `/usr/bin/chromium-browser` that is a snap shim fails to launch, so do not point `RUSTWRIGHT_CHROMIUM` at it.
+
 Run: `just test-ui`
 Expected: `a_writer_dismisses_a_finding_and_its_state_changes` and `a_reader_sees_the_run_and_its_work_but_cannot_decide` pass with Task 1's journeys, with no skip lines.
 
 - [ ] **Step 9: Docs and changelog**
 
 - `docs/operations.md`, "Web console", subsection "Findings and runs". Rows for the API reference table:
+
+  > **Corrected (issue #221, 2026-11-10).** As corrected for Task 3 (issue #218), the rows went into the subsection's own three-column table (`Method and path | Key | Does`), in `### Findings and runs` before "Testing the console", with the paragraph above the table, a 404 line for an unreached catalog, and a `curl` example on `okf-mcp.example.com`.
 
   | Method | Path | Access | Notes |
   |---|---|---|---|
@@ -8790,7 +8800,7 @@ Expected: `a_writer_dismisses_a_finding_and_its_state_changes` and `a_reader_see
 
 - [ ] **Step 10: Gates and commit**
 
-Run every gate in "Conventions". This task changes `src/mcp/maintenance/reports.rs` by delegation only (no behaviour change), so the parity and roundtrip runs are not needed; `cargo test --test maintenance` covers the MCP path. Then:
+Run every gate in "Conventions". This task changes `src/mcp/maintenance/reports.rs` by delegation only (no behaviour change), so the parity and roundtrip runs are not needed; `cargo test --test maintenance` covers the MCP path. (Issue #221: they also could not run, since no local catalog checkout was available.) Then:
 
 ```bash
 git add src/store/maintenance/mod.rs src/store/maintenance/runs.rs src/store/maintenance/reports.rs \
@@ -9351,3 +9361,5 @@ Tasks 2, 3, 5, 6 and 7 have not been compiled. Their facts are cited against the
 - that an `app_with` catalog can be claimed for maintenance (Task 6);
 - `is_visible` inside a closed `<details>` (Task 4 checks `details.open` instead);
 - that rustwright's `evaluate` awaits a returned promise (Task 1's router journey).
+
+> **Corrected (issue #221, 2026-11-10).** Both Task 6 checks hold: `Option<Disposition>` deserializes from `Query` (an unknown value is 400), and an `app_with` catalog can be claimed and submitted through the store. See Task 6's notes.

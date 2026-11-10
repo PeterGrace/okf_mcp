@@ -885,3 +885,104 @@ async fn maintenance_report_terminal_and_running_work_without_findings() {
         .items
         .is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn maintenance_findings_filter_and_count_by_current_disposition() {
+    let db = test_db().await;
+    let catalog = setup(&db.pool, &["a.md", "b.md"]).await;
+    let (_, first) = fixture(&db.pool, catalog, "first").await;
+    let (_, second) = fixture(&db.pool, catalog, "second").await;
+    let ids = |page: &runs::Page<reports::FindingRecord>| {
+        page.items
+            .iter()
+            .map(|finding| finding.id.clone())
+            .collect::<Vec<_>>()
+    };
+    let human = actor("human");
+    reports::dispose(
+        &db.pool,
+        catalog,
+        &human,
+        &first,
+        Disposition::Dismissed,
+        "Not useful.",
+        "dismiss",
+        t0(),
+    )
+    .await
+    .unwrap();
+    let open = reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Open))
+        .await
+        .unwrap();
+    assert_eq!(ids(&open), [second]);
+    assert_eq!(open.next_after, None);
+    let dismissed =
+        reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Dismissed))
+            .await
+            .unwrap();
+    assert_eq!(ids(&dismissed), std::slice::from_ref(&first));
+    assert!(reports::list_findings_with(
+        &db.pool,
+        catalog,
+        None,
+        20,
+        Some(Disposition::NeedsInput)
+    )
+    .await
+    .unwrap()
+    .items
+    .is_empty());
+    assert_eq!(
+        reports::count_findings(&db.pool, catalog).await.unwrap(),
+        reports::FindingCounts {
+            open: 1,
+            accepted_for_follow_up: 0,
+            dismissed: 1,
+            needs_input: 0
+        }
+    );
+
+    // Only the last decision counts: reopening moves the finding back.
+    reports::dispose(
+        &db.pool,
+        catalog,
+        &human,
+        &first,
+        Disposition::Open,
+        "Reopened.",
+        "reopen",
+        t0(),
+    )
+    .await
+    .unwrap();
+    let all = reports::list_findings(&db.pool, catalog, None, 20)
+        .await
+        .unwrap();
+    let open = reports::list_findings_with(&db.pool, catalog, None, 20, Some(Disposition::Open))
+        .await
+        .unwrap();
+    assert_eq!(open.items, all.items);
+    // A filtered page's cursor continues within the filter.
+    let page = reports::list_findings_with(&db.pool, catalog, None, 1, Some(Disposition::Open))
+        .await
+        .unwrap();
+    assert_eq!(page.items, all.items[..1]);
+    let rest = reports::list_findings_with(
+        &db.pool,
+        catalog,
+        page.next_after.as_deref(),
+        1,
+        Some(Disposition::Open),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rest.items, all.items[1..]);
+    assert_eq!(rest.next_after, None);
+    assert_eq!(
+        reports::count_findings(&db.pool, catalog).await.unwrap(),
+        reports::FindingCounts {
+            open: 2,
+            ..Default::default()
+        }
+    );
+}

@@ -288,6 +288,9 @@ is blocked), so sign out on a shared machine.
 The Health page shows lint, sprawl, link, staleness and open-question counts,
 with each report one click away.
 
+Maintenance findings can be triaged (accepted, dismissed, needs input,
+reopened) and runs inspected from the browser.
+
 Every console action is an `/api/v1` call with the same bearer key, so
 anything the console does can be scripted:
 

@@ -11,7 +11,7 @@ use sqlx::{PgPool, Row};
 use super::{candidates, lease_end, lock, receipt, recover, refused, replay, validate};
 use crate::error::OkfError;
 use crate::maintenance::select;
-use crate::maintenance::types::new_id;
+use crate::maintenance::types::{new_id, Disposition};
 use crate::maintenance::types::{
     Actor, Assessment, ClaimResult, Evidence, Lane, Lease, RevisionPin, RunState, WorkOutcome,
 };
@@ -82,40 +82,87 @@ pub(super) async fn snapshot(
     Ok(tx)
 }
 
+/// Which rows a page of IDs lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Listing {
+    /// Maintenance runs.
+    Runs,
+    /// Findings; with a disposition, only those whose current one it is.
+    Findings(Option<Disposition>),
+}
+
+/// Runs, oldest first.
+const RUNS_PAGE: &str = "SELECT id FROM maintenance_runs WHERE catalog_id=$1 AND \
+    ($2::timestamptz IS NULL OR (created_at,id)>($2,$3)) ORDER BY created_at,id LIMIT $4";
+
+/// Findings, oldest first, narrowed by `$5` (a disposition, or NULL for all).
+const FINDINGS_PAGE: &str = concat!(
+    "SELECT f.id FROM maintenance_findings f WHERE f.catalog_id=$1 AND \
+     ($2::timestamptz IS NULL OR (f.created_at,f.id)>($2,$3)) AND ($5::text IS NULL OR ",
+    current_disposition!(),
+    "=$5) ORDER BY f.created_at,f.id LIMIT $4"
+);
+
+/// One page of run or finding IDs, ascending by `(created_at,id)`.
+///
+/// The cursor `after` is any row of the listed kind in the catalog, so a
+/// finding cursor survives that finding changing disposition; `limit` and
+/// `next_after` count only the rows `listing` keeps.
+///
+/// # Errors
+/// `Refused` for a limit outside 1..=200, `NotFound` for an unknown cursor,
+/// or a database error.
 pub(super) async fn page_ids(
     conn: &mut sqlx::PgConnection,
     catalog: i64,
     after: Option<&str>,
     limit: u32,
-    findings: bool,
+    listing: Listing,
 ) -> Result<Page<String>, OkfError> {
     if !(1..=200).contains(&limit) {
         return Err(refused(
             "maintenance page size must be 1..=200 (default 20)",
         ));
     }
+    // The findings filter's text form, or `None` for runs (whose query has
+    // no `$5`). `transpose` turns Option<Result<..>> into Result<Option<..>>,
+    // so `?` can raise the (impossible) encoding error.
+    let (cursor_sql, page_sql, filter) = match listing {
+        Listing::Runs => (
+            "SELECT created_at,id FROM maintenance_runs WHERE catalog_id=$1 AND id=$2",
+            RUNS_PAGE,
+            None,
+        ),
+        Listing::Findings(disposition) => (
+            "SELECT created_at,id FROM maintenance_findings WHERE catalog_id=$1 AND id=$2",
+            FINDINGS_PAGE,
+            Some(disposition.map(super::reports::enum_text).transpose()?),
+        ),
+    };
     let cursor: Option<(DateTime<Utc>, String)> = if let Some(id) = after {
         Some(
-            sqlx::query_as(if findings {
-                "SELECT created_at,id FROM maintenance_findings WHERE catalog_id=$1 AND id=$2"
-            } else {
-                "SELECT created_at,id FROM maintenance_runs WHERE catalog_id=$1 AND id=$2"
-            })
-            .bind(catalog)
-            .bind(id)
-            .fetch_optional(&mut *conn)
-            .await?
-            .ok_or_else(not_found)?,
+            sqlx::query_as(cursor_sql)
+                .bind(catalog)
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or_else(not_found)?,
         )
     } else {
         None
     };
-    let mut items: Vec<String> = sqlx::query_scalar(if findings {
-        "SELECT id FROM maintenance_findings WHERE catalog_id=$1 AND ($2::timestamptz IS NULL OR (created_at,id)>($2,$3)) ORDER BY created_at,id LIMIT $4"
-    } else {
-        "SELECT id FROM maintenance_runs WHERE catalog_id=$1 AND ($2::timestamptz IS NULL OR (created_at,id)>($2,$3)) ORDER BY created_at,id LIMIT $4"
-    }).bind(catalog).bind(cursor.as_ref().map(|c| c.0)).bind(cursor.as_ref().map(|c| c.1.as_str()))
-        .bind(i64::from(limit) + 1).fetch_all(conn).await?;
+    let query = sqlx::query_scalar::<_, String>(page_sql)
+        .bind(catalog)
+        .bind(cursor.as_ref().map(|c| c.0))
+        .bind(cursor.as_ref().map(|c| c.1.as_str()))
+        .bind(i64::from(limit) + 1);
+    // Only the findings query has a `$5`; binding it for runs would be a
+    // parameter-count error from Postgres.
+    let query = match filter {
+        Some(filter) => query.bind(filter),
+        None => query,
+    };
+    let mut items: Vec<String> = query.fetch_all(conn).await?;
     let next_after = if items.len() > limit as usize {
         items.pop();
         items.last().cloned()
@@ -141,7 +188,7 @@ pub async fn list_runs(
     limit: u32,
 ) -> Result<Page<RunSummary>, OkfError> {
     let mut tx = snapshot(pool).await?;
-    let ids = page_ids(&mut tx, catalog_id, after, limit, false).await?;
+    let ids = page_ids(&mut tx, catalog_id, after, limit, Listing::Runs).await?;
     let mut items = Vec::with_capacity(ids.items.len());
     for id in ids.items {
         items.push(summary(&mut tx, catalog_id, &id).await?);

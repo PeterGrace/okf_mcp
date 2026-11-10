@@ -148,3 +148,7 @@ dl.facts dd { margin: 0; }
 .inline-form select, .inline-form button { width: auto; margin: 0; }
 pre.secret { white-space: pre-wrap; word-break: break-all; }
 .warn-text { color: var(--warn); font-weight: 600; }
+
+/* Findings and runs (Task 6): the disposition buttons; drawer facts reuse dl.facts */
+.dispose-buttons { display: flex; flex-wrap: wrap; gap: .5rem; }
+.dispose-buttons button, #findings-more { width: auto; margin: .5rem 0 0; }

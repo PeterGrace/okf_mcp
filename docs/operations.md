@@ -1152,6 +1152,35 @@ questions). The switcher below them shows one report at a time as a sortable
 table, and a row opens its concept in Browse. Refresh reloads the counts and
 the reports.
 
+### Findings and runs
+
+The Findings page (`/ui/#/findings`) lists the selected catalog's
+maintenance findings, open ones first, with a filter for each other
+disposition and one for all. A finding's drawer shows its claim, its evidence
+at the pinned revisions and its decision history, and a write key records a
+decision there with a rationale; the console makes the retry key. A decision
+is recorded only: it never edits the catalog. The Runs page (`/ui/#/runs`)
+lists runs newest first, and a run's drawer lists its work items with links
+to their concepts and findings. The nav badge shows the selected catalog's
+open findings.
+
+| Method and path | Key | Does |
+|---|---|---|
+| `GET /api/v1/catalogs/{catalog}/maintenance/runs?after=&limit=` | read | As `maintenance_list_runs`: oldest first; `limit` 1..=200 (default 20; outside is 409); `after` is the previous page's `next_after` (an unknown one is 404) |
+| `GET /api/v1/catalogs/{catalog}/maintenance/runs/{run}` | read | As `maintenance_get_run`: the run summary and up to 50 work items, with their finding ids |
+| `GET /api/v1/catalogs/{catalog}/maintenance/findings?after=&limit=&disposition=` | read | As `maintenance_list_findings`, optionally narrowed to one current disposition (`open`, `accepted_for_follow_up`, `dismissed`, `needs_input`; another value is 400). `limit` and `next_after` count matching findings only |
+| `GET /api/v1/catalogs/{catalog}/maintenance/findings/{finding}` | read | As `maintenance_get_finding`: claim, evidence with pinned revisions, decision history, `outdated` |
+| `GET /api/v1/catalogs/{catalog}/maintenance/counts` | read | `{catalog, open, accepted_for_follow_up, dismissed, needs_input}` by current disposition (the nav badge) |
+| `POST /api/v1/catalogs/{catalog}/maintenance/findings/{finding}/disposition` | write | Body `{disposition, rationale, idempotency_key}` (an unknown field is 422). As `maintenance_dispose`: appends a decision and never edits the catalog. A retry with the same key and body returns the original response; the same key with a different body is 409. The reporting flag grants nothing here: a read-level reporter key gets 403 |
+
+A catalog the key does not reach, or that does not exist, is 404 on all six.
+
+```sh
+curl -fsS -H "Authorization: Bearer $OKF_MCP_KEY" -H 'Content-Type: application/json' \
+    -d '{"disposition":"dismissed","rationale":"Covered elsewhere.","idempotency_key":"dismiss-1"}' \
+    https://okf-mcp.example.com/api/v1/catalogs/main/maintenance/findings/FINDING_ID/disposition
+```
+
 ### Testing the console
 
 `just test-ui` runs the browser journeys (`tests/ui_e2e`) against a real
