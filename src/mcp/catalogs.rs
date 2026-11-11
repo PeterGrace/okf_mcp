@@ -1,5 +1,4 @@
-//! `list_catalogs`: the catalogs a key can reach and this connection's
-//! selection.
+//! `list_catalogs`: the catalogs this connection offers and its selection.
 
 use axum::http::request::Parts;
 use rmcp::handler::server::tool::Extension;
@@ -30,7 +29,8 @@ pub struct CatalogInfo {
 /// `list_catalogs`' result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CatalogList {
-    /// Every catalog this key can reach, by name.
+    /// Every catalog this connection offers, by name: those the key reaches,
+    /// narrowed to the connection's list when it has one.
     pub catalogs: Vec<CatalogInfo>,
     /// The catalogs a call without a `catalog` argument reads, in order.
     pub selection: Vec<String>,
@@ -40,7 +40,8 @@ pub struct CatalogList {
     pub selection_error: Option<String>,
 }
 
-/// Lists the catalogs `ctx`'s key reaches and the connection's selection.
+/// Lists the catalogs `ctx` offers ([`ToolContext::offers`]) and the
+/// connection's selection.
 ///
 /// # Arguments
 /// * `ctx` - the call's context.
@@ -52,7 +53,7 @@ pub(crate) fn list(ctx: &ToolContext) -> CatalogList {
     let catalogs = ctx
         .catalogs()
         .iter()
-        .filter(|(name, _)| ctx.principal().reaches(name))
+        .filter(|(name, _)| ctx.offers(name))
         .map(|(name, state)| {
             let loaded = state.current();
             CatalogInfo {
@@ -91,9 +92,11 @@ impl OkfServer {
     // written type, and an alias hides it.
     #[tool(
         title = "List Catalogs",
-        description = "List the catalogs this API key can reach (name, description, file \
-                       count, last change) and this connection's selection: the catalogs \
-                       a call without a `catalog` argument reads, and the default write target.",
+        description = "List the catalogs this connection offers (name, description, file \
+                       count, last change): those the API key can reach, limited to the \
+                       connection's X-OKF-Catalogs list when it has one. Also this \
+                       connection's selection: the catalogs a call without a `catalog` \
+                       argument reads, and the default write target.",
         annotations(
             title = "List Catalogs",
             read_only_hint = true,
@@ -114,6 +117,8 @@ impl OkfServer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::config::Config;
     use crate::mcp::testing::{app_with, context, principal};
@@ -142,6 +147,29 @@ mod tests {
         assert_eq!(listed.selection, ["work", "pg"]);
         assert_eq!(listed.write_target.as_deref(), Some("work"));
         assert_eq!(listed.selection_error, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_list_hides_the_key_default_and_other_grants() {
+        let test = app_with(
+            &[("pg", &[]), ("work", &[]), ("home", &[])],
+            Config::default(),
+        )
+        .await;
+        let key = principal(&["pg", "work"], Some("pg"));
+
+        let listed = list(&context(&test, Arc::clone(&key), Some(&["work"])));
+        let mistyped = list(&context(&test, key, Some(&["work", "home"])));
+
+        let names: Vec<&str> = listed.catalogs.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["work"]);
+        assert_eq!(listed.selection, ["work"]);
+        assert_eq!(listed.write_target.as_deref(), Some("work"));
+        // An ungranted name is reported, never listed, and nothing falls back.
+        let names: Vec<&str> = mistyped.catalogs.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["work"]);
+        assert!(mistyped.selection.is_empty());
+        assert!(mistyped.selection_error.unwrap().contains("\"home\""));
     }
 
     #[tokio::test(flavor = "multi_thread")]

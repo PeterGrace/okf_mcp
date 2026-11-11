@@ -133,6 +133,104 @@ async fn selection_takes_the_header_then_the_key_default_then_the_server_default
     assert_eq!(structured(&listed)["catalogs"].as_array().unwrap().len(), 1);
 }
 
+/// The names in `list_catalogs`' `catalogs`, and its `selection` and
+/// `write_target`.
+async fn offered(client: &Client) -> (Vec<String>, serde_json::Value, serde_json::Value) {
+    let result = call(client, "list_catalogs", serde_json::json!({})).await;
+    let listed = structured(&result);
+    let names = listed["catalogs"]
+        .as_array()
+        .expect("catalogs")
+        .iter()
+        .map(|catalog| catalog["name"].as_str().expect("name").to_string())
+        .collect();
+    (
+        names,
+        listed["selection"].clone(),
+        listed["write_target"].clone(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_list_is_the_session_scope_whatever_its_spelling() {
+    let catalogs = vec![
+        ("pg", files(&[("a.md", "---\ntype: Note\n---\n# A\n")])),
+        ("work", files(&[])),
+        ("home", files(&[])),
+    ];
+    let server = TestServer::start(catalogs, Config::default()).await;
+    // Reaches `pg` and `work`, defaulting to `pg`.
+    let key = server
+        .key("a", Access::Read, &["pg", "work"], Some("pg"))
+        .await;
+    let query_url = format!("{}?catalogs=work", server.mcp_url());
+    let clients = [
+        server.client(&key, Some("work")).await.unwrap(),
+        server
+            .client_with(&key, &[("x-okf-catalog", "work")])
+            .await
+            .unwrap(),
+        server.client_at(&key, &query_url, &[]).await.unwrap(),
+    ];
+
+    for client in &clients {
+        let escaped = call(
+            client,
+            "get_concept",
+            serde_json::json!({"catalog": "pg", "path": "/a.md"}),
+        )
+        .await;
+
+        assert_eq!(
+            offered(client).await,
+            (
+                vec!["work".to_string()],
+                serde_json::json!(["work"]),
+                serde_json::json!("work")
+            )
+        );
+        assert_eq!(escaped.is_error, Some(true), "{escaped:?}");
+        let body = escaped.structured_content.expect("the error's JSON");
+        assert_eq!(body["error"], "CatalogNotSelected");
+        assert_eq!(body["catalog"], "pg");
+    }
+
+    // Both spellings: one list, the plural's names first.
+    let both = server
+        .client_with(&key, &[("x-okf-catalogs", "work"), ("x-okf-catalog", "pg")])
+        .await
+        .unwrap();
+    // Without a list, the key's grants are offered and its default selected.
+    let unlisted = server.client(&key, None).await.unwrap();
+    // A name the key does not reach is a diagnostic, never a fallback.
+    let ungranted = server.client(&key, Some("work,home")).await.unwrap();
+    let result = call(&ungranted, "list_catalogs", serde_json::json!({})).await;
+    let ungranted_listed = structured(&result);
+
+    assert_eq!(
+        offered(&both).await,
+        (
+            vec!["pg".to_string(), "work".to_string()],
+            serde_json::json!(["work", "pg"]),
+            serde_json::json!("work")
+        )
+    );
+    assert_eq!(
+        offered(&unlisted).await,
+        (
+            vec!["pg".to_string(), "work".to_string()],
+            serde_json::json!(["pg"]),
+            serde_json::json!("pg")
+        )
+    );
+    assert_eq!(ungranted_listed["catalogs"].as_array().unwrap().len(), 1);
+    assert_eq!(ungranted_listed["selection"], serde_json::json!([]));
+    assert!(ungranted_listed["selection_error"]
+        .as_str()
+        .unwrap()
+        .contains("\"home\""));
+}
+
 /// `GET /catalogs/{catalog}/export` with a bearer key.
 async fn get_export(server: &TestServer, catalog: &str, key: &str) -> reqwest::Response {
     reqwest::Client::new()
