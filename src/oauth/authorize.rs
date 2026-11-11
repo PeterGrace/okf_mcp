@@ -513,6 +513,7 @@ async fn approve(
             resource: pending.resource.clone(),
             family_id,
             used: false,
+            replayed: false,
         },
         Instant::now(),
     );
