@@ -178,6 +178,135 @@ pub async fn revoke(
     }))
 }
 
+/// What presenting a refresh token found ([`use_refresh`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshUse {
+    /// Live and unused: now marked used. Mint its successor in the same
+    /// transaction.
+    Rotated {
+        /// Its grant.
+        grant_id: String,
+        /// Its family, which the successor joins.
+        family_id: String,
+        /// The resource it was issued for.
+        resource: String,
+    },
+    /// Already used once: a stolen copy, or the client replaying it. The
+    /// caller revokes the family.
+    Reused {
+        /// The family to revoke.
+        family_id: String,
+    },
+    /// Unknown, not a refresh token, expired, revoked, or its grant revoked.
+    Unknown,
+}
+
+/// The row [`use_refresh`] reads: the token's binding, its state, and its
+/// grant's revocation time.
+type RefreshRow = (
+    String,
+    String,
+    String,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+);
+
+/// Presents a refresh token: locks its row and, if it is live and unused,
+/// marks it used.
+///
+/// Reuse is checked first: a used token is `Reused` even after its family
+/// was revoked, so replaying it again stays harmless (revoking twice).
+///
+/// # Arguments
+/// * `tx` - the transaction the successor is minted in (commit it after;
+///   dropping it uncommitted rolls the mark back).
+/// * `sha256` - the presented token's hash.
+/// * `now` - the server clock.
+///
+/// # Returns
+/// What was found.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn use_refresh(
+    tx: &mut PgConnection,
+    sha256: &[u8; 32],
+    now: DateTime<Utc>,
+) -> Result<RefreshUse, OkfError> {
+    // `FOR UPDATE OF t` locks only the token row, so two racing refreshes of
+    // one token run one after the other: the second waits for the first to
+    // commit (its successor included), then sees `used_at` set.
+    let row: Option<RefreshRow> = sqlx::query_as(
+        "SELECT t.grant_id, t.family_id, t.resource, t.used_at, t.revoked_at, t.expires_at, \
+                k.revoked_at \
+         FROM oauth_tokens t JOIN api_keys k ON k.id = t.grant_id \
+         WHERE t.sha256 = $1 AND t.kind = 'refresh' \
+         FOR UPDATE OF t",
+    )
+    .bind(sha256.as_slice())
+    .fetch_optional(&mut *tx)
+    .await?;
+    // `let ... else`: return early when there is no row.
+    let Some((grant_id, family_id, resource, used_at, revoked_at, expires_at, grant_revoked_at)) =
+        row
+    else {
+        return Ok(RefreshUse::Unknown);
+    };
+    if used_at.is_some() {
+        return Ok(RefreshUse::Reused { family_id });
+    }
+    if revoked_at.is_some() || grant_revoked_at.is_some() || expires_at <= now {
+        return Ok(RefreshUse::Unknown);
+    }
+    sqlx::query("UPDATE oauth_tokens SET used_at = $2 WHERE sha256 = $1")
+        .bind(sha256.as_slice())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    Ok(RefreshUse::Rotated {
+        grant_id,
+        family_id,
+        resource,
+    })
+}
+
+/// Revokes every live token of a family.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `family_id` - the family.
+/// * `now` - the server clock.
+///
+/// # Returns
+/// The hashes it revoked (none if it was already revoked), for
+/// `AccessTokens::forget`.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn revoke_family(
+    pool: &PgPool,
+    family_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<[u8; 32]>, OkfError> {
+    let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+        "UPDATE oauth_tokens SET revoked_at = $2 \
+         WHERE family_id = $1 AND revoked_at IS NULL RETURNING sha256",
+    )
+    .bind(family_id)
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+    // The schema checks `length(sha256) = 32`, so the conversion to a fixed
+    // array cannot fail on a row the server wrote; `filter_map` skips any
+    // other.
+    Ok(rows
+        .into_iter()
+        .filter_map(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
+        .collect())
+}
+
 /// Deletes every token that expired before `expired_before`.
 ///
 /// # Arguments
@@ -311,6 +440,131 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(revoked_at, now(), "the first revocation time stays");
+    }
+
+    /// A token of `grant` in `family`, live for 30 days.
+    fn token<'a>(
+        grant: &'a str,
+        kind: TokenKind,
+        family: &'a str,
+        sha256: [u8; 32],
+    ) -> NewToken<'a> {
+        NewToken {
+            sha256,
+            grant_id: grant,
+            kind,
+            family_id: family,
+            resource: "https://okf.example.com/mcp",
+            expires_at: now() + TimeDelta::days(30),
+        }
+    }
+
+    /// `use_refresh` in its own committed transaction.
+    async fn present(db: &crate::db::pg_support::TestDb, sha256: &[u8; 32]) -> RefreshUse {
+        let mut tx = db.pool.begin().await.unwrap();
+        let found = use_refresh(&mut tx, sha256, now()).await.unwrap();
+        tx.commit().await.unwrap();
+        found
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refresh_token_rotates_once_then_counts_as_reused() {
+        let (db, grant) = with_grant().await;
+        store(&db, &token(&grant, TokenKind::Refresh, "family-a", [8; 32])).await;
+
+        let first = present(&db, &[8; 32]).await;
+        let second = present(&db, &[8; 32]).await;
+
+        assert_eq!(
+            first,
+            RefreshUse::Rotated {
+                grant_id: grant.clone(),
+                family_id: "family-a".to_string(),
+                resource: "https://okf.example.com/mcp".to_string(),
+            }
+        );
+        assert_eq!(
+            second,
+            RefreshUse::Reused {
+                family_id: "family-a".to_string()
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rolled_back_rotation_leaves_the_token_unused() {
+        let (db, grant) = with_grant().await;
+        store(&db, &token(&grant, TokenKind::Refresh, "family-b", [9; 32])).await;
+
+        let mut tx = db.pool.begin().await.unwrap();
+        let first = use_refresh(&mut tx, &[9; 32], now()).await.unwrap();
+        // Dropped without `commit`: sqlx rolls the transaction back.
+        drop(tx);
+
+        assert!(matches!(first, RefreshUse::Rotated { .. }));
+        assert!(matches!(
+            present(&db, &[9; 32]).await,
+            RefreshUse::Rotated { .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_access_expired_revoked_and_revoked_grant_tokens_are_unknown() {
+        let (db, grant) = with_grant().await;
+        store(&db, &token(&grant, TokenKind::Access, "f", [10; 32])).await;
+        store(
+            &db,
+            &NewToken {
+                expires_at: now() + TimeDelta::seconds(1),
+                ..token(&grant, TokenKind::Refresh, "f", [11; 32])
+            },
+        )
+        .await;
+        store(&db, &token(&grant, TokenKind::Refresh, "f", [12; 32])).await;
+        revoke(&db.pool, &[12; 32], now()).await.unwrap();
+        store(&db, &token(&grant, TokenKind::Refresh, "g", [13; 32])).await;
+        let mut tx = db.pool.begin().await.unwrap();
+        // One second on, the short-lived token has expired.
+        let expired = use_refresh(&mut tx, &[11; 32], now() + TimeDelta::seconds(1))
+            .await
+            .unwrap();
+        drop(tx);
+        crate::store::keys::revoke_by_id(&db.pool, &grant, now())
+            .await
+            .unwrap();
+
+        assert_eq!(expired, RefreshUse::Unknown, "expired");
+        for (hash, what) in [
+            ([14u8; 32], "unknown"),
+            ([10; 32], "an access token"),
+            ([12; 32], "revoked"),
+            ([13; 32], "its grant revoked"),
+        ] {
+            assert_eq!(present(&db, &hash).await, RefreshUse::Unknown, "{what}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoke_family_revokes_every_live_member_and_returns_their_hashes() {
+        let (db, grant) = with_grant().await;
+        store(&db, &token(&grant, TokenKind::Access, "fam", [15; 32])).await;
+        store(&db, &token(&grant, TokenKind::Refresh, "fam", [16; 32])).await;
+        store(&db, &token(&grant, TokenKind::Access, "else", [17; 32])).await;
+
+        let mut revoked = revoke_family(&db.pool, "fam", now()).await.unwrap();
+        revoked.sort();
+        let again = revoke_family(&db.pool, "fam", now()).await.unwrap();
+
+        assert_eq!(revoked, vec![[15; 32], [16; 32]]);
+        assert!(again.is_empty(), "already revoked");
+        assert!(find_access(&db.pool, &[15; 32], now())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(find_access(&db.pool, &[17; 32], now())
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]

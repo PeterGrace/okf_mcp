@@ -103,6 +103,10 @@ pub struct AuthorizationCode {
     /// expires, so presenting it again is seen as a replay (RFC 6749
     /// section 4.1.2: Task 6 then revokes its family).
     pub used: bool,
+    /// Whether it was presented again after it was used. The exchange that
+    /// used it checks this after its tokens commit, so a replay racing that
+    /// exchange still revokes the tokens it mints (Task 6).
+    pub replayed: bool,
 }
 
 /// The key of `OAuth::codes` for an authorization code: the hex SHA-256 of

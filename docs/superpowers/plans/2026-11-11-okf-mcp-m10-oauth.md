@@ -56,6 +56,7 @@ Deliberately deferred (spec "Non-goals"):
 8. **Rate limits are three in-memory token buckets** (`src/oauth/ratelimit.rs`): register, token and consent POST. They are global, not per client address: behind an ingress the address is the proxy's. No crate is added.
 9. **The consent page escapes through one helper,** `oauth::consent::escape`. There is no template engine. The page's text comes from client metadata, which is attacker-controlled.
 10. **Outward steps** (tagging, publishing the image, rollout) wait for the maintainer's go-ahead, as in M7 to M9. Task 8 only prepares the release.
+11. **`/oauth/revoke` does not check the token's client** (Task 6, issue #250, 2026-11-11). RFC 7009 says a token should belong to the requesting client, but clients are public (no authentication) and tokens carry no client id: holding a token already allows everything revoking it takes away.
 
 ## Simplifications and deviations relative to the design
 
@@ -74,6 +75,8 @@ Filled in as tasks land, as in M9 (dated `> **Corrected (issue #N).**` notes in 
 11. **`okf-mcp key revoke|grant|ungrant|maintenance-report` resolve API keys only** (Task 4, issue #248, 2026-11-11): `store::keys::resolve_active` filters `kind = 'key'` by id and by name, so a key name never matches, collides with or is made ambiguous by an OAuth grant. Grants are reached by exact id only: `okf-mcp oauth grant revoke` and the `/api/v1/keys/{id}` routes (`Selector::Exact`). Task 8 adds this to the spec.
 12. **The discovery documents are `Cache-Control: no-store`** (Task 3, corrected issue #247, 2026-11-11), like every OAuth route, not `public, max-age=300`: Task 2's layer sets it on everything under `oauth::routes()`. They still carry `Access-Control-Allow-Origin: *`.
 13. **`TestServer::start_with` landed in Task 5** (issue #249, 2026-11-11), as Task 6 Step 7 shows it, because the consent journey needs it first. Task 6 skips that step.
+14. **A replay that races the first exchange still revokes** (Task 6, issue #250, 2026-11-11): `AuthorizationCode.replayed` is set under the map's lock by the replay, and the exchange checks it after its tokens commit (revoking them if set, or if the code has left the map). The spec's "a used code revokes its family" holds for any interleaving.
+15. **A failed exchange spends the code** (Task 6, issue #250, 2026-11-11): the code is marked used before its bindings are checked, so a wrong verifier, client, redirect URI or resource ends it, and presenting it again counts as a replay.
 
 ## Verified facts the code relies on
 
@@ -310,7 +313,10 @@ pub struct AcceptedCode { pub code_id: String, pub summary_nonce: String }   // 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationCode { pub grant_id: String, pub client_id: String, pub redirect_uri: String,
     pub code_challenge: String, pub resource: String, pub family_id: String,
-    pub used: bool }                        // a used code stays until expiry, so a replay is detected
+    pub used: bool,                         // a used code stays until expiry, so a replay is detected
+    pub replayed: bool }                    // Task 6: set by a replay; the exchange checks it after commit
+// Corrected (issue #250, 2026-11-11): `replayed` closes the race of a replay arriving while the first
+// exchange is still minting (its family revocation would otherwise run before the tokens exist).
 pub fn code_key(code: &str) -> String;   // hex SHA-256 of an okfac_ code: the key of OAuth.codes
                                           // Corrected (issue #246, 2026-11-11): `pub`, so the stub crate has no dead-code warning before Task 5 uses it
 pub const PENDING_TTL: Duration;            // 10 minutes
@@ -351,11 +357,22 @@ pub fn routes() -> Router<Arc<App>>;                                      // bot
 ```
 
 ```rust
-// tests/support/server.rs (Task 6): TestServer::start_with(catalogs, impl FnOnce(&str /* base */) -> Config)
+// tests/support/server.rs (Task 5): TestServer::start_with(catalogs, impl FnOnce(&str /* base */) -> Config)
 // tests/support/oauth.rs (Task 6), for the end-to-end tests
-pub struct OAuthClient { /* reqwest client, base, client_id, redirect_uri, verifier */ }
-pub async fn start_oauth_server(catalogs: Vec<(&str, Files)>) -> (TestServer, CimdHost);
-// CimdHost: a local axum server serving a client metadata document at /client.json
+// Corrected (issue #250, 2026-11-11): the real API.
+pub async fn start_oauth_server(catalogs: Vec<(&str, Files)>) -> TestServer;   // public_url = own base, cimd_allow_private
+pub struct CimdHost { pub client_id: String, pub redirect_uri: String }       // CimdHost::start(): /client.json on loopback
+pub async fn sign_in_code(server: &TestServer, access: Access, catalogs: &[&str]) -> String;
+pub struct OAuthClient { /* reqwest client (no redirects), base, verifier, challenge */ pub client_id: String, pub redirect_uri: String }
+impl OAuthClient {
+    pub fn new(server: &TestServer, client_id: &str, redirect_uri: &str) -> Self;
+    pub async fn register(server: &TestServer, redirect_uri: &str) -> Self;   // DCR
+    pub async fn discover(&self) -> Discovered;                              // 401 -> PRM -> AS metadata
+    pub async fn authorize(&self, sign_in_code: &str, resource: &str) -> String;  // step 1, code, Approve (summary nonce)
+    pub async fn exchange(&self, code: &str, resource: &str) -> TokenAnswer;
+    pub async fn refresh(&self, refresh_token: &str) -> TokenAnswer;
+}
+pub struct TokenAnswer { pub status: reqwest::StatusCode, pub body: serde_json::Value }  // .access(), .refresh()
 ```
 
 ## File map
@@ -10909,6 +10926,8 @@ async fn revoke_family_revokes_every_live_member_and_returns_their_hashes() {
 }
 ```
 
+> **Corrected (issue #250, 2026-11-11).** The test module already has fixtures (`with_grant()`, `store(&db, &new)`, a fixed `now()`), so the tests use them with byte-array hashes instead of `grant_on` and `crate::mcp::testing::app_with`; a fourth test checks that a rotation rolled back leaves the token unused. See `src/store/oauth/tokens.rs`.
+
 Run: `cargo test --lib store::oauth::tokens`
 Expected: FAIL to compile (`RefreshUse`, `use_refresh`, `revoke_family` not found).
 
@@ -11250,6 +11269,8 @@ mod tests {
 }
 ```
 
+> **Corrected (issue #250, 2026-11-11).** Approve needs the step-2 page's `summary` nonce (Task 5, PR #259 review), so `authorization_code` posts `("summary", &hidden(&summary_page, "summary"))` with the Approve. `verify` takes the resource (`&oauth.settings.resource`). The shipped module has 13 tests: the ones above plus a replay racing the exchange, a code whose grant was revoked, a refused refresh with another `resource`, revoke without a token, and Debug redaction. See `src/oauth/token.rs`.
+
 Run: `cargo test --lib oauth::token`
 Expected: FAIL to compile (`routes` and the handlers not found).
 
@@ -11580,6 +11601,12 @@ async fn revoke(
     Ok(([(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], StatusCode::OK).into_response())
 }
 ```
+
+> **Superseded in part (issue #250, 2026-11-11).** What shipped differs from the code above in four places; read `src/oauth/token.rs`:
+> - **Replay race.** The replay sets `AuthorizationCode.replayed` under the map's lock; after its commit the exchange re-reads the code (as of the instant it started) and revokes its family if `replayed` is set or the code has left the map.
+> - **Grant check in the exchange** is liveness only (`app.keys().find_grant(..).is_some()`): the stored code already binds the client, and `grant_client` stays for the refresh grant, where it is the only client check.
+> - **`mint`** takes a `Binding { grant_id, family_id, resource }` struct instead of a tuple.
+> - **`revoke`** returns `StatusCode` (the `oauth::routes()` layer adds `no-store`) and calls `forget` only for an access token it found, so unknown tokens do not bump the cache generation.
 
 > `OAuthError` must convert from `OkfError` (Task 2's `Server(#[from] OkfError)`), so `?` on a store call works in these handlers. `map_err(OkfError::from)` turns a raw `sqlx::Error` into `OkfError` first. This relies on `src/error.rs`'s `From<sqlx::Error> for OkfError`, which already exists (it maps deadlocks to `Busy`).
 
@@ -11991,6 +12018,8 @@ fn hidden(page: &str, name: &str) -> String {
 }
 ```
 
+> **Corrected (issue #250, 2026-11-11).** `start_oauth_server` returns the `TestServer` only (the CIMD test starts its own `CimdHost`). `authorize` reads the summary page and posts its `summary` nonce with the Approve. `register` also sends `grant_types: ["authorization_code", "refresh_token"]`. `#![allow(dead_code)]` is at the top of `oauth.rs`. See `tests/support/oauth.rs`.
+
 Run: `cargo test --test server --no-run`
 Expected: compiles. `support` is shared, and `#![allow(dead_code)]` in `server.rs` covers only that file, so add `#![allow(dead_code)]` at the top of `oauth.rs` if a test crate that does not use it warns.
 
@@ -12176,6 +12205,8 @@ async fn a_revoked_grant_stops_its_tokens_at_the_next_poll() {
     assert_eq!(client.refresh(&tokens.refresh()).await.status, 400);
 }
 ```
+
+> **Corrected (issue #250, 2026-11-11).** `AccessTokens::verify` takes the resource, so the grant lookups pass `&oauth.settings.resource`; the shipped tests share `signed_in` (register, discover, consent, exchange) and `grant_of` helpers, and `catalogs_of` sorts. See `tests/server_oauth.rs`.
 
 Notes for the implementer:
 - `http://127.0.0.1:9/callback` is never fetched. The consent POST's 303 is only read, not followed, so the port is irrelevant. Task 3's `validate_redirect_uri` accepts `http` on a loopback host for registration.
