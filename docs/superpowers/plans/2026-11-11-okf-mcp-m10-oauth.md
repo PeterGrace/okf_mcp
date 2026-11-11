@@ -9066,7 +9066,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 - `PendingAuthorization` derives `Clone` (`Debug` stays by hand).
 - `AuthorizationCode` derives `Debug, Clone` and gains `pub used: bool`. Task 6 marks a code used instead of removing it, so a replay within its 60 seconds is detected.
-- New `pub(crate) fn code_key(code: &str) -> String` in `src/oauth/state.rs`: the lowercase hex SHA-256 of an `okfac_` code, the key of `OAuth.codes`.
+- New `pub fn code_key(code: &str) -> String` in `src/oauth/state.rs`: the lowercase hex SHA-256 of an `okfac_` code, the key of `OAuth.codes`.
   > **Corrected (issue #246, 2026-11-11).** Task 2 already ships both structs as below (`Clone`, `used`) and `code_key`, as `pub fn` with this task's `fold` body, plus `code_key_is_the_hex_sha256`. Step 4's `state.rs` changes are done: skip them (don't add a second `code_key` test).
 - New `#[cfg(test)] pub(crate) mod testing;` in `src/oauth/mod.rs`. It holds the helpers Tasks 5 and 6 share.
 
@@ -9269,7 +9269,7 @@ pub struct AuthorizationCode {
 ///
 /// # Returns
 /// 64 hex characters.
-pub(crate) fn code_key(code: &str) -> String {
+pub fn code_key(code: &str) -> String {
     // `fold` with `write!` appends each byte's two hex digits to one
     // preallocated `String` (Python: `hashlib.sha256(...).hexdigest()`).
     use std::fmt::Write as _;
