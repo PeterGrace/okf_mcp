@@ -145,6 +145,23 @@ impl ToolContext {
         self.principal.reaches(name) && in_scope(self.connection.as_deref(), name)
     }
 
+    /// Checks the connection's list whole, as [`resolve`] does: for the
+    /// paths that reach a catalog without selecting one (a changeset
+    /// handle, `list_changesets` without `catalog`), so a list naming a bad
+    /// catalog fails them too. Without a list there is nothing to check.
+    ///
+    /// # Errors
+    /// [`OkfError::CatalogNotSelected`] naming the first listed catalog that
+    /// does not exist or that the key does not reach.
+    pub fn check_connection(&self) -> Result<(), OkfError> {
+        match self.connection.as_deref() {
+            // With a list, `select(None)` resolves to exactly that list.
+            // `map(drop)` discards the selection, keeping only `Ok(())`.
+            Some(list) if !list.is_empty() => self.select(None).map(drop),
+            _ => Ok(()),
+        }
+    }
+
     /// Resolves the call's catalogs (design "Catalog selection").
     ///
     /// # Arguments
@@ -325,6 +342,9 @@ impl ToolContext {
     /// a write locks it again (`changesets::lock`) before trusting its state.
     ///
     /// # Errors
+    /// - [`OkfError::CatalogNotSelected`] for a connection list naming a bad
+    ///   catalog ([`ToolContext::check_connection`]), before the handle is
+    ///   looked up;
     /// - [`OkfError::UnknownChangeset`] for a handle that does not exist, is
     ///   in a catalog this key does not reach (or that is not loaded, or
     ///   that the connection's list leaves out), or
@@ -335,6 +355,7 @@ impl ToolContext {
     ///   discarded after 24 hours);
     /// - [`OkfError::Database`].
     pub async fn changeset(&self, handle: &str, access: Access) -> Result<Pinned, OkfError> {
+        self.check_connection()?;
         // A closure, so each refusal below builds its own error value.
         let unknown = || OkfError::UnknownChangeset {
             changeset: handle.to_string(),
@@ -575,6 +596,29 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(refused.kind(), "UnknownChangeset");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bad_connection_list_refuses_a_handle_it_would_otherwise_resolve() {
+        let test = app_with(&[("pg", &[]), ("work", &[])], Config::default()).await;
+        store_key(&test, "writer").await;
+        let handle = open(&as_key(&test, "writer", Access::Write)).await;
+        // `nope` does not exist; `work` exists but the key does not reach it.
+        for (list, bad) in [(["pg", "nope"], "nope"), (["pg", "work"], "work")] {
+            let on_list = context(
+                &test,
+                principal_as("writer", Access::Write, &["pg"], Some("pg")),
+                Some(&list),
+            );
+
+            let refused = on_list.changeset(&handle, Access::Write).await.unwrap_err();
+
+            assert_eq!(refused.kind(), "CatalogNotSelected", "{list:?}");
+            assert!(
+                refused.to_string().contains(&format!("{bad:?}")),
+                "{refused}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

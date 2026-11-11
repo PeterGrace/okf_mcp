@@ -114,12 +114,15 @@ pub(crate) async fn list_changesets(
     let catalog_ids: Vec<i64> = match params.catalog.as_deref() {
         // `one` refuses a catalog the key does not reach.
         Some(name) => vec![ctx.one(Some(name))?.id()],
-        None => ctx
-            .catalogs()
-            .values()
-            .filter(|state| ctx.offers(state.name()))
-            .map(|state| state.id())
-            .collect(),
+        None => {
+            // A list naming a bad catalog fails here as it does elsewhere.
+            ctx.check_connection()?;
+            ctx.catalogs()
+                .values()
+                .filter(|state| ctx.offers(state.name()))
+                .map(|state| state.id())
+                .collect()
+        }
     };
     let admin = principal.access >= Access::Admin;
     // The database narrows by key (unless admin) and catalog, so other
@@ -950,6 +953,18 @@ mod lifecycle_tests {
         assert_eq!(unlisted.changesets.len(), 2);
         assert!(handles(&unlisted).contains(&in_pg.as_str()));
         assert_eq!(handles(&listed), [in_work.as_str()]);
+        // `nope` does not exist; the second key reaches only `work`, not `pg`.
+        for (list, reach) in [(["work", "nope"], &[][..]), (["work", "pg"], &["work"][..])] {
+            let on_list = context(
+                &test,
+                principal_as("alice", Access::Write, reach, Some("work")),
+                Some(&list),
+            );
+
+            let refused = list_changesets(&on_list, all()).await.unwrap_err();
+
+            assert_eq!(refused.kind(), "CatalogNotSelected", "{list:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
