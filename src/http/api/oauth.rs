@@ -1,0 +1,495 @@
+//! `/api/v1/oauth/codes` (OAuth design "Sign-in codes"): what
+//! `okf-mcp oauth code ...` does, over HTTP. Grants are listed and revoked
+//! through `/api/v1/keys`, whose views carry `kind` and `client_name`.
+//!
+//! Access is the key area's (`api::keys`, M9 Task 2 "Security decisions"):
+//! - every route needs an admin key;
+//! - an admin manages only codes inside its reach (`manages_grants`); any
+//!   other code is a 404, like an unknown id;
+//! - a new code may name only catalogs the caller reaches, and `all: true`
+//!   needs a caller that reaches every catalog;
+//! - only `POST /oauth/codes` answers a code, once; nothing answers its hash.
+//!
+//! Codes are read from the database on every use, never cached, so these
+//! handlers do not poll (M10 Task 4, Decision 4).
+
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::routing::{delete, get};
+use axum::{Extension, Json, Router};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::app::App;
+use crate::auth::Principal;
+use crate::clock::format_timestamp;
+use crate::error::OkfError;
+use crate::http::api::keys::{manages_grants, parse_access, requested_grants};
+use crate::http::api::require_admin;
+use crate::http::AppError;
+use crate::store::oauth::codes::{self, NewSignInCode, SignInCodeRecord};
+
+/// One sign-in code as the API shows it: never the code or its hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SignInCodeView {
+    /// Its immutable id (the `{id}` of `DELETE`).
+    pub id: String,
+    /// Its label.
+    pub name: String,
+    /// The grant's actor.
+    pub actor: String,
+    /// `read` or `write`.
+    pub access: &'static str,
+    /// The grant reaches every catalog.
+    pub all_catalogs: bool,
+    /// The grant's catalogs, sorted.
+    pub catalogs: Vec<String>,
+    /// The grant's default catalog.
+    pub default_catalog: Option<String>,
+    /// `live`, `expired`, `redeemed` or `revoked`, as of the request.
+    pub state: &'static str,
+    /// When it was minted.
+    pub created_at: String,
+    /// When it stops working unredeemed.
+    pub expires_at: String,
+    /// When it was redeemed.
+    pub redeemed_at: Option<String>,
+    /// The grant (key id) it became.
+    pub grant_id: Option<String>,
+    /// When it was revoked.
+    pub revoked_at: Option<String>,
+}
+
+impl SignInCodeView {
+    /// The view of `record` at `now` (its state depends on the time).
+    ///
+    /// # Arguments
+    /// * `record` - the stored code.
+    /// * `now` - the request's time.
+    ///
+    /// # Returns
+    /// The view, timestamps formatted.
+    fn new(record: SignInCodeRecord, now: DateTime<Utc>) -> Self {
+        let state = record.state(now).as_str();
+        // Destructuring names every field: a field added to the record later
+        // fails to compile here until someone decides whether the API shows it.
+        let SignInCodeRecord {
+            id,
+            name,
+            access,
+            all_catalogs,
+            catalogs,
+            default_catalog,
+            actor,
+            created_at,
+            expires_at,
+            redeemed_at,
+            grant_id,
+            revoked_at,
+        } = record;
+        Self {
+            id,
+            name,
+            actor,
+            access: access.as_str(),
+            all_catalogs,
+            catalogs,
+            default_catalog,
+            state,
+            created_at: format_timestamp(created_at),
+            expires_at: format_timestamp(expires_at),
+            redeemed_at: redeemed_at.map(format_timestamp),
+            grant_id,
+            revoked_at: revoked_at.map(format_timestamp),
+        }
+    }
+}
+
+/// `GET /oauth/codes`' answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SignInCodeList {
+    /// The codes the caller manages, newest first, in every state.
+    pub codes: Vec<SignInCodeView>,
+}
+
+/// `POST /oauth/codes`' answer: the new code's view and, this once, the code.
+// `Debug` by hand, so a stray `{:?}` can never print the code.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CreatedSignInCodeView {
+    /// The new code.
+    pub code: SignInCodeView,
+    /// The `okfsc_` code. Not stored; it cannot be shown again.
+    pub secret: String,
+}
+
+impl std::fmt::Debug for CreatedSignInCodeView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreatedSignInCodeView")
+            .field("code", &self.code)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `POST /oauth/codes`' body. `deny_unknown_fields` turns a misspelt field
+/// into a 422.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateCodeBody {
+    /// Label, `[A-Za-z0-9._-]+`.
+    name: String,
+    /// The grant's actor (required).
+    actor: String,
+    /// `read` or `write`.
+    access: String,
+    /// Grant every catalog.
+    #[serde(default)]
+    all: bool,
+    /// The catalogs to grant (without `all`).
+    #[serde(default)]
+    catalogs: Vec<String>,
+    /// The default catalog (empty or absent: none).
+    default_catalog: Option<String>,
+    /// How long it stays valid (`humantime`: `2h`, `3d`; absent or empty: 24h).
+    expires_in: Option<String>,
+}
+
+/// This area's routes.
+pub(crate) fn routes() -> Router<Arc<App>> {
+    Router::new()
+        .route("/oauth/codes", get(list_codes).post(create_code))
+        .route("/oauth/codes/{id}", delete(revoke_code))
+}
+
+/// The code with exactly this id, if `principal` is an admin that manages it.
+///
+/// # Arguments
+/// * `app` - the application.
+/// * `principal` - the caller.
+/// * `id` - the code's id.
+///
+/// # Returns
+/// The code's record.
+///
+/// # Errors
+/// [`OkfError::Forbidden`] below admin; [`OkfError::NotFound`] for an unknown
+/// id or a code the caller does not manage (worded alike); [`OkfError::Database`].
+async fn managed_code(
+    app: &App,
+    principal: &Principal,
+    id: &str,
+) -> Result<SignInCodeRecord, OkfError> {
+    require_admin(principal)?;
+    codes::list(app.pool())
+        .await?
+        .into_iter()
+        .find(|code| code.id == id && manages_grants(principal, code.all_catalogs, &code.catalogs))
+        .ok_or_else(|| OkfError::NotFound {
+            path: format!("oauth/codes/{id}"),
+        })
+}
+
+/// `GET /oauth/codes`: the codes the caller manages.
+///
+/// # Errors
+/// 403 below admin; 500 if the codes cannot be read.
+async fn list_codes(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+) -> Result<Json<SignInCodeList>, AppError> {
+    require_admin(&principal)?;
+    let now = app.clock().now();
+    let codes = codes::list(app.pool())
+        .await?
+        .into_iter()
+        .filter(|code| manages_grants(&principal, code.all_catalogs, &code.catalogs))
+        .map(|code| SignInCodeView::new(code, now))
+        .collect();
+    Ok(Json(SignInCodeList { codes }))
+}
+
+/// `POST /oauth/codes`: mints a code and returns it, once.
+///
+/// # Errors
+/// 403 below admin, or `all` from a scoped caller; 404 for a catalog the
+/// caller does not reach; 400 for an unknown `access` or an unparsable
+/// `expires_in`; 409 for `admin` access, a bad name, an empty actor, no
+/// catalogs, `all` with `catalogs`, an ungranted default, or an expiry past
+/// `oauth.code_max_expiry`; 422 for an unknown field.
+async fn create_code(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Json(body): Json<CreateCodeBody>,
+) -> Result<Json<CreatedSignInCodeView>, AppError> {
+    require_admin(&principal)?;
+    let access = parse_access(&body.access)?;
+    // `filter` turns `Some("")` (an empty form field) into `None`.
+    let default_catalog = body
+        .default_catalog
+        .as_deref()
+        .filter(|name| !name.is_empty());
+    let grants = requested_grants(&principal, body.all, &body.catalogs, default_catalog)?;
+    let requested = match body
+        .expires_in
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        None => codes::DEFAULT_EXPIRY,
+        Some(text) => humantime_serde::re::humantime::parse_duration(text).map_err(|error| {
+            OkfError::InvalidPath {
+                path: "expires_in".to_string(),
+                reason: error.to_string(),
+            }
+        })?,
+    };
+    let now = app.clock().now();
+    let expires_at = codes::expiry(now, requested, app.config().oauth.code_max_expiry)?;
+    let new = NewSignInCode {
+        name: &body.name,
+        access,
+        grants,
+        default_catalog,
+        actor: &body.actor,
+        expires_at,
+    };
+    let created = codes::create(app.pool(), &new, now).await?;
+    let record = managed_code(&app, &principal, &created.id).await?;
+    Ok(Json(CreatedSignInCodeView {
+        code: SignInCodeView::new(record, now),
+        secret: created.code,
+    }))
+}
+
+/// `DELETE /oauth/codes/{id}`: revokes a code nobody has redeemed.
+///
+/// # Errors
+/// 403 below admin; 404 for a code the caller does not manage; 409 if it is
+/// redeemed or already revoked.
+async fn revoke_code(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(id): Path<String>,
+) -> Result<Json<SignInCodeView>, AppError> {
+    let target = managed_code(&app, &principal, &id).await?;
+    let now = app.clock().now();
+    codes::revoke(app.pool(), &target.id, now).await?;
+    let record = managed_code(&app, &principal, &target.id).await?;
+    Ok(Json(SignInCodeView::new(record, now)))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeDelta, Utc};
+    use serde_json::json;
+
+    use crate::http::api::testing::{app, assert_matrix, keys, send, Row};
+    use crate::mcp::testing::TestApp;
+    use crate::store::keys::{Access, Grants};
+    use crate::store::oauth::codes::{self, CreatedSignInCode, NewSignInCode};
+
+    /// Mints a code straight in the store, as `okf-mcp oauth code create` would.
+    async fn stored(test: &TestApp, name: &str, catalog: &str) -> CreatedSignInCode {
+        let grants = [catalog.to_string()];
+        let new = NewSignInCode {
+            name,
+            access: Access::Read,
+            grants: Grants::Catalogs(&grants),
+            default_catalog: None,
+            actor: "example-actor",
+            expires_at: Utc::now() + TimeDelta::hours(1),
+        };
+        codes::create(test.app.pool(), &new, Utc::now())
+            .await
+            .expect("mint a code")
+    }
+
+    #[tokio::test]
+    async fn code_routes_need_an_admin_that_reaches_the_code() {
+        let test = app().await;
+        let code = stored(&test, "target", "main").await.id;
+        // Callers run read, write, stranger, admin; the DELETE succeeds last.
+        assert_matrix(
+            &test,
+            &[
+                Row {
+                    method: "GET",
+                    uri: "/api/v1/oauth/codes".into(),
+                    body: None,
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 200,
+                },
+                Row {
+                    method: "POST",
+                    uri: "/api/v1/oauth/codes".into(),
+                    body: Some(json!({"name": "made", "actor": "example-actor",
+                                      "access": "read", "catalogs": ["main"]})),
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 404,
+                },
+                Row {
+                    method: "DELETE",
+                    uri: format!("/api/v1/oauth/codes/{code}"),
+                    body: None,
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 404,
+                },
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_returns_the_code_once_and_the_list_never_shows_it() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let body = json!({"name": "laptop", "actor": "example-actor", "access": "write",
+                          "catalogs": ["main"], "default_catalog": "main", "expires_in": "2h"});
+
+        let (status, created) = send(
+            &test,
+            "POST",
+            "/api/v1/oauth/codes",
+            Some(&keys.admin),
+            Some(body),
+        )
+        .await;
+
+        assert_eq!(status.as_u16(), 200, "{created}");
+        let secret = created["secret"].as_str().expect("a secret").to_string();
+        assert!(secret.starts_with(crate::keys::SIGN_IN_CODE_PREFIX));
+        let code = &created["code"];
+        assert_eq!(code["name"], "laptop");
+        assert_eq!(code["actor"], "example-actor");
+        assert_eq!(code["access"], "write");
+        assert_eq!(code["all_catalogs"], false);
+        assert_eq!(code["catalogs"], json!(["main"]));
+        assert_eq!(code["default_catalog"], "main");
+        assert_eq!(code["state"], "live");
+        assert!(code["redeemed_at"].is_null() && code["grant_id"].is_null());
+        assert!(code["revoked_at"].is_null());
+        let created_at = chrono::DateTime::parse_from_rfc3339(code["created_at"].as_str().unwrap())
+            .expect("an RFC 3339 created_at");
+        let expires_at = chrono::DateTime::parse_from_rfc3339(code["expires_at"].as_str().unwrap())
+            .expect("an RFC 3339 expires_at");
+        assert_eq!(expires_at - created_at, TimeDelta::hours(2));
+        let (status, listed) =
+            send(&test, "GET", "/api/v1/oauth/codes", Some(&keys.admin), None).await;
+        assert_eq!(status.as_u16(), 200);
+        let text = listed.to_string();
+        assert!(!text.contains(&secret));
+        assert!(!text.contains("sha256") && !text.contains("secret"));
+        assert_eq!(listed["codes"][0]["id"], code["id"]);
+        // The code works on the consent page's lookup.
+        let live = codes::find_live(test.app.pool(), &secret, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(live.map(|record| record.name), Some("laptop".to_string()));
+    }
+
+    #[tokio::test]
+    async fn create_refuses_admin_access_all_from_a_scoped_admin_and_long_expiries() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let post = |body: serde_json::Value| {
+            let test = &test;
+            let key = keys.admin.clone();
+            async move {
+                send(test, "POST", "/api/v1/oauth/codes", Some(&key), Some(body))
+                    .await
+                    .0
+                    .as_u16()
+            }
+        };
+        let base = json!({"name": "c", "actor": "example-actor", "access": "read",
+                          "catalogs": ["main"]});
+        let with = |field: &str, value: serde_json::Value| {
+            let mut body = base.clone();
+            body[field] = value;
+            body
+        };
+
+        assert_eq!(post(with("access", json!("admin"))).await, 409);
+        assert_eq!(post(with("access", json!("root"))).await, 400);
+        assert_eq!(post(with("expires_in", json!("8d"))).await, 409);
+        assert_eq!(post(with("expires_in", json!("soon"))).await, 400);
+        assert_eq!(post(with("actor", json!(" "))).await, 409);
+        assert_eq!(post(with("name", json!("bad name"))).await, 409);
+        assert_eq!(post(with("catalogs", json!([]))).await, 409);
+        assert_eq!(
+            post(with("all", json!(true))).await,
+            409,
+            "all and catalogs"
+        );
+        assert_eq!(
+            post(json!({"name": "c", "actor": "example-actor", "access": "read", "all": true}))
+                .await,
+            403,
+            "a scoped admin cannot mint an all-catalogs code"
+        );
+        assert_eq!(post(with("catalogs", json!(["other"]))).await, 404);
+        assert_eq!(post(with("default_catalog", json!("other"))).await, 404);
+        assert_eq!(post(with("surprise", json!(1))).await, 422);
+        assert!(codes::list(test.app.pool()).await.unwrap().is_empty());
+        // An empty `expires_in` means the default.
+        assert_eq!(post(with("expires_in", json!(""))).await, 200);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_admin_sees_and_revokes_only_codes_inside_its_reach() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let mine = stored(&test, "mine", "main").await.id;
+        let theirs = stored(&test, "theirs", "other").await.id;
+        let delete = |id: String| {
+            let test = &test;
+            let key = keys.admin.clone();
+            async move {
+                send(
+                    test,
+                    "DELETE",
+                    &format!("/api/v1/oauth/codes/{id}"),
+                    Some(&key),
+                    None,
+                )
+                .await
+            }
+        };
+
+        let (_, listed) = send(&test, "GET", "/api/v1/oauth/codes", Some(&keys.admin), None).await;
+        let (status, _) = delete(theirs.clone()).await;
+        let (revoked, view) = delete(mine.clone()).await;
+        let (again, _) = delete(mine.clone()).await;
+
+        let ids: Vec<&str> = listed["codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|code| code["id"].as_str())
+            .collect();
+        assert_eq!(ids, [mine.as_str()]);
+        assert_eq!(status.as_u16(), 404);
+        assert_eq!(revoked.as_u16(), 200);
+        assert_eq!(view["state"], "revoked");
+        assert!(view["revoked_at"].is_string());
+        assert_eq!(again.as_u16(), 409);
+        let (_, stranger_view) = send(
+            &test,
+            "GET",
+            "/api/v1/oauth/codes",
+            Some(&keys.stranger),
+            None,
+        )
+        .await;
+        assert_eq!(stranger_view["codes"][0]["id"], theirs.as_str());
+        assert_eq!(stranger_view["codes"][0]["state"], "live");
+    }
+}

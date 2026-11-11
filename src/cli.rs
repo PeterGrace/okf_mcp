@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 // `Context` adds a message to an error (anyhow's `.context(..)`), like
 // `raise X from e` with a better message.
@@ -20,14 +21,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::app::App;
 use crate::archive::{self, Files};
-use crate::clock::Clock;
+use crate::clock::{format_timestamp, Clock};
 use crate::config::Config;
 use crate::db;
 use crate::http;
 use crate::store::catalogs;
 use crate::store::export;
 use crate::store::import::{self, ImportOptions, ImportScope};
-use crate::store::keys::{self, Access, Grants, NewKey};
+use crate::store::keys::{self, Access, Grants, KeyKind, NewKey};
+use crate::store::oauth::codes::{self, NewSignInCode, SignInCodeRecord};
 
 /// `okf-mcp`: an MCP server for OKF knowledge catalogs.
 // `derive(Parser)` generates the argument parser from the struct, as
@@ -63,6 +65,11 @@ pub enum Command {
     /// Create, list, revoke, grant, ungrant or configure reporting on API keys.
     #[command(subcommand)]
     Key(KeyCommand),
+    /// Mint, list and revoke OAuth sign-in codes; list and revoke OAuth grants.
+    // clap names a subcommand after its variant in kebab case: `Oauth` is
+    // `oauth` (an `OAuth` variant would be `o-auth`).
+    #[command(subcommand)]
+    Oauth(OauthCommand),
     /// Import a directory or a .tar.gz into an existing catalog.
     Import {
         /// The catalog.
@@ -154,7 +161,7 @@ pub enum KeyCommand {
         #[arg(long)]
         actor: Option<String>,
     },
-    /// Revoke a key.
+    /// Revoke a key (an OAuth grant is revoked with `oauth grant revoke`).
     Revoke {
         /// The key's id, or an unambiguous active name.
         id: String,
@@ -217,6 +224,84 @@ pub struct KeyCreateArgs {
     pub actor: Option<String>,
 }
 
+/// `okf-mcp oauth ...`.
+#[derive(Debug, Subcommand)]
+pub enum OauthCommand {
+    /// Sign-in codes: one-time codes a person enters on the consent page.
+    #[command(subcommand)]
+    Code(CodeCommand),
+    /// OAuth grants: the keys sign-in codes became.
+    #[command(subcommand)]
+    Grant(GrantCommand),
+}
+
+/// `okf-mcp oauth code ...`.
+#[derive(Debug, Subcommand)]
+pub enum CodeCommand {
+    /// Mint a code and print it once.
+    Create(CodeCreateArgs),
+    /// List codes in every state (never the codes themselves).
+    List,
+    /// Revoke a code nobody has redeemed.
+    Revoke {
+        /// The code's id (from `oauth code list`).
+        id: String,
+    },
+}
+
+/// `okf-mcp oauth grant ...`.
+#[derive(Debug, Subcommand)]
+pub enum GrantCommand {
+    /// List OAuth grants, revoked ones included.
+    List,
+    /// Revoke an OAuth grant: its tokens stop working within `poll_interval`.
+    Revoke {
+        /// The grant's id (from `oauth grant list`).
+        id: String,
+    },
+}
+
+/// `okf-mcp oauth code create`'s options.
+#[derive(Debug, Args)]
+pub struct CodeCreateArgs {
+    /// A label (`[A-Za-z0-9._-]+`); the grant's name starts with it.
+    pub name: String,
+    /// The actor the grant's writes are recorded as.
+    #[arg(long)]
+    pub actor: String,
+    /// Access level: `read` or `write` (`admin` is refused).
+    #[arg(long, value_enum)]
+    pub access: Access,
+    /// Granted catalogs, comma-separated.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        required_unless_present = "all",
+        conflicts_with = "all"
+    )]
+    pub catalogs: Vec<String>,
+    /// Grant every catalog, present and future.
+    #[arg(long)]
+    pub all: bool,
+    /// The grant's default catalog (must be granted).
+    #[arg(long)]
+    pub default: Option<String>,
+    /// How long the code stays valid unredeemed (`24h`, `3d`; at most
+    /// `oauth.code_max_expiry`).
+    // `value_parser = fn` runs the function on the text; its `Err(String)`
+    // becomes clap's usage error.
+    #[arg(long, default_value = "24h", value_parser = parse_expiry)]
+    pub expires: Duration,
+}
+
+/// Parses `--expires` (`humantime` syntax: `90m`, `24h`, `3d`).
+///
+/// # Errors
+/// `humantime`'s message, for clap to print.
+fn parse_expiry(text: &str) -> Result<Duration, String> {
+    humantime_serde::re::humantime::parse_duration(text).map_err(|error| error.to_string())
+}
+
 /// Runs one command line.
 ///
 /// # Arguments
@@ -267,6 +352,10 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
         Command::Key(command) => {
             let pool = connect(cli.database_url.as_deref(), &config).await?;
             run_key(&pool, command, clock.as_ref()).await?;
+        }
+        Command::Oauth(command) => {
+            let pool = connect(cli.database_url.as_deref(), &config).await?;
+            run_oauth(&pool, command, &config, clock.as_ref()).await?;
         }
         Command::Import {
             catalog,
@@ -547,6 +636,113 @@ fn format_key_record(key: &keys::KeyRecord) -> String {
         key.access.as_str(),
         key.default_catalog.as_deref().unwrap_or("-"),
         key.maintenance_report
+    )
+}
+
+/// Runs one `okf-mcp oauth ...` subcommand. `code create` prints the code
+/// alone on stdout and its id and expiry on stderr, as `key create` does.
+///
+/// # Arguments
+/// * `pool` - the migrated database.
+/// * `command` - the subcommand.
+/// * `config` - for `oauth.code_max_expiry`.
+/// * `clock` - the source of every timestamp.
+///
+/// # Errors
+/// The store's refusal or database error; an id that is no OAuth grant.
+async fn run_oauth(
+    pool: &PgPool,
+    command: OauthCommand,
+    config: &Config,
+    clock: &dyn Clock,
+) -> anyhow::Result<()> {
+    let now = clock.now();
+    match command {
+        OauthCommand::Code(CodeCommand::Create(args)) => {
+            let expires_at = codes::expiry(now, args.expires, config.oauth.code_max_expiry)?;
+            let grants = if args.all {
+                Grants::All
+            } else {
+                Grants::Catalogs(&args.catalogs)
+            };
+            let new = NewSignInCode {
+                name: &args.name,
+                access: args.access,
+                grants,
+                default_catalog: args.default.as_deref(),
+                actor: &args.actor,
+                expires_at,
+            };
+            let created = codes::create(pool, &new, now).await?;
+            println!("{}", created.code);
+            eprintln!(
+                "code id: {}\nexpires: {}\nhand this code over now: it is not shown again",
+                created.id,
+                format_timestamp(expires_at)
+            );
+        }
+        OauthCommand::Code(CodeCommand::List) => {
+            for code in codes::list(pool).await? {
+                println!("{}", format_code_record(&code, now));
+            }
+        }
+        OauthCommand::Code(CodeCommand::Revoke { id }) => {
+            codes::revoke(pool, &id, now).await?;
+            println!("revoked sign-in code {id}");
+        }
+        OauthCommand::Grant(GrantCommand::List) => {
+            for grant in keys::list(pool).await? {
+                if grant.kind == KeyKind::OAuth {
+                    println!(
+                        "{}\tclient {}",
+                        format_key_record(&grant),
+                        grant.client_name.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+        }
+        OauthCommand::Grant(GrantCommand::Revoke { id }) => {
+            // The one exact-id path to a grant on the command line: `key
+            // revoke` resolves API keys only (`store::keys`).
+            let is_grant = keys::list(pool)
+                .await?
+                .iter()
+                .any(|key| key.id == id && key.kind == KeyKind::OAuth);
+            if !is_grant {
+                anyhow::bail!("no OAuth grant {id:?} (a plain key is revoked with `key revoke`)");
+            }
+            keys::revoke_by_id(pool, &id, now).await?;
+            println!("revoked OAuth grant {id}");
+        }
+    }
+    Ok(())
+}
+
+/// One `oauth code list` line, tab-separated: name, actor, id, access,
+/// state, catalogs (`*` for all), `default X`, `expires T`, `grant G`.
+///
+/// # Arguments
+/// * `code` - the code.
+/// * `now` - the time its state is computed at.
+///
+/// # Returns
+/// The line, without a newline.
+fn format_code_record(code: &SignInCodeRecord, now: chrono::DateTime<chrono::Utc>) -> String {
+    let catalogs = if code.all_catalogs {
+        "*".to_string()
+    } else {
+        code.catalogs.join(",")
+    };
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{catalogs}\tdefault {}\texpires {}\tgrant {}",
+        code.name,
+        code.actor,
+        code.id,
+        code.access.as_str(),
+        code.state(now).as_str(),
+        code.default_catalog.as_deref().unwrap_or("-"),
+        format_timestamp(code.expires_at),
+        code.grant_id.as_deref().unwrap_or("-")
     )
 }
 
@@ -989,6 +1185,291 @@ mod tests {
         assert_eq!(
             format_key_record(&record),
             "claude\tclaude-code-tui\tcredential-id\twrite\tactive\tpg,work\tdefault pg\tmaintenance_report false"
+        );
+    }
+
+    #[test]
+    fn oauth_code_create_parses_like_key_create() {
+        let parse = |args: &[&str]| {
+            // `chain` puts the program name in front, as the shell would.
+            Cli::try_parse_from(["okf-mcp", "oauth", "code", "create"].iter().chain(args))
+        };
+        let parsed = parse(&[
+            "laptop",
+            "--actor",
+            "example-actor",
+            "--access",
+            "write",
+            "--catalogs",
+            "main,other",
+            "--default",
+            "main",
+            "--expires",
+            "3d",
+        ])
+        .unwrap();
+        let defaulted = parse(&["c", "--actor", "a", "--access", "read", "--all"]).unwrap();
+
+        let Some(Command::Oauth(OauthCommand::Code(CodeCommand::Create(args)))) = parsed.command
+        else {
+            panic!("expected oauth code create");
+        };
+        assert_eq!(args.name, "laptop");
+        assert_eq!(args.actor, "example-actor");
+        assert_eq!(args.access, Access::Write);
+        assert_eq!(args.catalogs, ["main", "other"]);
+        assert!(!args.all);
+        assert_eq!(args.default.as_deref(), Some("main"));
+        assert_eq!(args.expires, Duration::from_secs(3 * 24 * 60 * 60));
+        let Some(Command::Oauth(OauthCommand::Code(CodeCommand::Create(args)))) = defaulted.command
+        else {
+            panic!("expected oauth code create");
+        };
+        assert!(args.all);
+        // `default_value = "24h"` and the store's constant agree.
+        assert_eq!(args.expires, codes::DEFAULT_EXPIRY);
+        // `--actor` is required, `--expires` must parse, and `--catalogs`
+        // and `--all` exclude each other.
+        assert_eq!(
+            parse(&["c", "--access", "read", "--all"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            parse(&[
+                "c",
+                "--actor",
+                "a",
+                "--access",
+                "read",
+                "--all",
+                "--expires",
+                "soon"
+            ])
+            .unwrap_err()
+            .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            parse(&[
+                "c",
+                "--actor",
+                "a",
+                "--access",
+                "read",
+                "--all",
+                "--catalogs",
+                "main"
+            ])
+            .unwrap_err()
+            .kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["okf-mcp", "oauth", "grant", "revoke", "g"]).unwrap().command,
+            Some(Command::Oauth(OauthCommand::Grant(GrantCommand::Revoke { ref id }))) if id == "g"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["okf-mcp", "oauth", "code", "revoke", "c"]).unwrap().command,
+            Some(Command::Oauth(OauthCommand::Code(CodeCommand::Revoke { ref id }))) if id == "c"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oauth_subcommands_run_against_the_database() {
+        use crate::store::oauth::clients::ClientKind;
+        use crate::store::oauth::codes::insert_test_client;
+
+        let db = crate::db::pg_support::TestDb::start().await;
+        let clock = fixed_now();
+        let url = Some(db.url.clone());
+        // Runs `okf-mcp <args>` against the test database.
+        let okf = |args: &[&str]| {
+            let command = Cli::try_parse_from(std::iter::once(&"okf-mcp").chain(args))
+                .expect("a valid command line")
+                .command
+                .expect("a subcommand");
+            run(cli(url.clone(), command), Arc::clone(&clock))
+        };
+        okf(&["catalog", "create", "main"]).await.unwrap();
+
+        okf(&[
+            "oauth",
+            "code",
+            "create",
+            "laptop",
+            "--actor",
+            "example-actor",
+            "--access",
+            "read",
+            "--catalogs",
+            "main",
+        ])
+        .await
+        .unwrap();
+        let too_long = okf(&[
+            "oauth",
+            "code",
+            "create",
+            "late",
+            "--actor",
+            "example-actor",
+            "--access",
+            "read",
+            "--all",
+            "--expires",
+            "8d",
+        ])
+        .await;
+        let admin = okf(&[
+            "oauth",
+            "code",
+            "create",
+            "boss",
+            "--actor",
+            "example-actor",
+            "--access",
+            "admin",
+            "--all",
+        ])
+        .await;
+        okf(&["oauth", "code", "list"]).await.unwrap();
+
+        let minted = codes::list(&db.pool).await.unwrap();
+        assert_eq!(minted.len(), 1, "8 days and admin are refused");
+        assert!(too_long.is_err() && admin.is_err());
+        assert_eq!(minted[0].name, "laptop");
+        assert_eq!(minted[0].catalogs, ["main"]);
+        // Whole seconds: Postgres keeps microseconds, the clock nanoseconds.
+        assert_eq!(
+            minted[0].expires_at.timestamp(),
+            (clock.now() + chrono::TimeDelta::hours(24)).timestamp()
+        );
+        okf(&["oauth", "code", "revoke", &minted[0].id])
+            .await
+            .unwrap();
+        assert!(codes::list(&db.pool).await.unwrap()[0].revoked_at.is_some());
+        assert!(okf(&["oauth", "code", "revoke", &minted[0].id])
+            .await
+            .is_err());
+
+        // A grant, made the way the consent page makes one.
+        let main = ["main".to_string()];
+        let code = codes::create(
+            &db.pool,
+            &NewSignInCode {
+                name: "phone",
+                access: Access::Write,
+                grants: Grants::Catalogs(&main),
+                default_catalog: None,
+                actor: "example-actor",
+                expires_at: clock.now() + chrono::TimeDelta::hours(1),
+            },
+            clock.now(),
+        )
+        .await
+        .unwrap();
+        let client = insert_test_client(
+            &db.pool,
+            "dcr-client",
+            ClientKind::Dcr,
+            "https://client.example.com/callback",
+        )
+        .await;
+        let grant = codes::redeem(&db.pool, &code.id, &client, clock.now())
+            .await
+            .unwrap();
+        let grant_name = keys::list(&db.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|key| key.id == grant)
+            .expect("the grant")
+            .name;
+        // A plain key with the grant's very name and actor (allowed: the
+        // live name/actor rule covers keys only).
+        let plain = keys::create_with_id(
+            &db.pool,
+            &NewKey {
+                name: &grant_name,
+                access: Access::Read,
+                maintenance_report: false,
+                grants: Grants::All,
+                default_catalog: None,
+                actor: "example-actor",
+            },
+            clock.now(),
+        )
+        .await
+        .unwrap();
+
+        okf(&["oauth", "grant", "list"]).await.unwrap();
+        // `key ...` by name reaches the key alone: not ambiguous, grant untouched.
+        okf(&[
+            "key",
+            "maintenance-report",
+            &grant_name,
+            "--enabled",
+            "true",
+        ])
+        .await
+        .unwrap();
+        // `key revoke` does not take a grant's id, and `oauth grant revoke`
+        // does not take a plain key's.
+        assert!(okf(&["key", "revoke", &grant]).await.is_err());
+        assert!(okf(&["oauth", "grant", "revoke", &plain.id]).await.is_err());
+        okf(&["oauth", "grant", "revoke", &grant]).await.unwrap();
+
+        let rows: Vec<(String, bool, bool)> = sqlx::query_as(
+            "SELECT id, revoked_at IS NOT NULL, maintenance_report FROM api_keys ORDER BY id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert!(rows.contains(&(grant, true, false)));
+        assert!(rows.contains(&(plain.id, false, true)));
+    }
+
+    #[test]
+    fn code_list_columns_have_the_documented_order() {
+        let at = |text: &str| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .expect("a valid timestamp")
+                .to_utc()
+        };
+        let record = SignInCodeRecord {
+            id: "code-id".to_string(),
+            name: "laptop".to_string(),
+            access: Access::Read,
+            all_catalogs: false,
+            catalogs: vec!["main".to_string(), "other".to_string()],
+            default_catalog: None,
+            actor: "example-actor".to_string(),
+            created_at: at("2026-11-11T11:00:00Z"),
+            expires_at: at("2026-11-12T12:00:00Z"),
+            redeemed_at: None,
+            grant_id: None,
+            revoked_at: None,
+        };
+        let redeemed = SignInCodeRecord {
+            all_catalogs: true,
+            catalogs: Vec::new(),
+            default_catalog: Some("main".to_string()),
+            redeemed_at: Some(at("2026-11-11T13:00:00Z")),
+            grant_id: Some("grant-id".to_string()),
+            ..record.clone()
+        };
+
+        assert_eq!(
+            format_code_record(&record, at("2026-11-11T12:00:00Z")),
+            "laptop\texample-actor\tcode-id\tread\tlive\tmain,other\tdefault -\t\
+             expires 2026-11-12T12:00:00Z\tgrant -"
+        );
+        assert_eq!(
+            format_code_record(&redeemed, at("2026-11-11T14:00:00Z")),
+            "laptop\texample-actor\tcode-id\tread\tredeemed\t*\tdefault main\t\
+             expires 2026-11-12T12:00:00Z\tgrant grant-id"
         );
     }
 
