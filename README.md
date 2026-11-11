@@ -62,6 +62,9 @@ subcommand). Every subcommand applies the embedded migrations first, so
 its access level; `key maintenance-report ID --enabled true|false [--actor ACTOR]`
 changes the flag. Reporting still requires catalog read access and never
 confers write access.
+`okf-mcp oauth code create|list|revoke` and `okf-mcp oauth grant list|revoke`
+manage OAuth sign-in codes and the grants they become (see
+`docs/operations.md`, "OAuth sign-in codes").
 
 `import` takes a `.tar.gz` file, `-` for one on stdin, or a directory. A
 `git archive` tarball imports exactly the checkout's tracked files, and a

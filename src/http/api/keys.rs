@@ -171,22 +171,97 @@ pub(crate) fn routes() -> Router<Arc<App>> {
         )
 }
 
-/// Whether `principal` may see and change `record` (module doc, "Access").
+/// Whether `principal` manages a credential with these grants (module doc,
+/// "Access"); keys and sign-in codes (`api::oauth`) share this rule.
+///
+/// # Arguments
+/// * `principal` - the caller.
+/// * `all_catalogs` - the credential reaches every catalog.
+/// * `catalogs` - its named catalogs.
 ///
 /// # Returns
 /// `true` for a caller reaching every catalog; otherwise `true` only for a
-/// key that is not an all-catalogs key and whose every grant the caller reaches.
-fn manages(principal: &Principal, record: &KeyRecord) -> bool {
+/// credential that is not all-catalogs and whose every catalog the caller reaches.
+pub(crate) fn manages_grants(
+    principal: &Principal,
+    all_catalogs: bool,
+    catalogs: &[String],
+) -> bool {
     match &principal.reach {
         Reach::All => true,
         Reach::Catalogs(_) => {
-            !record.all_catalogs
-                && record
-                    .catalogs
-                    .iter()
-                    .all(|catalog| principal.reaches(catalog))
+            !all_catalogs && catalogs.iter().all(|catalog| principal.reaches(catalog))
         }
     }
+}
+
+/// Whether `principal` may see and change `record` ([`manages_grants`]).
+fn manages(principal: &Principal, record: &KeyRecord) -> bool {
+    manages_grants(principal, record.all_catalogs, &record.catalogs)
+}
+
+/// The grants a caller asks a new credential to have, checked against its
+/// reach: shared by `POST /keys` and `POST /oauth/codes`.
+///
+/// # Arguments
+/// * `principal` - the caller (already checked to be admin).
+/// * `all` - the body's `all`.
+/// * `catalogs` - the body's `catalogs`.
+/// * `default_catalog` - the body's default catalog, empty already mapped to `None`.
+///
+/// # Returns
+/// The grants, borrowing `catalogs`.
+///
+/// # Errors
+/// [`OkfError::Refused`] for `all` together with `catalogs`;
+/// [`OkfError::Forbidden`] for `all` from a caller that does not reach every
+/// catalog; [`OkfError::CatalogNotSelected`] for a catalog or default the
+/// caller does not reach.
+pub(crate) fn requested_grants<'a>(
+    principal: &Principal,
+    all: bool,
+    catalogs: &'a [String],
+    default_catalog: Option<&str>,
+) -> Result<Grants<'a>, OkfError> {
+    let grants = if all {
+        if !catalogs.is_empty() {
+            return Err(OkfError::Refused {
+                reason: "give `all` or `catalogs`, not both".to_string(),
+            });
+        }
+        if !matches!(principal.reach, Reach::All) {
+            return Err(OkfError::Forbidden {
+                reason: "only a key that reaches every catalog may grant every catalog".to_string(),
+            });
+        }
+        Grants::All
+    } else {
+        for catalog in catalogs {
+            principal.require(Access::Admin, catalog)?;
+        }
+        Grants::Catalogs(catalogs)
+    };
+    if let Some(name) = default_catalog {
+        principal.require(Access::Admin, name)?;
+    }
+    Ok(grants)
+}
+
+/// Parses a body's `access` field.
+///
+/// # Arguments
+/// * `text` - the field's value.
+///
+/// # Returns
+/// The level.
+///
+/// # Errors
+/// [`OkfError::InvalidPath`] (400) naming the `access` field.
+pub(crate) fn parse_access(text: &str) -> Result<Access, OkfError> {
+    Access::parse(text).ok_or_else(|| OkfError::InvalidPath {
+        path: "access".to_string(),
+        reason: format!("must be read, write or admin, not {text:?}"),
+    })
 }
 
 /// The key with exactly this id, if `principal` is an admin that manages it.
@@ -250,39 +325,13 @@ async fn create_key(
     Json(body): Json<CreateKeyBody>,
 ) -> Result<Json<CreatedKeyView>, AppError> {
     require_admin(&principal)?;
-    let access = Access::parse(&body.access).ok_or_else(|| OkfError::InvalidPath {
-        path: "access".to_string(),
-        reason: format!("must be read, write or admin, not {:?}", body.access),
-    })?;
-    let grants = if body.all {
-        if !body.catalogs.is_empty() {
-            return Err(OkfError::Refused {
-                reason: "give `all` or `catalogs`, not both".to_string(),
-            }
-            .into());
-        }
-        if !matches!(principal.reach, Reach::All) {
-            return Err(OkfError::Forbidden {
-                reason: "only a key that reaches every catalog may create one that does"
-                    .to_string(),
-            }
-            .into());
-        }
-        Grants::All
-    } else {
-        for catalog in &body.catalogs {
-            principal.require(Access::Admin, catalog)?;
-        }
-        Grants::Catalogs(&body.catalogs)
-    };
+    let access = parse_access(&body.access)?;
     // `filter` turns `Some("")` (an empty form field) into `None`.
     let default_catalog = body
         .default_catalog
         .as_deref()
         .filter(|name| !name.is_empty());
-    if let Some(name) = default_catalog {
-        principal.require(Access::Admin, name)?;
-    }
+    let grants = requested_grants(&principal, body.all, &body.catalogs, default_catalog)?;
     let actor = body
         .actor
         .as_deref()
@@ -309,7 +358,7 @@ async fn create_key(
 ///
 /// # Errors
 /// 403 below admin; 404 for a key the caller does not manage; 409 for a
-/// revoked key.
+/// revoked key, or for enabling reporting on an OAuth grant.
 async fn update_key(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
@@ -779,5 +828,53 @@ mod tests {
             state(&listed, &replacement.id).is_null(),
             "the replacement stays live"
         );
+    }
+
+    #[tokio::test]
+    async fn a_grant_is_managed_by_id_but_never_given_maintenance_reporting() {
+        use crate::store::oauth::testing::{insert_client, insert_grant};
+
+        let test = app().await;
+        let keys = keys(&test).await;
+        let client = insert_client(
+            test.app.pool(),
+            "https://client.example.com/client.json",
+            "Example Client",
+            Utc::now(),
+        )
+        .await;
+        let grant = insert_grant(
+            test.app.pool(),
+            &client,
+            Access::Read,
+            &["main"],
+            Utc::now(),
+        )
+        .await;
+        let uri = format!("/api/v1/keys/{grant}");
+
+        let (enable, refused) = send(
+            &test,
+            "PATCH",
+            &uri,
+            Some(&keys.admin),
+            Some(json!({"maintenance_report": true})),
+        )
+        .await;
+        let (revoke, revoked) = send(
+            &test,
+            "POST",
+            &format!("{uri}/revoke"),
+            Some(&keys.admin),
+            None,
+        )
+        .await;
+
+        assert_eq!(enable.as_u16(), 409, "{refused}");
+        assert_eq!(revoke.as_u16(), 200, "{revoked}");
+        assert_eq!(revoked["kind"], "oauth");
+        assert_eq!(revoked["client_name"], "Example Client");
+        assert_eq!(revoked["maintenance_report"], false);
+        assert!(revoked["revoked_at"].is_string());
     }
 }
