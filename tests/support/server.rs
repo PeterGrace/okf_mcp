@@ -282,6 +282,31 @@ impl TestServer {
         key: &str,
         headers: &[(&'static str, &str)],
     ) -> Result<Client, String> {
+        self.client_at(key, &self.mcp_url(), headers).await
+    }
+
+    /// An MCP client with `key` and extra request headers on `url` (the
+    /// MCP URL with a query, say).
+    ///
+    /// # Arguments
+    /// * `key` - the bearer key.
+    /// * `url` - the MCP endpoint to connect to.
+    /// * `headers` - `(lowercase name, value)` pairs.
+    ///
+    /// # Returns
+    /// The connected client.
+    ///
+    /// # Errors
+    /// As [`TestServer::client`].
+    ///
+    /// # Panics
+    /// If a name is not lowercase or a value is not a valid header value.
+    pub async fn client_at(
+        &self,
+        key: &str,
+        url: &str,
+        headers: &[(&'static str, &str)],
+    ) -> Result<Client, String> {
         let headers: HashMap<HeaderName, HeaderValue> = headers
             .iter()
             // `&(name, value)` copies the two references out of each pair.
@@ -290,7 +315,7 @@ impl TestServer {
                 (HeaderName::from_static(name), value)
             })
             .collect();
-        let config = StreamableHttpClientTransportConfig::with_uri(self.mcp_url())
+        let config = StreamableHttpClientTransportConfig::with_uri(url.to_string())
             .auth_header(key)
             .custom_headers(headers);
         // `()` is a client handler that does nothing: tests only call tools.

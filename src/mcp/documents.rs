@@ -986,18 +986,25 @@ mod tests {
             )
         };
         let handle = open(&alice(None)).await;
+        // The connection offers `pg`, but the call reads only `work`.
+        let both = alice(Some(&["work", "pg"]));
         let only_work = alice(Some(&["work"]));
+        let in_work = GetConceptParams {
+            catalog: Some("work".to_string()),
+            ..through("hub", &handle)
+        };
 
-        let refused = get_concept(&only_work, through("hub", &handle))
-            .await
-            .unwrap_err();
+        let refused = get_concept(&both, in_work).await.unwrap_err();
         let document = ReadDocumentParams {
             path: None,
-            catalog: None,
+            catalog: Some("work".to_string()),
             changeset: Some(handle.clone()),
         };
-        let refused_read = read_document(&only_work, document).await.unwrap_err();
+        let refused_read = read_document(&both, document.clone()).await.unwrap_err();
+        // A connection that leaves `pg` out does not resolve the handle at all.
+        let unknown = read_document(&only_work, document).await.unwrap_err();
 
+        assert_eq!(unknown.kind(), "UnknownChangeset");
         assert_eq!(refused.kind(), "Refused");
         let message = refused.to_string();
         assert!(

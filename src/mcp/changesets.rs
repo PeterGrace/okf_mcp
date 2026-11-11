@@ -36,7 +36,8 @@ use crate::write::{apply, WriteReport};
 // its input schema, with the doc comments as the fields' descriptions.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct ListParams {
-    /// Only this catalog (default: every catalog the key reaches).
+    /// Only this catalog (default: every catalog the connection offers: the
+    /// key's, limited to the connection's list when it has one).
     pub catalog: Option<String>,
 }
 
@@ -96,8 +97,9 @@ fn idle_cutoff(now: DateTime<Utc>, idle: Duration) -> DateTime<Utc> {
 /// * `params` - an optional catalog to narrow the list to.
 ///
 /// # Returns
-/// Open changesets, empty ones included, in the catalogs the key reaches
-/// (or the one named): the key's own, and with `admin` every key's.
+/// Open changesets, empty ones included, in the catalogs the connection
+/// offers ([`ToolContext::offers`]) or the one named: the key's own, and
+/// with `admin` every key's.
 ///
 /// # Errors
 /// A selection error for `catalog`; [`OkfError::Database`].
@@ -115,7 +117,7 @@ pub(crate) async fn list_changesets(
         None => ctx
             .catalogs()
             .values()
-            .filter(|state| principal.reaches(state.name()))
+            .filter(|state| ctx.offers(state.name()))
             .map(|state| state.id())
             .collect(),
     };

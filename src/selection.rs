@@ -1,10 +1,13 @@
 //! Catalog selection (design "Catalog selection"): which catalogs a tool
 //! call reads, and which one it would write.
 //!
-//! The sources, in order: the call's argument; the connection (the
-//! `X-OKF-Catalogs` header, else `?catalogs=` on the MCP URL); the key's
-//! default catalog; the server's `default_catalog`. The first that is set
-//! wins, and every name in it must exist and be reachable by the key.
+//! The connection's list (the `X-OKF-Catalogs` header, or its alias
+//! `X-OKF-Catalog`, else `?catalogs=` on the MCP URL) is the session's
+//! scope: when it is set, a call sees only those catalogs, whatever else
+//! the key reaches. A call's argument narrows it and never escapes it.
+//! Without a connection list, the argument, else the key's default
+//! catalog, else the server's `default_catalog`, is the selection. Every
+//! name must exist and be reachable by the key: a list never grants.
 
 use axum::http::request::Parts;
 
@@ -14,6 +17,10 @@ use crate::error::OkfError;
 /// The header naming a connection's catalogs (`pg,work`); HTTP header names
 /// are case-insensitive, and `http` stores them lowercase.
 pub const CATALOGS_HEADER: &str = "x-okf-catalogs";
+
+/// The singular spelling, accepted as an alias of [`CATALOGS_HEADER`]: both
+/// are read, the plural's names first, as one list.
+pub const CATALOG_HEADER_ALIAS: &str = "x-okf-catalog";
 
 /// The MCP URL's query parameter with the same meaning.
 pub const CATALOGS_QUERY: &str = "catalogs";
@@ -69,9 +76,11 @@ fn non_empty(names: Vec<String>) -> Option<Vec<String>> {
     (!names.is_empty()).then_some(names)
 }
 
-/// The catalogs a connection names: the `X-OKF-Catalogs` header, else the
-/// `catalogs` query parameter.
+/// The catalogs a connection names: the `X-OKF-Catalogs` and
+/// `X-OKF-Catalog` headers, else the `catalogs` query parameter.
 ///
+/// Both header spellings are read, every `X-OKF-Catalogs` name before every
+/// `X-OKF-Catalog` name, as one list ([`resolve`] drops duplicates).
 /// Repeated headers are read in order, as one list (RFC 9110 5.3), and so
 /// are repeated `catalogs` parameters (`?catalogs=pg&catalogs=work`). A header
 /// that names nothing (`" , "`) counts as unset, so the query is read. Bytes
@@ -91,7 +100,10 @@ fn non_empty(names: Vec<String>) -> Option<Vec<String>> {
 /// The names, or `None` if neither source names a catalog.
 pub fn connection_catalogs(parts: &Parts) -> Option<Vec<String>> {
     let mut from_header: Vec<String> = Vec::new();
-    for value in parts.headers.get_all(CATALOGS_HEADER) {
+    let values = [CATALOGS_HEADER, CATALOG_HEADER_ALIAS]
+        .into_iter()
+        .flat_map(|name| parts.headers.get_all(name));
+    for value in values {
         // `from_utf8_lossy` returns a `Cow`: a borrow when the bytes are
         // valid UTF-8, a new string (with U+FFFD for bad bytes) otherwise.
         from_header.extend(split_names(&String::from_utf8_lossy(value.as_bytes())));
@@ -110,50 +122,29 @@ pub fn connection_catalogs(parts: &Parts) -> Option<Vec<String>> {
     })
 }
 
-/// Resolves a call's catalogs.
+/// Is `name` inside the connection's scope? Every name is when the
+/// connection names none (an empty list counts as unset).
 ///
 /// # Arguments
-/// * `principal` - the calling key.
-/// * `sources` - the argument, the connection and the server default.
-/// * `exists` - whether a catalog of that name is loaded.
+/// * `connection` - the connection's list ([`connection_catalogs`]).
+/// * `name` - a catalog name.
 ///
 /// # Returns
-/// The selection: the first source that is set, without duplicates.
-///
-/// # Errors
-/// [`OkfError::CatalogNotSelected`] naming the first catalog that does not
-/// exist or that the key does not reach; [`OkfError::Refused`] if no source
-/// names a catalog.
-// `impl Fn(&str) -> bool`: any function or closure taking a name, like a
-// Python callable argument.
-pub fn resolve(
-    principal: &Principal,
-    sources: Sources<'_>,
-    exists: impl Fn(&str) -> bool,
+/// `true` if a call on this connection may use `name` (the key's reach is
+/// checked separately).
+pub fn in_scope(connection: Option<&[String]>, name: &str) -> bool {
+    // `is_none_or(f)`: `true` for `None`, else `f(value)`.
+    connection.is_none_or(|list| list.is_empty() || list.iter().any(|listed| listed == name))
+}
+
+/// `list` as a selection: in order, without duplicates, every name allowed.
+fn checked<'a>(
+    list: impl IntoIterator<Item = &'a str>,
+    allowed: impl Fn(&str) -> bool,
 ) -> Result<Selection, OkfError> {
-    // `as_deref`: `Option<String>` to `Option<&str>`, borrowing the name.
-    let key_default = principal.default_catalog.as_deref();
-    // The argument, else the connection. An empty list (`catalogs: []`)
-    // counts as unset, so the selection is never empty; `flatten` skips the
-    // sources that are `None`.
-    let listed = [sources.argument, sources.connection]
-        .into_iter()
-        .flatten()
-        .find(|list| !list.is_empty());
-    let names: Vec<&str> = if let Some(list) = listed {
-        list.iter().map(String::as_str).collect()
-    } else if let Some(name) = key_default.or(sources.server_default) {
-        vec![name]
-    } else {
-        return Err(OkfError::Refused {
-            reason: "no catalog selected: pass `catalog`, set the X-OKF-Catalogs header \
-                     or `?catalogs=` on the MCP URL, or give the key a default catalog"
-                .to_string(),
-        });
-    };
-    let mut catalogs: Vec<String> = Vec::with_capacity(names.len());
-    for name in names {
-        if !exists(name) || !principal.reaches(name) {
+    let mut catalogs: Vec<String> = Vec::new();
+    for name in list {
+        if !allowed(name) {
             return Err(OkfError::CatalogNotSelected {
                 catalog: name.to_string(),
             });
@@ -164,6 +155,68 @@ pub fn resolve(
         }
     }
     Ok(Selection { catalogs })
+}
+
+/// Resolves a call's catalogs.
+///
+/// A connection list is checked whole, even when the argument names a
+/// catalog in it, so a mistyped list fails every call instead of falling
+/// back to a default.
+///
+/// # Arguments
+/// * `principal` - the calling key.
+/// * `sources` - the argument, the connection and the server default.
+/// * `exists` - whether a catalog of that name is loaded.
+///
+/// # Returns
+/// The selection: the argument if set, else the connection's list, else
+/// the key's default, else the server's; without duplicates.
+///
+/// # Errors
+/// [`OkfError::CatalogNotSelected`] naming the first catalog that does not
+/// exist, that the key does not reach, or (in the argument) that the
+/// connection's list leaves out; [`OkfError::Refused`] if no source names a
+/// catalog.
+// `impl Fn(&str) -> bool`: any function or closure taking a name, like a
+// Python callable argument.
+pub fn resolve(
+    principal: &Principal,
+    sources: Sources<'_>,
+    exists: impl Fn(&str) -> bool,
+) -> Result<Selection, OkfError> {
+    let available = |name: &str| exists(name) && principal.reaches(name);
+    // An empty list (`catalogs: []`) counts as unset, so the selection is
+    // never empty.
+    fn set(list: Option<&[String]>) -> Option<&[String]> {
+        list.filter(|list| !list.is_empty())
+    }
+    let argument = set(sources.argument);
+    if let Some(connection) = set(sources.connection) {
+        let scope = checked(connection.iter().map(String::as_str), available)?;
+        return match argument {
+            None => Ok(scope),
+            // Every scope name is available, so membership is the whole check.
+            Some(list) => checked(list.iter().map(String::as_str), |name| {
+                scope.catalogs.iter().any(|listed| listed == name)
+            }),
+        };
+    }
+    if let Some(list) = argument {
+        return checked(list.iter().map(String::as_str), available);
+    }
+    // `as_deref`: `Option<String>` to `Option<&str>`, borrowing the name.
+    match principal
+        .default_catalog
+        .as_deref()
+        .or(sources.server_default)
+    {
+        Some(name) => checked([name], available),
+        None => Err(OkfError::Refused {
+            reason: "no catalog selected: pass `catalog`, set the X-OKF-Catalogs header \
+                     or `?catalogs=` on the MCP URL, or give the key a default catalog"
+                .to_string(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -205,29 +258,91 @@ mod tests {
     }
 
     #[test]
-    fn the_first_source_that_is_set_wins() {
+    fn without_a_connection_the_argument_then_the_defaults_win() {
         let key = principal(&[], Some("home"));
         let argument = names(&["work"]);
+        let with_argument = Sources {
+            argument: Some(&argument),
+            connection: None,
+            server_default: Some("pg"),
+        };
+
+        assert_eq!(select(&key, with_argument).unwrap(), ["work"]);
+        let key_default = Sources {
+            argument: None,
+            ..with_argument
+        };
+        assert_eq!(select(&key, key_default).unwrap(), ["home"]);
+        let server_default = principal(&[], None);
+        assert_eq!(select(&server_default, key_default).unwrap(), ["pg"]);
+    }
+
+    #[test]
+    fn the_connection_is_the_scope_and_the_argument_only_narrows_it() {
+        let key = principal(&["pg", "work"], Some("pg"));
+        let connection = names(&["work"]);
+        let inside = names(&["work", "work"]);
+        let outside = names(&["work", "pg"]);
+        let base = Sources {
+            argument: None,
+            connection: Some(&connection),
+            server_default: Some("pg"),
+        };
+
+        let alone = resolve(&key, base, exists).unwrap();
+        let narrowed = select(
+            &key,
+            Sources {
+                argument: Some(&inside),
+                ..base
+            },
+        );
+        let escaped = select(
+            &key,
+            Sources {
+                argument: Some(&outside),
+                ..base
+            },
+        );
+
+        // Neither the key's default nor its other grant joins the scope.
+        assert_eq!(alone.catalogs(), ["work"]);
+        assert_eq!(alone.write_target(), "work");
+        assert_eq!(narrowed.unwrap(), ["work"]);
+        assert!(
+            matches!(&escaped, Err(OkfError::CatalogNotSelected { catalog }) if catalog == "pg"),
+            "{escaped:?}"
+        );
+    }
+
+    #[test]
+    fn a_bad_connection_list_fails_even_with_a_good_argument() {
+        let key = principal(&["pg"], Some("pg"));
         let connection = names(&["pg", "work"]);
-        let all = Sources {
+        let argument = names(&["pg"]);
+        let sources = Sources {
             argument: Some(&argument),
             connection: Some(&connection),
             server_default: Some("pg"),
         };
 
-        assert_eq!(select(&key, all).unwrap(), ["work"]);
-        let no_argument = Sources {
-            argument: None,
-            ..all
-        };
-        assert_eq!(select(&key, no_argument).unwrap(), ["pg", "work"]);
-        let key_default = Sources {
-            connection: None,
-            ..no_argument
-        };
-        assert_eq!(select(&key, key_default).unwrap(), ["home"]);
-        let server_default = principal(&[], None);
-        assert_eq!(select(&server_default, key_default).unwrap(), ["pg"]);
+        let error = select(&key, sources).unwrap_err();
+
+        assert!(
+            matches!(&error, OkfError::CatalogNotSelected { catalog } if catalog == "work"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn in_scope_is_everything_without_a_list() {
+        let list = names(&["work"]);
+        let empty: Vec<String> = Vec::new();
+
+        assert!(in_scope(None, "pg"));
+        assert!(in_scope(Some(&empty), "pg"));
+        assert!(in_scope(Some(&list), "work"));
+        assert!(!in_scope(Some(&list), "pg"));
     }
 
     #[test]
@@ -355,6 +470,17 @@ mod tests {
             .headers
             .append(CATALOGS_HEADER, HeaderValue::from_static("work"));
         assert_eq!(connection_catalogs(&repeated), Some(names(&["pg", "work"])));
+
+        let mut both = parts("/mcp?catalogs=home", None);
+        both.headers
+            .insert(CATALOG_HEADER_ALIAS, HeaderValue::from_static("work, pg"));
+        assert_eq!(connection_catalogs(&both), Some(names(&["work", "pg"])));
+        both.headers
+            .insert(CATALOGS_HEADER, HeaderValue::from_static("pg"));
+        assert_eq!(
+            connection_catalogs(&both),
+            Some(names(&["pg", "work", "pg"]))
+        );
 
         let mut garbled = parts("/mcp?catalogs=home", None);
         garbled.headers.insert(

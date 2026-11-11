@@ -194,10 +194,19 @@ An `mcp.json` entry (Claude Code expands the `${...}` variables):
 
 `X-OKF-Catalogs` (or `?catalogs=pg,work` on the URL) names the connection's
 catalogs: the whole list is the read set and the first is the default write
-target. Without it the key's default catalog is used, then the server's
-`default_catalog`. A tool's `catalog` (or `search`'s `catalogs`) argument
-wins over all of these. Every step is limited to the key's grants, and a
-catalog the key cannot reach is an error, never silently dropped.
+target. The list is also the session's boundary: `list_catalogs` offers only
+those catalogs, and a tool's `catalog` (or `search`'s `catalogs`) argument or
+a changeset handle can narrow it but never reach a catalog it leaves out,
+even one the key's grants or default catalog would otherwise allow. The
+singular `X-OKF-Catalog` is accepted as an alias; if a request sends both,
+they form one list, the `X-OKF-Catalogs` names first. A header takes
+precedence over `?catalogs=`.
+
+Without a list, a tool's argument is used, else the key's default catalog,
+then the server's `default_catalog`, and `list_catalogs` offers every catalog
+the key reaches. Every step is limited to the key's grants: a list never
+grants anything, and a catalog the key cannot reach (or that does not exist)
+is an error naming it, never silently dropped or replaced by a default.
 
 ### Tools
 

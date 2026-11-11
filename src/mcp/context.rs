@@ -11,7 +11,7 @@ use crate::auth::Principal;
 use crate::catalog::CatalogState;
 use crate::error::OkfError;
 use crate::overlay::View;
-use crate::selection::{connection_catalogs, resolve, Selection, Sources};
+use crate::selection::{connection_catalogs, in_scope, resolve, Selection, Sources};
 use crate::store::changesets::{self, ChangesetRow, ChangesetState};
 use crate::store::keys::Access;
 
@@ -130,6 +130,19 @@ impl ToolContext {
     /// Every loaded catalog, by name, as of the context's creation.
     pub fn catalogs(&self) -> &Catalogs {
         &self.catalogs
+    }
+
+    /// Does this call see `name`: the key reaches it and the connection's
+    /// list, if it has one, names it? What a tool that lists catalogs (or
+    /// what is in them) filters by, so an omitted catalog never shows.
+    ///
+    /// # Arguments
+    /// * `name` - a catalog name.
+    ///
+    /// # Returns
+    /// `true` if the call may see the catalog.
+    pub fn offers(&self, name: &str) -> bool {
+        self.principal.reaches(name) && in_scope(self.connection.as_deref(), name)
     }
 
     /// Resolves the call's catalogs (design "Catalog selection").
@@ -273,12 +286,10 @@ impl ToolContext {
     /// the pinned changeset's catalog, else the first selected. A `pg`
     /// handle on a `work,pg` connection reports on `pg`.
     ///
-    /// The pinned changeset's catalog stands in for a `catalog` argument, and
-    /// an argument wins over the connection's catalogs (design "Catalog
-    /// selection"), so it needs only the key's reach, not the connection's
-    /// selection: a `pg` handle on a `work`-only connection reports on `pg`
-    /// too. [`ToolContext::changeset`] has already checked that the key
-    /// reaches it, so `one` cannot refuse it.
+    /// The pinned changeset's catalog stands in for a `catalog` argument.
+    /// [`ToolContext::changeset`] has already checked that the key reaches
+    /// it and that the connection's list (if any) names it, so `one` cannot
+    /// refuse it: a `pg` handle on a `work`-only connection never resolves.
     ///
     /// # Arguments
     /// * `catalog` - the call's `catalog` argument.
@@ -315,7 +326,8 @@ impl ToolContext {
     ///
     /// # Errors
     /// - [`OkfError::UnknownChangeset`] for a handle that does not exist, is
-    ///   in a catalog this key does not reach (or that is not loaded), or
+    ///   in a catalog this key does not reach (or that is not loaded, or
+    ///   that the connection's list leaves out), or
     ///   belongs to another key while this one is not `admin`;
     /// - [`OkfError::Forbidden`] below `access`;
     /// - [`OkfError::Refused`] for a changeset that was published or
@@ -345,7 +357,7 @@ impl ToolContext {
         // admins. Don't reorder these checks.
         let own = row.key_id.as_deref() == Some(self.principal.key_id.as_str());
         let admin = self.principal.access == Access::Admin;
-        if !self.principal.reaches(state.name()) || !(own || admin) {
+        if !self.offers(state.name()) || !(own || admin) {
             return Err(unknown());
         }
         self.principal.require(access, state.name())?;
@@ -422,7 +434,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_argument_wins_and_reports_use_the_first_selected_catalog() {
+    async fn the_argument_narrows_the_connection_and_reports_use_the_first_selected_catalog() {
         let config = Config {
             default_catalog: Some("home".to_string()),
             ..Config::default()
@@ -434,14 +446,18 @@ mod tests {
 
         let states = on_connection.states(None).unwrap();
         let chosen = on_connection.states(Some(&argument)).unwrap();
-        let read_set = on_connection.read_set(Some("home")).unwrap();
+        let read_set = on_connection.read_set(Some("pg")).unwrap();
+        let escaped = on_connection.read_set(Some("home")).unwrap_err();
         let first = on_connection.one(None).unwrap();
         let fallback = on_default.read_set(None).unwrap();
         let unreachable = on_default.one(Some("work")).unwrap_err();
 
         assert_eq!(names(&states), ["work", "pg"]);
         assert_eq!(names(&chosen), ["pg"]);
-        assert_eq!(names(&read_set), ["home"]);
+        assert_eq!(names(&read_set), ["pg"]);
+        assert_eq!(escaped.kind(), "CatalogNotSelected");
+        assert!(on_connection.offers("pg") && !on_connection.offers("home"));
+        assert!(on_default.offers("home") && !on_default.offers("work"));
         assert_eq!(first.name(), "work");
         assert_eq!(names(&fallback), ["home"]);
         assert_eq!(unreachable.kind(), "CatalogNotSelected");
@@ -539,6 +555,26 @@ mod tests {
             refused_published.to_string(),
             format!("changeset {published} is published; open a new one with open_changeset")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handle_outside_the_connection_list_does_not_resolve() {
+        let test = app_with(&[("pg", &[]), ("work", &[])], Config::default()).await;
+        store_key(&test, "writer").await;
+        let writer = as_key(&test, "writer", Access::Write);
+        let handle = open(&writer).await;
+        let work_only = context(
+            &test,
+            principal_as("writer", Access::Write, &[], Some("pg")),
+            Some(&["work"]),
+        );
+
+        let refused = work_only
+            .changeset(&handle, Access::Write)
+            .await
+            .unwrap_err();
+
+        assert_eq!(refused.kind(), "UnknownChangeset");
     }
 
     #[tokio::test(flavor = "multi_thread")]
