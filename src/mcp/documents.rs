@@ -472,6 +472,7 @@ impl OkfServer {
     // `ToolResult<...>`, so the macro sees `Json<...>` and emits an output
     // schema.
     #[tool(
+        title = "Get Concept",
         description = "Get a concept: its frontmatter as JSON, its body and the body's size \
                        (`lines`, `chars`). A body over the server's limit (20,000 characters \
                        by default) comes back as an `outline` instead, with `truncated: true` \
@@ -482,7 +483,14 @@ impl OkfServer {
                        broken) and its backlinks; with `raw`, the file verbatim, but only \
                        within the limit or with `full`. Without `catalog`, the first selected \
                        catalog that has it answers. With `changeset` (a handle from \
-                       open_changeset), its catalog reads through that changeset's drafts."
+                       open_changeset), its catalog reads through that changeset's drafts.",
+        annotations(
+            title = "Get Concept",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn get_concept(
         &self,
@@ -495,10 +503,18 @@ impl OkfServer {
 
     /// The `read_document` tool.
     #[tool(
+        title = "Read Document",
         description = "Read the raw text of an index.md (default /index.md), log.md or \
                        AGENTS.md. Without `catalog`, the first selected catalog that has it \
                        answers. With `changeset` (a handle from open_changeset), its catalog \
-                       reads through that changeset's drafts."
+                       reads through that changeset's drafts.",
+        annotations(
+            title = "Read Document",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn read_document(
         &self,

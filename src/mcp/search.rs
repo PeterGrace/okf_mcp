@@ -168,6 +168,7 @@ impl OkfServer {
     // out (not `ToolResult<...>`) so the macro sees `Json<...>` and builds
     // the output schema.
     #[tool(
+        title = "Search Concepts",
         description = "Search concepts across this connection's catalogs (or `catalogs`). \
                        Every term of `query` must occur, as a case-insensitive substring, in \
                        a concept's title or aliases, tags, description or body; free text \
@@ -178,7 +179,14 @@ impl OkfServer {
                        since a large concept stays in context once read. With \
                        `changeset` (a handle from open_changeset), its catalog is searched \
                        through that changeset's drafts, and is listed in `skipped` if they \
-                       cannot be applied."
+                       cannot be applied.",
+        annotations(
+            title = "Search Concepts",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn search(
         &self,

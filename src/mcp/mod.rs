@@ -4,6 +4,9 @@
 //! plain function, which the module's tests call directly.
 
 pub(crate) mod catalogs;
+// Test-only: the tool classification the annotations are checked against.
+#[cfg(test)]
+mod annotations;
 pub(crate) mod changesets;
 pub(crate) mod documents;
 // `pub` (not `pub(crate)`): the context's helpers, like `ToolResult`,

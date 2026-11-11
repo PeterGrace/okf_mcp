@@ -151,12 +151,20 @@ pub(crate) async fn list_changesets(
 impl OkfServer {
     /// The `list_changesets` tool.
     #[tool(
+        title = "List Changesets",
         description = "List the open changesets this key may use (an admin: every key's, in the \
                        catalogs it reaches), with their handles, paths and last change; idle \
                        means nothing changed within the idle timeout. Empty changesets are \
                        listed too, but one with no write within 24 hours is discarded and no \
                        longer listed: open a new one then. Use it to find a handle again after a \
-                       reconnect or a lost context. Read access."
+                       reconnect or a lost context. Read access.",
+        annotations(
+            title = "List Changesets",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_changesets(
         &self,
@@ -235,11 +243,19 @@ pub(crate) async fn open_changeset(
 impl OkfServer {
     /// The `open_changeset` tool.
     #[tool(
+        title = "Open Changeset",
         description = "Open a changeset in a catalog and return its handle. Every edit, \
                        publish, discard, revert and pending_changes needs a handle, and the \
                        reads take one to see its drafts. Nothing is visible to anyone else until \
                        publish. Several changesets may be open at once. A changeset with no \
-                       edits is discarded after 24 hours. Write access."
+                       edits is discarded after 24 hours. Write access.",
+        annotations(
+            title = "Open Changeset",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn open_changeset(
         &self,
@@ -315,6 +331,7 @@ pub(crate) async fn publish(
 impl OkfServer {
     /// The `publish` tool.
     #[tool(
+        title = "Publish Changeset",
         description = "Publish the changeset `changeset` names: its edits become the \
                        published documents, each with a new revision carrying `message`. Refused \
                        with Conflict when a document changed since this changeset read it \
@@ -322,7 +339,14 @@ impl OkfServer {
                        or with LintFailed when a changed file has lint errors; the changeset \
                        then stays open. Lint errors elsewhere come back as warnings. When every \
                        edit already matches the published text, the changeset is closed with \
-                       published: true and no revisions. Write access."
+                       published: true and no revisions. Write access.",
+        annotations(
+            title = "Publish Changeset",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn publish(
         &self,
@@ -710,10 +734,18 @@ pub(crate) fn unified_diff(path: &str, published: Option<&[u8]>, pending: Option
 impl OkfServer {
     /// The `discard` tool.
     #[tool(
+        title = "Discard Changeset Entries",
         description = "Drop entries from the changeset `changeset` names: the named `paths`, or \
                        every entry, which closes the changeset for good (its handle is refused \
                        from then on; call open_changeset for new work). Published documents are \
-                       not touched. Write access."
+                       not touched. Write access.",
+        annotations(
+            title = "Discard Changeset Entries",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn discard(
         &self,
@@ -726,11 +758,19 @@ impl OkfServer {
 
     /// The `revert` tool.
     #[tool(
+        title = "Revert Document",
         description = "Add a document's content at an earlier revision (from `history`), or its \
                        deletion for a `delete` revision, to the changeset `changeset` names, for \
                        review and publish like any other edit. Every write rule applies, so \
                        machinery cannot be reverted. Reverting a file this changeset created to \
-                       a `delete` revision drops it from the changeset. Write access."
+                       a `delete` revision drops it from the changeset. Write access.",
+        annotations(
+            title = "Revert Document",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn revert(
         &self,
@@ -743,10 +783,18 @@ impl OkfServer {
 
     /// The `pending_changes` tool.
     #[tool(
+        title = "Show Pending Changes",
         description = "The unpublished changeset `changeset` names: each changed path \
                        (create, update or delete), the revision it was based on and the one \
                        published now, whether that base is stale, whether publish can replay \
-                       it, and a unified diff against the published text."
+                       it, and a unified diff against the published text.",
+        annotations(
+            title = "Show Pending Changes",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn pending_changes(
         &self,
