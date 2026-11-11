@@ -151,11 +151,19 @@ impl OkfServer {
     // The return type is spelled out (not `ToolResult<...>`) so the macro
     // sees `Json<...>` and builds the output schema.
     #[tool(
+        title = "Document History",
         description = "A document's revisions, newest first: revision, op (create, update, \
                        delete, import), actor, message and time. Deleted documents keep their \
                        history; log.md, indexes and other files have one too. Without \
                        `catalog`, the first selected catalog with any revision of the path \
-                       answers. At most `limit` revisions (default 20, at most 200)."
+                       answers. At most `limit` revisions (default 20, at most 200).",
+        annotations(
+            title = "Document History",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn history(
         &self,

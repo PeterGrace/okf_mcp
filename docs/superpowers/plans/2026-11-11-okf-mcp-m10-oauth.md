@@ -354,7 +354,7 @@ pub async fn start_oauth_server(catalogs: Vec<(&str, Files)>) -> (TestServer, Ci
 | File | Tasks |
 |---|---|
 | `Cargo.toml`, `Cargo.lock` | 3 (`url`), 8 (version 0.13.0) |
-| `src/mcp/*.rs`, `src/mcp/maintenance/*.rs` (`#[tool(annotations(...))]`), `src/mcp/annotations.rs` (new, coverage test) | 1 |
+| `src/mcp/*.rs`, `src/mcp/maintenance/*.rs` (`#[tool(annotations(...))]`), `src/mcp/annotations.rs` (new, coverage test), `src/investigator/contract_tools.json` (recaptured) | 1 |
 | `migrations/0008_oauth.sql` | 2 |
 | `src/keys.rs`, `src/config.rs`, `src/auth.rs`, `src/app.rs`, `src/lib.rs` (`pub mod oauth;`) | 2 |
 | `src/store/keys.rs` | 2, 4 (`is_valid_name`, `resolve_grants`, refusing maintenance reporting on a grant) |
@@ -437,11 +437,16 @@ beside Task 2.
 - Create: `src/mcp/annotations.rs` (test-only: the classification and the coverage tests)
 - Modify: `src/mcp/mod.rs` (declare `#[cfg(test)] mod annotations;`)
 - Modify: every file with a `#[tool(`, which are `src/mcp/catalogs.rs`, `search.rs`, `documents.rs`, `history.rs`, `reports.rs`, `changesets.rs`, `writes.rs`, `restructure.rs` and `maintenance/mod.rs`
+- Modify: `src/investigator/contract_tools.json` (the investigator's checked-in tool contracts)
 - Create: `changelog/<date -u +%Y-%m-%dT%H%M%SZ>-m10-task-01-tool-annotations.md`
+
+> **Corrected (issue #245, 2026-11-11).** The plan missed one file. `investigator::contract::tests::investigator_contract_rejects_missing_or_changed_tools` compares each of the investigator runner's nine allowed tools, serialized whole, with `src/investigator/contract_tools.json`. Once the tools carry `title` and `annotations`, that comparison fails. Regenerate the fixture with its ignored capture test, `cargo test --lib investigator_contract_capture_fixture -- --ignored`. The diff should add only `title` and `annotations` to the nine entries. `validate_tools` itself compares only the input and output schemas, so the runner's behaviour does not change.
 
 - [ ] **Step 1: Write the failing coverage test**
 
 Create `src/mcp/annotations.rs`:
+
+> **Corrected (issue #245, 2026-11-11).** The block below is now as `cargo fmt` lays it out (the `DESTRUCTIVE` list on one line, two `assert_eq!`s wrapped); the code is unchanged.
 
 ```rust
 //! The connector directories' tool metadata (M10 Task 1): every tool has a
@@ -502,12 +507,7 @@ const STAGED: &[&str] = &[
 ];
 
 /// Tools that cannot be undone from inside the server, or that delete.
-const DESTRUCTIVE: &[&str] = &[
-    "delete_concept",
-    "discard",
-    "maintenance_close",
-    "publish",
-];
+const DESTRUCTIVE: &[&str] = &["delete_concept", "discard", "maintenance_close", "publish"];
 
 /// The hints a tool's class implies (`open_world` is always false: every
 /// tool acts only on this server's catalogs).
@@ -598,8 +598,16 @@ fn every_tool_has_a_title_and_all_four_hints() {
             "{name}: the annotation title differs from the tool title"
         );
         assert_eq!(annotations.read_only_hint, Some(hints.read_only), "{name}");
-        assert_eq!(annotations.destructive_hint, Some(hints.destructive), "{name}");
-        assert_eq!(annotations.idempotent_hint, Some(hints.idempotent), "{name}");
+        assert_eq!(
+            annotations.destructive_hint,
+            Some(hints.destructive),
+            "{name}"
+        );
+        assert_eq!(
+            annotations.idempotent_hint,
+            Some(hints.idempotent),
+            "{name}"
+        );
         assert_eq!(annotations.open_world_hint, Some(false), "{name}");
     }
 }
@@ -813,7 +821,7 @@ Write `N` as this task's issue number (`gh issue list --search "M10 Task 1"`).
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/mcp changelog
+git add src/mcp src/investigator/contract_tools.json changelog
 git commit -m "feat(mcp): a title and behaviour hints on every tool (M10 task 1)
 
 Every tool has a title, on the tool and in its annotations, and explicit
