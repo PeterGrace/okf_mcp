@@ -86,7 +86,8 @@ impl AppError {
         match &self.0 {
             OkfError::NotFound { .. }
             | OkfError::CatalogNotSelected { .. }
-            | OkfError::UnknownChangeset { .. } => StatusCode::NOT_FOUND,
+            | OkfError::UnknownChangeset { .. }
+            | OkfError::UnknownName { .. } => StatusCode::NOT_FOUND,
             OkfError::Forbidden { .. } => StatusCode::FORBIDDEN,
             OkfError::Refused { .. } | OkfError::Conflict { .. } | OkfError::StillLinked { .. } => {
                 StatusCode::CONFLICT
@@ -380,6 +381,29 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"], "Busy");
         assert!(body["message"].as_str().unwrap().ends_with("retry"));
+    }
+
+    #[test]
+    fn an_unknown_user_or_team_is_a_404() {
+        let error = AppError(OkfError::UnknownName {
+            noun: "user",
+            name: "alice".into(),
+        });
+
+        let status = error.status();
+        let body = error.0.to_json();
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error.0.to_string(), "user \"alice\" does not exist");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "UnknownName",
+                "message": "user \"alice\" does not exist",
+                "noun": "user",
+                "name": "alice",
+            })
+        );
     }
 
     #[test]

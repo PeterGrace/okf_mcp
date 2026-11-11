@@ -342,7 +342,9 @@ CREATE INDEX catalogs_owner_team_id ON catalogs (owner_team_id)
     },
 ```
 
-In `src/http/mod.rs` `status()`, add `| OkfError::UnknownName { .. }` to the `NOT_FOUND` arm. Then run `cargo build`. Every other exhaustive match on `OkfError` (its `to_json` code string, the MCP error mapping) fails to compile. Add the variant to each, with JSON code `"unknown_name"` and the MCP "invalid params" class used for `CatalogNotSelected`. Add a unit test next to the existing status tests in `src/http/mod.rs`:
+In `src/http/mod.rs` `status()`, add `| OkfError::UnknownName { .. }` to the `NOT_FOUND` arm. Then run `cargo build`. The other exhaustive matches on `OkfError` are `OkfError::kind` and `OkfError::to_json` in `src/error.rs`: the variant's kind is `"UnknownName"`, and its body carries `noun` and `name`. Add a unit test next to the existing status tests in `src/http/mod.rs`:
+
+> **Corrected (issue #279).** The plan named a JSON code `"unknown_name"` and an MCP "invalid params" class. Neither exists: error kinds are the variant names (`OkfError::kind`, so `"UnknownName"`), and MCP tool errors use the same `to_json` body as REST. The shipped body is `{"error": "UnknownName", "message": "user \"alice\" does not exist", "noun": "user", "name": "alice"}`.
 
 ```rust
 #[test]
