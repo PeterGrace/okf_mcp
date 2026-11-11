@@ -551,7 +551,8 @@ claude mcp add --transport http okf https://okf-mcp.example.com/mcp \
 
 `X-OKF-Catalogs` (or its alias `X-OKF-Catalog`, or `?catalogs=a,b`) picks
 the connection's catalogs, and bounds them: the session sees no other
-catalog, whatever the key's grants or default. No
+catalog, whatever the key's grants or default. A request with both header
+spellings reads them as one list, the `X-OKF-Catalogs` names first. No
 header names a changeset: an agent calls `open_changeset` and passes the
 handle it returns as `changeset` to every write. The README's "Connecting a
 client" and "Changesets" sections describe both.

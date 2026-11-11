@@ -933,6 +933,26 @@ mod lifecycle_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn list_changesets_lists_only_the_connection_s_catalogs() {
+        let test = test_app().await;
+        let alice = connection(&test, "alice", Access::Write, &[]);
+        let in_pg = open_at(&test, &alice, "pg", Utc::now()).await.handle;
+        let in_work = open_at(&test, &alice, "work", Utc::now()).await.handle;
+        let work_only = context(
+            &test,
+            principal_as("alice", Access::Write, &[], Some("pg")),
+            Some(&["work"]),
+        );
+
+        let unlisted = list_changesets(&alice, all()).await.unwrap();
+        let listed = list_changesets(&work_only, all()).await.unwrap();
+
+        assert_eq!(unlisted.changesets.len(), 2);
+        assert!(handles(&unlisted).contains(&in_pg.as_str()));
+        assert_eq!(handles(&listed), [in_work.as_str()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn list_changesets_shows_a_key_its_own_and_an_admin_everyone_s() {
         let test = test_app().await;
         let alice = connection(&test, "alice", Access::Write, &[]);
