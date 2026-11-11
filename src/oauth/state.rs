@@ -38,9 +38,9 @@ pub struct PendingAuthorization {
     pub code_challenge: String,
     /// The resource (always this server's `/mcp`).
     pub resource: String,
-    /// The sign-in code accepted at step 1, awaiting Approve (its id, never
-    /// the code).
-    pub sign_in_code_id: Option<String>,
+    /// The sign-in code accepted at step 1 and the step-2 page showing it,
+    /// awaiting Approve.
+    pub accepted: Option<AcceptedCode>,
     /// Wrong codes entered so far.
     pub failed_attempts: u8,
 }
@@ -53,9 +53,33 @@ impl std::fmt::Debug for PendingAuthorization {
             .field("csrf", &"<redacted>")
             .field("client_id", &self.client.client_id)
             .field("redirect_uri", &self.redirect_uri)
-            .field("sign_in_code_id", &self.sign_in_code_id)
+            .field("accepted", &self.accepted)
             .field("failed_attempts", &self.failed_attempts)
             .finish_non_exhaustive()
+    }
+}
+
+/// A sign-in code accepted at step 1, bound to the one step-2 summary that
+/// shows it. Entering another code (in another copy of the step-1 form)
+/// replaces both, so an older summary's Approve no longer matches and
+/// cannot approve a code that page did not show.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AcceptedCode {
+    /// The code's id (never the code).
+    pub code_id: String,
+    /// A random token in that summary's Approve form, compared in constant
+    /// time on Approve.
+    pub summary_nonce: String,
+}
+
+// Written by hand, not derived, so a stray `{:?}` never prints the nonce.
+impl std::fmt::Debug for AcceptedCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcceptedCode")
+            .field("code_id", &self.code_id)
+            .field("summary_nonce", &"<redacted>")
+            .finish()
     }
 }
 
@@ -135,13 +159,18 @@ mod tests {
             state: None,
             code_challenge: "c".repeat(43),
             resource: "https://okf.example.com/mcp".into(),
-            sign_in_code_id: None,
+            accepted: Some(AcceptedCode {
+                code_id: "code-id".into(),
+                summary_nonce: "nonce-value-that-must-not-leak".into(),
+            }),
             failed_attempts: 0,
         };
 
         let printed = format!("{pending:?}");
 
         assert!(!printed.contains("csrf-value-that-must-not-leak"));
+        assert!(!printed.contains("nonce-value-that-must-not-leak"));
+        assert!(printed.contains("code-id"));
         assert!(printed.contains("<redacted>"));
     }
 }

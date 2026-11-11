@@ -1,0 +1,61 @@
+/* The OAuth consent page (src/oauth/consent.rs), layered on pico.min.css and
+ * styles.css. The page runs no script, so it follows the system theme here
+ * instead of main.js's data-theme. The dark tokens repeat styles.css's.
+ *
+ * `:root:not([data-theme])` matches Pico's own theme selectors in
+ * specificity, and this file loads after Pico, so the console's tokens win
+ * over Pico's defaults in both themes. */
+
+:root:not([data-theme]) {
+    --pico-background-color: var(--bg);
+    --pico-color: var(--fg);
+    --pico-muted-color: var(--fg-muted);
+    --pico-muted-border-color: var(--border);
+    --pico-primary: var(--accent);
+    --pico-primary-background: var(--accent);
+    --pico-primary-border: var(--accent);
+    --pico-primary-hover-background: var(--accent);
+    --pico-primary-inverse: var(--accent-fg);
+    --pico-secondary-background: var(--surface-2);
+    --pico-secondary-border: var(--border-strong);
+    --pico-secondary-hover-background: var(--border);
+    --pico-secondary-inverse: var(--fg);
+    --pico-form-element-background-color: var(--surface);
+    --pico-form-element-border-color: var(--border-strong);
+    --pico-form-element-color: var(--fg);
+    color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+        --bg: #0f0f11; --surface: #18181b; --surface-2: #1f1f23;
+        --fg: #e4e4e7; --fg-muted: #a1a1aa;
+        --border: #27272a; --border-strong: #3f3f46;
+        --accent: #a78bfa; --accent-fg: #1a1a1c; --accent-soft: #2e1065;
+        --ok: #34d399; --ok-soft: #064e3b;
+        --warn: #fbbf24; --warn-soft: #451a03;
+        --error: #f87171; --error-soft: #450a0a;
+        --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 16px rgba(0,0,0,.4);
+        color-scheme: dark;
+    }
+}
+
+.consent-card { max-width: 440px; }
+.consent-card h1 { margin-bottom: .75rem; }
+.consent-client { font-family: var(--font-display); font-size: 1.1rem; font-weight: 700; }
+.consent-host { font-family: var(--font-mono); font-size: .85rem; overflow-wrap: anywhere; }
+.consent-badge { display: inline-block; margin-left: .4rem; padding: 0 .45rem; border-radius: 999px;
+    font-size: .7rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+    background: var(--warn-soft); color: var(--warn); }
+.consent-summary { padding: .9rem 1rem; margin: 1rem 0; border-radius: var(--radius-sm);
+    background: var(--accent-soft); border: 1px solid var(--border); line-height: 1.6;
+    overflow-wrap: anywhere; }
+.consent-summary strong { color: var(--accent); }
+.consent-actions { display: flex; gap: .5rem; }
+.consent-actions button { flex: 1; margin: 0; }
+.consent-error { padding: .6rem .8rem; border-radius: var(--radius-sm); background: var(--error-soft); }
+
+/* Phone width: the card fills the screen with a gutter. */
+@media (max-width: 480px) {
+    .consent-card { margin: 1rem; padding: 1.25rem; }
+}

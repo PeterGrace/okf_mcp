@@ -73,6 +73,7 @@ Filled in as tasks land, as in M9 (dated `> **Corrected (issue #N).**` notes in 
 10. **`sign_in_codes_redeemed_grant`** (Task 2, corrected issue #246, 2026-11-11) is `grant_id IS NULL OR redeemed_at IS NOT NULL`, a check the spec's DDL lacks; Task 8 adds it to the spec.
 11. **`okf-mcp key revoke|grant|ungrant|maintenance-report` resolve API keys only** (Task 4, issue #248, 2026-11-11): `store::keys::resolve_active` filters `kind = 'key'` by id and by name, so a key name never matches, collides with or is made ambiguous by an OAuth grant. Grants are reached by exact id only: `okf-mcp oauth grant revoke` and the `/api/v1/keys/{id}` routes (`Selector::Exact`). Task 8 adds this to the spec.
 12. **The discovery documents are `Cache-Control: no-store`** (Task 3, corrected issue #247, 2026-11-11), like every OAuth route, not `public, max-age=300`: Task 2's layer sets it on everything under `oauth::routes()`. They still carry `Access-Control-Allow-Origin: *`.
+13. **`TestServer::start_with` landed in Task 5** (issue #249, 2026-11-11), as Task 6 Step 7 shows it, because the consent journey needs it first. Task 6 skips that step.
 
 ## Verified facts the code relies on
 
@@ -302,7 +303,10 @@ impl TokenBucket { pub fn new(capacity: u32, refill_per_sec: f64) -> Self; pub f
 // src/oauth/state.rs (Task 2)
 pub struct PendingAuthorization { pub csrf: String, pub client: ClientRecord, pub redirect_uri: String,
     pub state: Option<String>, pub code_challenge: String, pub resource: String,
-    pub sign_in_code_id: Option<String>, pub failed_attempts: u8 }           // Clone; Debug by hand: csrf redacted
+    pub accepted: Option<AcceptedCode>, pub failed_attempts: u8 }            // Clone; Debug by hand: csrf redacted
+// Corrected (issue #249, 2026-11-11, PR #259 review): `sign_in_code_id: Option<String>` became `accepted`,
+// binding the accepted code to the one step-2 summary that shows it (Debug by hand: nonce redacted).
+pub struct AcceptedCode { pub code_id: String, pub summary_nonce: String }   // Clone, PartialEq, Eq
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationCode { pub grant_id: String, pub client_id: String, pub redirect_uri: String,
     pub code_challenge: String, pub resource: String, pub family_id: String,
@@ -9088,6 +9092,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Task 2's `consent_limit` bucket must allow at least 20 POSTs in a burst: each unit test gets a fresh app (so a fresh bucket) and sends up to 8. If Task 2 chose less, raise it there.
 - `crate::http::router(app, &CancellationToken)` and `crate::mcp::testing::app_with(&[...], Config)` drive the whole router in unit tests (as `src/http/ui.rs` tests do).
 - `tests/ui_e2e/harness.rs`: `drive(base, journey)` fails a journey on any console `error` record except Chromium's "Failed to load resource" lines. `Ui.page` is public, so a journey can `goto` any URL. **To verify while implementing (Step 12):** that Chromium reports a CSP `form-action` violation, including one on the redirect after a POST, as a console `error` record. Step 12 proves it with a probe.
+  > **Corrected (issue #249, 2026-11-11).** Verified by the probe: with `form-action 'self'` only, Chromium blocks the 303 to the client's origin after the Approve POST, and the journey fails at `wait_visible("#done")` (timed out) before the console check runs. Either way the journey catches it.
 
 **Interface corrections this task makes** (already folded into the plan's "Interfaces shared across tasks"):
 
@@ -9332,6 +9337,8 @@ pub(crate) mod testing;
 
 Create `src/oauth/testing.rs`:
 
+> **Corrected (issue #249, 2026-11-11).** What shipped: `oauth_app` builds its config with Task 2's `store::oauth::testing::oauth_config(PUBLIC_URL)` and registers the client with Task 4's `store::oauth::codes::insert_test_client(pool, CLIENT_ID, ClientKind::Dcr, REDIRECT_URI)` (name "Example Client") instead of the hand-written SQL below. Every helper has doc comments, and `send` returns `(StatusCode, HeaderMap, String)`. The names and signatures Task 6 imports are unchanged. Read `src/oauth/testing.rs`.
+
 ```rust
 //! Test helpers for the OAuth routes: an app with OAuth on, a registered DCR
 //! client, a live sign-in code, and a request helper over the whole router.
@@ -9572,6 +9579,8 @@ Expected: FAIL to compile (`PageView`, `escape`, ... not found).
 
 Create `src/http/ui/consent.css`:
 
+> **Corrected (issue #249, 2026-11-11).** `styles.css` maps its tokens onto Pico's variables on plain `:root`, which loses to Pico's own `:root:not([data-theme=dark])` and, in dark mode, `:root:not([data-theme])` selectors when no `data-theme` is set (the consent page sets none). The shipped `consent.css` repeats the mapping (plus Pico's secondary-button and form-colour variables) on `:root:not([data-theme])`, puts the dark tokens under `@media (prefers-color-scheme: dark) { :root:not([data-theme]) { ... } }`, and adds a phone-width rule. Read the file.
+
 ```css
 /* The OAuth consent page (src/oauth/consent.rs), layered on pico.min.css and
  * styles.css. The page runs no script, so it follows the system theme here
@@ -9607,6 +9616,8 @@ Create `src/http/ui/consent.css`:
 ```
 
 - [ ] **Step 7: Implement the consent pages**
+
+> **Corrected (issue #249, 2026-11-11, PR #259 review).** `summary_page(view, grant, summary_nonce)` and `summary_page_html(view, grant, summary_nonce)` take the summary's token and render it as a hidden `summary` input in `consent-approve-form`. See the Step 9 note.
 
 Put this above the tests in `src/oauth/consent.rs`:
 
@@ -10133,6 +10144,16 @@ Expected: FAIL to compile (`routes` and the handlers not found).
 
 Put this above the tests in `src/oauth/authorize.rs`:
 
+> **Corrected (issue #249, 2026-11-11).** Clippy's `result_large_err` refuses `Result<_, Response>` (a `Response` is 128 bytes). What shipped: `oauth_or_404` is gone; each handler opens with `let Some(oauth) = app.oauth() else { return StatusCode::NOT_FOUND.into_response(); };`. Steps 1 and 2 (client, then exact redirect URI) are a separate `trusted_client(app, oauth, &query) -> Result<(ClientRecord, &str), (StatusCode, &'static str)>`, and `authorize` renders its error as the error page, so the no-redirect half is one function. `error_to_client` takes `(redirect_uri, state, issuer, code, description)`. The tests below gained `the_sign_in_code_is_consumed_only_on_approve`, `another_requests_csrf_token_does_not_work`, `consent_posts_are_rate_limited` (drains `consent_limit` at an instant a minute ahead, so it is exact), more cases in the two redirect tests (a missing parameter of each kind, a redirect URI with an extra query, an untrusted redirect URI with a later error too), and a PKCE check of the stored code against `VERIFIER`. `consent.rs` gained `a_hostile_host_cannot_break_out_of_its_markup` and `pages_have_no_inline_script_or_style`. Read `src/oauth/authorize.rs` and `src/oauth/consent.rs`.
+
+> **Corrected (issue #249, 2026-11-11, PR #259 review).** The code below let a stale summary approve a different code. Every summary carries the same pending id and CSRF token, and `check_code` overwrote `sign_in_code_id`. So the Approve form of a summary for read-only code A, posted after code B was entered in another copy of step 1, redeemed write-capable B. What shipped:
+> - `PendingAuthorization.accepted: Option<AcceptedCode { code_id, summary_nonce }>` replaces `sign_in_code_id`.
+> - `check_code` mints a fresh nonce (`keys::generate_with("")`), stores it with the code id (replacing any earlier pair), and renders it in the summary's form as `summary`. `ConsentForm` gained `summary: Option<String>`.
+> - Inside the same `pending.update` closure that checks the CSRF token, a private `approval(accepted, posted)` decides `Approval::{NoCode, Stale, Current(code_id)}`, comparing the nonce in constant time, so the code id and its nonce come from one snapshot.
+> - `approve(app, oauth, pending_id, pending, code_id)` takes the code id it decided on.
+> - `NoCode` re-renders step 1. `Stale` (an older summary, or no token) re-renders step 1 with "That approval page was out of date..." and changes nothing, so the latest summary still approves. It is not a failed attempt.
+> - Test: `an_older_summary_cannot_approve_a_code_entered_after_it` (it fails on the earlier code). The other Approve tests post the summary page's own hidden fields (`testing::hidden_inputs`).
+
 ```rust
 //! `GET` and `POST /oauth/authorize` (spec "Endpoints" and "Consent flow").
 //!
@@ -10557,6 +10578,8 @@ Expected: all OAuth tests pass, with no warnings. If clippy flags `too_many_line
 - [ ] **Step 11: Write the browser journey**
 
 Add `mod consent;` to `tests/ui_e2e/main.rs`, in alphabetical order after `mod changesets;`. The journey needs a server whose `public_url` is its own address, so it uses `TestServer::start_with`, which Task 6 adds to `tests/support/server.rs`. **If Task 6 has not landed, add `start_with` here exactly as Task 6, Step 9 shows** and note it in the PR.
+
+> **Corrected (issue #249, 2026-11-11).** Task 6 had not landed, so Task 5 added `start_with` and the bind-first `serve_app` exactly as Task 6 **Step 7** shows (not Step 9). The journey also checks, after it ran, that one OAuth grant for the client exists and is in the key cache.
 
 Create `tests/ui_e2e/consent.rs`:
 
@@ -11569,6 +11592,8 @@ Run: `cargo test --lib && cargo clippy --all-targets -- -D warnings`
 Expected: PASS with no warnings.
 
 - [ ] **Step 7: `TestServer::start_with` (support change)**
+
+> **Corrected (issue #249, 2026-11-11).** Already done by Task 5 (the consent journey needed it): `tests/support/server.rs` has `start_with` and the bind-first `serve_app` below. Skip this step.
 
 In `tests/support/server.rs`, split the catalog setup out of `start`, add `start_with`, and make `serve_app` bind first:
 
