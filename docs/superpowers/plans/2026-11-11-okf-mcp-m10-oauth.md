@@ -12201,6 +12201,7 @@ Depends on Task 4 (the `/api/v1/oauth/codes` endpoints) and Task 2 (`KeyView.kin
 
 > **Corrected (issue #251, 2026-11-11).** What shipped (`src/http/ui/js/pages/keys.js`) differs from Step 2 in these ways; the API is as Task 4 shipped it, so no request or response changed:
 > - Every helper takes the page's `main` (`newKey(main, reload)`, `showKey(main, key, reload)`, `codesPanel(main)`, `newCode(main, reload)`, `showCode(main, code, reload)`), and each checks `main.isConnected` after an await before it touches the drawer, reloads or redraws (the M9 router convention). The one-time dialog is still shown after navigating away: it is the code's only appearance.
+> - So the revoke handlers (key and code) toast first, then return if `main` is detached, and only then `closeDrawer()` and reload; the create handlers close the drawer only while `main` is connected.
 > - `showOnce` holds the secret in a local it sets to `null` when "I have stored it" is clicked, so not even the copy handler keeps it after the dialog closes.
 > - The codes table's empty text is "No sign-in codes to show." (it also shows with every state ticked).
 > - The first journey also asserts the code is in neither `localStorage` nor `sessionStorage` after the dialog closes.
