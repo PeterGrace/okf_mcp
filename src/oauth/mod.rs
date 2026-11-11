@@ -12,7 +12,8 @@ pub mod metadata;
 pub mod pkce;
 pub mod ratelimit;
 pub mod state;
-// Task 5 adds `#[cfg(test)] pub(crate) mod testing;` with its file.
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod token;
 
 use std::sync::Arc;

@@ -95,6 +95,28 @@ impl TestServer {
     /// If the database, a create, an import or the bind fails: a broken
     /// test setup.
     pub async fn start(catalogs_and_files: Vec<(&str, Files)>, config: Config) -> Self {
+        Self::start_with(catalogs_and_files, move |_| config).await
+    }
+
+    /// As [`TestServer::start`], with settings computed from the server's
+    /// own base URL, which is known only once its port is bound: OAuth's
+    /// `public_url` must name it.
+    ///
+    /// # Arguments
+    /// * `catalogs_and_files` - as for `start`.
+    /// * `make_config` - builds the settings from `http://127.0.0.1:<port>`.
+    ///
+    /// # Returns
+    /// The running server.
+    ///
+    /// # Panics
+    /// As [`TestServer::start`].
+    // `impl FnOnce(&str) -> Config`: any closure called once with the base
+    // URL, like a Python callable argument.
+    pub async fn start_with(
+        catalogs_and_files: Vec<(&str, Files)>,
+        make_config: impl FnOnce(&str) -> Config,
+    ) -> Self {
         let db = TestDb::start().await;
         okf_mcp::db::migrate(&db.pool).await.expect("migrations");
         for (name, files) in catalogs_and_files {
@@ -112,7 +134,7 @@ impl TestServer {
                 .await
                 .expect("import");
         }
-        let (base, app, shutdown, served) = serve_app(&db, config).await;
+        let (base, app, shutdown, served) = serve_app(&db, make_config).await;
         Self {
             base,
             app,
@@ -146,7 +168,7 @@ impl TestServer {
             .expect("the old server stops")
             .expect("the old server's task")
             .expect("the old server serves without an I/O error");
-        let (base, app, shutdown, served) = serve_app(&self.db, config).await;
+        let (base, app, shutdown, served) = serve_app(&self.db, move |_| config).await;
         self.base = base;
         self.app = app;
         self.shutdown = shutdown;
@@ -278,27 +300,32 @@ impl TestServer {
     }
 }
 
-/// Loads the app on `db` and serves it on a free port.
+/// Binds a free port, loads the app on `db` with settings built from the
+/// port's URL, and serves it.
 ///
 /// # Arguments
 /// * `db` - the database, already migrated and imported.
-/// * `config` - the server's settings.
+/// * `make_config` - builds the settings from the base URL.
 ///
 /// # Returns
 /// The base URL, the app, the token that stops the server, and the task
 /// serving it.
 ///
 /// # Panics
-/// If the app does not load or the bind fails.
-async fn serve_app(db: &TestDb, config: Config) -> (String, Arc<App>, CancellationToken, Served) {
-    let app = App::load(db.pool.clone(), config, Arc::new(SystemClock))
-        .await
-        .expect("app loads");
-    // Port 0: the OS picks a free one.
+/// If the bind fails or the app does not load.
+async fn serve_app(
+    db: &TestDb,
+    make_config: impl FnOnce(&str) -> Config,
+) -> (String, Arc<App>, CancellationToken, Served) {
+    // Port 0: the OS picks a free one. Bound first, so the settings can
+    // name the server's own URL.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let base = format!("http://{}", listener.local_addr().expect("address"));
+    let app = App::load(db.pool.clone(), make_config(&base), Arc::new(SystemClock))
+        .await
+        .expect("app loads");
     let shutdown = CancellationToken::new();
     let served = tokio::spawn(okf_mcp::http::serve(
         Arc::clone(&app),

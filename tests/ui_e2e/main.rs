@@ -8,6 +8,7 @@ mod support;
 mod browse;
 mod catalogs;
 mod changesets;
+mod consent;
 mod harness;
 mod health;
 mod keys;
