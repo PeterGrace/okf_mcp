@@ -1583,6 +1583,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn registration_bodies_over_16_kib_are_refused() {
+        let test = rig(true).await;
+        let body = format!(
+            r#"{{"redirect_uris": ["https://client.example.com/cb"], "pad": "{}"}}"#,
+            "x".repeat(REGISTER_BODY_LIMIT)
+        );
+
+        let (status, _, _) = register_request(&test, &body).await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            client_rows::count_unbound_dcr(test.app.pool())
+                .await
+                .expect("count"),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn without_dcr_registration_is_404() {
         let test = rig(false).await;
 
