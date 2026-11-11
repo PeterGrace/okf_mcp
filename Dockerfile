@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # The okf-mcp server image (M7). Built by .github/workflows/image.yml and
-# published to ghcr.io/petergrace/okf-mcp; see docs/operations.md.
+# published to ghcr.io/hypotheosis/okf-mcp; see docs/operations.md.
 
 # Build stage: the same Rust as the workstation's toolchain (1.99.1). Bump both
 # together.
@@ -23,6 +23,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # tools, which the server never runs. A fixed, non-root uid that manifests
 # can name.
 FROM debian:bookworm-slim
+# The official MCP Registry checks this label against server.json's name.
+LABEL io.modelcontextprotocol.server.name="io.github.hypotheosis/okf-mcp"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

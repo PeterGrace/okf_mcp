@@ -35,7 +35,7 @@ changesets and the routes in detail.
 
 ## 2. The image
 
-- **Name:** `ghcr.io/petergrace/okf-mcp:<version>`, for example `:0.12.1`.
+- **Name:** `ghcr.io/hypotheosis/okf-mcp:<version>`, for example `:0.12.1`.
   Every build is also tagged `:sha-<short commit>`. There is no `:latest`:
   manifests pin a version.
 - **Built by** `.github/workflows/image.yml` when a `v*` tag is pushed (`v0.12.1`
@@ -253,7 +253,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: okf-mcp
-          image: ghcr.io/petergrace/okf-mcp:0.12.1
+          image: ghcr.io/hypotheosis/okf-mcp:0.12.1
           args: ["serve"]
           ports:
             - name: http

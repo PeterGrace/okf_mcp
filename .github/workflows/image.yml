@@ -26,7 +26,7 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           # GHCR names are lower case.
-          images: ghcr.io/petergrace/okf-mcp
+          images: ghcr.io/hypotheosis/okf-mcp
           # No `:latest`: deployments pin a version (Decision 13).
           flavor: |
             latest=false
