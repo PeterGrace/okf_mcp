@@ -152,9 +152,14 @@ No authentication.
 - Accepts JSON client metadata, which must be a JSON object (an array is
   refused before deserializing, since serde would read one in field order).
   Requires `redirect_uris` (1 to 10, each at most 2,000 characters, `https`,
-  or `http` on a loopback host for native clients). `token_endpoint_auth_method`
-  must be absent or `none`. `grant_types` must be a subset of
-  `authorization_code` and `refresh_token`; `response_types` of `code`.
+  or `http` on a loopback host for native clients). Only public clients:
+  `token_endpoint_auth_method` must be absent or `none`, or the metadata must
+  list `none` in `token_endpoint_auth_methods_supported` (ChatGPT declares
+  `private_key_jwt` but lists `none` there; it then authenticates with `none`,
+  the only method this server advertises; issue #273). Grant types this server
+  does not support are dropped (RFC 7591 section 2), and `authorization_code`
+  must remain; `response_types` must be `code`. The client is registered as
+  `token_endpoint_auth_method: none` whatever it declared.
   `client_name`, if sent, is 1 to 200 characters. The body is capped at 16
   KiB. Errors are `invalid_client_metadata` or `invalid_redirect_uri`.
 - Stores an `oauth_clients` row (`kind = 'dcr'`, `client_id` a fresh UUID
@@ -270,8 +275,9 @@ document.
     only), documents may also be fetched over `http`.
 - **Validation:** the document must be a JSON object, and its `client_id`
   must exactly equal the URL it was fetched from. It needs `redirect_uris`.
-  `token_endpoint_auth_method` must be absent or `none`. `client_name` is
-  optional. The other rules are DCR's.
+  The auth-method and grant rules are DCR's: absent or `none`, or `none` among
+  `token_endpoint_auth_methods_supported`; unsupported grant types dropped.
+  `client_name` is optional. The other rules are DCR's too.
 - **Cache:** the result is an `oauth_clients` row (`kind = 'cimd'`), refetched
   when its `Cache-Control` max-age lapses, with a floor of 5 minutes and a
   ceiling of 24 hours. The freshness is stored in

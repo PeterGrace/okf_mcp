@@ -1589,8 +1589,15 @@ console" ([OAuth sign-in codes](#oauth-sign-in-codes)).
     max-age, clamped between 5 minutes and 24 hours; if a refetch fails, the
     cached copy is used for up to a day after it was fetched.
   - Any other `client_id` must have been registered at `/oauth/register`:
-    public clients only (`token_endpoint_auth_method` absent or `none`), 1 to
-    10 redirect URIs, each `https` or `http` on a loopback host.
+    public clients only, 1 to 10 redirect URIs, each `https` or `http` on a
+    loopback host.
+  - Either way the client must be able to authenticate with `none`: its
+    `token_endpoint_auth_method` is absent or `none`, or its
+    `token_endpoint_auth_methods_supported` lists `none` (as ChatGPT's
+    document does). Grant types other than `authorization_code` and
+    `refresh_token` are ignored. A refused client gets a generic "not known"
+    page; the server logs the reason at `warn` (`refused an OAuth client`,
+    with the `client_id`).
 - **Redirects.** The `redirect_uri` must equal one the client declared,
   character for character. An error found before that check (an unknown
   client, a redirect URI it did not declare) is shown on the server's own
