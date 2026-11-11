@@ -11,7 +11,7 @@ API at `/api/v1` ("Web console" below; design:
 `docs/superpowers/specs/2026-11-09-okf-webui-design.md`).
 
 Deployed: `https://okf-mcp.k.vsix.me` (every route but `/healthz` needs a
-bearer key), from the image `ghcr.io/petergrace/okf-mcp`, with its database
+bearer key), from the image `ghcr.io/hypotheosis/okf-mcp`, with its database
 backed up continuously and a restore drill done.
 
 The library reads a catalog into an in-memory `Snapshot` and runs `okf.py`'s
@@ -34,7 +34,7 @@ when the environment asks for it.
 ## Running it
 
 `docs/operations.md` is the operator guide: the container image
-(`ghcr.io/petergrace/okf-mcp:<version>`), every configuration key and
+(`ghcr.io/hypotheosis/okf-mcp:<version>`), every configuration key and
 environment variable, TLS to Postgres, a complete Kubernetes example with
 CloudNativePG and an ingress, the first catalog and keys, `/healthz` and the
 clock check, upgrades, backup and restore, and troubleshooting. The sections

@@ -94,7 +94,7 @@ class Packaging(unittest.TestCase):
     def test_workflow_never_labels_manual_build_as_release_or_latest(self):
         steps = self.workflow()["jobs"]["image"]["steps"]
         meta = next(step["with"] for step in steps if step.get("id") == "meta")
-        self.assertEqual(meta["images"], "ghcr.io/petergrace/okf-maintenance")
+        self.assertEqual(meta["images"], "ghcr.io/hypotheosis/okf-maintenance")
         self.assertEqual(meta["flavor"].strip(), "latest=false")
         self.assertEqual(meta["tags"].splitlines(), [
             "type=semver,pattern={{version}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}",

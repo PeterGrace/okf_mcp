@@ -6,10 +6,10 @@ The dedicated runner is **not** part of the concurrent v0.10.1 server release.
 It becomes available only after a future packaging release containing
 `Dockerfile.maintenance` and `.github/workflows/maintenance-image.yml`.
 The staged Argo reference
-`r.gfpd.us/ghcrio/petergrace/okf-maintenance:0.10.2` is an **unpublished
+`r.gfpd.us/ghcrio/hypotheosis/okf-maintenance:0.10.2` is an **unpublished
 prerequisite**, not an available image. Do not retag an old server release.
 
-The separate workflow publishes `ghcr.io/petergrace/okf-maintenance` for
+The separate workflow publishes `ghcr.io/hypotheosis/okf-maintenance` for
 `linux/amd64` only. Future `v*` tag pushes produce semver tags; manual dispatch
 produces only `sha-<full commit SHA>`, even when dispatched from a tag ref.
 Neither produces `latest`. Manual OCI version labels identify the commit, not
