@@ -351,10 +351,14 @@ async fn exchange_code(
         resource: &stored.resource,
     };
     let mut tx = app.pool().begin().await.map_err(OkfError::from)?;
+    // The family's lock, as a rotation takes it (`use_refresh`), so a
+    // family revocation waits for this commit and then sees these tokens.
+    token_rows::lock_family(&mut tx, &stored.family_id).await?;
     let minted = mint(&mut tx, oauth, binding, app.clock().now()).await?;
     tx.commit().await.map_err(OkfError::from)?;
-    // A replay that arrived while this exchange was minting revoked the
-    // family before these tokens existed. The flag is set under the map's
+    // The lock covers a revocation that starts while this transaction
+    // holds it. A replay can also revoke the family before this exchange
+    // took the lock, before these tokens existed. The flag is set under the map's
     // lock before that revocation, so either this sees it, or the replay's
     // revocation ran after the commit and caught these tokens. A code gone
     // from the map (pruned once expired) cannot vouch for itself: revoke.

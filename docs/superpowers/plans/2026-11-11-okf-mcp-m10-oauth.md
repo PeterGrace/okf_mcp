@@ -77,6 +77,7 @@ Filled in as tasks land, as in M9 (dated `> **Corrected (issue #N).**` notes in 
 13. **`TestServer::start_with` landed in Task 5** (issue #249, 2026-11-11), as Task 6 Step 7 shows it, because the consent journey needs it first. Task 6 skips that step.
 14. **A replay that races the first exchange still revokes** (Task 6, issue #250, 2026-11-11): `AuthorizationCode.replayed` is set under the map's lock by the replay, and the exchange checks it after its tokens commit (revoking them if set, or if the code has left the map). The spec's "a used code revokes its family" holds for any interleaving.
 15. **A failed exchange spends the code** (Task 6, issue #250, 2026-11-11): the code is marked used before its bindings are checked, so a wrong verifier, client, redirect URI or resource ends it, and presenting it again counts as a replay.
+16. **Family operations are serialized by a per-family advisory lock** (Task 6, issue #250, 2026-11-11, PR #262 review): `store::oauth::tokens::lock_family` (namespace `okff`, key `hashtext(family_id)`). Without it, a family revocation racing a rotation of the family's current refresh token missed the successors the rotation had inserted but not committed, leaving a live lineage after reuse was detected. The spec's "a reused refresh token revokes the family" now holds under read committed; Task 8 adds the mechanism to the spec.
 
 ## Verified facts the code relies on
 
@@ -198,6 +199,11 @@ pub async fn prune(pool: &PgPool, expired_before: DateTime<Utc>) -> Result<u64, 
 pub enum RefreshUse { Rotated { grant_id: String, family_id: String, resource: String }, Reused { family_id: String }, Unknown }
 pub async fn use_refresh(tx: &mut PgConnection, sha256: &[u8; 32], now: DateTime<Utc>) -> Result<RefreshUse, OkfError>;
 pub async fn revoke_family(pool: &PgPool, family_id: &str, now: DateTime<Utc>) -> Result<Vec<[u8; 32]>, OkfError>; // revoked hashes
+pub async fn lock_family(conn: &mut PgConnection, family_id: &str) -> Result<(), OkfError>; // pg_advisory_xact_lock('okff', hashtext(family))
+// Corrected (issue #250, 2026-11-11, PR #262 review): every transaction that adds tokens to a family
+// (`use_refresh` before it reads its token, the code exchange before it mints) or revokes one
+// (`revoke_family`, now its own transaction) takes `lock_family` first. Under read committed a revocation's
+// UPDATE snapshot cannot see a rotation's uncommitted successors; with the lock it runs wholly before or after.
 
 // src/store/oauth/clients.rs (Task 2: types, client_columns!/ClientRow, `find`, `prune_unbound_dcr`; Task 3: the rest)
 // Corrected (issue #246, 2026-11-11): the select list is a private `client_columns!()` macro, not a
@@ -11046,6 +11052,8 @@ pub async fn revoke_family(
         .collect())
 }
 ```
+
+> **Corrected (issue #250, 2026-11-11, PR #262 review).** The code above lets a family revocation miss successors that a concurrent rotation of another member has inserted but not committed: the `UPDATE`'s snapshot is taken when it starts, and locking existing rows does not make new rows visible. What shipped adds `lock_family` (a transaction-scoped advisory lock per family). `use_refresh` reads the token's family, takes the lock, and only then reads and locks the token (a new statement, so a fresh snapshot). `revoke_family` runs in its own transaction under the lock. The code exchange takes it before minting. Regression tests `a_reuse_racing_a_rotation_revokes_the_successors_too` and `a_revoke_racing_a_rotation_revokes_the_successors_too` hold the rotation open after it inserts its successors, wait until the revocation blocks on a lock, then commit. See `src/store/oauth/tokens.rs`.
 
 Run: `cargo test --lib store::oauth::tokens`
 Expected: `ok`. Task 2's tests plus these 3 pass.

@@ -178,6 +178,45 @@ pub async fn revoke(
     }))
 }
 
+/// The first key of the token-family locks (`okff` in ASCII): its own
+/// namespace, apart from the catalog locks (`okf`) and the DCR registration
+/// lock (`okfo`), so a family's hash can never collide with them.
+const FAMILY_LOCK_NAMESPACE: i32 = 0x6f6b_6666;
+
+/// Takes the family's lock for the rest of the transaction.
+///
+/// Every transaction that adds tokens to a family (minting from a code,
+/// rotating a refresh token) or revokes it ([`revoke_family`]) takes this
+/// lock first, so they run one at a time. That is what makes "reuse revokes
+/// the whole family" hold under read committed: a statement's snapshot is
+/// taken when the statement starts, so a revocation's `UPDATE` cannot see
+/// successors inserted by a rotation that has not committed yet (PR #262
+/// review). With the lock, either the revocation runs after the rotation
+/// commits, and its `UPDATE`, started after the lock was granted, sees and
+/// revokes the successors; or it runs first, and the rotation, reading its
+/// token only after the lock was granted, finds it revoked and mints nothing.
+///
+/// Two families whose ids hash alike share a lock: harmless, they only wait
+/// for each other.
+///
+/// # Arguments
+/// * `conn` - the transaction's connection (pass `&mut tx`; outside a
+///   transaction the lock would end with the statement).
+/// * `family_id` - the family.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn lock_family(conn: &mut PgConnection, family_id: &str) -> Result<(), OkfError> {
+    // `hashtext` maps the text id onto the lock's `int4` second key.
+    // `pg_advisory_xact_lock` returns `void`, so run it with `execute`.
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(FAMILY_LOCK_NAMESPACE)
+        .bind(family_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// What presenting a refresh token found ([`use_refresh`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshUse {
@@ -213,15 +252,16 @@ type RefreshRow = (
     Option<DateTime<Utc>>,
 );
 
-/// Presents a refresh token: locks its row and, if it is live and unused,
-/// marks it used.
+/// Presents a refresh token: takes its family's lock ([`lock_family`]),
+/// locks its row and, if it is live and unused, marks it used.
 ///
 /// Reuse is checked first: a used token is `Reused` even after its family
 /// was revoked, so replaying it again stays harmless (revoking twice).
 ///
 /// # Arguments
-/// * `tx` - the transaction the successor is minted in (commit it after;
-///   dropping it uncommitted rolls the mark back).
+/// * `tx` - a read-committed transaction, the one the successor is minted
+///   in (commit it after; dropping it uncommitted rolls the mark back and
+///   releases the family lock).
 /// * `sha256` - the presented token's hash.
 /// * `now` - the server clock.
 ///
@@ -235,9 +275,21 @@ pub async fn use_refresh(
     sha256: &[u8; 32],
     now: DateTime<Utc>,
 ) -> Result<RefreshUse, OkfError> {
-    // `FOR UPDATE OF t` locks only the token row, so two racing refreshes of
-    // one token run one after the other: the second waits for the first to
-    // commit (its successor included), then sees `used_at` set.
+    // The family first: a token's family never changes, so reading it
+    // before the lock is safe; the token's state is read only after it.
+    let family: Option<String> = sqlx::query_scalar(
+        "SELECT family_id FROM oauth_tokens WHERE sha256 = $1 AND kind = 'refresh'",
+    )
+    .bind(sha256.as_slice())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(family) = family else {
+        return Ok(RefreshUse::Unknown);
+    };
+    lock_family(&mut *tx, &family).await?;
+    // A new statement, so (read committed) a new snapshot: it sees whatever
+    // the family's previous lock holder committed, a revocation included.
+    // `FOR UPDATE OF t` also locks the token row.
     let row: Option<RefreshRow> = sqlx::query_as(
         "SELECT t.grant_id, t.family_id, t.resource, t.used_at, t.revoked_at, t.expires_at, \
                 k.revoked_at \
@@ -272,7 +324,9 @@ pub async fn use_refresh(
     })
 }
 
-/// Revokes every live token of a family.
+/// Revokes every live token of a family, under its lock ([`lock_family`]),
+/// so a rotation or a mint in flight either commits first and is revoked
+/// with the rest, or runs after and finds its parent revoked.
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -290,14 +344,19 @@ pub async fn revoke_family(
     family_id: &str,
     now: DateTime<Utc>,
 ) -> Result<Vec<[u8; 32]>, OkfError> {
+    let mut tx = pool.begin().await?;
+    lock_family(&mut tx, family_id).await?;
+    // Started after the lock was granted, so its snapshot holds every token
+    // the family's previous lock holder committed.
     let rows: Vec<Vec<u8>> = sqlx::query_scalar(
         "UPDATE oauth_tokens SET revoked_at = $2 \
          WHERE family_id = $1 AND revoked_at IS NULL RETURNING sha256",
     )
     .bind(family_id)
     .bind(now)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     // The schema checks `length(sha256) = 32`, so the conversion to a fixed
     // array cannot fail on a row the server wrote; `filter_map` skips any
     // other.
@@ -565,6 +624,137 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// Waits until another backend on this test's database is blocked on a
+    /// lock (an advisory lock or a row lock): the step that makes the race
+    /// below deterministic instead of a matter of scheduling.
+    async fn until_another_backend_waits_on_a_lock(db: &crate::db::pg_support::TestDb) {
+        for _ in 0..500 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND pid <> pg_backend_pid() \
+                 AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the revocation never waited on a lock");
+    }
+
+    /// What revokes the family in [`race_a_revocation_with_a_rotation`].
+    #[derive(Debug, Clone, Copy)]
+    enum Trigger {
+        /// R0 presented again at the token endpoint.
+        Reuse,
+        /// R0 revoked at `/oauth/revoke`.
+        Revoke,
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reuse_racing_a_rotation_revokes_the_successors_too() {
+        race_a_revocation_with_a_rotation(Trigger::Reuse).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoke_racing_a_rotation_revokes_the_successors_too() {
+        race_a_revocation_with_a_rotation(Trigger::Revoke).await;
+    }
+
+    /// PR #262 review: R0 has rotated to R1. A rotation of R1 inserts its
+    /// successors (A2, R2) and stays open; meanwhile `trigger` on R0 revokes
+    /// the family. When the rotation commits, its successors must be revoked
+    /// too, not left live outside the revocation's snapshot.
+    async fn race_a_revocation_with_a_rotation(trigger: Trigger) {
+        let (db, grant) = with_grant().await;
+        let family = "family-race";
+        let (r0, a1, r1, a2, r2) = ([20u8; 32], [21; 32], [22; 32], [23; 32], [24; 32]);
+        store(&db, &token(&grant, TokenKind::Refresh, family, r0)).await;
+        // R0 -> (A1, R1), committed.
+        let mut tx = db.pool.begin().await.unwrap();
+        assert!(matches!(
+            use_refresh(&mut tx, &r0, now()).await.unwrap(),
+            RefreshUse::Rotated { .. }
+        ));
+        insert(
+            &mut tx,
+            &token(&grant, TokenKind::Access, family, a1),
+            now(),
+        )
+        .await
+        .unwrap();
+        insert(
+            &mut tx,
+            &token(&grant, TokenKind::Refresh, family, r1),
+            now(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        // R1 -> (A2, R2), held open after inserting the successors.
+        let mut rotation = db.pool.begin().await.unwrap();
+        assert!(matches!(
+            use_refresh(&mut rotation, &r1, now()).await.unwrap(),
+            RefreshUse::Rotated { .. }
+        ));
+        insert(
+            &mut rotation,
+            &token(&grant, TokenKind::Access, family, a2),
+            now(),
+        )
+        .await
+        .unwrap();
+        insert(
+            &mut rotation,
+            &token(&grant, TokenKind::Refresh, family, r2),
+            now(),
+        )
+        .await
+        .unwrap();
+
+        // On another connection, as the endpoints do it: the token endpoint
+        // finds R0 reused, or `/oauth/revoke` revokes R0; then the family.
+        let pool = db.pool.clone();
+        let reuse = tokio::spawn(async move {
+            let family_id = match trigger {
+                Trigger::Reuse => {
+                    let mut tx = pool.begin().await.unwrap();
+                    let found = use_refresh(&mut tx, &r0, now()).await.unwrap();
+                    drop(tx);
+                    let RefreshUse::Reused { family_id } = found else {
+                        panic!("R0 is a reuse, found {found:?}");
+                    };
+                    family_id
+                }
+                Trigger::Revoke => {
+                    revoke(&pool, &r0, now())
+                        .await
+                        .unwrap()
+                        .expect("R0")
+                        .family_id
+                }
+            };
+            revoke_family(&pool, &family_id, now()).await.unwrap()
+        });
+        until_another_backend_waits_on_a_lock(&db).await;
+        rotation.commit().await.unwrap();
+        let mut revoked = reuse.await.unwrap();
+        revoked.sort();
+
+        assert!(
+            find_access(&db.pool, &a2, now()).await.unwrap().is_none(),
+            "the successor access token is revoked"
+        );
+        assert_eq!(present(&db, &r2).await, RefreshUse::Unknown, "so is R2");
+        assert!(
+            revoked.contains(&a2) && revoked.contains(&r2),
+            "{revoked:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

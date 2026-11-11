@@ -7,7 +7,7 @@
   - a replayed code or a reused refresh token revokes the whole token family and drops its access tokens from the cache;
   - success answers carry `Cache-Control: no-store` and `Pragma: no-cache`; errors are RFC 6749 `{error, error_description}`.
 - `POST /oauth/revoke` (RFC 7009): always 200, an unknown token included. Revoking a refresh token revokes its family.
-- `store::oauth::tokens::{RefreshUse, use_refresh, revoke_family}`.
+- `store::oauth::tokens::{RefreshUse, use_refresh, revoke_family, lock_family}`. Every transaction that adds tokens to a family or revokes it takes the family's advisory lock first, so a revocation racing a rotation either revokes the rotation's committed successors or makes the rotation find its parent revoked (PR #262 review; regression tests hold a rotation open across a reuse and a revoke).
 - End-to-end OAuth tests (`tests/server_oauth.rs`, helpers in `tests/support/oauth.rs`):
   - CIMD (a local metadata host) and DCR flows from the 401 through discovery, consent and the token endpoint to an MCP tool call with a real rmcp client;
   - the audience check, refresh-token reuse, grant revocation at the next poll, and a static key beside OAuth.
