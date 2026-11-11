@@ -355,7 +355,7 @@ fn an_unknown_user_or_team_is_a_404() {
 
 - [ ] **Step 5: Run the tests**
 
-Run: `cargo test --lib db::tests http::tests`
+Run: `cargo test --lib -- db::tests http::tests` (libtest takes several filters after `--`)
 Expected: PASS.
 
 - [ ] **Step 6: Changelog and commit**
@@ -444,6 +444,50 @@ mod tests {
 
         assert!(matches!(duplicate, Err(OkfError::Refused { .. })));
         assert!(matches!(invalid, Err(OkfError::Refused { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_name_that_loses_the_insert_race_is_refused_not_a_database_error() {
+        // `check_free` passes for both of two concurrent creates; the INSERT
+        // then hits the UNIQUE constraint. Reproduce that deterministically:
+        // a transaction that passed `check_free` before another committed the
+        // same team name.
+        let db = test_db().await;
+        create(&db.pool, &alice(), now()).await.unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        check_free(&mut tx, "family").await.unwrap();
+        teams::create(&db.pool, &teams::NewTeam { name: "family", display_name: "", owner: "alice" }, now())
+            .await
+            .unwrap();
+
+        let inserted = sqlx::query_scalar::<_, String>(
+            "INSERT INTO teams (name, created_at) VALUES ('family', now()) RETURNING id",
+        )
+        .fetch_one(&mut *tx)
+        .await;
+
+        let mapped = or_name_taken(inserted, "family");
+        assert!(matches!(mapped, Err(OkfError::Refused { .. })), "{mapped:?}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_user_and_team_creates_of_one_name_give_one_winner_and_a_409() {
+        let db = test_db().await;
+        create(&db.pool, &alice(), now()).await.unwrap();
+        let user = NewUser { name: "family", display_name: "" };
+        let team = teams::NewTeam { name: "family", display_name: "", owner: "alice" };
+
+        // `tokio::join!` runs both futures concurrently, like `asyncio.gather`.
+        let (made_user, made_team) = tokio::join!(
+            create(&db.pool, &user, now()),
+            teams::create(&db.pool, &team, now()),
+        );
+
+        let refused = [made_user.is_err(), made_team.is_err()];
+        assert_eq!(refused.iter().filter(|r| **r).count(), 1, "{made_user:?} {made_team:?}");
+        for result in [made_user.err(), made_team.err()].into_iter().flatten() {
+            assert!(matches!(result, OkfError::Refused { .. }), "{result:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -603,7 +647,7 @@ The "team owning a catalog cannot be deleted" test belongs to Task 3.
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test --lib store::users store::teams`
+Run: `cargo test --lib -- store::users store::teams`
 Expected: compile errors (functions not defined).
 
 - [ ] **Step 3: Add the fixture** to `src/db.rs`:
@@ -706,11 +750,39 @@ pub(crate) async fn check_free(conn: &mut PgConnection, name: &str) -> Result<()
     .fetch_one(&mut *conn)
     .await?;
     if taken {
-        return Err(OkfError::Refused {
-            reason: format!("the name {name:?} is already taken by a user or team"),
-        });
+        return Err(name_taken(name));
     }
     Ok(())
+}
+
+/// The refusal for a name a user or team already has.
+pub(crate) fn name_taken(name: &str) -> OkfError {
+    OkfError::Refused {
+        reason: format!("the name {name:?} is already taken by a user or team"),
+    }
+}
+
+/// Maps a UNIQUE violation from inserting a user or team row to
+/// [`name_taken`]. `check_free` only narrows the race: two creates of one
+/// name (a user and a team, or two of either) can both pass it, and then the
+/// `users.name` or `teams.name` constraint decides inside the INSERT. Every
+/// user and team insert goes through this, so the loser always gets the 409.
+///
+/// # Arguments
+/// * `inserted` - the INSERT's result.
+/// * `name` - the name being created.
+///
+/// # Errors
+/// [`name_taken`] for a unique violation; [`OkfError::Database`] otherwise.
+// Generic over `T`: the inserts return an id (`String`) or nothing.
+pub(crate) fn or_name_taken<T>(inserted: Result<T, sqlx::Error>, name: &str) -> Result<T, OkfError> {
+    inserted.map_err(|error| {
+        if is_unique_violation(&error) {
+            name_taken(name)
+        } else {
+            error.into()
+        }
+    })
 }
 
 /// Creates a user and its personal team (the user as owner), and bumps the
@@ -743,18 +815,10 @@ pub async fn create(
     .bind(now)
     .fetch_one(&mut *tx)
     .await;
-    // A racing create of the same name passes `check_free` too; the UNIQUE
-    // constraint then decides, and the loser gets the same refusal.
-    let user_id = match inserted {
-        Ok(id) => id,
-        Err(error) if is_unique_violation(&error) => {
-            return Err(OkfError::Refused {
-                reason: format!("the name {:?} is already taken by a user or team", new.name),
-            })
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let team_id: String = sqlx::query_scalar(
+    let user_id = or_name_taken(inserted, new.name)?;
+    // The personal team's insert can lose the race too: to a concurrent
+    // `teams::create` of the same name, which no `users` constraint sees.
+    let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO teams (name, display_name, personal_of, created_at) \
          VALUES ($1, $2, $3, $4) RETURNING id",
     )
@@ -763,7 +827,8 @@ pub async fn create(
     .bind(&user_id)
     .bind(now)
     .fetch_one(&mut *tx)
-    .await?;
+    .await;
+    let team_id = or_name_taken(inserted, new.name)?;
     sqlx::query(
         "INSERT INTO team_members (team_id, user_id, role, created_at) VALUES ($1, $2, 'owner', $3)",
     )
@@ -971,13 +1036,13 @@ async fn refuse_last_owner(
 
   - `remove_member` locks the team and resolves the user. It then refuses when the team's `personal_of` is this user, when the user isn't a member (409, "not a member"), and when it's the last owner. Otherwise it deletes the row and bumps.
   - `delete` locks the team and refuses when `personal_of IS NOT NULL` or when any catalog has `owner_team_id = id`. Otherwise it deletes the team (memberships cascade) and bumps.
-  - `create` checks the name, calls `users::check_free`, resolves the owner with `users::id_of`, inserts the team and the owner membership, and bumps.
+  - `create` checks the name, calls `users::check_free`, resolves the owner with `users::id_of`, inserts the team (its result through `users::or_name_taken`, so a team that loses the race to a concurrent user or team of that name is a 409, not a database error), inserts the owner membership, and bumps.
 
 Register both modules in `src/store/mod.rs` (`pub mod teams;`, `pub mod users;`, keeping the list sorted).
 
 - [ ] **Step 6: Run the tests**
 
-Run: `cargo test --lib store::users store::teams db::tests`
+Run: `cargo test --lib -- store::users store::teams db::tests`
 Expected: PASS.
 
 - [ ] **Step 7: Run the whole suite.** The fixture adds a user to every unit-test database. Fix any existing test that counts `admin_generation` from zero, by reading it before acting instead.
@@ -1448,7 +1513,7 @@ let who = match &grant.user {
 
     Splice `{who}` into the existing paragraph in place of `as actor <strong>{actor}</strong>`, and drop the now-unused `actor = …` format argument.
 
-- [ ] **Step 4: Run the tests** (`cargo test --lib auth http::api::identity oauth::consent`), then `cargo test`. Expected: PASS.
+- [ ] **Step 4: Run the tests** (`cargo test --lib -- auth http::api::identity oauth::consent`), then `cargo test`. Expected: PASS.
 
 - [ ] **Step 5: Changelog and commit**
 
@@ -2148,7 +2213,7 @@ async function renderUnassigned(main) {
   - Every write runs only when `store.whoami.all_catalogs`. Without it, the controls render disabled.
 
 - [ ] **Step 5: Keys, codes, catalogs and the shell**
-  - **`keys.js`** `newKey` and `newCode` forms: add `h('label', {}, 'User', h('select', { name: 'user', required: true }, ...))`, filled from `GET /users` when the drawer opens. Send `user` in the body. In `newCode`, the actor input loses `required` and gets the placeholder "defaults to the name". Add a `{ key: 'user', label: 'User', sort: k => k.user ?? '', render: k => k.user ?? h('span', { class: 'muted' }, 'unassigned') }` column to both tables. In `showKey`, a key with `user === null` gets the same user picker and an `#key-assign` button that PUTs `/keys/{id}/user`. `showCode` gets the same for codes.
+  - **`keys.js`** `newKey` and `newCode` forms: add `h('label', {}, 'User', h('select', { name: 'user', required: true }, ...))`, filled from `GET /users` when the drawer opens. Send `user` in the body. In `newCode`, the actor input loses `required` and gets the placeholder "defaults to the name". Add a `{ key: 'user', label: 'User', sort: k => k.user ?? '', render: k => k.user ?? h('span', { class: 'muted' }, 'unassigned') }` column to both tables. In `showKey`, every key and grant gets the same user picker, preselected with its current user (or empty when unassigned), and an `#key-assign` button labelled "Assign" when unassigned and "Change user" otherwise, that PUTs `/keys/{id}/user`. This matches the CLI and REST, which reassign an already-assigned credential too. `showCode` gets the same for codes. Extend `tests/ui_e2e/keys.rs` with a journey that changes an assigned key's user from `tester` to a second user and sees the USER column follow.
   - **`catalogs.js`:** the create form gets an `owner` `<select>` filled from `GET /teams`, sent as `owner`. Add an `Owner` column rendering `h('span', { dataset: { test: `catalog-owner-${row.name}` } }, row.owner_team ?? 'unassigned')`. `openEdit` gets a "Change owner" select plus button, PUT `/catalogs/{name}/owner`, shown when `creator`.
   - **`index.html`:** in the `data-need="admin"` nav group, add `<a class="nav-link" data-nav="users" href="#/users">Users <span id="unassigned-badge" class="nav-badge" hidden></span></a>` and `<a class="nav-link" data-nav="teams" href="#/teams">Teams</a>`.
   - **`shell.js`:**
