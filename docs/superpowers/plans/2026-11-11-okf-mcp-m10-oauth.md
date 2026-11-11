@@ -208,7 +208,9 @@ pub async fn find(pool: &PgPool, client_id: &str) -> Result<Option<ClientRecord>
 pub async fn prune_unbound_dcr(pool: &PgPool, created_before: DateTime<Utc>) -> Result<u64, OkfError>;
 // Task 3:
 pub struct NewDcrClient<'a> { /* client_name, redirect_uris, metadata */ }
-pub async fn insert_dcr(pool: &PgPool, new: &NewDcrClient<'_>, now: DateTime<Utc>) -> Result<ClientRecord, OkfError>; // id: gen_random_uuid()::text
+pub async fn insert_dcr(pool: &PgPool, new: &NewDcrClient<'_>, now: DateTime<Utc>, max_unbound: i64) -> Result<Option<ClientRecord>, OkfError>; // id: gen_random_uuid()::text; None at the cap
+// Corrected (issue #247, 2026-11-11, PR #257 review): the cap check and the insert are one statement under a
+// transaction-scoped advisory lock, so concurrent registrations cannot pass the cap.
 pub async fn upsert_cimd(pool: &PgPool, client: &ClientRecord) -> Result<(), OkfError>;
 pub async fn count_unbound_dcr(pool: &PgPool) -> Result<i64, OkfError>;
 
@@ -5287,6 +5289,8 @@ Run: `cargo test --lib store::oauth::clients`
 Expected: FAIL to compile (`insert_dcr`, `NewDcrClient`, `upsert_cimd`, `count_unbound_dcr` not found).
 
 - [ ] **Step 6: Write the store functions**
+
+> **Corrected (issue #247, 2026-11-11, PR #257 review).** `register` below counted the unbound clients and then inserted, so concurrent registrations at 499 all read 499 and all inserted (a test saw 6 or 7 of 8 succeed). What shipped: `insert_dcr(pool, new, now, max_unbound) -> Result<Option<ClientRecord>, OkfError>` takes `pg_advisory_xact_lock(0x6f6b666f /* "okfo" */, 1)` in a transaction and runs one `INSERT ... SELECT ... WHERE <unbound count> < $5 RETURNING ...`; `None` means the cap was reached. The count subquery is a private `unbound_dcr_count!()` macro shared with `count_unbound_dcr`. `register` calls it with `MAX_UNBOUND_DCR` and answers `slow_down` on `None`, with no separate count. The lock is in the database, so it holds for a CLI or a second process too. Tests: `insert_dcr_stops_at_the_cap_of_unbound_clients` (store) and `concurrent_registrations_never_pass_the_cap` (8 simultaneous registrations at 499: exactly one 201, the rest 429, 500 stored). Read `src/store/oauth/clients.rs` and `register` in `src/oauth/clients.rs`.
 
 Append to `src/store/oauth/clients.rs`, above its test module. This reuses Task 2's `client_columns!()`, `ClientRow` and `From<ClientRow> for ClientRecord` (correction 2). `prune_unbound_dcr` is Task 2's (its correction 6); the test below exercises it beside this task's functions, and the code block below does not repeat it.
 
@@ -10599,7 +10603,8 @@ async fn a_person_enters_a_code_approves_and_lands_back_at_the_client() {
     let client_base = callback_host().await;
     let redirect_uri = format!("{client_base}/callback");
     // Corrected (issue #247, 2026-11-11): `insert_dcr` takes a `NewDcrClient`
-    // and returns the stored client, whose id Postgres picks.
+    // and the cap of unbound clients, and returns the stored client (whose id
+    // Postgres picks), or `None` at the cap.
     let redirect_uris = [redirect_uri.clone()];
     let metadata = serde_json::json!({ "redirect_uris": [redirect_uri] });
     let client = client_rows::insert_dcr(
@@ -10610,9 +10615,11 @@ async fn a_person_enters_a_code_approves_and_lands_back_at_the_client() {
             metadata: &metadata,
         },
         Utc::now(),
+        okf_mcp::oauth::clients::MAX_UNBOUND_DCR,
     )
     .await
-    .expect("register the client");
+    .expect("register the client")
+    .expect("under the cap");
     let catalogs = ["main".to_string()];
     let code = code_rows::create(
         &server.db.pool,

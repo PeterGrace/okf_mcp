@@ -171,15 +171,38 @@ pub struct NewDcrClient<'a> {
     pub metadata: &'a serde_json::Value,
 }
 
-/// Registers a DCR client under a fresh UUID.
+/// The first key of the DCR registration lock (`okfo` in ASCII): a two-key
+/// advisory lock in its own namespace, apart from the catalog locks
+/// (`store::catalogs`, namespace `okf`).
+const OAUTH_LOCK_NAMESPACE: i32 = 0x6f6b_666f;
+/// The second key: the lock every DCR registration takes.
+const DCR_REGISTRATION_LOCK: i32 = 1;
+
+/// How many DCR clients no grant names: the subquery the cap and
+/// [`count_unbound_dcr`] share.
+// A macro, like `client_columns!`, so `concat!` can splice it into
+// compile-time SQL.
+macro_rules! unbound_dcr_count {
+    () => {
+        "(SELECT count(*) FROM oauth_clients c WHERE c.kind = 'dcr' \
+          AND NOT EXISTS (SELECT 1 FROM api_keys k WHERE k.client_id = c.client_id))"
+    };
+}
+
+/// Registers a DCR client under a fresh UUID, unless `max_unbound` DCR
+/// clients already have no grant. The count and the insert run under one
+/// transaction-scoped advisory lock, so concurrent registrations, from this
+/// process or any other, take turns: each sees every insert committed
+/// before it, and none can pass the cap.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `new` - the validated registration.
 /// * `now` - the registration time (server clock).
+/// * `max_unbound` - the cap (spec "Abuse limits": 500).
 ///
 /// # Returns
-/// The stored client.
+/// The stored client, or `None` when the cap is reached (nothing stored).
 ///
 /// # Errors
 /// [`OkfError::Database`].
@@ -187,22 +210,38 @@ pub async fn insert_dcr(
     pool: &PgPool,
     new: &NewDcrClient<'_>,
     now: DateTime<Utc>,
-) -> Result<ClientRecord, OkfError> {
+    max_unbound: i64,
+) -> Result<Option<ClientRecord>, OkfError> {
+    let mut tx = pool.begin().await?;
+    // Held until the commit (or the rollback when `tx` is dropped on an
+    // error). Read committed is enough under it: the previous holder has
+    // committed before this one gets the lock, so the count sees its row.
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(OAUTH_LOCK_NAMESPACE)
+        .bind(DCR_REGISTRATION_LOCK)
+        .execute(&mut *tx)
+        .await?;
     // `concat!` splices the shared column list into the `RETURNING` clause
-    // at compile time, so the row decodes through the same `ClientRow` as `find`.
+    // at compile time, so the row decodes through the same `ClientRow` as
+    // `find`. `INSERT ... SELECT ... WHERE` inserts nothing (and returns no
+    // row) when the cap is reached.
     let row = sqlx::query_as::<_, ClientRow>(concat!(
         "INSERT INTO oauth_clients \
          (client_id, kind, client_name, redirect_uris, metadata, created_at) \
-         VALUES (gen_random_uuid()::text, 'dcr', $1, $2, $3, $4) RETURNING ",
+         SELECT gen_random_uuid()::text, 'dcr', $1, $2, $3, $4 WHERE ",
+        unbound_dcr_count!(),
+        " < $5 RETURNING ",
         client_columns!()
     ))
     .bind(new.client_name)
     .bind(new.redirect_uris)
     .bind(new.metadata)
     .bind(now)
-    .fetch_one(pool)
+    .bind(max_unbound)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(row.into())
+    tx.commit().await?;
+    Ok(row.map(ClientRecord::from))
 }
 
 /// Stores a freshly fetched Client ID Metadata Document, or refreshes the
@@ -241,7 +280,7 @@ pub async fn upsert_cimd(pool: &PgPool, client: &ClientRecord) -> Result<(), Okf
 }
 
 /// How many DCR clients no grant points at: the number the registration cap
-/// (spec "Abuse limits", 500) counts.
+/// (spec "Abuse limits", 500) counts ([`insert_dcr`] checks it itself).
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -252,12 +291,11 @@ pub async fn upsert_cimd(pool: &PgPool, client: &ClientRecord) -> Result<(), Okf
 /// # Errors
 /// [`OkfError::Database`].
 pub async fn count_unbound_dcr(pool: &PgPool) -> Result<i64, OkfError> {
-    Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM oauth_clients c WHERE c.kind = 'dcr' \
-         AND NOT EXISTS (SELECT 1 FROM api_keys k WHERE k.client_id = c.client_id)",
+    Ok(
+        sqlx::query_scalar::<_, i64>(concat!("SELECT ", unbound_dcr_count!()))
+            .fetch_one(pool)
+            .await?,
     )
-    .fetch_one(pool)
-    .await?)
 }
 
 #[cfg(test)]
@@ -365,7 +403,10 @@ mod tests {
             metadata: &metadata,
         };
 
-        let first = insert_dcr(&db.pool, &named, now()).await.unwrap();
+        let first = insert_dcr(&db.pool, &named, now(), 500)
+            .await
+            .unwrap()
+            .expect("under the cap");
         let second = insert_dcr(
             &db.pool,
             &NewDcrClient {
@@ -373,9 +414,11 @@ mod tests {
                 ..named
             },
             now(),
+            500,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("under the cap");
 
         assert_eq!(first.kind, ClientKind::Dcr);
         assert_eq!(first.client_id.len(), 36, "a UUID: {}", first.client_id);
@@ -388,6 +431,29 @@ mod tests {
         assert_eq!(first.cache_expires_at, None);
         assert_eq!(first.created_at, now());
         assert_eq!(find(&db.pool, &first.client_id).await.unwrap(), Some(first));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_dcr_stops_at_the_cap_of_unbound_clients() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "main", "", now()).await.unwrap();
+        let uris = vec!["https://client.example.com/callback".to_string()];
+        let metadata = serde_json::json!({});
+        let new = NewDcrClient {
+            client_name: None,
+            redirect_uris: &uris,
+            metadata: &metadata,
+        };
+        insert_dcr_row(&db.pool, "unbound", now()).await;
+        insert_dcr_row(&db.pool, "bound", now()).await;
+        insert_grant(&db.pool, "bound", Access::Read, &["main"], now()).await;
+
+        let second = insert_dcr(&db.pool, &new, now(), 2).await.unwrap();
+        let third = insert_dcr(&db.pool, &new, now(), 2).await.unwrap();
+
+        assert!(second.is_some(), "a bound client does not count");
+        assert_eq!(third, None, "two unbound clients reach a cap of 2");
+        assert_eq!(count_unbound_dcr(&db.pool).await.unwrap(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]

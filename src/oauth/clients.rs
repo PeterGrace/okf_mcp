@@ -762,10 +762,6 @@ async fn register(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, 
         OAuthError::InvalidClientMetadata("the body must be a JSON object".to_string())
     })?;
     let metadata = validate_metadata(&document)?;
-    if client_rows::count_unbound_dcr(app.pool()).await? >= MAX_UNBOUND_DCR {
-        tracing::warn!("DCR refused: {MAX_UNBOUND_DCR} registered clients have no grant");
-        return Err(OAuthError::SlowDown);
-    }
     let now = app.clock().now();
     // The metadata as registered, which the response echoes; `client_name`
     // only when the client sent one.
@@ -778,7 +774,9 @@ async fn register(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, 
     stored.insert("response_types".to_string(), json!(metadata.response_types));
     stored.insert("token_endpoint_auth_method".to_string(), json!("none"));
     let stored = Value::Object(stored);
-    let client = client_rows::insert_dcr(
+    // `None`: the cap of unbound clients is reached (checked atomically with
+    // the insert, so concurrent registrations cannot pass it).
+    let Some(client) = client_rows::insert_dcr(
         app.pool(),
         &NewDcrClient {
             client_name: metadata.client_name.as_deref(),
@@ -786,8 +784,13 @@ async fn register(State(app): State<Arc<App>>, body: Bytes) -> Result<Response, 
             metadata: &stored,
         },
         now,
+        MAX_UNBOUND_DCR,
     )
-    .await?;
+    .await?
+    else {
+        tracing::warn!("DCR refused: {MAX_UNBOUND_DCR} registered clients have no grant");
+        return Err(OAuthError::SlowDown);
+    };
     let mut answer = stored;
     // `as_object_mut` borrows the JSON object's map mutably; it is always an
     // object here, since it was built from a `Map` just above.
@@ -1565,6 +1568,54 @@ mod tests {
         assert_eq!(last, StatusCode::CREATED, "the 500th is accepted");
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(json["error"], "slow_down");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_registrations_never_pass_the_cap() {
+        let test = rig(true).await;
+        sqlx::query(
+            "INSERT INTO oauth_clients (client_id, kind, redirect_uris, metadata, created_at) \
+             SELECT gen_random_uuid()::text, 'dcr', ARRAY['https://client.example.com/cb'], \
+                    '{}'::jsonb, now() FROM generate_series(1, 499)",
+        )
+        .execute(test.app.pool())
+        .await
+        .expect("fill");
+        let body = r#"{"redirect_uris": ["https://client.example.com/cb"]}"#;
+
+        // Eight requests at once (within the burst of 10), each on its own
+        // tokio task, so their database round trips overlap.
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let router = crate::oauth::routes().with_state(Arc::clone(&test.app));
+            requests.spawn(async move {
+                let request = Request::post("/oauth/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("request");
+                router.oneshot(request).await.expect("infallible").status()
+            });
+        }
+        let statuses = requests.join_all().await;
+
+        let created = statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CREATED)
+            .count();
+        assert_eq!(created, 1, "{statuses:?}");
+        assert!(
+            statuses.iter().all(|status| matches!(
+                *status,
+                StatusCode::CREATED | StatusCode::TOO_MANY_REQUESTS
+            )),
+            "{statuses:?}"
+        );
+        assert_eq!(
+            client_rows::count_unbound_dcr(test.app.pool())
+                .await
+                .expect("count"),
+            MAX_UNBOUND_DCR
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

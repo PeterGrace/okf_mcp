@@ -11,7 +11,10 @@
 - `POST /oauth/register`: RFC 7591 registration for public clients
   (`token_endpoint_auth_method` `none`; `https` redirect URIs, or `http` on
   loopback). Refused with `slow_down` past the rate limit or while 500
-  registered clients have no grant; 404 when `dcr_enabled = false`.
+  registered clients have no grant; 404 when `dcr_enabled = false`. The
+  cap is checked in the same statement as the insert, under a
+  transaction-scoped advisory lock, so concurrent registrations (from any
+  process) cannot pass it.
 - Client ID Metadata Documents: an `https://` `client_id` is fetched over
   HTTPS without redirects or a proxy, within 5 seconds (body included) and
   16 KiB (enforced while reading, with or without `Content-Length`), from a
@@ -24,7 +27,7 @@
   Concurrent requests for one URL fetch it once.
 - `oauth::clients::resolve`: an authorize request's `client_id` as a CIMD
   client (by URL) or a registered DCR client.
-- Store: `insert_dcr`, `upsert_cimd`, `count_unbound_dcr`.
+- Store: `insert_dcr` (capped, atomic), `upsert_cimd`, `count_unbound_dcr`.
 - `tests/cimd_no_proxy.rs`: the fetcher ignores `HTTP_PROXY`/`ALL_PROXY`.
 
 ## Changed
