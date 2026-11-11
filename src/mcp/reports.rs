@@ -354,8 +354,16 @@ async fn one_view(
 impl OkfServer {
     /// The `open_questions` tool.
     #[tool(
+        title = "List Open Questions",
         description = "Every queued open_questions entry in a catalog, grouped by concept \
-                          and numbered from 1 (the number `unquestion` takes)."
+                          and numbered from 1 (the number `unquestion` takes).",
+        annotations(
+            title = "List Open Questions",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn open_questions(
         &self,
@@ -368,8 +376,16 @@ impl OkfServer {
 
     /// The `oldest` tool.
     #[tool(
+        title = "Oldest Concepts",
         description = "The stalest concepts (okf.py oldest --json): last stamp, by whom, \
-                          age in days, stale flag and queued questions."
+                          age in days, stale flag and queued questions.",
+        annotations(
+            title = "Oldest Concepts",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn oldest(
         &self,
@@ -382,8 +398,16 @@ impl OkfServer {
 
     /// The `sprawl` tool.
     #[tool(
+        title = "Sprawl Report",
         description = "Sprawl scores (okf.py sprawl --json): which concepts have grown too \
-                          long or volatile, with sections and split candidates."
+                          long or volatile, with sections and split candidates.",
+        annotations(
+            title = "Sprawl Report",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn sprawl(
         &self,
@@ -396,9 +420,17 @@ impl OkfServer {
 
     /// The `links_report` tool.
     #[tool(
+        title = "Links Report",
         description = "The link report (okf.py links --json): broken links and anchors, \
                           relative links, orphans, dead ends, index drift and (unless \
-                          `mentions` is false) unlinked mentions."
+                          `mentions` is false) unlinked mentions.",
+        annotations(
+            title = "Links Report",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn links_report(
         &self,
@@ -411,10 +443,18 @@ impl OkfServer {
 
     /// The `lint` tool.
     #[tool(
+        title = "Lint Catalog",
         description = "Lint a catalog (okf.py lint --json): errors and warnings with file, \
                           line, rule and message. Without `changeset`, the published catalog; \
                           with `changeset` (a handle from open_changeset), that changeset's \
-                          drafts applied to it, the changed paths counted as uncommitted."
+                          drafts applied to it, the changed paths counted as uncommitted.",
+        annotations(
+            title = "Lint Catalog",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn lint(
         &self,

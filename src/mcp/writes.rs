@@ -214,12 +214,20 @@ pub(crate) async fn set_frontmatter(
 impl OkfServer {
     /// The `create_concept` tool.
     #[tool(
+        title = "Create Concept",
         description = "Create a concept in the changeset `changeset` names (open one with \
                        open_changeset); nothing is visible to others until `publish`. `path` is \
                        the new concept's path, `.md` optional (e.g. /infra/ntp). Needs `type` in \
                        `frontmatter`; the server writes `generated: { by, at }` itself. With \
                        `index_summary`, also lists it in its folder's index.md (creating folder \
-                       indexes as needed). Write access."
+                       indexes as needed). Write access.",
+        annotations(
+            title = "Create Concept",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn create_concept(
         &self,
@@ -232,11 +240,19 @@ impl OkfServer {
 
     /// The `edit_document` tool.
     #[tool(
+        title = "Edit Document",
         description = "Replace exact text in a concept or an index.md, in the changeset \
                        `changeset` names (open one with open_changeset). `path` is a full path \
                        with .md (e.g. /infra/ntp.md or /infra/index.md). `old_str` must occur \
                        exactly once unless `replace_all`; the edit may not add or change \
-                       frontmatter. log.md and machinery are refused (use `log`). Write access."
+                       frontmatter. log.md and machinery are refused (use `log`). Write access.",
+        annotations(
+            title = "Edit Document",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn edit_document(
         &self,
@@ -249,10 +265,18 @@ impl OkfServer {
 
     /// The `replace_body` tool.
     #[tool(
+        title = "Replace Concept Body",
         description = "Replace a concept's body, keeping its frontmatter byte for byte, in the \
                        changeset `changeset` names (open one with open_changeset). `path` is a \
                        concept reference, .md optional (/infra/ntp or /infra/ntp.md). Write \
-                       access."
+                       access.",
+        annotations(
+            title = "Replace Concept Body",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn replace_body(
         &self,
@@ -265,11 +289,19 @@ impl OkfServer {
 
     /// The `set_frontmatter` tool.
     #[tool(
+        title = "Set Frontmatter",
         description = "Set (or, with a null value, delete) one descriptive frontmatter key of a \
                        concept, in the changeset `changeset` names (open one with \
                        open_changeset). `path` is a concept reference, .md optional (/infra/ntp \
                        or /infra/ntp.md). The stamps, open_questions and sources have their own \
-                       tools; `type` cannot be deleted. Write access."
+                       tools; `type` cannot be deleted. Write access.",
+        annotations(
+            title = "Set Frontmatter",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn set_frontmatter(
         &self,
@@ -659,10 +691,18 @@ pub(crate) async fn index(ctx: &ToolContext, params: IndexParams) -> Result<Writ
 impl OkfServer {
     /// The `stamp` tool.
     #[tool(
+        title = "Stamp Concept",
         description = "okf.py stamp: set a concept's `generated` (content written) or append to \
                        its `verified` (checked against the real system) with { by, at: now }, in \
                        the changeset `changeset` names (open one with open_changeset). `by` \
-                       defaults to the key's actor. Write access."
+                       defaults to the key's actor. Write access.",
+        annotations(
+            title = "Stamp Concept",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn stamp(
         &self,
@@ -675,10 +715,18 @@ impl OkfServer {
 
     /// The `review` tool.
     #[tool(
+        title = "Record Review",
         description = "okf.py review: replace a concept's `reviewed` with { by, at: now, outcome, \
                        note } and queue any `questions` in open_questions, in the changeset \
                        `changeset` names (open one with open_changeset). `by` defaults to the \
-                       key's actor. Write access."
+                       key's actor. Write access.",
+        annotations(
+            title = "Record Review",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn review(
         &self,
@@ -691,9 +739,17 @@ impl OkfServer {
 
     /// The `question` tool.
     #[tool(
+        title = "Add Question",
         description = "okf.py question: queue one question in a concept's open_questions without \
                        recording a review, in the changeset `changeset` names (open one with \
-                       open_changeset). Write access."
+                       open_changeset). Write access.",
+        annotations(
+            title = "Add Question",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn question(
         &self,
@@ -706,10 +762,18 @@ impl OkfServer {
 
     /// The `unquestion` tool.
     #[tool(
+        title = "Resolve Question",
         description = "okf.py unquestion: remove one queued question, by its 1-based number in \
                        open_questions or its exact text, deleting the key when none are left, in \
                        the changeset `changeset` names (open one with open_changeset). Write \
-                       access."
+                       access.",
+        annotations(
+            title = "Resolve Question",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn unquestion(
         &self,
@@ -722,9 +786,17 @@ impl OkfServer {
 
     /// The `add_source` tool.
     #[tool(
+        title = "Add Source",
         description = "okf.py source: append an entry (id, resource, title, author) to a \
                        concept's `sources`, refusing a duplicate id, in the changeset `changeset` \
-                       names (open one with open_changeset). Write access."
+                       names (open one with open_changeset). Write access.",
+        annotations(
+            title = "Add Source",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn add_source(
         &self,
@@ -737,11 +809,19 @@ impl OkfServer {
 
     /// The `remove_source` tool.
     #[tool(
+        title = "Remove Source",
         description = "Remove the entry with `id` from a concept's `sources`, deleting the key \
                        when none are left, in the changeset `changeset` names (open one with \
                        open_changeset). Refused while a footnote in the body still cites it (its \
                        label is the id, or its definition names the id, title or resource): \
-                       remove the citation first. Write access."
+                       remove the citation first. Write access.",
+        annotations(
+            title = "Remove Source",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn remove_source(
         &self,
@@ -754,10 +834,18 @@ impl OkfServer {
 
     /// The `log` tool.
     #[tool(
+        title = "Add Log Entry",
         description = "okf.py log: add `* **<kind>:** <text>` under today's UTC date in log.md, \
                        the only way to write log.md, in the changeset `changeset` names (open one \
                        with open_changeset). Replayed at publish onto a log.md that changed \
-                       meanwhile, so concurrent entries never conflict. Write access."
+                       meanwhile, so concurrent entries never conflict. Write access.",
+        annotations(
+            title = "Add Log Entry",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn log(
         &self,
@@ -770,11 +858,19 @@ impl OkfServer {
 
     /// The `index` tool.
     #[tool(
+        title = "Add Index Entry",
         description = "okf.py index: list a concept in its folder's index.md as `* \
                        [Title](name.md) - summary`, in the changeset `changeset` names (open one \
                        with open_changeset); nothing happens if it is already linked. Replayed at \
                        publish onto an index.md that changed meanwhile, unless a free edit of \
-                       that index.md follows. Write access."
+                       that index.md follows. Write access.",
+        annotations(
+            title = "Add Index Entry",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn index(
         &self,

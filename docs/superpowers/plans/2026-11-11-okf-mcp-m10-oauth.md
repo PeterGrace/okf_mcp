@@ -440,6 +440,8 @@ beside Task 2.
 
 Create `src/mcp/annotations.rs`:
 
+> **Corrected (issue #245, 2026-11-11).** The block below is now as `cargo fmt` lays it out (the `DESTRUCTIVE` list on one line, two `assert_eq!`s wrapped); the code is unchanged.
+
 ```rust
 //! The connector directories' tool metadata (M10 Task 1): every tool has a
 //! title and all four behaviour hints, and is classified exactly once here,
@@ -499,12 +501,7 @@ const STAGED: &[&str] = &[
 ];
 
 /// Tools that cannot be undone from inside the server, or that delete.
-const DESTRUCTIVE: &[&str] = &[
-    "delete_concept",
-    "discard",
-    "maintenance_close",
-    "publish",
-];
+const DESTRUCTIVE: &[&str] = &["delete_concept", "discard", "maintenance_close", "publish"];
 
 /// The hints a tool's class implies (`open_world` is always false: every
 /// tool acts only on this server's catalogs).
@@ -595,8 +592,16 @@ fn every_tool_has_a_title_and_all_four_hints() {
             "{name}: the annotation title differs from the tool title"
         );
         assert_eq!(annotations.read_only_hint, Some(hints.read_only), "{name}");
-        assert_eq!(annotations.destructive_hint, Some(hints.destructive), "{name}");
-        assert_eq!(annotations.idempotent_hint, Some(hints.idempotent), "{name}");
+        assert_eq!(
+            annotations.destructive_hint,
+            Some(hints.destructive),
+            "{name}"
+        );
+        assert_eq!(
+            annotations.idempotent_hint,
+            Some(hints.idempotent),
+            "{name}"
+        );
         assert_eq!(annotations.open_world_hint, Some(false), "{name}");
     }
 }

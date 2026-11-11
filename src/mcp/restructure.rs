@@ -170,6 +170,7 @@ pub(crate) async fn delete_concept(
 impl OkfServer {
     /// The `move_concept` tool.
     #[tool(
+        title = "Move Concept",
         description = "Move or rename a concept (port of `okf.py mv`) in the changeset \
                        `changeset` names (open one with open_changeset): its folder listing moves \
                        with it \
@@ -177,7 +178,14 @@ impl OkfServer {
                        keeping each link's style and anchor. `old` and `new` are concept paths, \
                        .md optional. Publish replays the index.md and log.md edits onto newer \
                        text; any other file it changed conflicts if someone changed it meanwhile. \
-                       Write access."
+                       Write access.",
+        annotations(
+            title = "Move Concept",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn move_concept(
         &self,
@@ -190,13 +198,21 @@ impl OkfServer {
 
     /// The `split_concept` tool.
     #[tool(
+        title = "Split Concept",
         description = "Carve a section (and its subsections) out of a concept into a new concept, \
                        in the changeset `changeset` names (open one with open_changeset); a port \
                        of `okf.py split`. The new concept gets type, title, description, the \
                        parent's status, generated, and the sources the section's footnotes cite \
                        (or `sources`); the parent keeps the heading with a stub linking to it; \
                        links to the section follow it; it is listed in its folder's index.md. \
-                       Returns okf.py's notes. Write access."
+                       Returns okf.py's notes. Write access.",
+        annotations(
+            title = "Split Concept",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn split_concept(
         &self,
@@ -209,12 +225,20 @@ impl OkfServer {
 
     /// The `delete_concept` tool.
     #[tool(
+        title = "Delete Concept",
         description = "Delete a concept and its listing in its folder's index.md, in the \
                        changeset `changeset` names (open one with open_changeset). Refused with \
                        StillLinked, listing each link (source, line), while any other document \
                        links to it, log.md and other index.md files included; move_concept or \
                        edit_document fixes them first. index.md files are never deleted. Write \
-                       access."
+                       access.",
+        annotations(
+            title = "Delete Concept",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn delete_concept(
         &self,

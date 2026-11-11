@@ -90,9 +90,17 @@ impl OkfServer {
     // the macro finds the output schema by reading `Json<...>` in the
     // written type, and an alias hides it.
     #[tool(
+        title = "List Catalogs",
         description = "List the catalogs this API key can reach (name, description, file \
                        count, last change) and this connection's selection: the catalogs \
-                       a call without a `catalog` argument reads, and the default write target."
+                       a call without a `catalog` argument reads, and the default write target.",
+        annotations(
+            title = "List Catalogs",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_catalogs(
         &self,
