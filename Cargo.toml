@@ -3,6 +3,7 @@ name = "okf_mcp"
 default-run = "okf-mcp"
 version = "0.12.1"
 edition = "2021"
+license = "AGPL-3.0-only"
 authors = ["Peter Grace <pete.grace@gmail.com>"]
 
 [lib]
