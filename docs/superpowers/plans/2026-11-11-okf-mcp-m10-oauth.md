@@ -72,6 +72,7 @@ Filled in as tasks land, as in M9 (dated `> **Corrected (issue #N).**` notes in 
 9. **Rate limits** (Task 2): register, a burst of 10 then one every 6 seconds; token and revoke, 60 then 2 a second; consent POST, 20 then 1 a second.
 10. **`sign_in_codes_redeemed_grant`** (Task 2, corrected issue #246, 2026-11-11) is `grant_id IS NULL OR redeemed_at IS NOT NULL`, a check the spec's DDL lacks; Task 8 adds it to the spec.
 11. **`okf-mcp key revoke|grant|ungrant|maintenance-report` resolve API keys only** (Task 4, issue #248, 2026-11-11): `store::keys::resolve_active` filters `kind = 'key'` by id and by name, so a key name never matches, collides with or is made ambiguous by an OAuth grant. Grants are reached by exact id only: `okf-mcp oauth grant revoke` and the `/api/v1/keys/{id}` routes (`Selector::Exact`). Task 8 adds this to the spec.
+12. **The discovery documents are `Cache-Control: no-store`** (Task 3, corrected issue #247, 2026-11-11), like every OAuth route, not `public, max-age=300`: Task 2's layer sets it on everything under `oauth::routes()`. They still carry `Access-Control-Allow-Origin: *`.
 
 ## Verified facts the code relies on
 
@@ -207,7 +208,9 @@ pub async fn find(pool: &PgPool, client_id: &str) -> Result<Option<ClientRecord>
 pub async fn prune_unbound_dcr(pool: &PgPool, created_before: DateTime<Utc>) -> Result<u64, OkfError>;
 // Task 3:
 pub struct NewDcrClient<'a> { /* client_name, redirect_uris, metadata */ }
-pub async fn insert_dcr(pool: &PgPool, new: &NewDcrClient<'_>, now: DateTime<Utc>) -> Result<ClientRecord, OkfError>; // id: gen_random_uuid()::text
+pub async fn insert_dcr(pool: &PgPool, new: &NewDcrClient<'_>, now: DateTime<Utc>, max_unbound: i64) -> Result<Option<ClientRecord>, OkfError>; // id: gen_random_uuid()::text; None at the cap
+// Corrected (issue #247, 2026-11-11, PR #257 review): the cap check and the insert are one statement under a
+// transaction-scoped advisory lock, so concurrent registrations cannot pass the cap.
 pub async fn upsert_cimd(pool: &PgPool, client: &ClientRecord) -> Result<(), OkfError>;
 pub async fn count_unbound_dcr(pool: &PgPool) -> Result<i64, OkfError>;
 
@@ -367,6 +370,7 @@ pub async fn start_oauth_server(catalogs: Vec<(&str, Files)>) -> (TestServer, Ci
 | `src/store/oauth/codes.rs` | 2, then 4 |
 | `src/oauth/mod.rs`, `error.rs`, `expiring.rs`, `ratelimit.rs`, `state.rs`, `access.rs` | 2 |
 | `src/oauth/metadata.rs`, `clients.rs` | 2 (stubs), 3 |
+| `tests/cimd_no_proxy.rs` (new: the fetcher ignores proxy variables; a binary of its own because it sets the environment) | 3 |
 | `src/oauth/pkce.rs`, `authorize.rs`, `consent.rs` | 2 (stubs), 5 |
 | `src/oauth/testing.rs` (test helpers), `src/http/ui/consent.css` | 5 |
 | `src/oauth/token.rs` | 2 (stub), 6 |
@@ -4819,6 +4823,7 @@ Depends on Task 2 (the `src/oauth/` skeleton, `OAuth`, `OAuthSettings`, `OAuthEr
 - Modify: `Cargo.toml` (`url`), `Cargo.lock`
 - Replace (Task 2 stubs): `src/oauth/metadata.rs`, `src/oauth/clients.rs`
 - Modify: `src/store/oauth/clients.rs` (append Task 3 functions and their tests)
+- Create: `tests/cimd_no_proxy.rs` (added by issue #247: the no-proxy defence's test)
 - Create: `changelog/<date -u +%Y-%m-%dT%H%M%SZ>-m10-task-03-metadata-dcr-cimd.md`
 
 - [ ] **Step 1: Add the `url` dependency**
@@ -4978,6 +4983,8 @@ Expected: the three pure tests FAIL to compile until Step 3 defines the structs.
 - [ ] **Step 3: Write the documents**
 
 `src/oauth/metadata.rs` (whole file; the tests from Step 2 stay at the bottom):
+
+> **Corrected (issue #247, 2026-11-11).** Task 2's `oauth::routes()` layers `Cache-Control: no-store` over every OAuth response, so the `public, max-age=300` below never reached a client: `public()` sets only `Access-Control-Allow-Origin: *`, and the documents are `no-store` like the rest. The routes use `PROTECTED_RESOURCE_PATH` and `AUTHORIZATION_SERVER_PATH`. The router tests send through `crate::oauth::routes()` (as `http::router` mounts it) and also check `no-store`, CORS on both documents, and 404 at all three paths without OAuth. Read `src/oauth/metadata.rs`.
 
 ```rust
 //! The two discovery documents (spec "Endpoints"): Protected Resource
@@ -5162,6 +5169,8 @@ Expected: 5 passed.
 
 Append to the `#[cfg(test)] mod tests` of `src/store/oauth/clients.rs` (Task 2 created the module; add `use super::*;` and `use crate::db::test_db;` if absent):
 
+> **Corrected (issue #247, 2026-11-11).** Task 2's test module already has a local `insert_dcr(pool, client_id, created_at)` helper, which would shadow the new `super::insert_dcr` (a local item beats a glob import); it is renamed `insert_dcr_row`. The tests use Task 2's `now()`, `insert_client` and `insert_grant` instead of `at(hour)` and a hand-written `api_keys` insert, `prune_unbound_dcr` keeps Task 2's own test, and two tests are added: `upsert_cimd_never_rewrites_a_dcr_row` and `only_dcr_clients_without_a_grant_are_counted`. Read the module.
+
 ```rust
     fn at(hour: u32) -> DateTime<Utc> {
         use chrono::TimeZone;
@@ -5280,6 +5289,8 @@ Run: `cargo test --lib store::oauth::clients`
 Expected: FAIL to compile (`insert_dcr`, `NewDcrClient`, `upsert_cimd`, `count_unbound_dcr` not found).
 
 - [ ] **Step 6: Write the store functions**
+
+> **Corrected (issue #247, 2026-11-11, PR #257 review).** `register` below counted the unbound clients and then inserted, so concurrent registrations at 499 all read 499 and all inserted (a test saw 6 or 7 of 8 succeed). What shipped: `insert_dcr(pool, new, now, max_unbound) -> Result<Option<ClientRecord>, OkfError>` takes `pg_advisory_xact_lock(0x6f6b666f /* "okfo" */, 1)` in a transaction and runs one `INSERT ... SELECT ... WHERE <unbound count> < $5 RETURNING ...`; `None` means the cap was reached. The count subquery is a private `unbound_dcr_count!()` macro shared with `count_unbound_dcr`. `register` calls it with `MAX_UNBOUND_DCR` and answers `slow_down` on `None`, with no separate count. The lock is in the database, so it holds for a CLI or a second process too. Tests: `insert_dcr_stops_at_the_cap_of_unbound_clients` (store) and `concurrent_registrations_never_pass_the_cap` (8 simultaneous registrations at 499: exactly one 201, the rest 429, 500 stored). Read `src/store/oauth/clients.rs` and `register` in `src/oauth/clients.rs`.
 
 Append to `src/store/oauth/clients.rs`, above its test module. This reuses Task 2's `client_columns!()`, `ClientRow` and `From<ClientRow> for ClientRecord` (correction 2). `prune_unbound_dcr` is Task 2's (its correction 6); the test below exercises it beside this task's functions, and the code block below does not repeat it.
 
@@ -5574,6 +5585,16 @@ Expected: FAIL to compile until Step 8 defines the functions.
 - [ ] **Step 8: Write `src/oauth/clients.rs`**
 
 Whole file (the Step 7 tests at the bottom, extended in Steps 9 and 11):
+
+> **Corrected (issue #247, 2026-11-11).** What shipped differs from the block below in these points (read `src/oauth/clients.rs`):
+> - `is_loopback_host` takes `&Host<&str>`: `url::Host<&str>` is not `Copy`, and a value bound in a match pattern cannot be moved into the guard (E0507).
+> - The resolver reports "no address" with a typed `NoAddress` error, found in reqwest's source chain like `RefusedAddress`, instead of matching the text "no addresses".
+> - The name lookup is a `Lookup` function pointer: `CimdFetcher::new` calls a private `with_lookup(allow_private, allow_http, system_lookup)`, and tests pass fixed answers to prove the connection goes only to the addresses the guard checked.
+> - `is_public_v6` also judges 6to4 (`2002::/16`) by its embedded IPv4 address and refuses `::/96` (IPv4-compatible).
+> - `resolve_cimd` truncates `now` to microseconds (`SubsecRound::trunc_subsecs(6)`), so the record it returns equals the row a later cache hit reads back.
+> - `register` stores and echoes `client_name` only when the client sent one (no `null`), and relies on the `no-store` layer in `oauth::routes()` rather than setting the header itself.
+> - `CimdError` derives `Clone, Copy, PartialEq, Eq`, so tests compare results with `assert_eq!`.
+> - **Corrected (issue #247, 2026-11-11, PR #257 review).** `validate_metadata` refuses anything but a JSON object (`invalid_client_metadata`) before deserializing: serde's derived struct deserializer also accepts an array in field order, so `["Example", ["https://client.example.com/cb"], null, null, null]` registered a client. CIMD documents share the check. Tests: `metadata_must_be_a_json_object` and `registration_refuses_metadata_that_is_not_an_object`.
 
 ```rust
 //! OAuth clients (spec "Client ID Metadata Documents", "`POST /oauth/register`"):
@@ -6454,6 +6475,8 @@ Add to the `tests` module of `src/oauth/clients.rs`. The local host is an axum s
     }
 ```
 
+> **Corrected (issue #247, 2026-11-11).** Observed as the plan expected: `Redirect::temporary` answers 307, and `https_only(true)` refuses an `http` URL before sending (`CimdError::Transport`). The tests that shipped differ: the host type is `CimdHost` (`Host` collides with `url::Host`); a raw-socket `raw_host` serves a body with no `Content-Length`, so the 16 KiB cap is tested while streaming, and a body that arrives after the deadline (`the_fetcher_gives_up_after_its_deadline`); `/text` tests non-JSON; a mixed public-and-private lookup is refused; `the_fetcher_connects_only_to_the_addresses_its_resolver_checked` tests pinning (and `Unresolvable`); `tests/cimd_no_proxy.rs` tests `no_proxy`. Each defence was removed in turn and its test failed.
+
 Run: `cargo test --lib oauth::clients`
 Expected: these 4 tests pass with Step 8's code (they test it; there is no new production code). If `the_fetcher_refuses_redirects_oversize_and_non_json` reports a different redirect status, adjust the expected status to the one `Redirect::temporary` sends: axum 0.8.9 sends 307. If `without_allow_http_plain_http_is_refused` sees another variant, check how `https_only` reports itself (`reqwest::Error::is_builder`). Either way, record the observed behaviour in a `> **Corrected (issue #N).**` note.
 
@@ -6465,6 +6488,8 @@ Expected: 10 passed.
 - [ ] **Step 11: Write the `resolve` and registration tests**
 
 Add to the same `tests` module. They need an `App` with OAuth on: a loopback `http` `public_url` (passes `Config::validate`) with `cimd_allow_private`, which by correction 4 also allows `http` CIMD URLs.
+
+> **Corrected (issue #247, 2026-11-11).** `rig_config` starts from Task 2's `store::oauth::testing::oauth_config`. `register_request` sends through `crate::oauth::routes()`, so `no-store` comes from the real layer. The cap test stores 499 clients and checks that the 500th registers and the 501st is refused; `registration_is_rate_limited` checks the burst of 10. Read the module.
 
 ```rust
     use axum::body::Body;
@@ -9324,7 +9349,6 @@ use crate::http::api::testing::MAIN;
 use crate::http::router;
 use crate::mcp::testing::{app_with, TestApp};
 use crate::store::keys::{Access, Grants};
-use crate::store::oauth::clients::{self as client_rows, ClientKind, ClientRecord};
 use crate::store::oauth::codes::{self as code_rows, NewSignInCode};
 
 /// The public URL the test apps run under.
@@ -9347,18 +9371,17 @@ pub(crate) async fn oauth_app() -> TestApp {
         ..Config::default()
     };
     let test = app_with(&[("main", MAIN), ("other", &[("index.md", "# Other\n")])], config).await;
-    let client = ClientRecord {
-        client_id: CLIENT_ID.to_string(),
-        kind: ClientKind::Dcr,
-        client_name: Some("Example Client".to_string()),
-        redirect_uris: vec![REDIRECT_URI.to_string()],
-        metadata: serde_json::json!({ "redirect_uris": [REDIRECT_URI] }),
-        fetched_at: None,
-        created_at: Utc::now(),
-    };
-    client_rows::insert_dcr(test.app.pool(), &client)
-        .await
-        .expect("register the test client");
+    // Corrected (issue #247, 2026-11-11): `insert_dcr` lets Postgres pick a
+    // UUID, so the fixed test id is written with plain SQL.
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, kind, client_name, redirect_uris, metadata, created_at) \
+         VALUES ($1, 'dcr', 'Example Client', ARRAY[$2], jsonb_build_object('redirect_uris', ARRAY[$2]), now())",
+    )
+    .bind(CLIENT_ID)
+    .bind(REDIRECT_URI)
+    .execute(test.app.pool())
+    .await
+    .expect("register the test client");
     test
 }
 
@@ -10549,7 +10572,7 @@ use axum::Router;
 use chrono::{TimeDelta, Utc};
 use okf_mcp::config::Config;
 use okf_mcp::store::keys::{Access, Grants};
-use okf_mcp::store::oauth::clients::{self as client_rows, ClientKind, ClientRecord};
+use okf_mcp::store::oauth::clients::{self as client_rows, NewDcrClient};
 use okf_mcp::store::oauth::codes::{self as code_rows, NewSignInCode};
 use rustwright::GotoOptions;
 
@@ -10580,20 +10603,24 @@ async fn a_person_enters_a_code_approves_and_lands_back_at_the_client() {
     .await;
     let client_base = callback_host().await;
     let redirect_uri = format!("{client_base}/callback");
-    client_rows::insert_dcr(
+    // Corrected (issue #247, 2026-11-11): `insert_dcr` takes a `NewDcrClient`
+    // and the cap of unbound clients, and returns the stored client (whose id
+    // Postgres picks), or `None` at the cap.
+    let redirect_uris = [redirect_uri.clone()];
+    let metadata = serde_json::json!({ "redirect_uris": [redirect_uri] });
+    let client = client_rows::insert_dcr(
         &server.db.pool,
-        &ClientRecord {
-            client_id: "journey-client".to_string(),
-            kind: ClientKind::Dcr,
-            client_name: Some("Example Client".to_string()),
-            redirect_uris: vec![redirect_uri.clone()],
-            metadata: serde_json::json!({ "redirect_uris": [redirect_uri] }),
-            fetched_at: None,
-            created_at: Utc::now(),
+        &NewDcrClient {
+            client_name: Some("Example Client"),
+            redirect_uris: &redirect_uris,
+            metadata: &metadata,
         },
+        Utc::now(),
+        okf_mcp::oauth::clients::MAX_UNBOUND_DCR,
     )
     .await
-    .expect("register the client");
+    .expect("register the client")
+    .expect("under the cap");
     let catalogs = ["main".to_string()];
     let code = code_rows::create(
         &server.db.pool,
@@ -10613,7 +10640,7 @@ async fn a_person_enters_a_code_approves_and_lands_back_at_the_client() {
     let query = form_urlencoded::Serializer::new(String::new())
         .extend_pairs([
             ("response_type", "code"),
-            ("client_id", "journey-client"),
+            ("client_id", client.client_id.as_str()),
             ("redirect_uri", redirect_uri.as_str()),
             ("state", "xyz"),
             // RFC 7636 appendix B's challenge: a published vector.
@@ -10737,6 +10764,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - **Interface corrections this task makes** (already folded into "Interfaces shared across tasks"):
   - `CredentialKind::OAuth { client_id: Option<String>, client_name: Option<String> }` gains `client_id`, filled from `KeyRecord.client_id` in `From<KeyRecord> for Principal`. The token endpoint checks that a refresh request's `client_id` is the grant's own. Task 2's `KeyRecord` already carries `client_id`, so this is one field in `auth.rs`.
   - **Task 3 correction:** with `cimd_allow_private = true` (test rigs only), `clients::resolve` also treats an `http://` `client_id` on a loopback host as a CIMD URL. Without that, the end-to-end CIMD test needs a TLS host and a trusted test CA. If Task 3 landed without it, add it there in this PR, with a unit test, and note it.
+    (Landed in Task 3, issue #247: `allow_http` is `cimd_allow_private` with an `http://` issuer, and `resolve` takes any `http://` `client_id` as a CIMD URL then; covered by `resolve_fetches_once_then_serves_the_cache`.)
   - `tests/support/server.rs` gains `TestServer::start_with`. `serve_app` binds before loading.
 - RFC 7009 says a revocation request's token should belong to the requesting client. Tokens here carry no client id, and the clients are public (no authentication), so this endpoint revokes whatever token it is given. Knowing a token already grants everything revoking it could take away. Recorded as a decision in the plan.
 

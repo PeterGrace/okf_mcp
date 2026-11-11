@@ -93,6 +93,10 @@ toml = "1.1"
 tower-http = { version = "0.6.11", features = ["trace", "timeout"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
+# Parsing and checking OAuth URLs: CIMD client ids and redirect URIs
+# (`src/oauth/clients.rs`). Already in the tree through reqwest; pinned to
+# the same version so there is one copy.
+url = "2.5.8"
 
 [dev-dependencies]
 # Property-based tests (Hypothesis-backed); the library is imported as `hegel`.
