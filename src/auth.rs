@@ -1,6 +1,7 @@
-//! API-key authentication (design "Data flow", "Read", step 1): the
-//! in-memory key cache, the [`Principal`] a request acts as, and the axum
-//! middleware that requires a key on every route but `/healthz`.
+//! API-key and OAuth-token authentication (design "Data flow", "Read", step
+//! 1): the in-memory key cache, the [`Principal`] a request acts as, the
+//! [`BearerVerifier`] seam between credential kinds, and the axum
+//! middleware that requires a credential on every route but `/healthz`.
 //!
 //! Keys are looked up by their SHA-256 in a `HashMap`. A timing difference
 //! in that lookup can tell an attacker only how the *hash* of a guess
@@ -8,17 +9,22 @@
 //! no constant-time scan (the design's deviation, recorded in the M4 plan).
 
 use std::collections::{BTreeSet, HashMap};
+// `Future` is not in the 2021 prelude; the trait below names it.
+use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sqlx::PgPool;
 
+use crate::app::App;
 use crate::error::OkfError;
+use crate::http::AppError;
 use crate::keys;
-use crate::store::keys::{self as key_rows, Access, KeyRecord};
+use crate::oauth::access::OAuthVerifier;
+use crate::store::keys::{self as key_rows, Access, KeyKind, KeyRecord};
 
 /// The catalogs a key may reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +35,22 @@ pub enum Reach {
     Catalogs(BTreeSet<String>),
 }
 
-/// Who a request acts as: one live API key (never the key itself).
+/// What credential a request came with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialKind {
+    /// An `okf_` API key.
+    ApiKey,
+    /// An OAuth access token of a grant.
+    OAuth {
+        /// The grant's client id (`None` once the client row is gone).
+        client_id: Option<String>,
+        /// The grant's client, as it names itself.
+        client_name: Option<String>,
+    },
+}
+
+/// Who a request acts as: one live API key or OAuth grant (never the
+/// secret itself).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     /// The key's id.
@@ -44,6 +65,8 @@ pub struct Principal {
     pub default_catalog: Option<String>,
     /// The actor its writes are recorded as.
     pub actor: String,
+    /// An API key or an OAuth grant.
+    pub kind: CredentialKind,
 }
 
 impl Principal {
@@ -116,6 +139,15 @@ impl From<KeyRecord> for Principal {
         } else {
             Reach::Catalogs(record.catalogs.into_iter().collect())
         };
+        let kind = match record.kind {
+            KeyKind::Key => CredentialKind::ApiKey,
+            // Moving the two fields out of `record` is fine: the struct
+            // literal below moves only its other fields.
+            KeyKind::OAuth => CredentialKind::OAuth {
+                client_id: record.client_id,
+                client_name: record.client_name,
+            },
+        };
         Self {
             key_id: record.id,
             access: record.access,
@@ -123,36 +155,57 @@ impl From<KeyRecord> for Principal {
             reach,
             default_catalog: record.default_catalog,
             actor: record.actor,
+            kind,
         }
     }
 }
 
-/// Every live key, by SHA-256. Immutable: a reload builds a new one.
+/// Every live key, by SHA-256, and every live OAuth grant, by id.
+/// Immutable: a reload builds a new one.
 #[derive(Debug, Default)]
 pub struct KeyCache {
     by_hash: HashMap<[u8; 32], Arc<Principal>>,
+    // Grants have no secret of their own: an access token names one by id.
+    by_id: HashMap<String, Arc<Principal>>,
 }
 
 impl KeyCache {
-    /// Builds the cache from stored keys, leaving out revoked ones.
+    /// Builds the cache from stored rows, leaving out revoked ones.
     ///
     /// # Arguments
-    /// * `records` - the keys, as [`key_rows::list`] returns them.
+    /// * `records` - the rows, as [`key_rows::list`] returns them.
     ///
     /// # Returns
     /// The cache.
     pub fn from_records(records: Vec<KeyRecord>) -> Self {
-        let by_hash = records
+        let mut cache = Self::default();
+        for record in records
             .into_iter()
             .filter(|record| record.revoked_at.is_none())
-            .filter_map(|record| {
-                // The schema checks `length(sha256) = 32`, so this fails only
-                // on a row edited by hand; such a key cannot authenticate.
-                let hash: [u8; 32] = record.sha256.as_slice().try_into().ok()?;
-                Some((hash, Arc::new(Principal::from(record))))
-            })
-            .collect();
-        Self { by_hash }
+        {
+            match record.kind {
+                KeyKind::Key => {
+                    // The schema checks `length(sha256) = 32`, so this fails
+                    // only on a row edited by hand; such a key cannot
+                    // authenticate. `let ... else` skips it.
+                    let Some(hash) = record
+                        .sha256
+                        .as_deref()
+                        .and_then(|sha256| <[u8; 32]>::try_from(sha256).ok())
+                    else {
+                        continue;
+                    };
+                    cache
+                        .by_hash
+                        .insert(hash, Arc::new(Principal::from(record)));
+                }
+                KeyKind::OAuth => {
+                    let id = record.id.clone();
+                    cache.by_id.insert(id, Arc::new(Principal::from(record)));
+                }
+            }
+        }
+        cache
     }
 
     /// The principal of a presented key.
@@ -164,6 +217,17 @@ impl KeyCache {
     /// Its principal, or `None` for an unknown or revoked key.
     pub fn find(&self, presented: &str) -> Option<Arc<Principal>> {
         self.by_hash.get(&keys::hash(presented)).cloned()
+    }
+
+    /// A live OAuth grant's principal.
+    ///
+    /// # Arguments
+    /// * `grant_id` - the grant's id (from its access token).
+    ///
+    /// # Returns
+    /// Its principal, or `None` for an unknown or revoked grant.
+    pub fn find_grant(&self, grant_id: &str) -> Option<Arc<Principal>> {
+        self.by_id.get(grant_id).cloned()
     }
 }
 
@@ -231,6 +295,92 @@ impl Keys {
             .expect("key cache lock poisoned")
             .find(presented)
     }
+
+    /// A live OAuth grant's principal, from the current cache.
+    ///
+    /// # Arguments
+    /// * `grant_id` - the grant's id.
+    ///
+    /// # Returns
+    /// Its principal, or `None` for an unknown or revoked grant (a revoke
+    /// takes effect at the next reload, within `poll_interval`).
+    pub fn find_grant(&self, grant_id: &str) -> Option<Arc<Principal>> {
+        self.cache
+            .read()
+            .expect("key cache lock poisoned")
+            .find_grant(grant_id)
+    }
+}
+
+/// Turns a presented bearer token into the principal it acts as. The seam
+/// for credential kinds: API keys ([`Keys`]), OAuth access tokens
+/// ([`OAuthVerifier`]) and, in a later round, an external issuer.
+// `-> impl Future<...> + Send`: the method returns some future that can move
+// between threads (tokio's worker threads need that), without naming its
+// type; an implementation may simply be an `async fn`.
+pub trait BearerVerifier {
+    /// The principal of `token`.
+    ///
+    /// # Arguments
+    /// * `token` - the bearer token, as presented.
+    ///
+    /// # Returns
+    /// The principal, or `None` for an unknown, expired, revoked or
+    /// wrong-audience token.
+    ///
+    /// # Errors
+    /// [`OkfError::Database`] when the lookup needs the database and it fails.
+    fn verify(
+        &self,
+        token: &str,
+    ) -> impl Future<Output = Result<Option<Arc<Principal>>, OkfError>> + Send;
+}
+
+impl BearerVerifier for Keys {
+    async fn verify(&self, token: &str) -> Result<Option<Arc<Principal>>, OkfError> {
+        Ok(self.find(token))
+    }
+}
+
+/// The principal of a bearer token. Dispatch is by prefix with no fallback
+/// between kinds: an `okfat_` token is only ever an OAuth access token
+/// (`None` with OAuth off), and anything else is looked up only among the
+/// API keys, which all carry `okf_`. Refresh tokens, sign-in codes and
+/// authorization codes are never bearer credentials and match nothing.
+///
+/// # Arguments
+/// * `app` - the shared state.
+/// * `token` - the bearer token.
+///
+/// # Returns
+/// The principal, or `None`.
+///
+/// # Errors
+/// [`OkfError::Database`] from an access-token lookup.
+pub async fn authenticate(app: &App, token: &str) -> Result<Option<Arc<Principal>>, OkfError> {
+    if token.starts_with(keys::ACCESS_TOKEN_PREFIX) {
+        return match app.oauth() {
+            Some(oauth) => OAuthVerifier { app, oauth }.verify(token).await,
+            None => Ok(None),
+        };
+    }
+    app.keys().verify(token).await
+}
+
+/// The `WWW-Authenticate` value of a 401: with OAuth on, it names the
+/// Protected Resource Metadata (RFC 9728 section 5.1), so a client can
+/// discover the authorization server.
+///
+/// # Arguments
+/// * `app` - the shared state.
+///
+/// # Returns
+/// `Bearer`, or `Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource"`.
+pub fn challenge(app: &App) -> HeaderValue {
+    app.oauth().map_or_else(
+        || HeaderValue::from_static("Bearer"),
+        |oauth| oauth.challenge.clone(),
+    )
 }
 
 /// The token of an `Authorization: Bearer <token>` header.
@@ -250,36 +400,46 @@ pub fn bearer(headers: &HeaderMap) -> Option<&str> {
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
-/// axum middleware: admits a request with a live key, inserting its
-/// `Arc<Principal>` into the request's extensions, and answers anything
-/// else with 401.
+/// axum middleware: admits a request with a live API key or OAuth access
+/// token, inserting its `Arc<Principal>` into the request's extensions, and
+/// answers anything else with 401 and [`challenge`].
 ///
 /// # Arguments
-/// * `keys` - the shared key cache (the layer's state).
+/// * `app` - the shared state (the layer's state).
 /// * `request` - the incoming request.
 /// * `next` - the rest of the stack.
 ///
 /// # Returns
-/// The route's response, or 401 with `WWW-Authenticate: Bearer`.
-// Used as `axum::middleware::from_fn_with_state(keys, require_key)`; axum
+/// The route's response; 401 with the challenge; or 500 if an access-token
+/// lookup fails (logged).
+// Used as `axum::middleware::from_fn_with_state(app, require_key)`; axum
 // fills each argument from the request (the extractor pattern).
 pub async fn require_key(
-    State(keys): State<Arc<Keys>>,
+    State(app): State<Arc<App>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let principal = bearer(request.headers()).and_then(|key| keys.find(key));
-    let Some(principal) = principal else {
-        return (
+    // The borrowed token (`&str` into the headers) ends with this `match`,
+    // before the request is changed below.
+    let found = match bearer(request.headers()) {
+        Some(token) => authenticate(&app, token).await,
+        None => Ok(None),
+    };
+    match found {
+        Ok(Some(principal)) => {
+            tracing::debug!(key = %principal.key_id, "authenticated");
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        Ok(None) => (
             StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
+            [(header::WWW_AUTHENTICATE, challenge(&app))],
             "missing or unknown API key\n",
         )
-            .into_response();
-    };
-    tracing::debug!(key = %principal.key_id, "authenticated");
-    request.extensions_mut().insert(principal);
-    next.run(request).await
+            .into_response(),
+        // `AppError` logs it and answers 500 without detail.
+        Err(error) => AppError(error).into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +449,8 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
     use chrono::Utc;
+
+    use crate::config::Config;
     // `oneshot` sends one request through a router without a socket.
     use tower::ServiceExt;
 
@@ -296,7 +458,7 @@ mod tests {
         KeyRecord {
             id: id.to_string(),
             name: id.to_string(),
-            sha256: keys::hash(key).to_vec(),
+            sha256: Some(keys::hash(key).to_vec()),
             access: Access::Read,
             maintenance_report: false,
             all_catalogs: false,
@@ -305,6 +467,9 @@ mod tests {
             actor: format!("actor-{id}"),
             created_at: Utc::now(),
             revoked_at: revoked.then(Utc::now),
+            kind: KeyKind::Key,
+            client_id: None,
+            client_name: None,
         }
     }
 
@@ -330,7 +495,7 @@ mod tests {
             record("reader", "reader-key", false),
             record("old", "old-key", true),
             KeyRecord {
-                sha256: vec![0; 5],
+                sha256: Some(vec![0; 5]),
                 ..record("short", "short-key", false)
             },
         ]);
@@ -409,9 +574,9 @@ mod tests {
         assert!(Principal::from(everything).reaches("work"));
     }
 
-    /// A router whose one route echoes the principal's key id.
-    fn app(cache: KeyCache) -> Router {
-        let keys = Arc::new(Keys::new(cache));
+    /// A router whose one route echoes the principal's key id, behind the
+    /// real middleware over `app`.
+    fn echo(app: &Arc<App>) -> Router {
         Router::new()
             .route(
                 "/",
@@ -423,7 +588,11 @@ mod tests {
                         .unwrap_or_default()
                 }),
             )
-            .route_layer(axum::middleware::from_fn_with_state(keys, require_key))
+            .route_layer(axum::middleware::from_fn_with_state(
+                Arc::clone(app),
+                require_key,
+            ))
+            .with_state(Arc::clone(app))
     }
 
     /// The response's status, its `WWW-Authenticate` header and its body.
@@ -454,28 +623,112 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn the_middleware_admits_a_known_key_and_refuses_the_rest() {
-        let cache = || {
-            KeyCache::from_records(vec![
-                record("reader", "reader-key", false),
-                record("old", "old-key", true),
-            ])
-        };
+    /// A stored read key on `main` called `name`, polled into the app's cache.
+    async fn stored_key(app: &App, name: &str) -> (String, String) {
+        let names = ["main".to_string()];
+        let created = key_rows::create_with_id(
+            app.pool(),
+            &key_rows::NewKey {
+                name,
+                access: Access::Read,
+                maintenance_report: false,
+                grants: key_rows::Grants::Catalogs(&names),
+                default_catalog: Some("main"),
+                actor: "example-actor",
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        app.poll().await.unwrap();
+        (created.id, created.key)
+    }
 
-        let admitted = status_and_body(app(cache()), Some("Bearer reader-key")).await;
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_middleware_admits_a_known_key_and_refuses_the_rest() {
+        let test = crate::mcp::testing::app_with(&[("main", &[])], Config::default()).await;
+        let (id, key) = stored_key(&test.app, "reader").await;
+        let (old_id, old_key) = stored_key(&test.app, "old").await;
+        key_rows::revoke_by_id(test.app.pool(), &old_id, Utc::now())
+            .await
+            .unwrap();
+        test.app.poll().await.unwrap();
+        let router = || echo(&test.app);
+
+        let admitted = status_and_body(router(), Some(&format!("Bearer {key}"))).await;
         let refused = [
-            status_and_body(app(cache()), Some("Bearer other-key")).await,
-            status_and_body(app(cache()), Some("Bearer old-key")).await,
-            status_and_body(app(cache()), Some("Basic reader-key")).await,
-            status_and_body(app(cache()), None).await,
+            status_and_body(router(), Some("Bearer okf_other-key")).await,
+            status_and_body(router(), Some(&format!("Bearer {old_key}"))).await,
+            status_and_body(router(), Some(&format!("Basic {key}"))).await,
+            // With OAuth off, an access-token-shaped bearer is simply unknown.
+            status_and_body(router(), Some("Bearer okfat_anything")).await,
+            status_and_body(router(), None).await,
         ];
 
-        assert_eq!(admitted, (StatusCode::OK, None, "reader".to_string()));
-        for (status, challenge, _) in refused {
+        assert_eq!(admitted, (StatusCode::OK, None, id));
+        for (status, challenge, body) in refused {
             assert_eq!(status, StatusCode::UNAUTHORIZED);
             assert_eq!(challenge.as_deref(), Some("Bearer"));
+            assert_eq!(body, "missing or unknown API key\n");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_oauth_on_a_401_names_the_resource_metadata() {
+        let config = crate::store::oauth::testing::oauth_config("https://okf.example.com");
+        let test = crate::mcp::testing::app_with(&[("main", &[])], config).await;
+        let (_, key) = stored_key(&test.app, "reader").await;
+
+        let refused = status_and_body(echo(&test.app), None).await;
+        let admitted = status_and_body(echo(&test.app), Some(&format!("Bearer {key}"))).await;
+
+        assert_eq!(refused.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            refused.1.as_deref(),
+            Some(
+                "Bearer resource_metadata=\"https://okf.example.com/.well-known/oauth-protected-resource\""
+            )
+        );
+        // Static keys keep working beside OAuth.
+        assert_eq!(admitted.0, StatusCode::OK);
+    }
+
+    fn grant_record(id: &str, revoked: bool) -> KeyRecord {
+        KeyRecord {
+            sha256: None,
+            kind: KeyKind::OAuth,
+            client_id: Some("https://client.example.com/client.json".into()),
+            client_name: Some("Example Client".into()),
+            ..record(id, "unused", revoked)
+        }
+    }
+
+    #[test]
+    fn grants_are_found_by_id_only_and_carry_their_client() {
+        let cache = KeyCache::from_records(vec![
+            record("reader", "reader-key", false),
+            grant_record("grant-1", false),
+            grant_record("grant-old", true),
+        ]);
+
+        let grant = cache.find_grant("grant-1").expect("live grant");
+
+        assert_eq!(
+            grant.kind,
+            CredentialKind::OAuth {
+                client_id: Some("https://client.example.com/client.json".into()),
+                client_name: Some("Example Client".into())
+            }
+        );
+        assert_eq!(grant.actor, "actor-grant-1");
+        assert!(cache.find_grant("grant-old").is_none());
+        // A key is not a grant, and a grant has no key to present.
+        assert!(cache.find_grant("reader").is_none());
+        assert!(cache.find("unused").is_none());
+        assert_eq!(
+            cache.find("reader-key").unwrap().kind,
+            CredentialKind::ApiKey
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -577,5 +830,20 @@ mod tests {
         db.pool.close().await;
         assert!(loaded.reload(&db.pool).await.is_err());
         assert_eq!(loaded.find(&other.key).unwrap().key_id, other.id);
+    }
+
+    #[hegel::test]
+    fn bearer_never_panics_and_returns_a_trimmed_nonempty_token(tc: hegel::TestCase) {
+        use hegel::generators;
+        let value: String = tc.draw(generators::text());
+        let mut headers = HeaderMap::new();
+        // Text that is not a valid header value is simply not a header.
+        let Ok(parsed) = value.parse() else { return };
+        headers.insert(header::AUTHORIZATION, parsed);
+
+        if let Some(token) = bearer(&headers) {
+            assert!(!token.is_empty());
+            assert_eq!(token, token.trim());
+        }
     }
 }

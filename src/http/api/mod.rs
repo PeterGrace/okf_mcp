@@ -30,13 +30,13 @@ pub(crate) mod testing;
 /// Every API route, for nesting at `/api/v1`, behind `require_key`.
 ///
 /// # Arguments
-/// * `app` - the application (its key cache for `require_key`; the import
-///   route's body limit comes from its config).
+/// * `app` - the application (`require_key`'s state; the import route's
+///   body limit comes from its config).
 ///
 /// # Returns
 /// A router whose responses all carry `Cache-Control: no-store` and
 /// `nosniff`, the 401 for a missing or unknown key included.
-pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
+pub(crate) fn routes(app: &Arc<App>) -> Router<Arc<App>> {
     Router::new()
         .merge(identity::routes())
         .merge(keys::routes())
@@ -48,10 +48,7 @@ pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
         .merge(changesets::routes())
         // `route_layer` covers the routes merged above and runs only when one
         // matched, so an unknown API path stays 404 rather than 401.
-        .route_layer(middleware::from_fn_with_state(
-            Arc::clone(app.keys()),
-            require_key,
-        ))
+        .route_layer(middleware::from_fn_with_state(Arc::clone(app), require_key))
         // Its own fallback, so an unknown API path is answered here (404,
         // without a key check) and gets the headers below; without one, the
         // outer router's fallback would answer it.

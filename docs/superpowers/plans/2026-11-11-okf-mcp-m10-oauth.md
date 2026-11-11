@@ -192,7 +192,9 @@ pub enum RefreshUse { Rotated { grant_id: String, family_id: String, resource: S
 pub async fn use_refresh(tx: &mut PgConnection, sha256: &[u8; 32], now: DateTime<Utc>) -> Result<RefreshUse, OkfError>;
 pub async fn revoke_family(pool: &PgPool, family_id: &str, now: DateTime<Utc>) -> Result<Vec<[u8; 32]>, OkfError>; // revoked hashes
 
-// src/store/oauth/clients.rs (Task 2: types, CLIENT_COLUMNS/ClientRow, `find`, `prune_unbound_dcr`; Task 3: the rest)
+// src/store/oauth/clients.rs (Task 2: types, client_columns!/ClientRow, `find`, `prune_unbound_dcr`; Task 3: the rest)
+// Corrected (issue #246, 2026-11-11): the select list is a private `client_columns!()` macro, not a
+// `CLIENT_COLUMNS` const; sqlx 0.9 refuses a `format!`ed `String` as SQL, so queries use `concat!`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum ClientKind { Dcr, Cimd }
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClientRecord { pub client_id: String, pub kind: ClientKind, pub client_name: Option<String>,
@@ -300,7 +302,8 @@ pub struct PendingAuthorization { pub csrf: String, pub client: ClientRecord, pu
 pub struct AuthorizationCode { pub grant_id: String, pub client_id: String, pub redirect_uri: String,
     pub code_challenge: String, pub resource: String, pub family_id: String,
     pub used: bool }                        // a used code stays until expiry, so a replay is detected
-pub(crate) fn code_key(code: &str) -> String;   // hex SHA-256 of an okfac_ code: the key of OAuth.codes
+pub fn code_key(code: &str) -> String;   // hex SHA-256 of an okfac_ code: the key of OAuth.codes
+                                          // Corrected (issue #246, 2026-11-11): `pub`, so the stub crate has no dead-code warning before Task 5 uses it
 pub const PENDING_TTL: Duration;            // 10 minutes
 pub const AUTHORIZATION_CODE_TTL: Duration; // 60 seconds
 pub const MAX_FAILED_ATTEMPTS: u8;          // 5
@@ -845,9 +848,9 @@ No token or client is created by any endpoint yet. Tests insert them with SQL an
 8. **A grant is not named `<code name>@<client host>`:** `api_keys_name_check` allows only `[A-Za-z0-9._-]`. Task 4's `redeem` names it `<code name>.<client host>-<first 8 characters of the code id>` (its Decision 1). Migration 0008 also limits the live name/actor unique index to `kind = 'key'`, so grants never collide on it however they are named.
 9. Dispatch is "`okfat_` goes to OAuth, anything else goes to the key cache". The cache holds only `okf_` keys, and every key ever issued was made by `keys::generate` with that prefix (since `e89ff71`), so the result is the spec's "anything else is 401". Existing tests that use unprefixed test keys keep working.
 10. A new `#[cfg(test)]` helper module, `src/store/oauth/testing.rs`, for Tasks 3 to 6: `insert_client`, `insert_grant`, `oauth_config` and `mint_access` (Steps 8 and 12). Task 2 does **not** create `src/oauth/testing.rs` or declare it in `src/oauth/mod.rs`. Task 5 creates that file and adds `#[cfg(test)] pub(crate) mod testing;`, and should build on these helpers rather than duplicate them.
-11. `oauth_clients` gains `cache_expires_at timestamptz`, and `ClientRecord` gains `pub cache_expires_at: Option<DateTime<Utc>>`. `store::oauth::clients` defines a private `CLIENT_COLUMNS` const, `ClientRow` (`sqlx::FromRow`) and `impl From<ClientRow> for ClientRecord`, which `find` uses and Task 3 reuses. Task 2 does not define `insert_dcr`; Task 3 owns it, as `insert_dcr(pool, &NewDcrClient<'_>, now) -> Result<ClientRecord, OkfError>`.
+11. `oauth_clients` gains `cache_expires_at timestamptz`, and `ClientRecord` gains `pub cache_expires_at: Option<DateTime<Utc>>`. `store::oauth::clients` defines a private `client_columns!()` macro (corrected from a `CLIENT_COLUMNS` const, issue #246, 2026-11-11: sqlx 0.9 takes only a `&'static str` or an `AssertSqlSafe` as SQL, so the column list is spliced with `concat!` at compile time), `ClientRow` (`sqlx::FromRow`) and `impl From<ClientRow> for ClientRecord`, which `find` uses and Task 3 reuses. Task 2 does not define `insert_dcr`; Task 3 owns it, as `insert_dcr(pool, &NewDcrClient<'_>, now) -> Result<ClientRecord, OkfError>`.
 12. The stub `CimdFetcher::new(allow_private: bool, allow_http: bool) -> Result<Self, OkfError>`. `OAuth::new` passes `allow_private = cimd_allow_private` and `allow_http = cimd_allow_private && issuer starts with "http://"`.
-13. `AuthorizationCode` derives `Debug, Clone, PartialEq, Eq` and gains `pub used: bool`: a used code stays in the map until it expires, so a replay is detected. `PendingAuthorization` derives `Clone` and keeps its hand-written `Debug`. `src/oauth/state.rs` adds `pub(crate) fn code_key(code: &str) -> String`, the hex SHA-256 of an `okfac_` code and the key of `OAuth.codes`.
+13. `AuthorizationCode` derives `Debug, Clone, PartialEq, Eq` and gains `pub used: bool`: a used code stays in the map until it expires, so a replay is detected. `PendingAuthorization` derives `Clone` and keeps its hand-written `Debug`. `src/oauth/state.rs` adds `pub fn code_key(code: &str) -> String` (corrected from `pub(crate)`, issue #246, 2026-11-11: nothing calls it before Task 5, and a `pub(crate)` item would fail `-D warnings` as dead code), the hex SHA-256 of an `okfac_` code and the key of `OAuth.codes`.
 14. `CredentialKind::OAuth { client_id: Option<String>, client_name: Option<String> }`.
 15. Rate limits: register, a burst of 10 then one every 6 seconds; token (and revoke), a burst of 60 then 2 a second; consent POST, a burst of 20 then 1 a second.
 
@@ -2225,8 +2228,16 @@ pub struct ClientRecord {
 
 /// The select list every client query reads, in [`ClientRow`]'s order
 /// (Task 3's writes `RETURNING` it too).
-const CLIENT_COLUMNS: &str =
-    "client_id, kind, client_name, redirect_uris, metadata, fetched_at, cache_expires_at, created_at";
+// A macro, not a `const`: sqlx 0.9 takes only a `&'static str` (or an
+// audited `AssertSqlSafe`) as SQL, and `concat!("SELECT ", client_columns!(),
+// ...)` builds that literal at compile time, where `format!` would build a
+// `String` at run time.
+macro_rules! client_columns {
+    () => {
+        "client_id, kind, client_name, redirect_uris, metadata, fetched_at, cache_expires_at, \
+         created_at"
+    };
+}
 
 /// One `oauth_clients` row as stored.
 // `derive(sqlx::FromRow)` maps columns to fields by name, like a dataclass
@@ -2270,8 +2281,10 @@ impl From<ClientRow> for ClientRecord {
 /// # Errors
 /// [`OkfError::Database`].
 pub async fn find(pool: &PgPool, client_id: &str) -> Result<Option<ClientRecord>, OkfError> {
-    let row = sqlx::query_as::<_, ClientRow>(&format!(
-        "SELECT {CLIENT_COLUMNS} FROM oauth_clients WHERE client_id = $1"
+    let row = sqlx::query_as::<_, ClientRow>(concat!(
+        "SELECT ",
+        client_columns!(),
+        " FROM oauth_clients WHERE client_id = $1"
     ))
     .bind(client_id)
     .fetch_optional(pool)
@@ -2477,6 +2490,8 @@ pub mod codes;
 pub(crate) mod testing;
 pub mod tokens;
 ```
+
+> **Corrected (issue #246, 2026-11-11).** `src/store/oauth/testing.rs` takes the Step 12 imports (`TimeDelta`, `App`, `Config`, `keys`, `tokens::{self, NewToken, TokenKind}`) when it is created here, since `mod.rs` declares `tokens` in the same step; `public_url` validation also refuses user info (`https://user@host`), and the middleware test keeps its revoked-key case (`stored_key(app, name)` takes a name).
 
 Run: `cargo test --lib store::oauth -- --test-threads=4`
 Expected: PASS (6 tests).
@@ -3069,13 +3084,18 @@ pub struct AuthorizationCode {
 ///
 /// # Returns
 /// 64 lowercase hex characters.
-pub(crate) fn code_key(code: &str) -> String {
-    // `iter().map(..).collect()` builds the `String` from formatted pieces,
-    // like `"".join(f"{b:02x}" for b in digest)`.
+pub fn code_key(code: &str) -> String {
+    // `fold` with `write!` appends each byte's two hex digits to one
+    // preallocated `String` (Python: `hashlib.sha256(...).hexdigest()`),
+    // with no `String` per byte.
+    use std::fmt::Write as _;
     crate::keys::hash(code)
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            // Writing to a `String` cannot fail.
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 #[cfg(test)]
@@ -3278,11 +3298,11 @@ Update the module doc's first line to "API-key and OAuth-token authentication". 
 ```rust
         let kind = match record.kind {
             KeyKind::Key => CredentialKind::ApiKey,
-            // `.clone()`: `record` is still needed below for its other fields
-            // (moving a field out of it here would leave it partly moved).
+            // Moving the two fields out of `record` is fine: the struct
+            // literal below moves only its other fields.
             KeyKind::OAuth => CredentialKind::OAuth {
-                client_id: record.client_id.clone(),
-                client_name: record.client_name.clone(),
+                client_id: record.client_id,
+                client_name: record.client_name,
             },
         };
 ```
@@ -3661,7 +3681,9 @@ impl AccessTokens {
             },
         };
         if live.expires_at <= now {
-            self.forget(&[sha256]);
+            // Expiry is not a revocation: drop the entry without bumping the
+            // generation, so lookups of other tokens in flight still cache.
+            self.lock().tokens.remove(&sha256);
             return Ok(None);
         }
         // The audience check (RFC 8707): a token issued for another
@@ -3976,8 +3998,6 @@ pub(crate) async fn mint_access(
     token
 }
 ```
-
-Drop the last two lines of `mint_access` (`let _ = Utc::now;` and its comment) and the `Utc` import if clippy flags them unused. They are not needed; the helper uses only `TimeDelta`.
 
 Run: `cargo build --all-targets`
 Expected: errors only in `src/app.rs`, `src/http/mod.rs` and `src/http/api/mod.rs` (no `App::oauth`, and `require_key`'s state changed). Step 13 fixes them.
@@ -4564,7 +4584,10 @@ Add to `src/app.rs` `mod tests`:
         let count = |table: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {table}"))
+                // `AssertSqlSafe`: `table` is one of this test's literals.
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                    "SELECT count(*) FROM {table}"
+                )))
                     .fetch_one(&pool)
                     .await
                     .unwrap()
@@ -4771,7 +4794,8 @@ Depends on Task 2 (the `src/oauth/` skeleton, `OAuth`, `OAuthSettings`, `OAuthEr
 **Interface corrections this task needs from Task 2** (the plan's shared interfaces are updated to match):
 
 1. `oauth_clients` gains `cache_expires_at timestamptz` (CIMD only: when the cached document must be refetched), and `ClientRecord` gains `pub cache_expires_at: Option<DateTime<Utc>>`. Without it, the `Cache-Control` freshness the spec requires has nowhere to live.
-2. `store::oauth::clients` (Task 2) defines a private `const CLIENT_COLUMNS: &str` (the select list), `#[derive(sqlx::FromRow)] struct ClientRow` and `impl From<ClientRow> for ClientRecord`. Task 3's queries reuse all three.
+2. `store::oauth::clients` (Task 2) defines a private `client_columns!()` macro (the select list), `#[derive(sqlx::FromRow)] struct ClientRow` and `impl From<ClientRow> for ClientRecord`. Task 3's queries reuse all three.
+   > **Corrected (issue #246, 2026-11-11).** The select list is a macro, not `const CLIENT_COLUMNS: &str`: sqlx 0.9 refuses a `format!`ed `String` as SQL (`SqlSafeStr`), so queries splice it with `concat!(.., client_columns!(), ..)`. `insert_dcr` below is updated.
 3. `insert_dcr` takes the new client's fields and lets Postgres pick the id: `insert_dcr(pool: &PgPool, new: &NewDcrClient<'_>, now: DateTime<Utc>) -> Result<ClientRecord, OkfError>`. The id is `gen_random_uuid()::text`, as `api_keys.id` already uses.
 4. `CimdFetcher::new(allow_private: bool, allow_http: bool) -> Result<Self, OkfError>`. `OAuth::new` passes `allow_private = cimd_allow_private` and `allow_http = cimd_allow_private && issuer starts with "http://"`. A test rig with a loopback `http` `public_url` and `cimd_allow_private` may thus serve CIMD documents over plain HTTP; production (an `https` `public_url`) never can. Task 6's end-to-end CIMD host relies on this.
 
@@ -5241,7 +5265,7 @@ Expected: FAIL to compile (`insert_dcr`, `NewDcrClient`, `upsert_cimd`, `count_u
 
 - [ ] **Step 6: Write the store functions**
 
-Append to `src/store/oauth/clients.rs`, above its test module. This reuses Task 2's `CLIENT_COLUMNS`, `ClientRow` and `From<ClientRow> for ClientRecord` (correction 2). `prune_unbound_dcr` is Task 2's (its correction 6); the test below exercises it beside this task's functions, and the code block below does not repeat it.
+Append to `src/store/oauth/clients.rs`, above its test module. This reuses Task 2's `client_columns!()`, `ClientRow` and `From<ClientRow> for ClientRecord` (correction 2). `prune_unbound_dcr` is Task 2's (its correction 6); the test below exercises it beside this task's functions, and the code block below does not repeat it.
 
 ```rust
 /// A client registering through RFC 7591, before it has an id.
@@ -5273,11 +5297,12 @@ pub async fn insert_dcr(
     new: &NewDcrClient<'_>,
     now: DateTime<Utc>,
 ) -> Result<ClientRecord, OkfError> {
-    // `format!` splices the shared column list into the `RETURNING` clause,
-    // so the row decodes through the same `ClientRow` as `find`.
-    let row = sqlx::query_as::<_, ClientRow>(&format!(
+    // `concat!` splices the shared column list into the `RETURNING` clause
+    // at compile time, so the row decodes through the same `ClientRow` as `find`.
+    let row = sqlx::query_as::<_, ClientRow>(concat!(
         "INSERT INTO oauth_clients (client_id, kind, client_name, redirect_uris, metadata, created_at) \
-         VALUES (gen_random_uuid()::text, 'dcr', $1, $2, $3, $4) RETURNING {CLIENT_COLUMNS}"
+         VALUES (gen_random_uuid()::text, 'dcr', $1, $2, $3, $4) RETURNING ",
+        client_columns!()
     ))
     .bind(new.client_name)
     .bind(new.redirect_uris)
@@ -9034,6 +9059,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - `PendingAuthorization` derives `Clone` (`Debug` stays by hand).
 - `AuthorizationCode` derives `Debug, Clone` and gains `pub used: bool`. Task 6 marks a code used instead of removing it, so a replay within its 60 seconds is detected.
 - New `pub(crate) fn code_key(code: &str) -> String` in `src/oauth/state.rs`: the lowercase hex SHA-256 of an `okfac_` code, the key of `OAuth.codes`.
+  > **Corrected (issue #246, 2026-11-11).** Task 2 already ships both structs as below (`Clone`, `used`) and `code_key`, as `pub fn` with this task's `fold` body, plus `code_key_is_the_hex_sha256`. Step 4's `state.rs` changes are done: skip them (don't add a second `code_key` test).
 - New `#[cfg(test)] pub(crate) mod testing;` in `src/oauth/mod.rs`. It holds the helpers Tasks 5 and 6 share.
 
 **Deviation from the spec** (recorded in the plan's deviations list):
@@ -9198,6 +9224,8 @@ Expected: PASS.
 - [ ] **Step 4: State corrections and the shared test helpers**
 
 In `src/oauth/state.rs`, change the two structs' derives and add `used` and `code_key`. Keep Task 2's hand-written `Debug` for `PendingAuthorization`.
+
+> **Corrected (issue #246, 2026-11-11).** Already done by Task 2: the derives, `used`, and `pub fn code_key` with the body below, tested by `code_key_is_the_hex_sha256`. Skip this `state.rs` part of the step.
 
 ```rust
 // PendingAuthorization: add `Clone` to its derive list (Debug stays by hand).

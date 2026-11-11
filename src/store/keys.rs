@@ -52,6 +52,44 @@ impl Access {
     }
 }
 
+/// What a key row is: an API key, or an OAuth grant (a key row with no
+/// hash, reached through its tokens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    /// An `okf_` API key.
+    Key,
+    /// A grant made by redeeming a sign-in code.
+    OAuth,
+}
+
+impl KeyKind {
+    /// The spelling stored in `api_keys.kind`.
+    ///
+    /// # Returns
+    /// `"key"` or `"oauth"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyKind::Key => "key",
+            KeyKind::OAuth => "oauth",
+        }
+    }
+
+    /// Parses the stored spelling.
+    ///
+    /// # Arguments
+    /// * `text` - an `api_keys.kind` value.
+    ///
+    /// # Returns
+    /// The kind, or `None` for anything else.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "key" => Some(KeyKind::Key),
+            "oauth" => Some(KeyKind::OAuth),
+            _ => None,
+        }
+    }
+}
+
 /// Which catalogs a new key reaches.
 // `'a` ties the borrowed slice to the caller's names: the enum holds a view of
 // them, not a copy.
@@ -94,8 +132,8 @@ pub struct KeyRecord {
     pub id: String,
     /// Its grouping name.
     pub name: String,
-    /// SHA-256 of the key.
-    pub sha256: Vec<u8>,
+    /// The key's SHA-256; `None` for an OAuth grant, which has no secret of its own.
+    pub sha256: Option<Vec<u8>>,
     /// Its access level.
     pub access: Access,
     /// Whether this key may submit maintenance reports.
@@ -112,6 +150,12 @@ pub struct KeyRecord {
     pub created_at: DateTime<Utc>,
     /// When it was revoked; a revoked key authenticates nothing.
     pub revoked_at: Option<DateTime<Utc>>,
+    /// An API key or an OAuth grant.
+    pub kind: KeyKind,
+    /// A grant's OAuth client (`None` for a key, or once the client is gone).
+    pub client_id: Option<String>,
+    /// That client's display name, if it gave one.
+    pub client_name: Option<String>,
 }
 
 /// The row as selected, before `access` is parsed.
@@ -119,7 +163,7 @@ pub struct KeyRecord {
 struct KeyRow {
     id: String,
     name: String,
-    sha256: Vec<u8>,
+    sha256: Option<Vec<u8>>,
     access: String,
     maintenance_report: bool,
     all_catalogs: bool,
@@ -128,6 +172,9 @@ struct KeyRow {
     actor: String,
     created_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
+    kind: String,
+    client_id: Option<String>,
+    client_name: Option<String>,
 }
 
 /// Is `name` valid under the schema's `api_keys_name_check` constraint?
@@ -287,11 +334,22 @@ pub(crate) async fn insert_legacy_test_key(
 }
 
 /// The ids of the catalogs called `names`, in the same order, in one query.
+/// Shared with the sign-in codes (`store::oauth::codes`).
+///
+/// # Arguments
+/// * `conn` - a connection or open transaction.
+/// * `names` - catalog names.
+///
+/// # Returns
+/// Their ids, in `names`' order.
 ///
 /// # Errors
 /// [`OkfError::CatalogNotSelected`] for the first name with no catalog;
 /// [`OkfError::Database`].
-async fn catalog_ids(conn: &mut PgConnection, names: &[String]) -> Result<Vec<i64>, OkfError> {
+pub(crate) async fn catalog_ids(
+    conn: &mut PgConnection,
+    names: &[String],
+) -> Result<Vec<i64>, OkfError> {
     // `WITH ORDINALITY` numbers the array's elements, so the rows come back in
     // the caller's order with a NULL id for each unknown name.
     let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
@@ -320,15 +378,17 @@ async fn catalog_ids(conn: &mut PgConnection, names: &[String]) -> Result<Vec<i6
 /// [`OkfError::Database`].
 pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
     let rows = sqlx::query_as::<_, KeyRow>(
-        "SELECT k.id, k.name, k.sha256, k.access, k.maintenance_report, k.all_catalogs, d.name AS default_catalog, k.actor, \
-                k.created_at, k.revoked_at, \
+        "SELECT k.id, k.name, k.sha256, k.access, k.maintenance_report, k.all_catalogs, \
+                d.name AS default_catalog, k.actor, k.created_at, k.revoked_at, \
+                k.kind, k.client_id, oc.client_name, \
                 COALESCE(array_agg(c.name ORDER BY c.name) FILTER (WHERE c.name IS NOT NULL), \
                          '{}'::text[]) AS catalogs \
          FROM api_keys k \
          LEFT JOIN catalogs d ON d.id = k.default_catalog_id \
+         LEFT JOIN oauth_clients oc ON oc.client_id = k.client_id \
          LEFT JOIN key_catalogs g ON g.key_id = k.id \
          LEFT JOIN catalogs c ON c.id = g.catalog_id \
-         GROUP BY k.id, d.name ORDER BY k.name, k.actor, k.created_at, k.id",
+         GROUP BY k.id, d.name, oc.client_name ORDER BY k.name, k.actor, k.created_at, k.id",
     )
     .fetch_all(pool)
     .await?;
@@ -346,6 +406,9 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
             actor: row.actor,
             created_at: row.created_at,
             revoked_at: row.revoked_at,
+            kind: KeyKind::parse(&row.kind).expect("the schema checks api_keys.kind"),
+            client_id: row.client_id,
+            client_name: row.client_name,
         })
         .collect())
 }
@@ -769,6 +832,63 @@ mod tests {
         assert!(Access::Read < Access::Write && Access::Write < Access::Admin);
     }
 
+    #[test]
+    fn key_kind_round_trips_its_spelling() {
+        for kind in [KeyKind::Key, KeyKind::OAuth] {
+            assert_eq!(KeyKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(KeyKind::parse("token"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_shows_a_grant_with_its_kind_and_client_and_no_hash() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "main", "", now()).await.unwrap();
+        let names = ["main".to_string()];
+        let key = create(
+            &db.pool,
+            &new_key("laptop", Grants::Catalogs(&names), None),
+            now(),
+        )
+        .await
+        .unwrap();
+        let client = crate::store::oauth::testing::insert_client(
+            &db.pool,
+            "https://client.example.com/client.json",
+            "Example Client",
+            now(),
+        )
+        .await;
+        let grant = crate::store::oauth::testing::insert_grant(
+            &db.pool,
+            &client,
+            Access::Read,
+            &["main"],
+            now(),
+        )
+        .await;
+
+        let records = list(&db.pool).await.unwrap();
+
+        let key_row = records
+            .iter()
+            .find(|record| record.name == "laptop" && record.kind == KeyKind::Key)
+            .unwrap();
+        assert!(crate::keys::matches(
+            key_row.sha256.as_deref().unwrap(),
+            &key
+        ));
+        assert_eq!(key_row.client_id, None);
+        assert_eq!(key_row.client_name, None);
+        let grant_row = records.iter().find(|record| record.id == grant).unwrap();
+        assert_eq!(grant_row.kind, KeyKind::OAuth);
+        assert_eq!(grant_row.sha256, None);
+        assert_eq!(grant_row.client_id.as_deref(), Some(client.as_str()));
+        assert_eq!(grant_row.client_name.as_deref(), Some("Example Client"));
+        assert_eq!(grant_row.catalogs, ["main"]);
+        assert_eq!(grant_row.access, Access::Read);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn create_stores_only_the_hash_and_the_grants() {
         let db = test_db().await;
@@ -794,7 +914,11 @@ mod tests {
         assert_eq!(record.catalogs, ["pg", "work"]);
         assert_eq!(record.default_catalog.as_deref(), Some("pg"));
         assert_eq!(record.actor, "claude-code/test");
-        assert!(crate::keys::matches(&record.sha256, &key));
+        assert!(crate::keys::matches(
+            record.sha256.as_deref().expect("a key row has a hash"),
+            &key
+        ));
+        assert_eq!(record.kind, KeyKind::Key);
         assert_eq!(record.created_at, now());
         assert_eq!(record.revoked_at, None);
         assert_eq!(catalogs::admin_generation(&db.pool).await.unwrap(), 3);
@@ -1025,11 +1149,13 @@ mod tests {
             2
         );
         assert!(crate::keys::matches(
-            &records
+            records
                 .iter()
                 .find(|record| record.id == replacement.id)
                 .unwrap()
-                .sha256,
+                .sha256
+                .as_deref()
+                .expect("a key row has a hash"),
             &replacement.key
         ));
         let cache = crate::auth::KeyCache::from_records(records);

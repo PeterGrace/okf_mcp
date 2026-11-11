@@ -39,6 +39,10 @@ pub(crate) struct KeyView {
     pub actor: String,
     /// `read`, `write` or `admin`.
     pub access: &'static str,
+    /// `key` or `oauth` (a grant made by redeeming a sign-in code).
+    pub kind: &'static str,
+    /// A grant's client, as it names itself (`None` for a key).
+    pub client_name: Option<String>,
     /// Whether it may submit maintenance reports.
     pub maintenance_report: bool,
     /// Granted every catalog, present and future.
@@ -70,12 +74,18 @@ impl From<KeyRecord> for KeyView {
             actor,
             created_at,
             revoked_at,
+            kind,
+            // `client_id: _`: a URL or UUID the console has no use for.
+            client_id: _,
+            client_name,
         } = record;
         Self {
             id,
             name,
             actor,
             access: access.as_str(),
+            kind: kind.as_str(),
+            client_name,
             maintenance_report,
             all_catalogs,
             catalogs,

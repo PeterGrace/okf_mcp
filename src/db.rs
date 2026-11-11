@@ -87,8 +87,12 @@ mod tests {
                 "maintenance_runs",
                 "maintenance_state",
                 "maintenance_work",
+                "oauth_clients",
+                "oauth_tokens",
                 "revisions",
                 "server_state",
+                "sign_in_code_catalogs",
+                "sign_in_codes",
             ]
         );
         let admin_generation: i64 = sqlx::query_scalar("SELECT admin_generation FROM server_state")
@@ -96,6 +100,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(admin_generation, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oauth_schema_keeps_existing_keys_and_guards_grant_rows() {
+        // Arrange: the schema as of 0007, with one key, then 0008 on top.
+        let db = pg_support::TestDb::start().await;
+        for migration in [
+            include_str!("../migrations/0001_schema.sql"),
+            include_str!("../migrations/0002_changeset_identity.sql"),
+            include_str!("../migrations/0003_changeset_handles.sql"),
+            include_str!("../migrations/0004_drop_changeset_labels.sql"),
+            include_str!("../migrations/0005_key_names.sql"),
+            include_str!("../migrations/0006_maintenance.sql"),
+            include_str!("../migrations/0007_maintenance_assessment_evidence.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&db.pool).await.unwrap();
+        }
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO api_keys (name, sha256, access, all_catalogs, actor, created_at) \
+             VALUES ('existing', $1, 'write', true, 'example-actor', $2)",
+        )
+        .bind(vec![7u8; 32])
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Act
+        sqlx::raw_sql(include_str!("../migrations/0008_oauth.sql"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Assert: the old key is a `key` row with its hash and no client.
+        let (kind, sha256, client_id): (String, Option<Vec<u8>>, Option<String>) =
+            sqlx::query_as("SELECT kind, sha256, client_id FROM api_keys WHERE name = 'existing'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(kind, "key");
+        assert_eq!(sha256, Some(vec![7u8; 32]));
+        assert_eq!(client_id, None);
+
+        // A grant row needs no hash, may not have one, and may not be admin
+        // or report maintenance.
+        let grant = |sha256: Option<Vec<u8>>, access: &'static str, report: bool| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO api_keys \
+                     (name, sha256, access, maintenance_report, all_catalogs, actor, created_at, kind) \
+                     VALUES ('laptop', $1, $2, $3, true, 'example-actor', $4, 'oauth')",
+                )
+                .bind(sha256)
+                .bind(access)
+                .bind(report)
+                .bind(now)
+                .execute(&pool)
+                .await
+            }
+        };
+        let constraint = |result: Result<_, sqlx::Error>| {
+            result
+                .expect_err("the row must be refused")
+                .as_database_error()
+                .and_then(|error| error.constraint().map(str::to_string))
+        };
+        assert!(grant(None, "write", false).await.is_ok());
+        // Two live grants with one name and actor: allowed (the unique index
+        // covers `kind = 'key'` rows only).
+        assert!(grant(None, "read", false).await.is_ok());
+        assert_eq!(
+            constraint(grant(Some(vec![8u8; 32]), "write", false).await).as_deref(),
+            Some("api_keys_kind_hash")
+        );
+        assert_eq!(
+            constraint(grant(None, "admin", false).await).as_deref(),
+            Some("api_keys_oauth_caps")
+        );
+        assert_eq!(
+            constraint(grant(None, "read", true).await).as_deref(),
+            Some("api_keys_oauth_caps")
+        );
+        // A key row still needs its hash, and a second live key of one
+        // name and actor is still refused.
+        let key = |sha256: Option<Vec<u8>>| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO api_keys (name, sha256, access, all_catalogs, actor, created_at) \
+                     VALUES ('existing', $1, 'read', true, 'example-actor', $2)",
+                )
+                .bind(sha256)
+                .bind(now)
+                .execute(&pool)
+                .await
+            }
+        };
+        assert_eq!(
+            constraint(key(None).await).as_deref(),
+            Some("api_keys_kind_hash")
+        );
+        assert_eq!(
+            constraint(key(Some(vec![9u8; 32])).await).as_deref(),
+            Some("api_keys_live_name_actor")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

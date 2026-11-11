@@ -10,4 +10,5 @@ pub mod history;
 pub mod import;
 pub mod keys;
 pub mod maintenance;
+pub mod oauth;
 pub mod publish;

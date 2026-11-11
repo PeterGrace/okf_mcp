@@ -7,6 +7,10 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
 use std::time::Duration;
 
+// `Uri` and `Authority` are the `http` crate's parsed URL and `host[:port]`
+// types, re-exported by axum; the MCP `Host` check parses `allowed_hosts`
+// with the same `Authority`.
+use axum::http::uri::{Authority, Uri};
 use bytesize::ByteSize;
 use serde::{Deserialize, Deserializer};
 
@@ -39,6 +43,48 @@ pub const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 16;
 
 /// The default number of changeset overlays kept in memory.
 pub const DEFAULT_OVERLAY_CACHE_SIZE: usize = 64;
+
+/// The default lifetime of an OAuth access token.
+pub const DEFAULT_ACCESS_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// The default lifetime of an OAuth refresh token (restarted by each rotation).
+pub const DEFAULT_REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The default cap on a sign-in code's `--expires`.
+pub const DEFAULT_CODE_MAX_EXPIRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The `[oauth]` section: used only when `public_url` is set.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct OAuthConfig {
+    /// How long an access token is accepted (`"1h"`).
+    #[serde(with = "humantime_serde")]
+    pub access_token_ttl: Duration,
+    /// How long a refresh token is accepted after it is issued (`"30d"`);
+    /// each rotation issues a new one, so the lifetime slides.
+    #[serde(with = "humantime_serde")]
+    pub refresh_token_ttl: Duration,
+    /// The longest `okf-mcp oauth code create --expires` accepts (`"7d"`).
+    #[serde(with = "humantime_serde")]
+    pub code_max_expiry: Duration,
+    /// Whether `POST /oauth/register` (RFC 7591) is offered.
+    pub dcr_enabled: bool,
+    /// Lets a Client ID Metadata Document live on a private or loopback
+    /// address. Only for test rigs: it opens the fetcher to the internal network.
+    pub cimd_allow_private: bool,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            access_token_ttl: DEFAULT_ACCESS_TOKEN_TTL,
+            refresh_token_ttl: DEFAULT_REFRESH_TOKEN_TTL,
+            code_max_expiry: DEFAULT_CODE_MAX_EXPIRY,
+            dcr_enabled: true,
+            cimd_allow_private: false,
+        }
+    }
+}
 
 /// Settings read from the configuration file.
 // `#[serde(default)]` fills every missing key from `Default::default()`.
@@ -88,6 +134,12 @@ pub struct Config {
     /// The most changeset overlays kept in memory; past it, the least
     /// recently used one is dropped (and rebuilt if read again).
     pub overlay_cache_size: usize,
+    /// The externally visible origin (`"https://okf.example.com"`). Setting
+    /// it turns OAuth on: it is the issuer, and `<public_url>/mcp` is the
+    /// resource tokens are issued for. Its host must be in `allowed_hosts`.
+    pub public_url: Option<String>,
+    /// The OAuth settings (`[oauth]`).
+    pub oauth: OAuthConfig,
 }
 
 impl Default for Config {
@@ -106,6 +158,8 @@ impl Default for Config {
             concept_outline_chars: DEFAULT_CONCEPT_OUTLINE_CHARS,
             database_max_connections: DEFAULT_DATABASE_MAX_CONNECTIONS,
             overlay_cache_size: DEFAULT_OVERLAY_CACHE_SIZE,
+            public_url: None,
+            oauth: OAuthConfig::default(),
         }
     }
 }
@@ -167,7 +221,9 @@ impl Config {
     /// so every request would get 403 with no hint why), or a blank
     /// `time_server` or one with surrounding whitespace (which the lookup
     /// would fail on every check, seen only as a `warn`), or a zero
-    /// `database_max_connections` or `overlay_cache_size`.
+    /// `database_max_connections` or `overlay_cache_size`, a zero OAuth
+    /// lifetime, or a `public_url` that is not an `https` origin (`http` on
+    /// a loopback host only) whose host `allowed_hosts` admits.
     pub fn validate(&self) -> Result<(), String> {
         if self.poll_interval.is_zero() {
             return Err("poll_interval must be more than zero".to_string());
@@ -219,6 +275,80 @@ impl Config {
                 ));
             }
         }
+        for (name, value) in [
+            ("oauth.access_token_ttl", self.oauth.access_token_ttl),
+            ("oauth.refresh_token_ttl", self.oauth.refresh_token_ttl),
+            ("oauth.code_max_expiry", self.oauth.code_max_expiry),
+        ] {
+            if value.is_zero() {
+                return Err(format!("{name} must be more than zero"));
+            }
+            if chrono::Duration::from_std(value).is_err() {
+                return Err(format!("{name} exceeds supported duration"));
+            }
+        }
+        self.validate_public_url()
+    }
+
+    /// Checks `public_url`: an `https` origin (`http` only on a loopback
+    /// host, for local testing), with no user info, path or query, whose
+    /// host an `allowed_hosts` entry admits under the MCP `Host` check's
+    /// rule (same host; the entry's port, if it has one, equal to the URL's).
+    ///
+    /// # Returns
+    /// `Ok(())` when `public_url` is unset or acceptable.
+    ///
+    /// # Errors
+    /// The problem in words.
+    fn validate_public_url(&self) -> Result<(), String> {
+        let Some(public_url) = self.public_url.as_deref() else {
+            return Ok(());
+        };
+        let uri: Uri = public_url
+            .parse()
+            .map_err(|_| format!("public_url {public_url:?} is not a URL"))?;
+        // A tuple pattern matches both `Option`s at once.
+        let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) else {
+            return Err(format!(
+                "public_url {public_url:?} needs a scheme and a host"
+            ));
+        };
+        // `user@host` would put the user info into the issuer and every URL
+        // built from it.
+        if authority.as_str().contains('@') {
+            return Err(format!(
+                "public_url {public_url:?} must be an origin, with no user info"
+            ));
+        }
+        if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
+            return Err(format!(
+                "public_url {public_url:?} must be an origin, with no path or query"
+            ));
+        }
+        let host = normalize_host(authority.host());
+        let secure = scheme.eq_ignore_ascii_case("https")
+            || (scheme.eq_ignore_ascii_case("http") && is_loopback(&host));
+        if !secure {
+            return Err(format!(
+                "public_url {public_url:?} must use https (http only on a loopback host)"
+            ));
+        }
+        let port = authority.port_u16();
+        let admitted = self.allowed_hosts.iter().any(|entry| {
+            // An entry that is not an authority (rmcp's fallback) is a bare host.
+            let (entry_host, entry_port) = match entry.trim().parse::<Authority>() {
+                Ok(parsed) => (normalize_host(parsed.host()), parsed.port_u16()),
+                Err(_) => (normalize_host(entry.trim()), None),
+            };
+            // `is_none_or`: true for `None`, else the closure's answer.
+            entry_host == host && entry_port.is_none_or(|entry_port| Some(entry_port) == port)
+        });
+        if !admitted {
+            return Err(format!(
+                "public_url's host {host:?} is not in allowed_hosts, so MCP requests to it \
+                 would be refused; add it"
+            ));
+        }
         Ok(())
     }
 
@@ -251,6 +381,34 @@ impl Config {
         config.validate().map_err(error)?;
         Ok(config)
     }
+}
+
+/// A host as the MCP `Host` check compares it: lowercase, IPv6 brackets trimmed.
+///
+/// # Arguments
+/// * `host` - a host as parsed from a URL or an `allowed_hosts` entry.
+///
+/// # Returns
+/// The normalized host.
+fn normalize_host(host: &str) -> String {
+    host.trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase()
+}
+
+/// Is `host` (normalized) this machine?
+///
+/// # Arguments
+/// * `host` - a host from [`normalize_host`].
+///
+/// # Returns
+/// `true` for `localhost` and loopback addresses of either family.
+fn is_loopback(host: &str) -> bool {
+    // `parse::<IpAddr>()` reads either address family; `is_ok_and` is
+    // Python's `try: ... except: False` around a test.
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 #[cfg(test)]
@@ -409,5 +567,137 @@ mod tests {
     #[test]
     fn no_file_gives_the_defaults() {
         assert_eq!(Config::load(None).unwrap(), Config::default());
+    }
+
+    /// The defaults with OAuth on at `public_url`, its host allowed.
+    fn oauth_on(public_url: &str, allowed: &[&str]) -> Config {
+        Config {
+            public_url: Some(public_url.to_string()),
+            allowed_hosts: allowed.iter().map(|host| host.to_string()).collect(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn oauth_is_off_by_default_with_sensible_lifetimes() {
+        let config = Config::default();
+
+        assert_eq!(config.public_url, None);
+        assert_eq!(config.oauth.access_token_ttl, Duration::from_secs(60 * 60));
+        assert_eq!(
+            config.oauth.refresh_token_ttl,
+            Duration::from_secs(30 * 24 * 60 * 60)
+        );
+        assert_eq!(
+            config.oauth.code_max_expiry,
+            Duration::from_secs(7 * 24 * 60 * 60)
+        );
+        assert!(config.oauth.dcr_enabled);
+        assert!(!config.oauth.cimd_allow_private);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn the_oauth_section_reads_from_the_file() {
+        let text = "public_url = \"https://okf.example.com\"\n\
+                    allowed_hosts = [\"okf.example.com\"]\n\
+                    [oauth]\n\
+                    access_token_ttl = \"15m\"\n\
+                    refresh_token_ttl = \"7d\"\n\
+                    code_max_expiry = \"2d\"\n\
+                    dcr_enabled = false\n\
+                    cimd_allow_private = true\n";
+
+        let config = Config::from_toml(text).unwrap();
+
+        assert_eq!(
+            config.public_url.as_deref(),
+            Some("https://okf.example.com")
+        );
+        assert_eq!(config.oauth.access_token_ttl, Duration::from_secs(15 * 60));
+        assert_eq!(
+            config.oauth.refresh_token_ttl,
+            Duration::from_secs(7 * 24 * 60 * 60)
+        );
+        assert_eq!(
+            config.oauth.code_max_expiry,
+            Duration::from_secs(2 * 24 * 60 * 60)
+        );
+        assert!(!config.oauth.dcr_enabled);
+        assert!(config.oauth.cimd_allow_private);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn public_url_must_be_an_allowed_https_origin() {
+        // Accepted: https on an allowed host, with or without a trailing
+        // slash or an explicit port that an entry allows; http on loopback.
+        for config in [
+            oauth_on("https://okf.example.com", &["okf.example.com"]),
+            oauth_on("https://okf.example.com/", &["okf.example.com"]),
+            oauth_on("https://OKF.example.com", &["okf.example.com"]),
+            oauth_on("https://okf.example.com:8443", &["okf.example.com:8443"]),
+            oauth_on("https://okf.example.com:8443", &["okf.example.com"]),
+            oauth_on("http://127.0.0.1:8080", &["127.0.0.1"]),
+            oauth_on("http://localhost:8080", &["localhost"]),
+            oauth_on("http://[::1]:8080", &["::1"]),
+        ] {
+            assert_eq!(config.validate(), Ok(()), "{:?}", config.public_url);
+        }
+        // Refused, each with a reason that names the problem.
+        for (config, needle) in [
+            (
+                oauth_on("http://okf.example.com", &["okf.example.com"]),
+                "https",
+            ),
+            (
+                oauth_on("ftp://okf.example.com", &["okf.example.com"]),
+                "https",
+            ),
+            (
+                oauth_on("https://okf.example.com/okf", &["okf.example.com"]),
+                "origin",
+            ),
+            (
+                oauth_on("https://okf.example.com/?a=b", &["okf.example.com"]),
+                "origin",
+            ),
+            (
+                oauth_on("https://user@okf.example.com", &["okf.example.com"]),
+                "user info",
+            ),
+            (oauth_on("okf.example.com", &["okf.example.com"]), "scheme"),
+            (
+                oauth_on("https://other.example.com", &["okf.example.com"]),
+                "allowed_hosts",
+            ),
+            (
+                oauth_on("https://okf.example.com", &["okf.example.com:8443"]),
+                "allowed_hosts",
+            ),
+            (oauth_on("not a url", &["okf.example.com"]), "URL"),
+        ] {
+            let error = config.validate().expect_err("refused");
+            assert!(error.contains(needle), "{:?}: {error}", config.public_url);
+        }
+    }
+
+    #[test]
+    fn oauth_lifetimes_must_be_positive() {
+        // Each closure is a plain `fn` pointer (it captures nothing), so the
+        // three share one type and fit in one array.
+        let changes: [fn(&mut OAuthConfig); 3] = [
+            |oauth| oauth.access_token_ttl = Duration::ZERO,
+            |oauth| oauth.refresh_token_ttl = Duration::ZERO,
+            |oauth| oauth.code_max_expiry = Duration::ZERO,
+        ];
+        for change in changes {
+            let mut config = Config::default();
+            change(&mut config.oauth);
+
+            let error = config.validate().expect_err("refused");
+
+            assert!(error.contains("more than zero"), "{error}");
+        }
     }
 }

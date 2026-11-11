@@ -21,7 +21,11 @@ use crate::config::Config;
 use crate::error::OkfError;
 use crate::http::sessions::SessionKeys;
 use crate::keyed_lock::KeyedLocks;
+use crate::oauth::OAuth;
 use crate::overlay::Overlays;
+use crate::store::oauth::{
+    clients as oauth_clients, codes as sign_in_codes, tokens as oauth_tokens,
+};
 use crate::store::{catalogs, changesets};
 
 /// Every loaded catalog, by name (a `BTreeMap`, so iteration is in name
@@ -36,6 +40,16 @@ type Broken = HashMap<i64, i64>;
 /// How long an empty open changeset may go unchanged before the poll loop
 /// discards it (design "Session lifecycle").
 const EMPTY_CHANGESET_HOURS: i64 = 24;
+
+/// How often the poll loop prunes the OAuth tables (they change slowly; a
+/// pass every `poll_interval` would be three needless deletes).
+const OAUTH_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// How long expired tokens and unredeemed codes are kept (for diagnosis).
+const OAUTH_RETENTION_DAYS: i64 = 7;
+
+/// How long a registered client that no grant names is kept.
+const UNBOUND_CLIENT_HOURS: i64 = 24;
 
 /// The state every route and tool shares. Built once by [`App::load`] and
 /// shared as an `Arc<App>`.
@@ -70,6 +84,11 @@ pub struct App {
     // The last clock check (design "Time"); `None` until the first one, and
     // always without a `time_server`. Written by the check loop only.
     clock_status: RwLock<Option<ClockStatus>>,
+    // The OAuth authorization server's state; `None` without `public_url`.
+    oauth: Option<OAuth>,
+    // When the OAuth tables were last pruned; `None` until the first pass.
+    // A `std` mutex: held only to read or set the instant.
+    oauth_pruned: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl App {
@@ -88,7 +107,8 @@ impl App {
     /// The shared state.
     ///
     /// # Errors
-    /// [`OkfError::Database`] reading the counter, the keys or the list.
+    /// [`OkfError::Database`] reading the counter, the keys or the list;
+    /// [`OkfError::Config`] from [`OAuth::new`].
     pub async fn load(
         pool: PgPool,
         config: Config,
@@ -116,6 +136,7 @@ impl App {
                 tracing::warn!(catalog = %name, "default_catalog is not loaded (yet)");
             }
         }
+        let oauth = OAuth::new(&config)?;
         let sessions = SessionKeys::new(config.session_idle_timeout);
         let overlays = Overlays::new(config.session_idle_timeout, config.overlay_cache_size);
         Ok(Arc::new(Self {
@@ -130,6 +151,8 @@ impl App {
             admin_generation: AtomicI64::new(admin_generation),
             polling: tokio::sync::Mutex::new(broken),
             clock_status: RwLock::new(None),
+            oauth,
+            oauth_pruned: std::sync::Mutex::new(None),
         }))
     }
 
@@ -159,6 +182,14 @@ impl App {
     /// The bindings, shared by every `/mcp` request.
     pub fn sessions(&self) -> &SessionKeys {
         &self.sessions
+    }
+
+    /// The OAuth state.
+    ///
+    /// # Returns
+    /// `None` when OAuth is off (no `public_url`).
+    pub fn oauth(&self) -> Option<&OAuth> {
+        self.oauth.as_ref()
     }
 
     /// The overlay cache (M5 Decision 6).
@@ -254,6 +285,7 @@ impl App {
         self.reload_keys_if_changed().await;
         // Before the catalog list, whose `?` would skip it on a failure.
         self.prune_empty_changesets().await;
+        self.prune_oauth().await;
         let current = self.catalogs();
         let mut next = Catalogs::new();
         // Rebuilt each pass, so a deleted catalog's entry goes with it.
@@ -343,6 +375,43 @@ impl App {
         }
     }
 
+    /// At most once per [`OAUTH_PRUNE_EVERY`], deletes expired OAuth tokens
+    /// and unredeemed codes kept [`OAUTH_RETENTION_DAYS`] past their expiry,
+    /// and registered clients no grant names after [`UNBOUND_CLIENT_HOURS`].
+    /// Runs whether or not OAuth is on, so rows left from when it was are
+    /// cleared too. Called only under `polling`.
+    ///
+    /// A failure is logged, not returned, and waits for the next hourly pass.
+    async fn prune_oauth(&self) {
+        let now_instant = std::time::Instant::now();
+        {
+            // A block, so the guard is released before the `.await`s below.
+            let mut pruned = self.oauth_pruned.lock().expect("oauth prune lock poisoned");
+            if pruned.is_some_and(|at| now_instant.duration_since(at) < OAUTH_PRUNE_EVERY) {
+                return;
+            }
+            *pruned = Some(now_instant);
+        }
+        let now = self.clock.now();
+        let retained = now - TimeDelta::days(OAUTH_RETENTION_DAYS);
+        log_pruned(
+            "expired OAuth tokens",
+            oauth_tokens::prune(&self.pool, retained).await,
+        );
+        log_pruned(
+            "expired sign-in codes",
+            sign_in_codes::prune(&self.pool, retained).await,
+        );
+        log_pruned(
+            "unused registered OAuth clients",
+            oauth_clients::prune_unbound_dcr(
+                &self.pool,
+                now - TimeDelta::hours(UNBOUND_CLIENT_HOURS),
+            )
+            .await,
+        );
+    }
+
     /// Runs [`App::poll`] every `poll_interval` until `shutdown` is cancelled.
     /// A failed pass is logged and the loop goes on.
     ///
@@ -399,6 +468,20 @@ impl App {
                 status = check => self.set_clock_status(status),
             }
         }
+    }
+}
+
+/// Logs one OAuth prune's outcome: silent for nothing deleted, `info` for
+/// some, `error` for a failure.
+///
+/// # Arguments
+/// * `what` - the rows, for the log line.
+/// * `result` - how many were deleted, or the failure.
+fn log_pruned(what: &'static str, result: Result<u64, OkfError>) {
+    match result {
+        Ok(0) => {}
+        Ok(pruned) => tracing::info!(pruned, "deleted {what}"),
+        Err(error) => tracing::error!(%error, "deleting {what} failed; retrying in an hour"),
     }
 }
 
@@ -918,5 +1001,71 @@ mod tests {
         assert_eq!(state(empty_old).await, ChangesetState::Discarded);
         assert_eq!(state(empty_new).await, ChangesetState::Open);
         assert_eq!(state(full_old).await, ChangesetState::Open);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn poll_prunes_oauth_rows_at_most_hourly() {
+        use crate::store::keys::Access;
+        use crate::store::oauth::testing::{insert_client, insert_grant};
+        let test = app_with(&[("main", &[])], Config::default()).await;
+        let pool = test.app.pool().clone();
+        let now = Utc::now();
+        let client = insert_client(
+            &pool,
+            "https://client.example.com/client.json",
+            "Example",
+            now,
+        )
+        .await;
+        let grant = insert_grant(&pool, &client, Access::Read, &["main"], now).await;
+        let stale_token = |byte: u8| {
+            let pool = pool.clone();
+            let grant = grant.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO oauth_tokens \
+                     (sha256, grant_id, kind, family_id, resource, created_at, expires_at) \
+                     VALUES ($1, $2, 'access', 'f', 'https://okf.example.com/mcp', $3, $4)",
+                )
+                .bind([byte; 32].as_slice())
+                .bind(&grant)
+                .bind(now - TimeDelta::days(9))
+                .bind(now - TimeDelta::days(8))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let count = |table: &'static str| {
+            let pool = pool.clone();
+            async move {
+                // `AssertSqlSafe`: `table` is one of this test's literals.
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                    "SELECT count(*) FROM {table}"
+                )))
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        stale_token(1).await;
+        sqlx::query(
+            "INSERT INTO oauth_clients (client_id, kind, redirect_uris, metadata, created_at) \
+             VALUES ('unbound', 'dcr', ARRAY['https://client.example.com/callback'], '{}', $1)",
+        )
+        .bind(now - TimeDelta::days(2))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The first pass prunes.
+        test.app.poll().await.unwrap();
+        assert_eq!(count("oauth_tokens").await, 0);
+        assert_eq!(count("oauth_clients").await, 1, "the bound client stays");
+
+        // Within the hour, a new stale row waits for the next hourly pass.
+        stale_token(2).await;
+        test.app.poll().await.unwrap();
+        assert_eq!(count("oauth_tokens").await, 1);
     }
 }
