@@ -306,10 +306,12 @@ pub const AUTHORIZATION_CODE_TTL: Duration; // 60 seconds
 pub const MAX_FAILED_ATTEMPTS: u8;          // 5
 
 // src/oauth/access.rs (Task 2)
-pub struct AccessTokens { /* cache: Mutex<HashMap<[u8; 32], LiveAccessToken>> */ }
+pub struct AccessTokens { /* cache: Mutex<Cache { tokens: HashMap<[u8; 32], LiveAccessToken>, generation: u64 }> */ }
 impl AccessTokens {
-    pub fn remember(&self, sha256: [u8; 32], token: LiveAccessToken, now: DateTime<Utc>);  // Task 6 calls on mint
-    pub fn forget(&self, hashes: &[[u8; 32]]);                            // Task 6 calls on revoke
+    pub fn generation(&self) -> u64;                                      // read BEFORE a lookup or mint
+    pub fn remember(&self, sha256: [u8; 32], token: LiveAccessToken, now: DateTime<Utc>,
+                    seen_generation: u64);                                // caches only if no `forget` since
+    pub fn forget(&self, hashes: &[[u8; 32]]);                            // Task 6 calls on revoke; bumps the generation
     pub async fn verify(&self, app: &App, resource: &str, token: &str) -> Result<Option<Arc<Principal>>, OkfError>;
 }
 // The trait's second implementation borrows what the lookup needs:
@@ -3529,12 +3531,24 @@ use crate::store::oauth::tokens::{self, LiveAccessToken};
 /// time instead of cached.
 const MAX_CACHED: usize = 10_000;
 
+/// The cache's contents: the tokens, and how many revocations it has seen.
+#[derive(Debug, Default)]
+struct Cache {
+    tokens: HashMap<[u8; 32], LiveAccessToken>,
+    // Bumped by every `forget`. A lookup records it before reading the
+    // database and may cache its result only if it has not moved, so a
+    // revocation that commits while the lookup is in flight cannot be undone
+    // by the lookup re-caching the token it read before the revocation
+    // (PR #243 review).
+    generation: u64,
+}
+
 /// Live access tokens seen recently, by SHA-256.
 #[derive(Debug, Default)]
 pub struct AccessTokens {
-    // A `std` mutex, held only to read or change the map, never across an
+    // A `std` mutex, held only to read or change the cache, never across an
     // `.await` (each use below is its own statement or block).
-    cache: Mutex<HashMap<[u8; 32], LiveAccessToken>>,
+    cache: Mutex<Cache>,
 }
 
 impl AccessTokens {
@@ -3546,36 +3560,64 @@ impl AccessTokens {
         Self::default()
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<[u8; 32], LiveAccessToken>> {
+    fn lock(&self) -> MutexGuard<'_, Cache> {
         self.cache.lock().expect("access token cache lock poisoned")
     }
 
-    /// Caches a live token (Task 6 calls this when it mints one).
+    /// The revocation generation. Read it before a database lookup (or, in
+    /// Task 6, before minting) and pass it to [`Self::remember`].
+    ///
+    /// # Returns
+    /// How many times [`Self::forget`] has run.
+    pub fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    /// Caches a live token, unless a revocation happened since
+    /// `seen_generation` was read: then the token may be the one just
+    /// revoked, and the next request rechecks the database instead.
     ///
     /// # Arguments
     /// * `sha256` - `keys::hash` of the token.
     /// * `token` - its facts.
     /// * `now` - the current time, to prune expired entries when full.
-    pub fn remember(&self, sha256: [u8; 32], token: LiveAccessToken, now: DateTime<Utc>) {
+    /// * `seen_generation` - [`Self::generation`], read before the token was
+    ///   looked up or minted.
+    pub fn remember(
+        &self,
+        sha256: [u8; 32],
+        token: LiveAccessToken,
+        now: DateTime<Utc>,
+        seen_generation: u64,
+    ) {
+        // The check and the insert happen under one lock, so no `forget` can
+        // fall between them.
         let mut cache = self.lock();
-        if cache.len() >= MAX_CACHED {
-            cache.retain(|_, cached| cached.expires_at > now);
-            if cache.len() >= MAX_CACHED {
+        if cache.generation != seen_generation {
+            return;
+        }
+        if cache.tokens.len() >= MAX_CACHED {
+            cache.tokens.retain(|_, cached| cached.expires_at > now);
+            if cache.tokens.len() >= MAX_CACHED {
                 return;
             }
         }
-        cache.insert(sha256, token);
+        cache.tokens.insert(sha256, token);
     }
 
-    /// Drops tokens from the cache (Task 6 calls this on revocation, so a
-    /// revoked token stops working at once).
+    /// Drops tokens from the cache and bumps the generation (Task 6 calls
+    /// this after a revocation commits), so a revoked token stops working at
+    /// once, and no lookup already in flight can cache it again.
     ///
     /// # Arguments
     /// * `hashes` - the revoked tokens' hashes.
     pub fn forget(&self, hashes: &[[u8; 32]]) {
         let mut cache = self.lock();
+        // `wrapping_add`: a u64 that never realistically wraps, but if it
+        // did, a wrapped value still differs from every recent reading.
+        cache.generation = cache.generation.wrapping_add(1);
         for hash in hashes {
-            cache.remove(hash);
+            cache.tokens.remove(hash);
         }
     }
 
@@ -3602,12 +3644,17 @@ impl AccessTokens {
         let now = app.clock().now();
         // The lock guard is a temporary of this statement, released before
         // the `.await` below.
-        let cached = self.lock().get(&sha256).cloned();
+        // Read the generation in the same lock as the cache miss, before the
+        // database read: a revocation committed after this point bumps it.
+        let (cached, generation) = {
+            let cache = self.lock();
+            (cache.tokens.get(&sha256).cloned(), cache.generation)
+        };
         let live = match cached {
             Some(live) => live,
             None => match tokens::find_access(app.pool(), &sha256, now).await? {
                 Some(live) => {
-                    self.remember(sha256, live.clone(), now);
+                    self.remember(sha256, live.clone(), now, generation);
                     live
                 }
                 None => return Ok(None),
@@ -4378,14 +4425,65 @@ mod tests {
         for index in 0..MAX_CACHED {
             let mut hash = [0u8; 32];
             hash[..8].copy_from_slice(&(index as u64).to_le_bytes());
-            tokens.remember(hash, live(now - TimeDelta::seconds(1)), now);
+            tokens.remember(hash, live(now - TimeDelta::seconds(1)), now, 0);
         }
 
-        tokens.remember([0xff; 32], live(now + TimeDelta::hours(1)), now);
+        tokens.remember([0xff; 32], live(now + TimeDelta::hours(1)), now, 0);
 
         let cache = tokens.lock();
-        assert_eq!(cache.len(), 1, "the expired entries were pruned");
-        assert!(cache.contains_key(&[0xff; 32]));
+        assert_eq!(cache.tokens.len(), 1, "the expired entries were pruned");
+        assert!(cache.tokens.contains_key(&[0xff; 32]));
+    }
+
+    #[test]
+    fn a_lookup_that_straddles_a_revocation_does_not_re_cache_the_token() {
+        // The interleaving from the PR #243 review, made deterministic by
+        // calling the cache's steps in that order: a request misses and reads
+        // the generation, the revocation commits and forgets, then the first
+        // request tries to cache what it read before the revocation.
+        let tokens = AccessTokens::new();
+        let now = chrono::Utc::now();
+        let hash = [0x11; 32];
+        let token = LiveAccessToken {
+            grant_id: "g".into(),
+            resource: RESOURCE.into(),
+            expires_at: now + TimeDelta::hours(1),
+        };
+        let seen = tokens.generation();
+
+        tokens.forget(&[hash]);
+        tokens.remember(hash, token.clone(), now, seen);
+
+        assert!(!tokens.lock().tokens.contains_key(&hash), "not re-cached");
+        // A lookup that starts after the revocation caches normally (the
+        // database, not the cache, then says whether the token is live).
+        tokens.remember(hash, token, now, tokens.generation());
+        assert!(tokens.lock().tokens.contains_key(&hash));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_token_read_before_its_revocation_is_refused_next_time() {
+        // The same race end to end: a lookup reads the token while it is
+        // live, the revocation commits and forgets, then the stale lookup's
+        // `remember` runs with the generation it read. The next verify goes
+        // to the database, which says revoked.
+        let (test, grant) = with_grant().await;
+        let oauth = test.app.oauth().expect("OAuth is on");
+        let token = mint_access(&test.app, &grant, RESOURCE, TimeDelta::hours(1)).await;
+        let hash = crate::keys::hash(&token);
+        let now = test.app.clock().now();
+        let seen = oauth.access.generation();
+        let stale = tokens::find_access(test.app.pool(), &hash, now)
+            .await
+            .unwrap()
+            .expect("live before the revocation");
+
+        tokens::revoke(test.app.pool(), &hash, now).await.unwrap();
+        oauth.access.forget(&[hash]);
+        oauth.access.remember(hash, stale, now, seen);
+
+        let after = oauth.access.verify(&test.app, RESOURCE, &token).await.unwrap();
+        assert!(after.is_none(), "the revoked token is not accepted from the cache");
     }
 }
 ```
@@ -11196,6 +11294,10 @@ struct Minted {
     access: LiveAccessToken,
     /// When it was minted, for the cache's pruning.
     now: DateTime<Utc>,
+    /// The cache's revocation generation, read before the tokens were
+    /// written: a family revocation that commits before `remember` (a
+    /// replayed code racing this exchange) keeps the token out of the cache.
+    generation: u64,
 }
 
 /// Mints an access and a refresh token in `conn`'s transaction.
@@ -11215,6 +11317,7 @@ async fn mint(
     now: DateTime<Utc>,
 ) -> Result<Minted, OkfError> {
     let (grant_id, family_id, resource) = bound;
+    let generation = oauth.access.generation();
     let access_token = keys::generate_with(keys::ACCESS_TOKEN_PREFIX)?;
     let refresh_token = keys::generate_with(keys::REFRESH_TOKEN_PREFIX)?;
     let access_expires = now + delta(oauth.settings.access_token_ttl)?;
@@ -11241,12 +11344,13 @@ async fn mint(
             expires_at: access_expires,
         },
         now,
+        generation,
     })
 }
 
 /// After commit: caches the new access token and hands back the response.
 fn remember(oauth: &OAuth, minted: Minted) -> TokenResponse {
-    oauth.access.remember(minted.access_hash, minted.access, minted.now);
+    oauth.access.remember(minted.access_hash, minted.access, minted.now, minted.generation);
     minted.response
 }
 
