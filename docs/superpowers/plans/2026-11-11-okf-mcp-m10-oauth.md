@@ -70,6 +70,7 @@ Filled in as tasks land, as in M9 (dated `> **Corrected (issue #N).**` notes in 
 7. **The consent page** follows the system light/dark theme with no toggle (it has no JavaScript), and its CSP allows the console's Google Fonts hosts (Task 5).
 8. **Bounded in-memory maps:** `ExpiringMap` has a capacity; a full pending map answers the authorize GET with 503 (Tasks 2 and 5).
 9. **Rate limits** (Task 2): register, a burst of 10 then one every 6 seconds; token and revoke, 60 then 2 a second; consent POST, 20 then 1 a second.
+10. **`sign_in_codes_redeemed_grant`** (Task 2, corrected issue #246, 2026-11-11) is `grant_id IS NULL OR redeemed_at IS NOT NULL`, a check the spec's DDL lacks; Task 8 adds it to the spec.
 
 ## Verified facts the code relies on
 
@@ -1101,7 +1102,9 @@ CREATE TABLE sign_in_codes (
     redeemed_at        timestamptz,
     grant_id           text REFERENCES api_keys (id) ON DELETE SET NULL,
     revoked_at         timestamptz,
-    CONSTRAINT sign_in_codes_redeemed_grant CHECK ((redeemed_at IS NULL) = (grant_id IS NULL))
+    -- A grant id only on a redeemed code. A redeemed code may lose it: the
+    -- `ON DELETE SET NULL` above clears it if the grant row is ever deleted.
+    CONSTRAINT sign_in_codes_redeemed_grant CHECK (grant_id IS NULL OR redeemed_at IS NOT NULL)
 );
 -- Lets deleting a catalog find the codes whose default it clears.
 CREATE INDEX sign_in_codes_default_catalog_id ON sign_in_codes (default_catalog_id)
@@ -1135,6 +1138,8 @@ CREATE INDEX oauth_tokens_family_id ON oauth_tokens (family_id);
 CREATE INDEX oauth_tokens_grant_id ON oauth_tokens (grant_id);
 CREATE INDEX oauth_tokens_expires_at ON oauth_tokens (expires_at);
 ```
+
+> **Corrected (issue #246, 2026-11-11, PR #254 review).** `sign_in_codes_redeemed_grant` was `(redeemed_at IS NULL) = (grant_id IS NULL)`, which the `grant_id ... ON DELETE SET NULL` action would violate on deleting a grant row. It is now `grant_id IS NULL OR redeemed_at IS NOT NULL`: a grant id only on a redeemed code, and a redeemed code may outlive its grant row. Task 4's `redeem` still sets both together. `oauth_schema_keeps_existing_keys_and_guards_grant_rows` also asserts both halves (an unredeemed code with a grant id is refused; deleting a redeemed code's grant clears `grant_id` and keeps `redeemed_at`). The spec's DDL has no such check; Task 8 adds it there.
 
 - [ ] **Step 4: Run the tests to see them pass**
 
@@ -4517,6 +4522,8 @@ mod tests {
 ```
 
 (`send` in `src/http/api/testing.rs` takes the key text and adds `Bearer `, so an access token goes through it unchanged.)
+
+> **Corrected (issue #246, 2026-11-11, PR #254 review).** One more test, `a_cached_token_past_its_expiry_is_refused_and_dropped`: it `remember`s a `LiveAccessToken` for the live grant with `expires_at` one second before the app's clock (not stored in the database), then asserts `verify` refuses it, drops it from the cache, and leaves the generation unchanged. Unlike the expired token above, which the database lookup already refuses, it fails if the cache-expiry check in `verify` is removed. That check drops the entry without `forget`: expiry is not a revocation.
 
 In `src/http/mod.rs` tests, add:
 

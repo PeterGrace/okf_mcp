@@ -57,7 +57,9 @@ CREATE TABLE sign_in_codes (
     redeemed_at        timestamptz,
     grant_id           text REFERENCES api_keys (id) ON DELETE SET NULL,
     revoked_at         timestamptz,
-    CONSTRAINT sign_in_codes_redeemed_grant CHECK ((redeemed_at IS NULL) = (grant_id IS NULL))
+    -- A grant id only on a redeemed code. A redeemed code may lose it: the
+    -- `ON DELETE SET NULL` above clears it if the grant row is ever deleted.
+    CONSTRAINT sign_in_codes_redeemed_grant CHECK (grant_id IS NULL OR redeemed_at IS NOT NULL)
 );
 -- Lets deleting a catalog find the codes whose default it clears.
 CREATE INDEX sign_in_codes_default_catalog_id ON sign_in_codes (default_catalog_id)

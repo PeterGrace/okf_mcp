@@ -42,3 +42,7 @@
   `oauth::state::code_key` is `pub` (no caller before Task 5) and already
   carries Task 5's single-allocation body; an expired cached token is
   dropped without bumping the revocation generation.
+- Review (PR #254): `sign_in_codes_redeemed_grant` is
+  `grant_id IS NULL OR redeemed_at IS NOT NULL`, so deleting a grant row
+  (`ON DELETE SET NULL`) cannot violate it; a regression test covers a
+  cached access token that expires after entering the cache.

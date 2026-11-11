@@ -184,6 +184,51 @@ mod tests {
             constraint(grant(None, "read", true).await).as_deref(),
             Some("api_keys_oauth_caps")
         );
+        // A sign-in code names a grant only once redeemed, and keeps its
+        // redemption when that grant row is deleted (`ON DELETE SET NULL`).
+        let grant_id: String = sqlx::query_scalar(
+            "INSERT INTO api_keys (name, access, all_catalogs, actor, created_at, kind) \
+             VALUES ('doomed', 'read', true, 'example-actor', $1, 'oauth') RETURNING id",
+        )
+        .bind(now)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let code = |byte: u8, redeemed: bool| {
+            let pool = db.pool.clone();
+            let grant_id = grant_id.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO sign_in_codes \
+                     (name, sha256, access, all_catalogs, actor, created_at, expires_at, \
+                      redeemed_at, grant_id) \
+                     VALUES ('laptop', $1, 'read', true, 'example-actor', $2, $3, $4, $5)",
+                )
+                .bind(vec![byte; 32])
+                .bind(now)
+                .bind(now + chrono::TimeDelta::hours(1))
+                .bind(redeemed.then_some(now))
+                .bind(grant_id)
+                .execute(&pool)
+                .await
+            }
+        };
+        assert_eq!(
+            constraint(code(1, false).await).as_deref(),
+            Some("sign_in_codes_redeemed_grant")
+        );
+        code(2, true).await.unwrap();
+        sqlx::query("DELETE FROM api_keys WHERE id = $1")
+            .bind(&grant_id)
+            .execute(&db.pool)
+            .await
+            .expect("deleting a redeemed code's grant clears the code's grant_id");
+        let (redeemed_at, kept_grant): (Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
+            sqlx::query_as("SELECT redeemed_at, grant_id FROM sign_in_codes")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!((redeemed_at.is_some(), kept_grant), (true, None));
         // A key row still needs its hash, and a second live key of one
         // name and actor is still refused.
         let key = |sha256: Option<Vec<u8>>| {
