@@ -576,3 +576,8 @@ and passes.
 Before a push, also run `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings` and
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`.
+
+## License
+
+okf-mcp is licensed under the GNU Affero General Public License v3.0 only
+(`AGPL-3.0-only`). See [LICENSE](LICENSE) for the full text.
