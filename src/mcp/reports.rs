@@ -780,8 +780,8 @@ mod tests {
             .await
             .unwrap_err();
         // The changeset's catalog stands in for a `catalog` argument, which
-        // wins over the connection's catalogs: a `work`-only connection
-        // reports on `pg` too.
+        // cannot escape the connection's catalogs: on a `work`-only
+        // connection the `pg` handle does not resolve.
         let work_only = context(
             &test,
             principal_as("writer", Access::Write, &[], None),
@@ -789,7 +789,7 @@ mod tests {
         );
         let outside_selection = open_questions(&work_only, questions(None, Some(&handle)))
             .await
-            .unwrap();
+            .unwrap_err();
 
         assert_eq!(plain.catalog, "work");
         assert_eq!(pinned.catalog, "pg");
@@ -802,6 +802,6 @@ mod tests {
         assert_eq!((lint.catalog.as_str(), lint.pending), ("pg", true));
         assert_eq!(elsewhere.kind(), "Refused");
         assert!(elsewhere.to_string().contains("\"pg\""), "{elsewhere}");
-        assert_eq!(outside_selection.catalog, "pg");
+        assert_eq!(outside_selection.kind(), "UnknownChangeset");
     }
 }

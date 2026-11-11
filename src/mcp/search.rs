@@ -260,7 +260,7 @@ mod tests {
             result.hits.iter().map(|hit| hit.catalog.clone()).collect()
         };
         assert_eq!(names(&found), ["work", "pg"]);
-        // The `catalogs` argument wins over the connection's catalogs.
+        // The `catalogs` argument narrows the connection's catalogs.
         assert_eq!(names(&found_in_pg), ["pg"]);
     }
 

@@ -36,7 +36,8 @@ use crate::write::{apply, WriteReport};
 // its input schema, with the doc comments as the fields' descriptions.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct ListParams {
-    /// Only this catalog (default: every catalog the key reaches).
+    /// Only this catalog (default: every catalog the connection offers: the
+    /// key's, limited to the connection's list when it has one).
     pub catalog: Option<String>,
 }
 
@@ -96,8 +97,9 @@ fn idle_cutoff(now: DateTime<Utc>, idle: Duration) -> DateTime<Utc> {
 /// * `params` - an optional catalog to narrow the list to.
 ///
 /// # Returns
-/// Open changesets, empty ones included, in the catalogs the key reaches
-/// (or the one named): the key's own, and with `admin` every key's.
+/// Open changesets, empty ones included, in the catalogs the connection
+/// offers ([`ToolContext::offers`]) or the one named: the key's own, and
+/// with `admin` every key's.
 ///
 /// # Errors
 /// A selection error for `catalog`; [`OkfError::Database`].
@@ -112,12 +114,15 @@ pub(crate) async fn list_changesets(
     let catalog_ids: Vec<i64> = match params.catalog.as_deref() {
         // `one` refuses a catalog the key does not reach.
         Some(name) => vec![ctx.one(Some(name))?.id()],
-        None => ctx
-            .catalogs()
-            .values()
-            .filter(|state| principal.reaches(state.name()))
-            .map(|state| state.id())
-            .collect(),
+        None => {
+            // A list naming a bad catalog fails here as it does elsewhere.
+            ctx.check_connection()?;
+            ctx.catalogs()
+                .values()
+                .filter(|state| ctx.offers(state.name()))
+                .map(|state| state.id())
+                .collect()
+        }
     };
     let admin = principal.access >= Access::Admin;
     // The database narrows by key (unless admin) and catalog, so other
@@ -928,6 +933,38 @@ mod lifecycle_tests {
 
         assert_eq!(cutoff, now - TimeDelta::hours(2));
         assert_eq!(huge, chrono::DateTime::<Utc>::MIN_UTC);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_changesets_lists_only_the_connection_s_catalogs() {
+        let test = test_app().await;
+        let alice = connection(&test, "alice", Access::Write, &[]);
+        let in_pg = open_at(&test, &alice, "pg", Utc::now()).await.handle;
+        let in_work = open_at(&test, &alice, "work", Utc::now()).await.handle;
+        let work_only = context(
+            &test,
+            principal_as("alice", Access::Write, &[], Some("pg")),
+            Some(&["work"]),
+        );
+
+        let unlisted = list_changesets(&alice, all()).await.unwrap();
+        let listed = list_changesets(&work_only, all()).await.unwrap();
+
+        assert_eq!(unlisted.changesets.len(), 2);
+        assert!(handles(&unlisted).contains(&in_pg.as_str()));
+        assert_eq!(handles(&listed), [in_work.as_str()]);
+        // `nope` does not exist; the second key reaches only `work`, not `pg`.
+        for (list, reach) in [(["work", "nope"], &[][..]), (["work", "pg"], &["work"][..])] {
+            let on_list = context(
+                &test,
+                principal_as("alice", Access::Write, reach, Some("work")),
+                Some(&list),
+            );
+
+            let refused = list_changesets(&on_list, all()).await.unwrap_err();
+
+            assert_eq!(refused.kind(), "CatalogNotSelected", "{list:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
