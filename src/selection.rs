@@ -171,7 +171,7 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
-    use crate::auth::Reach;
+    use crate::auth::{CredentialKind, Reach};
     use crate::store::keys::Access;
 
     fn principal(reach: &[&str], default: Option<&str>) -> Principal {
@@ -186,6 +186,7 @@ mod tests {
             },
             default_catalog: default.map(str::to_string),
             actor: "a".to_string(),
+            kind: CredentialKind::ApiKey,
         }
     }
 

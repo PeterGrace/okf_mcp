@@ -972,7 +972,7 @@ mod tests {
         let record = keys::KeyRecord {
             id: "credential-id".to_string(),
             name: "claude".to_string(),
-            sha256: Vec::new(),
+            sha256: None,
             access: Access::Write,
             maintenance_report: false,
             all_catalogs: false,
@@ -981,6 +981,9 @@ mod tests {
             actor: "claude-code-tui".to_string(),
             created_at: chrono::Utc::now(),
             revoked_at: None,
+            kind: keys::KeyKind::Key,
+            client_id: None,
+            client_name: None,
         };
 
         assert_eq!(

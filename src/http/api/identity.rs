@@ -9,7 +9,7 @@ use axum::{Extension, Json, Router};
 use serde::Serialize;
 
 use crate::app::App;
-use crate::auth::{Principal, Reach};
+use crate::auth::{CredentialKind, Principal, Reach};
 use crate::http::AppError;
 use crate::store::keys as key_rows;
 
@@ -32,6 +32,10 @@ pub(crate) struct WhoAmI {
     pub catalogs: Vec<String>,
     /// Its default catalog.
     pub default_catalog: Option<String>,
+    /// `key`, or `oauth` for a grant.
+    pub kind: &'static str,
+    /// A grant's client, as it names itself.
+    pub client_name: Option<String>,
 }
 
 /// This area's routes.
@@ -59,6 +63,11 @@ async fn whoami(
         .filter(|catalog| principal.reaches(catalog))
         .cloned()
         .collect();
+    // `match` on a reference: `client_name` binds a `&Option<String>`.
+    let (kind, client_name) = match &principal.kind {
+        CredentialKind::ApiKey => ("key", None),
+        CredentialKind::OAuth { client_name, .. } => ("oauth", client_name.clone()),
+    };
     Ok(Json(WhoAmI {
         key_id: principal.key_id.clone(),
         name,
@@ -68,6 +77,8 @@ async fn whoami(
         all_catalogs: matches!(principal.reach, Reach::All),
         catalogs,
         default_catalog: principal.default_catalog.clone(),
+        kind,
+        client_name,
     }))
 }
 
@@ -89,6 +100,8 @@ mod tests {
         assert_eq!(body["all_catalogs"], false);
         assert_eq!(body["catalogs"], serde_json::json!(["main"]));
         assert_eq!(body["default_catalog"], "main");
+        assert_eq!(body["kind"], "key");
+        assert_eq!(body["client_name"], serde_json::Value::Null);
         assert!(body.get("sha256").is_none(), "never a hash or secret");
     }
 

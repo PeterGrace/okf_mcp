@@ -9,7 +9,7 @@ use crate::app::App;
 // Re-exported so tool tests keep calling `testing::files`; it lives in
 // `archive`, beside `Files`, so store tests need not reach up into `mcp`.
 pub(crate) use crate::archive::files;
-use crate::auth::{Principal, Reach};
+use crate::auth::{CredentialKind, Principal, Reach};
 use crate::clock::{Clock, SystemClock};
 use crate::config::Config;
 use crate::db::pg_support::TestDb;
@@ -133,6 +133,7 @@ pub(crate) fn principal_with_reporting(
         },
         default_catalog: default.map(str::to_string),
         actor: key_id.to_string(),
+        kind: CredentialKind::ApiKey,
     })
 }
 

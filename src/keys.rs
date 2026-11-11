@@ -1,6 +1,7 @@
-//! API keys: generation, hashing and constant-time comparison. A key is
-//! shown once, when created; only its SHA-256 is stored, and keys are never
-//! logged.
+//! Secrets: API keys, OAuth access and refresh tokens, sign-in codes and
+//! authorization codes. Each is a recognizable prefix plus 32 random bytes.
+//! A secret is shown once, when created; only its SHA-256 is stored, and
+//! secrets are never logged.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 // `Engine as _` imports the trait for its `encode` method without binding a
@@ -11,11 +12,22 @@ use subtle::ConstantTimeEq;
 
 use crate::error::OkfError;
 
-/// Every key starts with this, so people and secret scanners can recognize one.
+/// Every API key starts with this, so people and secret scanners can recognize one.
 pub const KEY_PREFIX: &str = "okf_";
 
-/// Generates a new key: [`KEY_PREFIX`] plus 32 random bytes in unpadded
-/// base64url (43 characters).
+/// Every OAuth access token starts with this (the bearer dispatch in `auth`).
+pub const ACCESS_TOKEN_PREFIX: &str = "okfat_";
+
+/// Every OAuth refresh token starts with this.
+pub const REFRESH_TOKEN_PREFIX: &str = "okfrt_";
+
+/// Every admin-issued sign-in code starts with this.
+pub const SIGN_IN_CODE_PREFIX: &str = "okfsc_";
+
+/// Every OAuth authorization code starts with this.
+pub const AUTHORIZATION_CODE_PREFIX: &str = "okfac_";
+
+/// Generates a new API key: [`generate_with`] with [`KEY_PREFIX`].
 ///
 /// # Returns
 /// The key. Show it once; store only [`hash`] of it.
@@ -23,6 +35,21 @@ pub const KEY_PREFIX: &str = "okf_";
 /// # Errors
 /// [`OkfError::Io`] if the OS random source fails.
 pub fn generate() -> Result<String, OkfError> {
+    generate_with(KEY_PREFIX)
+}
+
+/// Generates a new secret: `prefix` plus 32 random bytes in unpadded
+/// base64url (43 characters).
+///
+/// # Arguments
+/// * `prefix` - one of this module's `*_PREFIX` constants.
+///
+/// # Returns
+/// The secret. Show it once; store only [`hash`] of it.
+///
+/// # Errors
+/// [`OkfError::Io`] if the OS random source fails.
+pub fn generate_with(prefix: &str) -> Result<String, OkfError> {
     // A fixed-size array on the stack, filled in place (`&mut` lends it out
     // for writing), like `bytearray(32)` passed to `os.urandom`'s C side.
     let mut bytes = [0u8; 32];
@@ -30,7 +57,7 @@ pub fn generate() -> Result<String, OkfError> {
         path: "<os random source>".to_string(),
         source: std::io::Error::other(error),
     })?;
-    Ok(format!("{KEY_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes)))
+    Ok(format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes)))
 }
 
 /// The SHA-256 of a key's text, as stored in `api_keys.sha256`.
@@ -101,5 +128,62 @@ mod tests {
             !matches(&stored[..31], &key),
             "a short hash is false, not a panic"
         );
+    }
+
+    #[test]
+    fn every_secret_kind_has_its_own_prefix() {
+        for prefix in PREFIXES {
+            let secret = generate_with(prefix).unwrap();
+
+            assert!(secret.starts_with(prefix), "{prefix}");
+            assert_eq!(secret.len(), prefix.len() + 43, "{prefix}");
+        }
+        // No prefix is a prefix of another, so dispatch by prefix is exact.
+        for (index, first) in PREFIXES.iter().enumerate() {
+            for second in &PREFIXES[index + 1..] {
+                assert!(!first.starts_with(second), "{first} {second}");
+                assert!(!second.starts_with(first), "{first} {second}");
+            }
+        }
+    }
+
+    /// Every kind of secret, by prefix. `KEY_PREFIX` (`okf_`) differs from the
+    /// others at its fourth byte, so no prefix is a prefix of another.
+    const PREFIXES: [&str; 5] = [
+        KEY_PREFIX,
+        ACCESS_TOKEN_PREFIX,
+        REFRESH_TOKEN_PREFIX,
+        SIGN_IN_CODE_PREFIX,
+        AUTHORIZATION_CODE_PREFIX,
+    ];
+
+    #[hegel::test]
+    fn a_prefixed_secret_is_exactly_one_kind(tc: hegel::TestCase) {
+        use hegel::generators;
+        let prefix: &str = tc.draw(generators::sampled_from(PREFIXES.to_vec()));
+        let rest: String = tc.draw(generators::text());
+        let token = format!("{prefix}{rest}");
+
+        // The bearer dispatch (`auth::authenticate`) routes on
+        // `starts_with`, so a token must never look like two kinds.
+        let kinds = PREFIXES
+            .iter()
+            .filter(|known| token.starts_with(**known))
+            .count();
+        assert_eq!(kinds, 1, "{token:?}");
+    }
+
+    #[hegel::test]
+    fn generated_secrets_keep_their_prefix_and_alphabet(tc: hegel::TestCase) {
+        use hegel::generators;
+        let prefix: &str = tc.draw(generators::sampled_from(PREFIXES.to_vec()));
+
+        let secret = generate_with(prefix).expect("random source");
+
+        assert!(secret.starts_with(prefix));
+        assert_eq!(secret.len(), prefix.len() + 43);
+        assert!(secret[prefix.len()..]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
     }
 }

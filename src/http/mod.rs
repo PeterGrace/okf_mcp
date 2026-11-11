@@ -1,7 +1,8 @@
 //! The HTTP server (design "Process and routes"): `/healthz`, `/mcp`, the
 //! archive routes (`archives`), the JSON API under `/api/v1` (`api`) and the
-//! web console under `/ui/` (`ui`), with request tracing, timeouts and the
-//! key layer, and on `/mcp` the session binding (`sessions`).
+//! web console under `/ui/` (`ui`), the OAuth routes (`crate::oauth`) when
+//! OAuth is on, with request tracing, timeouts and the key layer, and on
+//! `/mcp` the session binding (`sessions`).
 
 pub(crate) mod api;
 mod archives;
@@ -32,6 +33,7 @@ use crate::clock_check::ClockStatus;
 use crate::error::OkfError;
 use crate::http::sessions::bind_session;
 use crate::mcp::OkfServer;
+use crate::oauth;
 
 /// How long a request on any route but `/mcp` may take; for an import, how
 /// long reading and checking its upload may take (the import itself has no
@@ -199,7 +201,6 @@ fn mcp_service(
 /// # Returns
 /// The router, ready for [`axum::serve()`] (which [`serve`] calls).
 pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
-    let keys = Arc::clone(app.keys());
     // Layers wrap what is added before them, so a layer added later runs
     // first on the way in: `require_key` (on `keyed`) runs before
     // `bind_session` (on `mcp`), which can then read the principal.
@@ -214,13 +215,23 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     let keyed = Router::new()
         .merge(mcp)
         .merge(archives::routes(&app))
-        .route_layer(middleware::from_fn_with_state(keys, require_key));
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&app),
+            require_key,
+        ));
     let health = Router::new()
         .route("/healthz", get(healthz))
         .layer(timeout_layer());
-    Router::new()
-        .merge(health)
-        .merge(ui::routes())
+    // The OAuth routes exist only with OAuth on; without it `/oauth/*` and
+    // `/.well-known/*` stay 404, as before M10. They take no bearer token.
+    let open = if app.oauth().is_some() {
+        Router::new()
+            .merge(health)
+            .merge(oauth::routes().layer(timeout_layer()))
+    } else {
+        Router::new().merge(health)
+    };
+    open.merge(ui::routes())
         // The API applies `require_key` itself, inside its header layer, so
         // even its 401 carries `no-store` and `nosniff`.
         .nest("/api/v1", api::routes(&app))
@@ -530,6 +541,35 @@ mod tests {
         assert_eq!(
             after["clock"],
             serde_json::json!({"ok": false, "checked_at": "2026-11-03T12:00:00Z"})
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oauth_routes_exist_only_with_oauth_on() {
+        let off = app_with(&[("main", &[])], Config::default()).await;
+        let on = app_with(
+            &[("main", &[])],
+            crate::store::oauth::testing::oauth_config("https://okf.example.com"),
+        )
+        .await;
+        let get = |test: &crate::mcp::testing::TestApp| {
+            router(Arc::clone(&test.app), &CancellationToken::new()).oneshot(
+                Request::get("/mcp")
+                    .header("host", "okf.example.com")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+        };
+
+        let refused_off = get(&off).await.unwrap();
+        let refused_on = get(&on).await.unwrap();
+
+        assert_eq!(refused_off.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(refused_off.headers()["www-authenticate"], "Bearer");
+        assert_eq!(refused_on.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            refused_on.headers()["www-authenticate"],
+            "Bearer resource_metadata=\"https://okf.example.com/.well-known/oauth-protected-resource\""
         );
     }
 }
