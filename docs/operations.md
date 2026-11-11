@@ -1544,9 +1544,12 @@ its id, with `okf-mcp oauth grant revoke` or the `/api/v1/keys/{id}` routes
   database on every use). A redeemed code cannot be revoked; revoke the grant
   it became (its `grant` column).
 - **From the client**: disconnecting in the client may call `/oauth/revoke`.
-  Revoking a refresh token ends the whole connection's tokens; revoking an
-  access token alone leaves the refresh token working. Either way the grant
-  stays listed, with no working tokens, until an admin revokes it.
+  Revoking an access token ends only that token: the refresh token keeps
+  working and mints a new access token, so the client stays connected.
+  Revoking a refresh token ends its whole family, which disconnects the
+  client; the grant then stays listed, with no working tokens, until an
+  admin revokes it. Only a refresh-token revocation or revoking the grant
+  disconnects a client.
 
 Unused registered clients are deleted 24 hours after registration, and tokens
 and unredeemed codes 7 days after they expire, by an hourly pass of the
