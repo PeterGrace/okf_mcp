@@ -8,7 +8,10 @@ Status: every milestone of the design is delivered: 1 (core library), 2
 (analysis), 3 (storage), 4 (read-only server), 5 (writes), 6 (restructuring)
 and 7 (deployment). Milestone 9 added the web console at `/ui/` and its JSON
 API at `/api/v1` ("Web console" below; design:
-`docs/superpowers/specs/2026-11-09-okf-webui-design.md`).
+`docs/superpowers/specs/2026-11-09-okf-webui-design.md`). Milestone 10 added
+OAuth 2.1 for connectors that cannot send an API key, and a title and
+behaviour hints on every tool (`docs/operations.md`, "OAuth connectors";
+design: `docs/superpowers/specs/2026-11-11-okf-oauth-design.md`).
 
 Deployed: `https://okf-mcp.k.vsix.me` (every route but `/healthz` needs a
 bearer key), from the image `ghcr.io/hypotheosis/okf-mcp`, with its database
@@ -64,7 +67,7 @@ changes the flag. Reporting still requires catalog read access and never
 confers write access.
 `okf-mcp oauth code create|list|revoke` and `okf-mcp oauth grant list|revoke`
 manage OAuth sign-in codes and the grants they become (see
-`docs/operations.md`, "OAuth sign-in codes").
+`docs/operations.md`, "OAuth connectors").
 
 `import` takes a `.tar.gz` file, `-` for one on stdin, or a directory. A
 `git archive` tarball imports exactly the checkout's tracked files, and a
@@ -208,12 +211,29 @@ the key reaches. Every step is limited to the key's grants: a list never
 grants anything, and a catalog the key cannot reach (or that does not exist)
 is an error naming it, never silently dropped or replaced by a default.
 
+A client that can only use OAuth (ChatGPT's and Claude.ai's custom
+connectors, the connector directories) connects to the same `/mcp` URL once
+the server has a `public_url`. An admin mints a single-use sign-in code with
+`okf-mcp oauth code create` (or in the console), and the person connecting
+enters it on the server's consent page. The resulting OAuth grant acts like
+a key with the code's catalogs, access (`read` or `write`, never `admin`),
+default and actor (`docs/operations.md`, "OAuth connectors").
+
 ### Tools
 
 The read tools below need a `read` key; the write tools ("Writing") need
 `write`. Results are JSON (`structuredContent`, and the
 same JSON as the text block); errors are results with `isError: true` and
 `{"error": ..., "message": ...}`.
+
+Every tool also has a `title` and the hints `readOnlyHint`,
+`destructiveHint`, `idempotentHint` and `openWorldHint` (false everywhere:
+every tool acts only on this server's catalogs). The 17 read tools are
+read-only and idempotent. 20 non-destructive tools: changeset staging edits
+(undone by `discard`; `revert` among them) plus maintenance lease, report
+and disposition operations (`maintenance_claim`, `maintenance_renew`,
+`maintenance_submit`, `maintenance_dispose`). `publish`, `discard`,
+`delete_concept` and `maintenance_close` are destructive.
 
 Every catalog path in an error body (`path`, `files[].path`,
 `links[].source`, `errors[].file`, `warnings[].file`) has a leading `/`
@@ -259,6 +279,8 @@ only).
 | `GET /` | none | Redirects (303) to the web console, `/ui/` |
 | `GET /ui/*` | none | The web console's static files ("Web console" below) |
 | `/api/v1/*` | any (each endpoint checks its level) | The console's JSON API (`docs/operations.md`, "Web console") |
+| `GET /.well-known/oauth-protected-resource[/mcp]`, `GET /.well-known/oauth-authorization-server` | none | OAuth discovery; only with `public_url` set (`docs/operations.md`, "OAuth connectors") |
+| `GET/POST /oauth/authorize`, `POST /oauth/register`, `POST /oauth/token`, `POST /oauth/revoke` | none | The OAuth authorization server; only with `public_url` set |
 
 ```sh
 curl -s http://127.0.0.1:8080/healthz
@@ -269,8 +291,10 @@ git -C ~/repos/pg_knowledge_catalog archive --format=tar.gz HEAD |
         "http://127.0.0.1:8080/catalogs/pg/import?replace=true"
 ```
 
-A missing or unknown key gets 401 (`WWW-Authenticate: Bearer`, a plain-text
-body). A catalog that does not exist, or that the key does not reach, is 404
+A missing or unknown key or token gets 401 (`WWW-Authenticate: Bearer`,
+with `resource_metadata="<public_url>/.well-known/oauth-protected-resource"`
+when OAuth is on, and a plain-text body). `/mcp`, the archive routes and
+`/api/v1` take an OAuth access token (`okfat_...`) wherever they take a key. A catalog that does not exist, or that the key does not reach, is 404
 (never 403, so a key cannot probe which catalogs exist); a reachable catalog
 the key's level does not allow (a `read` key importing) is 403. Those and
 the other route errors have the body `{"error": ..., "message": ...}`; the
