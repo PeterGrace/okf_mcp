@@ -14,6 +14,9 @@
 ## Changed
 
 - No tool's name, description, parameters or results changed.
+- `src/investigator/contract_tools.json` is recaptured (its ignored capture
+  test), so the investigator's nine pinned tools carry the new `title` and
+  `annotations`. Its contract check compares only schemas and is unchanged.
 
 ## Notes
 
