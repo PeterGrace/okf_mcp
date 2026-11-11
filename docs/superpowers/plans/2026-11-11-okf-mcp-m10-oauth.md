@@ -78,6 +78,8 @@ Filled in as tasks land, as in M9 (dated `> **Corrected (issue #N).**` notes in 
 14. **A replay that races the first exchange still revokes** (Task 6, issue #250, 2026-11-11): `AuthorizationCode.replayed` is set under the map's lock by the replay, and the exchange checks it after its tokens commit (revoking them if set, or if the code has left the map). The spec's "a used code revokes its family" holds for any interleaving.
 15. **A failed exchange spends the code** (Task 6, issue #250, 2026-11-11): the code is marked used before its bindings are checked, so a wrong verifier, client, redirect URI or resource ends it, and presenting it again counts as a replay.
 16. **Family operations are serialized by a per-family advisory lock** (Task 6, issue #250, 2026-11-11, PR #262 review): `store::oauth::tokens::lock_family` (namespace `okff`, key `hashtext(family_id)`). Without it, a family revocation racing a rotation of the family's current refresh token missed the successors the rotation had inserted but not committed, leaving a live lineage after reuse was detected. The spec's "a reused refresh token revokes the family" now holds under read committed; Task 8 adds the mechanism to the spec.
+17. **Authorize redirects are 303** (Task 5, recorded by issue #252, 2026-11-11): axum's `Redirect::to`, for Approve, Deny and every error sent back to the client. The spec's diagram said 302. Either works for a browser; 303 always turns the consent POST into a GET.
+18. **Approve carries the step-2 page's `summary` nonce** (Task 5, issue #249, PR #259 review, recorded by issue #252): `PendingAuthorization.accepted` binds the accepted code to the one summary that shows it, so an older summary cannot approve a code entered later. The spec's form fields lacked it; Task 8 adds it.
 
 ## Verified facts the code relies on
 
@@ -12909,6 +12911,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ---
 
 ### Task 8: Operations documentation, spec wrap-up, release v0.13.0 preparation
+
+> **Corrected (issue #252, 2026-11-11).** What shipped differs from the steps below in these ways (read `docs/operations.md`, "OAuth connectors", and the spec):
+> - The `okf-mcp oauth` CLI table moved from the "Web console" subsection "OAuth sign-in codes" (Task 4) into "OAuth connectors" ("Managing codes and grants"), so it exists once; "OAuth sign-in codes" keeps the JSON API and the console paragraph and links to it, and the README's "Command line" line and the "First run" paragraph link there too.
+> - "OAuth connectors" also has "Routing" (a path-routing proxy must pass `/ui/` too: the consent page's stylesheets are console assets), "Egress" (CIMD fetches ignore proxy variables, so the pod needs direct outbound HTTPS), "State", "Revoking" (grant, code, and a client's own `/oauth/revoke`) and "What an operator sees in the console"; its routes table is headed "OAuth routes".
+> - The client steps are generic: no ChatGPT or Claude.ai screen labels, since they cannot be verified from here.
+> - The troubleshooting rows quote the consent page's own messages and add rows for an unregistered redirect URI and for `slow_down`; the 401 row names OAuth tokens.
+> - The spec's DDL is replaced by the shipped migration's statements, the deviations are folded in where they apply, and two deviations are added to the list above (17, 18).
+> - Part two (Steps 10-11) is unchanged: `scripts/release.py prepare` refuses any branch but `main` (equal to `origin/main`) and creates the release commit and a local annotated tag in the same run, so it cannot run on the docs branch.
 
 This task documents OAuth for self-hosters, brings the spec in line with what
 shipped, writes the milestone changelog, and prepares v0.13.0. It comes in

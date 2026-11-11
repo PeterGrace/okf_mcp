@@ -82,6 +82,12 @@ unknown keys are ignored, so one file serves every version.
 | `concept_outline_chars` | `20000` | `get_concept` returns an outline of the headings, not the body, for a body longer than this many characters, unless the call passes `full` or `section` |
 | `database_max_connections` | `16` | The most database connections one process opens (`serve` and every subcommand). Writers queued on one changeset wait without one; the writer whose turn it is, a publish, and a read that builds an overlay each hold one |
 | `overlay_cache_size` | `64` | The most changeset overlays (an open changeset's view of its catalog) kept in memory; past it, the least recently used is dropped and rebuilt on its next read |
+| `public_url` | none | The server's public origin, such as `"https://okf-mcp.example.com"` (no path, query or user info; a trailing `/` is dropped). Setting it turns on OAuth ("OAuth connectors"); without it the OAuth routes are 404. It must be `https`, except on a loopback host (such as `localhost`, `127.0.0.1` or `::1`) for local testing, and its host must be in `allowed_hosts` |
+| `oauth.access_token_ttl` | `"1h"` | How long an OAuth access token works |
+| `oauth.refresh_token_ttl` | `"30d"` | How long a refresh token works. Each refresh issues a new one with a fresh lifetime, so a connection used within this stays signed in |
+| `oauth.code_max_expiry` | `"7d"` | The longest expiry a sign-in code may be given (`oauth code create --expires`, the console's expiry) |
+| `oauth.dcr_enabled` | `true` | Accept dynamic client registration (RFC 7591) at `/oauth/register`. Clients that publish a Client ID Metadata Document work either way |
+| `oauth.cimd_allow_private` | `false` | Fetch Client ID Metadata Documents from loopback and private addresses. For test rigs only: it opens the fetcher to the internal network |
 
 The server refuses to start (and every subcommand refuses to run) with a zero
 `poll_interval`, `session_idle_timeout`, `database_max_connections` or
@@ -89,7 +95,11 @@ The server refuses to start (and every subcommand refuses to run) with a zero
 entry in it, or a `time_server` that is blank or has surrounding whitespace.
 `maintenance_review_intervals` also rejects invalid catalog names, malformed
 durations, durations below 86,400 seconds and durations beyond the supported
-range. Omitted catalogs use 30 days.
+range. Omitted catalogs use 30 days. It also refuses a zero `oauth.*`
+lifetime, and a `public_url` that is not a URL, has a path, query or user
+info, is `http` on a host other than a loopback one, or whose host no
+`allowed_hosts` entry admits (an entry with a port must match the URL's
+port).
 
 ```toml
 listen = "[::]:8080"
@@ -103,7 +113,18 @@ maintenance_review_intervals = { pg = "30d" }
 concept_outline_chars = 20000
 database_max_connections = 16
 overlay_cache_size = 64
+public_url = "https://okf-mcp.example.com"   # turns on OAuth; see "OAuth connectors"
+
+[oauth]
+access_token_ttl = "1h"
+refresh_token_ttl = "30d"
+code_max_expiry = "7d"
+dcr_enabled = true
+cimd_allow_private = false
 ```
+
+`[oauth]` is a TOML table, so it comes after every top-level key: a
+top-level key written below it would land inside the table.
 
 - **IPv6:** on an IPv6 or dual-stack cluster, listen on `[::]:8080`. Linux
   binds it dual-stack, so IPv4 still works. With the default `0.0.0.0:8080`,
@@ -228,6 +249,7 @@ data:
     allowed_hosts = ["okf-mcp.example.com"]
     default_catalog = "notes"
     time_server = "time.example.com"
+    public_url = "https://okf-mcp.example.com"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -465,7 +487,8 @@ the consent page, which turns it into an OAuth grant: a key row named
 `<code name>.<client host>-<8 characters of the code id>`, with the code's
 catalogs, access, default and actor. `okf-mcp key ...` never acts on a grant;
 `okf-mcp oauth grant revoke ID` revokes one (see
-[OAuth sign-in codes](#oauth-sign-in-codes) for every subcommand):
+[Managing codes and grants](#managing-codes-and-grants) for every
+subcommand, and [OAuth connectors](#oauth-connectors) for the whole flow):
 
 ```sh
 kubectl -n okf-mcp exec deploy/okf-mcp -- \
@@ -1184,13 +1207,9 @@ code's drawer revokes it until someone redeems it. In the key list, an OAuth
 grant is marked `OAuth` with its client's name. Its drawer revokes it or
 changes its catalogs, and has no reporting switch: a grant never reports.
 
-| Command | Does |
-|---|---|
-| `okf-mcp oauth code create <name> --actor <actor> --access read\|write (--catalogs a,b \| --all) [--default <c>] [--expires 24h]` | Prints the `okfsc_` code once (stdout) and its id and expiry (stderr). Refuses `admin`, and an expiry above `oauth.code_max_expiry` |
-| `okf-mcp oauth code list` | Tab-separated: name, actor, id, access, state (`live`, `expired`, `redeemed`, `revoked`), catalogs (`*` for all), `default`, `expires`, `grant` |
-| `okf-mcp oauth code revoke <id>` | Revokes an unredeemed code |
-| `okf-mcp oauth grant list` | `key list`'s columns for OAuth grants only, plus `client <name>` |
-| `okf-mcp oauth grant revoke <id>` | Revokes a grant by id: its tokens stop working within `poll_interval`. Refuses a plain key's id |
+The `okf-mcp oauth` commands are in "OAuth connectors"
+([Managing codes and grants](#managing-codes-and-grants)), with how to turn
+OAuth on and connect a client.
 
 | Method and path | Key | Does |
 |---|---|---|
@@ -1376,6 +1395,248 @@ snap package and cannot launch headless. If journeys fail at launch, leave
 Playwright cache comes before `PATH`), or point the variable at a real
 Chromium binary, never at the stub.
 
+## OAuth connectors
+
+Some MCP clients can only sign in with OAuth: ChatGPT's custom connectors,
+Claude.ai's custom connectors, and the Claude and ChatGPT connector
+directories. For them the server is also an OAuth 2.1 authorization server,
+following the MCP authorization specification (2026-07-28). Clients that send
+an API key (`Authorization: Bearer okf_...`) are not affected: keys and OAuth
+work side by side on the same `/mcp` URL.
+
+There are no user accounts. An admin mints a **sign-in code** that says what
+the connection may do: its catalogs, `read` or `write` access, the default
+catalog, and the actor its writes are recorded as. The person connecting
+types the code into the server's consent page. Redeeming a code creates an
+**OAuth grant**, which works like an API key with exactly the code's access:
+it is listed with the keys and revoked like one. A code works once, and
+expires unused after 24 hours unless it was minted with another expiry.
+
+OAuth grants are never `admin` and never submit maintenance reports (the
+database refuses both). The console and the maintenance runner keep using API
+keys.
+
+### Turning it on
+
+1. Set `public_url` to the origin clients reach the server at, and make sure
+   its host is in `allowed_hosts` (section 3):
+
+   ```toml
+   allowed_hosts = ["okf-mcp.example.com"]
+   public_url = "https://okf-mcp.example.com"
+   ```
+
+   The server refuses to start if the host is missing from `allowed_hosts`:
+   the MCP `Host` check would otherwise refuse every OAuth client.
+
+2. Restart the server. These now answer, with no key:
+
+   ```sh
+   curl -s https://okf-mcp.example.com/.well-known/oauth-protected-resource
+   curl -s https://okf-mcp.example.com/.well-known/oauth-authorization-server
+   ```
+
+   The first names the resource, `https://okf-mcp.example.com/mcp`, and its
+   authorization server, `https://okf-mcp.example.com`. A request to `/mcp`
+   without a token now gets a 401 whose `WWW-Authenticate` header points
+   clients at that document
+   (`Bearer resource_metadata="https://okf-mcp.example.com/.well-known/oauth-protected-resource"`).
+
+**Routing.** The example ingress (section 5) routes every path, so it needs
+no change. A proxy that routes only some paths must also pass
+`/.well-known/oauth-protected-resource` (and the same path with `/mcp`
+appended), `/.well-known/oauth-authorization-server`, `/oauth/` and `/ui/`
+(the consent page's stylesheets), and must let the server's own
+`Content-Security-Policy` through on `/oauth/`.
+
+**Egress.** A client that identifies itself by a Client ID Metadata Document
+(an `https://` `client_id`) makes the server fetch that document from the
+client's host over HTTPS. The fetch ignores `HTTP_PROXY` and the other proxy
+variables, so a network policy that blocks the pod's direct outbound HTTPS
+breaks such clients. Clients that register themselves (dynamic client
+registration) need no egress.
+
+**State.** The server stays single-replica. Consent pages in progress and
+authorization codes not yet exchanged live in memory, so a restart interrupts
+at most a sign-in in progress. The person starts again from the client, with
+the same code if they had not yet chosen Approve (a code is spent only by
+Approve). Grants, tokens, codes and clients are in the database.
+
+### Connecting a client
+
+The steps are the same for ChatGPT, Claude.ai and any other client that
+supports remote MCP servers with OAuth. The client's own screens differ and
+change over time, so they are described generically here.
+
+1. **Mint a sign-in code** for the connection, on the server:
+
+   ```sh
+   kubectl -n okf-mcp exec deploy/okf-mcp -- \
+       okf-mcp oauth code create chatgpt --actor example-actor \
+       --access write --catalogs notes --default notes
+   ```
+
+   The command prints the code (`okfsc_...`) once on stdout, and its id and
+   expiry on stderr. Only its SHA-256 is stored. Give it to the person
+   connecting over a private channel. An admin can also mint one in the web
+   console: API keys page, "Sign-in codes", "New sign-in code".
+
+2. **Add the connector** in the client (usually in its settings, where custom
+   connectors or remote MCP servers are added). Give it the URL
+   `https://okf-mcp.example.com/mcp`, that is `<public_url>/mcp`, and choose
+   OAuth if the client asks how to authenticate. Leave any client ID and
+   client secret fields empty: the server accepts clients that identify
+   themselves by a Client ID Metadata Document and clients that register
+   themselves, and needs no secret from either.
+
+3. **Sign in.** The client opens the server's consent page in a browser. It
+   names the client and the host it will send the browser back to. A client
+   that registered itself, rather than publishing a metadata document, is
+   marked "unverified": its name is whatever it said. Enter the sign-in code
+   and choose Continue. The next page states what will be granted (access,
+   catalogs, actor and default catalog). Choose Approve, and the browser goes
+   back to the client, which is now connected. Deny sends the client an
+   `access_denied` error and leaves the code unused.
+
+The sign-in must finish within 10 minutes of the client opening the page, and
+five wrong codes end it; either way the client has to start again. The page
+gives the same message for a mistyped, expired, revoked or already used code,
+on purpose.
+
+The client renews its access itself: access tokens last
+`oauth.access_token_ttl` and are renewed with a refresh token, which lasts
+`oauth.refresh_token_ttl` from its last use. A connection used at least that
+often stays connected.
+
+Each connection needs its own code. Connecting ChatGPT and Claude.ai, two
+people, or the same client again after a revoke, takes a new code each time.
+
+### Managing codes and grants
+
+| Command | Does |
+|---|---|
+| `okf-mcp oauth code create NAME --actor ACTOR --access read\|write (--catalogs C,C... \| --all) [--default C] [--expires 24h]` | Mints a single-use code. Prints the `okfsc_` code once (stdout) and its id and expiry (stderr). `NAME` is a label in `[A-Za-z0-9._-]+`; `--catalogs` is comma-separated, as for `key create`; `--default` must be granted. `--access admin` is refused. `--expires` (`24h`, `3d`) defaults to 24 hours and may not exceed `oauth.code_max_expiry` |
+| `okf-mcp oauth code list` | Every code, never the code itself. Tab-separated: name, actor, id, access, state (`live`, `expired`, `redeemed` or `revoked`), catalogs (`*` for all), `default`, `expires`, `grant` (the grant a redeemed code became) |
+| `okf-mcp oauth code revoke ID` | Revokes a code nobody has redeemed. Refuses a redeemed or already revoked one |
+| `okf-mcp oauth grant list` | The OAuth grants, revoked ones included, with `key list`'s columns and `client <name>` |
+| `okf-mcp oauth grant revoke ID` | Revokes a grant by its exact id, and with it every token it holds. Refuses a plain key's id |
+
+Each takes `--database-url` and `--config` like every subcommand; inside the
+pod, run them with `kubectl exec` as in step 1.
+
+A grant is named `<code name>.<client host>-<first 8 characters of the code's
+id>`, so a code named `chatgpt` redeemed by a client at `client.example.com`
+becomes a grant like `chatgpt.client.example.com-1a2b3c4d`. The client host is
+the metadata document's host, or a registered client's first redirect URI's. The suffix tells
+apart grants made from codes of the same name. `okf-mcp key revoke`,
+`grant`, `ungrant` and `maintenance-report` act on API keys only: they never
+match a grant, even one whose name and actor equal a key's. Reach a grant by
+its id, with `okf-mcp oauth grant revoke` or the `/api/v1/keys/{id}` routes
+("API keys").
+
+**Revoking.**
+
+- **A connection**: revoke its grant. Made with the CLI, the revoke takes
+  effect within `poll_interval`; made in the console, at once. The client
+  then gets 401 and must be connected again with a new code.
+- **A code** that was never redeemed: `okf-mcp oauth code revoke`, or its
+  drawer in the console. It takes effect at once (codes are read from the
+  database on every use). A redeemed code cannot be revoked; revoke the grant
+  it became (its `grant` column).
+- **From the client**: disconnecting in the client may call `/oauth/revoke`.
+  Revoking an access token ends only that token: the refresh token keeps
+  working and mints a new access token, so the client stays connected.
+  Revoking a refresh token ends its whole family, which disconnects the
+  client; the grant then stays listed, with no working tokens, until an
+  admin revokes it. Only a refresh-token revocation or revoking the grant
+  disconnects a client.
+
+Unused registered clients are deleted 24 hours after registration, and tokens
+and unredeemed codes 7 days after they expire, by an hourly pass of the
+server's poll loop.
+
+### What an operator sees in the console
+
+The API keys page (`/ui/#/keys`):
+
+- **Sign-in codes**, below the keys. "New sign-in code" mints one (name,
+  actor, `read` or `write`, catalogs, default, an expiry of 1 hour to 7 days)
+  and shows it once, in a dialog that keeps it only until "I have stored it"
+  is clicked. The list shows live codes; "Show redeemed, expired and revoked
+  codes" shows the rest. A live or expired code's drawer revokes it.
+- **OAuth grants**, in the key list, marked `OAuth` with their client's name.
+  A grant's drawer shows its kind ("OAuth grant") and client, revokes it, and
+  changes its catalogs. It has no maintenance-reporting switch: a grant never
+  reports.
+
+`GET /api/v1/whoami` and the key list carry each credential's `kind` (`key`
+or `oauth`) and `client_name`. The console's codes JSON API is under "Web
+console" ([OAuth sign-in codes](#oauth-sign-in-codes)).
+
+### What the server checks
+
+- **Clients.**
+  - A `client_id` that is an `https://` URL is fetched as a Client ID
+    Metadata Document: over `https`, with no redirects and no proxy, within 5
+    seconds and 16 KiB, and only from a public address (loopback, private,
+    link-local and unique-local addresses are refused, unless
+    `cimd_allow_private`). The connection goes only to the addresses checked,
+    so DNS rebinding cannot swap them. The document must be a JSON object
+    whose `client_id` equals its URL. It is cached for its `Cache-Control`
+    max-age, clamped between 5 minutes and 24 hours; if a refetch fails, the
+    cached copy is used for up to a day after it was fetched.
+  - Any other `client_id` must have been registered at `/oauth/register`:
+    public clients only (`token_endpoint_auth_method` absent or `none`), 1 to
+    10 redirect URIs, each `https` or `http` on a loopback host.
+- **Redirects.** The `redirect_uri` must equal one the client declared,
+  character for character. An error found before that check (an unknown
+  client, a redirect URI it did not declare) is shown on the server's own
+  error page, never sent to an unchecked address. Later errors go back to
+  the client with `error`, `state` and `iss`.
+- **PKCE.** S256 only, on every authorization.
+- **Audience.** `resource` is required at authorize and at the code
+  exchange, and must be `<public_url>/mcp` (RFC 8707). Every token is issued
+  for it and refused with any other.
+- **Replay.**
+  - An authorization code works once, within 60 seconds. Presenting it again
+    revokes the tokens issued from it, even if the two requests race. A
+    failed exchange (a wrong verifier, client, redirect URI or resource)
+    also spends it.
+  - A refresh token works once. Presenting a used one revokes the whole
+    connection's tokens, and the client must be connected again with a new
+    code. A refresh by another client, or for another `resource`, is refused
+    and changes nothing.
+- **Rate limits and caps.** Registration (a burst of 10, then one every 6
+  seconds), the token and revoke endpoints (60, then 2 a second, shared) and
+  the consent form (20, then 1 a second) are limited globally, not per
+  address. Over the limit, the JSON endpoints answer 429 `slow_down` and the
+  consent form a 429 page. Registration is also refused (429 `slow_down`)
+  while 500 registered clients have no grant. At most 10,000 consent pages
+  and 10,000 unexchanged authorization codes are held in memory; past that a
+  new sign-in gets a 503 page.
+
+Tokens and codes start with `okfat_` (access), `okfrt_` (refresh), `okfac_`
+(authorization code) and `okfsc_` (sign-in code), so secret scanners can
+find them. The server stores only their SHA-256 and never logs them.
+
+### OAuth routes
+
+| Route | Key | Does |
+|---|---|---|
+| `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-protected-resource/mcp` | none | Protected Resource Metadata (RFC 9728) |
+| `GET /.well-known/oauth-authorization-server` | none | Authorization server metadata (RFC 8414). `registration_endpoint` is absent when `dcr_enabled = false` |
+| `POST /oauth/register` | none | Dynamic client registration (RFC 7591), public clients only: 201 with the client's metadata and `client_id`. 404 when `dcr_enabled = false` |
+| `GET /oauth/authorize`, `POST /oauth/authorize` | none (a sign-in code on the form) | The consent page. Approve and Deny redirect (303) to the client |
+| `POST /oauth/token` | none (PKCE, or a refresh token) | `grant_type=authorization_code` or `refresh_token`: answers `access_token`, `token_type: Bearer`, `expires_in` and `refresh_token` |
+| `POST /oauth/revoke` | none | Revokes a token (RFC 7009): 200 for any token, an unknown one included; 400 `invalid_request` without `token` |
+
+All seven paths exist only while `public_url` is set; without it they are 404.
+Every response is `Cache-Control: no-store` (the discovery documents also
+carry `Access-Control-Allow-Origin: *`), and every JSON error is
+`{"error": ..., "error_description": ...}` with the OAuth error code:
+`invalid_client` is 401, `slow_down` 429, `server_error` 500 and the rest
+400.
+
 ## 7. Health and time
 
 `GET /healthz` needs no key:
@@ -1437,6 +1698,15 @@ take the server out of service. Alert on the `error` log line, not on
   `/ui/` (it was 404). The ingress above routes them with no change. A proxy
   that sets its own `Content-Security-Policy` must keep the console's sources
   ("Web console").
+- **0.13.0 (OAuth)** adds migration `0008_oauth.sql`: existing keys become
+  keys of kind `key` and work as before, and an older binary refuses the
+  migrated database. It adds the `public_url` setting and the `[oauth]`
+  table. Without `public_url` nothing else changes: the OAuth routes are 404
+  and a 401 still carries a plain `WWW-Authenticate: Bearer`. With it, see
+  "OAuth connectors" (and allow the pod outbound HTTPS if clients use
+  metadata documents). Every tool now carries a title and behaviour hints
+  (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`),
+  which clients may show; no tool's arguments or results changed.
 
 ### Preparing and shipping a release
 
@@ -1701,7 +1971,7 @@ curl -sf -H "Authorization: Bearer $OKF_MCP_KEY" -o notes.tar.gz \
 
 | Symptom | Cause and fix |
 |---|---|
-| 401 on `/mcp` or an archive route | No `Authorization: Bearer` header, or the key is unknown or revoked. The body is plain text, with `WWW-Authenticate: Bearer` |
+| 401 on `/mcp` or an archive route | No `Authorization: Bearer` header, or the key or OAuth access token is unknown, expired or revoked. The body is plain text, with `WWW-Authenticate: Bearer` (and `resource_metadata="..."` when OAuth is on) |
 | 403 on every `/mcp` request through the ingress | The `Host` is not in `allowed_hosts` (rmcp's DNS-rebinding check). Add the public host name and restart the pod |
 | 404 on `/mcp` with "Session not found" | The `Mcp-Session-Id` was opened by another key, idled out past `session_idle_timeout`, or predates a restart. Reconnect with the key that opened it |
 | A tool returns `UnknownChangeset`, or `Refused` naming a closed changeset ("is published", "is discarded", "was published or discarded while this write waited", "is no longer open") | `UnknownChangeset`: the handle is mistyped or belongs to another key (only its key, and an `admin` that reaches its catalog, may use it). `Refused`: its changeset is closed, by `publish`, by `discard`, or by the prune of changesets left empty for 24 hours, possibly while the call waited for it. `list_changesets` lists the open handles the key may use; otherwise call `open_changeset` |
@@ -1719,3 +1989,12 @@ curl -sf -H "Authorization: Bearer $OKF_MCP_KEY" -o notes.tar.gz \
 | Database tests fail locally with TLS errors | `PGSSLMODE=verify-full` is exported in your shell; unset it |
 | `just test-ui` fails to launch Chromium | `RUSTWRIGHT_CHROMIUM` (or `CHROME`, `CHROMIUM`, or `PATH`'s `chromium-browser`) names a snap stub that cannot run headless. Unset it so rustwright uses the Playwright cache, or name a real Chromium ("Testing the console") |
 | The console's fonts fall back, or the console logs CSP violations behind a proxy | The proxy adds its own `Content-Security-Policy`. Keep the console's sources ("Web console") |
+| `/.well-known/oauth-protected-resource` is 404 | `public_url` is not set (OAuth is off), or a proxy does not route `/.well-known/`. Set it, restart, and check the proxy ("OAuth connectors") |
+| The server exits naming `public_url` | It is not an `https` origin (a path, query or user info, or `http` off loopback), or its host is not in `allowed_hosts`. Give the bare origin and add its host to `allowed_hosts` |
+| A client says it cannot register, or the consent page says "This client is not known to the server." | With `dcr_enabled = false`, the client must publish a Client ID Metadata Document. Otherwise its document could not be fetched or was refused: it must be `https`, on a public address, a JSON object under 16 KiB naming its own URL as `client_id`, and answer within 5 seconds without a redirect. Check that the pod can make outbound HTTPS connections |
+| The consent page says the redirect URI is not one the client registered | The client sent a `redirect_uri` that is not, character for character, one of those it declared. Fix the client's registration or metadata document |
+| The consent page refuses a sign-in code | The code is mistyped, expired, already redeemed or revoked (the page does not say which, on purpose). `okf-mcp oauth code list` shows its state; mint a new one |
+| The consent page says "This sign-in request has expired or is not valid." or "Too many wrong sign-in codes." | The sign-in took longer than 10 minutes, the server restarted, or a code was refused five times. Start the connection again in the client |
+| An OAuth client was connected but now gets 401 and asks to sign in | Its grant was revoked, it was unused for longer than `oauth.refresh_token_ttl`, the client revoked its refresh token, or a used refresh token was presented again (a sign of a copied token), which ends the connection's tokens. Mint a new code and reconnect |
+| The browser shows a CSP error after Approve, and the client never connects | A proxy replaced the consent page's `Content-Security-Policy`. Its `form-action` must allow the client's redirect origin; let the server's header through on `/oauth/` |
+| `/oauth/register` or `/oauth/token` answers 429 `slow_down` | The global rate limit, or 500 registered clients without a grant (each is deleted 24 hours after registration). Wait and retry; look for a client registering in a loop |
