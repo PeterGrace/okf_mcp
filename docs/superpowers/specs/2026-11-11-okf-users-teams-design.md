@@ -1,6 +1,6 @@
 # okf-mcp users and teams: design
 
-Status: approved in brainstorming, 2026-11-11; not yet planned.
+Status: approved in brainstorming, 2026-11-11; milestone 11, planned in `docs/superpowers/plans/2026-11-11-okf-mcp-m11-users-teams.md`.
 
 ## Goal
 

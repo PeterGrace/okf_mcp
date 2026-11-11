@@ -1,4 +1,4 @@
-# OKF MCP Server: Users and Teams Implementation Plan
+# OKF MCP Server, Milestone 11 (users and teams): Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. In this project each task is one GitHub sub-issue and one PR (`github-issue-to-pr`).
 
@@ -28,7 +28,17 @@
 | 6 | CLI: `okf-mcp user ...`, `team ...`, `catalog set-owner`, `key assign`, `oauth code assign`, `unassigned`, required `--owner`/`--user` |
 | 7 | REST: `/users`, `/teams`, members, assign routes, `/unassigned`, required `user`/`owner` in bodies |
 | 8 | Console: Users and Teams pages, pickers and Assign on Keys / Codes / Catalogs, Unassigned view and badge |
-| 9 | Docs: `operations.md` sections and parity table, parity test, changelog, follow-up issues |
+| 9 | Docs: `operations.md` sections and parity table, parity test, milestone changelog, follow-up issues |
+
+Deliberately deferred (spec "Non-goals" and "Future work"); Task 9 files an issue for each:
+
+| Item | Where it goes |
+|---|---|
+| `NOT NULL` on `api_keys.user_id`, `sign_in_codes.user_id`, `catalogs.owner_team_id` | Follow-up issue, once `okf-mcp unassigned` is empty on a deployment |
+| Disabling users and teams (`disabled_at`) | Follow-up issue |
+| User login (`user_identities`, console sign-in as a user) | Follow-up issue |
+| Access through team membership | Follow-up issue |
+| Billing and usage records | Out of scope; teams are the owner it will reference |
 
 ## Decisions taken while planning
 
@@ -57,7 +67,8 @@
 - Before each commit: `just fmt`, `just lint`, `just test` (and `just test-ui` for Task 8).
 - Comments for a Python-expert, Rust-novice reader on Rust-specific constructs, as in the existing code.
 - Every public item gets a doc comment with `# Arguments`, `# Returns` and `# Errors`.
-- A `changelog/<UTC timestamp>-users-teams-task-N.md` per task (`date -u +%Y-%m-%dT%H-%M-%SZ`), with `## Added`, `## Changed` and `## Notes` like the existing entries.
+- One changelog entry per task, `changelog/<UTC ts>-m11-task-<NN>-<slug>.md` (`date -u +%Y-%m-%dT%H-%M-%SZ`), with `## Added`, `## Changed` and `## Notes` like the existing entries. Task 9 also writes the milestone changelog.
+- The code in this plan has not been compiled. If an implementation has to differ, fix this plan in the same PR (inline, or with a dated `> **Corrected (issue #N).**` note), then grep later tasks for the changed symbol.
 - Placeholders only in tests and docs (`alice`, `family`, `example.com`). No real hostnames or names.
 - Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -349,7 +360,7 @@ Expected: PASS.
 
 - [ ] **Step 6: Changelog and commit**
 
-Write `changelog/<ts>-users-teams-task-1.md`. Run `just fmt && just lint && just test`.
+Write `changelog/<ts>-m11-task-01-schema.md`. Run `just fmt && just lint && just test`.
 
 ```bash
 git add migrations/0009_users_teams.sql src/db.rs src/error.rs src/http/mod.rs src changelog
@@ -2175,7 +2186,7 @@ git commit -am "feat(console): users and teams pages, user and owner pickers, un
 - Modify: `docs/operations.md` (new "Users and teams" section, REST rows, parity table, updated `key create` / `oauth code create` / `catalog create` examples with `--user` / `--owner`; `--actor` no longer required for codes)
 - Modify: `README.md` if it shows `key create` or `catalog create`
 - Create: `tests/parity.rs`
-- Modify: the spec's status line: "delivered in … (plan `docs/superpowers/plans/2026-11-11-okf-users-teams.md`)", plus a "What shipped differently" section listing Decisions 1, 2 and 6
+- Modify: the spec's status line: "delivered in … (plan `docs/superpowers/plans/2026-11-11-okf-mcp-m11-users-teams.md`)", plus a "What shipped differently" section listing Decisions 1, 2 and 6
 
 - [ ] **Step 1: Write the failing parity test** `tests/parity.rs`:
 
@@ -2263,7 +2274,7 @@ Run it: `cargo test --test parity`. It fails: the section doesn't exist yet. If 
 
   Each body cites the spec section, and each is labelled `enhancement`.
 
-- [ ] **Step 5: Changelog and commit**
+- [ ] **Step 5: Changelogs and commit.** Write this task's entry and the milestone changelog `changelog/<UTC ts>-milestone-11-users-teams.md` (Added / Changed / Notes across all nine tasks, the epic number, and the follow-up issue numbers from Step 4).
 
 ```bash
 git commit -am "docs: users and teams operations, parity table and test"
