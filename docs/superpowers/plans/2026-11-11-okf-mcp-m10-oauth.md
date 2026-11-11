@@ -12199,6 +12199,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 Depends on Task 4 (the `/api/v1/oauth/codes` endpoints) and Task 2 (`KeyView.kind`, `client_name`). Parallel with Tasks 5 and 6.
 
+> **Corrected (issue #251, 2026-11-11).** What shipped (`src/http/ui/js/pages/keys.js`) differs from Step 2 in these ways; the API is as Task 4 shipped it, so no request or response changed:
+> - Every helper takes the page's `main` (`newKey(main, reload)`, `showKey(main, key, reload)`, `codesPanel(main)`, `newCode(main, reload)`, `showCode(main, code, reload)`), and each checks `main.isConnected` after an await before it touches the drawer, reloads or redraws (the M9 router convention). The one-time dialog is still shown after navigating away: it is the code's only appearance.
+> - So the revoke handlers (key and code) toast first, then return if `main` is detached, and only then `closeDrawer()` and reload; the create handlers close the drawer only while `main` is connected.
+> - `showOnce` holds the secret in a local it sets to `null` when "I have stored it" is clicked, so not even the copy handler keeps it after the dialog closes.
+> - The codes table's empty text is "No sign-in codes to show." (it also shows with every state ticked).
+> - The first journey also asserts the code is in neither `localStorage` nor `sessionStorage` after the dialog closes.
+> - The first journey (PR #256 review) first submits the form with no catalog: it waits for the 409 toast ("must be granted a catalog"), asserts no `#code-secret-dialog` and that name and actor are still filled, then ticks `main` and retries. With the dialog open it presses Escape (`ui.page.press_key(None, "Escape")`) and asserts the dialog is still open.
+
 **Facts this task relies on** (verified at `c24fef1`; Task 2 and Task 4 additions from their sections):
 - `src/http/ui/js/pages/keys.js`:
   - It renders the keys table (`#keys-table`, rows `[data-test=key-<name>]`), the `#key-new` drawer form (`#key-form`), the one-time secret dialog (`#key-secret`, `#key-secret-copy`, `#key-secret-done`), and the per-key drawer (`#key-grant`, `#key-report-toggle`, `#key-revoke`).
