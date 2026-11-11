@@ -149,6 +149,11 @@ dl.facts dd { margin: 0; }
 pre.secret { white-space: pre-wrap; word-break: break-all; }
 .warn-text { color: var(--warn); font-weight: 600; }
 
+/* Sign-in codes (M10 Task 7): the second section of the keys page */
+.codes-panel { margin-top: 2.5rem; }
+.codes-panel .page-head { margin-bottom: .75rem; }
+.client-name { white-space: nowrap; }
+
 /* browse and search (M9 task 4) */
 .browse { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 1.5rem; align-items: start; }
 .browse-tree { position: sticky; top: 1rem; max-height: calc(100vh - 2rem); overflow-y: auto; background: var(--surface);

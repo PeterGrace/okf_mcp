@@ -1177,6 +1177,13 @@ every use, so minting or revoking one takes effect at once. Grants, the keys
 codes become, are listed and revoked with the other keys: their views carry
 `kind: "oauth"` and `client_name`.
 
+The API keys page (`/ui/#/keys`) has a "Sign-in codes" section below the
+keys: "New sign-in code" mints one and shows it once, the list shows live
+codes (tick "Show redeemed, expired and revoked codes" for the rest), and a
+code's drawer revokes it until someone redeems it. In the key list, an OAuth
+grant is marked `OAuth` with its client's name. Its drawer revokes it or
+changes its catalogs, and has no reporting switch: a grant never reports.
+
 | Command | Does |
 |---|---|
 | `okf-mcp oauth code create <name> --actor <actor> --access read\|write (--catalogs a,b \| --all) [--default <c>] [--expires 24h]` | Prints the `okfsc_` code once (stdout) and its id and expiry (stderr). Refuses `admin`, and an expiry above `oauth.code_max_expiry` |
