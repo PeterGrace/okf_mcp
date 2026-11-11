@@ -11269,7 +11269,7 @@ mod tests {
 }
 ```
 
-> **Corrected (issue #250, 2026-11-11).** Approve needs the step-2 page's `summary` nonce (Task 5, PR #259 review), so `authorization_code` posts `("summary", &hidden(&summary_page, "summary"))` with the Approve. `verify` takes the resource (`&oauth.settings.resource`). The shipped module has 13 tests: the ones above plus a replay racing the exchange, a code whose grant was revoked, a refused refresh with another `resource`, revoke without a token, and Debug redaction. See `src/oauth/token.rs`.
+> **Corrected (issue #250, 2026-11-11).** Approve needs the step-2 page's `summary` nonce (Task 5, PR #259 review), so `authorization_code` posts `("summary", &hidden(&summary_page, "summary"))` with the Approve. `verify` takes the resource (`&oauth.settings.resource`). The shipped module has 12 tests: the ones above plus a replay racing the exchange, a code whose grant was revoked, a refused refresh with another `resource`, revoke without a token, and Debug redaction. See `src/oauth/token.rs`.
 
 Run: `cargo test --lib oauth::token`
 Expected: FAIL to compile (`routes` and the handlers not found).
