@@ -220,8 +220,10 @@ same JSON as the text block); errors are results with `isError: true` and
 Every tool also has a `title` and the hints `readOnlyHint`,
 `destructiveHint`, `idempotentHint` and `openWorldHint` (false everywhere:
 every tool acts only on this server's catalogs). The 17 read tools are
-read-only and idempotent. The 20 write tools that only stage changes in a
-changeset, `revert` among them, are not destructive. `publish`, `discard`,
+read-only and idempotent. 20 non-destructive tools: changeset staging edits
+(undone by `discard`; `revert` among them) plus maintenance lease, report
+and disposition operations (`maintenance_claim`, `maintenance_renew`,
+`maintenance_submit`, `maintenance_dispose`). `publish`, `discard`,
 `delete_concept` and `maintenance_close` are destructive.
 
 Every catalog path in an error body (`path`, `files[].path`,

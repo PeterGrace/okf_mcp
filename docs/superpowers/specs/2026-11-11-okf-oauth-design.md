@@ -579,12 +579,14 @@ rmcp 3.8's `#[tool(annotations(...))]` sets them. Every tool gets:
 | Class | Tools | readOnly | destructive | idempotent |
 |---|---|---|---|---|
 | Reads | `search`, `get_concept`, `read_document`, `list_catalogs`, `list_changesets`, `pending_changes`, `history`, `lint`, `sprawl`, `links_report`, `oldest`, `open_questions`, `maintenance_list_runs`, `maintenance_get_run`, `maintenance_list_findings`, `maintenance_get_finding`, `maintenance_read_revision` | true | false | true |
-| Staged edits (unpublished, undone by `discard`) | `open_changeset`, `create_concept`, `edit_document`, `replace_body`, `set_frontmatter`, `stamp`, `review`, `question`, `unquestion`, `add_source`, `remove_source`, `log`, `index`, `move_concept`, `split_concept`, `revert`, `maintenance_claim`, `maintenance_renew`, `maintenance_submit`, `maintenance_dispose` | false | false | false |
+| Non-destructive writes: changeset staging edits (unpublished, undone by `discard`) plus maintenance lease, report and disposition operations (`maintenance_claim`, `maintenance_renew`, `maintenance_submit`, `maintenance_dispose`) | `open_changeset`, `create_concept`, `edit_document`, `replace_body`, `set_frontmatter`, `stamp`, `review`, `question`, `unquestion`, `add_source`, `remove_source`, `log`, `index`, `move_concept`, `split_concept`, `revert`, `maintenance_claim`, `maintenance_renew`, `maintenance_submit`, `maintenance_dispose` | false | false | false |
 | Irreversible or deleting | `publish`, `discard`, `delete_concept`, `maintenance_close` | false | true | false |
 
 `revert` stages an earlier revision in the changeset for review and
 publish, so it is a staged edit, not destructive (Plan deviation 3). The
-classes are 17 reads, 20 staged edits and 4 destructive tools, 41 in all.
+classes are 17 reads, 20 non-destructive writes (16 changeset staging
+edits and 4 maintenance lease, report and disposition operations) and 4
+destructive tools, 41 in all.
 
 A unit test (`src/mcp/annotations.rs`) lists every registered tool and fails
 if any tool lacks a title or any of the four hints. The test also checks
@@ -699,8 +701,10 @@ The code is the reference; each item names the file to read.
 
 **Task 1, tool annotations (issue #245, PR #253):**
 
-- `revert` is a staged edit, not destructive: 17 reads, 20 staged edits, 4
-  destructive (`src/mcp/annotations.rs`; Plan deviation 3).
+- `revert` is a staged edit, not destructive: 17 reads, 20 non-destructive
+  writes (changeset staging edits plus maintenance lease, report and
+  disposition operations), 4 destructive (`src/mcp/annotations.rs`; Plan
+  deviation 3).
 - The plan missed one file: the investigator's pinned tool fixture,
   `src/investigator/contract_tools.json`, is recaptured with its ignored
   capture test so its nine tools carry `title` and `annotations`. Its
