@@ -823,7 +823,7 @@ The code is the reference; each item names the file to read.
   (`tests/ui_e2e/keys.rs`).
 - The codes table's empty text is "No sign-in codes to show.".
 
-**Task 8, documentation (issue #252, this PR):**
+**Task 8, documentation (issue #252, PR #263):**
 
 - The CLI reference moved from the "Web console" subsection "OAuth sign-in
   codes" into "OAuth connectors" in `docs/operations.md`, which also covers
