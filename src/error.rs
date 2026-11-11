@@ -132,6 +132,16 @@ pub enum OkfError {
         catalog: String,
     },
 
+    /// No user or team by that name.
+    #[error("{noun} {name:?} does not exist")]
+    UnknownName {
+        /// `"user"` or `"team"`. (`&'static str`: a string literal baked into
+        /// the binary, so the variant borrows nothing at run time.)
+        noun: &'static str,
+        /// The name as given.
+        name: String,
+    },
+
     /// The key reaches the catalog but its access level does not allow this.
     #[error("forbidden: {reason}")]
     Forbidden {
@@ -256,6 +266,7 @@ impl OkfError {
             OkfError::Migrate { .. } => "Migrate",
             OkfError::Config { .. } => "Config",
             OkfError::CatalogNotSelected { .. } => "CatalogNotSelected",
+            OkfError::UnknownName { .. } => "UnknownName",
             OkfError::Forbidden { .. } => "Forbidden",
             OkfError::Refused { .. } => "Refused",
             OkfError::Busy { .. } => "Busy",
@@ -282,7 +293,7 @@ impl OkfError {
     }
 
     /// The error as clients see it: `{"error": kind, "message": text}`, plus
-    /// the `path`, `catalog` or `problems` it concerns.
+    /// the `path`, `catalog`, `noun` and `name`, or `problems` it concerns.
     ///
     /// Every catalog path in the body is `/`-prefixed (`path`, `files[].path`,
     /// `links[].source`, `errors[].file`, `warnings[].file`). An
@@ -330,6 +341,11 @@ impl OkfError {
                 body["matches"] = (*matches).into();
             }
             OkfError::CatalogNotSelected { catalog } => body["catalog"] = catalog.as_str().into(),
+            OkfError::UnknownName { noun, name } => {
+                // `*noun` copies the `&'static str` out of the borrowed field.
+                body["noun"] = (*noun).into();
+                body["name"] = name.as_str().into();
+            }
             OkfError::UnknownChangeset { changeset } => {
                 body["changeset"] = changeset.as_str().into();
             }

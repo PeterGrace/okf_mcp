@@ -93,6 +93,9 @@ mod tests {
                 "server_state",
                 "sign_in_code_catalogs",
                 "sign_in_codes",
+                "team_members",
+                "teams",
+                "users",
             ]
         );
         let admin_generation: i64 = sqlx::query_scalar("SELECT admin_generation FROM server_state")
@@ -251,6 +254,90 @@ mod tests {
         assert_eq!(
             constraint(key(Some(vec![9u8; 32])).await).as_deref(),
             Some("api_keys_live_name_actor")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_0009_keeps_every_credential_and_catalog_unassigned() {
+        // Arrange: the schema as of 0008, with one catalog, one key, one grant
+        // and one sign-in code, written as the pre-0009 server wrote them.
+        let db = pg_support::TestDb::start().await;
+        for migration in [
+            include_str!("../migrations/0001_schema.sql"),
+            include_str!("../migrations/0002_changeset_identity.sql"),
+            include_str!("../migrations/0003_changeset_handles.sql"),
+            include_str!("../migrations/0004_drop_changeset_labels.sql"),
+            include_str!("../migrations/0005_key_names.sql"),
+            include_str!("../migrations/0006_maintenance.sql"),
+            include_str!("../migrations/0007_maintenance_assessment_evidence.sql"),
+            include_str!("../migrations/0008_oauth.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&db.pool).await.unwrap();
+        }
+        sqlx::raw_sql(
+            "INSERT INTO catalogs (name, created_at) VALUES ('legacy', now());
+             INSERT INTO api_keys (name, sha256, access, all_catalogs, actor, created_at)
+                 VALUES ('old', decode(repeat('ab', 32), 'hex'), 'write', true, 'old', now());
+             INSERT INTO oauth_clients (client_id, kind, redirect_uris, metadata, created_at)
+                 VALUES ('c1', 'dcr', '{https://client.example.com/cb}', '{}', now());
+             INSERT INTO api_keys (name, kind, client_id, access, all_catalogs, actor, created_at)
+                 VALUES ('old.grant', 'oauth', 'c1', 'read', true, 'old', now());
+             INSERT INTO sign_in_codes (name, sha256, access, all_catalogs, actor, created_at, expires_at)
+                 VALUES ('old-code', decode(repeat('cd', 32), 'hex'), 'read', true, 'old',
+                         now(), now() + interval '1 day');",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Act
+        sqlx::raw_sql(include_str!("../migrations/0009_users_teams.sql"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Assert: every row survived, none was attributed to anyone.
+        let unassigned: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM api_keys WHERE user_id IS NULL), \
+                    (SELECT count(*) FROM sign_in_codes WHERE user_id IS NULL), \
+                    (SELECT count(*) FROM catalogs WHERE owner_team_id IS NULL)",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(unassigned, (2, 1, 1));
+        let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(users, 0, "the migration creates no user");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_user_with_a_credential_cannot_be_deleted() {
+        // Arrange: a user and a key that names it.
+        let db = test_db().await;
+        sqlx::raw_sql(
+            "INSERT INTO users (name, created_at) VALUES ('alice', now());
+             INSERT INTO api_keys (name, sha256, access, all_catalogs, actor, created_at, user_id)
+                 SELECT 'k', decode(repeat('ef', 32), 'hex'), 'read', true, 'k', now(), id
+                 FROM users WHERE name = 'alice';",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Act
+        let deleted = sqlx::query("DELETE FROM users WHERE name = 'alice'")
+            .execute(&db.pool)
+            .await;
+
+        // Assert: `ON DELETE RESTRICT` keeps the key's user.
+        let error = deleted.expect_err("RESTRICT refuses");
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("23503"),
+            "a foreign-key violation"
         );
     }
 
