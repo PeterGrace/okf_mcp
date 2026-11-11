@@ -102,6 +102,18 @@ async fn an_admin_mints_a_sign_in_code_sees_it_once_and_revokes_it() {
         ui.click("#code-new");
         ui.fill("#code-form input[name=name]", "console-code");
         ui.fill("#code-form input[name=actor]", "example-actor");
+        // No catalog: the server refuses (409), which the page toasts. No
+        // code was minted, so no dialog opens, and the form stays filled.
+        ui.click("#code-form button[type=submit]");
+        ui.wait_text("#toasts", "must be granted a catalog");
+        assert!(!ui.page.is_visible("#code-secret-dialog").expect("visible"));
+        let kept = ui.eval(
+            "() => ['name', 'actor'].map(field => \
+                 document.querySelector(`#code-form input[name=${field}]`).value)",
+            serde_json::json!(null),
+        );
+        assert_eq!(kept, serde_json::json!(["console-code", "example-actor"]));
+        // The retry, with a catalog, mints the code.
         ui.click("#code-form input[name=catalog][value=main]");
         ui.click("#code-form button[type=submit]");
         ui.wait_visible("#code-secret");
@@ -110,6 +122,14 @@ async fn an_admin_mints_a_sign_in_code_sees_it_once_and_revokes_it() {
             secret.starts_with("okfsc_"),
             "a sign-in code, not {secret:?}"
         );
+        // Escape does not close the dialog: only "I have stored it" does.
+        ui.page.press_key(None, "Escape").expect("press Escape");
+        let open = ui.eval(
+            "() => document.getElementById('code-secret-dialog').open",
+            serde_json::json!(null),
+        );
+        assert_eq!(open, serde_json::json!(true), "Escape closed the dialog");
+        assert!(ui.page.is_visible("#code-secret").expect("visible"));
         ui.click("#code-secret-done");
         ui.wait_hidden("#code-secret");
         ui.wait_text("[data-test=code-state-console-code]", "live");

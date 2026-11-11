@@ -12,6 +12,8 @@
 - Two browser journeys in `tests/ui_e2e/keys.rs`:
   `an_admin_mints_a_sign_in_code_sees_it_once_and_revokes_it` and
   `an_oauth_grant_is_marked_and_cannot_be_given_reporting`.
+  The first also covers a refused mint (no catalog) and its retry, and
+  that Escape leaves the code dialog open.
 - A paragraph on the console's codes section in `docs/operations.md`
   ("OAuth sign-in codes").
 

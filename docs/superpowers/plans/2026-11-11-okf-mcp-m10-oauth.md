@@ -12205,6 +12205,7 @@ Depends on Task 4 (the `/api/v1/oauth/codes` endpoints) and Task 2 (`KeyView.kin
 > - `showOnce` holds the secret in a local it sets to `null` when "I have stored it" is clicked, so not even the copy handler keeps it after the dialog closes.
 > - The codes table's empty text is "No sign-in codes to show." (it also shows with every state ticked).
 > - The first journey also asserts the code is in neither `localStorage` nor `sessionStorage` after the dialog closes.
+> - The first journey (PR #256 review) first submits the form with no catalog: it waits for the 409 toast ("must be granted a catalog"), asserts no `#code-secret-dialog` and that name and actor are still filled, then ticks `main` and retries. With the dialog open it presses Escape (`ui.page.press_key(None, "Escape")`) and asserts the dialog is still open.
 
 **Facts this task relies on** (verified at `c24fef1`; Task 2 and Task 4 additions from their sections):
 - `src/http/ui/js/pages/keys.js`:
