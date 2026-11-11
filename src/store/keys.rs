@@ -177,8 +177,15 @@ struct KeyRow {
     client_name: Option<String>,
 }
 
-/// Is `name` valid under the schema's `api_keys_name_check` constraint?
-fn is_valid_name(name: &str) -> bool {
+/// Is `name` valid under the schema's `api_keys_name_check` constraint? Sign-in
+/// codes use the same rule for their names (`store::oauth::codes`).
+///
+/// # Arguments
+/// * `name` - a key or sign-in code name.
+///
+/// # Returns
+/// `true` for a non-empty name of letters, digits, `.`, `_` and `-`.
+pub(crate) fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -223,38 +230,9 @@ pub async fn create_with_id(
             ),
         });
     }
-    if matches!(new.grants, Grants::Catalogs([])) {
-        // A slice pattern: `[]` matches an empty slice.
-        return Err(OkfError::Refused {
-            reason: format!(
-                "key {:?} must be granted a catalog, or every catalog",
-                new.name
-            ),
-        });
-    }
-    // Where the default sits among the granted names, checked before any query.
-    let default_position = match (new.default_catalog, new.grants) {
-        (Some(default), Grants::Catalogs(names)) => Some(
-            names
-                .iter()
-                .position(|name| name == default)
-                .ok_or_else(|| OkfError::Refused {
-                    reason: format!("default catalog {default:?} is not granted to the key"),
-                })?,
-        ),
-        (Some(_), Grants::All) | (None, _) => None,
-    };
     let mut tx = pool.begin().await?;
-    let granted = match new.grants {
-        Grants::All => Vec::new(),
-        Grants::Catalogs(names) => catalog_ids(&mut tx, names).await?,
-    };
-    let default_catalog_id = match (new.default_catalog, default_position) {
-        (_, Some(position)) => Some(granted[position]),
-        // An unknown catalog is `CatalogNotSelected`; any other error propagates.
-        (Some(default), None) => Some(catalogs::find(&mut *tx, default).await?.id),
-        (None, None) => None,
-    };
+    let (granted, default_catalog_id) =
+        resolve_grants(&mut tx, "key", new.name, new.grants, new.default_catalog).await?;
     let key = crate::keys::generate()?;
     let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO api_keys \
@@ -366,6 +344,63 @@ pub(crate) async fn catalog_ids(
         .collect()
 }
 
+/// Checks a new credential's grants and default catalog, then looks up their
+/// ids: the rules `okf-mcp key create` and `okf-mcp oauth code create` share.
+///
+/// # Arguments
+/// * `conn` - the creating transaction's connection.
+/// * `noun` - `"key"` or `"sign-in code"`, for the messages.
+/// * `name` - the credential's name, for the messages.
+/// * `grants` - the catalogs it reaches.
+/// * `default_catalog` - its default catalog, if any.
+///
+/// # Returns
+/// The granted catalog ids, in the caller's order (empty for [`Grants::All`]),
+/// and the default catalog's id.
+///
+/// # Errors
+/// [`OkfError::Refused`] for no catalogs or an ungranted default (checked
+/// before any query); [`OkfError::CatalogNotSelected`] for an unknown catalog;
+/// [`OkfError::Database`].
+pub(crate) async fn resolve_grants(
+    conn: &mut PgConnection,
+    noun: &str,
+    name: &str,
+    grants: Grants<'_>,
+    default_catalog: Option<&str>,
+) -> Result<(Vec<i64>, Option<i64>), OkfError> {
+    if matches!(grants, Grants::Catalogs([])) {
+        // A slice pattern: `[]` matches an empty slice.
+        return Err(OkfError::Refused {
+            reason: format!("{noun} {name:?} must be granted a catalog, or every catalog"),
+        });
+    }
+    // Where the default sits among the granted names, checked before any query.
+    let default_position = match (default_catalog, grants) {
+        (Some(default), Grants::Catalogs(names)) => Some(
+            names
+                .iter()
+                .position(|granted| granted == default)
+                .ok_or_else(|| OkfError::Refused {
+                    reason: format!("default catalog {default:?} is not granted to the {noun}"),
+                })?,
+        ),
+        (Some(_), Grants::All) | (None, _) => None,
+    };
+    let granted = match grants {
+        Grants::All => Vec::new(),
+        Grants::Catalogs(names) => catalog_ids(conn, names).await?,
+    };
+    let default_id = match (default_catalog, default_position) {
+        // `catalog_ids` returns one id per name, so `position` is in range.
+        (_, Some(position)) => Some(granted[position]),
+        // An unknown catalog is `CatalogNotSelected`; any other error propagates.
+        (Some(default), None) => Some(catalogs::find(&mut *conn, default).await?.id),
+        (None, None) => None,
+    };
+    Ok((granted, default_id))
+}
+
 /// Every key, by id, with its granted catalogs.
 ///
 /// # Arguments
@@ -452,6 +487,21 @@ async fn set_maintenance_report_with(
 ) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
     let id = select(&mut tx, selector).await?;
+    if enabled {
+        // An OAuth grant never reports (the schema's `api_keys_oauth_caps`):
+        // refuse it here as a 409 instead of letting the CHECK fail as a 500.
+        let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM api_keys WHERE id = $1")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if kind.as_deref() == Some(KeyKind::OAuth.as_str()) {
+            return Err(OkfError::Refused {
+                reason: format!(
+                    "key {id:?} is an OAuth grant, which cannot submit maintenance reports"
+                ),
+            });
+        }
+    }
     let updated = sqlx::query(
         "UPDATE api_keys SET maintenance_report = $2 \
          WHERE id = $1 AND revoked_at IS NULL AND maintenance_report IS DISTINCT FROM $2",
@@ -672,15 +722,15 @@ pub async fn ungrant(pool: &PgPool, target: &str, catalog: &str) -> Result<(), O
 /// How a key change names its key.
 #[derive(Debug, Clone, Copy)]
 enum Selector<'a> {
-    /// An exact generated id, else an unambiguous active name (the CLI's
-    /// rules, [`resolve_active`]).
+    /// An exact generated id, else an unambiguous active name, of an API key
+    /// only (the CLI's rules, [`resolve_active`]).
     Resolve {
         /// The id or name.
         target: &'a str,
         /// Narrows a name to one actor.
         actor: Option<&'a str>,
     },
-    /// Exactly this id, whatever its shape.
+    /// Exactly this id, whatever its shape, an OAuth grant's included.
     Exact(&'a str),
 }
 
@@ -703,13 +753,23 @@ async fn select(conn: &mut PgConnection, selector: Selector<'_>) -> Result<Strin
     }
 }
 
+/// The id an `okf-mcp key ...` target names: an exact generated id, else the
+/// one active key with that name (and actor, if given). Only API keys
+/// (`kind = 'key'`) are considered, by id or by name: an OAuth grant may share
+/// a key's name (the live name/actor index covers keys only), and a key
+/// command must never act on, or be made ambiguous by, a grant. Grants are
+/// revoked by exact id (`okf-mcp oauth grant revoke`, `/api/v1/keys`).
+///
+/// # Errors
+/// [`OkfError::Refused`] for an unknown, revoked or ambiguous target, or an
+/// actor given with an id; [`OkfError::Database`].
 async fn resolve_active(
     conn: &mut PgConnection,
     target: &str,
     actor: Option<&str>,
 ) -> Result<String, OkfError> {
     let exact: Option<(String, String)> =
-        sqlx::query_as("SELECT id, name FROM api_keys WHERE id = $1")
+        sqlx::query_as("SELECT id, name FROM api_keys WHERE id = $1 AND kind = 'key'")
             .bind(target)
             .fetch_optional(&mut *conn)
             .await?;
@@ -731,7 +791,7 @@ async fn resolve_active(
         }
     }
     let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM api_keys WHERE revoked_at IS NULL AND name = $1 \
+        "SELECT id FROM api_keys WHERE revoked_at IS NULL AND name = $1 AND kind = 'key' \
          AND ($2::text IS NULL OR actor = $2) \
          ORDER BY actor, id",
     )
@@ -744,7 +804,7 @@ async fn resolve_active(
         [] => {
             // Only diagnose revoked names after looking for live replacements.
             let revoked: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM api_keys WHERE name = $1 \
+                "SELECT EXISTS(SELECT 1 FROM api_keys WHERE name = $1 AND kind = 'key' \
                  AND revoked_at IS NOT NULL AND ($2::text IS NULL OR actor = $2))",
             )
             .bind(target)
@@ -1351,5 +1411,87 @@ mod tests {
                 .unwrap(),
             replacement.id
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn key_commands_by_name_act_on_the_key_and_never_on_a_grant_of_that_name() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "main", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "other", "", now())
+            .await
+            .unwrap();
+        let client = crate::store::oauth::testing::insert_client(
+            &db.pool,
+            "https://client.example.com/client.json",
+            "Example Client",
+            now(),
+        )
+        .await;
+        // `insert_grant` names its grant `laptop`, actor `example-actor`.
+        let grant = crate::store::oauth::testing::insert_grant(
+            &db.pool,
+            &client,
+            Access::Read,
+            &["main"],
+            now(),
+        )
+        .await;
+        let main = ["main".to_string()];
+        let same_name = NewKey {
+            actor: "example-actor",
+            ..new_key("laptop", Grants::Catalogs(&main), None)
+        };
+        // The live name/actor rule covers keys only: the grant does not collide.
+        let key = create_with_id(&db.pool, &same_name, now())
+            .await
+            .unwrap()
+            .id;
+        let row = |id: String| {
+            let pool = db.pool.clone();
+            async move {
+                list(&pool)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|record| record.id == id)
+                    .expect("the row exists")
+            }
+        };
+
+        // Each by-name command finds exactly one candidate (not "ambiguous").
+        let reporting = set_maintenance_report_target(&db.pool, "laptop", None, true).await;
+        let granted = grant_target(&db.pool, "laptop", Some("example-actor"), "other").await;
+        let ungranted = ungrant_target(&db.pool, "laptop", None, "main").await;
+        let revoked = revoke_target(&db.pool, "laptop", None, now()).await;
+
+        assert_eq!(reporting.unwrap(), key);
+        assert_eq!(granted.unwrap(), key);
+        assert_eq!(ungranted.unwrap(), key);
+        assert_eq!(revoked.unwrap(), key);
+        let key_row = row(key.clone()).await;
+        assert!(key_row.maintenance_report && key_row.revoked_at.is_some());
+        assert_eq!(key_row.catalogs, ["other"]);
+        let grant_row = row(grant.clone()).await;
+        assert_eq!(grant_row.kind, KeyKind::OAuth);
+        assert!(!grant_row.maintenance_report);
+        assert_eq!(grant_row.catalogs, ["main"]);
+        assert_eq!(grant_row.revoked_at, None, "the grant is untouched");
+        // With the key revoked, the name reports the key, not the live grant.
+        assert!(matches!(
+            revoke_target(&db.pool, "laptop", None, now()).await,
+            Err(OkfError::Refused { reason }) if reason.contains("is revoked")
+        ));
+        // A grant's id is no key id to `okf-mcp key ...`.
+        for result in [
+            revoke_target(&db.pool, &grant, None, now()).await,
+            grant_target(&db.pool, &grant, None, "other").await,
+            set_maintenance_report_target(&db.pool, &grant, None, false).await,
+        ] {
+            assert!(
+                matches!(&result, Err(OkfError::Refused { reason }) if reason.contains("no active key")),
+                "{result:?}"
+            );
+        }
+        assert_eq!(row(grant).await.revoked_at, None);
     }
 }

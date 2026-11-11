@@ -71,6 +71,7 @@ Filled in as tasks land, as in M9 (dated `> **Corrected (issue #N).**` notes in 
 8. **Bounded in-memory maps:** `ExpiringMap` has a capacity; a full pending map answers the authorize GET with 503 (Tasks 2 and 5).
 9. **Rate limits** (Task 2): register, a burst of 10 then one every 6 seconds; token and revoke, 60 then 2 a second; consent POST, 20 then 1 a second.
 10. **`sign_in_codes_redeemed_grant`** (Task 2, corrected issue #246, 2026-11-11) is `grant_id IS NULL OR redeemed_at IS NOT NULL`, a check the spec's DDL lacks; Task 8 adds it to the spec.
+11. **`okf-mcp key revoke|grant|ungrant|maintenance-report` resolve API keys only** (Task 4, issue #248, 2026-11-11): `store::keys::resolve_active` filters `kind = 'key'` by id and by name, so a key name never matches, collides with or is made ambiguous by an OAuth grant. Grants are reached by exact id only: `okf-mcp oauth grant revoke` and the `/api/v1/keys/{id}` routes (`Selector::Exact`). Task 8 adds this to the spec.
 
 ## Verified facts the code relies on
 
@@ -358,7 +359,7 @@ pub async fn start_oauth_server(catalogs: Vec<(&str, Files)>) -> (TestServer, Ci
 | `src/mcp/*.rs`, `src/mcp/maintenance/*.rs` (`#[tool(annotations(...))]`), `src/mcp/annotations.rs` (new, coverage test), `src/investigator/contract_tools.json` (recaptured) | 1 |
 | `migrations/0008_oauth.sql` | 2 |
 | `src/keys.rs`, `src/config.rs`, `src/auth.rs`, `src/app.rs`, `src/lib.rs` (`pub mod oauth;`) | 2 |
-| `src/store/keys.rs` | 2, 4 (`is_valid_name`, `resolve_grants`, refusing maintenance reporting on a grant) |
+| `src/store/keys.rs` | 2, 4 (`is_valid_name`, `resolve_grants`, refusing maintenance reporting on a grant, `resolve_active` limited to `kind = 'key'`) |
 | `src/store/mod.rs` (`pub mod oauth;`) | 2 |
 | `src/store/oauth/mod.rs`, `testing.rs` (test helpers) | 2 |
 | `src/store/oauth/tokens.rs` | 2, then 6 |
@@ -6756,6 +6757,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 Depends on Task 2. Parallel with Task 3. Tasks 5 and 7 build on it.
 
+> **Corrected (issue #248, 2026-11-11).** What shipped differs from the steps below in these ways (the code is in `src/store/oauth/codes.rs`, `src/store/keys.rs`, `src/cli.rs`, `src/http/api/{keys,oauth}.rs`):
+> - **Added scope:** `store::keys::resolve_active` (the `*_target` functions behind `okf-mcp key revoke|grant|ungrant|maintenance-report`) considers only `kind = 'key'` rows, by exact id and by name, including the "is revoked" diagnosis. A key name never matches, collides with or is made ambiguous by a grant, and a grant's id is "no active key" to `key ...`. Exact-id paths (`Selector::Exact`: `oauth grant revoke`, `/api/v1/keys/{id}`) still reach grants. Tests: `store::keys::tests::key_commands_by_name_act_on_the_key_and_never_on_a_grant_of_that_name`, and `cli::tests::oauth_subcommands_run_against_the_database` (a key with the grant's own name and actor).
+> - `redeem` has no unique-violation branch: migration 0008's `api_keys_live_name_actor` covers `kind = 'key'` only, so a grant insert cannot violate it. `codes.rs` does not import `is_unique_violation`. The grant name's code-id suffix (Decision 1) now only tells grants apart in lists.
+> - `insert_test_client` sets `fetched_at` and `cache_expires_at` for a CIMD row (Task 2's `oauth_clients_fetched_cimd` check refuses one without), binds `kind.as_str()`, and returns the row read back with `clients::find`.
+> - The tests reuse Task 2's `now()` (2026-11-11 12:00) rather than an `at()`, compare `admin_generation` with its value before the change (not a literal `2`), and the grant-name test's `ClientRecord` has `cache_expires_at: None`.
+> - `a_racing_double_redeem_yields_one_grant` is deterministic: a third connection holds the code's row lock, both redeems run as `tokio::spawn`ed tasks until `pg_stat_activity` shows two backends waiting on that lock, then the blocker rolls back and exactly one redeem wins.
+> - `expiry` adds with `checked_add_signed`, so a huge `requested` is a refusal, not a panic.
+> - More tests: `redeem_refuses_expired_revoked_and_unknown_codes_and_changes_nothing`, `code_states_have_their_spellings`, `api::keys::tests::a_grant_is_managed_by_id_but_never_given_maintenance_reporting`, and more 409/404 rows in `create_refuses_admin_access_all_from_a_scoped_admin_and_long_expiries`.
+> - The "First run" paragraph does not link a "Connecting over OAuth" section (none exists until Task 8's "OAuth connectors").
+
 **Facts this task relies on** (verified at `c24fef1`; Task 2's additions are taken from "Interfaces shared across tasks"):
 - `src/store/keys.rs`:
   - `create_with_id` (166-262) runs its checks in this order: the name against `is_valid_name` (131, private), no empty `Grants::Catalogs([])`, a default that is among the granted names (a position computed before any query). Then, in one transaction, `catalog_ids` (294; Task 2 makes it `pub(crate)`) and `catalogs::find` for an all-catalogs key's default, the insert, the `key_catalogs` insert through `unnest($2::bigint[])`, and `bump_admin_generation`.
@@ -6786,7 +6797,7 @@ Depends on Task 2. Parallel with Task 3. Tasks 5 and 7 build on it.
   - "First run" (404) shows `okf-mcp key create`.
 
 **Decisions (this task):**
-1. **A grant's name is `<code name>.<client host>-<first 8 characters of the code id>`**, for example `laptop.client.example.com-1a2b3c4d`. `@` fails the `api_keys` name check, and the suffix keeps two codes with one name, actor and client from colliding on `api_keys_live_name_actor`. The client host is the host of the CIMD `client_id` URL, or of a DCR client's first redirect URI. It is lowercased and mapped to the name charset, and is `client` when nothing is left. Task 8 updates the spec ("Consent flow", step 3).
+1. **A grant's name is `<code name>.<client host>-<first 8 characters of the code id>`**, for example `laptop.client.example.com-1a2b3c4d`. `@` fails the `api_keys` name check, and the suffix tells apart the grants of two codes with one name, actor and client (corrected issue #248: `api_keys_live_name_actor` covers keys only, so they could not collide anyway). The client host is the host of the CIMD `client_id` URL, or of a DCR client's first redirect URI. It is lowercased and mapped to the name charset, and is `client` when nothing is left. Task 8 updates the spec ("Consent flow", step 3).
 2. **The CLI takes `--catalogs a,b` or `--all`, exactly as `key create` does,** not the spec's repeated `--catalog`. Task 8 updates the spec.
 3. **`--actor` is required for a code** (the spec's CLI line). A code has no meaningful name-as-actor default: the code's name is a label for the hand-over.
 4. **Sign-in codes are read from the database on every use, never cached,** so minting or revoking one needs no `app.poll()`. Redeeming creates a key row and does bump the admin generation, so the key cache picks up the grant on the next poll (Task 5 polls right after redeeming).
@@ -6910,6 +6921,8 @@ In `set_maintenance_report_with`, right after `let id = select(&mut tx, selector
     }
 ```
 
+> **Corrected (issue #248, 2026-11-11): added scope.** `resolve_active` adds `AND kind = 'key'` to its three queries (the exact-id lookup, the live-name lookup and the revoked-name check) and gains a doc comment saying why; `Selector`'s docs say `Resolve` is API keys only and `Exact` reaches grants too. Add `key_commands_by_name_act_on_the_key_and_never_on_a_grant_of_that_name` to `store::keys`' tests: a grant from `testing::insert_grant` (name `laptop`, actor `example-actor`) and a key with the same name and actor (creatable: the index covers keys only); `set_maintenance_report_target`, `grant_target`, `ungrant_target` and `revoke_target` by name all return the key's id and leave the grant alone; afterwards the name reports "is revoked" (the key), and the grant's id is "no active key" to `revoke_target`, `grant_target` and `set_maintenance_report_target`.
+
 Run `cargo test --lib store::keys` and expect the existing tests to pass. The refactor changes no behaviour; Step 2's tests cover the refusal.
 
 - [ ] **Step 2: Write the failing store tests**
@@ -6935,34 +6948,26 @@ pub(crate) async fn insert_test_client(
     kind: ClientKind,
     redirect_uri: &str,
 ) -> ClientRecord {
-    let record = ClientRecord {
-        client_id: client_id.to_string(),
-        kind,
-        client_name: Some("Example Client".to_string()),
-        redirect_uris: vec![redirect_uri.to_string()],
-        metadata: serde_json::json!({}),
-        fetched_at: None,
-        cache_expires_at: None,
-        created_at: Utc::now(),
-    };
-    let kind_text = match kind {
-        ClientKind::Dcr => "dcr",
-        ClientKind::Cimd => "cimd",
-    };
+    // A CIMD row must carry its fetch times (`oauth_clients_fetched_cimd`);
+    // a DCR row must not.
     sqlx::query(
-        "INSERT INTO oauth_clients (client_id, kind, client_name, redirect_uris, metadata, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO oauth_clients \
+         (client_id, kind, client_name, redirect_uris, metadata, fetched_at, cache_expires_at, \
+          created_at) \
+         VALUES ($1, $2, 'Example Client', ARRAY[$3], '{}'::jsonb, \
+                 CASE WHEN $2 = 'cimd' THEN now() END, \
+                 CASE WHEN $2 = 'cimd' THEN now() + interval '1 hour' END, now())",
     )
-    .bind(&record.client_id)
-    .bind(kind_text)
-    .bind(&record.client_name)
-    .bind(&record.redirect_uris)
-    .bind(&record.metadata)
-    .bind(record.created_at)
+    .bind(client_id)
+    .bind(kind.as_str())
+    .bind(redirect_uri)
     .execute(pool)
     .await
     .expect("insert a test client");
-    record
+    crate::store::oauth::clients::find(pool, client_id)
+        .await
+        .expect("read the test client")
+        .expect("the test client exists")
 }
 ```
 
@@ -7214,8 +7219,10 @@ Add these tests to the module's `#[cfg(test)] mod tests` (beside Task 2's `prune
             .await
             .unwrap();
 
-        // `tokio::join!` runs both futures concurrently on two pooled
-        // connections; `FOR UPDATE` makes the second wait for the first.
+        // Corrected (issue #248, 2026-11-11): what shipped holds the row lock
+        // on a third connection, `tokio::spawn`s both redeems, waits until
+        // `pg_stat_activity` shows both blocked on it, then releases it; see
+        // `src/store/oauth/codes.rs`.
         let (first, second) = tokio::join!(
             redeem(&db.pool, &code.id, &client, at()),
             redeem(&db.pool, &code.id, &client, at())
@@ -7328,6 +7335,7 @@ Add these tests to the module's `#[cfg(test)] mod tests` (beside Task 2's `prune
             redirect_uris: vec![redirect.to_string()],
             metadata: serde_json::json!({}),
             fetched_at: None,
+            cache_expires_at: None,
             created_at: at(),
         };
         let id = "1a2b3c4d-0000-4000-8000-000000000000";
@@ -7395,7 +7403,7 @@ use sqlx::PgPool;
 
 use crate::error::OkfError;
 use crate::keys::{self, SIGN_IN_CODE_PREFIX};
-use crate::store::catalogs::{bump_admin_generation, is_unique_violation};
+use crate::store::catalogs::bump_admin_generation;
 use crate::store::keys::{is_valid_name, resolve_grants, Access, Grants};
 use crate::store::oauth::clients::{ClientKind, ClientRecord};
 
@@ -7596,10 +7604,13 @@ pub fn expiry(
             ),
         });
     }
-    let delta = TimeDelta::from_std(requested).map_err(|_| OkfError::Refused {
-        reason: "the expiry is out of range".to_string(),
-    })?;
-    Ok(now + delta)
+    // `checked_add_signed` is `None` past chrono's range instead of panicking.
+    TimeDelta::from_std(requested)
+        .ok()
+        .and_then(|delta| now.checked_add_signed(delta))
+        .ok_or_else(|| OkfError::Refused {
+            reason: "the expiry is out of range".to_string(),
+        })
 }
 
 /// Mints a code and its catalog grants in one transaction. It changes no
@@ -7826,7 +7837,9 @@ pub async fn redeem(
             reason: "every catalog this sign-in code granted has been deleted".to_string(),
         });
     }
-    let inserted = sqlx::query_scalar::<_, String>(
+    // The live name/actor unique index covers `kind = 'key'` only (migration
+    // 0008), so a grant's name can never collide with a key or another grant.
+    let grant_id: String = sqlx::query_scalar(
         "INSERT INTO api_keys \
          (name, sha256, kind, client_id, access, maintenance_report, all_catalogs, \
           default_catalog_id, actor, created_at) \
@@ -7840,25 +7853,7 @@ pub async fn redeem(
     .bind(&code.actor)
     .bind(now)
     .fetch_one(&mut *tx)
-    .await;
-    let grant_id = match inserted {
-        Ok(id) => id,
-        // Only possible if an 8-character code-id prefix repeats for one
-        // name, client and actor (Decision 1): the transaction rolls back and
-        // the code stays live, so the person can simply try again.
-        Err(error)
-            if is_unique_violation(&error)
-                && error
-                    .as_database_error()
-                    .and_then(|db_error| db_error.constraint())
-                    == Some("api_keys_live_name_actor") =>
-        {
-            return Err(OkfError::Refused {
-                reason: "a grant with this name already exists; try again".to_string(),
-            })
-        }
-        Err(error) => return Err(error.into()),
-    };
+    .await?;
     sqlx::query(
         "INSERT INTO key_catalogs (key_id, catalog_id) SELECT $1, unnest($2::bigint[])",
     )
@@ -12303,10 +12298,14 @@ async fn an_oauth_grant_is_marked_and_cannot_be_given_reporting() {
     // A client and a grant made the way the consent page makes them (Task 3
     // registers clients; a raw row keeps this journey independent of it).
     let client_id = "https://client.example.com/client.json";
+    // Corrected (issue #248, 2026-11-11): a CIMD row needs `fetched_at` and
+    // `cache_expires_at` (Task 2's `oauth_clients_fetched_cimd` check).
     sqlx::query(
-        "INSERT INTO oauth_clients (client_id, kind, client_name, redirect_uris, metadata, created_at) \
+        "INSERT INTO oauth_clients \
+         (client_id, kind, client_name, redirect_uris, metadata, fetched_at, cache_expires_at, \
+          created_at) \
          VALUES ($1, 'cimd', 'Example Client', ARRAY['https://client.example.com/callback'], \
-                 '{}'::jsonb, now())",
+                 '{}'::jsonb, now(), now() + interval '1 hour', now())",
     )
     .bind(client_id)
     .execute(&server.db.pool)

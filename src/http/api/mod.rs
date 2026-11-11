@@ -23,6 +23,7 @@ mod health;
 mod identity;
 mod keys;
 mod maintenance;
+mod oauth;
 mod search;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -45,6 +46,7 @@ pub(crate) fn routes(app: &Arc<App>) -> Router<Arc<App>> {
         .merge(search::routes())
         .merge(catalogs::routes(app))
         .merge(maintenance::routes())
+        .merge(oauth::routes())
         .merge(changesets::routes())
         // `route_layer` covers the routes merged above and runs only when one
         // matched, so an unknown API path stays 404 rather than 401.

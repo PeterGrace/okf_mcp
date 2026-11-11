@@ -447,11 +447,30 @@ shells). `key list` shows name, actor, id, access, state, grants, default and
 `maintenance_report true|false`, grouped by name. Use
 `okf-mcp key maintenance-report ID --enabled true|false [--actor ACTOR]` to
 change the reporting flag. `revoke`, `grant`, `ungrant` and `maintenance-report`
-accept an id, an unambiguous live name, or `NAME --actor ACTOR`; for example,
+accept an id, an unambiguous live name, or `NAME --actor ACTOR` of an API key;
+they never match an OAuth grant, whose name may repeat a key's (see "Mint a
+sign-in code" below); for example,
 `okf-mcp key grant claude work --actor
 claude-ai-web`. A revoked name/actor pair can be created again for rotation;
 the old row and its changeset history remain attached to the old id. A revoked
 key stops working within `poll_interval`.
+
+**Mint a sign-in code** for a person connecting an OAuth client. Codes are
+redeemed on the OAuth consent page, which exists only once OAuth is on
+(`public_url` is set). The code is printed once. It is single-use and expires
+unused after 24 hours unless `--expires` says otherwise, up to
+`oauth.code_max_expiry` (7 days by default). Access is `read` or `write`;
+`admin` is refused, and `--actor` is required. The person enters the code on
+the consent page, which turns it into an OAuth grant: a key row named
+`<code name>.<client host>-<8 characters of the code id>`, with the code's
+catalogs, access, default and actor. `okf-mcp key ...` never acts on a grant;
+`okf-mcp oauth grant revoke ID` revokes one (see
+[OAuth sign-in codes](#oauth-sign-in-codes) for every subcommand):
+
+```sh
+kubectl -n okf-mcp exec deploy/okf-mcp -- \
+    okf-mcp oauth code create laptop --actor example-actor --access write --catalogs notes --default notes
+```
 
 **Import a catalog**, from a `git archive` tarball (exactly the tracked files)
 or any `.tar.gz` that follows the import rules. Either copy it into the pod's
@@ -1096,8 +1115,9 @@ browser out at its next request.
 
 ### API reference
 
-The API has 31 endpoints. The identity endpoint is below, and each area's
+The API has 34 endpoints. The identity endpoint is below, and each area's
 endpoints are in its own subsection: [API keys](#api-keys) (6),
+[OAuth sign-in codes](#oauth-sign-in-codes) (3),
 [Health](#health) (2), [Browse and search](#browse-and-search) (7),
 [Catalogs and import/export](#catalogs-and-importexport) (6),
 [Findings and runs](#findings-and-runs) (6) and [Changesets](#changesets) (3).
@@ -1135,7 +1155,7 @@ no audit actor, as with the CLI.
 |---|---|---|
 | `GET /api/v1/keys` | admin | The keys the caller manages, revoked ones included: `id`, `name`, `actor`, `access`, `maintenance_report`, `all_catalogs`, `catalogs`, `default_catalog`, `created_at`, `revoked_at`. Never a secret or hash |
 | `POST /api/v1/keys` | admin | Body `{name, access: "read"\|"write"\|"admin", all, catalogs, default_catalog, actor, maintenance_report}` (`actor` defaults to `name`). Answers `{key, secret}`. 400 for a bad `access`, 403 for `all` from a scoped caller, 404 for an unreached catalog, 409 for a bad or taken name, no catalogs, or `all` with `catalogs`, 422 for an unknown field |
-| `PATCH /api/v1/keys/{id}` | admin | Body `{maintenance_report: bool}`. 409 for a revoked key |
+| `PATCH /api/v1/keys/{id}` | admin | Body `{maintenance_report: bool}`. 409 for a revoked key, or for enabling reporting on an OAuth grant |
 | `POST /api/v1/keys/{id}/revoke` | admin | Refused from the key's next request on. 409 if already revoked |
 | `PUT /api/v1/keys/{id}/catalogs/{catalog}` | admin | Grants a catalog. 404 for an unreached catalog or an unmanaged key; 409 for a revoked or all-catalogs key |
 | `DELETE /api/v1/keys/{id}/catalogs/{catalog}` | admin | Removes a grant, and the default if it was that catalog. Errors as for the grant |
@@ -1144,6 +1164,37 @@ no audit actor, as with the CLI.
 curl -fsS -H "Authorization: Bearer $OKF_MCP_KEY" -H 'Content-Type: application/json' \
     -d '{"name":"ci-reader","access":"read","catalogs":["main"],"default_catalog":"main"}' \
     https://okf-mcp.example.com/api/v1/keys
+```
+
+### OAuth sign-in codes
+
+`okf-mcp oauth ...` and `/api/v1/oauth/codes` mint and manage the one-time
+codes the OAuth consent page asks for. The reach rule is the one for keys:
+a scoped admin manages only codes whose every catalog it reaches, and no
+all-catalogs code. The code itself is in the create response (and the CLI's
+stdout) only; only its SHA-256 is stored. Codes are read from the database on
+every use, so minting or revoking one takes effect at once. Grants, the keys
+codes become, are listed and revoked with the other keys: their views carry
+`kind: "oauth"` and `client_name`.
+
+| Command | Does |
+|---|---|
+| `okf-mcp oauth code create <name> --actor <actor> --access read\|write (--catalogs a,b \| --all) [--default <c>] [--expires 24h]` | Prints the `okfsc_` code once (stdout) and its id and expiry (stderr). Refuses `admin`, and an expiry above `oauth.code_max_expiry` |
+| `okf-mcp oauth code list` | Tab-separated: name, actor, id, access, state (`live`, `expired`, `redeemed`, `revoked`), catalogs (`*` for all), `default`, `expires`, `grant` |
+| `okf-mcp oauth code revoke <id>` | Revokes an unredeemed code |
+| `okf-mcp oauth grant list` | `key list`'s columns for OAuth grants only, plus `client <name>` |
+| `okf-mcp oauth grant revoke <id>` | Revokes a grant by id: its tokens stop working within `poll_interval`. Refuses a plain key's id |
+
+| Method and path | Key | Does |
+|---|---|---|
+| `GET /api/v1/oauth/codes` | admin | The codes the caller manages, newest first: `id`, `name`, `actor`, `access`, `all_catalogs`, `catalogs`, `default_catalog`, `state`, `created_at`, `expires_at`, `redeemed_at`, `grant_id`, `revoked_at`. Never a code or hash |
+| `POST /api/v1/oauth/codes` | admin | Body `{name, actor, access: "read"\|"write", all, catalogs, default_catalog, expires_in}` (`expires_in` like `2h` or `3d`, default 24h). Answers `{code, secret}`. 400 for a bad `access` or `expires_in`, 403 for `all` from a scoped caller, 404 for an unreached catalog, 409 for `admin`, a bad name, an empty actor, no catalogs, `all` with `catalogs` or too long an expiry, 422 for an unknown field |
+| `DELETE /api/v1/oauth/codes/{id}` | admin | Revokes an unredeemed code; answers its view. 404 for an unmanaged code, 409 if redeemed or already revoked |
+
+```sh
+curl -fsS -H "Authorization: Bearer $OKF_MCP_KEY" -H 'Content-Type: application/json' \
+    -d '{"name":"laptop","actor":"example-actor","access":"read","catalogs":["main"]}' \
+    https://okf-mcp.example.com/api/v1/oauth/codes
 ```
 
 ### Health
