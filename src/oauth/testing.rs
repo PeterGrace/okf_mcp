@@ -164,3 +164,29 @@ pub(crate) fn hidden(page: &str, name: &str) -> String {
     let end = start + page[start..].find('"').expect("closing quote");
     page[start..end].to_string()
 }
+
+/// Every hidden input of the form `form_id` in a consent page, in order:
+/// what a browser would post from that form, minus its buttons.
+///
+/// # Arguments
+/// * `page` - the page's HTML.
+/// * `form_id` - the form's `id` attribute.
+///
+/// # Returns
+/// `(name, value)` pairs, as written (escaped).
+///
+/// # Panics
+/// If the page has no such form.
+pub(crate) fn hidden_inputs(page: &str, form_id: &str) -> Vec<(String, String)> {
+    let start = page.find(&format!("id=\"{form_id}\"")).expect("the form");
+    let form = &page[start..];
+    let form = &form[..form.find("</form>").expect("the form's end")];
+    form.match_indices("<input type=\"hidden\" name=\"")
+        .map(|(at, marker)| {
+            let rest = &form[at + marker.len()..];
+            let (name, rest) = rest.split_once("\" value=\"").expect("a value");
+            let (value, _) = rest.split_once('"').expect("closing quote");
+            (name.to_string(), value.to_string())
+        })
+        .collect()
+}

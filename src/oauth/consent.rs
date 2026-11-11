@@ -230,10 +230,16 @@ pub fn code_page(view: &PageView, error: Option<&str>) -> Response {
 /// # Arguments
 /// * `view` - the request.
 /// * `grant` - what the sign-in code grants.
+/// * `summary_nonce` - this summary's token (a hidden field), which binds
+///   its Approve to the code it shows.
 ///
 /// # Returns
 /// The page body.
-pub(crate) fn summary_page_html(view: &PageView, grant: &GrantSummary) -> String {
+pub(crate) fn summary_page_html(
+    view: &PageView,
+    grant: &GrantSummary,
+    summary_nonce: &str,
+) -> String {
     let default = grant
         .default_catalog
         .as_deref()
@@ -246,6 +252,7 @@ pub(crate) fn summary_page_html(view: &PageView, grant: &GrantSummary) -> String
         <p class="consent-summary" id="consent-summary"><strong>{name}</strong> ({host}) will get <strong>{access}</strong> access to <strong>{catalogs}</strong> as actor <strong>{actor}</strong>{default}.</p>
         <form method="post" action="/oauth/authorize" id="consent-approve-form">
             {hidden}
+            <input type="hidden" name="summary" value="{summary}">
             <div class="consent-actions">
                 <button type="submit" name="action" value="approve" id="consent-approve">Approve</button>
                 <button type="submit" name="action" value="deny" id="consent-deny" class="secondary">Deny</button>
@@ -259,6 +266,7 @@ pub(crate) fn summary_page_html(view: &PageView, grant: &GrantSummary) -> String
         catalogs = escape(&grant.catalogs),
         actor = escape(&grant.actor),
         hidden = hidden_fields(view),
+        summary = escape(summary_nonce),
     )
 }
 
@@ -267,14 +275,16 @@ pub(crate) fn summary_page_html(view: &PageView, grant: &GrantSummary) -> String
 /// # Arguments
 /// * `view` - the request.
 /// * `grant` - what the sign-in code grants.
+/// * `summary_nonce` - this summary's token, rendered as the hidden
+///   `summary` input that binds its Approve to the code it shows.
 ///
 /// # Returns
 /// 200 with the page.
-pub fn summary_page(view: &PageView, grant: &GrantSummary) -> Response {
+pub fn summary_page(view: &PageView, grant: &GrantSummary, summary_nonce: &str) -> Response {
     page(
         StatusCode::OK,
         "Allow access?",
-        &summary_page_html(view, grant),
+        &summary_page_html(view, grant, summary_nonce),
         Some(&view.redirect_origin),
     )
 }
@@ -388,7 +398,7 @@ mod tests {
         };
         for html in [
             code_page_html(&hostile, None),
-            summary_page_html(&hostile, &grant),
+            summary_page_html(&hostile, &grant, "n1"),
         ] {
             assert!(!html.contains("<script>"), "{html}");
             assert!(!html.contains("<b>a</b>"), "{html}");
@@ -406,7 +416,7 @@ mod tests {
         };
         for html in [
             document("t", &code_page_html(&view(), Some("e"))),
-            document("t", &summary_page_html(&view(), &grant)),
+            document("t", &summary_page_html(&view(), &grant, "n1")),
             document("t", &error_page_html("e")),
         ] {
             assert!(!html.contains("<script"), "{html}");
@@ -423,13 +433,14 @@ mod tests {
             actor: "example-actor".to_string(),
             default_catalog: Some("main".to_string()),
         };
-        let html = summary_page_html(&view(), &grant);
+        let html = summary_page_html(&view(), &grant, "n1");
         assert!(html.contains("<strong>write</strong>"));
         assert!(html.contains("<strong>main, other</strong>"));
         assert!(html.contains("<strong>example-actor</strong>"));
         assert!(html.contains("default catalog <strong>main</strong>"));
         assert!(html.contains(r#"id="consent-approve""#));
         assert!(html.contains(r#"id="consent-deny""#));
+        assert!(html.contains(r#"name="summary" value="n1""#));
     }
 
     #[test]

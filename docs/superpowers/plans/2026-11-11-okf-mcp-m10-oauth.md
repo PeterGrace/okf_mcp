@@ -303,7 +303,10 @@ impl TokenBucket { pub fn new(capacity: u32, refill_per_sec: f64) -> Self; pub f
 // src/oauth/state.rs (Task 2)
 pub struct PendingAuthorization { pub csrf: String, pub client: ClientRecord, pub redirect_uri: String,
     pub state: Option<String>, pub code_challenge: String, pub resource: String,
-    pub sign_in_code_id: Option<String>, pub failed_attempts: u8 }           // Clone; Debug by hand: csrf redacted
+    pub accepted: Option<AcceptedCode>, pub failed_attempts: u8 }            // Clone; Debug by hand: csrf redacted
+// Corrected (issue #249, 2026-11-11, PR #259 review): `sign_in_code_id: Option<String>` became `accepted`,
+// binding the accepted code to the one step-2 summary that shows it (Debug by hand: nonce redacted).
+pub struct AcceptedCode { pub code_id: String, pub summary_nonce: String }   // Clone, PartialEq, Eq
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationCode { pub grant_id: String, pub client_id: String, pub redirect_uri: String,
     pub code_challenge: String, pub resource: String, pub family_id: String,
@@ -9614,6 +9617,8 @@ Create `src/http/ui/consent.css`:
 
 - [ ] **Step 7: Implement the consent pages**
 
+> **Corrected (issue #249, 2026-11-11, PR #259 review).** `summary_page(view, grant, summary_nonce)` and `summary_page_html(view, grant, summary_nonce)` take the summary's token and render it as a hidden `summary` input in `consent-approve-form`. See the Step 9 note.
+
 Put this above the tests in `src/oauth/consent.rs`:
 
 ```rust
@@ -10140,6 +10145,14 @@ Expected: FAIL to compile (`routes` and the handlers not found).
 Put this above the tests in `src/oauth/authorize.rs`:
 
 > **Corrected (issue #249, 2026-11-11).** Clippy's `result_large_err` refuses `Result<_, Response>` (a `Response` is 128 bytes). What shipped: `oauth_or_404` is gone; each handler opens with `let Some(oauth) = app.oauth() else { return StatusCode::NOT_FOUND.into_response(); };`. Steps 1 and 2 (client, then exact redirect URI) are a separate `trusted_client(app, oauth, &query) -> Result<(ClientRecord, &str), (StatusCode, &'static str)>`, and `authorize` renders its error as the error page, so the no-redirect half is one function. `error_to_client` takes `(redirect_uri, state, issuer, code, description)`. The tests below gained `the_sign_in_code_is_consumed_only_on_approve`, `another_requests_csrf_token_does_not_work`, `consent_posts_are_rate_limited` (drains `consent_limit` at an instant a minute ahead, so it is exact), more cases in the two redirect tests (a missing parameter of each kind, a redirect URI with an extra query, an untrusted redirect URI with a later error too), and a PKCE check of the stored code against `VERIFIER`. `consent.rs` gained `a_hostile_host_cannot_break_out_of_its_markup` and `pages_have_no_inline_script_or_style`. Read `src/oauth/authorize.rs` and `src/oauth/consent.rs`.
+
+> **Corrected (issue #249, 2026-11-11, PR #259 review).** The code below let a stale summary approve a different code. Every summary carries the same pending id and CSRF token, and `check_code` overwrote `sign_in_code_id`. So the Approve form of a summary for read-only code A, posted after code B was entered in another copy of step 1, redeemed write-capable B. What shipped:
+> - `PendingAuthorization.accepted: Option<AcceptedCode { code_id, summary_nonce }>` replaces `sign_in_code_id`.
+> - `check_code` mints a fresh nonce (`keys::generate_with("")`), stores it with the code id (replacing any earlier pair), and renders it in the summary's form as `summary`. `ConsentForm` gained `summary: Option<String>`.
+> - Inside the same `pending.update` closure that checks the CSRF token, a private `approval(accepted, posted)` decides `Approval::{NoCode, Stale, Current(code_id)}`, comparing the nonce in constant time, so the code id and its nonce come from one snapshot.
+> - `approve(app, oauth, pending_id, pending, code_id)` takes the code id it decided on.
+> - `NoCode` re-renders step 1. `Stale` (an older summary, or no token) re-renders step 1 with "That approval page was out of date..." and changes nothing, so the latest summary still approves. It is not a failed attempt.
+> - Test: `an_older_summary_cannot_approve_a_code_entered_after_it` (it fails on the earlier code). The other Approve tests post the summary page's own hidden fields (`testing::hidden_inputs`).
 
 ```rust
 //! `GET` and `POST /oauth/authorize` (spec "Endpoints" and "Consent flow").

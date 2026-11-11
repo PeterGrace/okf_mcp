@@ -25,7 +25,9 @@ use crate::maintenance::types::new_id;
 use crate::oauth::clients;
 use crate::oauth::consent::{self, GrantSummary, PageView};
 use crate::oauth::error::OAuthError;
-use crate::oauth::state::{code_key, AuthorizationCode, PendingAuthorization, MAX_FAILED_ATTEMPTS};
+use crate::oauth::state::{
+    code_key, AcceptedCode, AuthorizationCode, PendingAuthorization, MAX_FAILED_ATTEMPTS,
+};
 use crate::oauth::{pkce, OAuth};
 use crate::store::oauth::clients::{ClientKind, ClientRecord};
 use crate::store::oauth::codes::{self as code_rows, SignInCodeRecord};
@@ -33,6 +35,10 @@ use crate::store::oauth::codes::{self as code_rows, SignInCodeRecord};
 /// The message for every unusable sign-in code, so the page never says
 /// whether a code exists, expired, was redeemed or was revoked.
 const BAD_CODE: &str = "That sign-in code is not valid. Check it, or ask for a new one.";
+/// The message for an Approve from a step-2 page that a later code entry
+/// (in another copy of the form) replaced.
+const STALE: &str =
+    "That approval page was out of date. Approve from the latest page, or enter the code again.";
 /// The message for an unknown, expired or forged pending authorization.
 const EXPIRED: &str = "This sign-in request has expired or is not valid.";
 
@@ -67,6 +73,8 @@ struct ConsentForm {
     csrf: String,
     action: String,
     sign_in_code: Option<String>,
+    /// The step-2 page's token (see [`AcceptedCode`]); absent on step 1.
+    summary: Option<String>,
 }
 
 impl std::fmt::Debug for ConsentForm {
@@ -76,6 +84,45 @@ impl std::fmt::Debug for ConsentForm {
             .field("pending", &self.pending)
             .field("action", &self.action)
             .finish_non_exhaustive()
+    }
+}
+
+/// What an Approve finds, decided under the pending map's lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Approval {
+    /// No code has been accepted yet: back to step 1.
+    NoCode,
+    /// The form came from a step-2 page that a later code entry replaced.
+    Stale,
+    /// The form is the current summary's: redeem this code id.
+    Current(String),
+}
+
+/// Decides an Approve against the accepted code, comparing the posted
+/// summary token in constant time.
+///
+/// # Arguments
+/// * `accepted` - the pending request's accepted code, if any.
+/// * `posted` - the form's `summary` field, if any.
+///
+/// # Returns
+/// [`Approval::Current`] only when `posted` is that code's summary token.
+fn approval(accepted: Option<&AcceptedCode>, posted: Option<&str>) -> Approval {
+    let Some(accepted) = accepted else {
+        return Approval::NoCode;
+    };
+    // `is_some_and`: `posted is not None and <predicate>`.
+    let current = posted.is_some_and(|posted| {
+        accepted
+            .summary_nonce
+            .as_bytes()
+            .ct_eq(posted.as_bytes())
+            .into()
+    });
+    if current {
+        Approval::Current(accepted.code_id.clone())
+    } else {
+        Approval::Stale
     }
 }
 
@@ -291,7 +338,7 @@ async fn authorize(
         state: query.state.clone(),
         code_challenge: code_challenge.to_string(),
         resource: oauth.settings.resource.clone(),
-        sign_in_code_id: None,
+        accepted: None,
         failed_attempts: 0,
     };
     let page = consent::code_page(&view(&pending_id, &pending), None);
@@ -327,13 +374,18 @@ async fn consent_post(
     };
     // The CSRF token is checked before anything else, and a mismatch leaves
     // the pending authorization alone: someone who learned its id cannot
-    // cancel it. `update` holds the map's lock only for the closure.
+    // cancel it. Under the same lock (`update` holds it only for the
+    // closure), an Approve's summary token is matched against the code it
+    // was rendered for, so the code id and its token come from one snapshot.
     let pending = oauth.pending.update(&form.pending, now, |pending| {
         let matches: bool = pending.csrf.as_bytes().ct_eq(form.csrf.as_bytes()).into();
-        matches.then(|| pending.clone())
+        matches.then(|| {
+            let decided = approval(pending.accepted.as_ref(), form.summary.as_deref());
+            (pending.clone(), decided)
+        })
     });
     // `Some(Some(_))`: the entry is live (outer) and the token matched (inner).
-    let Some(Some(pending)) = pending else {
+    let Some(Some((pending, decided))) = pending else {
         return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED);
     };
     match form.action.as_str() {
@@ -351,7 +403,14 @@ async fn consent_post(
             let presented = form.sign_in_code.as_deref().unwrap_or_default();
             check_code(&app, oauth, &form.pending, &pending, presented).await
         }
-        "approve" => approve(&app, oauth, &form.pending, &pending).await,
+        "approve" => match decided {
+            Approval::NoCode => consent::code_page(&view(&form.pending, &pending), None),
+            // Nothing changes: the latest summary still approves.
+            Approval::Stale => consent::code_page(&view(&form.pending, &pending), Some(STALE)),
+            Approval::Current(code_id) => {
+                approve(&app, oauth, &form.pending, &pending, &code_id).await
+            }
+        },
         _ => consent::error_page(StatusCode::BAD_REQUEST, EXPIRED),
     }
 }
@@ -361,7 +420,7 @@ async fn consent_post(
 fn failed_attempt(oauth: &OAuth, pending_id: &str, pending: &PendingAuthorization) -> Response {
     let attempts = oauth.pending.update(pending_id, Instant::now(), |pending| {
         pending.failed_attempts = pending.failed_attempts.saturating_add(1);
-        pending.sign_in_code_id = None;
+        pending.accepted = None;
         pending.failed_attempts
     });
     match attempts {
@@ -375,7 +434,8 @@ fn failed_attempt(oauth: &OAuth, pending_id: &str, pending: &PendingAuthorizatio
     }
 }
 
-/// `action=code`: checks the code without consuming it, and shows step 2.
+/// `action=code`: checks the code without consuming it, and shows step 2
+/// with a fresh summary token that replaces any earlier summary's.
 async fn check_code(
     app: &App,
     oauth: &OAuth,
@@ -385,31 +445,41 @@ async fn check_code(
 ) -> Response {
     match code_rows::find_live(app.pool(), presented, app.clock().now()).await {
         Ok(Some(record)) => {
-            let code_id = record.id.clone();
+            let summary_nonce = match keys::generate_with("") {
+                Ok(nonce) => nonce,
+                Err(error) => return server_error(&error),
+            };
+            let accepted = AcceptedCode {
+                code_id: record.id.clone(),
+                summary_nonce: summary_nonce.clone(),
+            };
             let stored = oauth.pending.update(pending_id, Instant::now(), |pending| {
-                pending.sign_in_code_id = Some(code_id);
+                pending.accepted = Some(accepted);
             });
             if stored.is_none() {
                 return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED);
             }
-            consent::summary_page(&view(pending_id, pending), &summary(&record))
+            consent::summary_page(
+                &view(pending_id, pending),
+                &summary(&record),
+                &summary_nonce,
+            )
         }
         Ok(None) => failed_attempt(oauth, pending_id, pending),
         Err(error) => server_error(&error),
     }
 }
 
-/// `action=approve`: redeems the code into a grant, mints an authorization
-/// code and sends the browser back to the client.
+/// `action=approve` from the current summary: redeems its code into a
+/// grant, mints an authorization code and sends the browser back to the
+/// client.
 async fn approve(
     app: &App,
     oauth: &OAuth,
     pending_id: &str,
     pending: &PendingAuthorization,
+    code_id: &str,
 ) -> Response {
-    let Some(code_id) = pending.sign_in_code_id.as_deref() else {
-        return consent::code_page(&view(pending_id, pending), None);
-    };
     let grant_id =
         match code_rows::redeem(app.pool(), code_id, &pending.client, app.clock().now()).await {
             Ok(grant_id) => grant_id,
@@ -479,8 +549,8 @@ mod tests {
     use crate::oauth::pkce;
     use crate::oauth::state::code_key;
     use crate::oauth::testing::{
-        authorize_query, form, hidden, oauth_app, send, sign_in_code, CLIENT_ID, PUBLIC_URL,
-        REDIRECT_URI, VERIFIER,
+        authorize_query, form, hidden, hidden_inputs, oauth_app, send, sign_in_code, CLIENT_ID,
+        PUBLIC_URL, REDIRECT_URI, VERIFIER,
     };
     use crate::store::keys::{self as key_rows, Access, KeyKind};
     use crate::store::oauth::codes as code_rows;
@@ -654,15 +724,7 @@ mod tests {
             .unwrap()
             .contains("form-action 'self' https://client.example.com;"));
 
-        let (status, headers, _) = post(
-            &test,
-            &[
-                ("pending", &pending),
-                ("csrf", &csrf),
-                ("action", "approve"),
-            ],
-        )
-        .await;
+        let (status, headers, _) = approve_from(&test, &summary).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         let target = location(&headers);
         let issued = param(&target, "code").expect("a code");
@@ -698,15 +760,7 @@ mod tests {
         assert!(live.is_none());
 
         // The pending request is spent: a second approve finds nothing.
-        let (status, _, _) = post(
-            &test,
-            &[
-                ("pending", &pending),
-                ("csrf", &csrf),
-                ("action", "approve"),
-            ],
-        )
-        .await;
+        let (status, _, _) = approve_from(&test, &summary).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
@@ -887,8 +941,9 @@ mod tests {
         let code = sign_in_code(&test, Access::Read).await;
         let (first, first_csrf) = start(&test).await;
         let (second, second_csrf) = start(&test).await;
+        let mut summaries = Vec::new();
         for (pending, csrf) in [(&first, &first_csrf), (&second, &second_csrf)] {
-            let (status, _, _) = post(
+            let (status, _, summary) = post(
                 &test,
                 &[
                     ("pending", pending),
@@ -899,29 +954,100 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::OK);
+            summaries.push(summary);
         }
-        let (status, _, _) = post(
-            &test,
-            &[
-                ("pending", &first),
-                ("csrf", &first_csrf),
-                ("action", "approve"),
-            ],
-        )
-        .await;
+        let (status, _, _) = approve_from(&test, &summaries[0]).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
+        let (status, _, page) = approve_from(&test, &summaries[1]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains("That sign-in code is not valid"));
+        assert_eq!(oauth_grants(&test).await, 1);
+    }
+
+    /// Posts the Approve button of a step-2 page's form, with exactly the
+    /// hidden fields that page carries.
+    async fn approve_from(test: &TestApp, summary: &str) -> (StatusCode, HeaderMap, String) {
+        let fields = hidden_inputs(summary, "consent-approve-form");
+        let mut pairs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        pairs.push(("action", "approve"));
+        post(test, &pairs).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_older_summary_cannot_approve_a_code_entered_after_it() {
+        let test = oauth_app().await;
+        let read_code = sign_in_code(&test, Access::Read).await;
+        let write_code = sign_in_code(&test, Access::Write).await;
+        let (pending, csrf) = start(&test).await;
+        let mut summaries = Vec::new();
+        // Two copies of step 1 under one pending request: A, then B.
+        for code in [&read_code, &write_code] {
+            let (status, _, summary) = post(
+                &test,
+                &[
+                    ("pending", &pending),
+                    ("csrf", &csrf),
+                    ("action", "code"),
+                    ("sign_in_code", code),
+                ],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            summaries.push(summary);
+        }
+        assert!(summaries[0].contains("<strong>read</strong> access"));
+        assert!(summaries[1].contains("<strong>write</strong> access"));
+
+        // A's page said read-only: its Approve must not redeem B (or A).
+        let (status, headers, page) = approve_from(&test, &summaries[0]).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert!(headers.get("location").is_none());
+        assert!(page.contains(r#"id="sign-in-code""#), "back at step 1");
+        assert_eq!(oauth_grants(&test).await, 0);
+        let now = test.app.clock().now();
+        for code in [&read_code, &write_code] {
+            let live = code_rows::find_live(test.app.pool(), code, now)
+                .await
+                .unwrap();
+            assert!(live.is_some(), "neither code is redeemed");
+        }
+
+        // A crafted Approve with no summary token is refused the same way.
         let (status, _, page) = post(
             &test,
             &[
-                ("pending", &second),
-                ("csrf", &second_csrf),
+                ("pending", &pending),
+                ("csrf", &csrf),
                 ("action", "approve"),
             ],
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(page.contains("That sign-in code is not valid"));
-        assert_eq!(oauth_grants(&test).await, 1);
+        assert!(page.contains("out of date"));
+        assert_eq!(oauth_grants(&test).await, 0);
+
+        // B's own, current summary still approves, and grants write.
+        let (status, headers, _) = approve_from(&test, &summaries[1]).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let issued = param(&location(&headers), "code").expect("a code");
+        let oauth = test.app.oauth().expect("oauth on");
+        let waiting = oauth
+            .codes
+            .update(&code_key(&issued), Instant::now(), |code| code.clone())
+            .expect("the code is stored");
+        let principal = test
+            .app
+            .keys()
+            .find_grant(&waiting.grant_id)
+            .expect("cached grant");
+        assert_eq!(principal.access, Access::Write);
+        let read_live = code_rows::find_live(test.app.pool(), &read_code, now)
+            .await
+            .unwrap();
+        assert!(read_live.is_some(), "A was never redeemed");
     }
 
     #[tokio::test(flavor = "multi_thread")]
