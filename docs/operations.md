@@ -82,7 +82,7 @@ unknown keys are ignored, so one file serves every version.
 | `concept_outline_chars` | `20000` | `get_concept` returns an outline of the headings, not the body, for a body longer than this many characters, unless the call passes `full` or `section` |
 | `database_max_connections` | `16` | The most database connections one process opens (`serve` and every subcommand). Writers queued on one changeset wait without one; the writer whose turn it is, a publish, and a read that builds an overlay each hold one |
 | `overlay_cache_size` | `64` | The most changeset overlays (an open changeset's view of its catalog) kept in memory; past it, the least recently used is dropped and rebuilt on its next read |
-| `public_url` | none | The server's public origin, such as `"https://okf-mcp.example.com"` (no path, query or user info; a trailing `/` is dropped). Setting it turns on OAuth ("OAuth connectors"); without it the OAuth routes are 404. It must be `https`, except on a loopback host (`localhost`, `127.0.0.1`, `::1`) for local testing, and its host must be in `allowed_hosts` |
+| `public_url` | none | The server's public origin, such as `"https://okf-mcp.example.com"` (no path, query or user info; a trailing `/` is dropped). Setting it turns on OAuth ("OAuth connectors"); without it the OAuth routes are 404. It must be `https`, except on a loopback host (such as `localhost`, `127.0.0.1` or `::1`) for local testing, and its host must be in `allowed_hosts` |
 | `oauth.access_token_ttl` | `"1h"` | How long an OAuth access token works |
 | `oauth.refresh_token_ttl` | `"30d"` | How long a refresh token works. Each refresh issues a new one with a fresh lifetime, so a connection used within this stays signed in |
 | `oauth.code_max_expiry` | `"7d"` | The longest expiry a sign-in code may be given (`oauth code create --expires`, the console's expiry) |
@@ -1627,7 +1627,7 @@ find them. The server stores only their SHA-256 and never logs them.
 | `POST /oauth/token` | none (PKCE, or a refresh token) | `grant_type=authorization_code` or `refresh_token`: answers `access_token`, `token_type: Bearer`, `expires_in` and `refresh_token` |
 | `POST /oauth/revoke` | none | Revokes a token (RFC 7009): 200 for any token, an unknown one included; 400 `invalid_request` without `token` |
 
-All six paths exist only while `public_url` is set; without it they are 404.
+All seven paths exist only while `public_url` is set; without it they are 404.
 Every response is `Cache-Control: no-store` (the discovery documents also
 carry `Access-Control-Allow-Origin: *`), and every JSON error is
 `{"error": ..., "error_description": ...}` with the OAuth error code:

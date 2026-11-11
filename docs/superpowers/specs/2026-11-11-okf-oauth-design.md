@@ -336,10 +336,12 @@ Plan deviation 7).
    replacing any earlier pair).
 3. **Approve (`action=approve`).** Approve redeems only the code of the
    summary it came from: its `summary` must match the stored nonce (compared
-   in constant time, under the same lock as the CSRF check). An older
-   summary, or none, re-renders step 1 with "That approval page was out of
-   date..." and changes nothing, so the latest summary still approves; it is
-   not a failed attempt. Otherwise, one transaction:
+   in constant time, under the same lock as the CSRF check). Once a code is
+   accepted, an Approve with an older summary's nonce, or with none,
+   re-renders step 1 with "That approval page was out of date..." and changes
+   nothing, so the latest summary still approves; it is not a failed attempt.
+   An Approve before any code was accepted re-renders step 1 with no message.
+   Otherwise, one transaction:
    1. lock the code row and re-check that it is live;
    2. mark it redeemed;
    3. insert the grant: an `api_keys` row with `kind = 'oauth'`, the code's
