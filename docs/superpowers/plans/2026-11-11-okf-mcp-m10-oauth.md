@@ -5594,6 +5594,7 @@ Whole file (the Step 7 tests at the bottom, extended in Steps 9 and 11):
 > - `resolve_cimd` truncates `now` to microseconds (`SubsecRound::trunc_subsecs(6)`), so the record it returns equals the row a later cache hit reads back.
 > - `register` stores and echoes `client_name` only when the client sent one (no `null`), and relies on the `no-store` layer in `oauth::routes()` rather than setting the header itself.
 > - `CimdError` derives `Clone, Copy, PartialEq, Eq`, so tests compare results with `assert_eq!`.
+> - **Corrected (issue #247, 2026-11-11, PR #257 review).** `validate_metadata` refuses anything but a JSON object (`invalid_client_metadata`) before deserializing: serde's derived struct deserializer also accepts an array in field order, so `["Example", ["https://client.example.com/cb"], null, null, null]` registered a client. CIMD documents share the check. Tests: `metadata_must_be_a_json_object` and `registration_refuses_metadata_that_is_not_an_object`.
 
 ```rust
 //! OAuth clients (spec "Client ID Metadata Documents", "`POST /oauth/register`"):

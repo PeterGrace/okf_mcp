@@ -203,11 +203,17 @@ struct ClientMetadata {
 /// (`grant_types` `["authorization_code"]`, `response_types` `["code"]`).
 ///
 /// # Errors
-/// [`OAuthError::InvalidClientMetadata`] for a shape, auth method, grant or
-/// response type this server does not support;
+/// [`OAuthError::InvalidClientMetadata`] for anything but a JSON object, or a
+/// shape, auth method, grant or response type this server does not support;
 /// [`OAuthError::InvalidRedirectUri`] for a bad redirect URI.
 pub fn validate_metadata(document: &Value) -> Result<ValidatedMetadata, OAuthError> {
     let invalid = |why: String| OAuthError::InvalidClientMetadata(why);
+    // RFC 7591 metadata is a JSON object. Checked first because serde's
+    // derived struct deserializer would also accept an array holding the
+    // fields in declaration order.
+    if !document.is_object() {
+        return Err(invalid("client metadata must be a JSON object".to_string()));
+    }
     // `T::deserialize(&Value)` reads a `Value` already in memory, without
     // re-serializing it (serde_json implements `Deserializer` for `&Value`).
     let metadata = ClientMetadata::deserialize(document)
@@ -1013,6 +1019,38 @@ mod tests {
         assert!(matches!(bad_uri, Err(OAuthError::InvalidRedirectUri(_))));
     }
 
+    /// Client metadata as a well-typed positional array, in `ClientMetadata`'s
+    /// field order: serde's derived struct deserializer accepts that shape.
+    fn positional_metadata() -> Value {
+        json!([
+            "Example",
+            ["https://client.example.com/cb"],
+            null,
+            null,
+            null
+        ])
+    }
+
+    #[test]
+    fn metadata_must_be_a_json_object() {
+        let positional = positional_metadata();
+
+        assert!(
+            matches!(
+                validate_metadata(&positional),
+                Err(OAuthError::InvalidClientMetadata(_))
+            ),
+            "registration metadata"
+        );
+        assert!(
+            matches!(
+                validate_cimd_document("https://client.example.com/c.json", &positional),
+                Err(OAuthError::InvalidClient(_))
+            ),
+            "a metadata document"
+        );
+    }
+
     #[test]
     fn cimd_urls_must_be_canonical_https_with_a_path() {
         assert!(cimd_url("https://client.example.com/oauth/client.json", false).is_ok());
@@ -1631,6 +1669,22 @@ mod tests {
         // Task 2's register bucket: a burst of 10, then one every 6 seconds.
         assert_eq!(statuses[..10], [StatusCode::CREATED; 10]);
         assert_eq!(statuses[10], StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registration_refuses_metadata_that_is_not_an_object() {
+        let test = rig(true).await;
+
+        let (status, _, json) = register_request(&test, &positional_metadata().to_string()).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"], "invalid_client_metadata");
+        assert_eq!(
+            client_rows::count_unbound_dcr(test.app.pool())
+                .await
+                .expect("count"),
+            0
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

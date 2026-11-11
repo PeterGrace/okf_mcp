@@ -8,7 +8,8 @@
 - `GET /.well-known/oauth-authorization-server`: RFC 8414 metadata (S256
   PKCE, public clients, `client_id_metadata_document_supported`, RFC 9207
   `iss`). `registration_endpoint` is left out when `dcr_enabled = false`.
-- `POST /oauth/register`: RFC 7591 registration for public clients
+- `POST /oauth/register`: RFC 7591 registration for public clients (the
+  metadata must be a JSON object, as must a CIMD document)
   (`token_endpoint_auth_method` `none`; `https` redirect URIs, or `http` on
   loopback). Refused with `slow_down` past the rate limit or while 500
   registered clients have no grant; 404 when `dcr_enabled = false`. The
