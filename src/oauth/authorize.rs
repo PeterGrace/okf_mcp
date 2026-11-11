@@ -259,11 +259,15 @@ async fn trusted_client<'q>(
                 "The server could not check this client.",
             ));
         }
-        Err(_) => {
+        Err(error) => {
+            // The page stays generic; the log says why, so an operator can
+            // tell an unknown DCR id from a document this server refuses
+            // (issue #273). A client id is not a secret.
+            tracing::warn!(client_id, reason = %error, "refused an OAuth client");
             return Err((
                 StatusCode::BAD_REQUEST,
                 "This client is not known to the server.",
-            ))
+            ));
         }
     };
     // 2. Its exact redirect URI: string equality, no prefix or pattern.

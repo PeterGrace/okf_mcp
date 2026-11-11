@@ -175,7 +175,8 @@ pub struct ValidatedMetadata {
     pub client_name: Option<String>,
     /// Its redirect URIs, each checked by [`validate_redirect_uri`].
     pub redirect_uris: Vec<String>,
-    /// A non-empty subset of `authorization_code` and `refresh_token`.
+    /// The grant types it asked for that this server supports:
+    /// `authorization_code`, and optionally `refresh_token`.
     pub grant_types: Vec<String>,
     /// `["code"]`.
     pub response_types: Vec<String>,
@@ -190,7 +191,14 @@ struct ClientMetadata {
     grant_types: Option<Vec<String>>,
     response_types: Option<Vec<String>>,
     token_endpoint_auth_method: Option<String>,
+    // Not an RFC 7591 field, but clients that can authenticate several ways
+    // publish it in their metadata document: ChatGPT lists `none` here while
+    // declaring `private_key_jwt` above (issue #273).
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
 }
+
+/// The grant types this server issues tokens for.
+const SUPPORTED_GRANT_TYPES: [&str; 2] = ["authorization_code", "refresh_token"];
 
 /// Validates client metadata, from a registration request or a CIMD
 /// document.
@@ -227,8 +235,18 @@ pub fn validate_metadata(document: &Value) -> Result<ValidatedMetadata, OAuthErr
         .redirect_uris
         .iter()
         .try_for_each(|uri| validate_redirect_uri(uri))?;
+    // Only public clients: the client must be able to use `none`, either as
+    // its declared method or among the methods it says it supports. One that
+    // also supports another method reads this server's metadata, which offers
+    // only `none`, and authenticates that way; it is treated exactly as a
+    // public client (PKCE, an exact redirect URI, no client secret).
+    let offers_none = metadata
+        .token_endpoint_auth_methods_supported
+        .as_ref()
+        .is_some_and(|methods| methods.iter().any(|method| method == "none"));
     match metadata.token_endpoint_auth_method.as_deref() {
         None | Some("none") => {}
+        Some(_) if offers_none => {}
         Some(other) => {
             return Err(invalid(format!(
                 "token_endpoint_auth_method {other:?} is not supported; \
@@ -236,16 +254,22 @@ pub fn validate_metadata(document: &Value) -> Result<ValidatedMetadata, OAuthErr
             )))
         }
     }
-    let grant_types = metadata
+    // RFC 7591 section 2 lets the server drop grant types it does not
+    // support. Keep the supported ones, in the order given; the client must
+    // still be able to start with an authorization code.
+    let grant_types: Vec<String> = metadata
         .grant_types
-        .unwrap_or_else(|| vec!["authorization_code".to_string()]);
-    if grant_types.is_empty()
-        || !grant_types
-            .iter()
-            .all(|grant| matches!(grant.as_str(), "authorization_code" | "refresh_token"))
+        .unwrap_or_else(|| vec!["authorization_code".to_string()])
+        .into_iter()
+        .filter(|grant| SUPPORTED_GRANT_TYPES.contains(&grant.as_str()))
+        .collect();
+    if !grant_types
+        .iter()
+        .any(|grant| grant == "authorization_code")
     {
         return Err(invalid(
-            "grant_types must be authorization_code and optionally refresh_token".to_string(),
+            "grant_types must include authorization_code (refresh_token is also supported)"
+                .to_string(),
         ));
     }
     let response_types = metadata
@@ -944,6 +968,76 @@ mod tests {
             CACHE_FLOOR
         );
         assert_eq!(cache_lifetime(&header("max-age=junk")), CACHE_FLOOR);
+    }
+
+    #[test]
+    fn a_client_that_also_offers_none_is_accepted_as_public() {
+        // ChatGPT's own document (https://chatgpt.com/oauth/client.json,
+        // 2026-11-11), verbatim: it declares private_key_jwt but lists `none`
+        // among the methods it supports, and asks for one grant this server
+        // does not offer (issue #273).
+        let chatgpt = json!({
+            "client_id": "https://chatgpt.com/oauth/client.json",
+            "client_uri": "https://chatgpt.com/",
+            "redirect_uris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
+            "token_endpoint_auth_method": "private_key_jwt",
+            "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+            "grant_types": [
+                "authorization_code",
+                "refresh_token",
+                "urn:ietf:params:oauth:grant-type:jwt-bearer"
+            ],
+            "response_types": ["code"],
+            "client_name": "ChatGPT",
+            "logo_uri": "https://persistent.oaistatic.com/sonic/misc/openai-logo.png",
+            "token_endpoint_auth_signing_alg": "RS256",
+            "jwks_uri": "https://chatgpt.com/oauth/jwks.json"
+        });
+
+        let accepted = validate_cimd_document("https://chatgpt.com/oauth/client.json", &chatgpt)
+            .expect("ChatGPT's document is a public client");
+
+        assert_eq!(accepted.client_name.as_deref(), Some("ChatGPT"));
+        // Only the grants this server supports are kept.
+        assert_eq!(
+            accepted.grant_types,
+            ["authorization_code", "refresh_token"]
+        );
+
+        let cb = "https://client.example.com/cb";
+        for (bad, why) in [
+            (
+                json!({
+                    "redirect_uris": [cb],
+                    "token_endpoint_auth_method": "private_key_jwt",
+                    "token_endpoint_auth_methods_supported": ["private_key_jwt"]
+                }),
+                "does not offer none",
+            ),
+            (
+                json!({
+                    "redirect_uris": [cb],
+                    "token_endpoint_auth_method": "private_key_jwt",
+                    "token_endpoint_auth_methods_supported": "none"
+                }),
+                "supported methods not a list",
+            ),
+            (
+                json!({
+                    "redirect_uris": [cb],
+                    "grant_types": ["refresh_token", "urn:ietf:params:oauth:grant-type:jwt-bearer"]
+                }),
+                "no authorization_code",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    validate_metadata(&bad),
+                    Err(OAuthError::InvalidClientMetadata(_))
+                ),
+                "{why}: {bad}"
+            );
+        }
     }
 
     #[test]
