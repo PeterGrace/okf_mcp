@@ -19,7 +19,7 @@
 
 ## Roadmap position
 
-Milestone 10. `main` is at `485539e` (v0.12.1) plus the spec commit `65ecc0c`. M10 adds OAuth beside the static keys and annotates the MCP tools. It changes no tool's parameters or results.
+Milestone 10. `main` is at `3262209` (v0.12.1 plus the AGPL license and the move to the hypotheosis organization; no `src/` changes) plus the spec commit `c24fef1`. M10 adds OAuth beside the static keys and annotates the MCP tools. It changes no tool's parameters or results.
 
 ## Scope
 
@@ -80,7 +80,7 @@ Filled in as tasks land, as in M9 (dated `> **Corrected (issue #N).**` notes in 
 - `ToolAnnotations { title, read_only_hint, destructive_hint, idempotent_hint, open_world_hint }`, each `Option` (REG/rmcp-3.8.0/src/model/tool.rs:54-90).
 - `ToolRouter::list_all() -> Vec<Tool>` (REG/rmcp-3.8.0/src/handler/server/router/tool.rs:581) lists every registered tool, for the coverage test.
 
-**This repository** (at `65ecc0c`)
+**This repository** (at `c24fef1`)
 - `src/auth.rs`:
   - `Principal { key_id, access, maintenance_report, reach, default_catalog, actor }` derives `Debug, Clone, PartialEq, Eq`;
   - `impl From<KeyRecord> for Principal`;
@@ -402,7 +402,7 @@ the connector directories check. No tool's name, parameters, results or
 description change. This task is independent of the OAuth tasks and can run
 beside Task 2.
 
-**Facts this task relies on** (verified at `65ecc0c`):
+**Facts this task relies on** (verified at `c24fef1`):
 
 - rmcp-macros 3.8.0's `#[tool(...)]` takes `title = "..."` (REG/rmcp-macros-3.8.0/src/tool.rs:67) and `annotations(...)` (tool.rs:74). The annotations are parsed by darling into `ToolAnnotationsAttribute { title, read_only_hint, destructive_hint, idempotent_hint, open_world_hint }`, each `Option` (tool.rs:146-180), so the syntax is `annotations(title = "...", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)`.
 - The tool-level `title` becomes `.with_title(...)` on the generated `Tool` (tool.rs:109-111). The annotations become `.with_annotations(ToolAnnotations::from_raw(...))` (tool.rs:118-119, 211-226).
@@ -849,7 +849,7 @@ No token or client is created by any endpoint yet. Tests insert them with SQL an
 14. `CredentialKind::OAuth { client_id: Option<String>, client_name: Option<String> }`.
 15. Rate limits: register, a burst of 10 then one every 6 seconds; token (and revoke), a burst of 60 then 2 a second; consent POST, a burst of 20 then 1 a second.
 
-**Facts this task relies on** (verified at `65ecc0c`):
+**Facts this task relies on** (verified at `c24fef1`):
 - **Existing schema and auth:**
   - `api_keys.sha256` is `bytea NOT NULL UNIQUE CHECK (length(sha256) = 32)` (`migrations/0001_schema.sql:44`).
   - Postgres treats NULLs as distinct in a UNIQUE constraint by default (`NULLS DISTINCT`), so many grant rows with a NULL `sha256` do not conflict. `length(NULL) = 32` is NULL, which a CHECK accepts.
@@ -6618,7 +6618,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 Depends on Task 2. Parallel with Task 3. Tasks 5 and 7 build on it.
 
-**Facts this task relies on** (verified at `65ecc0c`; Task 2's additions are taken from "Interfaces shared across tasks"):
+**Facts this task relies on** (verified at `c24fef1`; Task 2's additions are taken from "Interfaces shared across tasks"):
 - `src/store/keys.rs`:
   - `create_with_id` (166-262) runs its checks in this order: the name against `is_valid_name` (131, private), no empty `Grants::Catalogs([])`, a default that is among the granted names (a position computed before any query). Then, in one transaction, `catalog_ids` (294; Task 2 makes it `pub(crate)`) and `catalogs::find` for an all-catalogs key's default, the insert, the `key_catalogs` insert through `unnest($2::bigint[])`, and `bump_admin_generation`.
   - A taken live name and actor is detected as a unique violation on the constraint `api_keys_live_name_actor` (migration `0005_key_names.sql`).
@@ -8899,7 +8899,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Goal:** `GET /oauth/authorize` validates a client's request and shows the consent page. `POST /oauth/authorize` takes the sign-in code, shows what will be granted, and on Approve redeems the code into a grant and redirects to the client with a one-time `okfac_` authorization code.
 
-**Facts this task relies on** (verified at `65ecc0c` unless marked):
+**Facts this task relies on** (verified at `c24fef1` unless marked):
 
 - axum 0.8.9:
   - `Redirect::to` answers **303 See Other** (REG/axum-0.8.9/src/response/redirect.rs:37-38). `Redirect::temporary` is 307, which would make the browser re-POST the consent form (sign-in code included) to the client, so it is never used here. OAuth 2.1 (draft-ietf-oauth-v2-1, "307 redirect" security consideration) recommends 303 for exactly this reason. This is from the draft, not re-checked in this repository.
@@ -10578,7 +10578,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Goal:** `POST /oauth/token` exchanges an authorization code (PKCE-checked) for an `okfat_` access token and an `okfrt_` refresh token, and rotates refresh tokens. A replayed code or refresh token revokes its whole family. `POST /oauth/revoke` implements RFC 7009. End-to-end tests drive the full flow against the real server with a real rmcp client.
 
-**Facts this task relies on** (verified at `65ecc0c` unless marked):
+**Facts this task relies on** (verified at `c24fef1` unless marked):
 
 - axum 0.8.9 `Form` and `FormRejection` as in Task 5. `Json<T>` with a headers array is an `IntoResponse` tuple (M9 verified facts).
 - RFC 6749 section 5.1: a token response carries `Cache-Control: no-store` and `Pragma: no-cache`. Section 4.1.2: a code used twice SHOULD revoke the tokens issued from it. RFC 7009 section 2.2: the revocation endpoint answers 200 for an unknown token too. These are from the RFCs, not checked in this repository.
@@ -12057,7 +12057,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 Depends on Task 4 (the `/api/v1/oauth/codes` endpoints) and Task 2 (`KeyView.kind`, `client_name`). Parallel with Tasks 5 and 6.
 
-**Facts this task relies on** (verified at `65ecc0c`; Task 2 and Task 4 additions from their sections):
+**Facts this task relies on** (verified at `c24fef1`; Task 2 and Task 4 additions from their sections):
 - `src/http/ui/js/pages/keys.js`:
   - It renders the keys table (`#keys-table`, rows `[data-test=key-<name>]`), the `#key-new` drawer form (`#key-form`), the one-time secret dialog (`#key-secret`, `#key-secret-copy`, `#key-secret-done`), and the per-key drawer (`#key-grant`, `#key-report-toggle`, `#key-revoke`).
   - It imports `h, pill` (`core/dom.js`), `api, enc` (`core/api.js`), `store` (`core/store.js`), `toast`, `openDrawer, closeDrawer`, `when` (`core/format.js`), `listTable`, `confirmDialog`.
@@ -12672,7 +12672,7 @@ two parts, like M9 Task 8:
   after that PR merges, and stops. Shipping, tagging, publishing the image
   and rollout each wait for the owner's go-ahead.
 
-**Facts this task relies on** (verified at `65ecc0c`):
+**Facts this task relies on** (verified at `c24fef1`):
 
 - `docs/operations.md` structure:
   - "## 3. Configuration" with a key table (lines 71-83) and a TOML example (95-107);
