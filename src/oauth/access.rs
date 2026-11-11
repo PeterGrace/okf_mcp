@@ -383,4 +383,45 @@ mod tests {
             "the revoked token is not accepted from the cache"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cached_token_past_its_expiry_is_refused_and_dropped() {
+        // A token that entered the cache while live and has since expired.
+        // It is not in the database, so only the cache-expiry check can
+        // refuse it: without that check, `verify` would admit the live grant.
+        let (test, grant) = with_grant().await;
+        let oauth = test.app.oauth().expect("OAuth is on");
+        let token = keys::generate_with(keys::ACCESS_TOKEN_PREFIX).unwrap();
+        let hash = keys::hash(&token);
+        let now = test.app.clock().now();
+        let generation = oauth.access.generation();
+        oauth.access.remember(
+            hash,
+            LiveAccessToken {
+                grant_id: grant,
+                resource: RESOURCE.into(),
+                expires_at: now - TimeDelta::seconds(1),
+            },
+            now,
+            generation,
+        );
+        assert!(oauth.access.lock().tokens.contains_key(&hash), "cached");
+
+        let after = oauth
+            .access
+            .verify(&test.app, RESOURCE, &token)
+            .await
+            .unwrap();
+
+        assert!(after.is_none(), "an expired cached token is refused");
+        assert!(
+            !oauth.access.lock().tokens.contains_key(&hash),
+            "and dropped"
+        );
+        assert_eq!(
+            oauth.access.generation(),
+            generation,
+            "expiry is not a revocation"
+        );
+    }
 }
