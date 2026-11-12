@@ -1,6 +1,8 @@
 //! The Teams page and the unassigned view (M11 Task 8): the users and teams
 //! design's journey (a team, a member, a catalog it owns, a key for the
-//! member), and assigning a key from before users existed.
+//! member), membership changes and team deletion (the last-owner refusal,
+//! Remove, Delete, and what a personal team keeps), and assigning a key
+//! from before users existed.
 
 use okf_mcp::config::Config;
 use okf_mcp::store::keys::Access;
@@ -84,6 +86,57 @@ async fn a_legacy_key_is_assigned_from_the_unassigned_view() {
         ui.click("[data-test=assign-key-legacy] button");
         ui.wait_text("#unassigned-empty", "Nothing is unassigned");
         ui.wait_hidden("#unassigned-badge");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_owner_is_kept_then_replaced_removed_and_the_team_deleted() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/users");
+        ui.click("#user-new");
+        ui.fill("#user-form input[name=name]", "alice");
+        ui.click("#user-form button[type=submit]");
+        ui.wait_visible("[data-test=user-alice]");
+        // A personal team keeps its own user and cannot be deleted.
+        ui.open("/teams");
+        ui.click(&format!("[data-test=team-{OWNER}]"));
+        ui.wait_visible(&format!("[data-test=member-remove-{OWNER}][disabled]"));
+        ui.wait_visible("#team-delete[disabled]");
+        ui.wait_text("#team-delete-reason", "personal team");
+        ui.click("#drawer-close");
+        // A shared team, owned by the fixture user alone.
+        ui.click("#team-new");
+        ui.fill("#team-form input[name=name]", "family");
+        ui.select("#team-form select[name=owner]", OWNER);
+        ui.click("#team-form button[type=submit]");
+        ui.click("[data-test=team-family]");
+        let owner_role = format!("[data-test=member-role-{OWNER}]");
+        ui.wait_visible(&owner_role);
+        // Demoting the last owner is refused, and the select shows the role
+        // it kept.
+        ui.select(&owner_role, "member");
+        ui.wait_text("#toasts", "last owner");
+        let role = ui.eval(
+            "(selector) => document.querySelector(selector).value",
+            serde_json::json!(owner_role),
+        );
+        assert_eq!(role, serde_json::json!("owner"));
+        // Recovery: alice joins as an owner, then the fixture user leaves.
+        ui.select("#member-form select[name=user]", "alice");
+        ui.select("#member-form select[name=role]", "owner");
+        ui.click("#member-form button[type=submit]");
+        ui.wait_text("#team-members", "alice");
+        ui.click(&format!("[data-test=member-remove-{OWNER}]"));
+        ui.wait_hidden(&owner_role);
+        ui.wait_text("#team-members", "alice");
+        // A shared team that owns no catalog is deleted.
+        ui.click("#team-delete");
+        ui.click("#confirm-ok");
+        ui.wait_hidden("[data-test=team-family]");
     })
     .await;
 }
