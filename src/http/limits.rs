@@ -71,16 +71,18 @@ impl KeyedLimiter {
     /// spraying keys must not evict the buckets that are holding someone
     /// back.
     pub fn try_take(&self, key: &str, now: Instant) -> bool {
-        // `update` runs the closure on a live entry under the map's lock and
-        // returns its result, or `None` when the key has no live bucket.
-        if let Some(taken) = self.buckets.update(key, now, |bucket| bucket.try_take(now)) {
-            return taken;
-        }
-        let bucket = TokenBucket::new(self.capacity, self.refill_per_sec);
-        let taken = bucket.try_take(now);
-        // Two first requests racing for one key may each insert a bucket;
-        // the second replaces the first, which costs at most one request.
-        self.buckets.insert(key.to_string(), bucket, now) && taken
+        // One lock covers finding or creating the key's bucket and taking
+        // from it, so concurrent first requests share one bucket and no
+        // late creator replaces a bucket others have drawn down. `None`
+        // (a full map) refuses.
+        self.buckets
+            .update_or_insert_with(
+                key,
+                now,
+                || TokenBucket::new(self.capacity, self.refill_per_sec),
+                |bucket| bucket.try_take(now),
+            )
+            .unwrap_or(false)
     }
 }
 
@@ -183,6 +185,53 @@ mod tests {
         assert!(!limiter.try_take("a", now));
         // Once the window passes, the expired keys make room.
         assert!(limiter.try_take("c", now + WINDOW + Duration::from_secs(1)));
+    }
+
+    /// Runs `try_take(key, now)` on `callers` threads released together by
+    /// a barrier, and counts how many were let through.
+    fn passed_together(limiter: &KeyedLimiter, key: &str, now: Instant, callers: usize) -> usize {
+        let barrier = std::sync::Barrier::new(callers);
+        // `thread::scope` lets the threads borrow `limiter` and `barrier`:
+        // every thread is joined before the scope returns.
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..callers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        limiter.try_take(key, now)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a caller thread"))
+                .filter(|passed| *passed)
+                .count()
+        })
+    }
+
+    #[test]
+    fn concurrent_first_requests_share_one_bucket() {
+        let limiter = KeyedLimiter::new(1, WINDOW, 100);
+        let now = Instant::now();
+
+        let passed = passed_together(&limiter, "a", now, 16);
+
+        assert_eq!(passed, 1, "one token, one request through");
+        assert!(!limiter.try_take("a", now), "and the next is refused");
+    }
+
+    #[test]
+    fn an_expired_bucket_is_replaced_exactly_once() {
+        let limiter = KeyedLimiter::new(1, WINDOW, 100);
+        let start = Instant::now();
+        assert!(limiter.try_take("a", start));
+        let later = start + WINDOW + Duration::from_secs(1);
+
+        let passed = passed_together(&limiter, "a", later, 16);
+
+        assert_eq!(passed, 1, "the new bucket is shared, not made per caller");
+        assert!(!limiter.try_take("a", later));
     }
 
     #[test]
