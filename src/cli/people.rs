@@ -505,6 +505,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn key_assign_reaches_an_unassigned_grant_and_its_code() {
+        use crate::store::oauth::clients::ClientKind;
+        use crate::store::oauth::codes::insert_test_client;
+
+        let db = test_db().await;
+        okf(&db, &["user", "create", "alice"]).await.unwrap();
+        okf(
+            &db,
+            &[
+                "oauth", "code", "create", "phone", "--access", "read", "--all", "--user",
+                TEST_USER,
+            ],
+        )
+        .await
+        .unwrap();
+        let code = codes::list(&db.pool).await.unwrap().remove(0);
+        let client = insert_test_client(
+            &db.pool,
+            "dcr-client",
+            ClientKind::Dcr,
+            "https://client.example.com/callback",
+        )
+        .await;
+        let grant = codes::redeem(&db.pool, &code.id, &client, Utc::now())
+            .await
+            .unwrap();
+        // Make both rows look as if they predate migration 0009.
+        sqlx::query("UPDATE api_keys SET user_id = NULL")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sign_in_codes SET user_id = NULL")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let grant_name = keys::list(&db.pool).await.unwrap().remove(0).name;
+
+        let before = okf(&db, &["unassigned"]).await.unwrap();
+        let assigned = okf(&db, &["key", "assign", &grant, "--user", "alice"])
+            .await
+            .unwrap();
+        okf(
+            &db,
+            &["oauth", "code", "assign", &code.id, "--user", "alice"],
+        )
+        .await
+        .unwrap();
+        let after = okf(&db, &["unassigned"]).await.unwrap();
+
+        assert_eq!(
+            before,
+            format!(
+                "grant {grant_name} (id {grant})\ncode phone (id {})\n",
+                code.id
+            )
+        );
+        assert_eq!(assigned, format!("key {grant} now belongs to alice\n"));
+        assert_eq!(after, "nothing is unassigned\n");
+        let record = keys::list(&db.pool).await.unwrap().remove(0);
+        assert_eq!(record.user.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn deleting_a_user_with_a_key_fails_and_says_why() {
         let db = test_db().await;
         okf(&db, &["user", "create", "alice"]).await.unwrap();
