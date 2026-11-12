@@ -20,11 +20,13 @@
 ## Notes
 
 - Root cause: apalis claims up to `batch_size` (10) jobs per fetch, and
-  claims more while sends are still in flight. A run's 30 jobs were claimed
-  in three blocks of 10 (logged lock counts were 10/20, 20/10, 15/15 and
-  23/7), so one worker could win every block. Before the fix, the test failed
-  1 time in 3.
-- Holding back each send until both workers had started one would not have
-  fixed this: the first worker keeps claiming while its sends wait, so it can
-  still claim all 30.
+  keeps claiming while sends are still in flight. The logged splits of 30
+  jobs over 15 instrumented runs were 10/20 (8 runs), 20/10 (4), 17/13,
+  15/15 and 23/7, so one worker could win every fetch. #335 reports the old
+  test failing 1 time in 3.
+- Holding back each send until both workers had started one would likely
+  not have fixed this: the first worker keeps claiming while its sends wait,
+  so it could still claim all 30.
+- `wait_listening` counts only sessions on the test's own database, so
+  workers from tests running in parallel are not counted.
 - Test-only change; no production code changed.

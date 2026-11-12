@@ -630,13 +630,15 @@ mod tests {
         held
     }
 
-    /// Waits (up to 10 s) until `count` worker sessions are LISTENing.
+    /// Waits (up to 10 s) until `count` worker sessions on this test's
+    /// database are LISTENing.
     async fn wait_listening(pool: &PgPool, count: i64) {
         let mut listening = 0_i64;
         for _ in 0..100 {
             listening = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_stat_activity \
-                 WHERE application_name = $1 AND query LIKE 'LISTEN %'",
+                 WHERE datname = current_database() AND application_name = $1 \
+                 AND query LIKE 'LISTEN %'",
             )
             .bind(WORKER_APPLICATION_NAME)
             .fetch_one(pool)
