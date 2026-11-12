@@ -410,7 +410,10 @@ async fn serve_app(
         .await
         .expect("bind");
     let base = format!("http://{}", listener.local_addr().expect("address"));
-    let app = App::load(db.pool.clone(), make_config(&base), Arc::new(SystemClock))
+    let mut config = make_config(&base);
+    // Test servers only enqueue; the mail tests run their own worker.
+    config.mail.worker = false;
+    let app = App::load(db.pool.clone(), config, Arc::new(SystemClock))
         .await
         .expect("app loads");
     let shutdown = CancellationToken::new();

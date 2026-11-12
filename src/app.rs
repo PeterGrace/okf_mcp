@@ -100,6 +100,8 @@ pub struct App {
     oauth_pruned: std::sync::Mutex<Option<std::time::Instant>>,
     // The sign-in routes' per-address and per-email limits.
     sign_in_limits: SignInLimits,
+    // The configured mail provider (Decision 10), built once at start-up.
+    mailer: Arc<dyn crate::mail::Mailer>,
 }
 
 impl App {
@@ -121,7 +123,9 @@ impl App {
     /// # Errors
     /// [`OkfError::Database`] reading the counter, the keys, the settings or
     /// the list;
-    /// [`OkfError::Config`] from [`OAuth::new`].
+    /// [`OkfError::Config`] from [`OAuth::new`], or from
+    /// [`crate::mail::from_config`] (a mail secret missing from the
+    /// environment).
     pub async fn load(
         pool: PgPool,
         config: Config,
@@ -154,6 +158,7 @@ impl App {
         let oauth = OAuth::new(&config)?;
         let sessions = SessionKeys::new(config.session_idle_timeout);
         let overlays = Overlays::new(config.session_idle_timeout, config.overlay_cache_size);
+        let mailer = crate::mail::from_config(&config.mail)?;
         Ok(Arc::new(Self {
             pool,
             config,
@@ -170,6 +175,7 @@ impl App {
             oauth,
             oauth_pruned: std::sync::Mutex::new(None),
             sign_in_limits: SignInLimits::new(),
+            mailer,
         }))
     }
 
@@ -194,6 +200,23 @@ impl App {
     /// The limiters.
     pub fn sign_in_limits(&self) -> &SignInLimits {
         &self.sign_in_limits
+    }
+
+    /// The clock as a shared handle, for tasks that outlive a borrow of
+    /// `App` (the mail worker).
+    ///
+    /// # Returns
+    /// The same clock [`App::clock`] lends.
+    pub fn clock_handle(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
+    }
+
+    /// The configured mail provider.
+    ///
+    /// # Returns
+    /// The mailer the mail worker sends with.
+    pub fn mailer(&self) -> &Arc<dyn crate::mail::Mailer> {
+        &self.mailer
     }
 
     /// The key cache (shared with the auth layer).
@@ -426,8 +449,9 @@ impl App {
     /// and unredeemed codes kept [`OAUTH_RETENTION_DAYS`] past their expiry,
     /// registered clients no grant names after [`UNBOUND_CLIENT_HOURS`],
     /// sign-in events older than [`SIGN_IN_EVENT_RETENTION_DAYS`], emailed
-    /// links [`OAUTH_RETENTION_DAYS`] past their expiry and console sessions
-    /// past their absolute limit. Runs whether or not OAuth is on, so rows
+    /// links [`OAUTH_RETENTION_DAYS`] past their expiry, console sessions
+    /// past their absolute limit, and mail jobs (sent ones after 7 days and
+    /// failed ones after 30). Runs whether or not OAuth is on, so rows
     /// left from when it was are cleared too. Called only under `polling`.
     ///
     /// A failure is logged, not returned, and waits for the next hourly pass.
@@ -474,6 +498,10 @@ impl App {
         log_pruned(
             "expired console sessions",
             user_sessions::prune(&self.pool, now).await,
+        );
+        log_pruned(
+            "old mail jobs",
+            crate::mail::queue::prune(&self.pool, now).await,
         );
     }
 

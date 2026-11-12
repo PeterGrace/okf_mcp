@@ -12,6 +12,8 @@ use std::time::Duration;
 // with the same `Authority`.
 use axum::http::uri::{Authority, Uri};
 use bytesize::ByteSize;
+// lettre's parsed `Name <address>`; `mail.from` must parse as one.
+use lettre::message::Mailbox;
 use serde::{Deserialize, Deserializer};
 
 use crate::store::catalogs;
@@ -226,6 +228,168 @@ pub(crate) fn check_auth_duration(name: &str, value: Duration) -> Result<(), Str
     Ok(())
 }
 
+/// The default From address: a placeholder that is valid, so a server
+/// without `[mail]` starts (with the log provider, it sends nothing).
+pub const DEFAULT_MAIL_FROM: &str = "okf <okf@localhost>";
+
+/// The default SMTP port: submission with STARTTLS.
+pub const DEFAULT_SMTP_PORT: u16 = 587;
+
+/// The default Postmark message stream (its transactional one).
+pub const DEFAULT_POSTMARK_STREAM: &str = "outbound";
+
+/// Which [`crate::mail::Mailer`] sends mail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MailProvider {
+    /// An SMTP relay (`[mail.smtp]`).
+    Smtp,
+    /// Postmark's HTTP API (`[mail.postmark]`).
+    Postmark,
+    /// Writes each message, links included, to the log at `info`. For
+    /// development and tests only.
+    #[default]
+    Log,
+}
+
+/// `[mail.smtp]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SmtpConfig {
+    /// The relay's host name.
+    pub host: String,
+    /// Its port (587 for STARTTLS, 465 for implicit TLS).
+    #[serde(default = "default_smtp_port")]
+    pub port: u16,
+    /// `true`: STARTTLS, required (the session never continues in clear).
+    /// `false`: TLS from the first byte. There is no plaintext mode.
+    #[serde(default = "default_true")]
+    pub starttls: bool,
+    /// The user to authenticate as, if the relay wants one.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// The environment variable holding the password (required with
+    /// `username`).
+    #[serde(default)]
+    pub password_env: Option<String>,
+}
+
+/// `[mail.postmark]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PostmarkConfig {
+    /// The environment variable holding the server token.
+    pub token_env: String,
+    /// The message stream (`"outbound"`, Postmark's default transactional stream).
+    #[serde(default = "default_message_stream")]
+    pub message_stream: String,
+}
+
+// `serde(default = "...")` takes a function's name, not a value.
+fn default_smtp_port() -> u16 {
+    DEFAULT_SMTP_PORT
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_message_stream() -> String {
+    DEFAULT_POSTMARK_STREAM.to_string()
+}
+
+/// The `[mail]` section. Secrets are not here: only the names of the
+/// environment variables that hold them, read when the server starts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct MailConfig {
+    /// Which provider sends.
+    pub provider: MailProvider,
+    /// The From address (`"okf <okf@example.com>"`).
+    pub from: String,
+    /// Whether `serve` runs a mail worker. Off for a replica that should only
+    /// enqueue, and in the test servers (Decision 19). The worker uses a pool
+    /// of its own, up to 4 connections (one of them held by LISTEN), beside
+    /// `database_max_connections`.
+    pub worker: bool,
+    /// The SMTP relay, for `provider = "smtp"`.
+    pub smtp: Option<SmtpConfig>,
+    /// Postmark, for `provider = "postmark"`.
+    pub postmark: Option<PostmarkConfig>,
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self {
+            provider: MailProvider::Log,
+            from: DEFAULT_MAIL_FROM.to_string(),
+            worker: true,
+            smtp: None,
+            postmark: None,
+        }
+    }
+}
+
+impl MailConfig {
+    /// Checks what serde cannot: that the chosen provider is configured,
+    /// and that `from` is one address.
+    ///
+    /// # Returns
+    /// `Ok(())`, or the problem in words.
+    ///
+    /// # Errors
+    /// A `from` that is not one mailbox; `provider = "smtp"` without a
+    /// `[mail.smtp]` table, with a blank host, port 0, or a `username`
+    /// without `password_env` (or the reverse); `provider = "postmark"`
+    /// without a `[mail.postmark]` table, or with a blank `token_env` or
+    /// `message_stream`.
+    fn validate(&self) -> Result<(), String> {
+        self.from
+            .parse::<Mailbox>()
+            .map_err(|error| format!("mail.from {:?} is not an address: {error}", self.from))?;
+        match self.provider {
+            MailProvider::Log => Ok(()),
+            MailProvider::Smtp => {
+                // `let ... else`: bind the `Some`, or leave the function.
+                let Some(smtp) = &self.smtp else {
+                    return Err("mail.provider = \"smtp\" needs a [mail.smtp] table".to_string());
+                };
+                if smtp.host.trim().is_empty() {
+                    return Err("mail.smtp.host is blank".to_string());
+                }
+                if smtp.port == 0 {
+                    return Err("mail.smtp.port must be more than zero".to_string());
+                }
+                if smtp.username.is_some() != smtp.password_env.is_some() {
+                    return Err(
+                        "mail.smtp.username and mail.smtp.password_env go together".to_string()
+                    );
+                }
+                if smtp
+                    .password_env
+                    .as_deref()
+                    .is_some_and(|name| name.trim().is_empty())
+                {
+                    return Err("mail.smtp.password_env is blank".to_string());
+                }
+                Ok(())
+            }
+            MailProvider::Postmark => {
+                let Some(postmark) = &self.postmark else {
+                    return Err(
+                        "mail.provider = \"postmark\" needs a [mail.postmark] table".to_string()
+                    );
+                };
+                if postmark.token_env.trim().is_empty() {
+                    return Err("mail.postmark.token_env is blank".to_string());
+                }
+                if postmark.message_stream.trim().is_empty() {
+                    return Err("mail.postmark.message_stream is blank".to_string());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Settings read from the configuration file.
 // `#[serde(default)]` fills every missing key from `Default::default()`.
 // serde ignores keys the struct does not name unless told otherwise
@@ -270,6 +434,8 @@ pub struct Config {
     /// The most database connections one process opens (every command,
     /// `serve` included). A write holds one for its transaction, and a read
     /// that builds an overlay holds one to read the changeset's entries.
+    /// `serve`'s mail worker does not count against it: it opens up to
+    /// `mail::queue::WORKER_POOL_SIZE` (4) connections of its own.
     pub database_max_connections: u32,
     /// The most changeset overlays kept in memory; past it, the least
     /// recently used one is dropped (and rebuilt if read again).
@@ -282,6 +448,8 @@ pub struct Config {
     pub oauth: OAuthConfig,
     /// The console sign-in policy defaults (`[auth]`).
     pub auth: AuthConfig,
+    /// Outgoing mail (`[mail]`).
+    pub mail: MailConfig,
 }
 
 impl Default for Config {
@@ -303,6 +471,7 @@ impl Default for Config {
             public_url: None,
             oauth: OAuthConfig::default(),
             auth: AuthConfig::default(),
+            mail: MailConfig::default(),
         }
     }
 }
@@ -365,7 +534,8 @@ impl Config {
     /// `time_server` or one with surrounding whitespace (which the lookup
     /// would fail on every check, seen only as a `warn`), or a zero
     /// `database_max_connections` or `overlay_cache_size`, a zero OAuth
-    /// lifetime, an `[auth]` value out of range (see `AuthConfig`), or a
+    /// lifetime, an `[auth]` value out of range (see `AuthConfig`), a
+    /// `[mail]` section that cannot send (see `MailConfig`), or a
     /// `public_url` that is not an `https` origin (`http` on
     /// a loopback host only) whose host `allowed_hosts` admits.
     pub fn validate(&self) -> Result<(), String> {
@@ -427,6 +597,7 @@ impl Config {
             check_auth_duration(name, value)?;
         }
         self.auth.validate()?;
+        self.mail.validate()?;
         self.validate_public_url()
     }
 
@@ -928,5 +1099,90 @@ mod tests {
             too_long.contains("auth.console_session_absolute") && too_long.contains("10 years"),
             "{too_long}"
         );
+    }
+
+    #[test]
+    fn mail_defaults_to_the_log_provider_with_a_worker() {
+        let mail = Config::from_toml("").unwrap().mail;
+
+        assert_eq!(mail, MailConfig::default());
+        assert_eq!(mail.provider, MailProvider::Log);
+        assert_eq!(mail.from, "okf <okf@localhost>");
+        assert!(mail.worker);
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn every_mail_key_reads_from_the_file() {
+        let text = "[mail]\n\
+                    provider = \"smtp\"\n\
+                    from = \"okf <okf@example.com>\"\n\
+                    worker = false\n\
+                    [mail.smtp]\n\
+                    host = \"smtp.example.com\"\n\
+                    port = 465\n\
+                    starttls = false\n\
+                    username = \"okf\"\n\
+                    password_env = \"OKF_SMTP_PASSWORD\"\n\
+                    [mail.postmark]\n\
+                    token_env = \"OKF_POSTMARK_TOKEN\"\n";
+
+        let config = Config::from_toml(text).unwrap();
+
+        assert_eq!(config.mail.provider, MailProvider::Smtp);
+        assert_eq!(config.mail.from, "okf <okf@example.com>");
+        assert!(!config.mail.worker);
+        assert_eq!(
+            config.mail.smtp,
+            Some(SmtpConfig {
+                host: "smtp.example.com".to_string(),
+                port: 465,
+                starttls: false,
+                username: Some("okf".to_string()),
+                password_env: Some("OKF_SMTP_PASSWORD".to_string()),
+            })
+        );
+        assert_eq!(
+            config.mail.postmark,
+            Some(PostmarkConfig {
+                token_env: "OKF_POSTMARK_TOKEN".to_string(),
+                message_stream: "outbound".to_string(),
+            })
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn smtp_defaults_to_starttls_on_587() {
+        let text = "[mail]\nprovider = \"smtp\"\n[mail.smtp]\nhost = \"smtp.example.com\"\n";
+
+        let smtp = Config::from_toml(text).unwrap().mail.smtp.unwrap();
+
+        assert_eq!((smtp.port, smtp.starttls), (587, true));
+    }
+
+    #[test]
+    fn mail_settings_that_cannot_send_are_refused() {
+        let smtp = "[mail]\nprovider = \"smtp\"\n[mail.smtp]\nhost = \"smtp.example.com\"\n";
+        let refused = [
+            "[mail]\nprovider = \"smtp\"\n".to_string(),
+            "[mail]\nprovider = \"postmark\"\n".to_string(),
+            "[mail]\nfrom = \"not an address\"\n".to_string(),
+            "[mail]\nprovider = \"smtp\"\n[mail.smtp]\nhost = \" \"\n".to_string(),
+            format!("{smtp}username = \"okf\"\n"),
+            format!("{smtp}password_env = \"OKF_SMTP_PASSWORD\"\n"),
+            format!("{smtp}username = \"okf\"\npassword_env = \" \"\n"),
+            format!("{smtp}port = 0\n"),
+            "[mail]\nprovider = \"postmark\"\n[mail.postmark]\ntoken_env = \"\"\n".to_string(),
+            "[mail]\nprovider = \"postmark\"\n[mail.postmark]\ntoken_env = \"T\"\n\
+             message_stream = \" \"\n"
+                .to_string(),
+        ];
+
+        for text in &refused {
+            let config = Config::from_toml(text).unwrap();
+            assert!(config.validate().is_err(), "{text}");
+        }
+        assert!(Config::from_toml("[mail]\nprovider = \"pigeon\"\n").is_err());
     }
 }
