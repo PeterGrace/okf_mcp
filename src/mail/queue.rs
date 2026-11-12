@@ -28,7 +28,7 @@ use apalis_postgres::{Config as QueueConfig, PostgresStorage};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -132,7 +132,8 @@ fn queue_error(error: impl std::fmt::Display) -> OkfError {
 }
 
 /// Renders a template and queues it for `to`. Call it after the request's
-/// own transaction commits, so a rolled-back change sends nothing.
+/// own transaction commits, so a rolled-back change sends nothing, or use
+/// [`enqueue_in`] inside that transaction.
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -141,10 +142,33 @@ fn queue_error(error: impl std::fmt::Display) -> OkfError {
 /// * `now` - when (server clock): the start of the 24-hour retry window.
 ///
 /// # Errors
-/// [`OkfError::LimitExceeded`] with `limit: "email"` for a malformed
-/// address; [`OkfError::Database`] or [`OkfError::Io`] if the insert fails.
+/// As [`enqueue_in`].
 pub async fn enqueue(
     pool: &PgPool,
+    to: &str,
+    template: &Template,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
+    let mut conn = pool.acquire().await?;
+    // `&mut *conn`: the pooled connection's inner `PgConnection`.
+    enqueue_in(&mut conn, to, template, now).await
+}
+
+/// [`enqueue`], inside the caller's transaction: the job exists only if the
+/// change it reports commits (apalis' notify is delivered at the commit),
+/// and nothing runs after that commit (a sign-in's "method added" notice).
+///
+/// # Arguments
+/// * `conn` - the caller's connection or transaction (`&mut tx`).
+/// * `to` - one recipient address.
+/// * `template` - what to send.
+/// * `now` - when (server clock): the start of the 24-hour retry window.
+///
+/// # Errors
+/// [`OkfError::LimitExceeded`] with `limit: "email"` for a malformed
+/// address; [`OkfError::Database`] or [`OkfError::Io`] if the insert fails.
+pub async fn enqueue_in(
+    conn: &mut PgConnection,
     to: &str,
     template: &Template,
     now: DateTime<Utc>,
@@ -165,9 +189,6 @@ pub async fn enqueue(
     // encode it the same way the worker decodes it.
     let payload = serde_json::to_vec(&job).map_err(queue_error)?;
     let task = TaskBuilder::new(payload).max_attempts(MAX_ATTEMPTS).build();
-    let mut conn = pool.acquire().await?;
-    // `&mut *conn`: the pooled connection's inner `PgConnection`, which is
-    // what apalis's query takes.
     push_tasks(&mut *conn, QUEUE, vec![task])
         .await
         .map_err(queue_error)?;

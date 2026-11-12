@@ -305,6 +305,8 @@ pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError
 pub enum Method { Password, Passkey, Oidc, Setup }     // Debug, as_str
 pub enum Outcome { Ok, Failed, Locked }                 // Debug, as_str
 pub async fn record(pool: &PgPool, user_id: Option<&str>, method: Method, outcome: Outcome, ip: Option<IpAddr>, now: DateTime<Utc>) -> Result<(), OkfError>;
+pub struct Attempt<'a> { pub user_id: Option<&'a str>, pub method: Method, pub outcome: Outcome, pub ip: Option<IpAddr>, pub now: DateTime<Utc> } // Task 8
+pub async fn record_in(conn: &mut PgConnection, attempt: &Attempt<'_>) -> Result<(), OkfError>; // Task 8: a success event in the sign-in's transaction
 pub struct SignInEvent { pub method: Method, pub outcome: Outcome, pub ip: Option<IpAddr>, pub at: DateTime<Utc> }
 pub async fn recent(pool: &PgPool, user: &str, limit: i64) -> Result<Vec<SignInEvent>, OkfError>; // by user name, newest first
 pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError>;
@@ -380,6 +382,7 @@ pub const RESET_PATH: &str = "/account/reset";
 pub fn link(public_url: &str, path: &str, token: &str) -> String; // {public_url}{path}?token={token}; the one link builder
 // src/mail/queue.rs
 pub async fn enqueue(pool: &PgPool, to: &str, template: &Template, now: DateTime<Utc>) -> Result<(), OkfError>; // pushes SendMail; now = queued_at
+pub async fn enqueue_in(conn: &mut PgConnection, to: &str, template: &Template, now: DateTime<Utc>) -> Result<(), OkfError>; // Task 8: inside the caller's transaction (apalis' push_tasks takes the connection)
 pub struct QueuedMail { pub id: String, pub to: String, pub template: String /*setup|reset|method_added|test*/, pub status: String /*pending|failed*/, pub attempts: i32, pub last_error: Option<String>, pub run_at: DateTime<Utc> }
 pub async fn list(pool: &PgPool) -> Result<Vec<QueuedMail>, OkfError>;   // pending + failed, never the body
 pub async fn retry(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), OkfError>; // a new 24-hour window
@@ -425,10 +428,11 @@ pub(crate) fn safe_return_to(raw: Option<&str>) -> String;  // same-origin /ui/.
 pub const SIGN_IN_FAILED: &str; pub const LINK_EXPIRED: &str; pub const FORGOT_SENT: &str;
 pub struct ProviderButton { pub id: String, pub label: String }  // Task 9's buttons
 pub(crate) async fn sign_in(app: &App, parts: &Parts, user: &UserAuth, method: Method) -> Result<HeaderMap, OkfError>; // ends this browser's old session, starts one, records the event
-pub(crate) async fn start_in(app: &App, conn: &mut PgConnection, parts: &Parts, user: &UserAuth, password: Option<&PasswordStamp>) -> Result<HeaderMap, OkfError>; // Task 8 (PR #342 review): inserts the session and ends this browser's old one inside the caller's transaction; after the commit only `audit` runs. Password sign-in (`begin`), setup (`use_link`) and both passkey paths use it
+pub(crate) struct SignIn<'a> { pub user: &'a UserAuth, pub method: Method, pub password: Option<&'a PasswordStamp> } // Task 8
+pub(crate) async fn start_in(app: &App, conn: &mut PgConnection, parts: &Parts, signing_in: &SignIn<'_>) -> Result<HeaderMap, OkfError>; // Task 8 (PR #342 review): inserts the session, ends this browser's old one and records the Ok event (in a savepoint) inside the caller's transaction; nothing runs after the commit. Password sign-in (`begin`), setup (`use_link`) and both passkey paths use it; `audit` is for refused attempts only
 pub(crate) fn cross_site(headers: &HeaderMap) -> bool;    // Task 7b; pub(crate) from Task 8 (the passkey routes check it too)
 pub(crate) async fn audit(app: &App, user_id: Option<&str>, method: Method, outcome: Outcome, ip: Option<IpAddr>);
-pub(crate) async fn notify_method_added(app: &App, user: &UserAuth, method: &str); // queues Template::MethodAdded; logs a failure
+pub(crate) async fn notify_method_added(app: &App, conn: &mut PgConnection, user: &UserAuth, method: &str) -> Result<(), OkfError>; // corrected (issue #317, PR #342 review): queues Template::MethodAdded inside the caller's transaction (a savepoint, so a queue failure is logged and never undoes the change); Tasks 9 and 10b call it in the transaction that adds the method, before the commit
 pub(crate) fn message_page(status: StatusCode, title: &str, message: &str) -> Response; // pub(crate) from Task 9
 
 // ---- src/http/api/testing.rs (Task 7a; cfg(test)) ----
@@ -462,7 +466,7 @@ pub async fn find(pool: &PgPool, credential_id: &[u8]) -> Result<Option<(String 
 pub async fn lock_for_sign_in(conn: &mut PgConnection, credential_id: &[u8]) -> Result<Option<(UserAuth, Passkey)>, OkfError>; // corrected (issue #317): the owner FOR SHARE, then the passkey FOR UPDATE
 pub async fn update_in(conn: &mut PgConnection, credential_id: &[u8], passkey: &Passkey, now: DateTime<Utc>) -> Result<(), OkfError>; // corrected (issue #317): replaces `update(pool, ...)`
 pub struct SessionRegistration<'a> { pub user_id: &'a str, pub session_id: &'a str, pub passkey: &'a Passkey, pub name: &'a str, pub keep_sessions: bool, pub now: DateTime<Utc> }
-pub async fn add_from_session(pool: &PgPool, registration: &SessionRegistration<'_>) -> Result<u64 /*sessions ended*/, OkfError>; // corrected (issue #317): user locked, session checked, passkey stored, other sessions ended, one transaction
+pub async fn add_from_session_in(conn: &mut PgConnection, registration: &SessionRegistration<'_>) -> Result<u64 /*sessions ended*/, OkfError>; // corrected (issue #317): user locked, session checked, passkey stored, other sessions ended, in the caller's transaction (which queues the notice, then commits)
 pub struct PasskeyInfo { pub id: String /*base64url*/, pub name: String, pub created_at: DateTime<Utc>, pub last_used_at: Option<DateTime<Utc>> }
 pub async fn list(pool: &PgPool, user_id: &str) -> Result<Vec<PasskeyInfo>, OkfError>;
 pub async fn rename(pool: &PgPool, user_id: &str, id: &str, name: &str) -> Result<(), OkfError>; // 404 for another user's
@@ -12170,6 +12174,7 @@ webauthn-rs facts this task relies on (verified in the probe, `crate-probe/tests
 > - **Signed-in registration is one transaction** (`passkey_rows::add_from_session`): the user `FOR NO KEY UPDATE`, then `user_sessions::hold_live` on the registering session, then `add_in` and `revoke_all`. A reset that ended the session first leaves no passkey (401). The finishing session must be the one that started the ceremony (403 otherwise).
 > - `user_sessions::start` and `revoke` take an executor; `signin::start_in` is new; `console_session::session_cookie` is `pub(crate)`; `signin::cross_site` is `pub(crate)`.
 > - **Nothing fallible runs after a sign-in commits** (PR #342 review). `signin::start_in` inserts the session and then deletes this browser's old session in the caller's transaction (the user's row first, then the session rows). After the commit, only `audit` (which logs its own failure) and `notify_method_added` run. So a committed sign-in always reaches the browser with its cookie, and a failure before the commit changes nothing. The password sign-in (`begin`) and the password setup link (`use_link`, which now takes `parts` and starts the session in the link's transaction instead of a stamped `begin` afterwards) work the same way. `register_finish` treats a failed user lookup for the notice as a `warn`, not an error.
+> - **After the commit, nothing is awaited** (PR #342, second review). A blocked `sign_in_events` or `apalis.jobs` table could otherwise hold a committed sign-in past its timeout with no cookie. The Ok sign-in event is recorded in `start_in`'s transaction (`sign_in_events::record_in`, in a savepoint so a failure is logged and never decides the sign-in); refused attempts still use `audit`. The "method added" notice is queued in the transaction that adds the method (`notify_method_added(app, conn, ..)` over `mail::queue::enqueue_in`, also in a savepoint): the reset in `use_link`, and the signed-in passkey registration in `store_registration` (around `add_from_session_in`). A wait on either table therefore happens before the commit, while nothing is committed.
 > - **Ceremonies are bounded per actor.** `remember` drops the ceremony the request's old `okf_passkey` cookie names. A console session's new registration replaces that session's previous one through `Passkeys::by_session` (keyed by the hash of the session id, `update_or_insert_sliding`), cookie or not. Anonymous starts are bounded by the per-address limit.
 > - **The open routes refuse another site** (`cross_site`, 403) and the two starts and the sign-in finish take the per-address sign-in limit (429). `remember` and `take_ceremony` take the `Instant`, so a test checks the five-minute expiry.
 > - `passkey_rows::remove` answers the passkey's 404 (`me/passkeys/<id>`) for an unknown user too, not `count`'s `users/<id>` path. It deletes before deciding and rolls back when the passkey was the last method.
@@ -15427,6 +15432,7 @@ async fn finish_sign_in(
                 Err(error) => return Err(error),
             }
             tracing::info!(user = %user.id, provider, "OIDC identity linked by verified email");
+            // Corrected (issue #317, PR #342 review): `notify_method_added(app, &mut tx, user, method).await?` now takes the transaction that links the method and runs before its commit; nothing may be awaited after the commit.
             notify_method_added(app, &user, &method_text(app, provider)).await;
             user
         }
@@ -15451,6 +15457,7 @@ async fn finish_link(app: &App, provider: &str, identity: &Identity, link: LinkR
         tracing::info!(user = %link.user_id, ended, "other sessions ended after an identity was linked");
     }
     if let Some(user) = session_user(app, &link.user_id).await? {
+        // Corrected (issue #317, PR #342 review): `notify_method_added(app, &mut tx, user, method).await?` now takes the transaction that links the method and runs before its commit; nothing may be awaited after the commit.
         notify_method_added(app, &user, &method_text(app, provider)).await;
     }
     Ok(Done::Redirect { session_cookie: HeaderMap::new(), to: ACCOUNT_PAGE.to_string() })
@@ -17396,6 +17403,7 @@ async fn change_password(
     tracing::info!(user = %user.name, "password changed");
     // Task 7b's notice; it needs the user's email, which `UserAuth` carries.
     if let Some(account) = users::find_auth(app.pool(), user.id).await? {
+        // Corrected (issue #317, PR #342 review): `notify_method_added(&app, &mut tx, &account, "a new password").await?` now takes the password change's transaction (with `passwords::set_in` and `revoke_all`) and runs before its commit.
         notify_method_added(&app, &account, "a new password").await;
     }
     Ok(StatusCode::NO_CONTENT)

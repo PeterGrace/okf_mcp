@@ -21,7 +21,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Form, Router};
 use serde::Deserialize;
-use sqlx::PgConnection;
+use sqlx::{Connection as _, PgConnection};
 
 use crate::app::App;
 use crate::error::OkfError;
@@ -34,7 +34,7 @@ use crate::mail::queue as mail_queue;
 use crate::mail::{self, Template, RESET_PATH, SETUP_PATH};
 use crate::store::email_tokens::{self, Purpose};
 use crate::store::passwords::{self, NewPassword, PasswordStamp, SignInOutcome};
-use crate::store::sign_in_events::{self, Method, Outcome};
+use crate::store::sign_in_events::{self, Attempt, Method, Outcome};
 use crate::store::user_sessions::{self, SessionStart};
 use crate::store::users::{self, UserAuth};
 
@@ -409,20 +409,17 @@ async fn begin(
     method: Method,
     password: Option<&PasswordStamp>,
 ) -> Result<HeaderMap, OkfError> {
-    // The new session and the end of the old one commit together, so a
-    // failure leaves the browser as it was and nothing after the commit
-    // can fail.
+    // The new session, the end of the old one and the event commit
+    // together; after the commit nothing runs, so a committed sign-in
+    // always reaches the browser with its cookie.
     let mut tx = app.pool().begin().await?;
-    let headers = start_in(app, &mut tx, parts, user, password).await?;
-    tx.commit().await?;
-    audit(
-        app,
-        Some(&user.id),
+    let signing_in = SignIn {
+        user,
         method,
-        Outcome::Ok,
-        client_ip(parts, &app.config().auth),
-    )
-    .await;
+        password,
+    };
+    let headers = start_in(app, &mut tx, parts, &signing_in).await?;
+    tx.commit().await?;
     Ok(headers)
 }
 
@@ -436,13 +433,25 @@ fn client_of<'a>(app: &App, parts: &'a Parts) -> (Option<IpAddr>, &'a str) {
     (client_ip(parts, &app.config().auth), user_agent)
 }
 
-/// Starts a session for `user` inside the caller's transaction and ends
-/// the session this browser held before (rotation), in that order: the
-/// insert reads the user's row `FOR SHARE` first, then the old session's
-/// row is deleted (lock order: the user first). The caller commits, and
-/// then only records the event ([`audit`], which cannot fail), so a
-/// committed sign-in always reaches the browser with its cookie, and a
-/// failure before the commit changes nothing.
+/// A verified sign-in, for [`start_in`]. No `Debug`: the stamp is a
+/// password hash.
+pub(crate) struct SignIn<'a> {
+    /// The verified user.
+    pub user: &'a UserAuth,
+    /// How they proved who they are.
+    pub method: Method,
+    /// For a password sign-in, the hash the password matched
+    /// (`user_sessions::start`); `None` otherwise.
+    pub password: Option<&'a PasswordStamp>,
+}
+
+/// Starts a session inside the caller's transaction, ends the session this
+/// browser held before (rotation) and records the sign-in event, in that
+/// order: the insert reads the user's row `FOR SHARE` first, then the old
+/// session's row is deleted (lock order: the user first). The caller only
+/// commits after this: nothing that can block or fail runs after the
+/// commit, so a committed sign-in always reaches the browser with its
+/// cookie, and a failure (or a wait) before the commit changes nothing.
 ///
 /// A passkey sign-in or a setup link calls this inside the transaction
 /// that checked the credential under the user's lock, so nothing can
@@ -452,9 +461,7 @@ fn client_of<'a>(app: &App, parts: &'a Parts) -> (Option<IpAddr>, &'a str) {
 /// * `app` - the shared state.
 /// * `conn` - the caller's transaction (`&mut tx`).
 /// * `parts` - the request (old session cookie, address, `User-Agent`).
-/// * `user` - the verified user.
-/// * `password` - for a password sign-in, the hash the password matched
-///   (`user_sessions::start`); `None` otherwise.
+/// * `signing_in` - who, how, and (for a password) the matched stamp.
 ///
 /// # Returns
 /// The `Set-Cookie` header to send.
@@ -467,29 +474,48 @@ pub(crate) async fn start_in(
     app: &App,
     conn: &mut PgConnection,
     parts: &Parts,
-    user: &UserAuth,
-    password: Option<&PasswordStamp>,
+    signing_in: &SignIn<'_>,
 ) -> Result<HeaderMap, OkfError> {
+    let user = signing_in.user;
     let (ip, user_agent) = client_of(app, parts);
     let absolute = app.settings().console_session_absolute;
+    let now = app.clock().now();
     let request = SessionStart {
         user_id: &user.id,
         ip,
         user_agent,
         absolute,
-        now: app.clock().now(),
-        password,
+        now,
+        password: signing_in.password,
     };
     let session = user_sessions::start(&mut *conn, &request).await?;
     if let Some(old) = cookie(&parts.headers, COOKIE) {
         user_sessions::revoke(&mut *conn, old).await?;
     }
+    let attempt = Attempt {
+        user_id: Some(&user.id),
+        method: signing_in.method,
+        outcome: Outcome::Ok,
+        ip,
+        now,
+    };
+    // In a savepoint, so a failure to record is logged and never decides
+    // the sign-in (as `audit`), yet the row commits with the session.
+    let mut savepoint = conn.begin().await?;
+    match sign_in_events::record_in(&mut savepoint, &attempt).await {
+        Ok(()) => savepoint.commit().await?,
+        Err(error) => {
+            savepoint.rollback().await?;
+            tracing::error!(%error, "recording a sign-in event failed");
+        }
+    }
     Ok(session_cookie(app, &user.id, &session, absolute))
 }
 
-/// Records a sign-in attempt as a `sign_in_events` row (which also logs an
-/// `info` line). A failure to record is logged; it never decides the
-/// sign-in.
+/// Records a refused sign-in attempt as a `sign_in_events` row (which also
+/// logs an `info` line). A failure to record is logged; it never decides
+/// the sign-in. A successful sign-in records its event in its own
+/// transaction instead ([`start_in`]).
 ///
 /// # Arguments
 /// * `app` - the shared state.
@@ -511,23 +537,41 @@ pub(crate) async fn audit(
     }
 }
 
-/// Queues the "a sign-in method was added" notice to the user's email.
-/// A user without an email, or a failure to queue (logged), sends nothing.
+/// Queues the "a sign-in method was added" notice to the user's email,
+/// inside the caller's transaction (the one that adds the method), so the
+/// mail exists only if the change commits and nothing runs after the
+/// commit. A user without an email sends nothing; a failure to queue is
+/// logged and rolled back to a savepoint, so it never decides the change.
 ///
 /// # Arguments
 /// * `app` - the shared state.
+/// * `conn` - the caller's transaction (`&mut tx`).
 /// * `user` - the user.
 /// * `method` - what was added, in words ("a new password", "a passkey").
-pub(crate) async fn notify_method_added(app: &App, user: &UserAuth, method: &str) {
+///
+/// # Errors
+/// [`OkfError::Database`] opening or ending the savepoint.
+pub(crate) async fn notify_method_added(
+    app: &App,
+    conn: &mut PgConnection,
+    user: &UserAuth,
+    method: &str,
+) -> Result<(), OkfError> {
     let Some(to) = user.email.as_deref() else {
-        return;
+        return Ok(());
     };
     let template = Template::MethodAdded {
         method: method.to_string(),
     };
-    if let Err(error) = mail_queue::enqueue(app.pool(), to, &template, app.clock().now()).await {
-        tracing::error!(%error, user = %user.id, "queueing the sign-in method notice failed");
+    let mut savepoint = conn.begin().await?;
+    match mail_queue::enqueue_in(&mut savepoint, to, &template, app.clock().now()).await {
+        Ok(()) => savepoint.commit().await?,
+        Err(error) => {
+            savepoint.rollback().await?;
+            tracing::error!(%error, user = %user.id, "queueing the sign-in method notice failed");
+        }
     }
+    Ok(())
 }
 
 /// The forgot page's body: the form, or the one answer.
@@ -809,8 +853,6 @@ async fn setup_post(
         Ok(used) => used,
         Err(error) => return link_error(error),
     };
-    let ip = client_ip(&parts, &app.config().auth);
-    audit(&app, Some(&used.user.id), Method::Setup, Outcome::Ok, ip).await;
     // `unwrap_or_default`: a setup link always starts a session; an empty
     // header map would only mean no cookie to send.
     let cookie = used.cookie.unwrap_or_default();
@@ -859,12 +901,18 @@ async fn use_link(
     let (ended, cookie) = match purpose {
         Purpose::Setup => {
             passwords::set_in(&mut tx, &user.id, &hashed, now).await?;
-            (0, Some(start_in(app, &mut tx, parts, &user, None).await?))
+            let signing_in = SignIn {
+                user: &user,
+                method: Method::Setup,
+                password: None,
+            };
+            (0, Some(start_in(app, &mut tx, parts, &signing_in).await?))
         }
-        Purpose::Reset => (
-            passwords::reset_in(&mut tx, &user.id, &hashed, now).await?,
-            None,
-        ),
+        Purpose::Reset => {
+            let ended = passwords::reset_in(&mut tx, &user.id, &hashed, now).await?;
+            notify_method_added(app, &mut tx, &user, "a new password").await?;
+            (ended, None)
+        }
     };
     tx.commit().await?;
     Ok(LinkUsed {
@@ -957,8 +1005,8 @@ async fn reset_post(
             Ok(used) => used,
             Err(error) => return link_error(error),
         };
+    // The notice was queued in the reset's transaction (`use_link`).
     tracing::info!(user = %user.id, ended, "password reset; every session ended");
-    notify_method_added(&app, &user, "a new password").await;
     Redirect::to("/signin?notice=reset").into_response()
 }
 
@@ -2326,6 +2374,92 @@ mod tests {
         assert_eq!(password, SignInOutcome::Failed, "no password was set");
         assert_eq!(retried.status, StatusCode::SEE_OTHER, "{}", retried.text());
         assert_eq!(session.json()["user"], "alice");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_password_sign_in_waiting_on_the_event_table_commits_nothing_until_it_answers() {
+        let test = Arc::new(login_app().await);
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let pool = test.app.pool().clone();
+        let mut holder = pool.begin().await.expect("begin");
+        sqlx::query("LOCK TABLE sign_in_events IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .expect("lock the table");
+        let sign_in = tokio::spawn({
+            let test = Arc::clone(&test);
+            async move {
+                let mut browser = Browser::default();
+                let reply = post_sign_in(&mut browser, &test, "alice@example.com", PASSWORD).await;
+                (reply, browser)
+            }
+        });
+        wait_for_lock_waiters(&pool, 1).await;
+        let while_blocked = sessions_of(&pool, &alice.id).await;
+
+        holder.commit().await.expect("release the table");
+        let (reply, mut browser) = sign_in.await.expect("the sign-in task");
+        let session = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        assert_eq!(while_blocked, 0, "nothing committed while the event waited");
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.text());
+        assert!(reply.set_cookie(COOKIE).is_some());
+        assert_eq!(session.json()["user"], "alice");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_queues_its_notice_in_its_own_transaction() {
+        let test = Arc::new(login_app().await);
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let pool = test.app.pool().clone();
+        let token = email_tokens::issue(
+            &pool,
+            &alice.id,
+            Purpose::Reset,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await
+        .expect("issue a reset token");
+        let new_password = "amber-quarry-signal-77";
+        let mut holder = pool.begin().await.expect("begin");
+        sqlx::query("LOCK TABLE apalis.jobs IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .expect("lock the queue");
+        let reset = tokio::spawn({
+            let test = Arc::clone(&test);
+            let token = token.clone();
+            async move {
+                Browser::default()
+                    .send(
+                        &test,
+                        "POST",
+                        "/account/reset",
+                        new_password_form(&token, new_password),
+                    )
+                    .await
+            }
+        });
+        wait_for_lock_waiters(&pool, 1).await;
+        let while_blocked = email_tokens::peek(&pool, &token, Purpose::Reset, Utc::now()).await;
+
+        holder.commit().await.expect("release the queue");
+        let reply = reset.await.expect("the reset task");
+
+        assert!(while_blocked.is_ok(), "the link is unused until the commit");
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.text());
+        assert_eq!(
+            queued_mail(&pool).await,
+            1,
+            "the notice committed with the reset"
+        );
+        let changed = passwords::verify(&pool, "alice@example.com", new_password, Utc::now())
+            .await
+            .expect("check the password");
+        assert!(matches!(changed, SignInOutcome::Ok(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

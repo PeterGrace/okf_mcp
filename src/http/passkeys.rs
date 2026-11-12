@@ -46,7 +46,7 @@ use crate::http::console_session::{
 };
 use crate::http::limits::ip_key;
 use crate::http::pages::safe_return_to;
-use crate::http::signin::{audit, cross_site, notify_method_added, start_in, LINK_EXPIRED};
+use crate::http::signin::{audit, cross_site, notify_method_added, start_in, SignIn, LINK_EXPIRED};
 use crate::http::{timeout_layer, AppError};
 use crate::keys;
 use crate::oauth::expiring::ExpiringMap;
@@ -536,11 +536,10 @@ async fn setup_finish(
         passkey: &passkey,
         name: &pending.name,
     };
-    let (user, cookie) = use_setup_link(&app, &parts, &set_up).await?;
+    // The event is recorded in the link's transaction: nothing runs after
+    // its commit but building the response.
+    let cookie = use_setup_link(&app, &parts, &set_up).await?;
     append_all(&mut headers, &cookie);
-    // After the commit, only what cannot fail: the browser gets its cookie.
-    let ip = client_ip(&parts, &app.config().auth);
-    audit(&app, Some(&user.id), Method::Setup, Outcome::Ok, ip).await;
     Ok((
         headers,
         Json(serde_json::json!({ "redirect": pending.return_to })),
@@ -567,7 +566,7 @@ struct SetUp<'a> {
 /// any error drops `tx`, which rolls everything back.
 ///
 /// # Returns
-/// The user and the session's `Set-Cookie` header.
+/// The session's `Set-Cookie` header.
 ///
 /// # Errors
 /// [`OkfError::Gone`] for a link used, expired or now naming another user;
@@ -577,7 +576,7 @@ async fn use_setup_link(
     app: &App,
     parts: &Parts,
     set_up: &SetUp<'_>,
-) -> Result<(UserAuth, HeaderMap), OkfError> {
+) -> Result<HeaderMap, OkfError> {
     let now = app.clock().now();
     let mut tx = app.pool().begin().await?;
     let user = email_tokens::redeem_in(&mut tx, set_up.token, Purpose::Setup, now).await?;
@@ -587,10 +586,15 @@ async fn use_setup_link(
         });
     }
     passkey_rows::add_in(&mut tx, &user.id, set_up.passkey, set_up.name, now).await?;
-    let cookie = start_in(app, &mut tx, parts, &user, None).await?;
+    let signing_in = SignIn {
+        user: &user,
+        method: Method::Setup,
+        password: None,
+    };
+    let cookie = start_in(app, &mut tx, parts, &signing_in).await?;
     tx.commit().await?;
     tracing::info!(user = %user.id, "passkey added from a setup link");
-    Ok((user, cookie))
+    Ok(cookie)
 }
 
 /// `POST /auth/passkey/signin/start`'s body.
@@ -630,8 +634,8 @@ async fn sign_in_start(
 
 /// What an assertion proved.
 enum Verdict {
-    /// Signed in: the session is committed.
-    SignedIn { user: UserAuth, cookie: HeaderMap },
+    /// Signed in: the session (and its event) is committed.
+    SignedIn { cookie: HeaderMap },
     /// Refused, naming the credential's owner when it is known.
     Refused { user_id: Option<String> },
 }
@@ -699,9 +703,14 @@ async fn verify_and_start(
         });
     }
     passkey_rows::update_in(&mut tx, credential_id, &passkey, app.clock().now()).await?;
-    let cookie = start_in(app, &mut tx, parts, &user, None).await?;
+    let signing_in = SignIn {
+        user: &user,
+        method: Method::Passkey,
+        password: None,
+    };
+    let cookie = start_in(app, &mut tx, parts, &signing_in).await?;
     tx.commit().await?;
-    Ok(Verdict::SignedIn { user, cookie })
+    Ok(Verdict::SignedIn { cookie })
 }
 
 /// `POST /auth/passkey/signin/finish`: signs in. Answers
@@ -725,11 +734,10 @@ async fn sign_in_finish(
         return Err(expired().into());
     };
     match verify_and_start(&app, passkeys, &parts, &credential, state).await? {
-        Verdict::SignedIn { user, cookie } => {
+        // The event is recorded in the sign-in's transaction: nothing runs
+        // after its commit but building the response.
+        Verdict::SignedIn { cookie } => {
             append_all(&mut headers, &cookie);
-            // After the commit, only what cannot fail.
-            let ip = client_ip(&parts, &app.config().auth);
-            audit(&app, Some(&user.id), Method::Passkey, Outcome::Ok, ip).await;
             Ok((headers, Json(serde_json::json!({ "redirect": return_to }))).into_response())
         }
         Verdict::Refused { user_id } => {
@@ -851,22 +859,41 @@ async fn register_finish(
         keep_sessions,
         now: app.clock().now(),
     };
-    let ended = passkey_rows::add_from_session(app.pool(), &registration).await?;
+    let ended = store_registration(&app, &registration).await?;
     tracing::info!(user = %user_id, ended, "passkey added; other sessions ended unless kept");
-    // After the commit, nothing may turn the 201 into an error: a failed
-    // lookup only skips the notice.
-    match session_user(&app, &user_id).await {
-        Ok(Some(user)) => notify_method_added(&app, &user, "a passkey").await,
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(%error, user = %user_id, "no passkey notice: the user lookup failed");
-        }
-    }
     let body = serde_json::json!({
         "id": URL_SAFE_NO_PAD.encode(passkey.cred_id().as_slice()),
         "name": pending.name,
     });
     Ok((StatusCode::CREATED, clear, Json(body)).into_response())
+}
+
+/// Stores a session's passkey, ends the other sessions unless kept and
+/// queues the notice, in one transaction; nothing runs after its commit
+/// but building the response.
+///
+/// # Returns
+/// How many other sessions ended.
+///
+/// # Errors
+/// As `passkey_rows::add_from_session_in`; [`OkfError::Unauthenticated`]
+/// once the user is gone.
+async fn store_registration(
+    app: &App,
+    registration: &SessionRegistration<'_>,
+) -> Result<u64, OkfError> {
+    // Read before the transaction (the key cache, else the database), for
+    // the notice's address.
+    let user = session_user(app, registration.user_id)
+        .await?
+        .ok_or_else(|| OkfError::Unauthenticated {
+            reason: "this session's user no longer exists".to_string(),
+        })?;
+    let mut tx = app.pool().begin().await?;
+    let ended = passkey_rows::add_from_session_in(&mut tx, registration).await?;
+    notify_method_added(app, &mut tx, &user, "a passkey").await?;
+    tx.commit().await?;
+    Ok(ended)
 }
 
 #[cfg(test)]
@@ -1563,6 +1590,134 @@ mod tests {
         assert_eq!(after_one_session, 3);
         assert_eq!(started.status, StatusCode::OK, "others can still start");
         assert_eq!(passkeys.ceremonies.len(), 4);
+    }
+
+    /// Holds `table` in `ACCESS EXCLUSIVE` mode until the returned
+    /// transaction ends, so every statement that touches it waits.
+    async fn lock_table(
+        pool: &sqlx::PgPool,
+        table: &str,
+    ) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        let mut holder = pool.begin().await.expect("begin");
+        // `AssertSqlSafe`: `table` is a literal of the calling test.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(&mut *holder)
+        .await
+        .expect("lock the table");
+        holder
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sign_in_waiting_on_the_event_table_commits_nothing_until_it_returns_its_cookie() {
+        let test = Arc::new(login_app().await);
+        let (alice, mut soft) = alice_with_passkey(&test, None).await;
+        let before = sessions_of(&test, &alice).await;
+        let mut browser = Browser::default();
+        let signed = assertion(&test, &mut browser, &mut soft, &alice, "/ui/").await;
+        let pool = test.app.pool().clone();
+        let holder = lock_table(&pool, "sign_in_events").await;
+        let sign_in = tokio::spawn({
+            let test = Arc::clone(&test);
+            async move {
+                let reply = finish(&test, &mut browser, signed).await;
+                (reply, browser)
+            }
+        });
+        wait_for_lock_waiters(&pool, 1).await;
+        // Blocked on the event, inside its transaction: nothing committed.
+        let while_blocked = sessions_of(&test, &alice).await;
+
+        holder.commit().await.expect("release the table");
+        let (reply, mut browser) = sign_in.await.expect("the sign-in task");
+        let session = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        assert_eq!(while_blocked, before);
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+        assert!(reply.set_cookie(COOKIE).is_some());
+        assert_eq!(session.json()["user"], "alice");
+        let events = sign_in_events::recent(test.app.pool(), "alice", 1)
+            .await
+            .expect("events");
+        assert!(matches!(
+            (&events[0].method, &events[0].outcome),
+            (Method::Passkey, Outcome::Ok)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registration_waiting_on_the_mail_queue_commits_nothing_until_it_answers() {
+        let test = Arc::new(login_app().await);
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let mut browser = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let mut soft = SoftPasskey::new(true);
+        let credential =
+            registration_from_session(&test, &mut browser, &mut soft, json!({ "name": "Phone" }))
+                .await;
+        let pool = test.app.pool().clone();
+        let holder = lock_table(&pool, "apalis.jobs").await;
+        let finish = tokio::spawn({
+            let test = Arc::clone(&test);
+            async move {
+                browser
+                    .send(
+                        &test,
+                        "POST",
+                        "/api/v1/me/passkeys/register/finish",
+                        Payload::Json(credential),
+                    )
+                    .await
+            }
+        });
+        wait_for_lock_waiters(&pool, 1).await;
+        let while_blocked = passkey_rows::list(&pool, &alice.id).await.expect("list");
+
+        holder.commit().await.expect("release the queue");
+        let reply = finish.await.expect("the registration task");
+
+        assert!(
+            while_blocked.is_empty(),
+            "nothing committed while the notice waited"
+        );
+        assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.text());
+        assert_eq!(
+            passkey_rows::list(&pool, &alice.id)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+        let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM apalis.jobs")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(queued, 1, "the notice committed with the passkey");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_notice_that_cannot_be_queued_does_not_undo_the_passkey() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let mut browser = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let mut soft = SoftPasskey::new(true);
+        let pool = test.app.pool();
+        fail_on(pool, "BEFORE INSERT ON apalis.jobs FOR EACH STATEMENT").await;
+
+        let done =
+            register_from_session(&test, &mut browser, &mut soft, json!({ "name": "Phone" })).await;
+        allow(pool, "apalis.jobs").await;
+
+        assert_eq!(done.status, StatusCode::CREATED, "{}", done.text());
+        assert_eq!(
+            passkey_rows::list(pool, &alice.id)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

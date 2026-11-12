@@ -114,14 +114,15 @@ pub struct SessionRegistration<'a> {
 }
 
 /// Stores a passkey registered from a console session and, unless kept,
-/// ends the user's other sessions, in one transaction. The user's row is
+/// ends the user's other sessions, inside the caller's transaction (which
+/// also queues the notice, then commits). The user's row is
 /// locked first and the registering session is checked under that lock:
 /// a password reset (or any change that ended the session) committed
 /// meanwhile leaves no passkey behind, so a session that was signed out
 /// cannot give itself a lasting way back in.
 ///
 /// # Arguments
-/// * `pool` - the database.
+/// * `conn` - the caller's transaction (`&mut tx`).
 /// * `registration` - what to store and for whom.
 ///
 /// # Returns
@@ -131,22 +132,21 @@ pub struct SessionRegistration<'a> {
 /// [`OkfError::Unauthenticated`] once the session or the user is gone;
 /// [`OkfError::Refused`] for a credential already registered;
 /// [`OkfError::Database`].
-pub async fn add_from_session(
-    pool: &PgPool,
+pub async fn add_from_session_in(
+    conn: &mut PgConnection,
     registration: &SessionRegistration<'_>,
 ) -> Result<u64, OkfError> {
-    let mut tx = pool.begin().await?;
     // `FOR NO KEY UPDATE`, as every credential change takes it: a reset or
     // a removal on this user queues behind this transaction, or this one
     // behind it.
     let locked: Option<String> =
         sqlx::query_scalar("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
             .bind(registration.user_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
     let live = locked.is_some()
         && user_sessions::hold_live(
-            &mut *tx,
+            &mut *conn,
             registration.session_id,
             registration.user_id,
             registration.now,
@@ -158,7 +158,7 @@ pub async fn add_from_session(
         });
     }
     add_in(
-        &mut tx,
+        &mut *conn,
         registration.user_id,
         registration.passkey,
         registration.name,
@@ -169,13 +169,12 @@ pub async fn add_from_session(
         0
     } else {
         user_sessions::revoke_all(
-            &mut *tx,
+            &mut *conn,
             registration.user_id,
             Some(registration.session_id),
         )
         .await?
     };
-    tx.commit().await?;
     Ok(ended)
 }
 
