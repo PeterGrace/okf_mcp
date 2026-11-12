@@ -123,8 +123,9 @@ credential's `Principal` (which gains its `user`) stays current.
 ## Deletion
 
 Revoked keys are kept forever, and their rows reference their user, so a
-user who has ever held a credential cannot be deleted under `RESTRICT`. This
-is accepted for now:
+user cannot be deleted under `RESTRICT` while any credential, revoked or
+not, still names it (`key assign` can move a revoked one to another user;
+see "What shipped differently"). This is accepted for now:
 
 - `user delete` succeeds only for a user with no credentials (live or
   revoked), no sign-in codes, and no team memberships other than their own
@@ -297,6 +298,10 @@ give the reasons.
   redeemed code became keeps its own user, assigned with `key assign`.
   `key assign` takes an id or an unambiguous live name, with `--actor` to
   narrow it, as the other `key` subcommands do.
+- **A user is refused deletion only while something still names it**, not
+  forever after holding a credential: `key assign` reassigns revoked keys
+  and grants too, and expired unredeemed sign-in codes are pruned after a
+  week, so a former holder can become deletable.
 - **Assigning a sign-in code bumps no administrative generation**: codes are
   not in the key cache and are read from the database on every use. Every
   other write in "Cache reload" bumps it.

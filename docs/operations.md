@@ -709,9 +709,10 @@ a non-zero exit naming what still refers to it on the command line:
 - `user delete` is refused while any key, grant (revoked ones included) or
   sign-in code names the user, while the user belongs to a team other than
   its personal team, or while its personal team owns a catalog. Revoked keys
-  and grants are kept forever, so a user who ever held a key or grant cannot
-  be deleted (a sign-in code nobody redeemed is pruned a week after it
-  expires).
+  and grants are kept, so a user is refused for as long as any of them still
+  names it; `key assign` can move even a revoked key or grant to another
+  user, and a sign-in code nobody redeemed is pruned a week after it
+  expires.
 - `team delete` is refused for a personal team (it goes with its user) and
   for a team that owns a catalog.
 - `team remove-member` and `team set-role` never remove or demote a team's
