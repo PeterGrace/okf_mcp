@@ -3924,6 +3924,8 @@ In `src/http/api/people.rs`, `UserView` gains the three fields (the destructurin
 
 and `From<UserRecord>` destructures and copies `email`, `is_admin` and `has_password`. `format_user` in `src/cli/people.rs` reads fields by name and is unchanged; Task 13 (the CLI) decides what `user list` prints.
 
+> **Corrected (issue #312, 2026-11-12).** `two_admins_cleared_at_once_leave_one` runs on the multi-threaded runtime with spawned tasks. `tokio::join!` on one thread only interleaves the two calls. The deterministic form, `an_admin_cleared_while_another_clear_waits_is_not_counted`, was added. `changing_the_admin_flag_ends_the_users_console_sessions` also checks that a no-op `set_admin` keeps the session. `set_admin`'s doc records that it is the only writer of `users.is_admin`, so every path that changes the flag ends the sessions. `src/app.rs` gained `poll_prunes_old_sign_in_events_and_long_expired_emailed_links` for Step 11.
+
 - [ ] **Step 4: Run the `users` tests**
 
 Run: `cargo test --lib -- store::users`
@@ -4161,6 +4163,13 @@ Run: `cargo test --lib -- store::passwords`
 Expected: compile errors (the module is not registered and nothing is defined).
 
 - [ ] **Step 8: Implement `src/store/passwords.rs`** (above the test module), create the common-password list, register the module, and optimize argon2 in debug builds.
+
+> **Corrected (issue #312, 2026-11-12).** What shipped differs from the code below in three ways; read `src/store/passwords.rs`.
+> - `DUMMY_HASH` is a `const &str`: a PHC string (argon2id, m=19456, t=2, p=1) of a random password that was thrown away. A `LazyLock` would compute argon2 on an async worker thread at the first unknown email, and that first answer would take twice as long. The test uses `DUMMY_HASH` (not `&DUMMY_HASH`) and also checks that it parses.
+> - `check_candidate` hands off to `record_success` and `record_failure`. The row it read can be stale by the time argon2 finishes. So the success `UPDATE` only clears the counters `WHERE password_hash = <the hash it checked>` and while `locked_until` is not in the future. It answers `Locked` if a concurrent failure locked the account meanwhile, and `Failed` if the password changed or the user is gone. The failure `UPDATE` leaves the counter and lock alone while the account is already locked. Its CASEs first test `locked_until > now`, so a failure that read the row before the lock does not count during it. Both use `fetch_optional`, so a user deleted meanwhile is `Failed`, not a database error.
+> - The candidate `SELECT` is the `candidate_columns!` macro shared by `verify`, `verify_user` and the tests. `matches_off_thread` and `set` map a `JoinError` with `map_err(hasher_error)` directly, with no `.to_string()`.
+>
+> Tests added: `concurrent_failures_all_count` (nine at once leave the counter at nine), `ten_concurrent_failures_lock_exactly_once`, `a_lock_set_while_the_right_password_is_checked_still_holds`, `a_failure_that_read_the_row_before_a_lock_does_not_count_during_it` and `the_old_password_checked_while_it_is_changed_fails`.
 
 ```rust
 //! Local passwords (spec "Passwords"): the policy, argon2id hashing at
@@ -4587,6 +4596,8 @@ opt-level = 3
 ```
 
 - [ ] **Step 9: Write the failing tests for `email_tokens`, then implement it.** `src/store/email_tokens.rs`:
+
+> **Corrected (issue #312, 2026-11-12).** `issue` locks the user row `FOR NO KEY UPDATE`, not `FOR KEY SHARE`. Two concurrent issues for one user could otherwise both delete the old token and both insert, leaving two live links. The stronger lock also makes `users::delete` and `set_email` wait for the insert. `two_concurrent_uses_give_one_user_and_one_gone` shipped as `concurrent_uses_give_one_user_and_the_rest_gone` (eight redeems on spawned tasks, multi-threaded runtime). Added: `a_use_waiting_on_another_use_is_gone` (deterministic, through `catalogs::tests::until_a_lock_is_awaited`) and `concurrent_issues_leave_exactly_one_live_link`.
 
 ```rust
 //! Single-use emailed links (spec "Emailed links"): setup and reset

@@ -26,7 +26,7 @@ use crate::overlay::Overlays;
 use crate::store::oauth::{
     clients as oauth_clients, codes as sign_in_codes, tokens as oauth_tokens,
 };
-use crate::store::{catalogs, changesets};
+use crate::store::{catalogs, changesets, email_tokens, sign_in_events};
 
 /// Every loaded catalog, by name (a `BTreeMap`, so iteration is in name
 /// order, like `catalog list`).
@@ -50,6 +50,9 @@ const OAUTH_RETENTION_DAYS: i64 = 7;
 
 /// How long a registered client that no grant names is kept.
 const UNBOUND_CLIENT_HOURS: i64 = 24;
+
+/// How long sign-in events are kept (spec "Logging and audit").
+const SIGN_IN_EVENT_RETENTION_DAYS: i64 = 90;
 
 /// The state every route and tool shares. Built once by [`App::load`] and
 /// shared as an `Arc<App>`.
@@ -379,8 +382,9 @@ impl App {
 
     /// At most once per [`OAUTH_PRUNE_EVERY`], deletes expired OAuth tokens
     /// and unredeemed codes kept [`OAUTH_RETENTION_DAYS`] past their expiry,
-    /// and registered clients no grant names after [`UNBOUND_CLIENT_HOURS`].
-    /// Runs whether or not OAuth is on, so rows left from when it was are
+    /// registered clients no grant names after [`UNBOUND_CLIENT_HOURS`],
+    /// sign-in events older than [`SIGN_IN_EVENT_RETENTION_DAYS`] and emailed
+    /// links [`OAUTH_RETENTION_DAYS`] past their expiry. Runs whether or not OAuth is on, so rows left from when it was are
     /// cleared too. Called only under `polling`.
     ///
     /// A failure is logged, not returned, and waits for the next hourly pass.
@@ -411,6 +415,18 @@ impl App {
                 now - TimeDelta::hours(UNBOUND_CLIENT_HOURS),
             )
             .await,
+        );
+        log_pruned(
+            "old sign-in events",
+            sign_in_events::prune(
+                &self.pool,
+                now - TimeDelta::days(SIGN_IN_EVENT_RETENTION_DAYS),
+            )
+            .await,
+        );
+        log_pruned(
+            "expired emailed links",
+            email_tokens::prune(&self.pool, retained).await,
         );
     }
 
@@ -1095,5 +1111,53 @@ mod tests {
         stale_token(2).await;
         test.app.poll().await.unwrap();
         assert_eq!(count("oauth_tokens").await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn poll_prunes_old_sign_in_events_and_long_expired_emailed_links() {
+        let test = app_with(&[("main", &[])], Config::default()).await;
+        let pool = test.app.pool().clone();
+        let now = Utc::now();
+        let user: String = sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
+            .bind(crate::db::TEST_USER)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        for (byte, expired_days_ago) in [(1u8, 8), (2u8, 1)] {
+            sqlx::query(
+                "INSERT INTO email_tokens (hash, user_id, purpose, created_at, expires_at) \
+                 VALUES ($1, $2, 'setup', $3, $4)",
+            )
+            .bind([byte; 32].as_slice())
+            .bind(&user)
+            .bind(now - TimeDelta::days(expired_days_ago + 1))
+            .bind(now - TimeDelta::days(expired_days_ago))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for days_ago in [91, 1] {
+            sqlx::query(
+                "INSERT INTO sign_in_events (user_id, method, outcome, at) \
+                 VALUES ($1, 'password', 'failed', $2)",
+            )
+            .bind(&user)
+            .bind(now - TimeDelta::days(days_ago))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        test.app.poll().await.unwrap();
+
+        let tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM email_tokens")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let events: i64 = sqlx::query_scalar("SELECT count(*) FROM sign_in_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((tokens, events), (1, 1));
     }
 }

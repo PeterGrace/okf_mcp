@@ -57,6 +57,35 @@ pub fn format_timestamp(instant: DateTime<Utc>) -> String {
     instant.format(TIMESTAMP_FORMAT).to_string()
 }
 
+/// `now` plus a configured duration, checked: a duration too long for a
+/// timestamp is refused instead of panicking or wrapping.
+///
+/// # Arguments
+/// * `now` - the start (server clock).
+/// * `duration` - how long after it (a std `Duration`, as config and
+///   settings hold them).
+///
+/// # Returns
+/// The instant `duration` after `now`.
+///
+/// # Errors
+/// [`crate::error::OkfError::LimitExceeded`] with `limit: "duration"` when
+/// the sum is past chrono's range.
+pub fn after(
+    now: DateTime<Utc>,
+    duration: std::time::Duration,
+) -> Result<DateTime<Utc>, crate::error::OkfError> {
+    // `from_std` fails for durations beyond chrono's range; `checked_add_signed`
+    // for sums beyond the calendar's. `and_then` chains the two `Option`s.
+    chrono::TimeDelta::from_std(duration)
+        .ok()
+        .and_then(|delta| now.checked_add_signed(delta))
+        .ok_or_else(|| crate::error::OkfError::LimitExceeded {
+            limit: "duration",
+            reason: format!("{duration:?} is too long"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +95,26 @@ mod tests {
     fn fixed_clock_returns_its_instant() {
         let instant = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
         assert_eq!(FixedClock(instant).now(), instant);
+    }
+
+    #[test]
+    fn after_adds_a_std_duration_and_refuses_an_absurd_one() {
+        let start = Utc.with_ymd_and_hms(2026, 11, 12, 12, 0, 0).unwrap();
+
+        let later = after(start, std::time::Duration::from_secs(90)).unwrap();
+        let absurd = after(start, std::time::Duration::from_secs(u64::MAX));
+
+        assert_eq!(
+            later,
+            Utc.with_ymd_and_hms(2026, 11, 12, 12, 1, 30).unwrap()
+        );
+        assert!(matches!(
+            absurd,
+            Err(crate::error::OkfError::LimitExceeded {
+                limit: "duration",
+                ..
+            })
+        ));
     }
 
     #[test]
