@@ -479,6 +479,31 @@ async fn refuse_last_owner(
     Ok(())
 }
 
+/// The id of the team called `name`, inside a caller's transaction.
+///
+/// The row is held `FOR KEY SHARE` until that transaction ends, so a
+/// concurrent [`delete`] (which locks the team `FOR UPDATE`) waits for the
+/// caller and then sees what it wrote (a catalog the team now owns); one that
+/// got there first leaves no row, which is `UnknownName` here rather than a
+/// foreign-key failure at the caller's write.
+///
+/// # Arguments
+/// * `conn` - the caller's transaction (pass `&mut tx`).
+/// * `name` - the team's name.
+///
+/// # Returns
+/// Its `teams.id`.
+///
+/// # Errors
+/// [`OkfError::UnknownName`]; [`OkfError::Database`].
+pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String, OkfError> {
+    sqlx::query_scalar("SELECT id FROM teams WHERE name = $1 FOR KEY SHARE")
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| unknown(name))
+}
+
 /// The error for a team name that names no team.
 fn unknown(name: &str) -> OkfError {
     OkfError::UnknownName {

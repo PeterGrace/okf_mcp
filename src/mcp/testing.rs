@@ -74,7 +74,7 @@ pub(crate) async fn app_at(
 ) -> TestApp {
     let db = crate::db::test_db().await;
     for (name, entries) in catalogs_and_files {
-        catalogs::create(&db.pool, name, "", imported)
+        catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, imported)
             .await
             .expect("create the test catalog");
         let options = ImportOptions {

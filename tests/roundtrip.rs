@@ -13,7 +13,6 @@ use std::process::Command;
 
 use chrono::Utc;
 use okf_mcp::archive::{self, Files};
-use okf_mcp::db;
 use okf_mcp::okf::workspace::StoredFile;
 use okf_mcp::store::import::{import, ImportOptions, ImportReport, ImportScope};
 use okf_mcp::store::{catalogs, export};
@@ -26,8 +25,8 @@ use support::pg::TestDb;
 /// The files read from the export, and the second import's report.
 async fn round_trip(files: &Files) -> (Files, ImportReport) {
     let db = TestDb::start().await;
-    db::migrate(&db.pool).await.unwrap();
-    catalogs::create(&db.pool, "rt", "", Utc::now())
+    support::server::migrate_with_owner(&db.pool).await;
+    catalogs::create(&db.pool, "rt", "", support::server::OWNER, Utc::now())
         .await
         .unwrap();
     let first = ImportOptions {

@@ -402,7 +402,9 @@ mod tests {
     /// A database with one grant; returns it with its id.
     async fn with_grant() -> (crate::db::pg_support::TestDb, String) {
         let db = test_db().await;
-        catalogs::create(&db.pool, "main", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         let client = insert_client(
             &db.pool,
             "https://client.example.com/client.json",

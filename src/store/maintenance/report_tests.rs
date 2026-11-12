@@ -423,10 +423,11 @@ async fn maintenance_report_pages_are_catalog_scoped() {
     let catalog = setup(&db.pool, &["a.md", "b.md"]).await;
     let (first, _) = fixture(&db.pool, catalog, "first").await;
     let (second, _) = fixture(&db.pool, catalog, "second").await;
-    let foreign = crate::store::catalogs::create(&db.pool, "foreign", "", t0())
-        .await
-        .unwrap()
-        .id;
+    let foreign =
+        crate::store::catalogs::create(&db.pool, "foreign", "", crate::db::TEST_TEAM, t0())
+            .await
+            .unwrap()
+            .id;
     revision(&db.pool, foreign, "a.md", 1, t0(), "Body").await;
     revision(&db.pool, foreign, "b.md", 1, t0(), "Body").await;
     let (foreign_run, foreign_finding) = fixture(&db.pool, foreign, "first").await;

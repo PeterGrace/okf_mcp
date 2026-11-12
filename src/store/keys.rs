@@ -903,7 +903,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn list_shows_a_grant_with_its_kind_and_client_and_no_hash() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "main", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         let names = ["main".to_string()];
         let key = create(
             &db.pool,
@@ -954,8 +956,12 @@ mod tests {
         let db = test_db().await;
         // Read first: the fixture user already bumped the generation.
         let start = catalogs::admin_generation(&db.pool).await.unwrap();
-        catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
-        catalogs::create(&db.pool, "work", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
+        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         // "pg" twice: one grant.
         let names = ["work".to_string(), "pg".to_string(), "pg".to_string()];
 
@@ -994,7 +1000,9 @@ mod tests {
         let db = test_db().await;
         // Read first: the fixture user already bumped the generation.
         let start = catalogs::admin_generation(&db.pool).await.unwrap();
-        catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         let pg = ["pg".to_string()];
         let missing = ["pg".to_string(), "nope".to_string()];
         create(&db.pool, &new_key("a", Grants::All, None), now())
@@ -1041,8 +1049,12 @@ mod tests {
         let db = test_db().await;
         // Read first: the fixture user already bumped the generation.
         let start = catalogs::admin_generation(&db.pool).await.unwrap();
-        catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
-        catalogs::create(&db.pool, "work", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
+        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         let pg = ["pg".to_string()];
         create(
             &db.pool,
@@ -1106,7 +1118,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn deleting_a_catalog_clears_it_as_a_default() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         create(&db.pool, &new_key("k", Grants::All, Some("pg")), now())
             .await
             .unwrap();
@@ -1114,7 +1128,9 @@ mod tests {
             create(&db.pool, &new_key("j", Grants::All, Some("nope")), now()).await;
 
         catalogs::delete(&db.pool, "pg", false).await.unwrap();
-        catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
 
         // A re-created catalog of the same name is not the old default.
         assert_eq!(list(&db.pool).await.unwrap()[0].default_catalog, None);
@@ -1127,7 +1143,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn names_group_actors_and_revoked_pairs_can_be_reissued() {
         let db = test_db().await;
-        let work_catalog = catalogs::create(&db.pool, "work", "", now()).await.unwrap();
+        let work_catalog = catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         let terminal = NewKey {
             name: "claude",
             access: Access::Write,
@@ -1251,7 +1269,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_exact_id_wins_over_a_colliding_group_name() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "work", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         let work = ["work".to_string()];
         let by_id = create_with_id(
             &db.pool,
@@ -1307,7 +1327,9 @@ mod tests {
         // and actor, so name resolution would pick it; by id nothing may.
         let db = test_db().await;
         for name in ["work", "extra"] {
-            catalogs::create(&db.pool, name, "", now()).await.unwrap();
+            catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, now())
+                .await
+                .unwrap();
         }
         insert_legacy_test_key(&db.pool, "legacy", Access::Write, "terminal", now()).await;
         let snapshot = list(&db.pool)
@@ -1356,7 +1378,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_legacy_id_uses_active_name_resolution_after_rotation() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "work", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         insert_legacy_test_key(&db.pool, "legacy", Access::Write, "terminal", now()).await;
 
         let work = ["work".to_string()];
@@ -1431,8 +1455,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn key_commands_by_name_act_on_the_key_and_never_on_a_grant_of_that_name() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "main", "", now()).await.unwrap();
-        catalogs::create(&db.pool, "other", "", now())
+        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
+        catalogs::create(&db.pool, "other", "", crate::db::TEST_TEAM, now())
             .await
             .unwrap();
         let client = crate::store::oauth::testing::insert_client(

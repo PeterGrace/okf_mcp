@@ -8,7 +8,7 @@ use okf_mcp::store::keys::Access;
 use serde_json::json;
 
 use crate::harness::{drive, Ui};
-use crate::support::server::{files, TestServer};
+use crate::support::server::{files, TestServer, OWNER};
 
 const ALPHA: &str = "---\ntype: system\ntitle: Alpha\n---\n# Alpha\n\nAlpha.\n";
 
@@ -79,6 +79,7 @@ async fn an_admin_creates_and_deletes_a_catalog_and_the_switcher_follows() {
             "#catalog-create-form textarea[name=description]",
             "Scratch space",
         );
+        ui.fill("#catalog-create-form input[name=owner]", OWNER);
         ui.click("#catalog-create-form button[type=submit]");
         // The page rebuilds the switcher before it redraws the table.
         ui.wait_visible("[data-catalog=scratch]");

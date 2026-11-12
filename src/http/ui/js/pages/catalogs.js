@@ -47,14 +47,18 @@ export async function render(main) {
                 h('input', { name: 'name', required: true, pattern: '[a-z0-9-]+', autocomplete: 'off',
                              placeholder: 'lowercase letters, digits and -' })),
             h('label', {}, 'Description', h('textarea', { name: 'description', rows: '3' })),
+            h('label', {}, 'Owner',
+                h('input', { name: 'owner', required: true, autocomplete: 'off',
+                             placeholder: 'the owning team (a user name for its personal team)' })),
             h('button', { type: 'submit' }, 'Create catalog'));
         form.addEventListener('submit', async event => {
             event.preventDefault();
             const data = new FormData(form);
             const name = String(data.get('name') ?? '').trim();
             try {
-                await api.post('/catalogs', { name, description: String(data.get('description') ?? '') });
-            } catch { return; /* toasted: invalid or taken name */ }
+                await api.post('/catalogs', { name, description: String(data.get('description') ?? ''),
+                                              owner: String(data.get('owner') ?? '').trim() });
+            } catch { return; /* toasted: invalid or taken name, or unknown owner */ }
             toast(`Created catalog ${name}.`, 'ok');
             await settled();
         });
