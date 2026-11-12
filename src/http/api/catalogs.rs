@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, patch};
+use axum::routing::{get, patch, put};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 
-use super::require_admin;
+use super::{require_every_catalog, settle};
 use crate::app::App;
-use crate::auth::{Principal, Reach};
+use crate::auth::Principal;
 use crate::catalog::CatalogState;
 use crate::clock::format_timestamp;
 use crate::error::OkfError;
@@ -38,6 +38,7 @@ pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
             "/catalogs/{catalog}",
             patch(update_catalog).delete(delete_catalog),
         )
+        .route("/catalogs/{catalog}/owner", put(set_owner))
         .route("/catalogs/{catalog}/export", archives::export_route())
         .route("/catalogs/{catalog}/import", archives::import_route(app))
 }
@@ -123,6 +124,26 @@ pub(crate) struct DescriptionChanged {
     pub previous: String,
     /// The description it has now.
     pub description: String,
+}
+
+/// `PUT /catalogs/{catalog}/owner`'s body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerChange {
+    /// The team that owns it from now on.
+    team: String,
+}
+
+/// `PUT /catalogs/{catalog}/owner`'s answer, as `okf-mcp catalog set-owner`
+/// prints it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct OwnerChanged {
+    /// The catalog.
+    pub name: String,
+    /// The team that owned it; null when it was unassigned.
+    pub previous: Option<String>,
+    /// The team that owns it now.
+    pub owner_team: String,
 }
 
 /// `DELETE /catalogs/{catalog}`'s query.
@@ -228,6 +249,32 @@ async fn update_catalog(
     }))
 }
 
+/// `PUT /catalogs/{catalog}/owner`: makes `team` the catalog's owner, then
+/// polls so the listing shows it at once. Ownership grants no access, so it
+/// needs an admin key that reaches every catalog, like the users and teams
+/// routes (plan Decision 3), not `admin` on the catalog.
+///
+/// # Errors
+/// 403 for any other key; 404 for an unknown catalog or team; 422 for a body
+/// without `team`; 500 for a database failure.
+async fn set_owner(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(catalog): Path<String>,
+    Json(change): Json<OwnerChange>,
+) -> Result<Json<OwnerChanged>, AppError> {
+    require_every_catalog(&principal)?;
+    let previous = catalog_rows::set_owner(app.pool(), &catalog, &change.team).await?;
+    tracing::info!(%catalog, key = %principal.key_id, actor = %principal.actor,
+                   "catalog owner changed");
+    settle(&app).await;
+    Ok(Json(OwnerChanged {
+        name: catalog,
+        previous,
+        owner_team: change.team,
+    }))
+}
+
 /// `DELETE /catalogs/{catalog}[?force=true]`: deletes the catalog with its
 /// documents, history, changesets and grants (`admin` on the catalog), then
 /// polls so it is gone at once.
@@ -258,35 +305,6 @@ async fn delete_catalog(
     Ok(Json(CatalogDeleted { name: catalog }))
 }
 
-/// Refuses all but an admin key that reaches every catalog.
-///
-/// # Errors
-/// [`OkfError::Forbidden`] below `admin`, or for a key granted named catalogs.
-fn require_every_catalog(principal: &Principal) -> Result<(), OkfError> {
-    require_admin(principal)?;
-    match &principal.reach {
-        Reach::All => Ok(()),
-        Reach::Catalogs(_) => Err(OkfError::Forbidden {
-            reason: "creating a catalog needs an admin key that reaches every catalog \
-                     (okf-mcp key create --all)"
-                .to_string(),
-        }),
-    }
-}
-
-/// Polls after an administrative change, so the key cache and the catalog
-/// list reflect it for the next request. The change has committed, so a
-/// failed poll is logged, not returned: the poll loop retries it.
-///
-/// # Arguments
-/// * `app` - the application. An `&Arc<App>` argument coerces to `&App`
-///   automatically (deref coercion).
-async fn settle(app: &App) {
-    if let Err(error) = app.poll().await {
-        tracing::error!(%error, "poll after a catalog change failed; the poll loop retries");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,30 +316,9 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::db::TEST_TEAM;
-    use crate::http::api::testing::{app, assert_matrix, keys, send, Row};
+    use crate::http::api::testing::{app, assert_matrix, every_catalog_admin, keys, send, Row};
     use crate::http::archives::tarball_of;
     use crate::mcp::testing::{open, pending_entry, writer, PendingEdit, TestApp};
-    use crate::store::keys::{self as key_rows, Grants, NewKey};
-
-    /// An admin key that reaches every catalog, the only kind that may
-    /// create one. It is polled in, like `testing::keys`.
-    async fn every_catalog_admin(test: &TestApp) -> String {
-        let new = NewKey {
-            name: "root",
-            access: Access::Admin,
-            maintenance_report: false,
-            grants: Grants::All,
-            default_catalog: Some("main"),
-            actor: "root",
-            user: crate::db::TEST_USER,
-        };
-        let key = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
-            .await
-            .expect("create the key")
-            .key;
-        test.app.poll().await.expect("poll the key in");
-        key
-    }
 
     /// One request with a raw body through the whole router; the status,
     /// the headers and the body bytes.
@@ -366,7 +363,8 @@ mod tests {
     async fn the_catalog_routes_follow_the_access_matrix() {
         let test = app().await;
         // The delete runs last: it removes `main`. Every key in the matrix
-        // reaches one catalog only, so none may create one (all 403).
+        // reaches one catalog only, so none may create one or change an
+        // owner (all 403).
         assert_matrix(
             &test,
             &[
@@ -402,6 +400,15 @@ mod tests {
                     method: "POST",
                     uri: "/api/v1/catalogs".into(),
                     body: Some(json!({ "name": "made-in-matrix", "owner": TEST_TEAM })),
+                    read: 403,
+                    write: 403,
+                    admin: 403,
+                    stranger: 403,
+                },
+                Row {
+                    method: "PUT",
+                    uri: "/api/v1/catalogs/main/owner".into(),
+                    body: Some(json!({ "team": TEST_TEAM })),
                     read: 403,
                     write: 403,
                     admin: 403,
