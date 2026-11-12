@@ -83,8 +83,10 @@ pub const DATABASE_PREFIX: &str = "test_";
 /// server (any constant every process agrees on: "okf-tpl" in ASCII).
 const TEMPLATE_LOCK_KEY: i64 = 0x006f_6b66_2d74_706c;
 
-/// The pool size of each test's own connection to its database.
-const POOL_SIZE: u32 = 4;
+/// The pool size of each test's own connection to its database: 8, so a
+/// mail test's worker (a LISTEN connection, plus fetches, acks and
+/// heartbeats) and the test itself both fit (Decision 19).
+const POOL_SIZE: u32 = 8;
 
 /// The schema migrations, embedded here as in `okf_mcp::db::MIGRATOR` (this
 /// file cannot name that: it is `crate::db` in the library's unit tests and
@@ -104,7 +106,8 @@ fn apalis_migrator() -> Migrator {
 /// tests ask at the same time (like a lock-guarded lazy global in Python).
 static SHARED_TEMPLATE: OnceCell<String> = OnceCell::const_new();
 
-/// A database of a test's own and a pool connected to it.
+/// A database of a test's own and a pool connected to it, with up to 8
+/// connections.
 pub struct TestDb {
     /// Connected to the test's database.
     pub pool: PgPool,

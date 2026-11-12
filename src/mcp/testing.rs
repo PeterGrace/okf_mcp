@@ -88,6 +88,9 @@ pub(crate) async fn app_at(
             .await
             .expect("import the test files");
     }
+    // Test apps only enqueue (Decision 19); the investigator test serves one.
+    let mut config = config;
+    config.mail.worker = false;
     let app = App::load(db.pool.clone(), config, clock)
         .await
         .expect("load the app");
