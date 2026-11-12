@@ -1,15 +1,28 @@
 //! The API keys page: create a key and see its secret once, sign in with
 //! it, revoke the signed-in key, and what a read key sees; mint, list and
-//! revoke a sign-in code, and how an OAuth grant shows (M10 Task 7).
+//! revoke a sign-in code, and how an OAuth grant shows (M10 Task 7); change
+//! a key's or code's user, and assign one that has none (M11 Task 8).
 
 use chrono::{TimeDelta, Utc};
 use okf_mcp::config::Config;
 use okf_mcp::store::keys::{self as key_rows, Access, Grants};
 use okf_mcp::store::oauth::clients;
 use okf_mcp::store::oauth::codes::{self, NewSignInCode};
+use okf_mcp::store::users::{self, NewUser};
 
-use crate::harness::drive;
+use crate::harness::{drive, Ui};
 use crate::support::server::{files, TestServer, OWNER};
+
+/// Creates the user `alice`, a second one to reassign credentials to.
+async fn alice(server: &TestServer) {
+    let alice = NewUser {
+        name: "alice",
+        display_name: "Alice Example",
+    };
+    users::create(&server.db.pool, &alice, Utc::now())
+        .await
+        .expect("create alice");
+}
 
 async fn server() -> TestServer {
     TestServer::start(
@@ -31,7 +44,7 @@ async fn an_admin_creates_a_key_sees_its_secret_once_and_signs_in_with_it() {
         ui.wait_visible("[data-test=key-console-admin]");
         ui.click("#key-new");
         ui.fill("#key-form input[name=name]", "console-made");
-        ui.fill("#key-form input[name=user]", OWNER);
+        ui.select("#key-form select[name=user]", OWNER);
         ui.click("#key-form input[name=catalog][value=main]");
         ui.click("#key-form button[type=submit]");
         ui.wait_visible("#key-secret");
@@ -103,15 +116,15 @@ async fn an_admin_mints_a_sign_in_code_sees_it_once_and_revokes_it() {
         ui.click("#code-new");
         ui.fill("#code-form input[name=name]", "console-code");
         ui.fill("#code-form input[name=actor]", "example-actor");
-        ui.fill("#code-form input[name=user]", OWNER);
+        ui.select("#code-form select[name=user]", OWNER);
         // No catalog: the server refuses (409), which the page toasts. No
         // code was minted, so no dialog opens, and the form stays filled.
         ui.click("#code-form button[type=submit]");
         ui.wait_text("#toasts", "must be granted a catalog");
         assert!(!ui.page.is_visible("#code-secret-dialog").expect("visible"));
         let kept = ui.eval(
-            "() => ['name', 'actor', 'user'].map(field => \
-                 document.querySelector(`#code-form input[name=${field}]`).value)",
+            "() => ['input[name=name]', 'input[name=actor]', 'select[name=user]'].map(field => \
+                 document.querySelector(`#code-form ${field}`).value)",
             serde_json::json!(null),
         );
         assert_eq!(
@@ -232,6 +245,255 @@ async fn an_oauth_grant_is_marked_and_cannot_be_given_reporting() {
         ui.wait_text("#drawer", "OAuth grant");
         ui.wait_visible("#key-revoke");
         assert!(!ui.page.is_visible("#key-report-toggle").expect("visible"));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admin_changes_a_keys_user_and_assigns_a_legacy_key() {
+    let server = server().await;
+    // Every catalog: only such a key manages the legacy key, which has them.
+    let admin = server
+        .key("console-admin", Access::Admin, &[], Some("main"))
+        .await;
+    server.key("laptop", Access::Read, &["main"], None).await;
+    server.legacy_key("legacy", Access::Read).await;
+    alice(&server).await;
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        // The shell names the signed-in key's user.
+        ui.wait_text("#whoami", &format!("{OWNER} / console-admin"));
+        ui.open("/keys");
+        ui.wait_text("[data-test=key-user-laptop]", OWNER);
+        ui.click("[data-test=key-laptop]");
+        ui.wait_text("#key-assign", "Change user");
+        ui.select("#key-user-select", "alice");
+        ui.click("#key-assign");
+        ui.wait_text("[data-test=key-user-laptop]", "alice");
+        ui.click("#drawer-close");
+        // A key from before users existed is marked, and its drawer offers
+        // Assign instead.
+        ui.wait_text("[data-test=key-user-legacy]", "unassigned");
+        ui.click("[data-test=key-legacy]");
+        ui.wait_text("#drawer-title", "legacy");
+        ui.wait_text("#key-assign", "Assign");
+        ui.select("#key-user-select", OWNER);
+        ui.click("#key-assign");
+        ui.wait_text("[data-test=key-user-legacy]", OWNER);
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let rows = key_rows::list(&server.db.pool).await.expect("list keys");
+    let user_of = |name: &str| {
+        rows.iter()
+            .find(|key| key.name == name)
+            .and_then(|key| key.user.clone())
+    };
+    assert_eq!(user_of("laptop").as_deref(), Some("alice"));
+    assert_eq!(user_of("legacy").as_deref(), Some(OWNER));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admin_changes_a_sign_in_codes_user() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    alice(&server).await;
+    let main = ["main".to_string()];
+    codes::create(
+        &server.db.pool,
+        &NewSignInCode {
+            name: "tablet",
+            access: Access::Read,
+            grants: Grants::Catalogs(&main),
+            default_catalog: None,
+            actor: "",
+            expires_at: Utc::now() + TimeDelta::hours(1),
+            user: OWNER,
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("mint a code");
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        ui.wait_text("[data-test=code-user-tablet]", OWNER);
+        ui.click("[data-test=code-tablet]");
+        ui.wait_text("#code-assign", "Change user");
+        ui.select("#code-user-select", "alice");
+        ui.click("#code-assign");
+        ui.wait_text("[data-test=code-user-tablet]", "alice");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let minted = codes::list(&server.db.pool).await.expect("list codes");
+    assert_eq!(minted[0].user.as_deref(), Some("alice"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reassigning_the_signed_in_key_updates_the_shell_identity() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    alice(&server).await;
+    drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.wait_text("#whoami", &format!("{OWNER} / console-admin"));
+        ui.open("/keys");
+        ui.click("[data-test=key-console-admin]");
+        ui.wait_text("#key-assign", "Change user");
+        ui.select("#key-user-select", "alice");
+        ui.click("#key-assign");
+        ui.wait_text("[data-test=key-user-console-admin]", "alice");
+        // The shell follows without a reload: the identity line, and the
+        // Users page's "you" marker.
+        ui.wait_text("#whoami", "alice / console-admin");
+        ui.click("#drawer-close");
+        ui.open("/users");
+        ui.wait_text("[data-test=user-alice]", "you");
+        let tester = ui.text(&format!("[data-test=user-{OWNER}]"));
+        assert!(!tester.contains("you"), "still marked: {tester:?}");
+    })
+    .await;
+}
+
+/// Holds the page's next request with method `arg.method` to a path ending
+/// in `arg.suffix` until `window.releaseHeld()`; `window.heldDone` turns
+/// true once that held answer has been handed back to the page. Runs
+/// through `ui.eval`, so it wraps `fetch` without touching the page's code.
+const HOLD_NEXT: &str = "(arg) => {
+    const original = window.fetch;
+    let release = null;
+    window.heldDone = false;
+    window.releaseHeld = () => release();
+    window.fetch = (input, init) => {
+        const method = (init && init.method) || 'GET';
+        if (release === null && method === arg.method && String(input).endsWith(arg.suffix)) {
+            const held = new Promise(resolve => { release = resolve; });
+            return held.then(() => original(input, init))
+                .finally(() => { window.heldDone = true; window.fetch = original; });
+        }
+        return original(input, init);
+    };
+    return true;
+}";
+
+/// Holds the next `method` request to a path ending in `suffix` (see
+/// [`HOLD_NEXT`]).
+fn hold_next(ui: &Ui, method: &str, suffix: &str) {
+    ui.eval(
+        HOLD_NEXT,
+        serde_json::json!({ "method": method, "suffix": suffix }),
+    );
+}
+
+/// Releases the held answer, waits until the page has it, then gives the
+/// page a moment to act on it (a stale drawer would be drawn by then).
+fn release_held(ui: &Ui) {
+    ui.eval("() => window.releaseHeld()", serde_json::json!(null));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while ui.eval("() => window.heldDone", serde_json::json!(null)) != serde_json::json!(true) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the held answer never arrived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_answer_for_an_earlier_drawer_never_replaces_or_reopens_it() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    server.key("alpha", Access::Read, &["main"], None).await;
+    server.key("bravo", Access::Read, &["main"], None).await;
+    drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        ui.wait_visible("[data-test=key-bravo]");
+        // alpha's drawer waits on its held answer; bravo's opens meanwhile.
+        hold_next(ui, "GET", "/api/v1/users");
+        ui.click("[data-test=key-alpha]");
+        ui.click("[data-test=key-bravo]");
+        ui.wait_text("#drawer-title", "bravo");
+        release_held(ui);
+        assert_eq!(
+            ui.text("#drawer-title"),
+            "bravo",
+            "alpha's late answer replaced the drawer"
+        );
+        // Dismissing the drawer cancels a load still pending.
+        ui.click("#drawer-close");
+        ui.wait_hidden("#drawer");
+        hold_next(ui, "GET", "/api/v1/users");
+        ui.click("[data-test=key-alpha]");
+        ui.page.press_key(None, "Escape").expect("press Escape");
+        release_held(ui);
+        assert!(
+            !ui.page.is_visible("#drawer").expect("visible"),
+            "the dismissed load opened"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_assign_never_replaces_a_newer_drawer_or_reopens_a_dismissed_one() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    server.key("alpha", Access::Read, &["main"], None).await;
+    server.key("bravo", Access::Read, &["main"], None).await;
+    alice(&server).await;
+    drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        // alpha's assign is held while the user moves on to bravo.
+        ui.click("[data-test=key-alpha]");
+        ui.wait_text("#drawer-title", "alpha");
+        ui.select("#key-user-select", "alice");
+        hold_next(ui, "PUT", "/user");
+        ui.click("#key-assign");
+        ui.click("#drawer-close");
+        ui.wait_hidden("#drawer");
+        // Visible again only once bravo's drawer is drawn.
+        ui.click("[data-test=key-bravo]");
+        ui.wait_visible("#drawer");
+        ui.wait_text("#drawer-title", "bravo");
+        release_held(ui);
+        // The table follows the assign either way.
+        ui.wait_text("[data-test=key-user-alpha]", "alice");
+        let replaced = ui.text("#drawer-title") != "bravo";
+        // bravo's assign is held, and the drawer dismissed meanwhile.
+        ui.click("#drawer-close");
+        ui.wait_hidden("#drawer");
+        ui.click("[data-test=key-bravo]");
+        ui.wait_visible("#drawer");
+        ui.wait_text("#drawer-title", "bravo");
+        ui.select("#key-user-select", "alice");
+        hold_next(ui, "PUT", "/user");
+        ui.click("#key-assign");
+        ui.page.press_key(None, "Escape").expect("press Escape");
+        ui.wait_hidden("#drawer");
+        release_held(ui);
+        ui.wait_text("[data-test=key-user-bravo]", "alice");
+        let reopened = ui.page.is_visible("#drawer").expect("visible");
+        assert!(
+            !replaced && !reopened,
+            "alpha's late assign replaced bravo's drawer: {replaced}; \
+             bravo's late assign reopened the dismissed drawer: {reopened}"
+        );
     })
     .await;
 }

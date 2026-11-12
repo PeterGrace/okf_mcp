@@ -2,9 +2,11 @@
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use chrono::Utc;
 use okf_mcp::archive::{write_tarball, ExportFile};
 use okf_mcp::config::Config;
 use okf_mcp::store::keys::Access;
+use okf_mcp::store::teams::{self, NewTeam};
 use serde_json::json;
 
 use crate::harness::{drive, Ui};
@@ -79,10 +81,11 @@ async fn an_admin_creates_and_deletes_a_catalog_and_the_switcher_follows() {
             "#catalog-create-form textarea[name=description]",
             "Scratch space",
         );
-        ui.fill("#catalog-create-form input[name=owner]", OWNER);
+        ui.select("#catalog-create-form select[name=owner]", OWNER);
         ui.click("#catalog-create-form button[type=submit]");
         // The page rebuilds the switcher before it redraws the table.
         ui.wait_visible("[data-catalog=scratch]");
+        ui.wait_text("[data-test=catalog-owner-scratch]", OWNER);
         assert_eq!(switcher(ui), ["main", "scratch"]);
 
         ui.click("[data-catalog=scratch]");
@@ -95,6 +98,53 @@ async fn an_admin_creates_and_deletes_a_catalog_and_the_switcher_follows() {
         assert_eq!(switcher(ui), ["main"]);
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admin_changes_a_catalogs_owner_and_a_scoped_admin_cannot() {
+    let server = server().await;
+    let root = server.key("console-root", Access::Admin, &[], None).await;
+    let scoped = server
+        .key("console-scoped", Access::Admin, &["main"], Some("main"))
+        .await;
+    let family = NewTeam {
+        name: "family",
+        display_name: "",
+        owner: OWNER,
+    };
+    teams::create(&server.db.pool, &family, Utc::now())
+        .await
+        .expect("create a team");
+    let ran = drive(server.base.clone(), move |ui| {
+        // A scoped admin sees the owner, but the control is disabled.
+        ui.login(&scoped);
+        ui.open("/catalogs");
+        ui.wait_text("[data-test=catalog-owner-main]", OWNER);
+        ui.click("[data-catalog=main]");
+        ui.wait_visible("#catalog-owner-select[disabled]");
+        ui.wait_visible("#catalog-owner-save[disabled]");
+        ui.click("#drawer-close");
+        ui.click("#signout");
+        // One that reaches every catalog changes it.
+        ui.login(&root);
+        ui.open("/catalogs");
+        ui.click("[data-catalog=main]");
+        // The scoped admin's closed drawer still holds its disabled control
+        // until this one replaces it.
+        ui.wait_visible("#catalog-owner-select:not([disabled])");
+        ui.wait_text("#catalog-owner-save", "Change owner");
+        ui.select("#catalog-owner-select", "family");
+        ui.click("#catalog-owner-save");
+        ui.wait_text("[data-test=catalog-owner-main]", "family");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let owned = teams::find(&server.db.pool, "family")
+        .await
+        .expect("read the team");
+    assert_eq!(owned.catalogs, ["main"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

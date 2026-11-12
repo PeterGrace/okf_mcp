@@ -131,6 +131,17 @@ impl Ui {
             .expect("fill");
     }
 
+    /// Chooses `value` in the `<select>` `selector`, firing its `input` and
+    /// `change` events. rustwright's `fill` refuses a `<select>`, and its
+    /// `select_options` does not wait, so this polls until the select
+    /// exists and has an option of that value (pickers fill theirs after an
+    /// API call).
+    pub fn select(&self, selector: &str, value: &str) {
+        self.poll(&format!("{selector} offering {value:?}"), || {
+            self.page.select_options(selector, &[value]).is_ok()
+        });
+    }
+
     /// Runs a JS function expression `(arg) => ...` in the page and returns
     /// its JSON result. The function form runs under the console's CSP.
     pub fn eval(&self, function: &str, arg: serde_json::Value) -> serde_json::Value {

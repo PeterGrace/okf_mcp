@@ -2005,6 +2005,15 @@ git commit -am "feat(api): users, teams, membership, assign and unassigned route
 
 All rendering uses `h()` from `core/dom.js`, `listTable`, `openDrawer`, `confirmDialog` and `toast`, as `catalogs.js` does. No inline script or style (the CSP forbids them, and `pages_have_no_inline_script_or_style` style tests check it). Every interactive element gets a stable `id` or `data-test`, which the journeys use.
 
+> **Corrected (issue #286).** What shipped differs from the sketches below; read the files named. The journeys above are updated inline (`ui.select` for every `<select>`, `#catalog-create`, `key-user-<name>`).
+> - **Helpers.** `openDrawer(title, subtitle, ...content)`, `confirmDialog({ title, message, action })` and `count(n, noun)` are the real signatures, not the sketch's. A new `components/picker.js` holds what every page shares: `namesOf('users' | 'teams')`, `picker(attrs, names, selected)` (a disabled "Choose..." first option, so a `required` picker needs a deliberate choice; nothing is preselected) and `assignControl({ names, current, label, allowed, ids, assign })` (a picker plus a button enabled only for a different name).
+> - **Drawer tickets.** Each drawer (key, code, catalog, team, user, and the create forms) takes `drawerTicket(main)` from `core/drawer.js` when it is asked for and keeps it: it opens with `ticket.open(...)` and closes with `ticket.close()`, and every action in it (assign, revoke, grant, role change, remove, delete, change owner, save) refreshes the table and identity as before but re-renders or closes the drawer only while `ticket.current()`. `openDrawer`, `closeDrawer` and every new ticket bump one generation, so a late load or action answer never replaces a newer drawer or reopens a dismissed one. Journeys hold a request by wrapping `window.fetch` (`hold_next` in `tests/ui_e2e/keys.rs`): `a_late_answer_for_an_earlier_drawer_never_replaces_or_reopens_it` (a held `/users` load) and `a_late_assign_never_replaces_a_newer_drawer_or_reopens_a_dismissed_one` (a held assign `PUT`).
+> - **Gating.** `shell.js` exports `canAdministerPeople()` (`admin` and `whoami.all_catalogs`). Users, Teams and the catalog owner control render disabled without it, with a note; `#/users/unassigned` shows `#unassigned-denied`; `refreshUnassigned()` hides the badge. Key and code assign follow the managed rule, so any admin managing the credential may use them. `refreshUnassigned` also keeps only its newest call's answer, as `refreshFindingsBadge` does.
+> - **Keys page.** The create forms' `user` is the picker (`#key-form select[name=user]`, `#code-form select[name=user]`). Both tables gain a User column whose cell is `[data-test=key-user-<name>]` / `[data-test=code-user-<name>]` ("unassigned" when none). Each drawer has `#key-user-select` + `#key-assign` (`#code-user-select` + `#code-assign`), labelled "Assign" or "Change user"; a revoked key keeps this control. Journeys in `tests/ui_e2e/keys.rs`: `an_admin_changes_a_keys_user_and_assigns_a_legacy_key` (needs an every-catalog admin: only it manages a legacy all-catalogs key), `an_admin_changes_a_sign_in_codes_user`, and `reassigning_the_signed_in_key_updates_the_shell_identity`: reassigning the signed-in key, from its drawer or from the unassigned view, calls `shell.js`' `keyUserChanged(keyId)`, which runs `refreshIdentity()` for the signed-in key, so `#whoami` and the Users page's "you" marker follow (`teams::assigning_the_signed_in_key_from_the_unassigned_view_updates_the_shell_identity` covers the second path). `TestServer::legacy_key(name, access)` returns the key's secret.
+> - **Catalogs page.** The owner picker is filled from `GET /teams`; the edit drawer's control is `#catalog-owner-select` + `#catalog-owner-save` ("Change owner", or "Assign" when unassigned), disabled for a scoped admin. Journey: `catalogs::an_admin_changes_a_catalogs_owner_and_a_scoped_admin_cannot`.
+> - **Users and Teams.** The user drawer lists `#user-keys` and `#user-codes`, and `#user-delete-reason` explains a refused delete (credentials, other teams, or catalogs its personal team owns, from `GET /teams/{name}`). Team members carry `[data-test=member-role-<user>]` selects and `[data-test=member-remove-<user>]` buttons (disabled for the personal team's own user); `#team-delete-reason` explains a personal team or owned catalogs. `users::a_scoped_admin_lists_users_but_cannot_change_them` covers the disabled state, and `users::another_team_or_an_owned_catalog_refuses_the_delete_until_cleared` the other-team and owned-catalog reasons, each until its cause is cleared. `teams::the_last_owner_is_kept_then_replaced_removed_and_the_team_deleted` covers the last-owner refusal (the role select resets), Remove, a shared team's Delete, and a personal team's disabled controls. `teams::a_grant_a_code_and_a_catalog_are_assigned_from_the_unassigned_view` seeds an unassigned OAuth grant, sign-in code and catalog (cleared with SQL), assigns each from the unassigned view, and checks the badge counts down and the users and owner persist.
+> - **Harness.** `Ui::select(selector, value)` polls rustwright's `select_options` until the option exists (it fires `input` and `change`); `fill` refuses a `<select>`. `TestServer::legacy_key(name, access)` also bumps the admin generation before polling.
+
 - [ ] **Step 1: Write the failing journeys.** `tests/ui_e2e/users.rs`:
 
 ```rust
@@ -2076,17 +2085,17 @@ async fn create_team_add_member_create_owned_catalog_and_key_for_user() {
         ui.open("/teams");
         ui.click("#team-new");
         ui.fill("#team-form input[name=name]", "family");
-        ui.fill("#team-form select[name=owner]", "tester");
+        ui.select("#team-form select[name=owner]", "tester");
         ui.click("#team-form button[type=submit]");
         ui.click("[data-test=team-family]");
-        ui.fill("#member-form select[name=user]", "alice");
+        ui.select("#member-form select[name=user]", "alice");
         ui.click("#member-form button[type=submit]");
         ui.wait_text("#team-members", "alice");
         // A catalog the team owns.
         ui.open("/catalogs");
-        ui.click("#catalog-new");
+        ui.click("#catalog-create");
         ui.fill("#catalog-create-form input[name=name]", "shared");
-        ui.fill("#catalog-create-form select[name=owner]", "family");
+        ui.select("#catalog-create-form select[name=owner]", "family");
         ui.click("#catalog-create-form button[type=submit]");
         ui.wait_text("[data-catalog=shared]", "shared");
         ui.wait_text("[data-test=catalog-owner-shared]", "family");
@@ -2094,11 +2103,11 @@ async fn create_team_add_member_create_owned_catalog_and_key_for_user() {
         ui.open("/keys");
         ui.click("#key-new");
         ui.fill("#key-form input[name=name]", "alice-laptop");
-        ui.fill("#key-form select[name=user]", "alice");
+        ui.select("#key-form select[name=user]", "alice");
         ui.click("#key-form input[name=catalog][value=shared]");
         ui.click("#key-form button[type=submit]");
         ui.click("#key-secret-done");
-        ui.wait_text("[data-test=key-alice-laptop]", "alice");
+        ui.wait_text("[data-test=key-user-alice-laptop]", "alice");
         ui.assert_no_console_errors();
     })
     .await;
@@ -2108,12 +2117,12 @@ async fn create_team_add_member_create_owned_catalog_and_key_for_user() {
 async fn a_legacy_key_is_assigned_from_the_unassigned_view() {
     let server = TestServer::start(vec![("main", files(&[("index.md", "# Main\n")]))], Config::default()).await;
     let admin = server.key("console-admin", Access::Admin, &[], None).await;
-    server.legacy_key("legacy").await; // new TestServer helper: insert a key row with user_id NULL, poll
+    server.legacy_key("legacy", Access::Read).await; // new TestServer helper: insert a key row with user_id NULL, poll
     drive(server.base.clone(), move |ui| {
         ui.login(&admin);
         ui.wait_text("#unassigned-badge", "1");
         ui.open("/users/unassigned");
-        ui.fill("[data-test=assign-key-legacy] select", "tester");
+        ui.select("[data-test=assign-key-legacy] select", "tester");
         ui.click("[data-test=assign-key-legacy] button");
         ui.wait_text("#unassigned-empty", "Nothing is unassigned");
         ui.wait_hidden("#unassigned-badge");
@@ -2122,7 +2131,7 @@ async fn a_legacy_key_is_assigned_from_the_unassigned_view() {
 }
 ```
 
-Add `TestServer::legacy_key(name)` to `tests/support/server.rs`: it inserts an `api_keys` row through raw SQL with `user_id` NULL (as `insert_legacy_test_key` does) and polls. If `ui.fill` doesn't set `<select>` values, add a `ui.select(selector, value)` helper to `harness.rs` that runs `el.value = v; el.dispatchEvent(new Event('change', {bubbles: true}))` through `eval`.
+Add `TestServer::legacy_key(name, access) -> String` to `tests/support/server.rs`: it inserts an `api_keys` row through raw SQL with `user_id` NULL (as `insert_legacy_test_key` does) and polls. If `ui.fill` doesn't set `<select>` values, add a `ui.select(selector, value)` helper to `harness.rs` that runs `el.value = v; el.dispatchEvent(new Event('change', {bubbles: true}))` through `eval`.
 
 Update `tests/ui_e2e/keys.rs` and `tests/ui_e2e/catalogs.rs`: their create journeys now choose a user or owner (`tester`) before submitting.
 
@@ -2382,8 +2391,8 @@ Run it: `cargo test --test parity`. It fails: the section doesn't exist yet. If 
 | `okf-mcp team remove-member` | `DELETE /api/v1/teams/{name}/members/{user}` | Teams → team → Remove |
 | `okf-mcp team delete` | `DELETE /api/v1/teams/{name}` | Teams → team → Delete team |
 | `okf-mcp catalog set-owner` | `PUT /api/v1/catalogs/{name}/owner` | Catalogs → catalog → Change owner |
-| `okf-mcp key assign` | `PUT /api/v1/keys/{id}/user` | API keys → key → Assign; Users → Unassigned |
-| `okf-mcp oauth code assign` | `PUT /api/v1/oauth/codes/{id}/user` | API keys → code → Assign; Users → Unassigned |
+| `okf-mcp key assign` | `PUT /api/v1/keys/{id}/user` | API keys → key → Assign / Change user; Users → Unassigned |
+| `okf-mcp oauth code assign` | `PUT /api/v1/oauth/codes/{id}/user` | API keys → code → Assign / Change user; Users → Unassigned |
 | `okf-mcp unassigned` | `GET /api/v1/unassigned` | Users → Unassigned (badge on Users) |
 
 - [ ] **Step 3: Run** `cargo test --test parity`, then `just fmt && just lint && just test`. Expected: PASS.

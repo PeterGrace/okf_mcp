@@ -249,6 +249,40 @@ impl TestServer {
         key
     }
 
+    /// Inserts a key called `name`, granted every catalog, with no user, as
+    /// a key made before users existed is, then reloads the key cache. No
+    /// store function makes one any more, so this writes the row itself,
+    /// and bumps the administrative generation so the poll sees it.
+    ///
+    /// # Arguments
+    /// * `name` - its id, name and actor.
+    /// * `access` - its access level.
+    ///
+    /// # Returns
+    /// The key, to send as a bearer token.
+    ///
+    /// # Panics
+    /// If the insert or the poll fails.
+    pub async fn legacy_key(&self, name: &str, access: Access) -> String {
+        let secret = okf_mcp::keys::generate().expect("generate a key");
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, sha256, access, all_catalogs, actor, created_at) \
+             VALUES ($1, $1, $2, $3, true, $1, now())",
+        )
+        .bind(name)
+        .bind(okf_mcp::keys::hash(&secret).as_slice())
+        .bind(access.as_str())
+        .execute(&self.db.pool)
+        .await
+        .expect("insert a legacy key");
+        sqlx::query("UPDATE server_state SET admin_generation = admin_generation + 1")
+            .execute(&self.db.pool)
+            .await
+            .expect("bump the admin generation");
+        self.app.poll().await.expect("poll");
+        secret
+    }
+
     /// Creates a read-only maintenance reporter and refreshes the key cache.
     pub async fn reporter_key(&self, name: &str, catalogs: &[&str]) -> String {
         let key = self.key(name, Access::Read, catalogs, None).await;
