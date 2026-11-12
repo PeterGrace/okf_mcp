@@ -7,7 +7,9 @@
 - The sign-in journeys (`tests/ui_e2e/signin.rs`), `TestServer::user_with_password` and `Ui::sign_in_password`.
 
 ## Changed
-- The console resumes a cookie session at boot (`GET /api/v1/session`), sends `X-OKF-CSRF` on writes, and signs out over `DELETE /api/v1/session`; the login card links to `/signin`; `#whoami` shows a session as `<user> - <level>`.
+- The console resumes a cookie session at boot (`GET /api/v1/session`), sends `X-OKF-CSRF` on writes, and signs out over `DELETE /api/v1/session`. The login card links to `/signin`, and `#whoami` shows a session as `<user> - <level>`.
+- A live cookie session wins over a stored key at boot, and the key is dropped. Sign-out ends the browser's cookie session, if it has one, before clearing anything. It counts as done only on a 2xx or a 401; any other failure keeps the console signed in, with a retryable error.
+- Password sign-ins and resets serialize on the user row. `passwords::reset` changes the hash and ends every session in one transaction. A password sign-in inserts its session only while the hash it checked (`PasswordStamp`) is still current, so a sign-in that races a reset gets no session.
 - The request trace span records the path without the query, so an emailed link's token never reaches the log.
 - `pages::safe_return_to`, `is_safe_return_to` and `DEFAULT_RETURN_TO` lose their `expect(dead_code)` attributes.
 
