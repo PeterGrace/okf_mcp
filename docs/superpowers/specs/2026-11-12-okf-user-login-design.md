@@ -33,6 +33,7 @@ Today a user (M11) is only a label on a credential. The console is signed in to 
 | Browser authentication | Server-side sessions behind an `HttpOnly` cookie, with a CSRF header on writes. Bearer keys still work everywhere. |
 | OIDC configuration | The config file, with client secrets in environment variables. The console shows the providers read-only. |
 | Policy settings | A database settings table that the admin Settings page edits. The config file supplies the defaults. |
+| Background jobs | apalis, with jobs stored in the server's Postgres database (`apalis-postgres`). Sending mail is the first job. |
 | Pasted-key console sign-in | Kept, for automation and for admins without a user. |
 | Web console | At parity with the CLI. Every admin action has a console control. |
 
@@ -93,19 +94,6 @@ CREATE TABLE email_tokens (
     created_at timestamptz NOT NULL,
     expires_at timestamptz NOT NULL,
     used_at    timestamptz
-);
-
--- Outgoing mail, retried until sent or given up.
-CREATE TABLE mail_outbox (
-    id            bigserial PRIMARY KEY,
-    to_address    citext NOT NULL,
-    template      text NOT NULL,
-    payload       jsonb NOT NULL,                 -- never a secret other than the link
-    created_at    timestamptz NOT NULL,
-    attempts      integer NOT NULL DEFAULT 0,
-    next_try_at   timestamptz NOT NULL,
-    sent_at       timestamptz,
-    last_error    text
 );
 
 -- Sign-in audit, shown to the user and to admins.
@@ -277,13 +265,25 @@ message_stream = "outbound"
 - **Postmark:** calls its `/email` HTTP endpoint with `reqwest`.
 - **`log`:** writes the message, link included, to the log at `info`. It is meant for development and tests.
 
-A request that sends mail writes a `mail_outbox` row in the same transaction and returns. A background task delivers outbox rows, retrying with backoff for 24 hours, then gives up and records `last_error`. The Settings page shows undelivered mail.
+Mail is sent by a background job, never inside the request; see "Background jobs".
 
 The templates are plain text with a minimal HTML twin:
 - `setup`: "Set up your okf account" (link valid 24 hours by default);
 - `reset`: "Reset your password" (1 hour);
 - `method_added`: "A sign-in method was added to your account", sent after a password change, a new passkey or a linked identity;
 - `test`: the Settings page's test email.
+
+## Background jobs
+
+New asynchronous work runs on [apalis](https://crates.io/crates/apalis) 1.x, with `apalis-postgres` storing its jobs in the server's own Postgres database.
+
+- **Schema.** `apalis-postgres` creates and migrates its own `apalis` schema. It records its migrations in `apalis._sqlx_migrations`, apart from okf's `_sqlx_migrations`, so the two migrators never see each other's rows. `db::migrate` runs okf's migrations, then apalis's `PostgresStorage::setup`.
+- **Extensions.** Its migrations create `pgcrypto` and `hstore`; migration 0010 creates `citext`. All three are trusted extensions, so the database owner can create them; no superuser is needed.
+- **Workers.** Workers run inside the server process, started with the HTTP server and stopped on shutdown. Several replicas may run workers, because apalis claims jobs with row locks.
+- **The first job is `SendMail`.** Its payload is the rendered `Mail`. It retries with exponential backoff for up to 24 hours, then fails and keeps its last error. A request that sends mail enqueues the job, after its own transaction commits, and returns.
+- **Secrets in payloads.** A setup or reset link is the only secret a mail job holds. It is single-use and short-lived. Finished mail jobs are deleted after 7 days, and failed ones after 30.
+- **Visibility.** The Settings page lists mail jobs that are pending or failed (recipient, template, attempts, last error, but never the body), with Retry and Delete. `okf-mcp mail queue` shows the same list.
+- **Existing loops stay.** The existing background loops (the poll loop and token and code cleanup) are unchanged in this milestone. Moving them onto apalis is a follow-up.
 
 ### Emailed links
 
@@ -341,6 +341,7 @@ Every admin action has a CLI command, a REST route and a console control under *
 | Member access | `catalog set-member-access NAME --access none\|read\|write` | Catalog drawer: Team member access |
 | Policy settings | `settings list`, `settings set KEY VALUE`, `settings reset KEY` | Settings page |
 | Test email | `mail test ADDRESS` | Settings page: Send test email |
+| Mail queue | `mail queue`, `mail retry ID`, `mail delete ID` | Settings page: Mail queue, with Retry and Delete |
 
 - `user set-admin --off` is refused (409) for the last admin user, unless an admin key performs it.
 - `may_set_member_access(principal, catalog)` is the single permission check. It allows admins today, and team owners later.
@@ -408,7 +409,8 @@ Every admin action has a CLI command, a REST route and a console control under *
   - a bad nonce or state.
 - **Mail:**
   - each template sent through the `log` provider, with its link usable;
-  - outbox retry and give-up;
+  - the `SendMail` job through apalis on the test database: retry after a provider error, failure after the retry budget, Retry from the queue;
+  - the migration test: both migrators apply cleanly to an empty database and to one at schema 0009, and re-running is a no-op;
   - a Postmark request shape against a mock HTTP server.
 - **Consent as a signed-in user:**
   - the grant is capped;
@@ -440,3 +442,4 @@ Every admin action has a CLI command, a REST route and a console control under *
 2. **OIDC providers configured in the database**, with encrypted client secrets.
 3. **Multi-factor authentication** for password sign-in (TOTP or passkey as a second factor).
 4. **Self-service account deletion**, once credential history no longer blocks deletion (#297).
+5. **Move the existing background loops onto apalis**: token, code and session cleanup, and sign-in event pruning.
