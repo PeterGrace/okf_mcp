@@ -19,8 +19,13 @@ use openidconnect::{
     RedirectUrl, Scope, TokenResponse,
 };
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+
 use crate::config::{Config, OidcProviderConfig};
 use crate::error::OkfError;
+use crate::http::limits::KeyedLimiter;
+use crate::keys;
 use crate::oauth::expiring::ExpiringMap;
 
 /// A client configured from a discovery document: an authorization
@@ -45,6 +50,12 @@ pub const FLOW_TTL: Duration = Duration::from_secs(10 * 60);
 /// The most flows in progress at once (they start unauthenticated, so the
 /// start route also takes from the per-address sign-in limit).
 pub const MAX_FLOWS: usize = 10_000;
+/// Link flows one user may start per [`FLOW_TTL`]: each start holds a
+/// flow-map entry for ten minutes, so this bounds what one signed-in user
+/// can take from the map that every sign-in shares.
+pub const LINK_STARTS_PER_USER: u32 = 10;
+/// The most users the per-user link limiter tracks at once.
+const MAX_LINKING_USERS: usize = 10_000;
 /// The longest any provider request may take.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest `sub` OIDC Core allows (section 2: "MUST NOT exceed 255
@@ -215,7 +226,13 @@ pub struct OidcProviders {
     providers: BTreeMap<String, Provider>,
     /// Flows in progress (ten minutes, single use), keyed by the flow
     /// cookie's random id (chosen by the server, never by the client).
+    /// Add to it with [`Self::store_flow`], which bounds each actor's share.
     pub flows: ExpiringMap<Flow>,
+    /// Each console session's live link flow, by the SHA-256 of the session
+    /// id: a new link flow replaces (and removes) the session's previous one.
+    link_flows: ExpiringMap<String>,
+    /// Link starts by user id ([`LINK_STARTS_PER_USER`] per [`FLOW_TTL`]).
+    link_starts: KeyedLimiter,
 }
 
 // Hand-written: the providers hold client secrets, and the flows theirs.
@@ -301,7 +318,71 @@ impl OidcProviders {
             http,
             providers,
             flows: ExpiringMap::new(FLOW_TTL, MAX_FLOWS),
+            link_flows: ExpiringMap::new(FLOW_TTL, MAX_FLOWS),
+            link_starts: KeyedLimiter::new(LINK_STARTS_PER_USER, FLOW_TTL, MAX_LINKING_USERS),
         }))
+    }
+
+    /// Stores a new flow so that no actor holds more than its share of
+    /// [`Self::flows`]: the flow this browser held before (its old cookie)
+    /// is removed, and a link flow replaces the one its session started
+    /// before. The new flow is stored before the old one is removed, so
+    /// two concurrent starts of one session leave one flow, never a
+    /// stranded one.
+    ///
+    /// # Arguments
+    /// * `id` - the new flow cookie's random id.
+    /// * `flow` - the flow.
+    /// * `previous` - the id in the browser's current flow cookie, if any.
+    /// * `now` - the current instant.
+    ///
+    /// # Returns
+    /// `false`, storing nothing, when the map is full.
+    pub fn store_flow(&self, id: &str, flow: Flow, previous: Option<&str>, now: Instant) -> bool {
+        // The session the link belongs to, as the key of its index entry
+        // (a hash: the raw session id is a credential).
+        let session_key = flow
+            .link
+            .as_ref()
+            .map(|link| URL_SAFE_NO_PAD.encode(keys::hash(&link.session_id)));
+        if let Some(previous) = previous.filter(|previous| *previous != id) {
+            self.flows.remove(previous);
+        }
+        if !self.flows.insert(id.to_string(), flow, now) {
+            return false;
+        }
+        if let Some(key) = session_key {
+            // `mem::replace` swaps the session's flow id for the new one and
+            // returns the old (empty for a new entry), under the map's lock.
+            let replaced =
+                self.link_flows
+                    .update_or_insert_sliding(&key, now, String::new, |current| {
+                        std::mem::replace(current, id.to_string())
+                    });
+            match replaced {
+                Some(old) if !old.is_empty() && old != id => self.flows.remove(&old),
+                Some(_) => {}
+                // The index is full: keep the map bounded by refusing.
+                None => {
+                    self.flows.remove(id);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Takes one link start from the user's allowance.
+    ///
+    /// # Arguments
+    /// * `user_id` - the signed-in user.
+    /// * `now` - the current instant.
+    ///
+    /// # Returns
+    /// `false` once the user has started [`LINK_STARTS_PER_USER`] links in
+    /// the last [`FLOW_TTL`].
+    pub fn may_start_link(&self, user_id: &str, now: Instant) -> bool {
+        self.link_starts.try_take(user_id, now)
     }
 
     /// Every provider's id and label, by id.

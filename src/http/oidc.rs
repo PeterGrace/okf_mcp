@@ -67,6 +67,8 @@ pub const LINKED_ELSEWHERE: &str = "This account cannot be linked: it is linked 
      or another account at this provider is already linked to yours.";
 /// Over the per-address sign-in limit (429).
 const TOO_MANY: &str = "Too many attempts from this address. Wait a few minutes and try again.";
+/// Over the per-user link limit (429).
+const TOO_MANY_LINKS: &str = "Too many links started; wait a few minutes and try again.";
 /// Where linking returns to.
 const ACCOUNT_PAGE: &str = "/ui/#/account";
 /// The pages' title.
@@ -128,7 +130,19 @@ fn clear_flow(app: &App) -> HeaderMap {
     headers
 }
 
-/// Starts a flow: the provider's authorize URL and the flow cookie.
+/// A flow to start.
+struct NewFlow<'a> {
+    /// The provider's id.
+    provider: &'a str,
+    /// Where to go afterwards.
+    return_to: String,
+    /// Set for a link from the account page.
+    link: Option<LinkRequest>,
+}
+
+/// Starts a flow: the provider's authorize URL and the flow cookie. The
+/// flow this browser held before is dropped, and a link replaces the one
+/// its session started before ([`OidcProviders::store_flow`]).
 ///
 /// # Errors
 /// [`OkfError::NotFound`] for an unknown provider; [`OkfError::Busy`] when
@@ -137,19 +151,19 @@ fn clear_flow(app: &App) -> HeaderMap {
 async fn begin(
     app: &App,
     oidc: &OidcProviders,
-    provider: &str,
-    return_to: String,
-    link: Option<LinkRequest>,
+    headers: &HeaderMap,
+    new: NewFlow<'_>,
 ) -> Result<(String, HeaderMap), OkfError> {
-    let (url, secrets) = oidc.authorize_url(provider, Instant::now()).await?;
+    let (url, secrets) = oidc.authorize_url(new.provider, Instant::now()).await?;
     let id = keys::generate_with("")?;
     let flow = Flow {
-        provider: provider.to_string(),
+        provider: new.provider.to_string(),
         secrets,
-        return_to,
-        link,
+        return_to: new.return_to,
+        link: new.link,
     };
-    if !oidc.flows.insert(id.clone(), flow, Instant::now()) {
+    let previous = cookie(headers, FLOW_COOKIE);
+    if !oidc.store_flow(&id, flow, previous, Instant::now()) {
         return Err(OkfError::Busy {
             reason: "too many sign-ins in progress; try again shortly".to_string(),
         });
@@ -198,7 +212,12 @@ async fn start(
         return message_page(StatusCode::TOO_MANY_REQUESTS, TITLE, TOO_MANY);
     }
     let return_to = safe_return_to(query.return_to.as_deref());
-    match begin(&app, oidc, &provider, return_to, None).await {
+    let new = NewFlow {
+        provider: &provider,
+        return_to,
+        link: None,
+    };
+    match begin(&app, oidc, &parts.headers, new).await {
         Ok((url, headers)) => (headers, Redirect::to(&url)).into_response(),
         Err(OkfError::NotFound { .. }) => {
             message_page(StatusCode::NOT_FOUND, TITLE, "No such sign-in provider.")
@@ -464,12 +483,14 @@ struct LinkBody {
 ///
 /// # Errors
 /// 403 for a key or grant; 404 for an unknown provider or with OIDC off;
+/// 429 past [`crate::oidc::LINK_STARTS_PER_USER`] starts in ten minutes;
 /// 503 when the provider cannot be reached.
 async fn link(
     State(app): State<Arc<App>>,
     Path(provider): Path<String>,
     Extension(principal): Extension<Arc<Principal>>,
     session: Option<Extension<ConsoleSession>>,
+    headers: HeaderMap,
     Json(body): Json<LinkBody>,
 ) -> Result<Response, AppError> {
     let (user_id, session) = match (&principal.kind, session) {
@@ -486,19 +507,31 @@ async fn link(
     let oidc = app.oidc().ok_or_else(|| OkfError::NotFound {
         path: format!("me/identities/{provider}/link"),
     })?;
-    let request = LinkRequest {
-        user_id,
-        session_id: session.id,
-        keep_sessions: body.keep_sessions,
+    if oidc.label(&provider).is_none() {
+        return Err(OkfError::NotFound {
+            path: format!("me/identities/{provider}/link"),
+        }
+        .into());
+    }
+    // A signed-in user is not limited by address, so their own allowance
+    // keeps them from filling the flow map every sign-in shares.
+    if !oidc.may_start_link(&user_id, Instant::now()) {
+        let body = serde_json::json!({
+            "error": "TooManyRequests",
+            "message": TOO_MANY_LINKS,
+        });
+        return Ok((StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response());
+    }
+    let new = NewFlow {
+        provider: &provider,
+        return_to: ACCOUNT_PAGE.to_string(),
+        link: Some(LinkRequest {
+            user_id,
+            session_id: session.id,
+            keep_sessions: body.keep_sessions,
+        }),
     };
-    let (url, flow_cookie) = begin(
-        &app,
-        oidc,
-        &provider,
-        ACCOUNT_PAGE.to_string(),
-        Some(request),
-    )
-    .await?;
+    let (url, flow_cookie) = begin(&app, oidc, &headers, new).await?;
     Ok((flow_cookie, Json(serde_json::json!({ "url": url }))).into_response())
 }
 
@@ -517,8 +550,10 @@ mod tests {
         keys, login_config, user_with_password, Browser, Payload, Reply, MAIN, PASSWORD,
     };
     use crate::http::console_session::COOKIE;
+    use crate::http::limits::SIGN_IN_PER_IP;
     use crate::mcp::testing::{app_with, TestApp};
     use crate::oidc::testing::{self as idp, MockIdp, CLIENT_ID, SECRET};
+    use crate::oidc::LINK_STARTS_PER_USER;
     use crate::store::identities;
     use crate::store::sign_in_events::{self, Method, Outcome};
     use crate::store::{passwords, users};
@@ -854,6 +889,127 @@ mod tests {
             "a good token still works"
         );
         assert_eq!(sessions_of(test.app.pool(), &user_id(&test).await).await, 1);
+    }
+
+    /// `POST /api/v1/me/identities/example/link` with an empty body.
+    async fn post_link(test: &TestApp, browser: &mut Browser) -> Reply {
+        browser
+            .send(
+                test,
+                "POST",
+                "/api/v1/me/identities/example/link",
+                Payload::Json(json!({})),
+            )
+            .await
+    }
+
+    /// The number of flows in progress.
+    fn flows(test: &TestApp) -> usize {
+        test.app.oidc().expect("OIDC is on").flows.len()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn past_the_address_limit_a_start_is_429_without_a_flow() {
+        let idp = idp::start().await;
+        let test = oidc_app(&idp, "OKF_TEST_OIDC_SECRET_LIMIT").await;
+
+        // `oneshot` requests carry no address, so they share one bucket.
+        for _ in 0..SIGN_IN_PER_IP {
+            start(&test, &idp, &mut Browser::default()).await;
+        }
+        let mut browser = Browser::default();
+        let limited = browser
+            .send(&test, "GET", "/auth/oidc/example/start", Payload::Empty)
+            .await;
+        let unknown = browser
+            .send(&test, "GET", "/auth/oidc/nope/start", Payload::Empty)
+            .await;
+
+        assert_eq!(
+            limited.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{}",
+            limited.text()
+        );
+        assert!(limited.set_cookie(FLOW_COOKIE).is_none());
+        assert_eq!(
+            flows(&test),
+            usize::try_from(SIGN_IN_PER_IP).expect("small")
+        );
+        assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_browser_starting_again_replaces_its_previous_flow() {
+        let idp = idp::start().await;
+        let test = oidc_app(&idp, "OKF_TEST_OIDC_SECRET_RESTART").await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        idp.will_issue("sub-1", Some("alice@example.com"), Some(true));
+        let mut browser = Browser::default();
+
+        for _ in 0..3 {
+            start(&test, &idp, &mut browser).await;
+        }
+        let query = start(&test, &idp, &mut browser).await;
+        let done = callback(&test, &mut browser, &query["state"]).await;
+
+        assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.text());
+        assert_eq!(
+            flows(&test),
+            0,
+            "the earlier flows were dropped, not stranded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_link_starts_never_grow_the_flow_map_and_others_still_start() {
+        let idp = idp::start().await;
+        let test = oidc_app(&idp, "OKF_TEST_OIDC_SECRET_FLOOD").await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        user_with_password(&test, "bob", "bob@example.com", Some(PASSWORD)).await;
+        let alice = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let session = alice.cookie(COOKIE).expect("a session").to_string();
+        let csrf = alice.csrf.clone();
+
+        // A script that never keeps the flow cookie, on one session: each
+        // start replaces the session's previous flow.
+        for _ in 0..5 {
+            let mut scripted = Browser::with_cookie(COOKIE, &session);
+            scripted.csrf = csrf.clone();
+            assert_eq!(post_link(&test, &mut scripted).await.status, StatusCode::OK);
+        }
+        assert_eq!(flows(&test), 1, "one live link flow per session");
+
+        // New sessions each time: the per-user allowance runs out.
+        let mut refused = None;
+        for _ in 5..=LINK_STARTS_PER_USER {
+            let mut fresh = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+            let reply = post_link(&test, &mut fresh).await;
+            if reply.status != StatusCode::OK {
+                refused = Some(reply);
+                break;
+            }
+        }
+        let refused = refused.expect("the allowance ran out");
+        assert_eq!(
+            refused.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{}",
+            refused.text()
+        );
+        assert!(refused.set_cookie(FLOW_COOKIE).is_none());
+        assert!(flows(&test) <= usize::try_from(LINK_STARTS_PER_USER).expect("small"));
+
+        let mut bob = Browser::signed_in(&test, "bob@example.com", PASSWORD).await;
+        let anyone = Browser::default()
+            .send(&test, "GET", "/auth/oidc/example/start", Payload::Empty)
+            .await;
+        assert_eq!(
+            post_link(&test, &mut bob).await.status,
+            StatusCode::OK,
+            "another user"
+        );
+        assert_eq!(anyone.status, StatusCode::SEE_OTHER, "a sign-in");
     }
 
     #[tokio::test(flavor = "multi_thread")]
