@@ -540,7 +540,7 @@ mod tests {
 }
 ```
 
-The test "a user with a key is not deleted" belongs to Task 4, where keys gain a user.
+> **Corrected (issue #280).** The deletion guards are tested here, not in Tasks 3 and 4: review asked for them, and migration 0009's columns let the tests seed the references with SQL. `store::users::tests` adds `a_user_named_by_a_key_is_not_deleted`, `a_user_named_by_a_sign_in_code_is_not_deleted`, `a_user_whose_personal_team_owns_a_catalog_is_not_deleted` and the two-transaction `a_catalog_assigned_during_the_delete_is_refused_not_a_database_error`. `store::teams::tests` adds `a_team_that_owns_a_catalog_is_not_deleted`. Each asserts `Refused` and that the user or team, the reference and the admin generation are unchanged. Catalog ownership is seeded by `users::tests::seed_catalog_owned_by` (`catalogs::create`, then `UPDATE catalogs SET owner_team_id`).
 
 Tests for `src/store/teams.rs`:
 
@@ -904,6 +904,12 @@ pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError> {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| unknown(name))?;
+    // > **Corrected (issue #280).** Shipped code also locks the personal team
+    // > (`SELECT id FROM teams WHERE personal_of = $1 FOR UPDATE`) before the
+    // > counts, counts catalogs by that team id, and deletes the team by id:
+    // > otherwise a catalog assigned to the team concurrently is missed and
+    // > the team's DELETE fails as a database error instead of a 409. Read
+    // > `src/store/users.rs`.
     let (credentials, other_teams, owned): (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM api_keys WHERE user_id = $1) \
               + (SELECT count(*) FROM sign_in_codes WHERE user_id = $1), \
@@ -1127,7 +1133,9 @@ async fn set_owner_assigns_a_legacy_catalog() {
 }
 ```
 
-In `src/store/teams.rs` tests:
+> **Corrected (issue #280).** Do not add the test below: Task 2 already ships `teams::tests::a_team_that_owns_a_catalog_is_not_deleted` (and the user-side catalog guards in `users::tests`). When `catalogs::create` gains its owner argument, update `users::tests::seed_catalog_owned_by` to pass the team to `catalogs::create` and drop its `UPDATE`, and give the race test's `catalogs::create` call an owner (`TEST_TEAM`), keeping its explicit `UPDATE` inside the held transaction.
+
+In `src/store/teams.rs` tests (superseded, see above):
 
 ```rust
 #[tokio::test(flavor = "multi_thread")]
@@ -1259,6 +1267,11 @@ async fn assigning_a_legacy_key_sets_its_user_and_bumps_the_generation() {
     assert!(catalogs::admin_generation(&db.pool).await.unwrap() > before);
 }
 
+// > **Corrected (issue #280).** Superseded: Task 2 ships
+// > `users::tests::a_user_named_by_a_key_is_not_deleted` and
+// > `a_user_named_by_a_sign_in_code_is_not_deleted`, which seed `user_id`
+// > with SQL. Do not add this test; the `new_key` helper below is still
+// > needed by the other Task 4 tests.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_user_with_a_key_is_not_deleted() {
     let db = test_db().await;

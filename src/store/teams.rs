@@ -731,4 +731,30 @@ mod tests {
             Err(OkfError::UnknownName { .. })
         ));
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_team_that_owns_a_catalog_is_not_deleted() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        users::tests::seed_catalog_owned_by(&db.pool, "family").await;
+        let generation = crate::store::catalogs::admin_generation(&db.pool)
+            .await
+            .unwrap();
+
+        let refused = delete(&db.pool, "family").await;
+
+        assert!(
+            matches!(&refused, Err(OkfError::Refused { reason }) if reason.contains("catalog")),
+            "{refused:?}"
+        );
+        let team = find(&db.pool, "family").await.unwrap();
+        assert_eq!(team.catalogs, ["shared"]);
+        assert_eq!(team.members.len(), 1);
+        assert_eq!(
+            crate::store::catalogs::admin_generation(&db.pool)
+                .await
+                .unwrap(),
+            generation
+        );
+    }
 }

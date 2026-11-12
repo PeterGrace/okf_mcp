@@ -279,6 +279,17 @@ pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError> {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| unknown(name))?;
+    // Lock the personal team too: a catalog assigned to it concurrently takes
+    // `FOR KEY SHARE` on this row, so either it waits for this delete (and
+    // then fails its foreign-key check), or this waits for it to commit and
+    // the count below sees the catalog. Without the lock the count could miss
+    // it, and the team's DELETE would fail as a database error, not a 409.
+    // (`Option`: every user has one, but a missing row should not panic.)
+    let team_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM teams WHERE personal_of = $1 FOR UPDATE")
+            .bind(&user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
     // A tuple destructures the three columns of the one row, like Python's
     // `a, b, c = row`.
     let (credentials, other_teams, owned): (i64, i64, i64) = sqlx::query_as(
@@ -286,10 +297,10 @@ pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError> {
               + (SELECT count(*) FROM sign_in_codes WHERE user_id = $1), \
                 (SELECT count(*) FROM team_members m JOIN teams t ON t.id = m.team_id \
                  WHERE m.user_id = $1 AND t.personal_of IS DISTINCT FROM $1), \
-                (SELECT count(*) FROM catalogs c JOIN teams t ON t.id = c.owner_team_id \
-                 WHERE t.personal_of = $1)",
+                (SELECT count(*) FROM catalogs WHERE owner_team_id = $2)",
     )
     .bind(&user_id)
+    .bind(&team_id)
     .fetch_one(&mut *tx)
     .await?;
     let blocker = if credentials > 0 {
@@ -310,10 +321,12 @@ pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError> {
     }
     // Memberships cascade with the team; the team row goes before the user
     // row because `teams.personal_of` restricts the user's delete.
-    sqlx::query("DELETE FROM teams WHERE personal_of = $1")
-        .bind(&user_id)
-        .execute(&mut *tx)
-        .await?;
+    if let Some(team_id) = &team_id {
+        sqlx::query("DELETE FROM teams WHERE id = $1")
+            .bind(team_id)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(&user_id)
         .execute(&mut *tx)
@@ -324,10 +337,37 @@ pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError> {
 }
 
 #[cfg(test)]
-mod tests {
+// `pub(crate)` so `teams::tests` shares the seeding helpers below.
+pub(crate) mod tests {
     use super::*;
     use crate::db::test_db;
+    use crate::store::catalogs::{self, tests::until_a_lock_is_awaited};
     use crate::store::teams;
+
+    /// Gives `team` a catalog, `shared`, by writing `catalogs.owner_team_id`
+    /// directly (the store gains `catalogs::set_owner` in a later task).
+    pub(crate) async fn seed_catalog_owned_by(pool: &PgPool, team: &str) {
+        catalogs::create(pool, "shared", "", now()).await.unwrap();
+        sqlx::query(OWN_SHARED)
+            .bind(team)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Makes catalog `shared` belong to the team named `$1`.
+    const OWN_SHARED: &str = "UPDATE catalogs SET owner_team_id = \
+                              (SELECT id FROM teams WHERE name = $1) WHERE name = 'shared'";
+
+    /// Asserts a refused user delete changed nothing: the user is still
+    /// there, still names `credentials` credentials, and the generation is
+    /// still `generation`.
+    async fn assert_unchanged(pool: &PgPool, credentials: i64, generation: i64) {
+        let user = find(pool, "alice").await.unwrap();
+        assert_eq!(user.credentials, credentials);
+        assert_eq!(user.teams, ["alice"]);
+        assert_eq!(catalogs::admin_generation(pool).await.unwrap(), generation);
+    }
 
     fn now() -> DateTime<Utc> {
         // A fixed instant: tests never read the wall clock.
@@ -528,5 +568,105 @@ mod tests {
             missing,
             Err(OkfError::UnknownName { noun: "user", .. })
         ));
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_user_named_by_a_key_is_not_deleted() {
+        let db = test_db().await;
+        create(&db.pool, &alice(), now()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO api_keys (name, sha256, access, all_catalogs, actor, created_at, user_id) \
+             VALUES ('k', decode(repeat('ab', 32), 'hex'), 'read', true, 'k', now(), \
+                     (SELECT id FROM users WHERE name = 'alice'))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let generation = catalogs::admin_generation(&db.pool).await.unwrap();
+
+        let refused = delete(&db.pool, "alice").await;
+
+        assert!(
+            matches!(&refused, Err(OkfError::Refused { reason }) if reason.contains("key(s)")),
+            "{refused:?}"
+        );
+        assert_unchanged(&db.pool, 1, generation).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_user_named_by_a_sign_in_code_is_not_deleted() {
+        let db = test_db().await;
+        create(&db.pool, &alice(), now()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO sign_in_codes \
+                 (name, sha256, access, all_catalogs, actor, created_at, expires_at, user_id) \
+             VALUES ('laptop', decode(repeat('cd', 32), 'hex'), 'read', true, 'laptop', \
+                     now(), now() + interval '1 hour', \
+                     (SELECT id FROM users WHERE name = 'alice'))",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let generation = catalogs::admin_generation(&db.pool).await.unwrap();
+
+        let refused = delete(&db.pool, "alice").await;
+
+        assert!(
+            matches!(&refused, Err(OkfError::Refused { reason }) if reason.contains("code(s)")),
+            "{refused:?}"
+        );
+        assert_unchanged(&db.pool, 1, generation).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_user_whose_personal_team_owns_a_catalog_is_not_deleted() {
+        let db = test_db().await;
+        create(&db.pool, &alice(), now()).await.unwrap();
+        seed_catalog_owned_by(&db.pool, "alice").await;
+        let generation = catalogs::admin_generation(&db.pool).await.unwrap();
+
+        let refused = delete(&db.pool, "alice").await;
+
+        assert!(
+            matches!(&refused, Err(OkfError::Refused { reason }) if reason.contains("catalog")),
+            "{refused:?}"
+        );
+        assert_unchanged(&db.pool, 0, generation).await;
+        let team = teams::find(&db.pool, "alice").await.unwrap();
+        assert_eq!(team.catalogs, ["shared"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catalog_assigned_during_the_delete_is_refused_not_a_database_error() {
+        // Arrange: a transaction assigns a catalog to alice's personal team
+        // and holds its commit while the delete runs.
+        let db = test_db().await;
+        create(&db.pool, &alice(), now()).await.unwrap();
+        catalogs::create(&db.pool, "shared", "", now())
+            .await
+            .unwrap();
+        let mut assigning = db.pool.begin().await.unwrap();
+        sqlx::query(OWN_SHARED)
+            .bind("alice")
+            .execute(&mut *assigning)
+            .await
+            .unwrap();
+        // `tokio::spawn` runs the delete concurrently, like a thread; it
+        // blocks on the personal team's row, which the assignment's
+        // foreign-key check holds `FOR KEY SHARE`.
+        let pool = db.pool.clone();
+        let deleting = tokio::spawn(async move { delete(&pool, "alice").await });
+        until_a_lock_is_awaited(&db.pool).await;
+
+        assigning.commit().await.unwrap();
+        let outcome = deleting.await.unwrap();
+
+        assert!(
+            matches!(&outcome, Err(OkfError::Refused { reason }) if reason.contains("catalog")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            teams::find(&db.pool, "alice").await.unwrap().catalogs,
+            ["shared"]
+        );
     }
 }
