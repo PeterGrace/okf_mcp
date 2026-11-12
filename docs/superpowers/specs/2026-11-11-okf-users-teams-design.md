@@ -1,6 +1,6 @@
 # okf-mcp users and teams: design
 
-Status: approved in brainstorming, 2026-11-11; milestone 11, planned in `docs/superpowers/plans/2026-11-11-okf-mcp-m11-users-teams.md`.
+Status: delivered in milestone 11 (epic #278; sub-issues #279-#287, PRs #288-#295 and the PR for #287), 2026-11-12 (plan `docs/superpowers/plans/2026-11-11-okf-mcp-m11-users-teams.md`). What differs from this design is under "What shipped differently" at the end; the operator's view is `docs/operations.md`, "Users and teams".
 
 ## Goal
 
@@ -242,15 +242,83 @@ control) for this area, so drift shows up in review.
 - A parity test that fails when an admin subcommand in this area has no
   documented REST route.
 
-## Future work (to file as issues)
+## Future work (filed as issues)
 
-1. **Tighten to `NOT NULL`.** Once `okf-mcp unassigned` reports nothing on a
+1. **Tighten to `NOT NULL`** (#296). Once `okf-mcp unassigned` reports nothing on a
    deployment, a migration makes `api_keys.user_id`, `sign_in_codes.user_id`
    and `catalogs.owner_team_id` `NOT NULL`, and the `Option`s go away.
-2. **Disable users and teams** (`disabled_at`): refuse new credentials and
+2. **Disable users and teams** (`disabled_at`, #297): refuse new credentials and
    revoke live ones, keeping history.
-3. **Login.** `user_identities (user_id, provider, subject)`; users sign in
+3. **Login** (#298). `user_identities (user_id, provider, subject)`; users sign in
    to the console and approve OAuth consent as themselves, minting their own
    keys within limits an admin sets.
-4. **Access through membership** (option B in brainstorming): a credential
+4. **Access through membership** (#299; option B in brainstorming): a credential
    scoped to "my catalogs" reaches its user's teams' catalogs.
+
+## What shipped differently
+
+Read the plan's "Decisions taken while planning" and its `Corrected (issue
+#N)` notes for the detail; the per-task changelogs (`changelog/*-m11-task-*`)
+give the reasons.
+
+- **No `UserId`/`TeamId` newtypes** (plan Decision 1). The store is
+  addressed by name, as catalogs are, so ids never leave SQL. The create
+  inputs take a required `user: &str` / `owner_team: &str`, which gives the
+  same compile-time guarantee; records carry `user: Option<String>` /
+  `owner_team: Option<String>`, the name or `None` when unassigned.
+- **A missing `user` or `owner` in a REST body is a 422, not a 400** (plan
+  Decision 2), as for every other body (`deny_unknown_fields` with axum's
+  `Json` extractor). A missing `--user` / `--owner` is clap's usage error
+  (exit 2).
+- **A sign-in code's actor is optional** (plan Decision 6), as this design
+  planned; it is also trimmed, and a blank value counts as absent, so it
+  defaults to the code's name on the CLI, over REST and in the console.
+- **An unknown user or team is a new error, `OkfError::UnknownName`**
+  (404, kind `UnknownName`, with `noun` and `name` in the JSON body), since
+  `NotFound` is worded for documents.
+- **"Admin-only" has two levels** (plan Decision 3). Creating, deleting and
+  changing users, teams and memberships, `catalog set-owner` and
+  `GET /unassigned` need an admin key that reaches every catalog, the rule
+  `POST /catalogs` uses. Listing and reading users and teams needs any admin
+  key, so a scoped admin can pick the user of a key it creates. Assigning a
+  credential follows the existing rule for managing that credential. The
+  console shows the controls a key may not use disabled, with the reason.
+- **A user's detail shows only the credentials the caller manages.**
+  `GET /users/{name}` answers `{user, keys, codes}`, filtered by the keys
+  area's reach rule, so it reveals nothing outside a scoped admin's reach.
+  Teams are in `user.teams`.
+- **Adding an existing member is not a 409.** `team add-member` and
+  `team set-role` (and `PUT /teams/{name}/members/{user}`) both upsert: they
+  add the user, change its role, or report it unchanged
+  (`{change: "added"|"role_changed"|"unchanged"}`). `team remove-member` also
+  refuses (409) a user who is not a member.
+- **`oauth code assign` takes a code in any state**, not only legacy
+  unredeemed ones, and can change a user as well as set one. The grant a
+  redeemed code became keeps its own user, assigned with `key assign`.
+  `key assign` takes an id or an unambiguous live name, with `--actor` to
+  narrow it, as the other `key` subcommands do.
+- **Assigning a sign-in code bumps no administrative generation**: codes are
+  not in the key cache and are read from the database on every use. Every
+  other write in "Cache reload" bumps it.
+- **List layouts.** No listing has a header row, so `cut -f` scripts need
+  not skip one. `key list`, `oauth grant list` (before `client X`) and
+  `oauth code list` end with a labelled `user U` cell, and `catalog list` has
+  `owner T` before the description, each `-` when unassigned. `user list` is
+  name, `credentials N`, `teams a,b`, then the display name; `team list` is
+  name, `personal U`, `members u(role),...`, `catalogs c,...`, then the
+  display name. Free text always comes last.
+- **Races answer errors, not database failures.** `users::id_of` and
+  `teams::id_of` read the row `FOR KEY SHARE`, so a create or assign racing
+  a delete is `UnknownName` (404) rather than a foreign-key 500, and every
+  path locks a user before a team, so a membership change cannot deadlock
+  with a user's deletion.
+- **The parity test is `tests/admin_parity.rs`**, since `tests/parity.rs`
+  already holds the differential tests against `okf.py`. Besides the table
+  rows, it checks that each row's REST route is in the API reference.
+- **Unit-test databases start with a fixture user**, `test-user` (personal
+  team `test-user`), as `crate::db::TEST_USER` / `TEST_TEAM`; integration
+  tests create theirs through the public API (`tests/support/server.rs`).
+- **The console's Unassigned view** is `#/users/unassigned`, linked from the
+  Users page ("What is unassigned"), with its count as a badge on the Users
+  link. The key, grant and code drawers have Assign (unassigned) or Change
+  user, and the catalog drawer Change owner (or Assign).

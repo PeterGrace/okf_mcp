@@ -46,9 +46,10 @@ below cover local use.
 ## Command line
 
     okf-mcp migrate
-    okf-mcp catalog create pg --description "pgrace's catalog"
+    okf-mcp user create alice
+    okf-mcp catalog create pg --description "pgrace's catalog" --owner alice
     git -C ~/repos/pg_knowledge_catalog archive --format=tar.gz HEAD | okf-mcp import pg -
-    okf-mcp key create claude --access write --catalogs pg --default pg --actor claude-code/claude-opus-5-5
+    okf-mcp key create claude --access write --catalogs pg --default pg --actor claude-code/claude-opus-5-5 --user alice
     okf-mcp export pg pg.tar.gz
 
 Every subcommand reads the database URL from `DATABASE_URL` (or
@@ -65,9 +66,16 @@ subcommand). Every subcommand applies the embedded migrations first, so
 its access level; `key maintenance-report ID --enabled true|false [--actor ACTOR]`
 changes the flag. Reporting still requires catalog read access and never
 confers write access.
-`okf-mcp oauth code create|list|revoke` and `okf-mcp oauth grant list|revoke`
+`okf-mcp oauth code create|list|revoke|assign` and `okf-mcp oauth grant list|revoke`
 manage OAuth sign-in codes and the grants they become (see
 `docs/operations.md`, "OAuth connectors").
+Every key, grant and sign-in code belongs to a user (`--user`, required on
+create) and every catalog to a team (`--owner`); creating a user also
+creates its personal team of the same name. Ownership grants no access.
+`okf-mcp user create|list|delete`, `team create|list|add-member|set-role|remove-member|delete`,
+`catalog set-owner`, `key assign` and `oauth code assign` manage them, and
+`okf-mcp unassigned` lists what predates users and teams and has neither
+(`docs/operations.md`, "Users and teams").
 
 `import` takes a `.tar.gz` file, `-` for one on stdin, or a directory. A
 `git archive` tarball imports exactly the checkout's tracked files, and a
@@ -169,9 +177,10 @@ Create a catalog, fill it and make a key with the subcommands; the server
 notices each change within `poll_interval`, without a restart (a revoked key
 stops working at the next poll too):
 
-    okf-mcp catalog create pg --description "pgrace's catalog"
+    okf-mcp user create alice
+    okf-mcp catalog create pg --description "pgrace's catalog" --owner alice
     git -C ~/repos/pg_knowledge_catalog archive --format=tar.gz HEAD | okf-mcp import pg -
-    okf-mcp key create laptop --access read --catalogs pg --default pg
+    okf-mcp key create laptop --access read --catalogs pg --default pg --user alice
 
 `key create` prints the key once (and its administration id on stderr). Keep it in an environment variable, here
 `OKF_MCP_KEY`, and never in a file you commit.
@@ -343,7 +352,10 @@ anything the console does can be scripted:
 
 Admins manage API keys at `/ui/#/keys` (or `/api/v1/keys`) without a shell
 on the server: list, create (the secret is shown once), revoke, grant and
-ungrant catalogs, and the maintenance-report flag.
+ungrant catalogs, the maintenance-report flag, and the user each key
+belongs to. Users and Teams (`/ui/#/users`, `/ui/#/teams`) manage users,
+teams and membership, and `/ui/#/users/unassigned` assigns what predates
+them.
 
 Browse shows a catalog's tree, each concept rendered (raw HTML in a concept
 is shown as text, never run), its links, history and revision diffs, and
@@ -512,6 +524,9 @@ key's actor.
 - `src/clock.rs`, `src/error.rs` - the time source and the error type.
 - `src/ntp.rs` - a minimal SNTPv4 client; `src/clock_check.rs` - the clock
   check at startup and every 15 minutes, and the status `/healthz` shows.
+- `tests/admin_parity.rs` - the users-and-teams parity table in
+  `docs/operations.md` lists every such admin subcommand with a documented
+  REST route and a console control
 - `tests/parity.rs` - differential tests against `okf.py`: goldens for the
   synthetic corpus in `tests/fixtures/catalog`, and live tests that run
   `okf.py` itself.
