@@ -234,6 +234,17 @@ pub async fn find(pool: &PgPool, name: &str) -> Result<UserRecord, OkfError> {
 
 /// The id of the user called `name`, inside a caller's transaction.
 ///
+/// The row is held `FOR KEY SHARE` until that transaction ends, so a
+/// concurrent [`delete`] (which locks the user `FOR UPDATE`) waits for the
+/// caller and then sees what it wrote (a key or code naming the user); one
+/// that got there first leaves no row, which is `UnknownName` here rather
+/// than a foreign-key failure at the caller's write.
+///
+/// Lock order: call this before locking any team row. [`delete`] locks the
+/// user and then its personal team, so a caller holding a team while it
+/// waits here could deadlock with it (`teams::set_member` resolves the user
+/// first for this reason).
+///
 /// # Arguments
 /// * `conn` - the caller's transaction (pass `&mut tx`).
 /// * `name` - the user's name.
@@ -244,7 +255,7 @@ pub async fn find(pool: &PgPool, name: &str) -> Result<UserRecord, OkfError> {
 /// # Errors
 /// [`OkfError::UnknownName`]; [`OkfError::Database`].
 pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String, OkfError> {
-    sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
+    sqlx::query_scalar("SELECT id FROM users WHERE name = $1 FOR KEY SHARE")
         .bind(name)
         .fetch_optional(&mut *conn)
         .await?

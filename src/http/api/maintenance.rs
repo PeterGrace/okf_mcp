@@ -428,6 +428,7 @@ mod tests {
                 grants: Grants::Catalogs(&grants),
                 default_catalog: Some("main"),
                 actor: "runner",
+                user: crate::db::TEST_USER,
             },
             Utc::now(),
         )

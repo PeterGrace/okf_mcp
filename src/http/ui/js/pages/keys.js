@@ -127,11 +127,19 @@ function readGrants(data) {
     };
 }
 
+// The User field both create forms share: a plain text input until the
+// console gets a user picker (milestone 11, Task 8).
+function userField() {
+    return h('label', {}, 'User',
+        h('input', { name: 'user', required: true, autocomplete: 'off', placeholder: 'the user it belongs to' }));
+}
+
 // The create form, in the drawer.
 function newKey(main, reload) {
     const form = h('form', { id: 'key-form' },
         h('label', {}, 'Name', h('input', { name: 'name', required: true, autocomplete: 'off', placeholder: 'letters, digits, . _ -' })),
         h('label', {}, 'Actor', h('input', { name: 'actor', autocomplete: 'off', placeholder: 'defaults to the name' })),
+        userField(),
         h('label', {}, 'Access', h('select', { name: 'access' }, LEVELS.map(level => h('option', { value: level }, level)))),
         catalogFields(),
         h('label', {},
@@ -146,6 +154,7 @@ function newKey(main, reload) {
             ...readGrants(data),
             actor: String(data.get('actor') ?? '').trim() || null,
             maintenance_report: data.get('maintenance_report') === 'on',
+            user: String(data.get('user') ?? '').trim(),
         };
         try {
             const created = await api.post('/keys', body);
@@ -326,6 +335,7 @@ function newCode(main, reload) {
     const form = h('form', { id: 'code-form' },
         h('label', {}, 'Name', h('input', { name: 'name', required: true, autocomplete: 'off', placeholder: 'letters, digits, . _ -' })),
         h('label', {}, 'Actor', h('input', { name: 'actor', required: true, autocomplete: 'off', placeholder: 'who the grant writes as' })),
+        userField(),
         h('label', {}, 'Access', h('select', { name: 'access' }, CODE_LEVELS.map(level => h('option', { value: level }, level)))),
         catalogFields(),
         h('label', {}, 'Expires unused after',
@@ -341,6 +351,7 @@ function newCode(main, reload) {
             access: String(data.get('access') ?? 'read'),
             ...readGrants(data),
             expires_in: String(data.get('expires_in') ?? '24h'),
+            user: String(data.get('user') ?? '').trim(),
         };
         try {
             const created = await api.post('/oauth/codes', body);

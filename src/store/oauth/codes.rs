@@ -16,6 +16,7 @@ use crate::keys::{self, SIGN_IN_CODE_PREFIX};
 use crate::store::catalogs::bump_admin_generation;
 use crate::store::keys::{is_valid_name, resolve_grants, Access, Grants};
 use crate::store::oauth::clients::{ClientKind, ClientRecord};
+use crate::store::users;
 
 /// How long a code stays valid when its creator names no expiry: a day.
 pub const DEFAULT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -31,10 +32,13 @@ pub struct NewSignInCode<'a> {
     pub grants: Grants<'a>,
     /// The grant's default catalog (must be granted).
     pub default_catalog: Option<&'a str>,
-    /// The actor the grant's writes are recorded as.
+    /// The actor the grant's writes are recorded as; blank means the code's
+    /// name (as for keys).
     pub actor: &'a str,
     /// When the code stops working if nobody redeems it.
     pub expires_at: DateTime<Utc>,
+    /// The user it, and the grant it becomes, belongs to (must exist).
+    pub user: &'a str,
 }
 
 /// A minted code: its id and, this once, the code itself.
@@ -112,6 +116,9 @@ pub struct SignInCodeRecord {
     pub grant_id: Option<String>,
     /// When it was revoked.
     pub revoked_at: Option<DateTime<Utc>>,
+    /// The user it belongs to; `None` for a code from before migration 0009
+    /// that no admin has assigned yet.
+    pub user: Option<String>,
 }
 
 impl SignInCodeRecord {
@@ -152,6 +159,7 @@ struct CodeRow {
     redeemed_at: Option<DateTime<Utc>>,
     grant_id: Option<String>,
     revoked_at: Option<DateTime<Utc>>,
+    user: Option<String>,
 }
 
 impl From<CodeRow> for SignInCodeRecord {
@@ -169,6 +177,7 @@ impl From<CodeRow> for SignInCodeRecord {
             redeemed_at: row.redeemed_at,
             grant_id: row.grant_id,
             revoked_at: row.revoked_at,
+            user: row.user,
         }
     }
 }
@@ -180,10 +189,12 @@ macro_rules! select_codes {
     () => {
         "SELECT s.id, s.name, s.access, s.all_catalogs, d.name AS default_catalog, s.actor, \
                 s.created_at, s.expires_at, s.redeemed_at, s.grant_id, s.revoked_at, \
+                u.name AS user, \
                 COALESCE(array_agg(c.name ORDER BY c.name) FILTER (WHERE c.name IS NOT NULL), \
                          '{}'::text[]) AS catalogs \
          FROM sign_in_codes s \
          LEFT JOIN catalogs d ON d.id = s.default_catalog_id \
+         LEFT JOIN users u ON u.id = s.user_id \
          LEFT JOIN sign_in_code_catalogs g ON g.code_id = s.id \
          LEFT JOIN catalogs c ON c.id = g.catalog_id"
     };
@@ -240,10 +251,11 @@ pub fn expiry(
 /// The code itself: hand it over once; it is not stored and cannot be shown again.
 ///
 /// # Errors
-/// [`OkfError::Refused`] for an invalid name, `admin` access, an empty
-/// actor, an expiry not after `now`, no catalogs or an ungranted default;
-/// [`OkfError::CatalogNotSelected`] for an unknown catalog; [`OkfError::Io`]
-/// if the OS random source fails; [`OkfError::Database`] otherwise.
+/// [`OkfError::Refused`] for an invalid name, `admin` access, an expiry not
+/// after `now`, no catalogs or an ungranted default;
+/// [`OkfError::CatalogNotSelected`] for an unknown catalog;
+/// [`OkfError::UnknownName`] for an unknown user; [`OkfError::Io`] if the OS
+/// random source fails; [`OkfError::Database`] otherwise.
 pub async fn create(
     pool: &PgPool,
     new: &NewSignInCode<'_>,
@@ -259,10 +271,11 @@ pub async fn create(
     if new.access == Access::Admin {
         return refuse("a sign-in code grants read or write access, never admin".to_string());
     }
-    let actor = new.actor.trim();
-    if actor.is_empty() {
-        return refuse(format!("sign-in code {:?} needs an actor", new.name));
-    }
+    // A blank actor defaults to the code's name, as a key's does (Decision 6).
+    let actor = match new.actor.trim() {
+        "" => new.name,
+        trimmed => trimmed,
+    };
     if new.expires_at <= now {
         return refuse(format!(
             "sign-in code {:?} must expire in the future",
@@ -278,11 +291,15 @@ pub async fn create(
         new.default_catalog,
     )
     .await?;
+    // Held `FOR KEY SHARE` until commit, so a concurrent `users::delete`
+    // either waits and then counts this code, or wins and leaves an unknown name.
+    let user_id = users::id_of(&mut tx, new.user).await?;
     let code = keys::generate_with(SIGN_IN_CODE_PREFIX)?;
     let id: String = sqlx::query_scalar(
         "INSERT INTO sign_in_codes \
-         (name, sha256, access, all_catalogs, default_catalog_id, actor, created_at, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+         (name, sha256, access, all_catalogs, default_catalog_id, actor, created_at, expires_at, \
+          user_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
     )
     .bind(new.name)
     .bind(keys::hash(&code).as_slice())
@@ -292,6 +309,7 @@ pub async fn create(
     .bind(actor)
     .bind(now)
     .bind(new.expires_at)
+    .bind(&user_id)
     .fetch_one(&mut *tx)
     .await?;
     // `unnest` turns the bound array into rows; a name given twice is one grant.
@@ -322,7 +340,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<SignInCodeRecord>, OkfError> {
     // columns ungrouped (Postgres knows they depend on it).
     let rows = sqlx::query_as::<_, CodeRow>(concat!(
         select_codes!(),
-        " GROUP BY s.id, d.name ORDER BY s.created_at DESC, s.id"
+        " GROUP BY s.id, d.name, u.name ORDER BY s.created_at DESC, s.id"
     ))
     .fetch_all(pool)
     .await?;
@@ -357,7 +375,7 @@ pub async fn find_live(
         select_codes!(),
         " WHERE s.sha256 = $1 AND s.redeemed_at IS NULL AND s.revoked_at IS NULL \
           AND s.expires_at > $2 \
-          GROUP BY s.id, d.name"
+          GROUP BY s.id, d.name, u.name"
     ))
     .bind(keys::hash(presented).as_slice())
     .bind(now)
@@ -393,6 +411,37 @@ pub async fn revoke(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), O
     Ok(())
 }
 
+/// Gives a sign-in code a user, in any state (a redeemed code's history is
+/// attributed too). The grant it became is a key row and is assigned
+/// separately ([`crate::store::keys::assign_user_by_id`]). A code is not in
+/// the key cache, so the admin generation is left alone.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `id` - the code's id.
+/// * `user` - the user it belongs to from now on.
+///
+/// # Errors
+/// [`OkfError::UnknownName`] for an unknown user; [`OkfError::NotFound`]
+/// (`oauth/codes/<id>`) for an unknown code; [`OkfError::Database`].
+pub async fn assign_user(pool: &PgPool, id: &str, user: &str) -> Result<(), OkfError> {
+    let mut tx = pool.begin().await?;
+    // `FOR KEY SHARE` until commit: see `users::id_of`.
+    let user_id = users::id_of(&mut tx, user).await?;
+    let updated = sqlx::query("UPDATE sign_in_codes SET user_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(&user_id)
+        .execute(&mut *tx)
+        .await?;
+    if updated.rows_affected() == 0 {
+        return Err(OkfError::NotFound {
+            path: format!("oauth/codes/{id}"),
+        });
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// The locked row [`redeem`] reads.
 #[derive(sqlx::FromRow)]
 struct LockedCode {
@@ -403,6 +452,8 @@ struct LockedCode {
     actor: String,
     expires_at: DateTime<Utc>,
     used: bool,
+    /// The code's user, which the grant inherits (`None` for a legacy code).
+    user_id: Option<String>,
 }
 
 /// Turns a live code into an OAuth grant for `client`, in one transaction:
@@ -438,7 +489,7 @@ pub async fn redeem(
     // code waits here, then reads the committed `redeemed_at` and is refused.
     let code: Option<LockedCode> = sqlx::query_as(
         "SELECT name, access, all_catalogs, default_catalog_id, actor, expires_at, \
-                (redeemed_at IS NOT NULL OR revoked_at IS NOT NULL) AS used \
+                (redeemed_at IS NOT NULL OR revoked_at IS NOT NULL) AS used, user_id \
          FROM sign_in_codes WHERE id = $1 FOR UPDATE",
     )
     .bind(code_id)
@@ -464,8 +515,8 @@ pub async fn redeem(
     let grant_id: String = sqlx::query_scalar(
         "INSERT INTO api_keys \
          (name, sha256, kind, client_id, access, maintenance_report, all_catalogs, \
-          default_catalog_id, actor, created_at) \
-         VALUES ($1, NULL, 'oauth', $2, $3, false, $4, $5, $6, $7) RETURNING id",
+          default_catalog_id, actor, created_at, user_id) \
+         VALUES ($1, NULL, 'oauth', $2, $3, false, $4, $5, $6, $7, $8) RETURNING id",
     )
     .bind(grant_name(&code.name, client, code_id))
     .bind(&client.client_id)
@@ -474,6 +525,7 @@ pub async fn redeem(
     .bind(code.default_catalog_id)
     .bind(&code.actor)
     .bind(now)
+    .bind(&code.user_id)
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query("INSERT INTO key_catalogs (key_id, catalog_id) SELECT $1, unnest($2::bigint[])")
@@ -625,6 +677,7 @@ mod tests {
     use crate::store::catalogs;
     use crate::store::keys::{self as key_rows, KeyKind};
     use crate::store::oauth::testing::{insert_client, insert_grant};
+    use crate::store::users;
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 11, 11, 12, 0, 0).unwrap()
@@ -642,6 +695,7 @@ mod tests {
             default_catalog: default,
             actor: "example-actor",
             expires_at: now() + TimeDelta::hours(24),
+            user: crate::db::TEST_USER,
         }
     }
 
@@ -718,6 +772,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn create_refuses_admin_bad_names_ungranted_defaults_and_the_past() {
+        // A blank actor is no longer refused: see
+        // `a_blank_actor_defaults_to_the_codes_name` (plan Decision 6).
         let db = with_catalogs(&["main"]).await;
         let main = ["main".to_string()];
         let nope = ["nope".to_string()];
@@ -732,14 +788,9 @@ mod tests {
             expires_at: now(),
             ..new_code("p", Grants::Catalogs(&main), None)
         };
-        let no_actor = NewSignInCode {
-            actor: " ",
-            ..new_code("n", Grants::Catalogs(&main), None)
-        };
 
         assert!(refused(create(&db.pool, &admin, now()).await));
         assert!(refused(create(&db.pool, &past, now()).await));
-        assert!(refused(create(&db.pool, &no_actor, now()).await));
         assert!(refused(
             create(
                 &db.pool,
@@ -1236,5 +1287,199 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(left, [vec![2u8; 32], vec![3u8; 32], vec![4u8; 32]]);
+    }
+
+    /// The stored record of code `id`.
+    async fn code_record(pool: &PgPool, id: &str) -> SignInCodeRecord {
+        list(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == id)
+            .expect("the code exists")
+    }
+
+    /// Clears a code's user, as a code minted before migration 0009 has none.
+    async fn make_legacy(pool: &PgPool, id: &str) {
+        sqlx::query("UPDATE sign_in_codes SET user_id = NULL WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_code_belongs_to_its_user_and_an_unknown_user_is_unknown_name() {
+        let db = test_db().await;
+        let unknown = NewSignInCode {
+            user: "nobody",
+            ..new_code("other", Grants::All, None)
+        };
+
+        let code = create(&db.pool, &new_code("laptop", Grants::All, None), now())
+            .await
+            .unwrap();
+        let refused = create(&db.pool, &unknown, now()).await;
+
+        assert_eq!(
+            code_record(&db.pool, &code.id).await.user.as_deref(),
+            Some(crate::db::TEST_USER)
+        );
+        assert!(
+            matches!(&refused, Err(OkfError::UnknownName { noun: "user", .. })),
+            "{refused:?}"
+        );
+        assert_eq!(list(&db.pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_redeemed_grant_inherits_its_codes_user() {
+        let db = test_db().await;
+        let client = dcr_client(&db.pool).await;
+        let code = create(&db.pool, &new_code("laptop", Grants::All, None), now())
+            .await
+            .unwrap();
+
+        let grant = redeem(&db.pool, &code.id, &client, now()).await.unwrap();
+
+        let record = oauth_grants(&db.pool)
+            .await
+            .into_iter()
+            .find(|record| record.id == grant)
+            .unwrap();
+        assert_eq!(record.user.as_deref(), Some(crate::db::TEST_USER));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_codes_grant_stays_unassigned() {
+        let db = test_db().await;
+        let client = dcr_client(&db.pool).await;
+        let code = create(&db.pool, &new_code("laptop", Grants::All, None), now())
+            .await
+            .unwrap();
+        make_legacy(&db.pool, &code.id).await;
+
+        let grant = redeem(&db.pool, &code.id, &client, now()).await.unwrap();
+
+        let record = oauth_grants(&db.pool)
+            .await
+            .into_iter()
+            .find(|record| record.id == grant)
+            .unwrap();
+        assert_eq!(record.user, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blank_actor_defaults_to_the_codes_name() {
+        let db = test_db().await;
+        let blank = NewSignInCode {
+            actor: "  ",
+            ..new_code("laptop", Grants::All, None)
+        };
+
+        let code = create(&db.pool, &blank, now()).await.unwrap();
+
+        assert_eq!(code_record(&db.pool, &code.id).await.actor, "laptop");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assign_user_sets_a_codes_user_without_bumping_the_generation() {
+        let db = test_db().await;
+        let code = create(&db.pool, &new_code("laptop", Grants::All, None), now())
+            .await
+            .unwrap();
+        make_legacy(&db.pool, &code.id).await;
+        let generation = catalogs::admin_generation(&db.pool).await.unwrap();
+
+        assign_user(&db.pool, &code.id, crate::db::TEST_USER)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            code_record(&db.pool, &code.id).await.user.as_deref(),
+            Some(crate::db::TEST_USER)
+        );
+        assert_eq!(
+            catalogs::admin_generation(&db.pool).await.unwrap(),
+            generation,
+            "a code is not in the key cache"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assign_user_refuses_an_unknown_code_or_user() {
+        let db = test_db().await;
+        let code = create(&db.pool, &new_code("laptop", Grants::All, None), now())
+            .await
+            .unwrap();
+
+        let no_code = assign_user(&db.pool, "no-such-id", crate::db::TEST_USER).await;
+        let no_user = assign_user(&db.pool, &code.id, "nobody").await;
+
+        assert!(
+            matches!(&no_code, Err(OkfError::NotFound { path }) if path == "oauth/codes/no-such-id"),
+            "{no_code:?}"
+        );
+        assert!(
+            matches!(&no_user, Err(OkfError::UnknownName { noun: "user", .. })),
+            "{no_user:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_code_create_or_assign_that_waited_on_a_user_delete_is_unknown_name() {
+        // Arrange: alice exists, a legacy code waits for a user, and a
+        // transaction deletes alice and holds its commit.
+        let db = test_db().await;
+        let alice = users::NewUser {
+            name: "alice",
+            display_name: "",
+        };
+        users::create(&db.pool, &alice, now()).await.unwrap();
+        let legacy = create(&db.pool, &new_code("old", Grants::All, None), now())
+            .await
+            .unwrap();
+        make_legacy(&db.pool, &legacy.id).await;
+        let mut deleting = db.pool.begin().await.unwrap();
+        sqlx::query(
+            "DELETE FROM teams WHERE personal_of = (SELECT id FROM users WHERE name = 'alice')",
+        )
+        .execute(&mut *deleting)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM users WHERE name = 'alice'")
+            .execute(&mut *deleting)
+            .await
+            .unwrap();
+        // `tokio::spawn` runs each concurrently, like a thread; their
+        // `FOR KEY SHARE` reads of the user wait on the delete's row lock.
+        let pool = db.pool.clone();
+        let creating = tokio::spawn(async move {
+            let new = NewSignInCode {
+                user: "alice",
+                ..new_code("laptop", Grants::All, None)
+            };
+            create(&pool, &new, now()).await
+        });
+        let pool = db.pool.clone();
+        let id = legacy.id.clone();
+        let assigning = tokio::spawn(async move { assign_user(&pool, &id, "alice").await });
+        crate::store::catalogs::tests::until_locks_are_awaited(&db.pool, 2).await;
+
+        deleting.commit().await.unwrap();
+        let created = creating.await.unwrap();
+        let assigned = assigning.await.unwrap();
+
+        // Not foreign-key violations (500s): the user is simply unknown.
+        assert!(
+            matches!(&created, Err(OkfError::UnknownName { noun: "user", .. })),
+            "{created:?}"
+        );
+        assert!(
+            matches!(&assigned, Err(OkfError::UnknownName { noun: "user", .. })),
+            "{assigned:?}"
+        );
+        assert_eq!(list(&db.pool).await.unwrap().len(), 1);
+        assert_eq!(code_record(&db.pool, &legacy.id).await.user, None);
     }
 }

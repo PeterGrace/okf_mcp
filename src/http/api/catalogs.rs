@@ -313,6 +313,7 @@ mod tests {
             grants: Grants::All,
             default_catalog: Some("main"),
             actor: "root",
+            user: crate::db::TEST_USER,
         };
         let key = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
             .await

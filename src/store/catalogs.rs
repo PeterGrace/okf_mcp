@@ -711,7 +711,7 @@ pub(crate) mod tests {
     }
 
     /// Waits until at least `count` lock requests are blocked.
-    async fn until_locks_are_awaited(pool: &PgPool, count: i64) {
+    pub(crate) async fn until_locks_are_awaited(pool: &PgPool, count: i64) {
         for _ in 0..200 {
             let waiting: i64 =
                 sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")

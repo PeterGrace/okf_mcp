@@ -285,8 +285,10 @@ pub async fn set_member(
     now: DateTime<Utc>,
 ) -> Result<MemberChange, OkfError> {
     let mut tx = pool.begin().await?;
-    let locked = lock_team(&mut tx, team).await?;
+    // The user before the team: `users::delete` locks the user and then its
+    // personal team, so taking them in the other order could deadlock.
     let user_id = users::id_of(&mut tx, user).await?;
+    let locked = lock_team(&mut tx, team).await?;
     let change = match current_role(&mut tx, &locked.id, &user_id).await? {
         None => {
             insert_member(&mut tx, &locked.id, &user_id, role, now).await?;
@@ -325,8 +327,9 @@ pub async fn set_member(
 /// whose personal team this is; [`OkfError::Database`].
 pub async fn remove_member(pool: &PgPool, team: &str, user: &str) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
-    let locked = lock_team(&mut tx, team).await?;
+    // The user before the team, as in `set_member`.
     let user_id = users::id_of(&mut tx, user).await?;
+    let locked = lock_team(&mut tx, team).await?;
     if locked.personal_of.as_deref() == Some(user_id.as_str()) {
         return Err(OkfError::Refused {
             reason: format!("{team:?} is {user:?}'s personal team; it cannot leave it"),
@@ -398,6 +401,10 @@ struct LockedTeam {
 /// Locks the team row `FOR UPDATE`, so concurrent membership changes to one
 /// team run one at a time (the last-owner check cannot race), and so a
 /// concurrent catalog assignment to it waits for a delete.
+///
+/// Lock order: a caller that also needs a user resolves it first
+/// ([`users::id_of`], `FOR KEY SHARE`), because `users::delete` locks the
+/// user and then its personal team.
 ///
 /// # Errors
 /// [`OkfError::UnknownName`]; [`OkfError::Database`].
@@ -781,5 +788,88 @@ mod tests {
                 .unwrap(),
             generation
         );
+    }
+
+    /// Which membership change races the user's deletion.
+    #[derive(Debug, Clone, Copy)]
+    enum Change {
+        SetMember,
+        RemoveMember,
+    }
+
+    /// Deletes `alice` the way `users::delete` takes its locks (the user
+    /// `FOR UPDATE`, then her personal team `FOR UPDATE`) while `change` on
+    /// her personal team runs between the two, and returns that change's
+    /// outcome.
+    async fn race_membership_with_deleting_alice(change: Change) -> Result<(), OkfError> {
+        let db = test_db().await;
+        users::create(
+            &db.pool,
+            &NewUser {
+                name: "alice",
+                display_name: "",
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        let mut deleting = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM users WHERE name = 'alice' FOR UPDATE")
+            .execute(&mut *deleting)
+            .await
+            .unwrap();
+        // `tokio::spawn` runs the change concurrently, like a thread. It must
+        // wait on the user without holding alice's team: with the team taken
+        // first, the next statement and the change would deadlock.
+        let pool = db.pool.clone();
+        let changing = tokio::spawn(async move {
+            match change {
+                Change::SetMember => set_member(&pool, "alice", "alice", Role::Owner, now())
+                    .await
+                    .map(|_| ()),
+                Change::RemoveMember => remove_member(&pool, "alice", "alice").await,
+            }
+        });
+        crate::store::catalogs::tests::until_a_lock_is_awaited(&db.pool).await;
+
+        // A deadlock makes Postgres abort one side (after `deadlock_timeout`);
+        // the timeout only bounds a hang.
+        let team_lock = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            sqlx::query(
+                "SELECT id FROM teams WHERE personal_of = \
+                 (SELECT id FROM users WHERE name = 'alice') FOR UPDATE",
+            )
+            .execute(&mut *deleting),
+        )
+        .await
+        .expect("the team lock does not hang");
+        assert!(team_lock.is_ok(), "{change:?}: {team_lock:?}");
+        sqlx::query(
+            "DELETE FROM teams WHERE personal_of = (SELECT id FROM users WHERE name = 'alice')",
+        )
+        .execute(&mut *deleting)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM users WHERE name = 'alice'")
+            .execute(&mut *deleting)
+            .await
+            .unwrap();
+        deleting.commit().await.unwrap();
+        changing.await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_membership_change_racing_a_user_delete_waits_instead_of_deadlocking() {
+        for change in [Change::SetMember, Change::RemoveMember] {
+            let outcome = race_membership_with_deleting_alice(change).await;
+
+            // The change waited on the user, then found it gone: not a
+            // deadlock or foreign-key error (a 500).
+            assert!(
+                matches!(&outcome, Err(OkfError::UnknownName { noun: "user", .. })),
+                "{change:?}: {outcome:?}"
+            );
+        }
     }
 }

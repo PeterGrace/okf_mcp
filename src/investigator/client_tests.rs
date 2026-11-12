@@ -635,6 +635,7 @@ async fn investigator_client_real_slice1_http_nine_tools() {
             grants: Grants::Catalogs(&["pg".into()]),
             default_catalog: None,
             actor: "reporter",
+            user: crate::db::TEST_USER,
         },
         chrono::Utc::now(),
     )

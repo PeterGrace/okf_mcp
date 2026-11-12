@@ -71,6 +71,7 @@ pub(crate) async fn sign_in_code(test: &TestApp, access: Access) -> String {
         default_catalog: Some("main"),
         actor: "example-actor",
         expires_at: Utc::now() + TimeDelta::hours(24),
+        user: crate::db::TEST_USER,
     };
     code_rows::create(test.app.pool(), &new, Utc::now())
         .await

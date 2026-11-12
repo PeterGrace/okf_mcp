@@ -6,6 +6,7 @@ use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
 use crate::store::catalogs::{self, bump_admin_generation, is_unique_violation};
+use crate::store::users;
 
 /// What a key may do. Each level includes the ones before it, so the
 /// derived `Ord` (`Read < Write < Admin`, the declaration order) answers
@@ -116,6 +117,8 @@ pub struct NewKey<'a> {
     pub default_catalog: Option<&'a str>,
     /// The actor its writes are recorded as (`claude-code/claude-opus-5-5`).
     pub actor: &'a str,
+    /// The user it belongs to (must exist).
+    pub user: &'a str,
 }
 
 /// A newly issued credential. Its bearer secret is returned only once.
@@ -156,6 +159,9 @@ pub struct KeyRecord {
     pub client_id: Option<String>,
     /// That client's display name, if it gave one.
     pub client_name: Option<String>,
+    /// The user it belongs to; `None` for a row from before migration 0009
+    /// that no admin has assigned yet.
+    pub user: Option<String>,
 }
 
 /// The row as selected, before `access` is parsed.
@@ -175,6 +181,7 @@ struct KeyRow {
     kind: String,
     client_id: Option<String>,
     client_name: Option<String>,
+    user: Option<String>,
 }
 
 /// Is `name` valid under the schema's `api_keys_name_check` constraint? Sign-in
@@ -206,8 +213,9 @@ pub(crate) fn is_valid_name(name: &str) -> bool {
 /// # Errors
 /// [`OkfError::Refused`] for an invalid or taken id, no catalogs, or a default
 /// catalog that is not granted; [`OkfError::CatalogNotSelected`] for an unknown catalog
-/// (granted or default); [`OkfError::Io`] if the OS random source fails;
-/// [`OkfError::Database`] otherwise.
+/// (granted or default); [`OkfError::UnknownName`] for an unknown user;
+/// [`OkfError::Io`] if the OS random source fails; [`OkfError::Database`]
+/// otherwise.
 pub async fn create(
     pool: &PgPool,
     new: &NewKey<'_>,
@@ -217,6 +225,15 @@ pub async fn create(
 }
 
 /// Creates a key and also returns its immutable generated id.
+///
+/// # Arguments
+/// As [`create`].
+///
+/// # Returns
+/// The key's id and the key itself (shown once).
+///
+/// # Errors
+/// As [`create`].
 pub async fn create_with_id(
     pool: &PgPool,
     new: &NewKey<'_>,
@@ -233,11 +250,15 @@ pub async fn create_with_id(
     let mut tx = pool.begin().await?;
     let (granted, default_catalog_id) =
         resolve_grants(&mut tx, "key", new.name, new.grants, new.default_catalog).await?;
+    // Held `FOR KEY SHARE` until commit, so a concurrent `users::delete`
+    // either waits and then counts this key, or wins and leaves an unknown name.
+    let user_id = users::id_of(&mut tx, new.user).await?;
     let key = crate::keys::generate()?;
     let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO api_keys \
-         (name, sha256, access, maintenance_report, all_catalogs, default_catalog_id, actor, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+         (name, sha256, access, maintenance_report, all_catalogs, default_catalog_id, actor, \
+          created_at, user_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
     )
     .bind(new.name)
     .bind(crate::keys::hash(&key).as_slice())
@@ -247,6 +268,7 @@ pub async fn create_with_id(
     .bind(default_catalog_id)
     .bind(new.actor)
     .bind(now)
+    .bind(&user_id)
     .fetch_one(&mut *tx)
     .await;
     // Only the live name/actor constraint is a user-facing duplicate. A
@@ -415,15 +437,16 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
     let rows = sqlx::query_as::<_, KeyRow>(
         "SELECT k.id, k.name, k.sha256, k.access, k.maintenance_report, k.all_catalogs, \
                 d.name AS default_catalog, k.actor, k.created_at, k.revoked_at, \
-                k.kind, k.client_id, oc.client_name, \
+                k.kind, k.client_id, oc.client_name, u.name AS user, \
                 COALESCE(array_agg(c.name ORDER BY c.name) FILTER (WHERE c.name IS NOT NULL), \
                          '{}'::text[]) AS catalogs \
          FROM api_keys k \
          LEFT JOIN catalogs d ON d.id = k.default_catalog_id \
          LEFT JOIN oauth_clients oc ON oc.client_id = k.client_id \
+         LEFT JOIN users u ON u.id = k.user_id \
          LEFT JOIN key_catalogs g ON g.key_id = k.id \
          LEFT JOIN catalogs c ON c.id = g.catalog_id \
-         GROUP BY k.id, d.name, oc.client_name ORDER BY k.name, k.actor, k.created_at, k.id",
+         GROUP BY k.id, d.name, oc.client_name, u.name ORDER BY k.name, k.actor, k.created_at, k.id",
     )
     .fetch_all(pool)
     .await?;
@@ -444,6 +467,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
             kind: KeyKind::parse(&row.kind).expect("the schema checks api_keys.kind"),
             client_id: row.client_id,
             client_name: row.client_name,
+            user: row.user,
         })
         .collect())
 }
@@ -719,12 +743,108 @@ pub async fn ungrant(pool: &PgPool, target: &str, catalog: &str) -> Result<(), O
         .map(|_| ())
 }
 
+/// Gives a key or OAuth grant a user, revoked rows included (their history
+/// is attributed too), and bumps the administrative generation. Its access
+/// is unchanged.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `id` - exactly the key's or grant's immutable id, never a name.
+/// * `user` - the user it belongs to from now on.
+///
+/// # Returns
+/// The key's or grant's name.
+///
+/// # Errors
+/// [`OkfError::UnknownName`] for an unknown user; [`OkfError::NotFound`]
+/// (`keys/<id>`) when no row has this id; [`OkfError::Database`].
+pub async fn assign_user_by_id(pool: &PgPool, id: &str, user: &str) -> Result<String, OkfError> {
+    let mut tx = pool.begin().await?;
+    let name = set_user(&mut tx, id, user)
+        .await?
+        .ok_or_else(|| OkfError::NotFound {
+            path: format!("keys/{id}"),
+        })?;
+    bump_admin_generation(&mut tx).await?;
+    tx.commit().await?;
+    Ok(name)
+}
+
+/// As [`assign_user_by_id`], for an `okf-mcp key assign` target: an exact
+/// generated id, else the one active key or grant with that name (and actor,
+/// if given). Unlike the other `key` commands, grants are included.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `target` - the id or name.
+/// * `actor` - narrows a name to one actor.
+/// * `user` - the user it belongs to from now on.
+///
+/// # Returns
+/// The id it resolved to.
+///
+/// # Errors
+/// [`OkfError::Refused`] for an unknown, revoked (by name) or ambiguous
+/// target, or an actor given with an id; [`OkfError::UnknownName`] for an
+/// unknown user; [`OkfError::Database`].
+pub async fn assign_user_target(
+    pool: &PgPool,
+    target: &str,
+    actor: Option<&str>,
+    user: &str,
+) -> Result<String, OkfError> {
+    let mut tx = pool.begin().await?;
+    let id = select(&mut tx, Selector::ResolveAnyKind { target, actor }).await?;
+    // `select` found the row in this transaction, but without a lock it can
+    // be gone by the update; that is the same "no such key" answer.
+    set_user(&mut tx, &id, user)
+        .await?
+        .ok_or_else(|| OkfError::Refused {
+            reason: format!("no key {id:?}"),
+        })?;
+    bump_admin_generation(&mut tx).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Points the row `id` at `user`, inside the caller's transaction.
+///
+/// # Returns
+/// The row's name, or `None` when there is no row with this id.
+///
+/// # Errors
+/// [`OkfError::UnknownName`] for an unknown user; [`OkfError::Database`].
+async fn set_user(
+    conn: &mut PgConnection,
+    id: &str,
+    user: &str,
+) -> Result<Option<String>, OkfError> {
+    // The user is read `FOR KEY SHARE` (held until commit) before the update,
+    // so a concurrent `users::delete` either waits and then counts this row,
+    // or wins first and this is `UnknownName` rather than a foreign-key error.
+    let user_id = users::id_of(conn, user).await?;
+    Ok(
+        sqlx::query_scalar("UPDATE api_keys SET user_id = $2 WHERE id = $1 RETURNING name")
+            .bind(id)
+            .bind(&user_id)
+            .fetch_optional(&mut *conn)
+            .await?,
+    )
+}
+
 /// How a key change names its key.
 #[derive(Debug, Clone, Copy)]
 enum Selector<'a> {
     /// An exact generated id, else an unambiguous active name, of an API key
     /// only (the CLI's rules, [`resolve_active`]).
     Resolve {
+        /// The id or name.
+        target: &'a str,
+        /// Narrows a name to one actor.
+        actor: Option<&'a str>,
+    },
+    /// As `Resolve`, but OAuth grants count too (`key assign`, Decision 4).
+    ResolveAnyKind {
         /// The id or name.
         target: &'a str,
         /// Narrows a name to one actor.
@@ -737,7 +857,10 @@ enum Selector<'a> {
 /// The id `selector` names, inside the change's transaction.
 async fn select(conn: &mut PgConnection, selector: Selector<'_>) -> Result<String, OkfError> {
     match selector {
-        Selector::Resolve { target, actor } => resolve_active(conn, target, actor).await,
+        Selector::Resolve { target, actor } => resolve_active(conn, target, actor, false).await,
+        Selector::ResolveAnyKind { target, actor } => {
+            resolve_active(conn, target, actor, true).await
+        }
         Selector::Exact(id) => {
             // `FOR UPDATE` locks the row until the transaction ends, so a
             // concurrent revoke or grant of it waits for this change.
@@ -759,6 +882,8 @@ async fn select(conn: &mut PgConnection, selector: Selector<'_>) -> Result<Strin
 /// a key's name (the live name/actor index covers keys only), and a key
 /// command must never act on, or be made ambiguous by, a grant. Grants are
 /// revoked by exact id (`okf-mcp oauth grant revoke`, `/api/v1/keys`).
+/// `include_grants` lifts that rule for `okf-mcp key assign`, which reaches
+/// grants too; a grant sharing a key's name then makes the name ambiguous.
 ///
 /// # Errors
 /// [`OkfError::Refused`] for an unknown, revoked or ambiguous target, or an
@@ -767,10 +892,12 @@ async fn resolve_active(
     conn: &mut PgConnection,
     target: &str,
     actor: Option<&str>,
+    include_grants: bool,
 ) -> Result<String, OkfError> {
     let exact: Option<(String, String)> =
-        sqlx::query_as("SELECT id, name FROM api_keys WHERE id = $1 AND kind = 'key'")
+        sqlx::query_as("SELECT id, name FROM api_keys WHERE id = $1 AND ($2 OR kind = 'key')")
             .bind(target)
+            .bind(include_grants)
             .fetch_optional(&mut *conn)
             .await?;
     if let Some((id, name)) = exact {
@@ -791,12 +918,13 @@ async fn resolve_active(
         }
     }
     let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM api_keys WHERE revoked_at IS NULL AND name = $1 AND kind = 'key' \
-         AND ($2::text IS NULL OR actor = $2) \
+        "SELECT id FROM api_keys WHERE revoked_at IS NULL AND name = $1 \
+         AND ($3 OR kind = 'key') AND ($2::text IS NULL OR actor = $2) \
          ORDER BY actor, id",
     )
     .bind(target)
     .bind(actor)
+    .bind(include_grants)
     .fetch_all(&mut *conn)
     .await?;
     match ids.as_slice() {
@@ -804,11 +932,13 @@ async fn resolve_active(
         [] => {
             // Only diagnose revoked names after looking for live replacements.
             let revoked: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM api_keys WHERE name = $1 AND kind = 'key' \
-                 AND revoked_at IS NOT NULL AND ($2::text IS NULL OR actor = $2))",
+                "SELECT EXISTS(SELECT 1 FROM api_keys WHERE name = $1 \
+                 AND ($3 OR kind = 'key') AND revoked_at IS NOT NULL \
+                 AND ($2::text IS NULL OR actor = $2))",
             )
             .bind(target)
             .bind(actor)
+            .bind(include_grants)
             .fetch_one(&mut *conn)
             .await?;
             Err(OkfError::Refused {
@@ -875,6 +1005,7 @@ mod tests {
             grants,
             default_catalog: default,
             actor: "claude-code/test",
+            user: crate::db::TEST_USER,
         }
     }
 
@@ -1153,6 +1284,7 @@ mod tests {
             grants: Grants::All,
             default_catalog: None,
             actor: "claude-code-tui",
+            user: crate::db::TEST_USER,
         };
         let web = NewKey {
             actor: "claude-ai-web",
@@ -1282,6 +1414,7 @@ mod tests {
                 grants: Grants::Catalogs(&work),
                 default_catalog: None,
                 actor: "first",
+                user: crate::db::TEST_USER,
             },
             now(),
         )
@@ -1294,6 +1427,7 @@ mod tests {
             grants: Grants::Catalogs(&work),
             default_catalog: None,
             actor: "second",
+            user: crate::db::TEST_USER,
         };
         create(&db.pool, &collision, now()).await.unwrap();
 
@@ -1393,6 +1527,7 @@ mod tests {
                 grants: Grants::Catalogs(&work),
                 default_catalog: None,
                 actor: "web",
+                user: crate::db::TEST_USER,
             },
             now(),
         )
@@ -1426,6 +1561,7 @@ mod tests {
                 grants: Grants::Catalogs(&work),
                 default_catalog: None,
                 actor: "terminal",
+                user: crate::db::TEST_USER,
             },
             now(),
         )
@@ -1534,5 +1670,224 @@ mod tests {
             );
         }
         assert_eq!(row(grant).await.revoked_at, None);
+    }
+
+    /// The stored record for `id`.
+    async fn record(pool: &PgPool, id: &str) -> KeyRecord {
+        list(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == id)
+            .expect("the row exists")
+    }
+
+    /// Creates user `alice` (with her personal team).
+    async fn alice(pool: &PgPool) {
+        let new = users::NewUser {
+            name: "alice",
+            display_name: "",
+        };
+        users::create(pool, &new, now()).await.unwrap();
+    }
+
+    /// Opens a transaction that deletes `alice` (her personal team first)
+    /// and holds its commit, as a concurrent `users::delete` would.
+    async fn deleting_alice(pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "DELETE FROM teams WHERE personal_of = (SELECT id FROM users WHERE name = 'alice')",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM users WHERE name = 'alice'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_belongs_to_its_user() {
+        let db = test_db().await;
+        let created = create_with_id(&db.pool, &new_key("k", Grants::All, None), now())
+            .await
+            .unwrap();
+
+        let found = record(&db.pool, &created.id).await;
+
+        assert_eq!(found.user.as_deref(), Some(crate::db::TEST_USER));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_for_an_unknown_user_is_unknown_name() {
+        let db = test_db().await;
+        let new = NewKey {
+            user: "nobody",
+            ..new_key("k", Grants::All, None)
+        };
+        let generation = catalogs::admin_generation(&db.pool).await.unwrap();
+
+        let made = create_with_id(&db.pool, &new, now()).await;
+
+        assert!(
+            matches!(&made, Err(OkfError::UnknownName { noun: "user", name }) if name == "nobody"),
+            "{made:?}"
+        );
+        assert!(list(&db.pool).await.unwrap().is_empty());
+        assert_eq!(
+            catalogs::admin_generation(&db.pool).await.unwrap(),
+            generation
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assigning_a_legacy_key_sets_its_user_and_bumps_the_generation() {
+        let db = test_db().await;
+        insert_legacy_test_key(&db.pool, "legacy", Access::Read, "legacy", now()).await;
+        assert_eq!(record(&db.pool, "legacy").await.user, None);
+        let before = catalogs::admin_generation(&db.pool).await.unwrap();
+
+        let name = assign_user_by_id(&db.pool, "legacy", crate::db::TEST_USER)
+            .await
+            .unwrap();
+
+        assert_eq!(name, "legacy");
+        let found = record(&db.pool, "legacy").await;
+        assert_eq!(found.user.as_deref(), Some(crate::db::TEST_USER));
+        assert!(catalogs::admin_generation(&db.pool).await.unwrap() > before);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assigning_reassigns_a_revoked_key_and_refuses_unknown_names() {
+        // Arrange: a revoked key belonging to the fixture user, and alice.
+        let db = test_db().await;
+        alice(&db.pool).await;
+        let created = create_with_id(&db.pool, &new_key("k", Grants::All, None), now())
+            .await
+            .unwrap();
+        revoke_by_id(&db.pool, &created.id, now()).await.unwrap();
+
+        let moved = assign_user_by_id(&db.pool, &created.id, "alice").await;
+        let unknown_user = assign_user_by_id(&db.pool, &created.id, "nobody").await;
+        let unknown_key = assign_user_by_id(&db.pool, "no-such-id", "alice").await;
+
+        assert_eq!(moved.unwrap(), "k", "revoked rows are attributed too");
+        assert!(
+            matches!(
+                &unknown_user,
+                Err(OkfError::UnknownName { noun: "user", .. })
+            ),
+            "{unknown_user:?}"
+        );
+        assert!(
+            matches!(&unknown_key, Err(OkfError::NotFound { path }) if path == "keys/no-such-id"),
+            "{unknown_key:?}"
+        );
+        assert_eq!(
+            record(&db.pool, &created.id).await.user.as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assign_by_name_reaches_grants_and_a_shared_name_is_ambiguous() {
+        // Arrange: a grant named `laptop`, then a key of the same name.
+        let db = test_db().await;
+        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
+        let client = crate::store::oauth::testing::insert_client(
+            &db.pool,
+            "https://client.example.com/client.json",
+            "Example Client",
+            now(),
+        )
+        .await;
+        let grant = crate::store::oauth::testing::insert_grant(
+            &db.pool,
+            &client,
+            Access::Read,
+            &["main"],
+            now(),
+        )
+        .await;
+
+        let by_name = assign_user_target(&db.pool, "laptop", None, crate::db::TEST_USER).await;
+        assert_eq!(by_name.unwrap(), grant);
+        assert_eq!(
+            record(&db.pool, &grant).await.user.as_deref(),
+            Some(crate::db::TEST_USER)
+        );
+        let key = create_with_id(&db.pool, &new_key("laptop", Grants::All, None), now())
+            .await
+            .unwrap()
+            .id;
+        let ambiguous = assign_user_target(&db.pool, "laptop", None, crate::db::TEST_USER).await;
+        let by_actor = assign_user_target(
+            &db.pool,
+            "laptop",
+            Some("claude-code/test"),
+            crate::db::TEST_USER,
+        )
+        .await;
+
+        assert!(
+            matches!(&ambiguous, Err(OkfError::Refused { reason }) if reason.contains("ambiguous")),
+            "{ambiguous:?}"
+        );
+        assert_eq!(by_actor.unwrap(), key);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_create_that_waited_on_a_user_delete_is_unknown_name() {
+        // Arrange: a transaction deletes alice and holds its commit while the
+        // create runs.
+        let db = test_db().await;
+        alice(&db.pool).await;
+        let deleting = deleting_alice(&db.pool).await;
+        // `tokio::spawn` runs the create concurrently, like a thread; its
+        // `FOR KEY SHARE` read of the user waits on the delete's row lock.
+        let pool = db.pool.clone();
+        let creating = tokio::spawn(async move {
+            let new = NewKey {
+                user: "alice",
+                ..new_key("k", Grants::All, None)
+            };
+            create_with_id(&pool, &new, now()).await
+        });
+        crate::store::catalogs::tests::until_a_lock_is_awaited(&db.pool).await;
+
+        deleting.commit().await.unwrap();
+        let outcome = creating.await.unwrap();
+
+        // Not a foreign-key violation (a 500): the user is simply unknown.
+        assert!(
+            matches!(&outcome, Err(OkfError::UnknownName { noun: "user", .. })),
+            "{outcome:?}"
+        );
+        assert!(list(&db.pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_assign_that_waited_on_a_user_delete_is_unknown_name() {
+        let db = test_db().await;
+        alice(&db.pool).await;
+        insert_legacy_test_key(&db.pool, "legacy", Access::Read, "legacy", now()).await;
+        let deleting = deleting_alice(&db.pool).await;
+        let pool = db.pool.clone();
+        let assigning =
+            tokio::spawn(async move { assign_user_by_id(&pool, "legacy", "alice").await });
+        crate::store::catalogs::tests::until_a_lock_is_awaited(&db.pool).await;
+
+        deleting.commit().await.unwrap();
+        let outcome = assigning.await.unwrap();
+
+        assert!(
+            matches!(&outcome, Err(OkfError::UnknownName { noun: "user", .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(record(&db.pool, "legacy").await.user, None);
     }
 }

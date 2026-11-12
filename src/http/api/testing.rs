@@ -63,6 +63,7 @@ pub(crate) async fn keys(test: &TestApp) -> Keys {
                 grants: Grants::Catalogs(&grants),
                 default_catalog: Some(catalog),
                 actor: name,
+                user: crate::db::TEST_USER,
             };
             key_rows::create_with_id(&pool, &new, Utc::now())
                 .await

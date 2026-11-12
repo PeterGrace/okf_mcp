@@ -972,8 +972,9 @@ pub async fn set_member(
     now: DateTime<Utc>,
 ) -> Result<MemberChange, OkfError> {
     let mut tx = pool.begin().await?;
-    let team_id = lock_team(&mut tx, team).await?;
+    // Corrected (issue #282): the user first, then the team (lock order).
     let user_id = users::id_of(&mut tx, user).await?;
+    let team_id = lock_team(&mut tx, team).await?;
     let current: Option<String> =
         sqlx::query_scalar("SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2")
             .bind(&team_id)
@@ -1296,6 +1297,8 @@ async fn a_user_with_a_key_is_not_deleted() {
 
 Add a `new_key(name)` helper to that test module if none exists. It returns a `NewKey` with `Access::Read`, `Grants::All`, `actor: name` and `user: TEST_USER`.
 
+> **Corrected (issue #282).** `keys::tests` already has `new_key(name, grants, default)` (actor `claude-code/test`), and `codes::tests` has `new_code(name, grants, default)`; both gained `user: TEST_USER`, and the shipped tests call `new_key("k", Grants::All, None)` / `new_code("laptop", Grants::All, None)`. `insert_test_client` takes `(pool, client_id, kind, redirect_uri)`; the code tests use their `dcr_client(pool)` helper. The shipped tests also cover reassigning a revoked key, `NotFound` for an unknown id, name resolution reaching a grant, and the races below. Read `src/store/keys.rs`, `src/store/oauth/codes.rs` and `src/store/unassigned.rs` for the final set.
+
 In `src/store/oauth/codes.rs` tests:
 
 ```rust
@@ -1384,6 +1387,8 @@ async fn unassigned_lists_exactly_the_rows_with_no_user_or_owner() {
 - [ ] **Step 3: Implement keys**
   - `NewKey` gains `pub user: &'a str`, documented as "The user it belongs to (must exist)".
   - In `create_with_id`, resolve `let user_id = users::id_of(&mut tx, new.user).await?;` right after `resolve_grants`. Insert it as `user_id` (`$9`).
+
+> **Corrected (issue #282).** `users::id_of` now reads the user `FOR KEY SHARE`, as `teams::id_of` does, so a create or assign racing `users::delete` is `UnknownName`, not a foreign-key 500 (`a_create_that_waited_on_a_user_delete_is_unknown_name`, `an_assign_that_waited_on_a_user_delete_is_unknown_name`, `a_code_create_or_assign_that_waited_on_a_user_delete_is_unknown_name`). The resolver change is a `Selector::ResolveAnyKind` variant that calls `resolve_active(conn, target, actor, include_grants: true)`; both assign functions share a private `set_user(conn, id, user) -> Option<name>`. Lock order everywhere is a user before a team (`users::delete` locks the user, then its personal team), so `teams::set_member` and `remove_member` now call `users::id_of` before `lock_team` (`a_membership_change_racing_a_user_delete_waits_instead_of_deadlocking`).
   - `KeyRecord` and `KeyRow` gain `user: Option<String>`. `list` adds `LEFT JOIN users u ON u.id = k.user_id`, selects `u.name AS user` and adds `u.name` to the `GROUP BY`.
   - `assign_user_by_id(pool, id, user)` resolves the user and runs `UPDATE api_keys SET user_id = $2 WHERE id = $1 RETURNING name` (any kind, revoked included: history is attributed too). A missing row is `OkfError::NotFound { path: format!("keys/{id}") }`. It then bumps and commits.
   - `assign_user_target(pool, target, actor, user)` resolves `target` the way `revoke_target` does (id first, then an unambiguous live name, with `actor` as the tie-break), *including* `kind = 'oauth'` rows, then delegates. Read `revoke_target`'s resolver. If it filters `kind = 'key'`, add a `include_grants: bool` parameter to the shared resolver rather than copying it.
@@ -1448,13 +1453,15 @@ Register `pub mod unassigned;` in `src/store/mod.rs`.
 
 - [ ] **Step 6: Update every construction site.** `cargo build --all-targets` lists each `NewKey`/`NewSignInCode` missing `user` (E0063):
   - Test code under `src/` adds `user: crate::db::TEST_USER`.
-  - `tests/support/server.rs` `TestServer::key` adds `user: "tester"`. So do the other `tests/` sites.
+  - `tests/support/server.rs` `TestServer::key` adds `user: OWNER` (`"tester"`). So do the other `tests/` sites (`support::server::OWNER`).
   - The CLI and the REST handlers get their real field in Tasks 6 and 7. For now, add the clap field `#[arg(long)] user: String` to `KeyCreateArgs` and the code-create args, and `user: String` to `CreateKeyBody`/`CreateCodeBody`, and pass them through.
 
 > **Note (issue #281).** A required `user` in `CreateKeyBody`/`CreateCodeBody` makes the console's key and code create forms answer 422 until Task 8. Task 3 met the same problem for catalogs by adding a plain required text input to the form (filled in the `ui_e2e` journey). Do the same in `keys.js`, and run `just test-ui`. CLI tests that create keys or codes against an empty `TestDb::start()` need a user first; switching them to `crate::db::test_db()` (which has `TEST_USER`) is the simplest fix, as Task 3 did for `catalog create`.
   - `KeyView` and `SignInCodeView` destructure every field, so they now fail to compile. Add `pub user: Option<String>` to both views and map it through.
 
 - [ ] **Step 7: Run the whole suite** (`cargo test`). Expected: PASS. CLI tests in `src/cli.rs` that run `key create` need a user. Have them run `user create` first in Task 6. For now, insert one through `store::users::create` in their setup.
+
+> **Corrected (issue #282).** The CLI tests that create keys or codes start from `crate::db::test_db()` and pass `--user crate::db::TEST_USER`; nothing else was needed. Task 4 keeps `CodeCreateArgs.actor` and `CreateCodeBody.actor` required strings (a blank value now defaults to the name in the store); Tasks 6 and 7 make them optional.
 
 - [ ] **Step 8: Changelog and commit**
 
@@ -1650,6 +1657,8 @@ async fn deleting_a_user_with_a_key_fails_and_says_why() {
 ```
 
 `run_cli` and `parse_cli` are whatever the existing CLI tests at `src/cli.rs:794` use (reuse them; if each test inlines the call, factor a `run_cli(db, args) -> anyhow::Result<String>` helper into the test module first). Also update every existing CLI test that runs `key create`, `oauth code create` or `catalog create` to pass `--user` / `--owner`, after a `user create`.
+
+> **Corrected (issue #282).** Tasks 3 and 4 already did this: those tests run on `crate::db::test_db()` and pass `--owner TEST_TEAM` / `--user TEST_USER`. `KeyCreateArgs.user` and `CodeCreateArgs.user` (`#[arg(long)] String`) already exist. `keys::assign_user_target` returns the resolved id, `assign_user_by_id` the row's name.
 
 - [ ] **Step 2: Run them to see them fail.**
 
