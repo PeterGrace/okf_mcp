@@ -117,7 +117,8 @@ impl App {
         // Read the counter before the keys: a change committed between the
         // two moves it again, so the next poll reloads.
         let admin_generation = catalogs::admin_generation(&pool).await?;
-        let keys = Arc::new(Keys::load(&pool).await?);
+        // `clock` moves into `Self` below, so the key cache gets its own handle.
+        let keys = Arc::new(Keys::load(&pool, Arc::clone(&clock)).await?);
         let mut loaded = Catalogs::new();
         let mut broken = Broken::new();
         for row in catalogs::list(&pool).await? {

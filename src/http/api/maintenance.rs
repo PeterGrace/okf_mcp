@@ -429,6 +429,9 @@ mod tests {
                 default_catalog: Some("main"),
                 actor: "runner",
                 user: crate::db::TEST_USER,
+                self_issued: false,
+                expires_at: None,
+                levels: &[],
             },
             Utc::now(),
         )

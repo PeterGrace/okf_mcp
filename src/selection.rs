@@ -235,7 +235,12 @@ mod tests {
             reach: if reach.is_empty() {
                 Reach::All
             } else {
-                Reach::Catalogs(reach.iter().map(|name| name.to_string()).collect())
+                Reach::Catalogs(
+                    reach
+                        .iter()
+                        .map(|name| (name.to_string(), Access::Read))
+                        .collect(),
+                )
             },
             default_catalog: default.map(str::to_string),
             actor: "a".to_string(),

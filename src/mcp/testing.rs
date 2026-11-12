@@ -129,7 +129,13 @@ pub(crate) fn principal_with_reporting(
         reach: if reach.is_empty() {
             Reach::All
         } else {
-            Reach::Catalogs(reach.iter().map(|name| name.to_string()).collect())
+            // Each catalog at the principal's own `access`, as before levels.
+            Reach::Catalogs(
+                reach
+                    .iter()
+                    .map(|name| (name.to_string(), access))
+                    .collect(),
+            )
         },
         default_catalog: default.map(str::to_string),
         actor: key_id.to_string(),

@@ -8,7 +8,8 @@
 //! compares with stored hashes, which does not help find a key, so there is
 //! no constant-time scan (the design's deviation, recorded in the M4 plan).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 // `Future` is not in the 2021 prelude; the trait below names it.
 use std::future::Future;
 use std::sync::{Arc, RwLock};
@@ -17,22 +18,25 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::app::App;
+use crate::clock::Clock;
 use crate::error::OkfError;
 use crate::http::AppError;
 use crate::keys;
 use crate::oauth::access::OAuthVerifier;
 use crate::store::keys::{self as key_rows, Access, KeyKind, KeyRecord};
 
-/// The catalogs a key may reach.
+/// The catalogs a credential may reach, and at what level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reach {
-    /// Every catalog, present and future (`key create --all`).
+    /// Every catalog, present and future (`key create --all`), at the
+    /// principal's own `access`.
     All,
-    /// These catalogs, by name.
-    Catalogs(BTreeSet<String>),
+    /// These catalogs, by name, each at its own level (Decision 1).
+    Catalogs(BTreeMap<String, Access>),
 }
 
 /// What credential a request came with.
@@ -55,7 +59,11 @@ pub enum CredentialKind {
 pub struct Principal {
     /// The key's id.
     pub key_id: String,
-    /// What it may do.
+    /// The credential's highest level, for admin checks and display; what
+    /// it may do in a catalog is [`Principal::level`]. An admin credential
+    /// has admin on every catalog it reaches (the store refuses lower
+    /// per-catalog levels on an admin key), so `access == Admin` never
+    /// widens a catalog.
     pub access: Access,
     /// Independent opt-in to submit maintenance reports.
     pub maintenance_report: bool,
@@ -74,6 +82,22 @@ pub struct Principal {
 }
 
 impl Principal {
+    /// The level this principal has on `catalog`.
+    ///
+    /// # Arguments
+    /// * `catalog` - a catalog name.
+    ///
+    /// # Returns
+    /// Its level there, or `None` when it does not reach the catalog.
+    pub fn level(&self, catalog: &str) -> Option<Access> {
+        match &self.reach {
+            Reach::All => Some(self.access),
+            // `copied` turns the map's `Option<&Access>` into
+            // `Option<Access>` (`Access` is `Copy`).
+            Reach::Catalogs(levels) => levels.get(catalog).copied(),
+        }
+    }
+
     /// Does the key reach this catalog?
     ///
     /// # Arguments
@@ -82,10 +106,7 @@ impl Principal {
     /// # Returns
     /// `true` for a key granted every catalog, or this one.
     pub fn reaches(&self, catalog: &str) -> bool {
-        match &self.reach {
-            Reach::All => true,
-            Reach::Catalogs(names) => names.contains(catalog),
-        }
+        self.level(catalog).is_some()
     }
 
     /// Checks that the key may do something needing `access` to `catalog`.
@@ -97,21 +118,22 @@ impl Principal {
     /// # Errors
     /// [`OkfError::CatalogNotSelected`] if the key does not reach the
     /// catalog (worded like an unknown catalog, so a key cannot probe which
-    /// catalogs exist); [`OkfError::Forbidden`] if it does but its level is
-    /// lower than `access`.
+    /// catalogs exist); [`OkfError::Forbidden`] if it does but its level
+    /// there is lower than `access`.
     pub fn require(&self, access: Access, catalog: &str) -> Result<(), OkfError> {
-        if !self.reaches(catalog) {
+        // `let ... else`: bind the level, or leave early when there is none.
+        let Some(level) = self.level(catalog) else {
             return Err(OkfError::CatalogNotSelected {
                 catalog: catalog.to_string(),
             });
-        }
+        };
         // `Access` derives `Ord` in declaration order: Read < Write < Admin.
-        if self.access < access {
+        if level < access {
             return Err(OkfError::Forbidden {
                 reason: format!(
-                    "key {:?} has {} access; this needs {}",
+                    "key {:?} has {} access to {catalog:?}; this needs {}",
                     self.key_id,
-                    self.access.as_str(),
+                    level.as_str(),
                     access.as_str()
                 ),
             });
@@ -141,7 +163,7 @@ impl From<KeyRecord> for Principal {
         let reach = if record.all_catalogs {
             Reach::All
         } else {
-            Reach::Catalogs(record.catalogs.into_iter().collect())
+            Reach::Catalogs(record.catalog_access)
         };
         let kind = match record.kind {
             KeyKind::Key => CredentialKind::ApiKey,
@@ -165,29 +187,61 @@ impl From<KeyRecord> for Principal {
     }
 }
 
+/// Whether a credential with this expiry still works at `now`.
+///
+/// # Arguments
+/// * `expires_at` - its expiry; `None` never expires.
+/// * `now` - the server clock.
+///
+/// # Returns
+/// `true` before the expiry (or with none).
+fn unexpired(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    // `is_none_or`: true for `None`, else the test's answer.
+    expires_at.is_none_or(|at| at > now)
+}
+
+/// One cached credential and when it stops working.
+#[derive(Debug)]
+struct Cached {
+    principal: Arc<Principal>,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+impl Cached {
+    /// The principal, unless the credential has expired since the cache
+    /// was built (it can be up to one `poll_interval` old).
+    fn live_at(&self, now: DateTime<Utc>) -> Option<Arc<Principal>> {
+        // `then` runs the closure only when the test is true.
+        unexpired(self.expires_at, now).then(|| Arc::clone(&self.principal))
+    }
+}
+
 /// Every live key, by SHA-256, and every live OAuth grant, by id.
 /// Immutable: a reload builds a new one.
 #[derive(Debug, Default)]
 pub struct KeyCache {
-    by_hash: HashMap<[u8; 32], Arc<Principal>>,
+    by_hash: HashMap<[u8; 32], Cached>,
     // Grants have no secret of their own: an access token names one by id.
-    by_id: HashMap<String, Arc<Principal>>,
+    by_id: HashMap<String, Cached>,
 }
 
 impl KeyCache {
-    /// Builds the cache from stored rows, leaving out revoked ones.
+    /// Builds the cache from stored rows, leaving out revoked ones and
+    /// those already expired.
     ///
     /// # Arguments
     /// * `records` - the rows, as [`key_rows::list`] returns them.
+    /// * `now` - the server clock.
     ///
     /// # Returns
     /// The cache.
-    pub fn from_records(records: Vec<KeyRecord>) -> Self {
+    pub fn from_records(records: Vec<KeyRecord>, now: DateTime<Utc>) -> Self {
         let mut cache = Self::default();
         for record in records
             .into_iter()
-            .filter(|record| record.revoked_at.is_none())
+            .filter(|record| record.revoked_at.is_none() && unexpired(record.expires_at, now))
         {
+            let expires_at = record.expires_at;
             match record.kind {
                 KeyKind::Key => {
                     // The schema checks `length(sha256) = 32`, so this fails
@@ -200,48 +254,86 @@ impl KeyCache {
                     else {
                         continue;
                     };
-                    cache
-                        .by_hash
-                        .insert(hash, Arc::new(Principal::from(record)));
+                    let principal = Arc::new(Principal::from(record));
+                    cache.by_hash.insert(
+                        hash,
+                        Cached {
+                            principal,
+                            expires_at,
+                        },
+                    );
                 }
                 KeyKind::OAuth => {
                     let id = record.id.clone();
-                    cache.by_id.insert(id, Arc::new(Principal::from(record)));
+                    let principal = Arc::new(Principal::from(record));
+                    cache.by_id.insert(
+                        id,
+                        Cached {
+                            principal,
+                            expires_at,
+                        },
+                    );
                 }
             }
         }
         cache
     }
 
+    /// Reads every key and builds the cache.
+    ///
+    /// # Errors
+    /// [`OkfError::Database`].
+    async fn read(pool: &PgPool, now: DateTime<Utc>) -> Result<Self, OkfError> {
+        Ok(Self::from_records(key_rows::list(pool).await?, now))
+    }
+
     /// The principal of a presented key.
     ///
     /// # Arguments
     /// * `presented` - the key from the request.
+    /// * `now` - the server clock.
     ///
     /// # Returns
-    /// Its principal, or `None` for an unknown or revoked key.
-    pub fn find(&self, presented: &str) -> Option<Arc<Principal>> {
-        self.by_hash.get(&keys::hash(presented)).cloned()
+    /// Its principal, or `None` for an unknown, revoked or expired key.
+    pub fn find(&self, presented: &str, now: DateTime<Utc>) -> Option<Arc<Principal>> {
+        self.by_hash
+            .get(&keys::hash(presented))
+            .and_then(|cached| cached.live_at(now))
     }
 
     /// A live OAuth grant's principal.
     ///
     /// # Arguments
     /// * `grant_id` - the grant's id (from its access token).
+    /// * `now` - the server clock.
     ///
     /// # Returns
-    /// Its principal, or `None` for an unknown or revoked grant.
-    pub fn find_grant(&self, grant_id: &str) -> Option<Arc<Principal>> {
-        self.by_id.get(grant_id).cloned()
+    /// Its principal, or `None` for an unknown, revoked or expired grant.
+    pub fn find_grant(&self, grant_id: &str, now: DateTime<Utc>) -> Option<Arc<Principal>> {
+        self.by_id
+            .get(grant_id)
+            .and_then(|cached| cached.live_at(now))
     }
 }
 
-/// The key cache the server shares, replaced whole on reload.
-#[derive(Debug)]
+/// The key cache the server shares, replaced whole on reload. It holds the
+/// server clock, so a lookup refuses a key that expired since the load.
 pub struct Keys {
     // As in `CatalogState`: a `std` lock held only to clone or swap the
     // `Arc`, never across an `.await`.
     cache: RwLock<Arc<KeyCache>>,
+    clock: Arc<dyn Clock>,
+}
+
+// By hand: `dyn Clock` has no `Debug`. `finish_non_exhaustive` prints `..`
+// for the field left out.
+impl fmt::Debug for Keys {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Keys")
+            .field("cache", &self.cache)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Keys {
@@ -249,12 +341,14 @@ impl Keys {
     ///
     /// # Arguments
     /// * `cache` - the keys to start with.
+    /// * `clock` - the server clock, for expiry at lookup.
     ///
     /// # Returns
     /// The shared cache.
-    pub fn new(cache: KeyCache) -> Self {
+    pub fn new(cache: KeyCache, clock: Arc<dyn Clock>) -> Self {
         Self {
             cache: RwLock::new(Arc::new(cache)),
+            clock,
         }
     }
 
@@ -262,16 +356,16 @@ impl Keys {
     ///
     /// # Arguments
     /// * `pool` - the database.
+    /// * `clock` - the server clock.
     ///
     /// # Returns
     /// The shared cache.
     ///
     /// # Errors
     /// [`OkfError::Database`].
-    pub async fn load(pool: &PgPool) -> Result<Self, OkfError> {
-        Ok(Self::new(KeyCache::from_records(
-            key_rows::list(pool).await?,
-        )))
+    pub async fn load(pool: &PgPool, clock: Arc<dyn Clock>) -> Result<Self, OkfError> {
+        let cache = KeyCache::read(pool, clock.now()).await?;
+        Ok(Self::new(cache, clock))
     }
 
     /// Re-reads every key and swaps the new cache in.
@@ -282,7 +376,7 @@ impl Keys {
     /// # Errors
     /// [`OkfError::Database`]; the old cache stays in place.
     pub async fn reload(&self, pool: &PgPool) -> Result<(), OkfError> {
-        let cache = Arc::new(KeyCache::from_records(key_rows::list(pool).await?));
+        let cache = Arc::new(KeyCache::read(pool, self.clock.now()).await?);
         *self.cache.write().expect("key cache lock poisoned") = cache;
         Ok(())
     }
@@ -293,12 +387,14 @@ impl Keys {
     /// * `presented` - the key from the request.
     ///
     /// # Returns
-    /// Its principal, or `None` for an unknown or revoked key.
+    /// Its principal, or `None` for an unknown, revoked or expired key.
     pub fn find(&self, presented: &str) -> Option<Arc<Principal>> {
+        // The clock is read before the lock is taken.
+        let now = self.clock.now();
         self.cache
             .read()
             .expect("key cache lock poisoned")
-            .find(presented)
+            .find(presented, now)
     }
 
     /// A live OAuth grant's principal, from the current cache.
@@ -307,13 +403,15 @@ impl Keys {
     /// * `grant_id` - the grant's id.
     ///
     /// # Returns
-    /// Its principal, or `None` for an unknown or revoked grant (a revoke
-    /// takes effect at the next reload, within `poll_interval`).
+    /// Its principal, or `None` for an unknown, revoked or expired grant (a
+    /// revoke takes effect at the next reload, within `poll_interval`; an
+    /// expiry at once).
     pub fn find_grant(&self, grant_id: &str) -> Option<Arc<Principal>> {
+        let now = self.clock.now();
         self.cache
             .read()
             .expect("key cache lock poisoned")
-            .find_grant(grant_id)
+            .find_grant(grant_id, now)
     }
 }
 
@@ -455,9 +553,18 @@ mod tests {
     use axum::Router;
     use chrono::Utc;
 
+    use crate::clock::FixedClock;
     use crate::config::Config;
     // `oneshot` sends one request through a router without a socket.
     use tower::ServiceExt;
+
+    /// The catalog-to-level map of a record granted `names` at `access`.
+    fn levels(names: &[&str], access: Access) -> BTreeMap<String, Access> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), access))
+            .collect()
+    }
 
     fn record(id: &str, key: &str, revoked: bool) -> KeyRecord {
         KeyRecord {
@@ -468,14 +575,18 @@ mod tests {
             maintenance_report: false,
             all_catalogs: false,
             catalogs: vec!["pg".to_string()],
+            catalog_access: levels(&["pg"], Access::Read),
             default_catalog: Some("pg".to_string()),
             actor: format!("actor-{id}"),
             created_at: Utc::now(),
             revoked_at: revoked.then(Utc::now),
+            expires_at: None,
             kind: KeyKind::Key,
             client_id: None,
             client_name: None,
             user: Some(crate::db::TEST_USER.to_string()),
+            user_id: None,
+            self_issued: false,
         }
     }
 
@@ -497,26 +608,30 @@ mod tests {
 
     #[test]
     fn the_cache_finds_live_keys_only() {
-        let cache = KeyCache::from_records(vec![
-            record("reader", "reader-key", false),
-            record("old", "old-key", true),
-            KeyRecord {
-                sha256: Some(vec![0; 5]),
-                ..record("short", "short-key", false)
-            },
-        ]);
+        let now = Utc::now();
+        let cache = KeyCache::from_records(
+            vec![
+                record("reader", "reader-key", false),
+                record("old", "old-key", true),
+                KeyRecord {
+                    sha256: Some(vec![0; 5]),
+                    ..record("short", "short-key", false)
+                },
+            ],
+            now,
+        );
 
-        let found = cache.find("reader-key").expect("live key");
+        let found = cache.find("reader-key", now).expect("live key");
 
         assert_eq!(found.key_id, "reader");
         assert_eq!(found.actor, "actor-reader");
         assert_eq!(found.user.as_deref(), Some(crate::db::TEST_USER));
         assert_eq!(found.default_catalog.as_deref(), Some("pg"));
-        assert!(cache.find("old-key").is_none());
+        assert!(cache.find("old-key", now).is_none());
         // A stored hash of the wrong length is left out, not a panic.
-        assert!(cache.find("short-key").is_none());
+        assert!(cache.find("short-key", now).is_none());
         assert_eq!(cache.by_hash.len(), 1);
-        assert!(cache.find("no-such-key").is_none());
+        assert!(cache.find("no-such-key", now).is_none());
     }
 
     #[test]
@@ -559,11 +674,13 @@ mod tests {
             principal.require(Access::Admin, "pg"),
             Err(OkfError::Forbidden { .. })
         ));
-        // A write key may write and read, but not administer.
-        let writer = Principal {
+        // A write key may write and read, but not administer. Its level is
+        // per catalog, so the record (not just `access`) says write.
+        let writer = Principal::from(KeyRecord {
             access: Access::Write,
-            ..principal.clone()
-        };
+            catalog_access: levels(&["pg"], Access::Write),
+            ..record("writer", "writer-key", false)
+        });
         assert!(writer.require(Access::Write, "pg").is_ok());
         assert!(writer.require(Access::Read, "pg").is_ok());
         assert!(matches!(
@@ -578,7 +695,99 @@ mod tests {
         let mut everything = record("all", "all-key", false);
         everything.all_catalogs = true;
         everything.catalogs.clear();
+        everything.catalog_access.clear();
         assert!(Principal::from(everything).reaches("work"));
+    }
+
+    #[test]
+    fn require_checks_the_level_of_each_catalog() {
+        // A write key whose grant of `work` is read only.
+        let principal = Principal::from(KeyRecord {
+            access: Access::Write,
+            catalogs: vec!["pg".to_string(), "work".to_string()],
+            catalog_access: BTreeMap::from([
+                ("pg".to_string(), Access::Write),
+                ("work".to_string(), Access::Read),
+            ]),
+            ..record("mixed", "mixed-key", false)
+        });
+        let everything = Principal {
+            access: Access::Write,
+            reach: Reach::All,
+            ..principal.clone()
+        };
+
+        assert_eq!(principal.level("pg"), Some(Access::Write));
+        assert_eq!(principal.level("work"), Some(Access::Read));
+        assert_eq!(principal.level("other"), None);
+        assert!(principal.require(Access::Write, "pg").is_ok());
+        assert!(principal.require(Access::Read, "work").is_ok());
+        assert!(matches!(
+            principal.require(Access::Write, "work"),
+            Err(OkfError::Forbidden { reason }) if reason.contains("\"work\"")
+        ));
+        assert!(matches!(
+            principal.require(Access::Read, "other"),
+            Err(OkfError::CatalogNotSelected { .. })
+        ));
+        // Every catalog: the principal's own level everywhere.
+        assert_eq!(everything.level("anything"), Some(Access::Write));
+    }
+
+    #[test]
+    fn the_cache_leaves_out_keys_expired_at_load_and_refuses_them_at_lookup() {
+        let now = Utc::now();
+        let hour = chrono::TimeDelta::hours(1);
+        let cache = KeyCache::from_records(
+            vec![
+                KeyRecord {
+                    expires_at: Some(now - hour),
+                    ..record("expired", "expired-key", false)
+                },
+                KeyRecord {
+                    expires_at: Some(now + hour),
+                    ..record("soon", "soon-key", false)
+                },
+                KeyRecord {
+                    expires_at: Some(now + hour),
+                    ..grant_record("grant-soon", false)
+                },
+                record("forever", "forever-key", false),
+            ],
+            now,
+        );
+
+        assert!(cache.find("expired-key", now).is_none());
+        assert_eq!(cache.by_hash.len(), 2, "the expired key is not even cached");
+        assert!(cache.find("soon-key", now).is_some());
+        assert!(cache.find_grant("grant-soon", now).is_some());
+        // The cache may be one poll old: an expiry passed since the load
+        // is still refused.
+        let later = now + hour * 2;
+        assert!(cache.find("soon-key", later).is_none());
+        assert!(cache.find_grant("grant-soon", later).is_none());
+        assert!(cache.find("forever-key", later).is_some());
+    }
+
+    #[test]
+    fn keys_check_expiry_against_their_clock() {
+        let now = Utc::now();
+        let hour = chrono::TimeDelta::hours(1);
+        let soon = KeyRecord {
+            expires_at: Some(now + hour),
+            ..record("soon", "soon-key", false)
+        };
+        let fresh = Keys::new(
+            KeyCache::from_records(vec![soon.clone()], now),
+            Arc::new(FixedClock(now)),
+        );
+        let stale = Keys::new(
+            KeyCache::from_records(vec![soon], now),
+            Arc::new(FixedClock(now + hour * 2)),
+        );
+
+        assert!(fresh.find("soon-key").is_some());
+        assert!(stale.find("soon-key").is_none());
     }
 
     /// A router whose one route echoes the principal's key id, behind the
@@ -643,6 +852,9 @@ mod tests {
                 default_catalog: Some("main"),
                 actor: "example-actor",
                 user: crate::db::TEST_USER,
+                self_issued: false,
+                expires_at: None,
+                levels: &[],
             },
             Utc::now(),
         )
@@ -713,13 +925,17 @@ mod tests {
 
     #[test]
     fn grants_are_found_by_id_only_and_carry_their_client() {
-        let cache = KeyCache::from_records(vec![
-            record("reader", "reader-key", false),
-            grant_record("grant-1", false),
-            grant_record("grant-old", true),
-        ]);
+        let now = Utc::now();
+        let cache = KeyCache::from_records(
+            vec![
+                record("reader", "reader-key", false),
+                grant_record("grant-1", false),
+                grant_record("grant-old", true),
+            ],
+            now,
+        );
 
-        let grant = cache.find_grant("grant-1").expect("live grant");
+        let grant = cache.find_grant("grant-1", now).expect("live grant");
 
         assert_eq!(
             grant.kind,
@@ -729,12 +945,12 @@ mod tests {
             }
         );
         assert_eq!(grant.actor, "actor-grant-1");
-        assert!(cache.find_grant("grant-old").is_none());
+        assert!(cache.find_grant("grant-old", now).is_none());
         // A key is not a grant, and a grant has no key to present.
-        assert!(cache.find_grant("reader").is_none());
-        assert!(cache.find("unused").is_none());
+        assert!(cache.find_grant("reader", now).is_none());
+        assert!(cache.find("unused", now).is_none());
         assert_eq!(
-            cache.find("reader-key").unwrap().kind,
+            cache.find("reader-key", now).unwrap().kind,
             CredentialKind::ApiKey
         );
     }
@@ -754,6 +970,9 @@ mod tests {
             actor: "tester",
             maintenance_report: true,
             user: crate::db::TEST_USER,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
         };
         let created = key_rows::create_with_id(&db.pool, &new, Utc::now())
             .await
@@ -809,13 +1028,18 @@ mod tests {
             default_catalog: Some("pg"),
             actor: "tester",
             user: crate::db::TEST_USER,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
         };
         let created = key_rows::create_with_id(&db.pool, &new, Utc::now())
             .await
             .unwrap();
         let key = created.key;
 
-        let loaded = Keys::load(&db.pool).await.unwrap();
+        let loaded = Keys::load(&db.pool, Arc::new(crate::clock::SystemClock))
+            .await
+            .unwrap();
         assert_eq!(loaded.find(&key).unwrap().key_id, created.id);
         key_rows::revoke(&db.pool, "reader", Utc::now())
             .await

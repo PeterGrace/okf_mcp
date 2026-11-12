@@ -64,6 +64,9 @@ pub(crate) async fn keys(test: &TestApp) -> Keys {
                 default_catalog: Some(catalog),
                 actor: name,
                 user: crate::db::TEST_USER,
+                self_issued: false,
+                expires_at: None,
+                levels: &[],
             };
             key_rows::create_with_id(&pool, &new, Utc::now())
                 .await
@@ -97,6 +100,9 @@ pub(crate) async fn every_catalog_admin(test: &TestApp) -> String {
         default_catalog: Some("main"),
         actor: "root",
         user: crate::db::TEST_USER,
+        self_issued: false,
+        expires_at: None,
+        levels: &[],
     };
     let key = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
         .await
