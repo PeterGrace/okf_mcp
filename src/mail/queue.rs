@@ -27,6 +27,7 @@ use apalis_postgres::queries::push_tasks;
 use apalis_postgres::{Config as QueueConfig, PostgresStorage};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -60,6 +61,19 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a worker that stopped on an error waits before starting again.
 const RESTART_DELAY: Duration = Duration::from_secs(30);
+
+/// How often a worker tells apalis it is alive (apalis's default).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The connections the worker's own pool may open: one held by LISTEN, one
+/// for the fetch, ack and heartbeat cycle, and two for handlers
+/// rescheduling at the same time. Never taken from the request pool, so
+/// `database_max_connections` stays the request side's alone.
+pub const WORKER_POOL_SIZE: u32 = 4;
+
+/// The `application_name` the worker's connections carry, so an operator
+/// (or a test) can tell them apart in `pg_stat_activity`.
+pub const WORKER_APPLICATION_NAME: &str = "okf-mail-worker";
 
 /// How long sent mail jobs are kept.
 const DONE_RETENTION_DAYS: i64 = 7;
@@ -305,7 +319,8 @@ pub async fn prune(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, OkfError> {
 /// job: every field is a cheap handle).
 #[derive(Clone)]
 pub(crate) struct MailContext {
-    /// The database (for rescheduling).
+    /// The worker's own pool ([`worker_pool`]): apalis's LISTEN, fetches,
+    /// acks and heartbeats, and the handler's reschedules.
     pub pool: PgPool,
     /// The provider.
     pub mailer: Arc<dyn Mailer>,
@@ -391,11 +406,53 @@ fn worker_name() -> String {
     format!("okf-mail-{host}-{}", std::process::id())
 }
 
+/// The worker's own pool: the same database and credentials as `pool`, at
+/// most [`WORKER_POOL_SIZE`] connections, named [`WORKER_APPLICATION_NAME`].
+/// It connects lazily, on the worker's first query.
+///
+/// # Arguments
+/// * `pool` - the request pool, whose connect options are copied.
+///
+/// # Returns
+/// A new pool; closing it leaves `pool` untouched.
+pub(crate) fn worker_pool(pool: &PgPool) -> PgPool {
+    // `connect_options()` is shared (`Arc`); `as_ref().clone()` copies it so
+    // the name can be changed for this pool only.
+    let options = pool
+        .connect_options()
+        .as_ref()
+        .clone()
+        .application_name(WORKER_APPLICATION_NAME);
+    PgPoolOptions::new()
+        .max_connections(WORKER_POOL_SIZE)
+        .connect_lazy_with(options)
+}
+
+/// How often a worker polls, heartbeats and restarts. Tests shorten them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkerTiming {
+    /// How often to look for due jobs no NOTIFY announced.
+    pub poll: Duration,
+    /// How often to heartbeat (and re-enqueue jobs of dead workers).
+    pub heartbeat: Duration,
+    /// How long to wait before restarting after a backend error.
+    pub restart: Duration,
+}
+
+impl WorkerTiming {
+    /// The timing `serve` uses.
+    pub(crate) const SERVE: Self = Self {
+        poll: POLL_INTERVAL,
+        heartbeat: HEARTBEAT_INTERVAL,
+        restart: RESTART_DELAY,
+    };
+}
+
 /// Starts the mail worker for a serving process (`http::serve` calls it,
 /// unless `[mail] worker = false`).
 ///
 /// # Arguments
-/// * `app` - the shared state (its pool, mailer and clock).
+/// * `app` - the shared state (its pool's connect options, mailer and clock).
 /// * `shutdown` - cancelled when the server stops.
 ///
 /// # Returns
@@ -403,22 +460,23 @@ fn worker_name() -> String {
 /// hand (if any) is finished.
 pub fn spawn_worker(app: Arc<App>, shutdown: CancellationToken) -> JoinHandle<()> {
     let context = MailContext {
-        pool: app.pool().clone(),
+        pool: worker_pool(app.pool()),
         mailer: Arc::clone(app.mailer()),
         clock: app.clock_handle(),
     };
-    run_worker(context, worker_name(), POLL_INTERVAL, shutdown)
+    run_worker(context, worker_name(), WorkerTiming::SERVE, shutdown)
 }
 
 /// Runs one apalis worker on [`QUEUE`] until `shutdown`, restarting it
-/// after [`RESTART_DELAY`] if it stops on an error (a lost database, say).
+/// after `timing.restart` if it stops on an error (a lost database, say).
+/// It closes `context.pool` when it ends.
 ///
 /// # Arguments
-/// * `context` - what the handler needs.
+/// * `context` - what the handler needs; its pool is the worker's own.
 /// * `name` - the worker's name ([`worker_name`]); a restart registers as
 ///   `<name>-<restarts>`, a row of its own, so apalis's session-scoped lock
 ///   on the old row can never refuse it.
-/// * `poll` - how often to look for due jobs no NOTIFY announced.
+/// * `timing` - the poll, heartbeat and restart delays.
 /// * `shutdown` - cancelled to stop.
 ///
 /// # Returns
@@ -426,43 +484,57 @@ pub fn spawn_worker(app: Arc<App>, shutdown: CancellationToken) -> JoinHandle<()
 pub(crate) fn run_worker(
     context: MailContext,
     name: String,
-    poll: Duration,
+    timing: WorkerTiming,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // `0..`: an endless range, counting the restarts.
-        for restarts in 0_u64.. {
-            let backend = PostgresStorage::<SendMail>::new(&context.pool)
-                .with_config(QueueConfig::default().queue(QUEUE))
-                .with_pubsub()
-                .poll_with_interval(poll);
-            let registered = if restarts == 0 {
-                name.clone()
-            } else {
-                format!("{name}-{restarts}")
-            };
-            let worker = WorkerBuilder::new(registered)
-                .backend(backend)
-                .data(context.clone())
-                .build(send_mail);
-            let stop = shutdown.clone();
-            // The future apalis waits on: it resolves when we are cancelled.
-            let signal = async move {
-                stop.cancelled().await;
-                Ok::<(), std::io::Error>(())
-            };
-            match worker.run_until(signal).await {
-                Ok(()) => return,
-                Err(error) => {
-                    tracing::error!(%error, "the mail worker stopped; restarting it soon");
-                }
-            }
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(RESTART_DELAY) => {}
+        run_until_cancelled(&context, &name, timing, &shutdown).await;
+        context.pool.close().await;
+    })
+}
+
+/// [`run_worker`]'s loop: returns once `shutdown` is cancelled.
+async fn run_until_cancelled(
+    context: &MailContext,
+    name: &str,
+    timing: WorkerTiming,
+    shutdown: &CancellationToken,
+) {
+    // `0..`: an endless range, counting the restarts.
+    for restarts in 0_u64.. {
+        let config = QueueConfig::default()
+            .queue(QUEUE)
+            .heartbeat_interval(timing.heartbeat);
+        let backend = PostgresStorage::<SendMail>::new(&context.pool)
+            .with_config(config)
+            .with_pubsub()
+            .poll_with_interval(timing.poll);
+        let registered = if restarts == 0 {
+            name.to_string()
+        } else {
+            format!("{name}-{restarts}")
+        };
+        let worker = WorkerBuilder::new(registered)
+            .backend(backend)
+            .data(context.clone())
+            .build(send_mail);
+        let stop = shutdown.clone();
+        // The future apalis waits on: it resolves when we are cancelled.
+        let signal = async move {
+            stop.cancelled().await;
+            Ok::<(), std::io::Error>(())
+        };
+        match worker.run_until(signal).await {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::error!(%error, "the mail worker stopped; restarting it soon");
             }
         }
-    })
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(timing.restart) => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -511,25 +583,28 @@ mod tests {
         }
     }
 
-    /// Runs one worker named `name` (polling every 100 ms) until the
-    /// returned token is cancelled.
+    /// Fast timing for tests: polls every 100 ms, heartbeats every second
+    /// and restarts after 200 ms.
+    const FAST: WorkerTiming = WorkerTiming {
+        poll: Duration::from_millis(100),
+        heartbeat: Duration::from_secs(1),
+        restart: Duration::from_millis(200),
+    };
+
+    /// Runs one worker named `name`, on its own pool as `serve`'s does, with
+    /// [`FAST`] timing, until the returned token is cancelled.
     fn start_named(
         pool: &PgPool,
         mailer: Arc<Scripted>,
         name: &str,
     ) -> (CancellationToken, JoinHandle<()>) {
         let context = MailContext {
-            pool: pool.clone(),
+            pool: worker_pool(pool),
             mailer,
             clock: Arc::new(FixedClock(now())),
         };
         let shutdown = CancellationToken::new();
-        let worker = run_worker(
-            context,
-            name.to_string(),
-            Duration::from_millis(100),
-            shutdown.clone(),
-        );
+        let worker = run_worker(context, name.to_string(), FAST, shutdown.clone());
         (shutdown, worker)
     }
 
@@ -972,6 +1047,86 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(left, ["Done", "Killed"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_losing_the_database_the_worker_restarts_and_sends() {
+        let db = test_db().await;
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        // A connection to the server's `template1` database (the test's own
+        // may be `postgres`): Postgres refuses to close the database a
+        // connection is in, and while the test's database refuses
+        // connections this is the way back in.
+        // `use sqlx::Connection` brings the `connect_with` constructor into scope.
+        use sqlx::Connection;
+        let mut admin = sqlx::PgConnection::connect_with(
+            &db.pool
+                .connect_options()
+                .as_ref()
+                .clone()
+                .database("template1"),
+        )
+        .await
+        .unwrap();
+        let mailer = Scripted::with(vec![]);
+        let (shutdown, worker) = start_named(&db.pool, Arc::clone(&mailer), "okf-mail-r");
+        for _ in 0..200 {
+            let registered: i64 = sqlx::query_scalar("SELECT count(*) FROM apalis.workers")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+            if registered == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The outage: no new connections, and the worker's own are cut.
+        // `format!` for the name: ALTER DATABASE takes no bind parameters.
+        // `AssertSqlSafe`: the name is the test database's own.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER DATABASE \"{database}\" WITH ALLOW_CONNECTIONS false"
+        )))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+        let cut: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = $1 AND application_name = $2) AS cut",
+        )
+        .bind(&database)
+        .bind(WORKER_APPLICATION_NAME)
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+        // Long enough for the next poll to fail and a restart or two to fail too.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER DATABASE \"{database}\" WITH ALLOW_CONNECTIONS true"
+        )))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+        admin.close().await.unwrap();
+        enqueue(&db.pool, "alice@example.com", &Template::Test, now())
+            .await
+            .unwrap();
+        wait_for(&db.pool, "Done", 1).await;
+        let sent_by: String = sqlx::query_scalar("SELECT lock_by FROM apalis.jobs")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        stop(shutdown, worker).await;
+
+        assert!(cut >= 1, "the worker had connections to cut");
+        assert!(
+            sent_by.starts_with("okf-mail-r-") && sent_by != "okf-mail-r",
+            "sent by a restarted worker: {sent_by}"
+        );
+        assert_eq!(mailer.sent(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

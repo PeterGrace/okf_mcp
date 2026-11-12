@@ -306,7 +306,9 @@ pub struct MailConfig {
     /// The From address (`"okf <okf@example.com>"`).
     pub from: String,
     /// Whether `serve` runs a mail worker. Off for a replica that should only
-    /// enqueue, and in the test servers (Decision 19).
+    /// enqueue, and in the test servers (Decision 19). The worker uses a pool
+    /// of its own, up to 4 connections (one of them held by LISTEN), beside
+    /// `database_max_connections`.
     pub worker: bool,
     /// The SMTP relay, for `provider = "smtp"`.
     pub smtp: Option<SmtpConfig>,
@@ -432,6 +434,8 @@ pub struct Config {
     /// The most database connections one process opens (every command,
     /// `serve` included). A write holds one for its transaction, and a read
     /// that builds an overlay holds one to read the changeset's entries.
+    /// `serve`'s mail worker does not count against it: it opens up to
+    /// `mail::queue::WORKER_POOL_SIZE` (4) connections of its own.
     pub database_max_connections: u32,
     /// The most changeset overlays kept in memory; past it, the least
     /// recently used one is dropped (and rebuilt if read again).

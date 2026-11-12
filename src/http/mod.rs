@@ -645,17 +645,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn serve_runs_the_mail_worker_and_waits_for_it_on_shutdown() {
+    async fn serve_runs_the_mail_worker_on_its_own_connections_and_waits_for_it() {
         let db = crate::db::test_db().await;
+        // The smallest request pool the config accepts: one connection. The
+        // worker's LISTEN must not take it.
+        let one = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(db.pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let config = Config {
+            database_max_connections: 1,
+            ..Config::default()
+        };
         // The default `[mail]`: the log provider, with a worker.
-        let app = App::load(
-            db.pool.clone(),
-            Config::default(),
-            Arc::new(crate::clock::SystemClock),
-        )
-        .await
-        .unwrap();
+        let app = App::load(one, config, Arc::new(crate::clock::SystemClock))
+            .await
+            .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthz = format!("http://{}/healthz", listener.local_addr().unwrap());
         let shutdown = CancellationToken::new();
         let served = tokio::spawn(serve(Arc::clone(&app), listener, shutdown.clone()));
 
@@ -678,10 +686,37 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        // The worker's connections, by name: its LISTEN among them.
+        let (worker_connections, listening): (i64, i64) = sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE query ILIKE 'LISTEN%') \
+             FROM pg_stat_activity WHERE datname = current_database() AND application_name = $1",
+        )
+        .bind(crate::mail::queue::WORKER_APPLICATION_NAME)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let health = reqwest::Client::new()
+            .get(&healthz)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map(|response| response.status().as_u16());
         shutdown.cancel();
         let stopped = tokio::time::timeout(std::time::Duration::from_secs(20), served).await;
 
         assert_eq!(status, "Done", "the worker serve started sent it");
+        assert_eq!(
+            listening, 1,
+            "the worker listens ({worker_connections} connections)"
+        );
+        assert!(
+            worker_connections <= i64::from(crate::mail::queue::WORKER_POOL_SIZE),
+            "{worker_connections}"
+        );
+        assert!(
+            matches!(health, Ok(200)),
+            "requests are served on the one connection: {health:?}"
+        );
         assert!(
             matches!(stopped, Ok(Ok(Ok(())))),
             "serve returns once the worker stops: {stopped:?}"

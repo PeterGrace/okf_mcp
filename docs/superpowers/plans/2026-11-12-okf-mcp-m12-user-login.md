@@ -8095,7 +8095,7 @@ mod tests {
             clock: Arc::new(FixedClock(now())),
         };
         let shutdown = CancellationToken::new();
-        let worker = run_worker(context, worker_name(), Duration::from_millis(100), shutdown.clone());
+        let worker = run_worker(context, worker_name(), FAST, shutdown.clone()) // FAST: see src/mail/queue.rs;
         (shutdown, worker)
     }
 
@@ -8720,11 +8720,11 @@ fn worker_name() -> String {
 /// hand (if any) is finished.
 pub fn spawn_worker(app: Arc<App>, shutdown: CancellationToken) -> JoinHandle<()> {
     let context = MailContext {
-        pool: app.pool().clone(),
+        pool: worker_pool(app.pool()),
         mailer: Arc::clone(app.mailer()),
         clock: app.clock_handle(),
     };
-    run_worker(context, worker_name(), POLL_INTERVAL, shutdown)
+    run_worker(context, worker_name(), WorkerTiming::SERVE, shutdown)
 }
 
 /// Runs one apalis worker on [`QUEUE`] until `shutdown`, restarting it
@@ -8785,7 +8785,8 @@ pub(crate) fn run_worker(
 > - `run_worker` takes the worker's `name` (corrected inline above), so a test can run two workers on one queue, as two replicas would. A restart after a backend error registers as `<name>-<restarts>`, a row of its own: apalis-postgres 1.1.0's `register.sql` updates an existing worker row only under a session-scoped `pg_try_advisory_lock`, which another pooled connection may still hold, and it then refuses with `WorkerAlreadyExists`.
 > - The handler's arguments (`SendMail`, `Data<MailContext>`, `TaskId`) satisfy apalis's bounds as written; the `Data<Arc<MailContext>>` fallback was not needed.
 > - The tests go further than Step 9's (all under real apalis on the test database). `a_provider_error_reschedules_with_doubling_backoff_then_the_retry_succeeds` fails twice: 30 s then 60 s, `attempts` 1 then 2, each last error in `list`, and the job is not taken again while `run_at` is ahead. `a_mail_still_failing_after_24_hours_gives_up_and_retry_gives_a_new_window` retries the given-up job and checks it is rescheduled (`retrying`), not given up again. `two_workers_never_send_the_same_mail_twice` starts two workers, waits until both are registered, queues 30 mails, and checks each is sent exactly once and both workers took some (apalis's `get_jobs` takes rows `FOR UPDATE SKIP LOCKED`). `shutdown_finishes_the_mail_in_hand` cancels while a send is in progress and checks the job ends `Done`. `retry_and_delete_refuse_unknown_and_unfinished_jobs` also checks that a `Running` job cannot be deleted. `debug_hides_the_payloads_bodies` covers `SendMail`'s `Debug`. `Scripted` gained a `delay` and a `sent()` count, and the tests stop workers with a `stop` helper that times out after 20 s.
-> - `http::tests::serve_runs_the_mail_worker_and_waits_for_it_on_shutdown` checks that `serve` with the default `[mail]` sends a queued mail, and returns after `shutdown` once the worker has stopped.
+> - `http::tests::serve_runs_the_mail_worker_on_its_own_connections_and_waits_for_it` checks that `serve` with the default `[mail]` on a one-connection request pool sends a queued mail, and returns after `shutdown` once the worker has stopped.
+> - The worker never uses the request pool (review of PR #333). `spawn_worker` gives it `queue::worker_pool(app.pool())`: the same connect options, at most `WORKER_POOL_SIZE` (4) connections, `application_name` `WORKER_APPLICATION_NAME` (`okf-mail-worker`), connected lazily and closed when the worker ends. Otherwise apalis's LISTEN holds a request connection for good, and with `database_max_connections = 1` (still valid) nothing else is served. `run_worker(context, name, timing, shutdown)` takes a `WorkerTiming { poll, heartbeat, restart }` (`WorkerTiming::SERVE` is 30 s each), so tests can shorten the delays. Task 16's operations docs should say the worker's connections come on top of `database_max_connections`. The tests add `after_losing_the_database_the_worker_restarts_and_sends`, `smtp::tests::an_smtp_5xx_is_permanent_and_a_4xx_is_retryable` (a fake relay), and the `serve` test runs on a one-connection request pool (`serve_runs_the_mail_worker_on_its_own_connections_and_waits_for_it`).
 > - `MailConfig::validate` also refuses a blank `mail.smtp.password_env`; the constants `DEFAULT_SMTP_PORT` (587) and `DEFAULT_POSTMARK_STREAM` (`"outbound"`) back the serde defaults. `mail::tests::a_secret_never_reaches_the_error` checks that a Postmark token a header cannot hold is refused without showing it.
 
 Run: `cargo test --lib -- mail::queue`
