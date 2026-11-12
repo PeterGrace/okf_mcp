@@ -76,11 +76,13 @@ impl AppError {
     /// The HTTP status of the wrapped error.
     ///
     /// # Returns
-    /// 404 for a path, catalog or changeset that is not there (or not reachable), 403
-    /// for an access level that is not enough, 409 for a refused request or a
-    /// publish conflict, 422 for a publish whose result fails lint, 400 for a
-    /// bad input, 500 for the server's own failures, 503 for a request the
-    /// database aborted (retry it).
+    /// 404 for a path, catalog or changeset that is not there (or not reachable), 401
+    /// for a request that proves no identity, 403 for an access level that is
+    /// not enough, 409 for a refused request or a publish conflict, 410 for a
+    /// used or expired link, 422 for a publish whose result fails lint or a
+    /// self-service request past a limit, 400 for a bad input, 500 for the
+    /// server's own failures, 503 for a request the database aborted (retry
+    /// it).
     pub fn status(&self) -> StatusCode {
         // No `_` arm: a new variant fails to compile here until it has a status.
         match &self.0 {
@@ -89,10 +91,14 @@ impl AppError {
             | OkfError::UnknownChangeset { .. }
             | OkfError::UnknownName { .. } => StatusCode::NOT_FOUND,
             OkfError::Forbidden { .. } => StatusCode::FORBIDDEN,
+            OkfError::Unauthenticated { .. } => StatusCode::UNAUTHORIZED,
+            OkfError::Gone { .. } => StatusCode::GONE,
             OkfError::Refused { .. } | OkfError::Conflict { .. } | OkfError::StillLinked { .. } => {
                 StatusCode::CONFLICT
             }
-            OkfError::LintFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            OkfError::LintFailed { .. } | OkfError::LimitExceeded { .. } => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             OkfError::Busy { .. } => StatusCode::SERVICE_UNAVAILABLE,
             OkfError::InvalidPath { .. }
             | OkfError::FrontmatterParse { .. }
@@ -594,6 +600,34 @@ mod tests {
         assert_eq!(
             refused_on.headers()["www-authenticate"],
             "Bearer resource_metadata=\"https://okf.example.com/.well-known/oauth-protected-resource\""
+        );
+    }
+
+    #[test]
+    fn sign_in_errors_have_their_statuses() {
+        let statuses = [
+            AppError(OkfError::Unauthenticated {
+                reason: "no".into(),
+            })
+            .status(),
+            AppError(OkfError::Gone {
+                reason: "expired".into(),
+            })
+            .status(),
+            AppError(OkfError::LimitExceeded {
+                limit: "ceiling",
+                reason: "above".into(),
+            })
+            .status(),
+        ];
+
+        assert_eq!(
+            statuses,
+            [
+                StatusCode::UNAUTHORIZED,
+                StatusCode::GONE,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ]
         );
     }
 }

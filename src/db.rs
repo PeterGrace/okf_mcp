@@ -35,14 +35,63 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, OkfError
     Ok(pool)
 }
 
-/// Applies every migration not yet applied (a no-op when up to date).
+/// Applies every okf migration not yet applied, then apalis' own (both are
+/// no-ops when up to date).
+///
+/// apalis-postgres keeps its tables in schema `apalis` and its history in
+/// `apalis._sqlx_migrations`, apart from okf's `public._sqlx_migrations`, so
+/// neither migrator ever sees the other's rows. Its migrations create the
+/// `pgcrypto` and `hstore` extensions, which (like `citext`) are trusted:
+/// the database owner may create them.
 ///
 /// # Errors
 /// [`OkfError::Migrate`] if a migration fails, or the database has a
-/// migration this binary does not know (it is older than the schema).
+/// migration this binary does not know (it is older than the schema);
+/// [`OkfError::Database`] if apalis' setup cannot reach the database.
 pub async fn migrate(pool: &PgPool) -> Result<(), OkfError> {
     MIGRATOR.run(pool).await?;
+    // `::<()>`: `setup` is defined on `PostgresStorage<()>`; the job type
+    // a storage carries does not matter for creating the schema.
+    apalis_postgres::PostgresStorage::<()>::setup(pool)
+        .await
+        .map_err(apalis_error)?;
     Ok(())
+}
+
+/// An apalis setup failure as an [`OkfError`].
+///
+/// # Arguments
+/// * `error` - what `PostgresStorage::setup` returned.
+///
+/// # Returns
+/// [`OkfError::Migrate`] for a migration failure (including apalis' own
+/// "upgrade required" refusal), [`OkfError::Database`] (or `Busy`) for a
+/// driver error.
+fn apalis_error(error: apalis_postgres::Error) -> OkfError {
+    match error {
+        // apalis wraps its migrator's error in a driver error; unwrap it.
+        // `*source` moves the `MigrateError` out of its `Box`.
+        apalis_postgres::Error::Database(sqlx::Error::Migrate(source)) => {
+            OkfError::Migrate { source: *source }
+        }
+        apalis_postgres::Error::Database(source) => OkfError::from(source),
+        // `setup` returns `UpgradeRequired` for a pre-1.0 apalis history; the
+        // other variants are about running jobs, not setup. Each keeps its
+        // text. Listed rather than `_`, so a new apalis variant is a compile
+        // error here until someone decides what it means. `other @ (...)`
+        // binds the whole matched value to `other`.
+        other @ (apalis_postgres::Error::UpgradeRequired { .. }
+        | apalis_postgres::Error::JsonError(_)
+        | apalis_postgres::Error::ReenqueueMismatch { .. }
+        | apalis_postgres::Error::TaskIdError(_)
+        | apalis_postgres::Error::StatusError(_)
+        | apalis_postgres::Error::WorkerOutOfSync
+        | apalis_postgres::Error::WorkerAlreadyExists(_)) => OkfError::Migrate {
+            source: sqlx::migrate::MigrateError::Source(Box::new(std::io::Error::other(
+                other.to_string(),
+            ))),
+        },
+    }
 }
 
 /// The user (and its personal team) every unit-test database starts with,
@@ -71,19 +120,38 @@ pub(crate) async fn test_db() -> pg_support::TestDb {
 mod tests {
     use super::*;
 
+    use apalis_postgres::PostgresStorage;
+
+    /// How many migrations `apalis._sqlx_migrations` records.
+    async fn apalis_history(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM apalis._sqlx_migrations")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// How many migrations okf's own `_sqlx_migrations` records.
+    async fn okf_history(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn migrations_create_the_schema_and_rerun_as_a_no_op() {
         // A bare database, not `test_db()`: its fixture user would bump the
         // admin generation this test expects migrations to leave at zero.
         let db = pg_support::TestDb::start().await;
         migrate(&db.pool).await.unwrap();
+        let apalis_once = apalis_history(&db.pool).await;
 
         migrate(&db.pool).await.unwrap();
 
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT table_name::text FROM information_schema.tables \
              WHERE table_schema = 'public' AND table_name <> '_sqlx_migrations' \
-             ORDER BY table_name",
+             ORDER BY table_name COLLATE \"C\"",
         )
         .fetch_all(&db.pool)
         .await
@@ -96,6 +164,7 @@ mod tests {
                 "changeset_entries",
                 "changesets",
                 "documents",
+                "email_tokens",
                 "key_catalogs",
                 "maintenance_dispositions",
                 "maintenance_evidence",
@@ -107,19 +176,317 @@ mod tests {
                 "oauth_clients",
                 "oauth_tokens",
                 "revisions",
+                "server_settings",
                 "server_state",
                 "sign_in_code_catalogs",
                 "sign_in_codes",
+                "sign_in_events",
                 "team_members",
                 "teams",
+                "user_catalogs",
+                "user_identities",
+                "user_passkeys",
+                "user_sessions",
                 "users",
             ]
+        );
+        // apalis keeps everything in its own schema, with its own history.
+        let apalis_tables: Vec<String> = sqlx::query_scalar(
+            "SELECT table_name::text FROM information_schema.tables \
+             WHERE table_schema = 'apalis' ORDER BY table_name COLLATE \"C\"",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        for table in ["_sqlx_migrations", "jobs", "workers"] {
+            assert!(
+                apalis_tables.iter().any(|name| name == table),
+                "{apalis_tables:?}"
+            );
+        }
+        let embedded = i64::try_from(PostgresStorage::<()>::migrations().iter().count()).unwrap();
+        assert_eq!(apalis_once, embedded, "every apalis migration applied once");
+        assert_eq!(
+            apalis_history(&db.pool).await,
+            apalis_once,
+            "the rerun is a no-op"
+        );
+        assert_eq!(
+            okf_history(&db.pool).await,
+            i64::try_from(MIGRATOR.iter().count()).unwrap(),
+            "okf's history holds only okf's migrations"
         );
         let admin_generation: i64 = sqlx::query_scalar("SELECT admin_generation FROM server_state")
             .fetch_one(&db.pool)
             .await
             .unwrap();
         assert_eq!(admin_generation, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_0010_keeps_every_row_and_both_migrators_rerun_as_no_ops() {
+        // Arrange: a database the real migrator took to 0009 (so its history
+        // is what a v0.14 server left), with a user in her personal team,
+        // a catalog that team owns, a key with one grant and an OAuth grant.
+        let db = pg_support::TestDb::start().await;
+        MIGRATOR.run_to(9, &db.pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users (name, created_at) VALUES ('alice', now());
+             INSERT INTO teams (name, personal_of, created_at)
+                 SELECT 'alice', id, now() FROM users WHERE name = 'alice';
+             INSERT INTO team_members (team_id, user_id, role, created_at)
+                 SELECT t.id, u.id, 'owner', now() FROM teams t, users u
+                 WHERE t.name = 'alice' AND u.name = 'alice';
+             INSERT INTO catalogs (name, created_at, owner_team_id)
+                 SELECT 'pg', now(), id FROM teams WHERE name = 'alice';
+             INSERT INTO api_keys (name, sha256, access, all_catalogs, actor, created_at, user_id)
+                 SELECT 'laptop', decode(repeat('ab', 32), 'hex'), 'write', false, 'alice',
+                        now(), id
+                 FROM users WHERE name = 'alice';
+             INSERT INTO key_catalogs (key_id, catalog_id)
+                 SELECT k.id, c.id FROM api_keys k, catalogs c
+                 WHERE k.name = 'laptop' AND c.name = 'pg';
+             INSERT INTO oauth_clients (client_id, kind, redirect_uris, metadata, created_at)
+                 VALUES ('c1', 'dcr', '{https://client.example.com/cb}', '{}', now());
+             INSERT INTO api_keys (name, kind, client_id, access, all_catalogs, actor, created_at)
+                 VALUES ('laptop.grant', 'oauth', 'c1', 'read', true, 'alice', now());",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(okf_history(&db.pool).await, 9);
+
+        // Act: what a v0.15 server does on start, twice.
+        migrate(&db.pool).await.unwrap();
+        migrate(&db.pool).await.unwrap();
+
+        // Assert: nothing existing changed meaning.
+        // `email::text`: decode citext as plain text.
+        let user: (
+            Option<String>,
+            bool,
+            Option<String>,
+            i32,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as(
+            "SELECT email::text, is_admin, password_hash, failed_sign_ins, locked_until \
+                 FROM users WHERE name = 'alice'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(user, (None, false, None, 0, None));
+        let keys: Vec<(String, bool, Option<chrono::DateTime<chrono::Utc>>)> =
+            sqlx::query_as("SELECT name, self_issued, expires_at FROM api_keys ORDER BY name")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            keys,
+            [
+                ("laptop".to_string(), false, None),
+                ("laptop.grant".to_string(), false, None)
+            ]
+        );
+        let level: Option<String> = sqlx::query_scalar("SELECT access FROM key_catalogs")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(level, None, "an existing grant keeps the key's own level");
+        let member_access: String =
+            sqlx::query_scalar("SELECT member_access FROM catalogs WHERE name = 'pg'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(member_access, "write");
+        let new_rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM user_identities) + (SELECT count(*) FROM user_passkeys) \
+                  + (SELECT count(*) FROM user_sessions) + (SELECT count(*) FROM email_tokens) \
+                  + (SELECT count(*) FROM sign_in_events) + (SELECT count(*) FROM user_catalogs) \
+                  + (SELECT count(*) FROM server_settings)",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(new_rows, 0, "the migration creates no rows");
+        assert_eq!(
+            okf_history(&db.pool).await,
+            i64::try_from(MIGRATOR.iter().count()).unwrap()
+        );
+        assert_eq!(
+            apalis_history(&db.pool).await,
+            i64::try_from(PostgresStorage::<()>::migrations().iter().count()).unwrap()
+        );
+    }
+
+    /// Inserts an API key row with these columns, named `name` (its hash is
+    /// derived from the name, so each call is distinct).
+    async fn insert_key(
+        pool: &PgPool,
+        name: &str,
+        flags: (&str, bool, bool, bool),
+        user_id: Option<&str>,
+    ) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+        // A tuple keeps this at five parameters: (access, maintenance_report,
+        // all_catalogs, self_issued).
+        let (access, report, all, self_issued) = flags;
+        sqlx::query(
+            "INSERT INTO api_keys \
+             (name, sha256, access, maintenance_report, all_catalogs, actor, created_at, \
+              user_id, self_issued) \
+             VALUES ($1, sha256($1::bytea), $2, $3, $4, $1, now(), $5, $6)",
+        )
+        .bind(name)
+        .bind(access)
+        .bind(report)
+        .bind(all)
+        .bind(user_id)
+        .bind(self_issued)
+        .execute(pool)
+        .await
+    }
+
+    /// The constraint a refused statement broke.
+    fn broken<T>(result: Result<T, sqlx::Error>) -> Option<String> {
+        result.err().and_then(|error| {
+            error
+                .as_database_error()
+                .and_then(|e| e.constraint().map(str::to_string))
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_0010_constraints_hold() {
+        let db = test_db().await;
+        sqlx::raw_sql("INSERT INTO catalogs (name, created_at) VALUES ('pg', now());")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
+            .bind(TEST_USER)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let user = Some(user_id.as_str());
+
+        // A self-issued key: read or write, never a reporter, never every
+        // catalog, always a user's.
+        insert_key(&db.pool, "mine", ("write", false, false, true), user)
+            .await
+            .unwrap();
+        for (name, flags) in [
+            ("admin", ("admin", false, false, true)),
+            ("reporter", ("read", true, false, true)),
+            ("everything", ("read", false, true, true)),
+        ] {
+            assert_eq!(
+                broken(insert_key(&db.pool, name, flags, user).await).as_deref(),
+                Some("api_keys_self_issued_caps"),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            broken(insert_key(&db.pool, "orphan", ("read", false, false, true), None).await)
+                .as_deref(),
+            Some("api_keys_self_issued_user")
+        );
+        // Admin-issued keys are as before.
+        insert_key(&db.pool, "root", ("admin", true, true, false), None)
+            .await
+            .unwrap();
+
+        // Per-catalog levels are read or write; NULL is the key's own.
+        let grant = |access: Option<&'static str>| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO key_catalogs (key_id, catalog_id, access) \
+                     SELECT k.id, c.id, $1 FROM api_keys k, catalogs c \
+                     WHERE k.name = 'root' AND c.name = 'pg' \
+                     ON CONFLICT (key_id, catalog_id) DO UPDATE SET access = EXCLUDED.access",
+                )
+                .bind(access)
+                .execute(&pool)
+                .await
+            }
+        };
+        grant(None).await.unwrap();
+        grant(Some("read")).await.unwrap();
+        assert_eq!(
+            broken(grant(Some("admin")).await).as_deref(),
+            Some("key_catalogs_access_level")
+        );
+
+        // Entitlements, member access, tokens and events take only their values.
+        let checks = [
+            (
+                "INSERT INTO user_catalogs (user_id, catalog_id, access, created_at) \
+                 SELECT $1, id, 'admin', now() FROM catalogs WHERE name = 'pg'",
+                "user_catalogs_access_check",
+            ),
+            (
+                "UPDATE catalogs SET member_access = 'owner' WHERE name = 'pg' AND $1 <> ''",
+                "catalogs_member_access_check",
+            ),
+            (
+                "INSERT INTO email_tokens (hash, user_id, purpose, created_at, expires_at) \
+                 VALUES (sha256('t'::bytea), $1, 'login', now(), now())",
+                "email_tokens_purpose_check",
+            ),
+            (
+                "INSERT INTO sign_in_events (user_id, method, outcome, at) \
+                 VALUES ($1, 'password', 'maybe', now())",
+                "sign_in_events_outcome_check",
+            ),
+        ];
+        for (statement, constraint) in checks {
+            let result = sqlx::query(statement)
+                .bind(&user_id)
+                .execute(&db.pool)
+                .await;
+            assert_eq!(broken(result).as_deref(), Some(constraint), "{statement}");
+        }
+
+        // Email addresses are unique ignoring case (citext).
+        sqlx::query("UPDATE users SET email = 'Alice@Example.com' WHERE id = $1")
+            .bind(&user_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let clash = sqlx::query(
+            "INSERT INTO users (name, email, created_at) VALUES ('bob', 'alice@example.com', now())",
+        )
+        .execute(&db.pool)
+        .await;
+        assert_eq!(broken(clash).as_deref(), Some("users_email_key"));
+    }
+
+    #[test]
+    fn an_apalis_setup_error_is_a_migrate_or_database_error() {
+        let upgrade = apalis_error(apalis_postgres::Error::UpgradeRequired {
+            current: "0.7.4".into(),
+            required: "1.0.0".into(),
+            link: None,
+        });
+        let database = apalis_error(apalis_postgres::Error::Database(sqlx::Error::PoolClosed));
+        let migrate = apalis_error(apalis_postgres::Error::Database(sqlx::Error::Migrate(
+            Box::new(sqlx::migrate::MigrateError::VersionMismatch(1)),
+        )));
+
+        assert!(matches!(upgrade, OkfError::Migrate { .. }), "{upgrade:?}");
+        assert!(
+            matches!(database, OkfError::Database { .. }),
+            "{database:?}"
+        );
+        assert!(
+            matches!(
+                migrate,
+                OkfError::Migrate {
+                    source: sqlx::migrate::MigrateError::VersionMismatch(1)
+                }
+            ),
+            "{migrate:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
