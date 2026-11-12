@@ -335,6 +335,8 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn create_list_and_find() {
         let db = test_db().await;
+        // Read first: the fixture user already bumped the generation.
+        let start = admin_generation(&db.pool).await.unwrap();
 
         let pg = create(&db.pool, "pg", "pgrace's catalog", now())
             .await
@@ -357,12 +359,14 @@ pub(crate) mod tests {
             find(&db.pool, "nope").await,
             Err(OkfError::CatalogNotSelected { catalog }) if catalog == "nope"
         ));
-        assert_eq!(admin_generation(&db.pool).await.unwrap(), 2);
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), start + 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn update_description_replaces_it_and_returns_the_old_text() {
         let db = test_db().await;
+        // Read first: the fixture user already bumped the generation.
+        let start = admin_generation(&db.pool).await.unwrap();
         let pg = create(&db.pool, "pg", "copy", now()).await.unwrap();
 
         let previous = update_description(&db.pool, "pg", "source of truth")
@@ -379,7 +383,7 @@ pub(crate) mod tests {
             (row.description.as_str(), row.generation),
             ("", pg.generation)
         );
-        assert_eq!(admin_generation(&db.pool).await.unwrap(), 3);
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), start + 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -419,6 +423,8 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn update_description_refuses_an_unknown_catalog() {
         let db = test_db().await;
+        // Read first: the fixture user already bumped the generation.
+        let start = admin_generation(&db.pool).await.unwrap();
 
         let outcome = update_description(&db.pool, "nope", "x").await;
 
@@ -426,12 +432,14 @@ pub(crate) mod tests {
             outcome,
             Err(OkfError::CatalogNotSelected { catalog }) if catalog == "nope"
         ));
-        assert_eq!(admin_generation(&db.pool).await.unwrap(), 0);
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), start);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn bad_and_duplicate_names_are_refused() {
         let db = test_db().await;
+        // Read first: the fixture user already bumped the generation.
+        let start = admin_generation(&db.pool).await.unwrap();
         create(&db.pool, "pg", "", now()).await.unwrap();
 
         for name in ["", "Bad Name", "a/b", "ünï"] {
@@ -448,12 +456,14 @@ pub(crate) mod tests {
         assert!(
             matches!(duplicate, Err(OkfError::Refused { reason }) if reason.contains("already exists"))
         );
-        assert_eq!(admin_generation(&db.pool).await.unwrap(), 1);
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), start + 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn delete_refuses_unpublished_work_unless_forced() {
         let db = test_db().await;
+        // Read first: the fixture user already bumped the generation.
+        let start = admin_generation(&db.pool).await.unwrap();
         let pg = create(&db.pool, "pg", "", now()).await.unwrap();
         let changeset: i64 = sqlx::query_scalar(
             "INSERT INTO changesets (catalog_id, actor, state, created_at, updated_at) \
@@ -484,7 +494,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(entries, 0);
-        assert_eq!(admin_generation(&db.pool).await.unwrap(), 2);
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), start + 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -558,6 +568,8 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_delete_that_waited_finds_the_catalog_gone() {
         let db = test_db().await;
+        // Read first: the fixture user already bumped the generation.
+        let start = admin_generation(&db.pool).await.unwrap();
         let pg = create(&db.pool, "pg", "", now()).await.unwrap();
         let mut first = db.pool.begin().await.unwrap();
         lock(&mut first, pg.id).await.unwrap();
@@ -579,7 +591,7 @@ pub(crate) mod tests {
             outcome,
             Err(OkfError::CatalogNotSelected { catalog }) if catalog == "pg"
         ));
-        assert_eq!(admin_generation(&db.pool).await.unwrap(), 1);
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), start + 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
