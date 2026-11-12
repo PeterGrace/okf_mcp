@@ -45,11 +45,26 @@ pub async fn migrate(pool: &PgPool) -> Result<(), OkfError> {
     Ok(())
 }
 
-/// A migrated throwaway database for one test.
+/// The user (and its personal team) every unit-test database starts with,
+/// so tests that create keys, codes and catalogs have an owner to name.
+#[cfg(test)]
+pub(crate) const TEST_USER: &str = "test-user";
+/// [`TEST_USER`]'s personal team.
+#[cfg(test)]
+pub(crate) const TEST_TEAM: &str = TEST_USER;
+
+/// A migrated throwaway database for one test, with [`TEST_USER`].
 #[cfg(test)]
 pub(crate) async fn test_db() -> pg_support::TestDb {
     let db = pg_support::TestDb::start().await;
     migrate(&db.pool).await.expect("migrations apply");
+    let fixture = crate::store::users::NewUser {
+        name: TEST_USER,
+        display_name: "",
+    };
+    crate::store::users::create(&db.pool, &fixture, chrono::Utc::now())
+        .await
+        .expect("create the fixture user");
     db
 }
 
@@ -59,7 +74,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn migrations_create_the_schema_and_rerun_as_a_no_op() {
-        let db = test_db().await;
+        // A bare database, not `test_db()`: its fixture user would bump the
+        // admin generation this test expects migrations to leave at zero.
+        let db = pg_support::TestDb::start().await;
+        migrate(&db.pool).await.unwrap();
 
         migrate(&db.pool).await.unwrap();
 

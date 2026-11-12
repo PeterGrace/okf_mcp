@@ -952,6 +952,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn create_stores_only_the_hash_and_the_grants() {
         let db = test_db().await;
+        // Read first: the fixture user already bumped the generation.
+        let start = catalogs::admin_generation(&db.pool).await.unwrap();
         catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
         catalogs::create(&db.pool, "work", "", now()).await.unwrap();
         // "pg" twice: one grant.
@@ -981,12 +983,17 @@ mod tests {
         assert_eq!(record.kind, KeyKind::Key);
         assert_eq!(record.created_at, now());
         assert_eq!(record.revoked_at, None);
-        assert_eq!(catalogs::admin_generation(&db.pool).await.unwrap(), 3);
+        assert_eq!(
+            catalogs::admin_generation(&db.pool).await.unwrap(),
+            start + 3
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn bad_requests_are_refused() {
         let db = test_db().await;
+        // Read first: the fixture user already bumped the generation.
+        let start = catalogs::admin_generation(&db.pool).await.unwrap();
         catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
         let pg = ["pg".to_string()];
         let missing = ["pg".to_string(), "nope".to_string()];
@@ -1023,12 +1030,17 @@ mod tests {
         assert!(matches!(bad_default, Err(OkfError::Refused { .. })));
         // Only the first key exists, and only its creation bumped the generation.
         assert_eq!(list(&db.pool).await.unwrap().len(), 1);
-        assert_eq!(catalogs::admin_generation(&db.pool).await.unwrap(), 2);
+        assert_eq!(
+            catalogs::admin_generation(&db.pool).await.unwrap(),
+            start + 2
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn revoke_grant_and_ungrant() {
         let db = test_db().await;
+        // Read first: the fixture user already bumped the generation.
+        let start = catalogs::admin_generation(&db.pool).await.unwrap();
         catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
         catalogs::create(&db.pool, "work", "", now()).await.unwrap();
         let pg = ["pg".to_string()];
@@ -1057,7 +1069,10 @@ mod tests {
         assert_eq!(record.revoked_at, Some(now()));
         // Two catalogs, two keys, one grant, one ungrant, one revoke: the
         // no-ops bumped nothing.
-        assert_eq!(catalogs::admin_generation(&db.pool).await.unwrap(), 7);
+        assert_eq!(
+            catalogs::admin_generation(&db.pool).await.unwrap(),
+            start + 7
+        );
         assert!(matches!(
             revoke(&db.pool, "k", now()).await,
             Err(OkfError::Refused { .. })

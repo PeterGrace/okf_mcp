@@ -114,7 +114,7 @@ pub async fn find(pool: &PgPool, name: &str) -> Result<TeamRecord, OkfError>;
 pub async fn set_member(pool: &PgPool, team: &str, user: &str, role: Role, now: DateTime<Utc>) -> Result<MemberChange, OkfError>;
 pub async fn remove_member(pool: &PgPool, team: &str, user: &str) -> Result<(), OkfError>;
 pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError>;
-pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String, OkfError>;
+pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String, OkfError>; // added by Task 3 (its first caller)
 pub enum MemberChange { Added, RoleChanged, Unchanged }
 
 // src/store/catalogs.rs (Task 3)
@@ -540,7 +540,7 @@ mod tests {
 }
 ```
 
-The test "a user with a key is not deleted" belongs to Task 4, where keys gain a user.
+> **Corrected (issue #280).** The deletion guards are tested here, not in Tasks 3 and 4: review asked for them, and migration 0009's columns let the tests seed the references with SQL. `store::users::tests` adds `a_user_named_by_a_key_is_not_deleted`, `a_user_named_by_a_sign_in_code_is_not_deleted`, `a_user_whose_personal_team_owns_a_catalog_is_not_deleted` and the two-transaction `a_catalog_assigned_during_the_delete_is_refused_not_a_database_error`. `store::teams::tests` adds `a_team_that_owns_a_catalog_is_not_deleted`. Each asserts `Refused` and that the user or team, the reference and the admin generation are unchanged. Catalog ownership is seeded by `users::tests::seed_catalog_owned_by` (`catalogs::create`, then `UPDATE catalogs SET owner_team_id`).
 
 Tests for `src/store/teams.rs`:
 
@@ -728,7 +728,7 @@ macro_rules! select_users {
 }
 
 /// Refuses a name that is not `[a-z0-9-]+`.
-fn check_name(noun: &str, name: &str) -> Result<(), OkfError> {
+pub(crate) fn check_name(noun: &str, name: &str) -> Result<(), OkfError> {
     if is_valid_name(name) {
         Ok(())
     } else {
@@ -758,7 +758,7 @@ pub(crate) async fn check_free(conn: &mut PgConnection, name: &str) -> Result<()
 }
 
 /// The refusal for a name a user or team already has.
-pub(crate) fn name_taken(name: &str) -> OkfError {
+fn name_taken(name: &str) -> OkfError {
     OkfError::Refused {
         reason: format!("the name {name:?} is already taken by a user or team"),
     }
@@ -904,6 +904,12 @@ pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError> {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| unknown(name))?;
+    // > **Corrected (issue #280).** Shipped code also locks the personal team
+    // > (`SELECT id FROM teams WHERE personal_of = $1 FOR UPDATE`) before the
+    // > counts, counts catalogs by that team id, and deletes the team by id:
+    // > otherwise a catalog assigned to the team concurrently is missed and
+    // > the team's DELETE fails as a database error instead of a 409. Read
+    // > `src/store/users.rs`.
     let (credentials, other_teams, owned): (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM api_keys WHERE user_id = $1) \
               + (SELECT count(*) FROM sign_in_codes WHERE user_id = $1), \
@@ -1040,6 +1046,8 @@ async fn refuse_last_owner(
   - `delete` locks the team and refuses when `personal_of IS NOT NULL` or when any catalog has `owner_team_id = id`. Otherwise it deletes the team (memberships cascade) and bumps.
   - `create` checks the name, calls `users::check_free`, resolves the owner with `users::id_of`, inserts the team (its result through `users::or_name_taken`, so a team that loses the race to a concurrent user or team of that name is a 409, not a database error), inserts the owner membership, and bumps.
 
+> **Corrected (issue #280).** What shipped differs from the sketch above in four internal ways; read `src/store/teams.rs`. (1) `lock_team` returns a private `LockedTeam { id, personal_of }` (the personal owner's user id), which `remove_member` and `delete` need, so `set_member` uses `locked.id`. (2) `set_member` matches on a private `current_role` helper returning `Option<Role>` (the `Role::parse` failure is an `expect`, as for `Access`), so there is no `unreachable!` arm and no `update_role` helper. (3) The members query selects the team's name and is grouped in Rust by name (`list` runs it unfiltered, `find` with `WHERE t.name = $1`), instead of `WHERE m.team_id = ANY($1)`. (4) `teams::id_of` is not in this task: nothing called it, and `-D warnings` refuses dead code. Task 3, its first caller, adds it beside `lock_team` (`SELECT id FROM teams WHERE name = $1`, `UnknownName { noun: "team" }` when absent). `users::check_name` is `pub(crate)` so `teams::create` reuses it, and `name_taken` is private. Extra tests beyond the plan: `role_spellings_round_trip`, `list_groups_members_by_team`, `set_member_on_an_unknown_team_or_user_is_unknown_name`, `concurrent_removal_of_two_owners_leaves_one` and `a_member_is_removed_but_a_non_member_is_refused` (replacing `a_member_is_removed`).
+
 Register both modules in `src/store/mod.rs` (`pub mod teams;`, `pub mod users;`, keeping the list sorted).
 
 - [ ] **Step 6: Run the tests**
@@ -1048,6 +1056,8 @@ Run: `cargo test --lib -- store::users store::teams db::tests`
 Expected: PASS.
 
 - [ ] **Step 7: Run the whole suite.** The fixture adds a user to every unit-test database. Fix any existing test that counts `admin_generation` from zero, by reading it before acting instead.
+
+> **Corrected (issue #280).** Nine tests counted it from zero: six in `store::catalogs::tests` and three in `store::keys::tests`. Each now reads `let start = admin_generation(..)` right after `test_db()` and asserts `start + N`. `db::tests::migrations_create_the_schema_and_rerun_as_a_no_op` asserts that migrations leave it at 0, so it migrates a bare `pg_support::TestDb` (twice) instead of using `test_db()`. Later tasks' tests that assert an absolute generation must do the same.
 
 Run: `cargo test --lib`
 Expected: PASS.
@@ -1123,7 +1133,9 @@ async fn set_owner_assigns_a_legacy_catalog() {
 }
 ```
 
-In `src/store/teams.rs` tests:
+> **Corrected (issue #280).** Do not add the test below: Task 2 already ships `teams::tests::a_team_that_owns_a_catalog_is_not_deleted` (and the user-side catalog guards in `users::tests`). When `catalogs::create` gains its owner argument, update `users::tests::seed_catalog_owned_by` to pass the team to `catalogs::create` and drop its `UPDATE`, and give the race test's `catalogs::create` call an owner (`TEST_TEAM`), keeping its explicit `UPDATE` inside the held transaction.
+
+In `src/store/teams.rs` tests (superseded, see above):
 
 ```rust
 #[tokio::test(flavor = "multi_thread")]
@@ -1144,6 +1156,7 @@ async fn a_team_that_owns_a_catalog_is_not_deleted() {
 - [ ] **Step 3: Implement**
   - Add `pub owner_team: Option<String>` (doc: "The team that owns it; `None` only for a catalog from before migration 0009 not yet assigned") to `Catalog`.
   - Every `query_as::<_, Catalog>` now selects `(SELECT t.name FROM teams t WHERE t.id = c.owner_team_id) AS owner_team`, with the table aliased `c`.
+  - Add `pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String, OkfError>` to `src/store/teams.rs` (Task 2 left it out because nothing called it yet): `SELECT id FROM teams WHERE name = $1`, mapping no row to the module's `unknown(name)` (`UnknownName { noun: "team" }`).
   - `create` gains `owner_team: &str` before `now`. It resolves `teams::id_of(&mut tx, owner_team)?` inside the transaction before the insert, and inserts `owner_team_id`. `RETURNING` cannot use the subquery, so the returned row is built from `RETURNING id, name, description, generation, created_at` plus `owner_team: Some(owner_team.to_string())`. Use a small private `#[derive(sqlx::FromRow)] struct InsertedCatalog` for the insert.
   - `set_owner(pool, name, team)`:
 
@@ -1254,6 +1267,11 @@ async fn assigning_a_legacy_key_sets_its_user_and_bumps_the_generation() {
     assert!(catalogs::admin_generation(&db.pool).await.unwrap() > before);
 }
 
+// > **Corrected (issue #280).** Superseded: Task 2 ships
+// > `users::tests::a_user_named_by_a_key_is_not_deleted` and
+// > `a_user_named_by_a_sign_in_code_is_not_deleted`, which seed `user_id`
+// > with SQL. Do not add this test; the `new_key` helper below is still
+// > needed by the other Task 4 tests.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_user_with_a_key_is_not_deleted() {
     let db = test_db().await;

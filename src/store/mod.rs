@@ -12,3 +12,5 @@ pub mod keys;
 pub mod maintenance;
 pub mod oauth;
 pub mod publish;
+pub mod teams;
+pub mod users;
