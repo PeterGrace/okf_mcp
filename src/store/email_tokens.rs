@@ -2,6 +2,18 @@
 //! tokens. A token is 256 random bits in base64url; only its SHA-256 is
 //! stored. Issuing one deletes the user's older tokens of the same purpose,
 //! and redeeming one marks it used in the statement that checks it.
+//!
+//! **Lock order: the user's row first, then their tokens or sessions.**
+//! Every transaction that locks a `users` row and also writes
+//! `email_tokens` or `user_sessions` takes the user's row first: [`issue`],
+//! [`issue_for_email`] and [`redeem_in`] here; `users::set_email`,
+//! `users::set_admin` and `users::delete`; `passwords::set_in` and
+//! `passwords::reset_in` (whose `UPDATE users` precedes `revoke_all`); and
+//! `user_sessions::start` (the user `FOR SHARE`, then the insert). Two such
+//! transactions on one user therefore queue on that row and never deadlock.
+//! Statements that touch only tokens or only sessions (`touch`, `revoke`,
+//! `revoke_by_prefix`, the prunes) hold no user lock, so they cannot close a
+//! cycle. New code that touches both must keep the order.
 
 use std::time::Duration;
 
@@ -233,9 +245,16 @@ pub async fn redeem(
 
 /// [`redeem`] inside the caller's transaction, so using the link and the
 /// change it makes (a password, a passkey) commit or roll back together:
-/// a failure after this leaves the link unused. The token's row stays
-/// locked until the transaction ends, so a concurrent use waits and then
-/// finds it used (or, after a rollback, unused).
+/// a failure after this leaves the link unused.
+///
+/// Locks follow the module's order, the user's row first and then the
+/// token: the token's user is read without a lock, that user's row is
+/// locked (`FOR NO KEY UPDATE`, as [`issue`] takes it), and only then is the
+/// token marked used, with every check run again under the lock (unused,
+/// unexpired, the purpose, the same user). Both rows stay locked until the
+/// transaction ends, so a concurrent use waits and then finds the link used
+/// (or, after a rollback, unused), and a concurrent issue or email change
+/// waits on the user's row rather than deadlocking.
 ///
 /// # Arguments
 /// * `conn` - the transaction (`&mut *tx`).
@@ -254,19 +273,40 @@ pub async fn redeem_in(
     purpose: Purpose,
     now: DateTime<Utc>,
 ) -> Result<UserAuth, OkfError> {
+    let hash = keys::hash(token);
+    // No lock yet: only to learn which user's row to lock first.
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT user_id FROM email_tokens WHERE hash = $1")
+            .bind(hash.as_slice())
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some(owner) = owner else {
+        return Err(gone());
+    };
+    let locked: Option<String> =
+        sqlx::query_scalar("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(&owner)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if locked.is_none() {
+        return Err(gone());
+    }
+    // Under the user's lock: a token deleted or replaced meanwhile (an email
+    // change, a newer link) no longer matches, nor does one used meanwhile.
     sqlx::query_as::<_, UserAuth>(concat!(
         "WITH used AS (UPDATE email_tokens SET used_at = $3 \
                        WHERE hash = $1 AND purpose = $2 AND used_at IS NULL \
-                         AND expires_at > $3 \
+                         AND expires_at > $3 AND user_id = $4 \
                        RETURNING user_id) \
          SELECT ",
         user_auth_columns!(),
         " FROM used JOIN users u ON u.id = used.user_id"
     ))
-    .bind(keys::hash(token).as_slice())
+    .bind(hash.as_slice())
     .bind(purpose.as_str())
     .bind(now)
-    .fetch_optional(conn)
+    .bind(&owner)
+    .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(gone)
 }

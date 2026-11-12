@@ -1774,6 +1774,123 @@ mod tests {
         assert_eq!(live, 0);
     }
 
+    /// The other side of a race with a link's redemption.
+    #[derive(Debug, Clone, Copy)]
+    enum Rival {
+        Issue,
+        EmailChange,
+    }
+
+    /// Holds alice's row, then queues `rival` and, behind it, a redemption
+    /// of her reset token, and releases the row. Before the user-first lock
+    /// order the redemption locked the token at once and then queued for
+    /// alice's row behind the rival, which, once it had the row, waited on
+    /// the token to delete it: a deadlock (40P01). Now the redemption locks
+    /// nothing before alice's row.
+    ///
+    /// # Returns
+    /// The redemption's result and the token, once both sides finished.
+    async fn redemption_racing(rival: Rival) -> (TestApp, Result<(), OkfError>, String) {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let pool = test.app.pool().clone();
+        let token = email_tokens::issue(
+            &pool,
+            &alice.id,
+            Purpose::Reset,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await
+        .expect("issue a reset token");
+        let mut holder = pool.begin().await.expect("begin");
+        sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
+            .bind(&alice.id)
+            .execute(&mut *holder)
+            .await
+            .expect("hold alice's row");
+        let rival = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                match rival {
+                    Rival::Issue => email_tokens::issue_for_email(
+                        &pool,
+                        "alice@example.com",
+                        Purpose::Reset,
+                        Duration::from_secs(3600),
+                        Utc::now(),
+                    )
+                    .await
+                    .map(|_| ()),
+                    Rival::EmailChange => {
+                        users::set_email(&pool, "alice", Some("alice@example.net")).await
+                    }
+                }
+            })
+        };
+        wait_for_lock_waiters(&pool, 1).await;
+        let redemption = {
+            let app = Arc::clone(&test.app);
+            let token = token.clone();
+            tokio::spawn(async move {
+                use_link(
+                    &app,
+                    &token,
+                    Purpose::Reset,
+                    "amber-quarry-signal-77",
+                    Utc::now(),
+                )
+                .await
+                .map(|_| ())
+            })
+        };
+        wait_for_lock_waiters(&pool, 2).await;
+
+        holder.commit().await.expect("release alice's row");
+        rival
+            .await
+            .expect("the rival task")
+            .expect("the rival completes (no deadlock)");
+        let redeemed = redemption.await.expect("the redemption task");
+        (test, redeemed, token)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_redemption_racing_a_new_link_completes_without_a_deadlock() {
+        let (test, redeemed, token) = redemption_racing(Rival::Issue).await;
+        let pool = test.app.pool();
+
+        // The new link replaced the one being redeemed, so it is gone and
+        // the password is unchanged.
+        assert!(
+            matches!(redeemed, Err(OkfError::Gone { .. })),
+            "{redeemed:?}"
+        );
+        assert!(email_tokens::peek(pool, &token, Purpose::Reset, Utc::now())
+            .await
+            .is_err());
+        let old = passwords::verify(pool, "alice@example.com", PASSWORD, Utc::now())
+            .await
+            .expect("check the password");
+        assert!(matches!(old, SignInOutcome::Ok(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_redemption_racing_an_email_change_completes_without_a_deadlock() {
+        let (test, redeemed, _) = redemption_racing(Rival::EmailChange).await;
+        let pool = test.app.pool();
+
+        // The change deleted the link, so the password is unchanged.
+        assert!(
+            matches!(redeemed, Err(OkfError::Gone { .. })),
+            "{redeemed:?}"
+        );
+        let old = passwords::verify(pool, "alice@example.net", PASSWORD, Utc::now())
+            .await
+            .expect("check the password");
+        assert!(matches!(old, SignInOutcome::Ok(_)));
+    }
+
     /// Makes every statement matching `event` (`BEFORE DELETE ON
     /// user_sessions`, ...) fail, until [`allow`] drops it.
     async fn fail_on(pool: &PgPool, event: &str) {
