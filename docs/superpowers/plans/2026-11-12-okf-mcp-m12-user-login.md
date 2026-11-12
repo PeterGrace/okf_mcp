@@ -8917,7 +8917,12 @@ This part has no sign-in page: its tests start sessions with `Browser::session_f
 > - **`users::set_email` bumps `admin_generation` when the address changes** (a case-only change is no change), because the key cache now holds every user's email (`users::auth_by_id`, which reuses `user_auth_columns!`). Test `an_email_change_bumps_the_generation_and_a_no_op_does_not`.
 > - **`start_session` does not cut `User-Agent` itself**: `user_sessions::create` keeps 256 characters (issue #313), so `MAX_USER_AGENT_CHARS` is gone.
 > - **`ip_key` keys an IPv6 address by its /64** (`2001:db8:1:2::/64`), so one host cannot get a bucket per address, and maps an IPv4-mapped address to its IPv4 form. Test `an_ipv6_host_gets_one_key_for_its_whole_64`.
-> - **`KeyedLimiter::try_take` is one atomic step** (review of PR #334): the `update`-then-`insert` below let concurrent first requests each take from a fresh bucket, and a late `insert` replace a drawn-down one. `ExpiringMap::update_or_insert_with(key, now, make, change)` finds or creates the live entry and applies `change` under one lock, never replacing another caller's entry; `try_take` is that call with `TokenBucket::try_take`, and `None` (a full map) refuses. Tests `concurrent_first_requests_share_one_bucket` and `an_expired_bucket_is_replaced_exactly_once` (16 threads behind a barrier, capacity 1: exactly one passes), and `update_or_insert_with_creates_once_then_changes_in_place`. The OAuth maps only `insert` under fresh random keys and `update` existing ones, so they had no such race. Later code that keys an `ExpiringMap` by something a client chooses (an address, an email) uses `update_or_insert_with`, not `update` then `insert`.
+> - **`KeyedLimiter::try_take` is one atomic step, and a bucket's lifetime slides** (two reviews of PR #334).
+>   - The `update`-then-`insert` below let concurrent first requests each take from a fresh bucket, and let a late `insert` replace a drawn-down one. `ExpiringMap::update_or_insert_sliding(key, now, make, change)` finds or creates the live entry, renews it to `now + ttl` and applies `change`, all under one lock, and never replaces another caller's entry. `try_take` is that call with `TokenBucket::try_take`; `None` (a full map) refuses.
+>   - The map's ttl is `per`, the time to refill from empty. A bucket is dropped only after `per` with no request, when it is full anyway, so expiry never grants tokens. A fixed expiry would have reset a just-drawn-down bucket: at capacity 3 per 900 s, 7 requests would get through in 899 s.
+>   - The bound is a token bucket's: in any interval of length `t`, at most `capacity + t * capacity / per`. It is not "twice capacity per window".
+>   - Tests: `concurrent_first_requests_share_one_bucket` and `an_expired_bucket_is_replaced_exactly_once` (16 threads behind a barrier, capacity 1: exactly one passes); `expiry_never_grants_more_than_the_burst_plus_the_refill` (the review's t=0/1/899/900 case); `an_idle_bucket_is_dropped_and_its_replacement_acts_like_a_refilled_one`; `update_or_insert_sliding_creates_once_changes_in_place_and_slides`.
+>   - The OAuth maps only `insert` under fresh random keys and `update` existing ones, so they had no such race, and they keep fixed lifetimes. Later code that keys an `ExpiringMap` by something a client chooses (an address, an email) uses `update_or_insert_sliding`, not `update` then `insert`.
 > - **`ExpiringMap` keeps a lower bound on its entries' expiries** (`src/oauth/expiring.rs`): a full map refuses a new key without its O(n) prune until the earliest entry can have expired, so a flood of new keys against a full limiter costs one lookup each. Test `a_full_map_tracks_its_earliest_expiry_through_removals_and_prunes`.
 > - **Decision 5's guard lives in `open_changeset`** (`src/mcp/changesets.rs`), the only code that inserts a changeset: a session principal gets 403 there (test `a_console_session_cannot_open_a_changeset`). No `/api/v1` route opens one today. Every other `/api/v1` use of `principal.key_id` was checked: `whoami` (session arm), changeset list and discard (ownership compare only), maintenance dispositions and idempotency rows (`credential_id` is text with no foreign key; `maintenance_runs.key_id` is filled by a subselect), and log lines.
 > - **The archive routes stay bearer-only; their `/api/v1` copies do not.** `/mcp` and `/catalogs/{name}/export|import` sit behind `require_key`, which never reads a cookie (test `a_cookie_never_reaches_mcp_or_the_archive_routes`, with an admin session). `/api/v1/catalogs/{catalog}/export|import` are under `require_principal` like every API route, at the session's levels (export read, import admin), because Task 14a's `upload.js` imports through them with the session's CSRF header.
@@ -9413,12 +9418,8 @@ pub const FORGOT_WINDOW: Duration = Duration::from_secs(60 * 60);
 pub const MAX_LIMITED_KEYS: usize = 100_000;
 
 /// A token bucket per key: `capacity` requests at once, refilled evenly
-/// over `per`.
-///
-/// A key's bucket is dropped `per` after it was created and starts full
-/// again, so one key can get at most twice `capacity` through in any
-/// window of `per`. That bound is what a fixed window gives too, and it
-/// keeps the map from growing with keys that are no longer used.
+/// over `per` (see `src/http/limits.rs` for the shipped version: the
+/// bucket's lifetime slides, so expiry never grants tokens).
 pub struct KeyedLimiter {
     capacity: u32,
     refill_per_sec: f64,

@@ -79,8 +79,11 @@ impl<V> ExpiringMap<V> {
     }
 
     /// Changes the live entry of `key`, first creating it with `make` when
-    /// there is none (absent or expired), all under one lock: concurrent
-    /// callers on one key share one entry, and none replaces another's.
+    /// there is none (absent or expired), and renews its lifetime to
+    /// `now + ttl`, all under one lock: concurrent callers on one key share
+    /// one entry, and none replaces another's. The lifetime slides, so an
+    /// entry lives until `ttl` passes with no call for its key (the other
+    /// operations keep fixed lifetimes).
     ///
     /// # Arguments
     /// * `key` - its key.
@@ -91,7 +94,7 @@ impl<V> ExpiringMap<V> {
     /// # Returns
     /// `change`'s result, or `None`, creating nothing, when the key has no
     /// live entry and the map holds `capacity` live entries.
-    pub fn update_or_insert_with<R>(
+    pub fn update_or_insert_sliding<R>(
         &self,
         key: &str,
         now: Instant,
@@ -112,10 +115,12 @@ impl<V> ExpiringMap<V> {
             }
             self.store(&mut entries, key.to_string(), make(), now);
         }
-        entries
-            .by_key
-            .get_mut(key)
-            .map(|entry| change(&mut entry.value))
+        let expires = now + self.ttl;
+        entries.by_key.get_mut(key).map(|entry| {
+            // Only ever later, so `earliest_expiry` stays a lower bound.
+            entry.expires = entry.expires.max(expires);
+            change(&mut entry.value)
+        })
     }
 
     /// Whether `key` may be stored now: it already has an entry, or the
@@ -304,12 +309,13 @@ mod tests {
     }
 
     #[test]
-    fn update_or_insert_with_creates_once_then_changes_in_place() {
+    fn update_or_insert_sliding_creates_once_changes_in_place_and_slides() {
         let map = ExpiringMap::new(TTL, 1);
         let start = Instant::now();
+        let read = |at: Instant| map.update_or_insert_sliding("a", at, || 99, |value| *value);
 
-        let first = map.update_or_insert_with("a", start, || 10, |value| *value);
-        let second = map.update_or_insert_with(
+        let first = map.update_or_insert_sliding("a", start, || 10, |value| *value);
+        let second = map.update_or_insert_sliding(
             "a",
             start,
             || 99,
@@ -318,13 +324,16 @@ mod tests {
                 *value
             },
         );
-        let full = map.update_or_insert_with("b", start, || 1, |value| *value);
-        // Past "a"'s expiry, it is made again, and "b" fits too.
-        let renewed = map.update_or_insert_with("a", start + TTL, || 20, |value| *value);
+        let full = map.update_or_insert_sliding("b", start, || 1, |value| *value);
+        // Each call renews "a" for a whole `TTL`, so it outlives its first one.
+        let kept = read(start + TTL / 2);
+        let still = read(start + TTL);
+        // A whole `TTL` with no call: it is made again.
+        let renewed = map.update_or_insert_sliding("a", start + TTL * 2, || 20, |value| *value);
 
         assert_eq!(
-            (first, second, full, renewed),
-            (Some(10), Some(11), None, Some(20))
+            (first, second, full, kept, still, renewed),
+            (Some(10), Some(11), None, Some(11), Some(11), Some(20))
         );
         assert_eq!(map.len(), 1);
     }

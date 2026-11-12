@@ -30,12 +30,14 @@ pub const MAX_LIMITED_KEYS: usize = 100_000;
 const IPV6_KEY_PREFIX_BITS: u32 = 64;
 
 /// A token bucket per key: `capacity` requests at once, refilled evenly
-/// over `per`.
+/// over `per` (so `per` takes an empty bucket back to full).
 ///
-/// A key's bucket is dropped `per` after it was created and starts full
-/// again, so one key can get at most twice `capacity` through in any
-/// window of `per`. That bound is what a fixed window gives too, and it
-/// keeps the map from growing with keys that are no longer used.
+/// In any interval of length `t`, one key gets at most
+/// `capacity + t * capacity / per` requests through: the bucket's burst
+/// plus what refills meanwhile. A key's bucket is dropped once `per` has
+/// passed with no request for it; by then it has refilled to full, so a
+/// fresh full bucket in its place grants nothing extra. That keeps the map
+/// from growing with keys that are no longer used.
 pub struct KeyedLimiter {
     capacity: u32,
     refill_per_sec: f64,
@@ -46,8 +48,9 @@ impl KeyedLimiter {
     /// An empty limiter.
     ///
     /// # Arguments
-    /// * `capacity` - requests per key per `per`.
-    /// * `per` - the window; more than zero.
+    /// * `capacity` - the burst per key, and the refill per `per`.
+    /// * `per` - how long an empty bucket takes to refill, and how long an
+    ///   untouched one is kept; more than zero.
     /// * `max_keys` - the most keys tracked at once.
     ///
     /// # Returns
@@ -73,10 +76,12 @@ impl KeyedLimiter {
     pub fn try_take(&self, key: &str, now: Instant) -> bool {
         // One lock covers finding or creating the key's bucket and taking
         // from it, so concurrent first requests share one bucket and no
-        // late creator replaces a bucket others have drawn down. `None`
-        // (a full map) refuses.
+        // late creator replaces a bucket others have drawn down. Every call
+        // renews the bucket for `per` (the map's ttl), the time it takes to
+        // refill from empty, so it is only dropped once it is full anyway.
+        // `None` (a full map) refuses.
         self.buckets
-            .update_or_insert_with(
+            .update_or_insert_sliding(
                 key,
                 now,
                 || TokenBucket::new(self.capacity, self.refill_per_sec),
@@ -232,6 +237,49 @@ mod tests {
 
         assert_eq!(passed, 1, "the new bucket is shared, not made per caller");
         assert!(!limiter.try_take("a", later));
+    }
+
+    #[test]
+    fn expiry_never_grants_more_than_the_burst_plus_the_refill() {
+        // The review's case: capacity 3 per 900 s. A bucket that expired
+        // 900 s after it was made would hand out 3 fresh tokens at t=900.
+        let limiter = KeyedLimiter::new(3, WINDOW, 100);
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let takes = |secs: u64, count: usize| {
+            (0..count)
+                .filter(|_| limiter.try_take("a", at(secs)))
+                .count()
+        };
+
+        let passed = [takes(0, 1), takes(1, 2), takes(899, 2), takes(900, 3)];
+
+        assert_eq!(passed[..3], [1, 2, 2]);
+        // From t=0 to t=900: 3 burst plus 3 refilled, 5 already used.
+        assert!(passed[3] <= 1, "{passed:?}");
+        // [1, 900] is 899 s: at most 3 + 899 * 3 / 900 < 6 requests.
+        assert!(passed[1] + passed[2] + passed[3] <= 5, "{passed:?}");
+    }
+
+    #[test]
+    fn an_idle_bucket_is_dropped_and_its_replacement_acts_like_a_refilled_one() {
+        let limiter = KeyedLimiter::new(3, WINDOW, 100);
+        let refilled = TokenBucket::new(3, 3.0 / WINDOW.as_secs_f64());
+        let start = Instant::now();
+        for _ in 0..3 {
+            limiter.try_take("a", start);
+            refilled.try_take(start);
+        }
+        let idle = start + WINDOW;
+
+        // `per` with no request: the map no longer holds the bucket.
+        let held = limiter.buckets.update("a", idle, |_| ());
+        let fresh: Vec<bool> = (0..4).map(|_| limiter.try_take("a", idle)).collect();
+        let kept: Vec<bool> = (0..4).map(|_| refilled.try_take(idle)).collect();
+
+        assert_eq!(held, None, "dropped once idle for `per`");
+        assert_eq!(fresh, kept);
+        assert_eq!(fresh, [true, true, true, false]);
     }
 
     #[test]
