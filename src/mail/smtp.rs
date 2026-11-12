@@ -205,4 +205,83 @@ mod tests {
             Err(OkfError::Config { .. })
         ));
     }
+
+    /// A one-connection SMTP server that answers `RCPT TO` with `rcpt_reply`
+    /// and every other command (`DATA` included) with success.
+    async fn fake_relay(rcpt_reply: &'static str) -> u16 {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            write
+                .write_all(b"220 relay.example.com ready\r\n")
+                .await
+                .unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let command = line.to_ascii_uppercase();
+                if command.starts_with("DATA") {
+                    write.write_all(b"354 go ahead\r\n").await.unwrap();
+                    // The message, up to the line holding only a dot.
+                    while let Ok(Some(body)) = lines.next_line().await {
+                        if body == "." {
+                            break;
+                        }
+                    }
+                    write.write_all(b"250 queued\r\n").await.unwrap();
+                    continue;
+                }
+                let reply = if command.starts_with("RCPT") {
+                    rcpt_reply
+                } else if command.starts_with("QUIT") {
+                    "221 bye"
+                } else {
+                    "250 ok"
+                };
+                write
+                    .write_all(format!("{reply}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                if reply.starts_with("221") {
+                    break;
+                }
+            }
+        });
+        port
+    }
+
+    /// A mailer over a plaintext relay on the loopback (tests only).
+    fn plain_mailer(port: u16) -> SmtpMailer<AsyncSmtpTransport<Tokio1Executor>> {
+        let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
+            .port(port)
+            .timeout(Some(Duration::from_secs(10)))
+            .build();
+        SmtpMailer::new(transport, from())
+    }
+
+    #[tokio::test]
+    async fn an_smtp_5xx_is_permanent_and_a_4xx_is_retryable() {
+        let refused = plain_mailer(fake_relay("550 5.1.1 no such user").await)
+            .send(&mail("alice@example.com"))
+            .await;
+        let deferred = plain_mailer(fake_relay("451 4.3.0 try again later").await)
+            .send(&mail("alice@example.com"))
+            .await;
+        let accepted = plain_mailer(fake_relay("250 ok").await)
+            .send(&mail("alice@example.com"))
+            .await;
+
+        assert!(
+            matches!(&refused, Err(MailError::Permanent(detail)) if detail.contains("no such user")),
+            "{refused:?}"
+        );
+        assert!(
+            matches!(&deferred, Err(MailError::Retryable(detail)) if detail.contains("try again")),
+            "{deferred:?}"
+        );
+        assert_eq!(accepted, Ok(()));
+    }
 }
