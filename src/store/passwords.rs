@@ -464,6 +464,19 @@ impl NewPassword {
     }
 }
 
+impl NewPassword {
+    /// The [`PasswordStamp`] this password has once stored: a session
+    /// started from it (setup signs in after storing the password) is
+    /// refused if the password changes again before the session is
+    /// inserted.
+    ///
+    /// # Returns
+    /// The stamp.
+    pub fn stamp(&self) -> PasswordStamp {
+        PasswordStamp(self.0.clone())
+    }
+}
+
 // Hand-written (Python's `__repr__`), so `{:?}` never prints the hash.
 impl std::fmt::Debug for NewPassword {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

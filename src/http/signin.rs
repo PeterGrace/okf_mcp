@@ -367,6 +367,13 @@ async fn sign_in_post(
 ///
 /// # Errors
 /// [`OkfError::Database`]; [`OkfError::Io`] from the random source.
+// `expect(dead_code)` silences "never used" until a caller lands, and
+// itself warns once one does, so it cannot be forgotten. Setup now signs in
+// through the stamped `begin`.
+#[expect(
+    dead_code,
+    reason = "passkey (Task 8) and OIDC (Task 9) sign-ins call it; delete this then"
+)]
 pub(crate) async fn sign_in(
     app: &App,
     parts: &Parts,
@@ -714,12 +721,16 @@ async fn setup_post(
         };
         return setup_response(StatusCode::UNPROCESSABLE_ENTITY, &view);
     }
-    let user = match use_link(&app, &form.token, Purpose::Setup, &form.password, now).await {
-        Ok((user, _)) => user,
+    let used = match use_link(&app, &form.token, Purpose::Setup, &form.password, now).await {
+        Ok(used) => used,
         Err(error) => return link_error(error),
     };
-    match sign_in(&app, &parts, &user, Method::Setup).await {
+    // Stamped with the hash just stored, like a password sign-in: if a
+    // reset replaces the password before the session is inserted, there is
+    // no session, and the person signs in with the new password instead.
+    match begin(&app, &parts, &used.user, Method::Setup, Some(&used.stamp)).await {
         Ok(headers) => (headers, Redirect::to(&return_to)).into_response(),
+        Err(OkfError::Unauthenticated { .. }) => Redirect::to("/signin").into_response(),
         Err(error) => AppError(error).into_response(),
     }
 }
@@ -739,7 +750,8 @@ async fn setup_post(
 /// * `now` - when (server clock).
 ///
 /// # Returns
-/// The link's user and how many sessions ended (0 for setup).
+/// The link's user, how many sessions ended (0 for setup) and the stamp of
+/// the stored password.
 ///
 /// # Errors
 /// [`OkfError::Gone`] for a link that no longer works (also when a
@@ -751,7 +763,7 @@ async fn use_link(
     purpose: Purpose,
     password: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<(UserAuth, u64), OkfError> {
+) -> Result<LinkUsed, OkfError> {
     let hashed = NewPassword::hash(password).await?;
     let mut tx = app.pool().begin().await?;
     // The token's row stays locked until the commit, so of two concurrent
@@ -767,7 +779,21 @@ async fn use_link(
         Purpose::Reset => passwords::reset_in(&mut tx, &user.id, &hashed, now).await?,
     };
     tx.commit().await?;
-    Ok((user, ended))
+    Ok(LinkUsed {
+        user,
+        ended,
+        stamp: hashed.stamp(),
+    })
+}
+
+/// What [`use_link`] did. No `Debug`: the stamp is a password hash.
+struct LinkUsed {
+    /// The link's user.
+    user: UserAuth,
+    /// How many sessions it ended (a reset; 0 for setup).
+    ended: u64,
+    /// The stored password's stamp, for a session started from it.
+    stamp: PasswordStamp,
 }
 
 /// The reset page's body.
@@ -836,11 +862,13 @@ async fn reset_post(
             Some(&problem),
         );
     }
-    let (user, ended) = match use_link(&app, &form.token, Purpose::Reset, &form.password, now).await
-    {
-        Ok(done) => done,
-        Err(error) => return link_error(error),
-    };
+    // A reset signs nobody in: the person signs in with the new password,
+    // through the stamped password path.
+    let LinkUsed { user, ended, .. } =
+        match use_link(&app, &form.token, Purpose::Reset, &form.password, now).await {
+            Ok(used) => used,
+            Err(error) => return link_error(error),
+        };
     tracing::info!(user = %user.id, ended, "password reset; every session ended");
     notify_method_added(&app, &user, "a new password").await;
     Redirect::to("/signin?notice=reset").into_response()
@@ -1772,6 +1800,38 @@ mod tests {
 
         assert!(token.is_none(), "the old address no longer names alice");
         assert_eq!(live, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_after_setup_is_refused_once_a_reset_replaced_the_password() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
+        let pool = test.app.pool();
+        let token = email_tokens::issue(
+            pool,
+            &alice.id,
+            Purpose::Setup,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await
+        .expect("issue a setup token");
+
+        // Setup commits; its session start is delayed past a reset.
+        let used = use_link(&test.app, &token, Purpose::Setup, PASSWORD, Utc::now())
+            .await
+            .expect("use the setup link");
+        passwords::reset(pool, &alice.id, "amber-quarry-signal-77", Utc::now())
+            .await
+            .expect("reset");
+        let late = start_session_with(&test.app, &used.user, Some(&used.stamp), None, "").await;
+
+        assert!(
+            matches!(late, Err(OkfError::Unauthenticated { .. })),
+            "{:?}",
+            late.map(|_| ())
+        );
+        assert_eq!(sessions_of(pool, &alice.id).await, 0);
     }
 
     /// The other side of a race with a link's redemption.
