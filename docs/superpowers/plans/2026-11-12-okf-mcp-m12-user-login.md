@@ -10788,6 +10788,12 @@ Builds on Task 7a's pages, limits, `start_session`, `Browser` and `/api/v1/sessi
 >   - `redeem_in` used to lock the token first, which could deadlock with an issue or an email change. It now reads the token's `user_id` with no lock, locks that user `FOR NO KEY UPDATE`, and then marks the token used. The update re-checks the purpose, that the token is unused and unexpired, and that `user_id` still matches.
 >   - Tests: `a_redemption_racing_a_new_link_completes_without_a_deadlock` and `a_redemption_racing_an_email_change_completes_without_a_deadlock`. Each holds the user row and queues the rival ahead of the redemption: the order that used to deadlock. With the old `redeem_in`, both fail.
 >   - Later tasks (8, 9, 10b, 12) that write these tables in a transaction with a user row must keep this order.
+> - **Every session insert in `signin.rs` is stamped (fifth review of PR #337).**
+>   - `use_link` returns `LinkUsed { user, ended, stamp }`, where `stamp` is `NewPassword::stamp()`, the hash it just stored. Setup starts its session through the stamped `begin`, just as a password sign-in does. If a reset replaces the password between setup's commit and the session insert, setup creates no session and redirects to `/signin`.
+>   - A reset signs nobody in.
+>   - The unstamped `sign_in` is kept for Tasks 8 and 9 under `#[expect(dead_code)]`; delete that attribute when the first of them calls it.
+>   - Test: `a_session_after_setup_is_refused_once_a_reset_replaced_the_password`.
+> - **A console write with CSRF has a journey:** `an_admin_session_writes_through_the_console_with_its_csrf_token`. It signs in at `/signin`, reloads, checks that no key is stored, creates a user in the UI and reads it back through the API. Removing the `X-OKF-CSRF` line from `api.js` makes it fail.
 > - **One credential at a time in the console (second review of PR #337).**
 >   - At boot, `main.js` asks `GET /api/v1/session` first (a plain fetch, cookie only). A live session wins over a stored key, and the stored key is dropped. Otherwise a stored key is used; otherwise the login card is shown.
 >   - Sign-out (`endCookieSession`) always asks the server, cookie-only, whether the browser has a session. If it does, it sends `DELETE /api/v1/session` with that session's CSRF token, and only then clears the key. The failure rule is unchanged.
