@@ -72,13 +72,28 @@ run() {
     fi
     local name="okf-mcp-test-pg-$$"
     # Set before `up`, so a server that fails to become ready is removed too.
-    # INT and TERM exit through the EXIT trap.
     trap "down '$name'" EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
     TEST_PG_URL=$(up "$name")
     export TEST_PG_URL
-    "$@"
+    # The command runs in the background so a signal sent to this script
+    # alone (`kill`, a timeout) is handled at once: bash defers traps while a
+    # foreground child runs. `stop` ends the command with TERM (a background
+    # job starts with SIGINT ignored, so INT would not reach it), waits for
+    # it, and exits through the EXIT trap.
+    child=
+    trap 'stop 130' INT
+    trap 'stop 143' TERM
+    "$@" &
+    child=$!
+    wait "$child"
+}
+
+stop() {
+    if [[ -n $child ]]; then
+        kill -TERM "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+    fi
+    exit "$1"
 }
 
 (($# >= 1)) || usage

@@ -125,28 +125,35 @@ impl TestDb {
         Self::create(true).await
     }
 
-    /// Creates the test's database on the shared server, or on a container
-    /// of its own, from the migrated template when `migrated`.
+    /// Creates the test's database, migrated when `migrated`: on the shared
+    /// server, a new database (a copy of the template); on a container of
+    /// the test's own, its `postgres` database, migrated in place (a
+    /// template would be built for one copy).
     async fn create(migrated: bool) -> Self {
         let (server_url, container) = server().await;
-        let template = match &container {
-            // The shared server is prepared (template built, stale databases
-            // dropped) once per process, whether or not this test migrates.
-            None => Some(shared_template(&server_url).await),
-            Some(_) if migrated => Some(build_own_template(&server_url).await),
-            Some(_) => None,
-        }
-        .filter(|_| migrated);
-        let name = new_database_name(SystemTime::now());
-        create_database(&server_url, &name, template.as_deref())
-            .await
-            .expect("create the test database");
+        let name = match &container {
+            Some(_) => "postgres".to_string(),
+            None => {
+                // The shared server is prepared (template built, stale
+                // databases dropped) once per process, whether or not this
+                // test migrates.
+                let template = shared_template(&server_url).await;
+                let name = new_database_name(SystemTime::now());
+                create_database(&server_url, &name, migrated.then_some(template.as_str()))
+                    .await
+                    .expect("create the test database");
+                name
+            }
+        };
         let url = format!("{server_url}/{name}");
         let pool = PgPoolOptions::new()
             .max_connections(POOL_SIZE)
             .connect(&url)
             .await
             .expect("connect to the test database");
+        if migrated && container.is_some() {
+            MIGRATOR.run(&pool).await.expect("migrations apply");
+        }
         Self {
             pool,
             url,
@@ -238,22 +245,16 @@ pub async fn server() -> (String, Option<ContainerAsync<Postgres>>) {
 /// built it if needed and dropped stale databases.
 async fn shared_template(server_url: &str) -> String {
     let prepared = SHARED_TEMPLATE.get_or_init(|| async {
-        let name = build_own_template(server_url).await;
+        let name = template_name();
+        ensure_template(server_url, &name)
+            .await
+            .expect("build the migrated template database");
         drop_stale_databases(server_url, SystemTime::now())
             .await
             .expect("drop stale test databases");
         name
     });
     prepared.await.clone()
-}
-
-/// Builds the template on `server_url` if it is missing.
-async fn build_own_template(server_url: &str) -> String {
-    let name = template_name();
-    ensure_template(server_url, &name)
-        .await
-        .expect("build the migrated template database");
-    name
 }
 
 /// The migrated template's name: `okf_tpl_` and a hash of every migration's
@@ -369,11 +370,14 @@ pub fn database_created_at(name: &str) -> Option<u64> {
 
 /// Drops every test database created more than [`STALE_AFTER`] before `now`.
 ///
+/// A drop that fails is logged and skipped, not returned: another process
+/// sweeping at the same moment may be dropping the same database.
+///
 /// # Returns
-/// The names dropped.
+/// The names this call dropped.
 ///
 /// # Errors
-/// If the server is unreachable or a drop fails.
+/// If the server is unreachable or the databases cannot be listed.
 pub async fn drop_stale_databases(
     server_url: &str,
     now: SystemTime,
@@ -387,11 +391,15 @@ pub async fn drop_stale_databases(
         .into_iter()
         .filter(|name| database_created_at(name).is_some_and(|created| created < cutoff))
         .collect();
-    for name in &stale {
-        drop_database_on(&mut admin, name).await?;
+    let mut dropped = Vec::with_capacity(stale.len());
+    for name in stale {
+        match drop_database_on(&mut admin, &name).await {
+            Ok(()) => dropped.push(name),
+            Err(error) => tracing::warn!("drop stale test database {name}: {error}"),
+        }
     }
     admin.close().await?;
-    Ok(stale)
+    Ok(dropped)
 }
 
 /// Creates `name` on `server_url`, a copy of `template` when given (else
