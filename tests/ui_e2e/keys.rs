@@ -10,7 +10,7 @@ use okf_mcp::store::oauth::clients;
 use okf_mcp::store::oauth::codes::{self, NewSignInCode};
 use okf_mcp::store::users::{self, NewUser};
 
-use crate::harness::drive;
+use crate::harness::{drive, Ui};
 use crate::support::server::{files, TestServer, OWNER};
 
 /// Creates the user `alice`, a second one to reassign credentials to.
@@ -360,6 +360,79 @@ async fn reassigning_the_signed_in_key_updates_the_shell_identity() {
         ui.wait_text("[data-test=user-alice]", "you");
         let tester = ui.text(&format!("[data-test=user-{OWNER}]"));
         assert!(!tester.contains("you"), "still marked: {tester:?}");
+    })
+    .await;
+}
+
+/// Holds the page's next `GET /api/v1/users` (the first await of every key
+/// drawer) until `window.releaseUsers()`; `window.usersReleased` turns true
+/// once that held answer has been handed back to the page.
+const HOLD_NEXT_USERS: &str = "() => {
+    const original = window.fetch;
+    let release = null;
+    window.usersReleased = false;
+    window.releaseUsers = () => release();
+    window.fetch = (input, init) => {
+        if (release === null && String(input).endsWith('/api/v1/users')) {
+            const held = new Promise(resolve => { release = resolve; });
+            return held.then(() => original(input, init))
+                .finally(() => { window.usersReleased = true; window.fetch = original; });
+        }
+        return original(input, init);
+    };
+    return true;
+}";
+
+/// Releases the held answer, waits until the page has it, then gives the
+/// page a moment to act on it (a stale drawer would be drawn by then).
+fn release_users(ui: &Ui) {
+    ui.eval("() => window.releaseUsers()", serde_json::json!(null));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while ui.eval("() => window.usersReleased", serde_json::json!(null)) != serde_json::json!(true)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the held answer never arrived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_answer_for_an_earlier_drawer_never_replaces_or_reopens_it() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    server.key("alpha", Access::Read, &["main"], None).await;
+    server.key("bravo", Access::Read, &["main"], None).await;
+    drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        ui.wait_visible("[data-test=key-bravo]");
+        // alpha's drawer waits on its held answer; bravo's opens meanwhile.
+        ui.eval(HOLD_NEXT_USERS, serde_json::json!(null));
+        ui.click("[data-test=key-alpha]");
+        ui.click("[data-test=key-bravo]");
+        ui.wait_text("#drawer-title", "bravo");
+        release_users(ui);
+        assert_eq!(
+            ui.text("#drawer-title"),
+            "bravo",
+            "alpha's late answer replaced the drawer"
+        );
+        // Dismissing the drawer cancels a load still pending.
+        ui.click("#drawer-close");
+        ui.wait_hidden("#drawer");
+        ui.eval(HOLD_NEXT_USERS, serde_json::json!(null));
+        ui.click("[data-test=key-alpha]");
+        ui.page.press_key(None, "Escape").expect("press Escape");
+        release_users(ui);
+        assert!(
+            !ui.page.is_visible("#drawer").expect("visible"),
+            "the dismissed load opened"
+        );
     })
     .await;
 }

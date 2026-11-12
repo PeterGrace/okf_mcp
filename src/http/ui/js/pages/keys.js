@@ -6,12 +6,14 @@
 // changed (or, for one from before users existed, assigned) in its drawer.
 // The server enforces every rule; this page only hides what cannot work.
 // Each helper takes the page's `main` and checks `main.isConnected` after an
-// await: once the user has navigated away, the drawer is another page's.
+// await: once the user has navigated away, the drawer is another page's. A
+// drawer load checks its drawerTicket instead, which also goes stale once
+// another drawer is asked for or the drawer is dismissed.
 import { h, pill } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
-import { openDrawer, closeDrawer } from '../core/drawer.js';
+import { openDrawer, closeDrawer, drawerTicket } from '../core/drawer.js';
 import { when } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
@@ -173,8 +175,9 @@ async function usersOrNull() {
 
 // The create form, in the drawer.
 async function newKey(main, reload) {
+    const ticket = drawerTicket(main);
     const users = await usersOrNull();
-    if (!users || !main.isConnected) return;
+    if (!users || !ticket.current()) return;
     const form = h('form', { id: 'key-form' },
         h('label', {}, 'Name', h('input', { name: 'name', required: true, autocomplete: 'off', placeholder: 'letters, digits, . _ -' })),
         h('label', {}, 'Actor', h('input', { name: 'actor', autocomplete: 'off', placeholder: 'defaults to the name' })),
@@ -254,8 +257,9 @@ function fact(label, value) {
 // revoke. A revoked key keeps only its user control: history is attributed
 // too.
 async function showKey(main, key, reload) {
+    const ticket = drawerTicket(main);
     const users = await usersOrNull();
-    if (!users || !main.isConnected) return;
+    if (!users || !ticket.current()) return;
     const me = store.whoami;
     const mine = isMine(key);
     const grant = isGrant(key);
@@ -384,8 +388,9 @@ function codesPanel(main) {
 
 // The mint form, in the drawer.
 async function newCode(main, reload) {
+    const ticket = drawerTicket(main);
     const users = await usersOrNull();
-    if (!users || !main.isConnected) return;
+    if (!users || !ticket.current()) return;
     const form = h('form', { id: 'code-form' },
         h('label', {}, 'Name', h('input', { name: 'name', required: true, autocomplete: 'off', placeholder: 'letters, digits, . _ -' })),
         h('label', {}, 'Actor', h('input', { name: 'actor', autocomplete: 'off', placeholder: 'defaults to the name' })),
@@ -426,8 +431,9 @@ async function newCode(main, reload) {
 // redeemed it. A redeemed code's grant keeps its own user: change that in
 // the grant's drawer.
 async function showCode(main, code, reload) {
+    const ticket = drawerTicket(main);
     const users = await usersOrNull();
-    if (!users || !main.isConnected) return;
+    if (!users || !ticket.current()) return;
     const facts = h('dl', { class: 'facts' },
         fact('Id', h('code', {}, code.id)),
         fact('Actor', h('code', {}, code.actor)),

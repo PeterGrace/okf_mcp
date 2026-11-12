@@ -5,7 +5,7 @@ import { $, h } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
-import { openDrawer, closeDrawer } from '../core/drawer.js';
+import { openDrawer, closeDrawer, drawerTicket } from '../core/drawer.js';
 import { ago, count } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
@@ -48,9 +48,10 @@ export async function render(main) {
     }
 
     async function openCreate() {
+        const ticket = drawerTicket(main);
         let teams;
         try { teams = await namesOf('teams'); } catch { return; }
-        if (!main.isConnected) return;
+        if (!ticket.current()) return;
         const form = h('form', { id: 'catalog-create-form' },
             h('label', {}, 'Name',
                 h('input', { name: 'name', required: true, pattern: '[a-z0-9-]+', autocomplete: 'off',
@@ -73,9 +74,10 @@ export async function render(main) {
     }
 
     async function openEdit(row) {
+        const ticket = drawerTicket(main);
         let teams;
         try { teams = await namesOf('teams'); } catch { return; }
-        if (!main.isConnected) return;
+        if (!ticket.current()) return;
         const description = h('textarea', { id: 'catalog-description', name: 'description', rows: '3' }, row.description);
         const edit = h('form', { id: 'catalog-edit-form' },
             h('label', {}, 'Description', description),

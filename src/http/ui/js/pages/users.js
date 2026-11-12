@@ -8,7 +8,7 @@ import { h, pill } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
-import { openDrawer, closeDrawer } from '../core/drawer.js';
+import { openDrawer, closeDrawer, drawerTicket } from '../core/drawer.js';
 import { ago, when } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
@@ -84,13 +84,14 @@ export async function render(main, rest) {
     // The drawer: the user's teams and the credentials this key manages, and
     // Delete, disabled with the reason while anything still names the user.
     async function openDetail(name) {
+        const ticket = drawerTicket(main);
         let detail;
         let personal;
         try {
             [detail, personal] = await Promise.all([
                 api.get(`/users/${enc(name)}`), api.get(`/teams/${enc(name)}`)]);
         } catch { return; }
-        if (!main.isConnected) return;
+        if (!ticket.current()) return;
         const { user, keys, codes } = detail;
         const reason = deleteReason(user, personal);
         const remove = h('button', {

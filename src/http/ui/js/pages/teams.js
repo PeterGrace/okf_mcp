@@ -7,7 +7,7 @@ import { h, pill } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
-import { openDrawer, closeDrawer } from '../core/drawer.js';
+import { openDrawer, closeDrawer, drawerTicket } from '../core/drawer.js';
 import { ago, count, when } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
@@ -61,9 +61,10 @@ export async function render(main) {
     }
 
     async function openCreate() {
+        const ticket = drawerTicket(main);
         let users;
         try { users = await namesOf('users'); } catch { return; }
-        if (!main.isConnected) return;
+        if (!ticket.current()) return;
         const form = h('form', { id: 'team-form' },
             h('label', {}, 'Name',
                 h('input', { name: 'name', required: true, pattern: '[a-z0-9-]+', autocomplete: 'off',
@@ -102,12 +103,13 @@ export async function render(main) {
     // The drawer: members with their roles, adding one, and Delete,
     // disabled with the reason when the server would refuse it.
     async function openDetail(name, known = null) {
+        const ticket = drawerTicket(main);
         let team = known;
         let users;
         try {
             [team, users] = await Promise.all([team ?? api.get(`/teams/${enc(name)}`), namesOf('users')]);
         } catch { return; }
-        if (!main.isConnected) return;
+        if (!ticket.current()) return;
         const base = `/teams/${enc(team.name)}/members`;
         const members = h('ul', { class: 'grant-list', id: 'team-members' }, team.members.map(member => {
             const role = roleSelect({ 'aria-label': `Role of ${member.user}`, disabled: !manager,
