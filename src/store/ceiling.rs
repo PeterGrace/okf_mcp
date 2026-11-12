@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::auth::{Principal, Reach};
 use crate::error::OkfError;
@@ -115,12 +115,21 @@ const CEILING_ROWS: &str = "\
 
 /// The ceiling rows of every user, or of the user with this id.
 ///
+/// # Arguments
+/// * `executor` - a `&PgPool`, or `&mut *tx` to read inside a transaction.
+/// * `user_id` - one user's id, or `None` for every user.
+///
 /// # Errors
 /// [`OkfError::Database`].
-async fn ceiling_rows(pool: &PgPool, user_id: Option<&str>) -> Result<Vec<CeilingRow>, OkfError> {
+// `impl PgExecutor<'_>` accepts either a pool or a connection, as
+// `user_sessions::revoke_all` does.
+async fn ceiling_rows(
+    executor: impl PgExecutor<'_>,
+    user_id: Option<&str>,
+) -> Result<Vec<CeilingRow>, OkfError> {
     Ok(sqlx::query_as::<_, CeilingRow>(CEILING_ROWS)
         .bind(user_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?)
 }
 
@@ -131,6 +140,13 @@ fn row_level(write: bool) -> Access {
     } else {
         Access::Read
     }
+}
+
+/// One user's rows as a ceiling.
+fn one_ceiling(rows: Vec<CeilingRow>) -> Ceiling {
+    rows.into_iter()
+        .map(|row| (row.catalog, row_level(row.write)))
+        .collect()
 }
 
 /// The id of the user called `name`, without locking it (a read).
@@ -183,11 +199,27 @@ pub async fn ceilings(pool: &PgPool) -> Result<HashMap<String, Ceiling>, OkfErro
 /// [`OkfError::UnknownName`] for an unknown user; [`OkfError::Database`].
 pub async fn ceiling_of(pool: &PgPool, user: &str) -> Result<Ceiling, OkfError> {
     let user_id = user_id(pool, user).await?;
-    Ok(ceiling_rows(pool, Some(&user_id))
-        .await?
-        .into_iter()
-        .map(|row| (row.catalog, row_level(row.write)))
-        .collect())
+    Ok(one_ceiling(ceiling_rows(pool, Some(&user_id)).await?))
+}
+
+/// One user's ceiling, by id, read inside the caller's transaction: what
+/// `store::oauth::grants::create_self_issued` checks a consent against
+/// while it holds the user's row.
+///
+/// # Arguments
+/// * `conn` - the open transaction's connection.
+/// * `user_id` - the user's id.
+///
+/// # Returns
+/// The ceiling (empty for an unknown user or one who reaches nothing).
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub(crate) async fn ceiling_in(
+    conn: &mut PgConnection,
+    user_id: &str,
+) -> Result<Ceiling, OkfError> {
+    Ok(one_ceiling(ceiling_rows(conn, Some(user_id)).await?))
 }
 
 /// Sets what members of a catalog's owning team may reach, and bumps

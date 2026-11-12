@@ -243,15 +243,6 @@ pub(crate) async fn session_user(app: &App, user_id: &str) -> Result<Option<User
 ///
 /// # Errors
 /// [`OkfError::Database`].
-// `expect(dead_code)` silences "never used" until a caller lands, and
-// itself warns once one does, so it cannot be forgotten.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "OAuth consent as the signed-in user (Task 11) uses it; delete this then"
-    )
-)]
 pub(crate) async fn signed_in_user(
     app: &App,
     headers: &HeaderMap,

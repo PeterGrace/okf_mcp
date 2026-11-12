@@ -270,6 +270,9 @@ impl OAuthClient {
             ("code_challenge", &self.challenge),
             ("code_challenge_method", "S256"),
             ("resource", resource),
+            // The admin-minted sign-in code path; without it the browser is
+            // sent to `/signin` first.
+            ("signin", "code"),
         ]);
         let page = self
             .http
