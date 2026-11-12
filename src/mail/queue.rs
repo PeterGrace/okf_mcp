@@ -591,15 +591,16 @@ mod tests {
         restart: Duration::from_millis(200),
     };
 
-    /// Runs one worker named `name`, on its own pool as `serve`'s does, with
-    /// [`FAST`] timing, until the returned token is cancelled.
-    fn start_named(
-        pool: &PgPool,
+    /// Runs one worker named `name` on `own_pool` (a [`worker_pool`], as
+    /// `serve`'s is), with [`FAST`] timing, until the returned token is
+    /// cancelled. The test keeps a clone of the pool to [`starve`] it.
+    fn start_on(
+        own_pool: PgPool,
         mailer: Arc<Scripted>,
         name: &str,
     ) -> (CancellationToken, JoinHandle<()>) {
         let context = MailContext {
-            pool: worker_pool(pool),
+            pool: own_pool,
             mailer,
             clock: Arc::new(FixedClock(now())),
         };
@@ -609,7 +610,68 @@ mod tests {
     }
 
     fn start(pool: &PgPool, mailer: Arc<Scripted>) -> (CancellationToken, JoinHandle<()>) {
-        start_named(pool, mailer, &worker_name())
+        start_on(worker_pool(pool), mailer, &worker_name())
+    }
+
+    /// Holds every connection of a worker's pool that its LISTEN does not
+    /// (the listener keeps one for good), so the worker can neither claim
+    /// nor finish a job until the returned connections are dropped. Its
+    /// LISTEN still hears every insert.
+    async fn starve(own_pool: &PgPool) -> Vec<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+        let mut held = Vec::with_capacity(WORKER_POOL_SIZE as usize - 1);
+        // `1..WORKER_POOL_SIZE`: one fewer than the pool's size, the LISTEN's.
+        for _ in 1..WORKER_POOL_SIZE {
+            let connection = tokio::time::timeout(Duration::from_secs(10), own_pool.acquire())
+                .await
+                .expect("a worker connection frees up within 10 s")
+                .unwrap();
+            held.push(connection);
+        }
+        held
+    }
+
+    /// Waits (up to 10 s) until `count` worker sessions on this test's
+    /// database are LISTENing.
+    async fn wait_listening(pool: &PgPool, count: i64) {
+        let mut listening = 0_i64;
+        for _ in 0..100 {
+            listening = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND application_name = $1 \
+                 AND query LIKE 'LISTEN %'",
+            )
+            .bind(WORKER_APPLICATION_NAME)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if listening == count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("{listening} workers are listening, not {count}");
+    }
+
+    /// Enqueues mail to `to` and waits (up to 10 s) for `worker` to claim it.
+    async fn enqueue_claimed_by(pool: &PgPool, to: &str, worker: &str) {
+        enqueue(pool, to, &Template::Test, now()).await.unwrap();
+        let mut claimed_by: Option<String> = None;
+        for _ in 0..100 {
+            // `convert_from(job, 'UTF8')`: the payload is JSON bytes.
+            claimed_by = sqlx::query_scalar(
+                "SELECT lock_by FROM apalis.jobs \
+                 WHERE convert_from(job, 'UTF8')::jsonb #>> '{mail,to}' = $1",
+            )
+            .bind(to)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if claimed_by.as_deref() == Some(worker) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("mail to {to} was claimed by {claimed_by:?}, not {worker}");
     }
 
     /// Stops a worker and waits for it.
@@ -893,19 +955,24 @@ mod tests {
         let recipients: Vec<String> = (0..30).map(|n| format!("user{n}@example.com")).collect();
         // Two replicas: one queue, two worker names, both listening before
         // the mail arrives, so every NOTIFY wakes both.
-        let (stop_a, worker_a) = start_named(&db.pool, Arc::clone(&mailer), "okf-mail-a-1");
-        let (stop_b, worker_b) = start_named(&db.pool, Arc::clone(&mailer), "okf-mail-b-2");
-        for _ in 0..200 {
-            let workers: i64 = sqlx::query_scalar("SELECT count(*) FROM apalis.workers")
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-            if workers == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        for to in &recipients {
+        let pool_a = worker_pool(&db.pool);
+        let pool_b = worker_pool(&db.pool);
+        let (stop_a, worker_a) = start_on(pool_a.clone(), Arc::clone(&mailer), "okf-mail-a-1");
+        let (stop_b, worker_b) = start_on(pool_b.clone(), Arc::clone(&mailer), "okf-mail-b-2");
+        wait_listening(&db.pool, 2).await;
+        // apalis claims up to ten jobs a fetch, so either worker can win
+        // every race (issue #335). Give each one a mail of its own first,
+        // by starving the other of connections while that mail is claimed.
+        // `drop` returns the held connections to the pool at once, as
+        // leaving a `with` block would in Python.
+        let held_b = starve(&pool_b).await;
+        enqueue_claimed_by(&db.pool, &recipients[0], "okf-mail-a-1").await;
+        drop(held_b);
+        let held_a = starve(&pool_a).await;
+        enqueue_claimed_by(&db.pool, &recipients[1], "okf-mail-b-2").await;
+        drop(held_a);
+        // The rest arrive with both workers free to race for each one.
+        for to in &recipients[2..] {
             enqueue(&db.pool, to, &Template::Test, now()).await.unwrap();
         }
         let mut done = 0_i64;
@@ -1072,7 +1139,7 @@ mod tests {
         .await
         .unwrap();
         let mailer = Scripted::with(vec![]);
-        let (shutdown, worker) = start_named(&db.pool, Arc::clone(&mailer), "okf-mail-r");
+        let (shutdown, worker) = start_on(worker_pool(&db.pool), Arc::clone(&mailer), "okf-mail-r");
         for _ in 0..200 {
             let registered: i64 = sqlx::query_scalar("SELECT count(*) FROM apalis.workers")
                 .fetch_one(&db.pool)
