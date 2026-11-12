@@ -55,6 +55,12 @@
 .consent-actions button { flex: 1; margin: 0; }
 .consent-error { padding: .6rem .8rem; border-radius: var(--radius-sm); background: var(--error-soft); }
 
+/* The signed-in page's catalog rows: a checkbox and a level select each. */
+#consent-catalogs { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: .6rem .9rem; }
+.consent-catalog { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+.consent-catalog label { margin: 0; font-family: var(--font-mono); overflow-wrap: anywhere; }
+.consent-catalog select { width: auto; margin: 0; }
+
 /* Phone width: the card fills the screen with a gutter. */
 @media (max-width: 480px) {
     .consent-card { margin: 1rem; padding: 1.25rem; }
