@@ -269,7 +269,7 @@ pub fn cap(grant: &BTreeMap<String, Access>, ceiling: &Ceiling) -> BTreeMap<Stri
 
 // ---- src/store/users.rs (Task 4 additions; auth_by_id Task 7a; id_by_name Task 12) ----
 pub struct UserRecord { /* existing */ pub email: Option<String>, pub is_admin: bool, pub has_password: bool }
-pub async fn set_email(pool: &PgPool, name: &str, email: Option<&str>) -> Result<(), OkfError>; // 409 on duplicate, 422 bad address
+pub async fn set_email(pool: &PgPool, name: &str, email: Option<&str>) -> Result<(), OkfError>; // 409 on duplicate, 422 bad address; a change bumps admin_generation (Task 7a: the key cache holds emails)
 pub async fn set_admin(pool: &PgPool, name: &str, on: bool, allow_last: bool) -> Result<bool, OkfError>; // previous; a change deletes the user's console sessions (Decision 20)
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<UserAuth>, OkfError>;
 pub async fn find_auth(pool: &PgPool, user_id: &str) -> Result<Option<UserAuth>, OkfError>;
@@ -401,7 +401,7 @@ pub(crate) async fn signed_in_user(app: &App, headers: &HeaderMap) -> Result<Opt
 pub struct KeyedLimiter { /* ExpiringMap<TokenBucket> */ }
 impl KeyedLimiter { pub fn new(capacity: u32, per: Duration, max_keys: usize) -> Self; pub fn try_take(&self, key: &str, now: Instant) -> bool; } // a full map refuses new keys
 pub struct SignInLimits { pub sign_in_per_ip: KeyedLimiter, pub forgot_per_email: KeyedLimiter, pub forgot_per_ip: KeyedLimiter }
-pub fn ip_key(ip: Option<IpAddr>) -> String;
+pub fn ip_key(ip: Option<IpAddr>) -> String;           // IPv4 as text; IPv6 as its /64; None as "unknown"
 
 // ---- src/http/pages.rs (Task 7a) ----
 pub(crate) const DEFAULT_RETURN_TO: &str = "/ui/";
@@ -8911,6 +8911,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 This part has no sign-in page: its tests start sessions with `Browser::session_for` and `Browser::signed_in`, which call `console_session::start_session` directly. Task 7b adds the pages, the console change and the journey.
 
+> **Corrected (issue #315, 2026-11-12).** What shipped differs from the code below in these ways; the files named are authoritative.
+> - **The admin level comes from the key cache on every request** (`src/http/console_session.rs`, `session_principal`): `require_principal` builds the principal from `Keys::user_admin` and `Keys::ceiling_of`, and only for a user new to the cache from `users::find_auth` plus `ceiling::ceiling_of` (a user deleted between those two reads is a 401, not a 404). `start_session` uses only the user's id, so a `UserAuth` read at sign-in never sets the level. Test `a_demotion_between_the_password_check_and_the_session_is_honoured` lands `users::set_admin` between `passwords::verify` and `start_session`; `a_promotion_reaches_a_live_session_only_by_ending_it` checks Decision 20 with no poll.
+> - **`GET /api/v1/session` reads `admin` and a non-admin's `ceiling` from the principal** the middleware built for the request (an admin's `ceiling` is `Keys::ceiling_of`, shown for information). `SessionView` and `ConsoleSession` have hand-written `Debug`s that redact the CSRF token and the session id; `Browser` (test helper) derives `Default` but not `Debug`.
+> - **`users::set_email` bumps `admin_generation` when the address changes** (a case-only change is no change), because the key cache now holds every user's email (`users::auth_by_id`, which reuses `user_auth_columns!`). Test `an_email_change_bumps_the_generation_and_a_no_op_does_not`.
+> - **`start_session` does not cut `User-Agent` itself**: `user_sessions::create` keeps 256 characters (issue #313), so `MAX_USER_AGENT_CHARS` is gone.
+> - **`ip_key` keys an IPv6 address by its /64** (`2001:db8:1:2::/64`), so one host cannot get a bucket per address, and maps an IPv4-mapped address to its IPv4 form. Test `an_ipv6_host_gets_one_key_for_its_whole_64`.
+> - **`ExpiringMap` keeps a lower bound on its entries' expiries** (`src/oauth/expiring.rs`): a full map refuses a new key without its O(n) prune until the earliest entry can have expired, so a flood of new keys against a full limiter costs one lookup each. Test `a_full_map_tracks_its_earliest_expiry_through_removals_and_prunes`.
+> - **Decision 5's guard lives in `open_changeset`** (`src/mcp/changesets.rs`), the only code that inserts a changeset: a session principal gets 403 there (test `a_console_session_cannot_open_a_changeset`). No `/api/v1` route opens one today. Every other `/api/v1` use of `principal.key_id` was checked: `whoami` (session arm), changeset list and discard (ownership compare only), maintenance dispositions and idempotency rows (`credential_id` is text with no foreign key; `maintenance_runs.key_id` is filled by a subselect), and log lines.
+> - **The archive routes stay bearer-only; their `/api/v1` copies do not.** `/mcp` and `/catalogs/{name}/export|import` sit behind `require_key`, which never reads a cookie (test `a_cookie_never_reaches_mcp_or_the_archive_routes`, with an admin session). `/api/v1/catalogs/{catalog}/export|import` are under `require_principal` like every API route, at the session's levels (export read, import admin), because Task 14a's `upload.js` imports through them with the session's CSRF header.
+> - **Future callers are marked.** `pages::safe_return_to`, `is_safe_return_to` and `DEFAULT_RETURN_TO` carry `#[cfg_attr(not(test), expect(dead_code, reason = ...))]` until Task 7b uses them, and `console_session::signed_in_user` until Task 11 does. Each of those tasks deletes the attribute (an `expect` that is met warns, which `just lint` refuses).
+> - Extra tests: `a_policy_that_is_not_a_header_value_is_a_bare_500`, `only_get_head_and_options_skip_the_csrf_check`, `a_console_session_never_debug_prints_its_secrets`, `a_session_view_never_debug_prints_its_csrf_token`, `a_session_writes_only_where_its_ceiling_says_write`, `a_revoked_session_is_refused_at_once`, `an_unknown_cookie_is_a_401_that_clears_it`, `each_sign_in_gets_a_new_session_and_a_full_cookie`, `a_user_new_to_the_cache_is_read_from_the_database`, `auth_by_id_holds_every_user_by_id`, `the_browser_posts_forms_follows_cookies_and_reads_redirects`.
+
 - [ ] **Step 1: Write the failing tests for the pure parts.** `src/http/pages.rs` gets the escape test moved from `consent.rs` plus these:
 
 ```rust
@@ -10726,6 +10738,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Test: `src/http/signin.rs`; `tests/ui_e2e/signin.rs`
 
 Builds on Task 7a's pages, limits, `start_session`, `Browser` and `/api/v1/session`.
+
+> **Corrected (issue #315, 2026-11-12).** Task 7a marked `safe_return_to`, `is_safe_return_to` and `DEFAULT_RETURN_TO` in `src/http/pages.rs` with `#[cfg_attr(not(test), expect(dead_code, ...))]`; delete those three attributes when `signin.rs` starts calling them, or `just lint` fails on the unmet expectation. `ip_key` groups IPv6 addresses by /64, so tests that need two separate address buckets should use IPv4 addresses.
 
 - [ ] **Step 1: Write the failing tests.** `src/http/signin.rs` tests (the session cookie's attributes, rotation at sign-in, the limits, the links):
 
@@ -18380,7 +18394,7 @@ Append to `src/http/ui/consent.css`, before the phone-width media query:
   1. **Imports and constants.** Add these imports:
      - `std::collections::BTreeMap`;
      - `axum::extract::RawQuery` and `axum::http::HeaderMap`;
-     - `crate::http::console_session::signed_in_user` (Task 7a: the cookie's user, for this route outside `/api/v1`);
+     - `crate::http::console_session::signed_in_user` (Task 7a: the cookie's user, for this route outside `/api/v1`). **Corrected (issue #315, 2026-11-12):** delete its `#[cfg_attr(not(test), expect(dead_code, ...))]` attribute in `src/http/console_session.rs` in this task, or `just lint` fails on the unmet expectation;
      - `crate::oauth::state::UserConsent`;
      - `crate::oauth::consent::UserPage`;
      - `crate::store::ceiling::{self, Ceiling}`;

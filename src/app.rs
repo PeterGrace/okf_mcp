@@ -19,6 +19,7 @@ use crate::clock::Clock;
 use crate::clock_check::{self, ClockStatus};
 use crate::config::Config;
 use crate::error::OkfError;
+use crate::http::limits::SignInLimits;
 use crate::http::sessions::SessionKeys;
 use crate::keyed_lock::KeyedLocks;
 use crate::oauth::OAuth;
@@ -97,6 +98,8 @@ pub struct App {
     // When the OAuth tables were last pruned; `None` until the first pass.
     // A `std` mutex: held only to read or set the instant.
     oauth_pruned: std::sync::Mutex<Option<std::time::Instant>>,
+    // The sign-in routes' per-address and per-email limits.
+    sign_in_limits: SignInLimits,
 }
 
 impl App {
@@ -166,6 +169,7 @@ impl App {
             clock_status: RwLock::new(None),
             oauth,
             oauth_pruned: std::sync::Mutex::new(None),
+            sign_in_limits: SignInLimits::new(),
         }))
     }
 
@@ -182,6 +186,14 @@ impl App {
     /// The source of every timestamp.
     pub fn clock(&self) -> &dyn Clock {
         self.clock.as_ref()
+    }
+
+    /// The sign-in routes' rate limits.
+    ///
+    /// # Returns
+    /// The limiters.
+    pub fn sign_in_limits(&self) -> &SignInLimits {
+        &self.sign_in_limits
     }
 
     /// The key cache (shared with the auth layer).

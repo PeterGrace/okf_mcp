@@ -211,18 +211,27 @@ pub struct Opened {
 /// The new changeset's handle and its catalog's name.
 ///
 /// # Errors
-/// A selection error for `catalog`; [`OkfError::Forbidden`] without `write`;
-/// [`OkfError::Refused`] if the catalog was deleted meanwhile;
+/// A selection error for `catalog`; [`OkfError::Forbidden`] without `write`,
+/// or for a console session (it has no key row to own the changeset; M12
+/// Decision 5); [`OkfError::Refused`] if the catalog was deleted meanwhile;
 /// [`OkfError::Busy`] on a deadlock; [`OkfError::Database`].
 pub(crate) async fn open_changeset(
     ctx: &ToolContext,
     params: OpenParams,
 ) -> Result<Opened, OkfError> {
     // Local, as in the other tasks' functions here.
+    use crate::auth::CredentialKind;
     use crate::store::changesets;
 
     let state = ctx.one(params.catalog.as_deref())?;
     let principal = ctx.principal();
+    // `changesets.key_id` references `api_keys`. MCP takes only bearer
+    // credentials, so this guards any later `/api/v1` caller.
+    if matches!(principal.kind, CredentialKind::Session { .. }) {
+        return Err(OkfError::Forbidden {
+            reason: "a console session cannot open a changeset; use an API key".to_string(),
+        });
+    }
     principal.require(Access::Write, state.name())?;
     let now = ctx.app().clock().now();
     // The lock order of every changeset write: the catalog row first, so a
@@ -850,6 +859,31 @@ mod open_tests {
         assert_eq!(pinned.row.handle, opened.changeset);
         assert_eq!(pinned.row.key_id.as_deref(), Some("alice"));
         assert_eq!(refused.kind(), "Forbidden");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_console_session_cannot_open_a_changeset() {
+        let test = app_with(&[("pg", &[])], Config::default()).await;
+        let user = crate::store::users::UserAuth {
+            id: "9eaae459-441c-49c2-8613-e3996bdc96ee".to_string(),
+            name: "alice".to_string(),
+            email: None,
+            is_admin: true,
+        };
+        // An admin session: it passes every level check.
+        let session = crate::auth::Principal::for_session(&user, Default::default());
+        let ctx = crate::mcp::testing::context(&test, std::sync::Arc::new(session), None);
+
+        let refused = open_changeset(
+            &ctx,
+            OpenParams {
+                catalog: Some("pg".to_string()),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(refused.kind(), "Forbidden", "{refused}");
     }
 
     #[test]

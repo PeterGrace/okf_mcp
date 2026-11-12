@@ -1,7 +1,9 @@
 //! API-key and OAuth-token authentication (design "Data flow", "Read", step
 //! 1): the in-memory key cache, the [`Principal`] a request acts as, the
-//! [`BearerVerifier`] seam between credential kinds, and the axum
-//! middleware that requires a credential on every route but `/healthz`.
+//! [`BearerVerifier`] seam between credential kinds, the axum middleware
+//! that requires a bearer credential on MCP and the archive routes, and
+//! the principal of a console session (`/api/v1` admits those through
+//! `http::console_session::require_principal`).
 //! The cache caps each self-issued credential by its user's ceiling
 //! ([`crate::store::ceiling`]); admin-issued ones keep their stored levels.
 //!
@@ -31,6 +33,12 @@ use crate::keys;
 use crate::oauth::access::OAuthVerifier;
 use crate::store::ceiling::{self, cap, Ceiling};
 use crate::store::keys::{self as key_rows, Access, KeyKind, KeyRecord};
+use crate::store::users::{self, UserAuth};
+
+/// The `key_id` prefix of a console session's principal. Key ids match
+/// `^[A-Za-z0-9._-]+$`, so `session:<name>` never equals one (plan
+/// Decision 5).
+pub const SESSION_KEY_PREFIX: &str = "session:";
 
 /// The catalogs a credential may reach, and at what level.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,10 +62,16 @@ pub enum CredentialKind {
         /// The grant's client, as it names itself.
         client_name: Option<String>,
     },
+    /// A signed-in console session (`okf_session` cookie): never an MCP
+    /// credential, and it owns no changesets.
+    Session {
+        /// The signed-in user's id.
+        user_id: String,
+    },
 }
 
-/// Who a request acts as: one live API key or OAuth grant (never the
-/// secret itself).
+/// Who a request acts as: one live API key, OAuth grant or console session
+/// (never the secret itself).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     /// The key's id.
@@ -144,6 +158,44 @@ impl Principal {
         Ok(())
     }
 
+    /// The principal of a console session (plan Decision 5): an admin
+    /// user acts as an admin on every catalog; anyone else reaches exactly
+    /// their ceiling, at the ceiling's level for each catalog.
+    ///
+    /// Callers pass the user as the key cache knows it now, never as read
+    /// at sign-in: the admin flag can change between the password check
+    /// and the session's first request.
+    ///
+    /// # Arguments
+    /// * `user` - the signed-in user, from the key cache.
+    /// * `ceiling` - the user's ceiling (unused for an admin).
+    ///
+    /// # Returns
+    /// The principal; its `access` is the highest level it holds, for
+    /// display and the admin checks (which a non-admin never passes).
+    pub fn for_session(user: &UserAuth, ceiling: Ceiling) -> Self {
+        let (access, reach) = if user.is_admin {
+            (Access::Admin, Reach::All)
+        } else {
+            // `copied()` turns the `&Access` items into `Access` values;
+            // `max()` is `None` for an empty ceiling.
+            let highest = ceiling.values().copied().max().unwrap_or(Access::Read);
+            (highest, Reach::Catalogs(ceiling))
+        };
+        Self {
+            key_id: format!("{SESSION_KEY_PREFIX}{}", user.name),
+            access,
+            maintenance_report: false,
+            reach,
+            default_catalog: None,
+            actor: user.name.clone(),
+            kind: CredentialKind::Session {
+                user_id: user.id.clone(),
+            },
+            user: Some(user.name.clone()),
+        }
+    }
+
     /// Requires read access to the catalog and the independent reporting flag.
     ///
     /// # Errors
@@ -219,16 +271,19 @@ impl Cached {
     }
 }
 
-/// Every live key, by SHA-256, and every live OAuth grant, by id.
-/// Immutable: a reload builds a new one.
+/// Every live key, by SHA-256, every live OAuth grant, by id, and every
+/// user with its ceiling, by user id. Immutable: a reload builds a new one.
 #[derive(Debug, Default)]
 pub struct KeyCache {
     by_hash: HashMap<[u8; 32], Cached>,
     // Grants have no secret of their own: an access token names one by id.
     by_id: HashMap<String, Cached>,
     // Each user's ceiling, by user id: self-issued credentials are capped
-    // by it here, and console sessions (Task 7a) are built from it.
+    // by it here, and console sessions are built from it.
     by_user: HashMap<String, Ceiling>,
+    // Every user, by id: what a session principal is built from without a
+    // query (admin flag, name, email).
+    users: HashMap<String, UserAuth>,
 }
 
 /// The ceiling of a self-issued credential whose user has none.
@@ -333,17 +388,44 @@ impl KeyCache {
         cache
     }
 
-    /// Reads every key and every ceiling and builds the cache.
+    /// Adds the users a session principal is built from.
+    ///
+    /// # Arguments
+    /// * `users` - every user, by id ([`users::auth_by_id`]).
+    ///
+    /// # Returns
+    /// The cache with them.
+    pub fn with_users(mut self, users: HashMap<String, UserAuth>) -> Self {
+        self.users = users;
+        self
+    }
+
+    /// A user, by id.
+    ///
+    /// # Arguments
+    /// * `user_id` - the user's id.
+    ///
+    /// # Returns
+    /// The user, or `None` for one not loaded (deleted, or created since).
+    pub fn user(&self, user_id: &str) -> Option<&UserAuth> {
+        self.users.get(user_id)
+    }
+
+    /// Reads every key, every ceiling and every user, and builds the cache.
     ///
     /// # Errors
     /// [`OkfError::Database`].
     async fn read(pool: &PgPool, now: DateTime<Utc>) -> Result<Self, OkfError> {
-        // Both at once, on two pooled connections (`try_join!` is
+        // All three at once, on three pooled connections (`try_join!` is
         // `asyncio.gather` that stops at the first error). A change committed
-        // between the two reads also moved `admin_generation`, which every
+        // between the reads also moved `admin_generation`, which every
         // caller reads first, so the next poll reloads again.
-        let (records, ceilings) = tokio::try_join!(key_rows::list(pool), ceiling::ceilings(pool))?;
-        Ok(Self::from_records(records, ceilings, now))
+        let (records, ceilings, users) = tokio::try_join!(
+            key_rows::list(pool),
+            ceiling::ceilings(pool),
+            users::auth_by_id(pool)
+        )?;
+        Ok(Self::from_records(records, ceilings, now).with_users(users))
     }
 
     /// The principal of a presented key.
@@ -456,6 +538,21 @@ impl Keys {
             .get(user_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// A user's name, email and admin flag, from the current cache.
+    ///
+    /// # Arguments
+    /// * `user_id` - the user's id.
+    ///
+    /// # Returns
+    /// A copy of the user, or `None` when the cache does not know it.
+    pub fn user_admin(&self, user_id: &str) -> Option<UserAuth> {
+        self.cache
+            .read()
+            .expect("key cache lock poisoned")
+            .user(user_id)
+            .cloned()
     }
 
     /// The principal of a presented key, from the current cache.
@@ -580,6 +677,22 @@ pub fn bearer(headers: &HeaderMap) -> Option<&str> {
     (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
+/// The 401 for a request without a usable credential, with [`challenge`].
+///
+/// # Arguments
+/// * `app` - the shared state.
+///
+/// # Returns
+/// The response.
+pub(crate) fn unauthorized(app: &App) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, challenge(app))],
+        "missing or unknown API key\n",
+    )
+        .into_response()
+}
+
 /// axum middleware: admits a request with a live API key or OAuth access
 /// token, inserting its `Arc<Principal>` into the request's extensions, and
 /// answers anything else with 401 and [`challenge`].
@@ -611,12 +724,7 @@ pub async fn require_key(
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
-        Ok(None) => (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, challenge(&app))],
-            "missing or unknown API key\n",
-        )
-            .into_response(),
+        Ok(None) => unauthorized(&app),
         // `AppError` logs it and answers 500 without detail.
         Err(error) => AppError(error).into_response(),
     }
@@ -1360,6 +1468,80 @@ mod tests {
             app.keys().ceiling_of(&alice_id),
             BTreeMap::from([("shared".to_string(), Access::Read)])
         );
+    }
+
+    fn user(is_admin: bool) -> UserAuth {
+        UserAuth {
+            id: "9eaae459-441c-49c2-8613-e3996bdc96ee".to_string(),
+            name: "alice".to_string(),
+            email: Some("alice@example.com".to_string()),
+            is_admin,
+        }
+    }
+
+    #[test]
+    fn a_non_admin_session_reaches_its_ceiling_at_each_level() {
+        let ceiling = Ceiling::from([
+            ("main".to_string(), Access::Write),
+            ("other".to_string(), Access::Read),
+        ]);
+
+        let principal = Principal::for_session(&user(false), ceiling);
+
+        assert_eq!(principal.key_id, "session:alice");
+        assert_eq!(principal.actor, "alice");
+        assert_eq!(principal.user.as_deref(), Some("alice"));
+        assert_eq!(
+            principal.access,
+            Access::Write,
+            "the highest level in the ceiling"
+        );
+        assert!(!principal.maintenance_report);
+        assert!(principal.require(Access::Write, "main").is_ok());
+        assert!(matches!(
+            principal.require(Access::Write, "other"),
+            Err(OkfError::Forbidden { .. })
+        ));
+        assert!(principal.require(Access::Read, "other").is_ok());
+        assert!(matches!(
+            principal.require(Access::Read, "elsewhere"),
+            Err(OkfError::CatalogNotSelected { .. })
+        ));
+        assert!(matches!(
+            principal.require(Access::Admin, "main"),
+            Err(OkfError::Forbidden { .. })
+        ));
+        assert!(
+            matches!(principal.kind, CredentialKind::Session { ref user_id } if user_id == &user(false).id)
+        );
+    }
+
+    #[test]
+    fn an_admin_users_session_is_an_admin_on_every_catalog() {
+        let principal = Principal::for_session(&user(true), Ceiling::new());
+
+        assert_eq!(principal.access, Access::Admin);
+        assert_eq!(principal.reach, Reach::All);
+        assert!(principal.require(Access::Admin, "anything").is_ok());
+    }
+
+    #[test]
+    fn a_session_with_an_empty_ceiling_reaches_nothing() {
+        let principal = Principal::for_session(&user(false), Ceiling::new());
+
+        assert_eq!(principal.access, Access::Read);
+        assert!(!principal.reaches("main"));
+    }
+
+    #[test]
+    fn the_cache_knows_users_by_id() {
+        let alice = user(true);
+        let cache =
+            KeyCache::default().with_users(HashMap::from([(alice.id.clone(), alice.clone())]));
+        let keys = Keys::new(cache, Arc::new(crate::clock::SystemClock));
+
+        assert_eq!(keys.user_admin(&alice.id), Some(alice));
+        assert_eq!(keys.user_admin("nobody"), None);
     }
 
     #[hegel::test]

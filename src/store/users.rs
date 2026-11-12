@@ -2,6 +2,8 @@
 //! user also creates its personal team, so every user can own catalogs.
 //! Users are addressed by name; ids stay inside SQL.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
@@ -351,7 +353,9 @@ pub(crate) fn check_email(email: &str) -> Result<(), OkfError> {
 
 /// Sets or clears a user's email address. A changed address also deletes
 /// the user's outstanding emailed links, so a link sent to the old address
-/// stops working. A change of letter case only is not a change.
+/// stops working, and bumps the administrative generation, so the key
+/// cache (which console sessions read the email from) reloads. A change of
+/// letter case only is not a change.
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -396,6 +400,9 @@ pub async fn set_email(pool: &PgPool, name: &str, email: Option<&str>) -> Result
             .bind(&user_id)
             .execute(&mut *tx)
             .await?;
+        // The key cache holds every user's email for console sessions
+        // (`auth_by_id`), so a change reloads it.
+        bump_admin_generation(&mut tx).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -512,6 +519,29 @@ pub async fn find_auth(pool: &PgPool, user_id: &str) -> Result<Option<UserAuth>,
     .bind(user_id)
     .fetch_optional(pool)
     .await?)
+}
+
+/// Every user's sign-in identity, by id, for the key cache: console
+/// sessions are built from it without a query.
+///
+/// # Arguments
+/// * `pool` - the database.
+///
+/// # Returns
+/// The users, keyed by id.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn auth_by_id(pool: &PgPool) -> Result<HashMap<String, UserAuth>, OkfError> {
+    let users =
+        sqlx::query_as::<_, UserAuth>(concat!("SELECT ", user_auth_columns!(), " FROM users u"))
+            .fetch_all(pool)
+            .await?;
+    // `(user.id.clone(), user)`: the map owns a copy of the id as its key.
+    Ok(users
+        .into_iter()
+        .map(|user| (user.id.clone(), user))
+        .collect())
 }
 
 /// Deletes a user that nothing references, with its personal team, and
@@ -715,6 +745,47 @@ pub(crate) mod tests {
         assert_eq!(
             find_by_email(&db.pool, "alice@example.com").await.unwrap(),
             None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_email_change_bumps_the_generation_and_a_no_op_does_not() {
+        let db = test_db().await;
+        seed_user(&db.pool, "alice", Some("alice@example.com")).await;
+        let generation = || catalogs::admin_generation(&db.pool);
+        let start = generation().await.unwrap();
+
+        set_email(&db.pool, "alice", Some("ALICE@example.com"))
+            .await
+            .unwrap();
+        let after_case_only = generation().await.unwrap();
+        set_email(&db.pool, "alice", Some("alice@example.org"))
+            .await
+            .unwrap();
+        let after_change = generation().await.unwrap();
+
+        assert_eq!(after_case_only, start, "a case-only change is no change");
+        assert_eq!(after_change, start + 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auth_by_id_holds_every_user_by_id() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", Some("alice@example.com")).await;
+        set_admin(&db.pool, "alice", true, false).await.unwrap();
+
+        let users = auth_by_id(&db.pool).await.unwrap();
+
+        let stored = find_by_email(&db.pool, "alice@example.com")
+            .await
+            .unwrap()
+            .expect("alice");
+        assert_eq!(users.get(&stored.id), Some(&stored));
+        assert!(stored.is_admin);
+        assert_eq!(stored.name, alice.name);
+        assert!(
+            users.values().any(|user| user.name == crate::db::TEST_USER),
+            "every user, not only those with an email"
         );
     }
 

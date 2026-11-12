@@ -245,7 +245,7 @@ fn grant_client(app: &App, grant_id: &str) -> Option<String> {
     // `?` on an `Option` returns `None` early, as on a `Result`.
     match &app.keys().find_grant(grant_id)?.kind {
         CredentialKind::OAuth { client_id, .. } => client_id.clone(),
-        CredentialKind::ApiKey => None,
+        CredentialKind::ApiKey | CredentialKind::Session { .. } => None,
     }
 }
 

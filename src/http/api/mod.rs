@@ -11,8 +11,9 @@ use axum::response::Response;
 use axum::Router;
 
 use crate::app::App;
-use crate::auth::{require_key, Principal, Reach};
+use crate::auth::{Principal, Reach};
 use crate::error::OkfError;
+use crate::http::console_session::require_principal;
 use crate::mcp::context::ToolContext;
 use crate::store::keys::Access;
 
@@ -29,15 +30,16 @@ mod search;
 #[cfg(test)]
 pub(crate) mod testing;
 
-/// Every API route, for nesting at `/api/v1`, behind `require_key`.
+/// Every API route, for nesting at `/api/v1`, behind `require_principal`
+/// (a bearer key or grant, or a console session cookie).
 ///
 /// # Arguments
-/// * `app` - the application (`require_key`'s state; the import route's
-///   body limit comes from its config).
+/// * `app` - the application (`require_principal`'s state; the import
+///   route's body limit comes from its config).
 ///
 /// # Returns
 /// A router whose responses all carry `Cache-Control: no-store` and
-/// `nosniff`, the 401 for a missing or unknown key included.
+/// `nosniff`, the 401 for a missing or unknown credential included.
 pub(crate) fn routes(app: &Arc<App>) -> Router<Arc<App>> {
     Router::new()
         .merge(identity::routes())
@@ -52,19 +54,29 @@ pub(crate) fn routes(app: &Arc<App>) -> Router<Arc<App>> {
         .merge(people::routes())
         // `route_layer` covers the routes merged above and runs only when one
         // matched, so an unknown API path stays 404 rather than 401.
-        .route_layer(middleware::from_fn_with_state(Arc::clone(app), require_key))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(app),
+            require_principal,
+        ))
         // Its own fallback, so an unknown API path is answered here (404,
         // without a key check) and gets the headers below; without one, the
         // outer router's fallback would answer it.
         .fallback(|| async { StatusCode::NOT_FOUND })
-        // A plain `layer` wraps everything above, `require_key` and the
-        // fallback included, so the 401 and the 404 get these headers too.
+        // A plain `layer` wraps everything above, `require_principal` and
+        // the fallback included, so the 401 and the 404 get these headers too.
         .layer(middleware::map_response(api_headers))
 }
 
 /// Adds the headers every API response carries: never cached (keys and
-/// catalog content are private), never content-sniffed.
-async fn api_headers(mut response: Response) -> Response {
+/// catalog content are private), never content-sniffed. Also reused by the
+/// open passkey routes (Task 8), which sit outside `/api/v1`.
+///
+/// # Arguments
+/// * `response` - the response on its way out.
+///
+/// # Returns
+/// The response with the two headers.
+pub(crate) async fn api_headers(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
@@ -80,7 +92,7 @@ async fn api_headers(mut response: Response) -> Response {
 ///
 /// # Arguments
 /// * `app` - the application.
-/// * `principal` - the calling key, from `require_key`.
+/// * `principal` - the caller, from `require_principal`.
 ///
 /// # Returns
 /// A context acting as `principal`.
