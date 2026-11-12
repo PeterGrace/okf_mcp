@@ -17,5 +17,6 @@
 - The CSRF token is derived from the session id (SHA-256 under its own label), so `user_sessions` stores no secret: `csrf_token` holds only the token's hash. Neither raw value appears in a `Debug` output.
 - `touch`'s one write re-checks the absolute and idle limits and the write interval under the row lock, so a concurrent request can never extend a session that has been revoked or has ended, and a burst of requests writes once. A touch that writes nothing re-reads the row, so it never signs out a live session.
 - The write resolution follows the idle limit, so a short `console_session_idle` (such as `30s`) still keeps an active session alive.
+- The idle limit has one write resolution of grace, because a use too soon after the last write is not recorded: a session is never ended sooner than `console_session_idle` after its last use, and always by `console_session_idle` plus the resolution (12 h 1 min with the defaults).
 - Console session settings are `console_session_*`, apart from MCP's `session_idle_timeout` (Decision 9).
 - The plan's Task 5 carries a Corrected (issue #313) note for these differences.

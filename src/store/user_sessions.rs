@@ -13,9 +13,11 @@
 //! back: its writes re-check both limits under the row lock.
 //!
 //! Activity is recorded at most once per write resolution: a quarter of
-//! the idle limit, and never more than a minute. Recording it every minute
-//! regardless would let a session with an idle limit of a minute or less
-//! expire while in use.
+//! the idle limit, and never more than a minute. A use inside the window is
+//! not written, so the idle limit is enforced with one resolution of
+//! grace: a session ends once `last_seen_at + idle + resolution` has
+//! passed. It is never ended sooner than `idle` after its last use, and
+//! always by `idle + resolution` after it.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -113,13 +115,18 @@ fn csrf_for(id: &str) -> String {
     URL_SAFE_NO_PAD.encode(keys::hash(&format!("{CSRF_LABEL}{id}")))
 }
 
-/// The instant before which a session's `last_seen_at` means it has been
-/// idle too long, or `None` when `idle` reaches past every stored time (a
+/// The instant at or before which a session's `last_seen_at` means it has
+/// been idle too long: `now - (idle + resolution)`. The grace of one
+/// [`write_resolution`] covers a use that came too soon after the last
+/// write to be recorded (it was at most one resolution after
+/// `last_seen_at`), so no session ends sooner than `idle` after its real
+/// last use. `None` when the cutoff reaches past every stored time (a
 /// configured idle beyond 1970 never times out; no session predates it).
 fn idle_cutoff(idle: Duration, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     TimeDelta::from_std(idle)
         .ok()
-        .and_then(|idle| now.checked_sub_signed(idle))
+        .and_then(|idle| idle.checked_add(&write_resolution_of(idle)))
+        .and_then(|limit| now.checked_sub_signed(limit))
         .filter(|cutoff| *cutoff > DateTime::UNIX_EPOCH)
 }
 
@@ -129,9 +136,12 @@ fn idle_cutoff(idle: Duration, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 /// `last_seen_at` to stay alive, however short `idle` is.
 fn write_resolution(idle: Duration) -> TimeDelta {
     // `idle / 4` past chrono's range is far above the cap, so the cap wins.
-    TimeDelta::from_std(idle / 4).map_or(MAX_LAST_SEEN_RESOLUTION, |quarter| {
-        quarter.min(MAX_LAST_SEEN_RESOLUTION)
-    })
+    TimeDelta::from_std(idle).map_or(MAX_LAST_SEEN_RESOLUTION, write_resolution_of)
+}
+
+/// [`write_resolution`] for an idle limit already in chrono's range.
+fn write_resolution_of(idle: TimeDelta) -> TimeDelta {
+    (idle / 4).min(MAX_LAST_SEEN_RESOLUTION)
 }
 
 /// Starts a session.
@@ -214,8 +224,13 @@ impl Stored {
 }
 
 /// Looks a session up for a request: ends it if it is past its absolute
-/// limit or idle for `idle`, and otherwise records the activity, at most
+/// limit or idle too long, and otherwise records the activity, at most
 /// once per write resolution (`idle / 4`, capped at a minute).
+///
+/// Idle means no use for `idle` plus one write resolution of grace (a use
+/// inside a resolution of the last write is not recorded): a session is
+/// never ended sooner than `idle` after its last use, and always by
+/// `idle + resolution` after it.
 ///
 /// Safe under concurrency:
 /// - The activity write is one `UPDATE` whose `WHERE` requires the session
@@ -575,9 +590,9 @@ mod tests {
             .await
             .unwrap();
 
-        let idle = touch(&db.pool, &session.id, IDLE, now() + TimeDelta::hours(12))
-            .await
-            .unwrap();
+        // Twelve hours idle plus the one-minute grace.
+        let idle_end = now() + TimeDelta::hours(12) + TimeDelta::minutes(1);
+        let idle = touch(&db.pool, &session.id, IDLE, idle_end).await.unwrap();
         let again = touch(&db.pool, &session.id, IDLE, now()).await.unwrap();
 
         assert!(idle.is_none());
@@ -687,12 +702,76 @@ mod tests {
                 let alive = touch(&db.pool, &session.id, idle, at).await.unwrap();
                 assert!(alive.is_some(), "idle {idle_secs}s, touched at {at}");
             }
-            // Then left alone for exactly the idle limit.
-            let idle_end = at + TimeDelta::seconds(idle_secs as i64);
+            // Then left alone for the idle limit plus its grace (a
+            // quarter of it).
+            let idle_end = at + TimeDelta::milliseconds(idle_secs as i64 * 1250);
             let ended = touch(&db.pool, &session.id, idle, idle_end).await.unwrap();
 
             assert!(ended.is_none(), "idle {idle_secs}s ends once idle");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_use_too_soon_to_be_written_still_counts_toward_the_idle_limit() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        let idle = Duration::from_secs(30);
+        let session = create(&db.pool, &alice.id, None, "", ABSOLUTE, now())
+            .await
+            .unwrap();
+
+        // +7s is inside the 7.5 s write resolution, so it is not written;
+        // +32s is only 25 s after that use.
+        let early = touch(&db.pool, &session.id, idle, now() + TimeDelta::seconds(7))
+            .await
+            .unwrap();
+        let after_7s = last_seen(&db.pool, &session.id).await;
+        let later = touch(&db.pool, &session.id, idle, now() + TimeDelta::seconds(32))
+            .await
+            .unwrap();
+
+        assert!(early.is_some());
+        assert_eq!(after_7s, now(), "the +7s use was not written");
+        assert!(
+            later.is_some(),
+            "never ended sooner than idle after the last use"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unused_session_ends_once_idle_plus_the_resolution_has_passed() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        let idle = Duration::from_secs(30);
+        // Two sessions started together, so each is touched only once.
+        let just_inside = create(&db.pool, &alice.id, None, "", ABSOLUTE, now())
+            .await
+            .unwrap();
+        let at_the_limit = create(&db.pool, &alice.id, None, "", ABSOLUTE, now())
+            .await
+            .unwrap();
+
+        // 30 s idle plus the 7.5 s resolution is 37.5 s.
+        let inside = touch(
+            &db.pool,
+            &just_inside.id,
+            idle,
+            now() + TimeDelta::milliseconds(37_499),
+        )
+        .await
+        .unwrap();
+        let ended = touch(
+            &db.pool,
+            &at_the_limit.id,
+            idle,
+            now() + TimeDelta::milliseconds(37_500),
+        )
+        .await
+        .unwrap();
+
+        assert!(inside.is_some());
+        assert!(ended.is_none(), "always ended by idle + resolution");
+        assert_eq!(list(&db.pool, &alice.id, None).await.unwrap().len(), 1);
     }
 
     /// Counts every write to `user_sessions` (in `session_writes`), so a
