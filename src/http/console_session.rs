@@ -896,6 +896,47 @@ mod http_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn the_api_archive_routes_take_a_session_at_its_levels_and_with_csrf() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        ceiling::entitle(test.app.pool(), "alice", "main", Access::Write, Utc::now())
+            .await
+            .expect("entitle");
+        let mut writer = Browser::session_for(&test, "alice").await;
+
+        let export = writer
+            .send(&test, "GET", "/api/v1/catalogs/main/export", Payload::Empty)
+            .await;
+        let import = writer
+            .send(
+                &test,
+                "POST",
+                "/api/v1/catalogs/main/import",
+                Payload::Empty,
+            )
+            .await;
+        writer.csrf = None;
+        let no_csrf = writer
+            .send(
+                &test,
+                "POST",
+                "/api/v1/catalogs/main/import",
+                Payload::Empty,
+            )
+            .await;
+
+        assert_eq!(export.status, StatusCode::OK, "{}", export.text());
+        assert_eq!(&export.body[..2], &[0x1f, 0x8b], "a gzip archive");
+        assert_eq!(import.status, StatusCode::FORBIDDEN, "import needs admin");
+        assert_eq!(
+            no_csrf.status,
+            StatusCode::FORBIDDEN,
+            "and a write needs CSRF"
+        );
+        assert!(no_csrf.text().contains("X-OKF-CSRF"), "{}", no_csrf.text());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_revoked_session_is_refused_at_once() {
         let test = login_app().await;
         let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;

@@ -3,14 +3,14 @@
 //! be granted, and an error page ends a request that cannot go on.
 //!
 //! Client names come from client metadata, which anyone can write, so every
-//! piece of text goes through [`escape`]. There is no template engine; the
-//! document shell and the response headers are [`crate::http::pages`]'.
+//! piece of text goes through `escape`. There is no template engine; the
+//! document shell and the response headers come from `crate::http::pages`.
 
 use axum::http::StatusCode;
 use axum::response::Response;
 
 use crate::http::pages;
-/// Moved to [`crate::http::pages`]; kept here so `mail::templates` (Task 6)
+/// Moved to `crate::http::pages`; kept here so `mail::templates` (Task 6)
 /// compiles whichever of Tasks 6 and 7a merges first (plan Decision 14).
 pub(crate) use crate::http::pages::escape;
 
