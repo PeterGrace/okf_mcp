@@ -347,12 +347,12 @@ impl App {
 
 // ---- src/store/user_sessions.rs (Task 5) ----
 pub const ID_PREFIX_LENGTH: usize = 12;
-pub struct NewSession { pub id: String, pub csrf: String }  // raw values for the cookie and the page
+pub struct NewSession { pub id: String, pub csrf: String }  // raw values for the cookie and the page; csrf is derived from id, neither is stored
 pub struct SessionRow { pub user_id: String, pub csrf: String, pub created_at: DateTime<Utc>, pub expires_at: DateTime<Utc> }
 pub async fn create(pool: &PgPool, user_id: &str, ip: Option<IpAddr>, user_agent: &str, absolute: Duration, now: DateTime<Utc>) -> Result<NewSession, OkfError>;
-pub async fn touch(pool: &PgPool, id: &str, idle: Duration, now: DateTime<Utc>) -> Result<Option<SessionRow>, OkfError>; // None when absent/expired/idle; writes last_seen_at at most once a minute
+pub async fn touch(pool: &PgPool, id: &str, idle: Duration, now: DateTime<Utc>) -> Result<Option<SessionRow>, OkfError>; // None when absent/expired/idle/revoked meanwhile; writes last_seen_at at most once a minute
 pub async fn revoke(pool: &PgPool, id: &str) -> Result<(), OkfError>;
-pub async fn revoke_all(pool: &PgPool, user_id: &str, except: Option<&str>) -> Result<u64, OkfError>; // `except` is the raw cookie id
+pub async fn revoke_all(executor: impl PgExecutor<'_>, user_id: &str, except: Option<&str>) -> Result<u64, OkfError>; // `except` is the raw cookie id; a &PgPool or &mut *tx (users::set_admin)
 pub struct SessionInfo { pub id_prefix: String, pub created_at: DateTime<Utc>, pub last_seen_at: DateTime<Utc>, pub ip: Option<IpAddr>, pub user_agent: String, pub current: bool }
 pub async fn list(pool: &PgPool, user_id: &str, current: Option<&str>) -> Result<Vec<SessionInfo>, OkfError>; // `current` is the raw cookie id
 pub async fn revoke_by_prefix(pool: &PgPool, user_id: &str, id_prefix: &str) -> Result<(), OkfError>; // id_prefix = first 12 hex chars of the stored hash
@@ -5306,6 +5306,14 @@ Setting values are validated by one function, `settings::apply`, used both when 
 | `console_session_idle`, `console_session_absolute`, `setup_link_ttl`, `reset_link_ttl` | JSON string (humantime) | a duration above zero |
 
 Console sessions (spec "Sessions", Decision 9): the cookie value is 256 random bits (`keys::generate_with("")`, 43 base64url characters); only `keys::hash` of it is stored, as `user_sessions.id_hash`. `touch` returns `None` (and deletes the row) once `expires_at` passes or the session has been idle for `idle`; otherwise it writes `last_seen_at` only when the stored value is at least a minute old. A session's public handle is `id_prefix`, the first 12 hex characters of its hash: enough to tell sessions apart and revoke one, useless for signing in.
+
+> **Corrected (issue #313, 2026-11-12).** What shipped differs from the code below in four ways; `src/store/user_sessions.rs` is authoritative.
+> - **The CSRF token is derived, not stored.** `csrf = base64url(SHA-256("okf-mcp console session csrf\0" + id))`, 43 characters, computed by `create` and again by `touch` from the raw id. `user_sessions.csrf_token` holds only the hex SHA-256 of the token, so the table holds no secret. `SessionRow` is no longer `sqlx::FromRow` (touch reads a private `Stored` and builds it). Callers see no change: `NewSession.csrf` and `SessionRow.csrf` are still the raw token.
+> - **`touch` cannot extend an ended session under concurrency.** Its `last_seen_at` write is `UPDATE ... SET last_seen_at = GREATEST(last_seen_at, $now) WHERE id_hash = $1 AND expires_at > $now AND last_seen_at > $idle_cutoff`; Postgres re-checks the `WHERE` under the row lock, so a session revoked or ended meanwhile matches nothing and `touch` returns `None`. Its delete re-checks the same limits, so it never deletes a session another request just kept alive. The idle cutoff is `now - idle`, or none when that falls before 1970.
+> - **`revoke_all` takes `impl PgExecutor<'_>`** (a `&PgPool` still works), and `users::set_admin` (Task 4, which wrote the `DELETE` itself) now calls `user_sessions::revoke_all(&mut *tx, &user_id, None)` inside its transaction, so `store::user_sessions` is the only owner of that SQL. Task 4's `seed_session` test helper uses `user_sessions::create`.
+> - **`create` keeps the first 256 characters of `User-Agent`** (cut on a character boundary).
+>
+> Extra tests: `a_late_touch_never_revives_an_ended_session`, `a_revoked_session_is_not_revived_by_a_touch_that_read_it_first`, `a_long_user_agent_is_cut_at_a_character_boundary`, and in `app::tests` `an_unreadable_stored_setting_never_stops_the_server` and `a_failed_settings_reload_keeps_the_old_settings_and_retries`. `Config::validate`'s `[oauth]` lifetimes now go through `check_auth_duration` too (same messages).
 
 - [ ] **Step 1: Write the failing config tests.** Add to `config::tests`:
 

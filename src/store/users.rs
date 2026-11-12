@@ -7,6 +7,7 @@ use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
 use crate::store::catalogs::{bump_admin_generation, is_unique_violation, is_valid_name};
+use crate::store::user_sessions;
 
 /// A user to create.
 // `<'a>` is a lifetime parameter: the struct borrows its strings from the
@@ -460,10 +461,8 @@ pub async fn set_admin(
         .bind(on)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM user_sessions WHERE user_id = $1")
-        .bind(&user_id)
-        .execute(&mut *tx)
-        .await?;
+    // The session store owns its SQL; `&mut *tx` runs it in this transaction.
+    user_sessions::revoke_all(&mut *tx, &user_id, None).await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(previous)
@@ -645,17 +644,16 @@ pub(crate) mod tests {
         find_auth(pool, &id).await.unwrap().unwrap()
     }
 
-    /// Gives user `user_id` one console session, written directly (the
-    /// session store is Task 5's).
+    /// Gives user `user_id` one console session.
     async fn seed_session(pool: &PgPool, user_id: &str) {
-        sqlx::query(
-            "INSERT INTO user_sessions (id_hash, user_id, csrf_token, created_at, \
-                                        last_seen_at, expires_at) \
-             VALUES (decode(repeat('ab', 32), 'hex'), $1, 'csrf', now(), now(), \
-                     now() + interval '1 day')",
+        user_sessions::create(
+            pool,
+            user_id,
+            None,
+            "",
+            std::time::Duration::from_secs(86_400),
+            now(),
         )
-        .bind(user_id)
-        .execute(pool)
         .await
         .unwrap();
     }
