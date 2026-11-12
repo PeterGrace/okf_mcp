@@ -1841,8 +1841,8 @@ mod tests {
         let body = Some(json!({"name": "alice", "display_name": ""}));
 
         let (read, _) = send(&test, "POST", "/api/v1/users", Some(&keys.read), body.clone()).await;
-        let (scoped, _) = send(&test, "POST", "/api/v1/users", Some(&keys.scoped_admin), body.clone()).await;
-        let (listing, _) = send(&test, "GET", "/api/v1/users", Some(&keys.scoped_admin), None).await;
+        let (scoped, _) = send(&test, "POST", "/api/v1/users", Some(&keys.admin), body.clone()).await;
+        let (listing, _) = send(&test, "GET", "/api/v1/users", Some(&keys.admin), None).await;
 
         assert_eq!(read.as_u16(), 403);
         assert_eq!(scoped.as_u16(), 403);
@@ -1940,7 +1940,7 @@ mod tests {
 }
 ```
 
-Adapt `keys.scoped_admin` and `test.pool` to the fixture's real field names. If the `Keys` fixture has no scoped admin key, add one there (an admin granted only `main`). The `display_name` field is `#[serde(default)]`.
+Adapt `keys.admin` and `test.app.pool()` to the fixture if it changes. The `display_name` field is `#[serde(default)]`.
 
 > **Corrected (issue #283).** `TestApp` has no `pool` field: use `test.app.pool()` (the legacy-key calls above already do). `testing::Keys` has no `scoped_admin`, but its `admin` key is granted only `main`, so it is the scoped admin; `stranger` is an admin on `other` only. Neither reaches every catalog.
 
