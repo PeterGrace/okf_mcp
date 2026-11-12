@@ -24,6 +24,7 @@ mod health;
 mod identity;
 mod keys;
 mod maintenance;
+mod me;
 mod oauth;
 mod people;
 mod search;
@@ -52,6 +53,7 @@ pub(crate) fn routes(app: &Arc<App>) -> Router<Arc<App>> {
         .merge(oauth::routes())
         .merge(changesets::routes())
         .merge(people::routes())
+        .merge(me::routes())
         // `route_layer` covers the routes merged above and runs only when one
         // matched, so an unknown API path stays 404 rather than 401.
         .route_layer(middleware::from_fn_with_state(

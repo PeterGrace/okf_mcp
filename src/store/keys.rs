@@ -379,6 +379,33 @@ pub async fn create_with_id(
     new: &NewKey<'_>,
     now: DateTime<Utc>,
 ) -> Result<CreatedKey, OkfError> {
+    let mut tx = pool.begin().await?;
+    let created = insert_key(&mut tx, new, now).await?;
+    bump_admin_generation(&mut tx).await?;
+    tx.commit().await?;
+    Ok(created)
+}
+
+/// Checks a key and inserts it with its grants inside the caller's
+/// transaction, without bumping the administrative generation:
+/// [`create_with_id`] and [`create_self_issued`] share it and bump once each.
+///
+/// # Arguments
+/// * `conn` - the creating transaction (pass `&mut tx`: a `Transaction`
+///   dereferences to the `PgConnection` it runs on).
+/// * `new` - the key.
+/// * `now` - the creation time (server clock).
+///
+/// # Returns
+/// The key's id and the key itself (shown once).
+///
+/// # Errors
+/// As [`create`].
+async fn insert_key(
+    conn: &mut PgConnection,
+    new: &NewKey<'_>,
+    now: DateTime<Utc>,
+) -> Result<CreatedKey, OkfError> {
     if !is_valid_name(new.name) {
         return Err(OkfError::Refused {
             reason: format!(
@@ -394,12 +421,11 @@ pub async fn create_with_id(
             reason: format!("key {:?} would expire before it is created", new.name),
         });
     }
-    let mut tx = pool.begin().await?;
     let (granted, default_catalog_id) =
-        resolve_grants(&mut tx, "key", new.name, new.grants, new.default_catalog).await?;
+        resolve_grants(&mut *conn, "key", new.name, new.grants, new.default_catalog).await?;
     // Held `FOR KEY SHARE` until commit, so a concurrent `users::delete`
     // either waits and then counts this key, or wins and leaves an unknown name.
-    let user_id = users::id_of(&mut tx, new.user).await?;
+    let user_id = users::id_of(&mut *conn, new.user).await?;
     let key = crate::keys::generate()?;
     let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO api_keys \
@@ -418,7 +444,7 @@ pub async fn create_with_id(
     .bind(&user_id)
     .bind(new.self_issued)
     .bind(new.expires_at)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await;
     // Only the live name/actor constraint is a user-facing duplicate. A
     // `sha256` UNIQUE violation (a credential-hash collision) remains a
@@ -452,11 +478,132 @@ pub async fn create_with_id(
     .bind(&id)
     .bind(&granted)
     .bind(&levels)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
+    Ok(CreatedKey { id, key })
+}
+
+/// Creates a self-issued key (spec "Self-service") unless its user already
+/// has `max_live` live ones, and bumps the administrative generation, in
+/// one transaction. "Live" is a self-issued API key (not a grant) that is
+/// neither revoked nor past its expiry.
+///
+/// The user row is locked `FOR UPDATE` before counting, so two concurrent
+/// creates for one user run one after the other: the second counts the
+/// first. `insert_key`'s own `FOR KEY SHARE` on that row is then a no-op,
+/// since this transaction already holds a stronger lock.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `new` - the key; the caller sets `self_issued: true` and has checked
+///   its levels against the ceiling.
+/// * `max_live` - the `max_keys_per_user` setting.
+/// * `now` - the creation time, also the expiry cut-off for the count.
+///
+/// # Returns
+/// The key's id and the key itself (shown once).
+///
+/// # Errors
+/// [`OkfError::Refused`] for a key that is not marked self-issued;
+/// [`OkfError::LimitExceeded`] with `limit: "max_keys_per_user"` at the
+/// limit; [`OkfError::UnknownName`] for an unknown user; otherwise as
+/// [`create`].
+pub async fn create_self_issued(
+    pool: &PgPool,
+    new: &NewKey<'_>,
+    max_live: u32,
+    now: DateTime<Utc>,
+) -> Result<CreatedKey, OkfError> {
+    // The count below only covers self-issued keys, so an unmarked key
+    // would slip past it.
+    if !new.self_issued {
+        return Err(OkfError::Refused {
+            reason: format!("key {:?} is not marked self-issued", new.name),
+        });
+    }
+    let mut tx = pool.begin().await?;
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE name = $1 FOR UPDATE")
+        .bind(new.user)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| OkfError::UnknownName {
+            noun: "user",
+            name: new.user.to_string(),
+        })?;
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM api_keys \
+         WHERE user_id = $1 AND kind = 'key' AND self_issued AND revoked_at IS NULL \
+           AND (expires_at IS NULL OR expires_at > $2)",
+    )
+    .bind(&user_id)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    // `i64::from` widens the setting without a lossy `as` cast.
+    if live >= i64::from(max_live) {
+        return Err(OkfError::LimitExceeded {
+            limit: "max_keys_per_user",
+            reason: format!(
+                "{} already has {live} live keys; the limit is {max_live}",
+                new.user
+            ),
+        });
+    }
+    let created = insert_key(&mut tx, new, now).await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
-    Ok(CreatedKey { id, key })
+    Ok(created)
+}
+
+/// Renames a live API key. The name is not part of the cached principal
+/// (`whoami` reads it from the row), so nothing reloads and the
+/// administrative generation is left alone.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `id` - the key's immutable id.
+/// * `name` - the new name, `[A-Za-z0-9._-]+`.
+///
+/// # Returns
+/// `Ok(())` once the row is renamed.
+///
+/// # Errors
+/// [`OkfError::Refused`] for an invalid name, a name and actor another live
+/// key already has, or no live API key with this id; [`OkfError::Database`].
+pub async fn rename_by_id(pool: &PgPool, id: &str, name: &str) -> Result<(), OkfError> {
+    if !is_valid_name(name) {
+        return Err(OkfError::Refused {
+            reason: format!("key name {name:?} must be letters, digits, '.', '_' and '-'"),
+        });
+    }
+    let renamed = sqlx::query(
+        "UPDATE api_keys SET name = $2 WHERE id = $1 AND kind = 'key' AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .bind(name)
+    .execute(pool)
+    .await;
+    let renamed = match renamed {
+        Ok(done) => done,
+        Err(error)
+            if is_unique_violation(&error)
+                && error
+                    .as_database_error()
+                    .and_then(|db_error| db_error.constraint())
+                    == Some("api_keys_live_name_actor") =>
+        {
+            return Err(OkfError::Refused {
+                reason: format!("another active key with this actor is named {name:?}"),
+            })
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if renamed.rows_affected() == 0 {
+        return Err(OkfError::Refused {
+            reason: format!("no active key {id:?}"),
+        });
+    }
+    Ok(())
 }
 
 /// Inserts a test-only legacy row whose immutable id is also its name.
@@ -2338,6 +2485,255 @@ mod tests {
             catalogs::admin_generation(&db.pool).await.unwrap(),
             generation + 2,
             "only the grant and the ungrant changed anything"
+        );
+    }
+
+    /// A self-issued key for `TEST_USER` on `catalogs`, at `levels`.
+    fn self_issued<'a>(
+        name: &'a str,
+        catalogs: &'a [String],
+        levels: &'a [CatalogGrant],
+        expires_at: Option<DateTime<Utc>>,
+    ) -> NewKey<'a> {
+        NewKey {
+            self_issued: true,
+            expires_at,
+            levels,
+            ..new_key(name, Grants::Catalogs(catalogs), None)
+        }
+    }
+
+    /// Creates catalog `main` and returns its name and a read level on it.
+    async fn main_read(pool: &PgPool) -> ([String; 1], [CatalogGrant; 1]) {
+        catalogs::create(pool, "main", "", crate::db::TEST_TEAM, now())
+            .await
+            .expect("catalog");
+        (
+            ["main".to_string()],
+            [CatalogGrant {
+                catalog: "main".to_string(),
+                access: Some(Access::Read),
+            }],
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_self_issued_key_past_the_live_limit_is_refused() {
+        let db = test_db().await;
+        let (names, levels) = main_read(&db.pool).await;
+
+        let first =
+            create_self_issued(&db.pool, &self_issued("a", &names, &levels, None), 1, now()).await;
+        let second =
+            create_self_issued(&db.pool, &self_issued("b", &names, &levels, None), 1, now()).await;
+
+        assert!(first.is_ok(), "{first:?}");
+        assert!(
+            matches!(
+                second,
+                Err(OkfError::LimitExceeded {
+                    limit: "max_keys_per_user",
+                    ..
+                })
+            ),
+            "{second:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_self_issued_refuses_a_key_not_marked_self_issued() {
+        let db = test_db().await;
+        let (names, _) = main_read(&db.pool).await;
+
+        let unmarked = create_self_issued(
+            &db.pool,
+            &new_key("plain", Grants::Catalogs(&names), None),
+            5,
+            now(),
+        )
+        .await;
+
+        assert!(
+            matches!(unmarked, Err(OkfError::Refused { .. })),
+            "{unmarked:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoked_expired_and_admin_issued_keys_do_not_count_toward_the_limit() {
+        let db = test_db().await;
+        let (names, levels) = main_read(&db.pool).await;
+        let revoked = create_self_issued(
+            &db.pool,
+            &self_issued("gone", &names, &levels, None),
+            1,
+            now(),
+        )
+        .await
+        .expect("first key");
+        revoke_by_id(&db.pool, &revoked.id, now())
+            .await
+            .expect("revoke");
+        let in_an_hour = Some(now() + chrono::TimeDelta::hours(1));
+        let expired = create_self_issued(
+            &db.pool,
+            &self_issued("old", &names, &levels, in_an_hour),
+            1,
+            now(),
+        )
+        .await
+        .expect("second key");
+        // Expire it after the fact, as time passing would.
+        sqlx::query("UPDATE api_keys SET expires_at = $2 WHERE id = $1")
+            .bind(&expired.id)
+            .bind(now() - chrono::TimeDelta::hours(1))
+            .execute(&db.pool)
+            .await
+            .expect("expire");
+        create_with_id(&db.pool, &new_key("admin-made", Grants::All, None), now())
+            .await
+            .expect("an admin-issued key");
+
+        let made = create_self_issued(
+            &db.pool,
+            &self_issued("new", &names, &levels, None),
+            1,
+            now(),
+        )
+        .await;
+
+        assert!(made.is_ok(), "{made:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_creates_at_the_limit_never_pass_it() {
+        let db = test_db().await;
+        main_read(&db.pool).await;
+
+        // `tokio::spawn` runs each create on its own task (like a thread on
+        // this multi-threaded runtime), so they really race for the row lock.
+        let tasks: Vec<_> = (0..8)
+            .map(|index| {
+                let pool = db.pool.clone();
+                tokio::spawn(async move {
+                    let name = format!("k{index}");
+                    let names = ["main".to_string()];
+                    let levels = [CatalogGrant {
+                        catalog: "main".to_string(),
+                        access: Some(Access::Read),
+                    }];
+                    create_self_issued(&pool, &self_issued(&name, &names, &levels, None), 2, now())
+                        .await
+                })
+            })
+            .collect();
+        let mut made = 0;
+        let mut refused = 0;
+        for task in tasks {
+            match task.await.expect("the task ran") {
+                Ok(_) => made += 1,
+                Err(OkfError::LimitExceeded {
+                    limit: "max_keys_per_user",
+                    ..
+                }) => refused += 1,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        assert_eq!((made, refused), (2, 6));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_create_waiting_on_the_user_row_counts_the_key_made_meanwhile() {
+        let db = test_db().await;
+        let (names, levels) = main_read(&db.pool).await;
+        // Hold the user row as another create would, between its lock and
+        // its commit.
+        let mut holding = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM users WHERE name = $1 FOR UPDATE")
+            .bind(crate::db::TEST_USER)
+            .execute(&mut *holding)
+            .await
+            .unwrap();
+        let pool = db.pool.clone();
+        let waiting = tokio::spawn(async move {
+            let names = ["main".to_string()];
+            let levels = [CatalogGrant {
+                catalog: "main".to_string(),
+                access: Some(Access::Read),
+            }];
+            create_self_issued(&pool, &self_issued("late", &names, &levels, None), 1, now()).await
+        });
+        catalogs::tests::until_a_lock_is_awaited(&db.pool).await;
+
+        insert_key(
+            &mut holding,
+            &self_issued("early", &names, &levels, None),
+            now(),
+        )
+        .await
+        .expect("the first key");
+        holding.commit().await.unwrap();
+        let outcome = waiting.await.unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                Err(OkfError::LimitExceeded {
+                    limit: "max_keys_per_user",
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rename_keeps_the_id_and_refuses_a_taken_name() {
+        let db = test_db().await;
+        let first = create_with_id(&db.pool, &new_key("first", Grants::All, None), now())
+            .await
+            .expect("first");
+        create_with_id(&db.pool, &new_key("second", Grants::All, None), now())
+            .await
+            .expect("second");
+        let before = catalogs::admin_generation(&db.pool)
+            .await
+            .expect("generation");
+
+        rename_by_id(&db.pool, &first.id, "laptop")
+            .await
+            .expect("rename");
+        let taken = rename_by_id(&db.pool, &first.id, "second").await;
+        let invalid = rename_by_id(&db.pool, &first.id, "no spaces").await;
+        revoke_by_id(&db.pool, &first.id, now())
+            .await
+            .expect("revoke");
+        let revoked = rename_by_id(&db.pool, &first.id, "again").await;
+
+        let record = list(&db.pool)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|record| record.id == first.id)
+            .expect("the key");
+        assert_eq!(record.name, "laptop");
+        assert!(matches!(taken, Err(OkfError::Refused { .. })), "{taken:?}");
+        assert!(
+            matches!(invalid, Err(OkfError::Refused { .. })),
+            "{invalid:?}"
+        );
+        assert!(
+            matches!(revoked, Err(OkfError::Refused { .. })),
+            "{revoked:?}"
+        );
+        // The name is not part of the cached principal, so nothing reloads.
+        assert_eq!(
+            catalogs::admin_generation(&db.pool)
+                .await
+                .expect("generation"),
+            before + 1,
+            "only the revoke bumped"
         );
     }
 }
