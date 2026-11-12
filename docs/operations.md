@@ -498,8 +498,9 @@ unused after 24 hours unless `--expires` says otherwise, up to
 belong to; `--actor` defaults to the code's name. The person enters the code
 on the consent page, which turns it into an OAuth grant: a key row named
 `<code name>.<client host>-<8 characters of the code id>`, with the code's
-catalogs, access, default, actor and user. `okf-mcp key ...` never acts on a grant;
-`okf-mcp oauth grant revoke ID` revokes one (see
+catalogs, access, default, actor and user. `okf-mcp key ...` never acts on a grant,
+except `key assign`, which gives a key or a grant its user
+([Users and teams](#users-and-teams)); `okf-mcp oauth grant revoke ID` revokes one (see
 [Managing codes and grants](#managing-codes-and-grants) for every
 subcommand, and [OAuth connectors](#oauth-connectors) for the whole flow):
 
@@ -1749,7 +1750,8 @@ apart grants made from codes of the same name. `okf-mcp key revoke`,
 `grant`, `ungrant` and `maintenance-report` act on API keys only: they never
 match a grant, even one whose name and actor equal a key's. Reach a grant by
 its id, with `okf-mcp oauth grant revoke` or the `/api/v1/keys/{id}` routes
-("API keys").
+("API keys"). The one `key` subcommand that does reach grants is
+`okf-mcp key assign`, which changes only a grant's user.
 
 **Revoking.**
 
