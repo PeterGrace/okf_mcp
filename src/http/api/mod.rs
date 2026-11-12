@@ -54,6 +54,7 @@ pub(crate) fn routes(app: &Arc<App>) -> Router<Arc<App>> {
         .merge(changesets::routes())
         .merge(people::routes())
         .merge(me::routes())
+        .merge(crate::http::passkeys::api_routes())
         // `POST /me/identities/{provider}/link` (Task 9); it answers 404
         // itself without providers.
         .merge(crate::http::oidc::api_routes())

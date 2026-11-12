@@ -305,6 +305,8 @@ pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError
 pub enum Method { Password, Passkey, Oidc, Setup }     // Debug, as_str
 pub enum Outcome { Ok, Failed, Locked }                 // Debug, as_str
 pub async fn record(pool: &PgPool, user_id: Option<&str>, method: Method, outcome: Outcome, ip: Option<IpAddr>, now: DateTime<Utc>) -> Result<(), OkfError>;
+pub struct Attempt<'a> { pub user_id: Option<&'a str>, pub method: Method, pub outcome: Outcome, pub ip: Option<IpAddr>, pub now: DateTime<Utc> } // Task 8
+pub async fn record_in(conn: &mut PgConnection, attempt: &Attempt<'_>) -> Result<(), OkfError>; // Task 8: a success event in the sign-in's transaction
 pub struct SignInEvent { pub method: Method, pub outcome: Outcome, pub ip: Option<IpAddr>, pub at: DateTime<Utc> }
 pub async fn recent(pool: &PgPool, user: &str, limit: i64) -> Result<Vec<SignInEvent>, OkfError>; // by user name, newest first
 pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError>;
@@ -358,8 +360,10 @@ pub struct NewSession { pub id: String, pub csrf: String }  // raw values for th
 pub struct SessionRow { pub user_id: String, pub csrf: String, pub created_at: DateTime<Utc>, pub expires_at: DateTime<Utc> }
 pub async fn create(pool: &PgPool, user_id: &str, ip: Option<IpAddr>, user_agent: &str, absolute: Duration, now: DateTime<Utc>) -> Result<NewSession, OkfError>;
 pub async fn touch(pool: &PgPool, id: &str, idle: Duration, now: DateTime<Utc>) -> Result<Option<SessionRow>, OkfError>; // None when absent/expired/idle (idle + resolution with no use)/revoked meanwhile; writes last_seen_at at most once per min(1 minute, idle/4), once even under concurrent touches
-pub async fn revoke(pool: &PgPool, id: &str) -> Result<(), OkfError>;
+pub async fn revoke(executor: impl PgExecutor<'_>, id: &str) -> Result<(), OkfError>; // an executor since Task 8 (in-transaction rotation)
 pub async fn revoke_all(executor: impl PgExecutor<'_>, user_id: &str, except: Option<&str>) -> Result<u64, OkfError>; // `except` is the raw cookie id; a &PgPool or &mut *tx (users::set_admin)
+pub async fn start(executor: impl PgExecutor<'_>, request: &SessionStart<'_>) -> Result<NewSession, OkfError>; // Task 7b; an executor since Task 8 (corrected, issue #317), so a passkey sign-in inserts inside its transaction
+pub async fn hold_live(executor: impl PgExecutor<'_>, id: &str, user_id: &str, now: DateTime<Utc>) -> Result<bool, OkfError>; // Task 8: the session still in force, its row held FOR SHARE (after the user's row)
 pub struct SessionInfo { pub id_prefix: String, pub created_at: DateTime<Utc>, pub last_seen_at: DateTime<Utc>, pub ip: Option<IpAddr>, pub user_agent: String, pub current: bool }
 pub async fn list(pool: &PgPool, user_id: &str, current: Option<&str>) -> Result<Vec<SessionInfo>, OkfError>; // `current` is the raw cookie id
 pub async fn revoke_by_prefix(pool: &PgPool, user_id: &str, id_prefix: &str) -> Result<(), OkfError>; // id_prefix = first 12 hex chars of the stored hash
@@ -378,6 +382,7 @@ pub const RESET_PATH: &str = "/account/reset";
 pub fn link(public_url: &str, path: &str, token: &str) -> String; // {public_url}{path}?token={token}; the one link builder
 // src/mail/queue.rs
 pub async fn enqueue(pool: &PgPool, to: &str, template: &Template, now: DateTime<Utc>) -> Result<(), OkfError>; // pushes SendMail; now = queued_at
+pub async fn enqueue_in(conn: &mut PgConnection, to: &str, template: &Template, now: DateTime<Utc>) -> Result<(), OkfError>; // Task 8: inside the caller's transaction (apalis' push_tasks takes the connection)
 pub struct QueuedMail { pub id: String, pub to: String, pub template: String /*setup|reset|method_added|test*/, pub status: String /*pending|failed*/, pub attempts: i32, pub last_error: Option<String>, pub run_at: DateTime<Utc> }
 pub async fn list(pool: &PgPool) -> Result<Vec<QueuedMail>, OkfError>;   // pending + failed, never the body
 pub async fn retry(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), OkfError>; // a new 24-hour window
@@ -395,6 +400,7 @@ pub enum SameSite { Lax, Strict }
 pub async fn require_principal(State(app): State<Arc<App>>, request: Request, next: Next) -> Response; // bearer, else cookie (+CSRF on writes)
 pub fn client_ip(request_parts: &Parts, config: &AuthConfig) -> Option<IpAddr>;
 pub async fn start_session(app: &App, user: &UserAuth, ip: Option<IpAddr>, user_agent: &str) -> Result<(HeaderMap /*Set-Cookie*/, NewSession), OkfError>;
+pub(crate) fn session_cookie(app: &App, user_id: &str, session: &NewSession, absolute: Duration) -> HeaderMap; // Task 8 (PR #342 review): the Set-Cookie for a session started elsewhere (signin::start_in)
 pub fn clear_cookie(app: &App) -> HeaderMap;
 pub(crate) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str>;
 pub(crate) fn set_cookie(name: &str, value: &str, max_age: Duration, same_site: SameSite, secure: bool) -> HeaderValue;
@@ -422,8 +428,11 @@ pub(crate) fn safe_return_to(raw: Option<&str>) -> String;  // same-origin /ui/.
 pub const SIGN_IN_FAILED: &str; pub const LINK_EXPIRED: &str; pub const FORGOT_SENT: &str;
 pub struct ProviderButton { pub id: String, pub label: String }  // Task 9's buttons
 pub(crate) async fn sign_in(app: &App, parts: &Parts, user: &UserAuth, method: Method) -> Result<HeaderMap, OkfError>; // ends this browser's old session, starts one, records the event
+pub(crate) struct SignIn<'a> { pub user: &'a UserAuth, pub method: Method, pub password: Option<&'a PasswordStamp> } // Task 8
+pub(crate) async fn start_in(app: &App, conn: &mut PgConnection, parts: &Parts, signing_in: &SignIn<'_>) -> Result<HeaderMap, OkfError>; // Task 8 (PR #342 review): inserts the session, ends this browser's old one and records the Ok event (in a savepoint) inside the caller's transaction; nothing runs after the commit. Password sign-in (`begin`), setup (`use_link`) and both passkey paths use it; `audit` is for refused attempts only
+pub(crate) fn cross_site(headers: &HeaderMap) -> bool;    // Task 7b; pub(crate) from Task 8 (the passkey routes check it too)
 pub(crate) async fn audit(app: &App, user_id: Option<&str>, method: Method, outcome: Outcome, ip: Option<IpAddr>);
-pub(crate) async fn notify_method_added(app: &App, user: &UserAuth, method: &str); // queues Template::MethodAdded; logs a failure
+pub(crate) async fn notify_method_added(app: &App, conn: &mut PgConnection, user: &UserAuth, method: &str) -> Result<(), OkfError>; // corrected (issue #317, PR #342 review): queues Template::MethodAdded inside the caller's transaction (a savepoint, so a queue failure is logged and never undoes the change); Tasks 9 and 10b call it in the transaction that adds the method, before the commit
 pub(crate) fn message_page(status: StatusCode, title: &str, message: &str) -> Response; // pub(crate) from Task 9
 
 // ---- src/http/api/testing.rs (Task 7a; cfg(test)) ----
@@ -441,6 +450,11 @@ impl Browser {
     pub(crate) async fn signed_in(test: &TestApp, email: &str, password: &str) -> Self;
     pub(crate) async fn session_for(test: &TestApp, name: &str) -> Self;  // no password; polls first
 }
+// Task 8 moved these from signin.rs's tests (corrected, issue #317):
+pub(crate) async fn wait_for_lock_waiters(pool: &PgPool, want: i64);   // pg_stat_activity, for deterministic race tests
+pub(crate) async fn fail_on(pool: &PgPool, event: &str);              // a failing trigger, e.g. "BEFORE INSERT ON user_sessions FOR EACH ROW"
+pub(crate) async fn allow(pool: &PgPool, table: &str);                // drops it
+// tests/ui_e2e/harness.rs (Task 8): Ui::virtual_authenticator() -> VirtualAuthenticator (Chromium DevTools WebAuthn; dev-dependency tungstenite)
 // tests/support/server.rs (Task 7b): TestServer::user_with_password(&self, name, email, password) -> String
 // tests/ui_e2e/harness.rs (Task 7b): Ui::sign_in_password(&self, email, password)
 
@@ -448,20 +462,23 @@ impl Browser {
 pub async fn add(pool: &PgPool, user_id: &str, passkey: &Passkey, name: &str, now: DateTime<Utc>) -> Result<(), OkfError>;
 pub async fn add_in(conn: &mut PgConnection, user_id: &str, passkey: &Passkey, name: &str, now: DateTime<Utc>) -> Result<(), OkfError>; // corrected (issue #316): the setup link's passkey is stored in the redeeming transaction
 pub async fn for_user(pool: &PgPool, user_id: &str) -> Result<Vec<(String /*name*/, Passkey)>, OkfError>;
-pub async fn find(pool: &PgPool, credential_id: &[u8]) -> Result<Option<(String /*user_id*/, Passkey)>, OkfError>;
-pub async fn update(pool: &PgPool, credential_id: &[u8], passkey: &Passkey, now: DateTime<Utc>) -> Result<(), OkfError>;
+pub async fn find(pool: &PgPool, credential_id: &[u8]) -> Result<Option<(String /*user_id*/, Passkey)>, OkfError>; // no lock
+pub async fn lock_for_sign_in(conn: &mut PgConnection, credential_id: &[u8]) -> Result<Option<(UserAuth, Passkey)>, OkfError>; // corrected (issue #317): the owner FOR SHARE, then the passkey FOR UPDATE
+pub async fn update_in(conn: &mut PgConnection, credential_id: &[u8], passkey: &Passkey, now: DateTime<Utc>) -> Result<(), OkfError>; // corrected (issue #317): replaces `update(pool, ...)`
+pub struct SessionRegistration<'a> { pub user_id: &'a str, pub session_id: &'a str, pub passkey: &'a Passkey, pub name: &'a str, pub keep_sessions: bool, pub now: DateTime<Utc> }
+pub async fn add_from_session_in(conn: &mut PgConnection, registration: &SessionRegistration<'_>) -> Result<u64 /*sessions ended*/, OkfError>; // corrected (issue #317): user locked, session checked, passkey stored, other sessions ended, in the caller's transaction (which queues the notice, then commits)
 pub struct PasskeyInfo { pub id: String /*base64url*/, pub name: String, pub created_at: DateTime<Utc>, pub last_used_at: Option<DateTime<Utc>> }
 pub async fn list(pool: &PgPool, user_id: &str) -> Result<Vec<PasskeyInfo>, OkfError>;
 pub async fn rename(pool: &PgPool, user_id: &str, id: &str, name: &str) -> Result<(), OkfError>; // 404 for another user's
-pub async fn remove(pool: &PgPool, user_id: &str, id: &str) -> Result<(), OkfError>; // 409 if last sign-in method
+pub async fn remove(pool: &PgPool, user_id: &str, id: &str) -> Result<(), OkfError>; // 409 if last sign-in method; 404 for an unknown user too
 // src/http/passkeys.rs: POST /auth/passkey/{setup,signin}/{start,finish}; POST /api/v1/me/passkeys/register/{start,finish}
 // src/http/ui/js/signin/webauthn.js: toBuffer, toBase64url, creationOptions, requestOptions, registrationJson, assertionJson, createCredential(challenge)
 
 // ---- src/store/identities.rs (Task 9) ----
 pub async fn find(pool: &PgPool, provider: &str, subject: &str) -> Result<Option<UserAuth>, OkfError>;
 pub async fn link(pool: &PgPool, user_id: &str, provider: &str, subject: &str, email: &str, now: DateTime<Utc>) -> Result<(), OkfError>; // one subject per provider per user
-pub async fn sign_in(pool: &PgPool, request: &OidcSignIn<'_>, now: DateTime<Utc>) -> Result<OidcOutcome, OkfError>; // corrected (issue #318): the whole OIDC sign-in in one transaction, event included
-pub async fn link_for_session(pool: &PgPool, request: &SessionLink<'_>, now: DateTime<Utc>) -> Result<u64 /*ended*/, OkfError>; // corrected (issue #318): user, session FOR SHARE, link, revoke_all
+pub async fn sign_in_in(conn: &mut PgConnection, request: &OidcSignIn<'_>, now: DateTime<Utc>) -> Result<OidcOutcome, OkfError>; // corrected (issue #317, PR #342): the lookup, lock, link and stamp in the caller's transaction; `http::oidc::complete_sign_in` then runs `signin::start_in` and the notice and commits. OidcSignIn { provider, subject, verified_email }; OidcOutcome::SignedIn { user, linked }
+pub async fn link_for_session_in(conn: &mut PgConnection, request: &SessionLink<'_>, now: DateTime<Utc>) -> Result<u64 /*ended*/, OkfError>; // corrected (issue #317, PR #342): user, session FOR SHARE, link, revoke_all in the caller's transaction, which also queues the notice
 pub async fn touch(pool: &PgPool, provider: &str, subject: &str, now: DateTime<Utc>) -> Result<(), OkfError>;
 pub struct IdentityInfo { pub provider: String, pub email_at_link: String, pub created_at: DateTime<Utc>, pub last_used_at: Option<DateTime<Utc>> }
 pub async fn list(pool: &PgPool, user_id: &str) -> Result<Vec<IdentityInfo>, OkfError>;
@@ -10777,7 +10794,7 @@ Builds on Task 7a's pages, limits, `start_session`, `Browser` and `/api/v1/sessi
 >   - `passwords::reset(pool, user_id, password, now) -> u64` updates the hash and runs `revoke_all` in one transaction. `reset_post` uses it.
 >   - The two serialize on the user row. Either the insert commits first and the reset deletes its session, or the reset commits first and the insert re-checks the hash on the new row version and inserts nothing.
 >   - `console_session::start_session_with(app, user, password, ip, user_agent)` is the stamped form of `start_session`. In `signin.rs`, `begin(app, parts, user, method, password)` is the stamped form of `sign_in`.
->   - Passkey, OIDC and setup sign-ins keep calling `sign_in` / `start_session` with no stamp.
+>   - Passkey, OIDC and setup sign-ins keep calling `sign_in` / `start_session` with no stamp. *(Superseded by Task 8 (issue #317): all of them, and `begin`, start their session through `signin::start_in` inside their own transaction, and `sign_in` is deleted.)*
 >   - Tests: `a_sign_in_checked_before_a_reset_gets_no_session_after_it`, `a_sign_in_waiting_on_a_reset_in_progress_gets_no_session` (holds the user row so the reset and the insert queue behind it in that order) and `a_session_inserted_before_a_reset_is_ended_by_it`.
 > - Console sign-out counts as done only on a 2xx or a 401 from `DELETE /api/v1/session`. Any other failure keeps the session state and the shell, and shows a "Sign-out failed ... Try again." toast. The setup journey fails the first `DELETE` with a fetch wrapper and checks this.
 > - **Emailed links are issued and used atomically (third review of PR #337).**
@@ -10793,7 +10810,7 @@ Builds on Task 7a's pages, limits, `start_session`, `Browser` and `/api/v1/sessi
 > - **Every session insert in `signin.rs` is stamped (fifth review of PR #337).**
 >   - `use_link` returns `LinkUsed { user, ended, stamp }`, where `stamp` is `NewPassword::stamp()`, the hash it just stored. Setup starts its session through the stamped `begin`, just as a password sign-in does. If a reset replaces the password between setup's commit and the session insert, setup creates no session and redirects to `/signin`.
 >   - A reset signs nobody in.
->   - The unstamped `sign_in` is kept for Tasks 8 and 9 under `#[expect(dead_code)]`; delete that attribute when the first of them calls it.
+>   - The unstamped `sign_in` is kept for Tasks 8 and 9 under `#[expect(dead_code)]`; delete that attribute when the first of them calls it. *(Superseded by Task 8 (issue #317): neither called it, so `sign_in` and the attribute are deleted.)*
 >   - Test: `a_session_after_setup_is_refused_once_a_reset_replaced_the_password`.
 > - **A console write with CSRF has a journey:** `an_admin_session_writes_through_the_console_with_its_csrf_token`. It signs in at `/signin`, reloads, checks that no key is stored, creates a user in the UI and reads it back through the API. Removing the `X-OKF-CSRF` line from `api.js` makes it fail.
 > - **Typed text Postgres would refuse never reaches SQL on the sign-in surface (seventh review of PR #337).**
@@ -12152,6 +12169,20 @@ webauthn-rs facts this task relies on (verified in the probe, `crate-probe/tests
 - `finish_discoverable_authentication_v2(&credential, state, &passkey)` refuses a counter that did not move (`CredentialPossibleCompromise`), and `Passkey::update_credential` raises the stored counter.
 - `SoftPasskey::new(true)` (it fakes user verification) cannot discover credentials and sends no `userHandle`. HTTP tests therefore put the credential id in `allowCredentials` and the user's UUID bytes in `response.userHandle`; neither is covered by the signature.
 - `WebauthnBuilder::new` needs a domain: an address origin fails. Passkeys are off for an address `public_url`.
+
+> **Corrected (issue #317, 2026-11-12).** What shipped differs from the code below in these ways; `src/http/passkeys.rs` and `src/store/passkeys.rs` are authoritative.
+> - **Passkey sign-in checks and inserts under one lock.** `verify_assertion` (unlocked `find`, then `update` and `sign_in` on the pool) let a removal or a reset commit between the check and the session insert. `verify_and_start` opens one transaction: `passkey_rows::lock_for_sign_in` reads the owner without a lock, locks the user `FOR SHARE`, then the passkey `FOR UPDATE`; the handle is checked against that user, the assertion verified, `update_in` stores the counter and `signin::start_in` inserts the session, then it commits. Two sign-ins with one passkey run one at a time, so the counter never goes back. `CredentialPossibleCompromise` is logged at `warn` and recorded as a failed sign-in. `update(pool, ...)` became `update_in(conn, ...)`.
+> - **The setup link's session is in its transaction too.** `use_setup_link` runs `redeem_in`, the user check, `add_in` and `start_in` in one transaction; `start_in` also ends the browser's old session and records the sign-in event in that transaction, so nothing runs after the commit. `signin::sign_in` and its `expect(dead_code)` are deleted: every path, OIDC's included, starts its session through `start_in`.
+> - **Signed-in registration is one transaction** (`passkey_rows::add_from_session`): the user `FOR NO KEY UPDATE`, then `user_sessions::hold_live` on the registering session, then `add_in` and `revoke_all`. A reset that ended the session first leaves no passkey (401). The finishing session must be the one that started the ceremony (403 otherwise).
+> - `user_sessions::start` and `revoke` take an executor; `signin::start_in` is new; `console_session::session_cookie` is `pub(crate)`; `signin::cross_site` is `pub(crate)`.
+> - **Nothing fallible runs after a sign-in commits** (PR #342 review). `signin::start_in` inserts the session and then deletes this browser's old session in the caller's transaction (the user's row first, then the session rows). After the second review nothing at all runs after the commit (next bullet): the event and the notice are written in the transaction too. So a committed sign-in always reaches the browser with its cookie, and a failure before the commit changes nothing. The password sign-in (`begin`) and the password setup link (`use_link`, which now takes `parts` and starts the session in the link's transaction instead of a stamped `begin` afterwards) work the same way. `register_finish` reads the user for the notice before its transaction (`store_registration`).
+> - **After the commit, nothing is awaited** (PR #342, second review). A blocked `sign_in_events` or `apalis.jobs` table could otherwise hold a committed sign-in past its timeout with no cookie. The Ok sign-in event is recorded in `start_in`'s transaction (`sign_in_events::record_in`, in a savepoint so a failure is logged and never decides the sign-in); refused attempts still use `audit`. The "method added" notice is queued in the transaction that adds the method (`notify_method_added(app, conn, ..)` over `mail::queue::enqueue_in`, also in a savepoint): the reset in `use_link`, and the signed-in passkey registration in `store_registration` (around `add_from_session_in`). A wait on either table therefore happens before the commit, while nothing is committed.
+> - **Ceremonies are bounded per actor.** `remember` drops the ceremony the request's old `okf_passkey` cookie names. A console session's new registration replaces that session's previous one through `Passkeys::by_session` (keyed by the hash of the session id, `update_or_insert_sliding`), cookie or not. Anonymous starts are bounded by the per-address limit.
+> - **The open routes refuse another site** (`cross_site`, 403) and the two starts and the sign-in finish take the per-address sign-in limit (429). `remember` and `take_ceremony` take the `Instant`, so a test checks the five-minute expiry.
+> - `passkey_rows::remove` answers the passkey's 404 (`me/passkeys/<id>`) for an unknown user too, not `count`'s `users/<id>` path. It deletes before deciding and rolls back when the passkey was the last method.
+> - Tests added beyond the plan's: the lock races (`a_sign_in_queued_on_a_passkey_removal_gets_no_session`, `a_sign_in_ahead_of_a_reset_has_its_session_ended_by_it`, `a_passkey_added_by_a_session_a_reset_ended_is_refused`), the user handle, another session's ceremony, `keep_sessions`, cross-site, the per-address limit, hostile `return_to` and a failing setup.
+> - The 7b tests that asserted "no script" on `/signin` and the setup page now expect the passkey script, since `login_config`'s domain turns passkeys on. `fail_on`, `allow` and `wait_for_lock_waiters` moved to `http::api::testing`.
+> - **The browser journey registers and signs in for real.** `Ui::virtual_authenticator` adds a Chromium virtual authenticator over a raw DevTools connection (dev-dependency `tungstenite` 0.29, already in the tree through rustwright). `a_setup_link_registers_a_passkey_that_then_signs_in_from_the_sign_in_page` registers on the setup page, signs out, signs in with the passkey button and checks the stored passkey and events.
 
 - [ ] **Step 1: Write the failing store tests.** `src/store/passkeys.rs`:
 
@@ -13726,7 +13757,8 @@ openidconnect 4.1.0 facts this task relies on (verified in `crate-probe/tests/oi
 - Test ID tokens are HS256 with `CoreHmacKey::new(client_secret)`, listed in `id_token_signing_alg_values_supported`, with an empty JWKS.
 
 > **Corrected (issue #318, 2026-11-12).** What shipped differs from the code below in these ways; `src/http/oidc.rs`, `src/store/identities.rs` and `src/oidc.rs` are authoritative.
-> - **An OIDC sign-in is one transaction (PR #341 review).** `identities::sign_in(pool, &OidcSignIn { provider, subject, verified_email, old_session, ip, user_agent, absolute }, now) -> OidcOutcome` (`SignedIn { user, session, linked }`, `NoAccount` or `Unlinked`) does all of it in one transaction. It finds the user by `(provider, sub)` (a read with no lock, then the user's row `FOR NO KEY UPDATE` and a fresh re-read of the link), or else by `email = $1::citext FOR NO KEY UPDATE` and links the identity. It then ends the browser's old session, starts the new one (`user_sessions::start(&mut *tx, ..)`), stamps `last_used_at` and records the event (`sign_in_events::record_in`), and only then commits. So a sign-in queued behind an unlink gets no session (`a_sign_in_waiting_on_an_unlink_gets_no_session`). After the commit the callback only builds the cookie (`console_session::session_cookie`) and queues the method-added notice on a detached task (`notify_detached`). Nothing that can block or fail runs after a sign-in or link commits. `a_sign_in_commits_nothing_until_its_event_is_written_and_never_waits_on_mail` checks this: with `sign_in_events` locked `ACCESS EXCLUSIVE`, nothing is committed until the event is written; with `apalis.jobs` locked, the response still returns. `SessionStart`, `start_session_with` and `signin::begin` keep `main`'s shapes (`start` and `revoke` take an executor, and `hold_live` is new, as in Task 8). There is no `link_by_email`, `sign_in_linked` or `SessionProof`. `signin::sign_in` still has no caller here. A reset or admin change ends an OIDC session as it does any other (`an_oidc_session_ends_with_a_reset_or_an_admin_change`).
+> **Corrected (issue #317, PR #342 merge, 2026-11-12).** Task 8 merged after this and unified the sign-in paths: `identities::sign_in` became `sign_in_in(conn, &OidcSignIn { provider, subject, verified_email }, now)`, which only locks, links and stamps. `http::oidc::complete_sign_in` runs it, then `signin::start_in` (session, old session ended, event) and, for a link made by email, `notify_method_added(app, &mut tx, ..)`, then commits. `link_for_session` became `link_for_session_in`, wrapped by `http::oidc::link_in_one_transaction` with the notice. `notify_detached` is gone: the notice is queued in the transaction, so with `apalis.jobs` locked a linking sign-in waits before its commit, with nothing committed. The test is now `a_sign_in_commits_nothing_until_its_event_and_notice_are_written`. `signin::sign_in` is deleted (no caller).
+> - **An OIDC sign-in is one transaction (PR #341 review).** `identities::sign_in(pool, &OidcSignIn { provider, subject, verified_email, old_session, ip, user_agent, absolute }, now) -> OidcOutcome` (`SignedIn { user, session, linked }`, `NoAccount` or `Unlinked`) does all of it in one transaction. It finds the user by `(provider, sub)` (a read with no lock, then the user's row `FOR NO KEY UPDATE` and a fresh re-read of the link), or else by `email = $1::citext FOR NO KEY UPDATE` and links the identity. It then ends the browser's old session, starts the new one (`user_sessions::start(&mut *tx, ..)`), stamps `last_used_at` and records the event (`sign_in_events::record_in`), and only then commits. So a sign-in queued behind an unlink gets no session (`a_sign_in_waiting_on_an_unlink_gets_no_session`). After the commit the callback only builds the cookie (`console_session::session_cookie`) and queued the method-added notice on a detached task (`notify_detached`; superseded by the note above: the notice is now queued in the transaction). Nothing that can block or fail runs after a sign-in or link commits. `a_sign_in_commits_nothing_until_its_event_is_written_and_never_waits_on_mail` checks this: with `sign_in_events` locked `ACCESS EXCLUSIVE`, nothing is committed until the event is written; with `apalis.jobs` locked, the response still returns. `SessionStart`, `start_session_with` and `signin::begin` keep `main`'s shapes (`start` and `revoke` take an executor, and `hold_live` is new, as in Task 8). There is no `link_by_email`, `sign_in_linked` or `SessionProof`. `signin::sign_in` had no caller here (it is deleted since; note above). A reset or admin change ends an OIDC session as it does any other (`an_oidc_session_ends_with_a_reset_or_an_admin_change`).
 > - **Linking from the account page** is `identities::link_for_session(pool, &SessionLink { user_id, session_id, provider, subject, email, keep_sessions }, now) -> u64`: the user's row, then `user_sessions::hold_live` (the session `FOR SHARE`), the link and `revoke_all` in one transaction; the notice is detached. Before it, the callback requires the browser to send the very session that started the link (compared in constant time, touched, same user), else 400 `LINK_RETRY`. Tests `a_link_callback_needs_the_live_session_that_started_it` and `keep_sessions_keeps_the_other_sessions_when_linking`.
 > - Every `identities` link and unlink locks the user `FOR NO KEY UPDATE` (not `FOR UPDATE`); `touch` (only `last_used_at`) takes no user lock. `a_token_from_another_issuer_for_another_client_or_expired_is_400` covers the ID-token checks (the mock gained `will_sign_badly`). `email_at_link` is stored empty for text no address can be (a NUL), and a `sub` that is empty, over 255 bytes or holds a control character is refused as a bad ID token (400, `a_subject_postgres_would_refuse_is_400_not_500`). `IdentityInfo` derives `sqlx::FromRow`.
 > - `GET /auth/oidc/{provider}/start` answers an unknown provider's 404 before any discovery and takes from `sign_in_limits().sign_in_per_ip` (429), so no one address fills the flow map.
@@ -15415,6 +15447,7 @@ async fn finish_sign_in(
                 Err(error) => return Err(error),
             }
             tracing::info!(user = %user.id, provider, "OIDC identity linked by verified email");
+            // Corrected (issue #317, PR #342 review): `notify_method_added(app, &mut tx, user, method).await?` now takes the transaction that links the method and runs before its commit; nothing may be awaited after the commit.
             notify_method_added(app, &user, &method_text(app, provider)).await;
             user
         }
@@ -15439,6 +15472,7 @@ async fn finish_link(app: &App, provider: &str, identity: &Identity, link: LinkR
         tracing::info!(user = %link.user_id, ended, "other sessions ended after an identity was linked");
     }
     if let Some(user) = session_user(app, &link.user_id).await? {
+        // Corrected (issue #317, PR #342 review): `notify_method_added(app, &mut tx, user, method).await?` now takes the transaction that links the method and runs before its commit; nothing may be awaited after the commit.
         notify_method_added(app, &user, &method_text(app, provider)).await;
     }
     Ok(Done::Redirect { session_cookie: HeaderMap::new(), to: ACCOUNT_PAGE.to_string() })
@@ -17384,6 +17418,7 @@ async fn change_password(
     tracing::info!(user = %user.name, "password changed");
     // Task 7b's notice; it needs the user's email, which `UserAuth` carries.
     if let Some(account) = users::find_auth(app.pool(), user.id).await? {
+        // Corrected (issue #317, PR #342 review): `notify_method_added(&app, &mut tx, &account, "a new password").await?` now takes the password change's transaction (with `passwords::set_in` and `revoke_all`) and runs before its commit.
         notify_method_added(&app, &account, "a new password").await;
     }
     Ok(StatusCode::NO_CONTENT)

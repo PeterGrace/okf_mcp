@@ -21,10 +21,11 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Form, Router};
 use serde::Deserialize;
+use sqlx::{Connection as _, PgConnection};
 
 use crate::app::App;
 use crate::error::OkfError;
-use crate::http::console_session::{client_ip, cookie, start_session_with, COOKIE};
+use crate::http::console_session::{client_ip, cookie, session_cookie, COOKIE};
 use crate::http::limits::ip_key;
 use crate::http::pages::{self, escape, safe_return_to};
 use crate::http::ui::CONTENT_SECURITY_POLICY;
@@ -33,8 +34,8 @@ use crate::mail::queue as mail_queue;
 use crate::mail::{self, Template, RESET_PATH, SETUP_PATH};
 use crate::store::email_tokens::{self, Purpose};
 use crate::store::passwords::{self, NewPassword, PasswordStamp, SignInOutcome};
-use crate::store::sign_in_events::{self, Method, Outcome};
-use crate::store::user_sessions;
+use crate::store::sign_in_events::{self, Attempt, Method, Outcome};
+use crate::store::user_sessions::{self, SessionStart};
 use crate::store::users::{self, UserAuth};
 
 /// Every refused password sign-in says this, whatever the reason (spec).
@@ -118,10 +119,10 @@ pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
     router.layer(timeout_layer())
 }
 
-/// Whether the pages offer a passkey (Task 8 makes this
-/// `app.passkeys().is_some()`).
-fn offers_passkeys(_app: &App) -> bool {
-    false
+/// Whether the pages offer a passkey: only when passkeys are on (a
+/// domain `public_url`).
+fn offers_passkeys(app: &App) -> bool {
+    app.passkeys().is_some()
 }
 
 /// The OIDC provider buttons, one per configured provider.
@@ -152,7 +153,8 @@ fn sign_in_view(app: &App, return_to: String) -> SignInView {
 /// header is set by the browser, not by page script,
 /// and unlike `Origin` it does not turn into `null` under the pages'
 /// `Referrer-Policy: no-referrer`. A client that sends none (curl, an old
-/// browser) is let through: it is not a browser being steered.
+/// browser) is let through: it is not a browser being steered. The passkey
+/// routes (`http::passkeys`) check it too.
 pub(crate) fn cross_site(headers: &HeaderMap) -> bool {
     headers
         .get("sec-fetch-site")
@@ -376,42 +378,18 @@ async fn sign_in_post(
     sign_in_response(StatusCode::UNAUTHORIZED, &view)
 }
 
-/// Signs a verified user in: ends the session this browser held (rotation),
-/// starts a new one and records the event.
-///
-/// # Arguments
-/// * `app` - the shared state.
-/// * `parts` - the request (cookie, address, `User-Agent`).
-/// * `user` - the verified user.
-/// * `method` - how they proved who they are.
+/// Signs a verified user in (a password sign-in): starts a session, ends
+/// the one this browser held (rotation) and records the event, in one
+/// transaction ([`start_in`]). `password` is the hash the password matched,
+/// so the session is refused if a reset replaced it meanwhile.
 ///
 /// # Returns
 /// The `Set-Cookie` header to send.
 ///
 /// # Errors
-/// [`OkfError::Database`]; [`OkfError::Io`] from the random source.
-// `expect(dead_code)` silences "never used" until a caller lands, and
-// itself warns once one does, so it cannot be forgotten. Setup now signs in
-// through the stamped `begin`.
-#[expect(
-    dead_code,
-    reason = "passkey (Task 8) and OIDC (Task 9) sign-ins call it; delete this then"
-)]
-pub(crate) async fn sign_in(
-    app: &App,
-    parts: &Parts,
-    user: &UserAuth,
-    method: Method,
-) -> Result<HeaderMap, OkfError> {
-    begin(app, parts, user, method, None).await
-}
-
-/// [`sign_in`], with the password hash a password sign-in matched, so the
-/// session is refused if a reset replaced it meanwhile.
-///
-/// # Errors
-/// As [`sign_in`], and [`OkfError::Unauthenticated`] when the password (or
-/// the user) changed after the check.
+/// [`OkfError::Unauthenticated`] when the password (or the user) changed
+/// after the check; [`OkfError::Database`]; [`OkfError::Io`] from the
+/// random source.
 async fn begin(
     app: &App,
     parts: &Parts,
@@ -419,23 +397,113 @@ async fn begin(
     method: Method,
     password: Option<&PasswordStamp>,
 ) -> Result<HeaderMap, OkfError> {
-    if let Some(old) = cookie(&parts.headers, COOKIE) {
-        user_sessions::revoke(app.pool(), old).await?;
-    }
-    let ip = client_ip(parts, &app.config().auth);
+    // The new session, the end of the old one and the event commit
+    // together; after the commit nothing runs, so a committed sign-in
+    // always reaches the browser with its cookie.
+    let mut tx = app.pool().begin().await?;
+    let signing_in = SignIn {
+        user,
+        method,
+        password,
+    };
+    let headers = start_in(app, &mut tx, parts, &signing_in).await?;
+    tx.commit().await?;
+    Ok(headers)
+}
+
+/// The client address and `User-Agent` a new session records.
+fn client_of<'a>(app: &App, parts: &'a Parts) -> (Option<IpAddr>, &'a str) {
     let user_agent = parts
         .headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    let (headers, _session) = start_session_with(app, user, password, ip, user_agent).await?;
-    audit(app, Some(&user.id), method, Outcome::Ok, ip).await;
-    Ok(headers)
+    (client_ip(parts, &app.config().auth), user_agent)
 }
 
-/// Records a sign-in attempt as a `sign_in_events` row (which also logs an
-/// `info` line). A failure to record is logged; it never decides the
-/// sign-in.
+/// A verified sign-in, for [`start_in`]. No `Debug`: the stamp is a
+/// password hash.
+pub(crate) struct SignIn<'a> {
+    /// The verified user.
+    pub user: &'a UserAuth,
+    /// How they proved who they are.
+    pub method: Method,
+    /// For a password sign-in, the hash the password matched
+    /// (`user_sessions::start`); `None` otherwise.
+    pub password: Option<&'a PasswordStamp>,
+}
+
+/// Starts a session inside the caller's transaction, ends the session this
+/// browser held before (rotation) and records the sign-in event, in that
+/// order: the insert reads the user's row `FOR SHARE` first, then the old
+/// session's row is deleted (lock order: the user first). The caller only
+/// commits after this: nothing that can block or fail runs after the
+/// commit, so a committed sign-in always reaches the browser with its
+/// cookie, and a failure (or a wait) before the commit changes nothing.
+///
+/// A passkey sign-in or a setup link calls this inside the transaction
+/// that checked the credential under the user's lock, so nothing can
+/// change the credential between that check and the insert.
+///
+/// # Arguments
+/// * `app` - the shared state.
+/// * `conn` - the caller's transaction (`&mut tx`).
+/// * `parts` - the request (old session cookie, address, `User-Agent`).
+/// * `signing_in` - who, how, and (for a password) the matched stamp.
+///
+/// # Returns
+/// The `Set-Cookie` header to send.
+///
+/// # Errors
+/// [`OkfError::Unauthenticated`] when the user is gone or the stamped
+/// password changed; [`OkfError::Database`]; [`OkfError::Io`] from the
+/// random source.
+pub(crate) async fn start_in(
+    app: &App,
+    conn: &mut PgConnection,
+    parts: &Parts,
+    signing_in: &SignIn<'_>,
+) -> Result<HeaderMap, OkfError> {
+    let user = signing_in.user;
+    let (ip, user_agent) = client_of(app, parts);
+    let absolute = app.settings().console_session_absolute;
+    let now = app.clock().now();
+    let request = SessionStart {
+        user_id: &user.id,
+        ip,
+        user_agent,
+        absolute,
+        now,
+        password: signing_in.password,
+    };
+    let session = user_sessions::start(&mut *conn, &request).await?;
+    if let Some(old) = cookie(&parts.headers, COOKIE) {
+        user_sessions::revoke(&mut *conn, old).await?;
+    }
+    let attempt = Attempt {
+        user_id: Some(&user.id),
+        method: signing_in.method,
+        outcome: Outcome::Ok,
+        ip,
+        now,
+    };
+    // In a savepoint, so a failure to record is logged and never decides
+    // the sign-in (as `audit`), yet the row commits with the session.
+    let mut savepoint = conn.begin().await?;
+    match sign_in_events::record_in(&mut savepoint, &attempt).await {
+        Ok(()) => savepoint.commit().await?,
+        Err(error) => {
+            savepoint.rollback().await?;
+            tracing::error!(%error, "recording a sign-in event failed");
+        }
+    }
+    Ok(session_cookie(app, &user.id, &session, absolute))
+}
+
+/// Records a refused sign-in attempt as a `sign_in_events` row (which also
+/// logs an `info` line). A failure to record is logged; it never decides
+/// the sign-in. A successful sign-in records its event in its own
+/// transaction instead ([`start_in`]).
 ///
 /// # Arguments
 /// * `app` - the shared state.
@@ -457,23 +525,41 @@ pub(crate) async fn audit(
     }
 }
 
-/// Queues the "a sign-in method was added" notice to the user's email.
-/// A user without an email, or a failure to queue (logged), sends nothing.
+/// Queues the "a sign-in method was added" notice to the user's email,
+/// inside the caller's transaction (the one that adds the method), so the
+/// mail exists only if the change commits and nothing runs after the
+/// commit. A user without an email sends nothing; a failure to queue is
+/// logged and rolled back to a savepoint, so it never decides the change.
 ///
 /// # Arguments
 /// * `app` - the shared state.
+/// * `conn` - the caller's transaction (`&mut tx`).
 /// * `user` - the user.
 /// * `method` - what was added, in words ("a new password", "a passkey").
-pub(crate) async fn notify_method_added(app: &App, user: &UserAuth, method: &str) {
+///
+/// # Errors
+/// [`OkfError::Database`] opening or ending the savepoint.
+pub(crate) async fn notify_method_added(
+    app: &App,
+    conn: &mut PgConnection,
+    user: &UserAuth,
+    method: &str,
+) -> Result<(), OkfError> {
     let Some(to) = user.email.as_deref() else {
-        return;
+        return Ok(());
     };
     let template = Template::MethodAdded {
         method: method.to_string(),
     };
-    if let Err(error) = mail_queue::enqueue(app.pool(), to, &template, app.clock().now()).await {
-        tracing::error!(%error, user = %user.id, "queueing the sign-in method notice failed");
+    let mut savepoint = conn.begin().await?;
+    match mail_queue::enqueue_in(&mut savepoint, to, &template, app.clock().now()).await {
+        Ok(()) => savepoint.commit().await?,
+        Err(error) => {
+            savepoint.rollback().await?;
+            tracing::error!(%error, user = %user.id, "queueing the sign-in method notice failed");
+        }
     }
+    Ok(())
 }
 
 /// The forgot page's body: the form, or the one answer.
@@ -748,37 +834,38 @@ async fn setup_post(
         };
         return setup_response(StatusCode::UNPROCESSABLE_ENTITY, &view);
     }
-    let used = match use_link(&app, &form.token, Purpose::Setup, &form.password, now).await {
+    // The session starts in the link's transaction, so a reset cannot
+    // replace the password between the setup and the session, and the
+    // committed setup always reaches the browser with its cookie.
+    let used = match use_link(&app, &parts, &form.token, Purpose::Setup, &form.password).await {
         Ok(used) => used,
         Err(error) => return link_error(error),
     };
-    // Stamped with the hash just stored, like a password sign-in: if a
-    // reset replaces the password before the session is inserted, there is
-    // no session, and the person signs in with the new password instead.
-    match begin(&app, &parts, &used.user, Method::Setup, Some(&used.stamp)).await {
-        Ok(headers) => (headers, Redirect::to(&return_to)).into_response(),
-        Err(OkfError::Unauthenticated { .. }) => Redirect::to("/signin").into_response(),
-        Err(error) => AppError(error).into_response(),
-    }
+    // `unwrap_or_default`: a setup link always starts a session; an empty
+    // header map would only mean no cookie to send.
+    let cookie = used.cookie.unwrap_or_default();
+    (cookie, Redirect::to(&return_to)).into_response()
 }
 
 /// Uses an emailed link and stores the new password it was for, in one
 /// transaction, so the link is used only if the password change commits:
 /// a failure anywhere leaves the old password, the sessions and the link
-/// as they were. A reset link also ends every session of the user
-/// (`passwords::reset_in`). The password is hashed before the transaction
-/// opens, so no row lock is held during argon2.
+/// as they were. A setup link also starts the session (and ends this
+/// browser's old one) in that transaction ([`start_in`]); a reset link
+/// ends every session of the user (`passwords::reset_in`). The password is
+/// hashed before the transaction opens, so no row lock is held during
+/// argon2.
 ///
 /// # Arguments
 /// * `app` - the shared state.
+/// * `parts` - the request (for the setup link's session).
 /// * `token` - the raw token from the form.
 /// * `purpose` - which link the page is for.
 /// * `password` - the new password (already through [`check_new_password`]).
-/// * `now` - when (server clock).
 ///
 /// # Returns
-/// The link's user, how many sessions ended (0 for setup) and the stamp of
-/// the stored password.
+/// The link's user, how many sessions ended (0 for setup) and, for setup,
+/// the new session's `Set-Cookie` header.
 ///
 /// # Errors
 /// [`OkfError::Gone`] for a link that no longer works (also when a
@@ -786,41 +873,51 @@ async fn setup_post(
 /// [`OkfError::Io`] or [`OkfError::Database`] otherwise.
 async fn use_link(
     app: &App,
+    parts: &Parts,
     token: &str,
     purpose: Purpose,
     password: &str,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<LinkUsed, OkfError> {
     let hashed = NewPassword::hash(password).await?;
+    let now = app.clock().now();
     let mut tx = app.pool().begin().await?;
     // The token's row stays locked until the commit, so of two concurrent
     // posts the second waits and then finds the link used.
     let user = email_tokens::redeem_in(&mut tx, token, purpose, now).await?;
     // `match` on the purpose is exhaustive: a new purpose must say here what
     // its link changes.
-    let ended = match purpose {
+    let (ended, cookie) = match purpose {
         Purpose::Setup => {
             passwords::set_in(&mut tx, &user.id, &hashed, now).await?;
-            0
+            let signing_in = SignIn {
+                user: &user,
+                method: Method::Setup,
+                password: None,
+            };
+            (0, Some(start_in(app, &mut tx, parts, &signing_in).await?))
         }
-        Purpose::Reset => passwords::reset_in(&mut tx, &user.id, &hashed, now).await?,
+        Purpose::Reset => {
+            let ended = passwords::reset_in(&mut tx, &user.id, &hashed, now).await?;
+            notify_method_added(app, &mut tx, &user, "a new password").await?;
+            (ended, None)
+        }
     };
     tx.commit().await?;
     Ok(LinkUsed {
         user,
         ended,
-        stamp: hashed.stamp(),
+        cookie,
     })
 }
 
-/// What [`use_link`] did. No `Debug`: the stamp is a password hash.
+/// What [`use_link`] did. No `Debug`, as for the forms.
 struct LinkUsed {
     /// The link's user.
     user: UserAuth,
     /// How many sessions it ended (a reset; 0 for setup).
     ended: u64,
-    /// The stored password's stamp, for a session started from it.
-    stamp: PasswordStamp,
+    /// The setup link's session cookie (`None` for a reset).
+    cookie: Option<HeaderMap>,
 }
 
 /// The reset page's body.
@@ -892,12 +989,12 @@ async fn reset_post(
     // A reset signs nobody in: the person signs in with the new password,
     // through the stamped password path.
     let LinkUsed { user, ended, .. } =
-        match use_link(&app, &form.token, Purpose::Reset, &form.password, now).await {
+        match use_link(&app, &parts, &form.token, Purpose::Reset, &form.password).await {
             Ok(used) => used,
             Err(error) => return link_error(error),
         };
+    // The notice was queued in the reset's transaction (`use_link`).
     tracing::info!(user = %user.id, ended, "password reset; every session ended");
-    notify_method_added(&app, &user, "a new password").await;
     Redirect::to("/signin?notice=reset").into_response()
 }
 
@@ -916,9 +1013,10 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::http::api::testing::{
-        app, login_app, user_with_password, Browser, Payload, Reply, MAIN, PASSWORD,
+        allow, app, fail_on, login_app, user_with_password, wait_for_lock_waiters, Browser,
+        Payload, Reply, MAIN, PASSWORD,
     };
-    use crate::http::console_session::COOKIE;
+    use crate::http::console_session::{start_session_with, COOKIE};
     use crate::mcp::testing::{app_with, TestApp};
     use crate::store::settings::{self, SettingKey};
     use crate::store::sign_in_events::{Method, Outcome};
@@ -1428,10 +1526,9 @@ mod tests {
             page.headers["content-security-policy"],
             CONTENT_SECURITY_POLICY
         );
-        assert!(
-            !page.text().contains("<script"),
-            "no script without passkeys"
-        );
+        // Passkeys are on for this domain, so only their script loads.
+        assert_eq!(page.text().matches("<script").count(), 1);
+        assert!(page.text().contains(PASSKEY_SCRIPT));
         assert_eq!(done.status, StatusCode::SEE_OTHER);
         assert_eq!(done.location(), "/ui/");
         assert_eq!(session.json()["user"], "alice");
@@ -1726,25 +1823,6 @@ mod tests {
             .expect("count the sessions")
     }
 
-    /// Waits (up to 10 s) until `want` backends of this database wait on a
-    /// lock.
-    async fn wait_for_lock_waiters(pool: &PgPool, want: i64) {
-        for _ in 0..200 {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity \
-                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
-            )
-            .fetch_one(pool)
-            .await
-            .expect("count the lock waiters");
-            if waiting >= want {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("{want} backends never waited on a lock");
-    }
-
     /// The password alice signs in with, checked: what `POST /signin`
     /// holds between the check and the session insert.
     async fn verified(test: &TestApp, password: &str) -> passwords::Verified {
@@ -1934,7 +2012,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_session_after_setup_is_refused_once_a_reset_replaced_the_password() {
+    async fn a_reset_after_setup_ends_the_session_the_setup_started() {
         let test = login_app().await;
         let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
         let pool = test.app.pool();
@@ -1948,21 +2026,28 @@ mod tests {
         .await
         .expect("issue a setup token");
 
-        // Setup commits; its session start is delayed past a reset.
-        let used = use_link(&test.app, &token, Purpose::Setup, PASSWORD, Utc::now())
+        // The session commits with the setup, so no reset can land between
+        // the two; a reset after it ends the session.
+        let used = use_link(&test.app, &no_request(), &token, Purpose::Setup, PASSWORD)
             .await
             .expect("use the setup link");
+        let started = sessions_of(pool, &alice.id).await;
         passwords::reset(pool, &alice.id, "amber-quarry-signal-77", Utc::now())
             .await
             .expect("reset");
-        let late = start_session_with(&test.app, &used.user, Some(&used.stamp), None, "").await;
 
-        assert!(
-            matches!(late, Err(OkfError::Unauthenticated { .. })),
-            "{:?}",
-            late.map(|_| ())
-        );
+        assert!(used.cookie.is_some(), "the setup started a session");
+        assert_eq!(started, 1);
         assert_eq!(sessions_of(pool, &alice.id).await, 0);
+    }
+
+    /// A request with no headers, for calling [`use_link`] directly.
+    fn no_request() -> Parts {
+        Request::builder()
+            .body(())
+            .expect("a request")
+            .into_parts()
+            .0
     }
 
     /// The other side of a race with a link's redemption.
@@ -2026,10 +2111,10 @@ mod tests {
             tokio::spawn(async move {
                 use_link(
                     &app,
+                    &no_request(),
                     &token,
                     Purpose::Reset,
                     "amber-quarry-signal-77",
-                    Utc::now(),
                 )
                 .await
                 .map(|_| ())
@@ -2080,36 +2165,6 @@ mod tests {
             .await
             .expect("check the password");
         assert!(matches!(old, SignInOutcome::Ok(_)));
-    }
-
-    /// Makes every statement matching `event` (`BEFORE DELETE ON
-    /// user_sessions`, ...) fail, until [`allow`] drops it.
-    async fn fail_on(pool: &PgPool, event: &str) {
-        sqlx::query(
-            "CREATE FUNCTION okf_test_fail() RETURNS trigger LANGUAGE plpgsql AS \
-             $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
-        )
-        .execute(pool)
-        .await
-        .expect("create the failing function");
-        // `AssertSqlSafe`: `event` is one of this module's literals.
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE TRIGGER okf_test_fail {event} EXECUTE FUNCTION okf_test_fail()"
-        )))
-        .execute(pool)
-        .await
-        .expect("create the failing trigger");
-    }
-
-    /// Drops [`fail_on`]'s trigger.
-    async fn allow(pool: &PgPool, table: &str) {
-        // `AssertSqlSafe`: `table` is one of this module's literals.
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP TRIGGER okf_test_fail ON {table}"
-        )))
-        .execute(pool)
-        .await
-        .expect("drop the failing trigger");
     }
 
     fn new_password_form(token: &str, password: &str) -> Payload {
@@ -2227,6 +2282,174 @@ mod tests {
         assert_eq!(retried.status, StatusCode::SEE_OTHER, "{}", retried.text());
     }
 
+    /// The trigger that makes ending the browser's old session fail.
+    const FAIL_SESSION_DELETE: &str = "BEFORE DELETE ON user_sessions FOR EACH STATEMENT";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_password_sign_in_whose_old_session_cannot_end_changes_nothing() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let pool = test.app.pool();
+        let mut browser = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let old = browser.cookie(COOKIE).expect("a session").to_string();
+        fail_on(pool, FAIL_SESSION_DELETE).await;
+
+        let failed = post_sign_in(&mut browser, &test, "alice@example.com", PASSWORD).await;
+        let after_failure = sessions_of(pool, &alice.id).await;
+        allow(pool, "user_sessions").await;
+        let retried = post_sign_in(&mut browser, &test, "alice@example.com", PASSWORD).await;
+        let session = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        // All or nothing: no new session without the old one ending.
+        assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(failed.set_cookie(COOKIE).is_none());
+        assert_eq!(after_failure, 1, "only the old session");
+        assert_eq!(retried.status, StatusCode::SEE_OTHER, "{}", retried.text());
+        assert_ne!(browser.cookie(COOKIE), Some(old.as_str()));
+        assert_eq!(session.json()["user"], "alice");
+        assert_eq!(sessions_of(pool, &alice.id).await, 1, "the old one ended");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_setup_whose_old_session_cannot_end_keeps_the_link() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
+        user_with_password(&test, "bob", "bob@example.com", Some(PASSWORD)).await;
+        let pool = test.app.pool();
+        let token = email_tokens::issue(
+            pool,
+            &alice.id,
+            Purpose::Setup,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await
+        .expect("issue a setup token");
+        // The browser is still signed in as someone else.
+        let mut browser = Browser::signed_in(&test, "bob@example.com", PASSWORD).await;
+        fail_on(pool, FAIL_SESSION_DELETE).await;
+
+        let failed = browser
+            .send(
+                &test,
+                "POST",
+                "/account/setup",
+                new_password_form(&token, PASSWORD),
+            )
+            .await;
+        let link = email_tokens::peek(pool, &token, Purpose::Setup, Utc::now()).await;
+        allow(pool, "user_sessions").await;
+        let password = passwords::verify(pool, "alice@example.com", PASSWORD, Utc::now())
+            .await
+            .expect("check the password");
+        let retried = browser
+            .send(
+                &test,
+                "POST",
+                "/account/setup",
+                new_password_form(&token, PASSWORD),
+            )
+            .await;
+        let session = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(failed.set_cookie(COOKIE).is_none());
+        assert!(link.is_ok(), "the link was not used");
+        assert_eq!(password, SignInOutcome::Failed, "no password was set");
+        assert_eq!(retried.status, StatusCode::SEE_OTHER, "{}", retried.text());
+        assert_eq!(session.json()["user"], "alice");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_password_sign_in_waiting_on_the_event_table_commits_nothing_until_it_answers() {
+        let test = Arc::new(login_app().await);
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let pool = test.app.pool().clone();
+        let mut holder = pool.begin().await.expect("begin");
+        sqlx::query("LOCK TABLE sign_in_events IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .expect("lock the table");
+        let sign_in = tokio::spawn({
+            let test = Arc::clone(&test);
+            async move {
+                let mut browser = Browser::default();
+                let reply = post_sign_in(&mut browser, &test, "alice@example.com", PASSWORD).await;
+                (reply, browser)
+            }
+        });
+        wait_for_lock_waiters(&pool, 1).await;
+        let while_blocked = sessions_of(&pool, &alice.id).await;
+
+        holder.commit().await.expect("release the table");
+        let (reply, mut browser) = sign_in.await.expect("the sign-in task");
+        let session = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        assert_eq!(while_blocked, 0, "nothing committed while the event waited");
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.text());
+        assert!(reply.set_cookie(COOKIE).is_some());
+        assert_eq!(session.json()["user"], "alice");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_queues_its_notice_in_its_own_transaction() {
+        let test = Arc::new(login_app().await);
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let pool = test.app.pool().clone();
+        let token = email_tokens::issue(
+            &pool,
+            &alice.id,
+            Purpose::Reset,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await
+        .expect("issue a reset token");
+        let new_password = "amber-quarry-signal-77";
+        let mut holder = pool.begin().await.expect("begin");
+        sqlx::query("LOCK TABLE apalis.jobs IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .expect("lock the queue");
+        let reset = tokio::spawn({
+            let test = Arc::clone(&test);
+            let token = token.clone();
+            async move {
+                Browser::default()
+                    .send(
+                        &test,
+                        "POST",
+                        "/account/reset",
+                        new_password_form(&token, new_password),
+                    )
+                    .await
+            }
+        });
+        wait_for_lock_waiters(&pool, 1).await;
+        let while_blocked = email_tokens::peek(&pool, &token, Purpose::Reset, Utc::now()).await;
+
+        holder.commit().await.expect("release the queue");
+        let reply = reset.await.expect("the reset task");
+
+        assert!(while_blocked.is_ok(), "the link is unused until the commit");
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.text());
+        assert_eq!(
+            queued_mail(&pool).await,
+            1,
+            "the notice committed with the reset"
+        );
+        let changed = passwords::verify(&pool, "alice@example.com", new_password, Utc::now())
+            .await
+            .expect("check the password");
+        assert!(matches!(changed, SignInOutcome::Ok(_)));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn signing_in_again_ends_the_previous_session() {
         let test = login_app().await;
@@ -2264,7 +2487,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_pages_carry_the_console_policy_and_load_no_script() {
+    async fn the_pages_carry_the_console_policy_and_load_only_the_passkey_script() {
         let test = login_app().await;
 
         for path in ["/signin", "/signin/forgot", "/account/reset?token=nope"] {
@@ -2277,7 +2500,11 @@ mod tests {
             );
             assert_eq!(reply.headers["referrer-policy"], "no-referrer", "{path}");
             assert_eq!(reply.headers["cache-control"], "no-store", "{path}");
-            assert!(!reply.text().contains("<script"), "{path}");
+            // Only the sign-in page offers a passkey (the setup page too,
+            // with a token: `http::passkeys`'s tests).
+            let scripts = usize::from(path == "/signin");
+            assert_eq!(reply.text().matches("<script").count(), scripts, "{path}");
+            assert_eq!(reply.text().contains(PASSKEY_SCRIPT), path == "/signin");
         }
     }
 

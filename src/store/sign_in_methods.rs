@@ -48,6 +48,7 @@ mod tests {
 
     use super::*;
     use crate::db::test_db;
+    use crate::store::passkeys::{self, testing::passkey_for};
     use crate::store::{passwords, users};
 
     #[tokio::test(flavor = "multi_thread")]
@@ -77,15 +78,9 @@ mod tests {
         passwords::set(&db.pool, &alice, "violet-lantern-orbit-42", now)
             .await
             .expect("password");
-        // Only the row is counted, so the stored passkey can be any JSON.
-        sqlx::query(
-            "INSERT INTO user_passkeys (credential_id, user_id, passkey, name, created_at) \
-             VALUES ('\\x01', $1, '{}', 'Laptop', now())",
-        )
-        .bind(&alice)
-        .execute(&db.pool)
-        .await
-        .expect("passkey");
+        passkeys::add(&db.pool, &alice, &passkey_for(&alice), "Laptop", now)
+            .await
+            .expect("passkey");
         sqlx::query(
             "INSERT INTO user_identities (provider, subject, user_id, email_at_link, created_at) \
              VALUES ('example', 'sub-1', $1, 'alice@example.com', now())",

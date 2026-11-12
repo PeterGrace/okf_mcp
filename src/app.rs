@@ -20,6 +20,7 @@ use crate::clock_check::{self, ClockStatus};
 use crate::config::Config;
 use crate::error::OkfError;
 use crate::http::limits::SignInLimits;
+use crate::http::passkeys::Passkeys;
 use crate::http::sessions::SessionKeys;
 use crate::keyed_lock::KeyedLocks;
 use crate::oauth::OAuth;
@@ -103,6 +104,9 @@ pub struct App {
     sign_in_limits: SignInLimits,
     // The configured mail provider (Decision 10), built once at start-up.
     mailer: Arc<dyn crate::mail::Mailer>,
+    // The WebAuthn relying party and ceremonies; `None` without a domain
+    // `public_url`.
+    passkeys: Option<Passkeys>,
     // The configured OIDC providers; `None` without `public_url` or providers.
     oidc: Option<OidcProviders>,
 }
@@ -126,7 +130,7 @@ impl App {
     /// # Errors
     /// [`OkfError::Database`] reading the counter, the keys, the settings or
     /// the list;
-    /// [`OkfError::Config`] from [`OAuth::new`], or from
+    /// [`OkfError::Config`] from [`OAuth::new`] or [`Passkeys::new`], or from
     /// [`crate::mail::from_config`] (a mail secret missing from the
     /// environment) or [`OidcProviders::new`] (an OIDC client secret missing
     /// from the environment).
@@ -163,6 +167,7 @@ impl App {
         let sessions = SessionKeys::new(config.session_idle_timeout);
         let overlays = Overlays::new(config.session_idle_timeout, config.overlay_cache_size);
         let mailer = crate::mail::from_config(&config.mail)?;
+        let passkeys = Passkeys::new(&config)?;
         // A provider whose secret variable is unset fails start-up here.
         let oidc = OidcProviders::new(&config, |name| std::env::var(name).ok())?;
         Ok(Arc::new(Self {
@@ -182,6 +187,7 @@ impl App {
             oauth_pruned: std::sync::Mutex::new(None),
             sign_in_limits: SignInLimits::new(),
             mailer,
+            passkeys,
             oidc,
         }))
     }
@@ -262,6 +268,14 @@ impl App {
     /// `None` when OAuth is off (no `public_url`).
     pub fn oauth(&self) -> Option<&OAuth> {
         self.oauth.as_ref()
+    }
+
+    /// The passkey state.
+    ///
+    /// # Returns
+    /// `None` when passkeys are off (no `public_url`, or an address host).
+    pub fn passkeys(&self) -> Option<&Passkeys> {
+        self.passkeys.as_ref()
     }
 
     /// The overlay cache (M5 Decision 6).

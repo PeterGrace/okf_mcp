@@ -63,11 +63,11 @@ async fn health_tiles_match_the_api_and_a_row_opens_its_concept() {
             ("orphans", "orphans"),
             ("questions", "open_questions"),
         ] {
-            assert_eq!(
-                ui.text(&format!("#n-{tile}")),
-                health[field].to_string(),
-                "tile {tile}"
-            );
+            // The tiles are visible before the page's fetch fills them, so
+            // wait for each value rather than reading it at once.
+            let selector = format!("#n-{tile}");
+            let shown = ui.wait_text(&selector, &health[field].to_string());
+            assert_eq!(shown, health[field].to_string(), "tile {tile}");
         }
         assert_eq!(ui.text("#d-orphans"), broken_line);
         assert_eq!(ui.text("#n-oldest"), "never");

@@ -35,12 +35,14 @@ use crate::app::App;
 use crate::auth::{CredentialKind, Principal};
 use crate::error::OkfError;
 use crate::http::console_session::{
-    append_all, client_ip, cookie, secure_cookies, session_cookie, session_user, set_cookie,
-    ConsoleSession, SameSite, COOKIE,
+    append_all, client_ip, cookie, secure_cookies, session_user, set_cookie, ConsoleSession,
+    SameSite, COOKIE,
 };
 use crate::http::limits::ip_key;
 use crate::http::pages::safe_return_to;
-use crate::http::signin::{audit, message_page, notify_method_added, ProviderButton};
+use crate::http::signin::{
+    audit, message_page, notify_method_added, start_in, ProviderButton, SignIn,
+};
 use crate::http::{timeout_layer, AppError};
 use crate::keys;
 use crate::oidc::{Flow, Identity, LinkRequest, OidcError, OidcProviders, FLOW_TTL};
@@ -342,62 +344,34 @@ fn verified_email(identity: &Identity) -> Option<&str> {
         .filter(|_| identity.email_verified)
 }
 
-/// Queues the "a sign-in method was added" notice on a task of its own,
-/// after the commit: it is best effort (`notify_method_added` logs a
-/// failure), so a slow or failing queue can never hold back or fail the
-/// response of a committed sign-in or link.
-fn notify_detached(app: &Arc<App>, user: UserAuth, provider: &str) {
-    let app = Arc::clone(app);
-    let method = method_text(&app, provider);
-    // `tokio::spawn` runs the future on its own task, like
-    // `asyncio.create_task`; `move` hands it owned copies.
-    tokio::spawn(async move { notify_method_added(&app, &user, &method).await });
-}
-
 /// Signs in by `(provider, sub)`, else links by verified email and signs
-/// in, else refuses with 403 (spec, in that order), in one transaction
-/// (`identities::sign_in`) that also ends the browser's old session and
-/// records the event. An identity already linked always signs in as its
-/// own user, whatever email it now carries, so a changed email at the
-/// provider never reaches another account. After the commit only the
-/// cookie is built and the notice detached: nothing can block or fail.
+/// in, else refuses with 403 (spec, in that order). An identity already
+/// linked always signs in as its own user, whatever email it now carries,
+/// so a changed email at the provider never reaches another account.
+/// Everything is one transaction ([`complete_sign_in`]); after its commit
+/// only the response is built.
 async fn finish_sign_in(
-    app: &Arc<App>,
+    app: &App,
     parts: &Parts,
     provider: &str,
     identity: &Identity,
     return_to: String,
 ) -> Result<Done, OkfError> {
     let ip = client_ip(parts, &app.config().auth);
-    let absolute = app.settings().console_session_absolute;
-    let user_agent = parts
-        .headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
     let request = OidcSignIn {
         provider,
         subject: &identity.subject,
         // Only a verified email may claim an account.
         verified_email: verified_email(identity),
-        old_session: cookie(&parts.headers, COOKIE),
-        ip,
-        user_agent,
-        absolute,
     };
-    let outcome = identities::sign_in(app.pool(), &request, app.clock().now()).await;
-    let (user, session, linked) = match outcome {
-        Ok(OidcOutcome::SignedIn {
-            user,
-            session,
-            linked,
-        }) => (user, session, linked),
+    let session_cookie = match complete_sign_in(app, parts, &request).await {
+        Ok(Some(cookie)) => cookie,
         // Nothing was committed on these paths, so the audit may wait.
-        Ok(OidcOutcome::NoAccount) => {
+        Ok(None) => {
             audit(app, None, Method::Oidc, Outcome::Failed, ip).await;
             return Ok(Done::Refused(StatusCode::FORBIDDEN, NO_ACCOUNT));
         }
-        Ok(OidcOutcome::Unlinked) | Err(OkfError::Unauthenticated { .. }) => {
+        Err(OkfError::Unauthenticated { .. }) => {
             audit(app, None, Method::Oidc, Outcome::Failed, ip).await;
             return Ok(Done::Refused(StatusCode::BAD_REQUEST, SIGN_IN_RETRY));
         }
@@ -406,15 +380,54 @@ async fn finish_sign_in(
         }
         Err(error) => return Err(error),
     };
-    let session_cookie = session_cookie(app, &user.id, &session, absolute);
-    if linked {
-        tracing::info!(user = %user.id, provider, "OIDC identity linked by verified email");
-        notify_detached(app, user, provider);
-    }
     Ok(Done::Redirect {
         session_cookie,
         to: return_to,
     })
+}
+
+/// One OIDC sign-in transaction: `identities::sign_in_in` (the user locked,
+/// the link re-read or made, the identity stamped), then the session, the
+/// end of the browser's old one and the event (`signin::start_in`), then
+/// the notice of a link made just now, then the commit.
+///
+/// # Returns
+/// The session's `Set-Cookie` header, or `None` for no account (nothing
+/// changed).
+///
+/// # Errors
+/// [`OkfError::Unauthenticated`] for an identity unlinked (or a user
+/// deleted) meanwhile; [`OkfError::Refused`] as `identities::sign_in_in`;
+/// [`OkfError::Database`].
+async fn complete_sign_in(
+    app: &App,
+    parts: &Parts,
+    request: &OidcSignIn<'_>,
+) -> Result<Option<HeaderMap>, OkfError> {
+    let mut tx = app.pool().begin().await?;
+    // Returning early drops `tx`, which rolls back.
+    let (user, linked) = match identities::sign_in_in(&mut tx, request, app.clock().now()).await? {
+        OidcOutcome::SignedIn { user, linked } => (user, linked),
+        OidcOutcome::NoAccount => return Ok(None),
+        OidcOutcome::Unlinked => {
+            return Err(OkfError::Unauthenticated {
+                reason: "the identity was unlinked meanwhile".to_string(),
+            })
+        }
+    };
+    let signing_in = SignIn {
+        user: &user,
+        method: Method::Oidc,
+        password: None,
+    };
+    let cookie = start_in(app, &mut tx, parts, &signing_in).await?;
+    if linked {
+        tracing::info!(user = %user.id, provider = request.provider, "OIDC identity linked by verified email");
+        let method = method_text(app, request.provider);
+        notify_method_added(app, &mut tx, &user, &method).await?;
+    }
+    tx.commit().await?;
+    Ok(Some(cookie))
 }
 
 /// The user of this browser's console session, when it is the live session
@@ -461,7 +474,7 @@ async fn finish_link(
         email,
         keep_sessions: link.keep_sessions,
     };
-    let ended = match identities::link_for_session(app.pool(), &request, app.clock().now()).await {
+    let ended = match link_in_one_transaction(app, &user, &request).await {
         Ok(ended) => ended,
         Err(OkfError::Refused { .. }) => {
             return Ok(Done::Refused(StatusCode::CONFLICT, LINKED_ELSEWHERE))
@@ -473,12 +486,33 @@ async fn finish_link(
         Err(error) => return Err(error),
     };
     tracing::info!(user = %link.user_id, provider, ended, "OIDC identity linked from the account page");
-    // After the commit: nothing that can block or fail.
-    notify_detached(app, user, provider);
+    // The notice was queued in the link's transaction: nothing runs after
+    // its commit but building the response.
     Ok(Done::Redirect {
         session_cookie: HeaderMap::new(),
         to: ACCOUNT_PAGE.to_string(),
     })
+}
+
+/// Links the identity to the session's user and queues the notice, in one
+/// transaction (`identities::link_for_session_in`).
+///
+/// # Returns
+/// How many other sessions ended.
+///
+/// # Errors
+/// As `identities::link_for_session_in`.
+async fn link_in_one_transaction(
+    app: &App,
+    user: &UserAuth,
+    request: &SessionLink<'_>,
+) -> Result<u64, OkfError> {
+    let mut tx = app.pool().begin().await?;
+    let ended = identities::link_for_session_in(&mut tx, request, app.clock().now()).await?;
+    let method = method_text(app, request.provider);
+    notify_method_added(app, &mut tx, user, &method).await?;
+    tx.commit().await?;
+    Ok(ended)
 }
 
 /// `POST /me/identities/{provider}/link`'s body.
@@ -1275,7 +1309,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_sign_in_commits_nothing_until_its_event_is_written_and_never_waits_on_mail() {
+    async fn a_sign_in_commits_nothing_until_its_event_and_notice_are_written() {
         let idp = idp::start().await;
         let test = oidc_app(&idp, "OKF_TEST_OIDC_SECRET_COMMIT").await;
         let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
@@ -1317,8 +1351,10 @@ mod tests {
             (Method::Oidc, Outcome::Ok)
         ));
 
-        // The mail queue is locked: the committed sign-in answers at once,
-        // and the notice is queued once the queue is free.
+        // The mail queue is locked: the sign-in that links bob queues its
+        // notice inside its transaction, so it waits there with nothing
+        // committed, then answers with its cookie once the queue is free.
+        // After its commit it waits on nothing.
         idp.will_issue("sub-2", Some("bob@example.com"), Some(true));
         let mut browser = Browser::default();
         let query = start(&test, &idp, &mut browser).await;
@@ -1327,16 +1363,20 @@ mod tests {
             .execute(&mut *jobs)
             .await
             .expect("lock the mail queue");
-        let reply = tokio::time::timeout(
-            Duration::from_secs(30),
-            callback(&test, &mut browser, &query["state"]),
-        )
-        .await
-        .expect("the response never waits on the mail queue");
+        let release = async {
+            wait_for_lock_waiters(pool, 1).await;
+            assert_eq!(sessions_of(pool, &bob.id).await, 0, "no session yet");
+            jobs.rollback().await.expect("release the mail queue");
+        };
+        let (reply, ()) = tokio::join!(callback(&test, &mut browser, &query["state"]), release);
         assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.text());
+        assert!(reply.set_cookie(COOKIE).is_some());
         assert_eq!(sessions_of(pool, &bob.id).await, 1);
-        jobs.rollback().await.expect("release the mail queue");
-        wait_for_mail(&test, 2).await;
+        assert_eq!(
+            queued_mail(&test).await,
+            2,
+            "both notices committed with their links"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

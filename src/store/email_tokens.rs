@@ -9,9 +9,10 @@
 //! [`issue_for_email`] and [`redeem_in`] here; `users::set_email`,
 //! `users::set_admin` and `users::delete`; `passwords::set_in` and
 //! `passwords::reset_in` (whose `UPDATE users` precedes `revoke_all`);
-//! `identities::link_for_session` (the user, then the session `FOR SHARE`,
-//! the link and `revoke_all`); `identities::sign_in` (the user, then the
-//! identity's link, the browser's old session, the new one and the event);
+//! `identities::link_for_session_in` (the user, then the session `FOR
+//! SHARE`, the link and `revoke_all`); `identities::sign_in_in` (the user,
+//! then the identity's link; then `signin::start_in`'s new session, old
+//! session and event);
 //! and `user_sessions::start` (the user `FOR SHARE`, then the insert). Two such
 //! transactions on one user therefore queue on that row and never deadlock.
 //! Statements that touch only tokens or only sessions (`touch`, `revoke`,

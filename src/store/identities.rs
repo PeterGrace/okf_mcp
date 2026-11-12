@@ -10,25 +10,22 @@
 //! exception: it only records `last_used_at` on one identity row, decides
 //! nothing, and waits on no other lock, so it cannot close a lock cycle.
 //!
-//! An OIDC sign-in is one transaction ([`sign_in`]): it locks the user,
-//! re-reads (or makes) the link, ends the browser's old session, starts the
-//! new one, stamps the identity and records the event, then commits. So no
-//! session starts for an identity unlinked meanwhile, and nothing that can
-//! block or fail runs after the commit: a committed sign-in always reaches
-//! the browser with its cookie, and one that fails or times out first
-//! changes nothing.
-
-use std::net::IpAddr;
-use std::time::Duration;
+//! An OIDC sign-in is one transaction: [`sign_in_in`] locks the user,
+//! re-reads (or makes) the link and stamps the identity, then the caller
+//! (`http::oidc`) starts the session, ends the browser's old one and
+//! records the event (`signin::start_in`), queues the notice of a new link
+//! and commits. So no session starts for an identity unlinked meanwhile,
+//! and nothing that can block or fail runs after the commit: a committed
+//! sign-in always reaches the browser with its cookie, and one that fails
+//! or times out first changes nothing.
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::error::OkfError;
 use crate::store::catalogs::is_unique_violation;
-use crate::store::sign_in_events::{self, Attempt, Method, Outcome};
 use crate::store::sign_in_methods;
-use crate::store::user_sessions::{self, NewSession, SessionStart};
+use crate::store::user_sessions;
 use crate::store::users::{is_lookup_email, user_auth_columns, UserAuth};
 
 /// A linked identity as the account page lists it (never the subject).
@@ -135,12 +132,13 @@ pub async fn link(
 }
 
 /// Links an identity to the user of a console session, whatever its email,
-/// and (unless `keep_sessions`) ends the user's other sessions, in one
-/// transaction: the user's row, then the session `FOR SHARE` (so it cannot
-/// be signed out half way), then the link and the revocation.
+/// and (unless `keep_sessions`) ends the user's other sessions, inside the
+/// caller's transaction (which also queues the notice, then commits): the
+/// user's row, then the session `FOR SHARE` (so it cannot be signed out
+/// half way), then the link and the revocation.
 ///
 /// # Arguments
-/// * `pool` - the database.
+/// * `conn` - the caller's transaction (`&mut tx`).
 /// * `request` - the user, their session and the identity.
 /// * `now` - the server clock.
 ///
@@ -150,20 +148,19 @@ pub async fn link(
 /// # Errors
 /// [`OkfError::Unauthenticated`] when the session has ended or is not the
 /// user's; as [`link`].
-pub async fn link_for_session(
-    pool: &PgPool,
+pub async fn link_for_session_in(
+    conn: &mut PgConnection,
     request: &SessionLink<'_>,
     now: DateTime<Utc>,
 ) -> Result<u64, OkfError> {
-    let mut tx = pool.begin().await?;
-    lock_user(&mut tx, request.user_id).await?;
-    if !user_sessions::hold_live(&mut *tx, request.session_id, request.user_id, now).await? {
+    lock_user(&mut *conn, request.user_id).await?;
+    if !user_sessions::hold_live(&mut *conn, request.session_id, request.user_id, now).await? {
         return Err(OkfError::Unauthenticated {
             reason: "the session that started linking has ended; sign in again".to_string(),
         });
     }
     link_in(
-        &mut tx,
+        &mut *conn,
         request.user_id,
         request.provider,
         request.subject,
@@ -174,10 +171,9 @@ pub async fn link_for_session(
     let ended = if request.keep_sessions {
         0
     } else {
-        // `&mut *tx`: the session store's SQL, in this transaction.
-        user_sessions::revoke_all(&mut *tx, request.user_id, Some(request.session_id)).await?
+        // `&mut *conn`: the session store's SQL, in this transaction.
+        user_sessions::revoke_all(&mut *conn, request.user_id, Some(request.session_id)).await?
     };
-    tx.commit().await?;
     Ok(ended)
 }
 
@@ -285,8 +281,8 @@ pub async fn touch(
     Ok(())
 }
 
-/// An OIDC sign-in to complete: the identity the ID token proved, and the
-/// session to start for it.
+/// An OIDC sign-in to complete: the identity the ID token proved.
+#[derive(Debug, Clone, Copy)]
 pub struct OidcSignIn<'a> {
     /// The provider's id.
     pub provider: &'a str,
@@ -295,38 +291,16 @@ pub struct OidcSignIn<'a> {
     /// The token's email, when the provider verified it (trimmed): used
     /// only when the identity is not linked yet.
     pub verified_email: Option<&'a str>,
-    /// The raw id of the session this browser held, ended in the same
-    /// transaction (rotation).
-    pub old_session: Option<&'a str>,
-    /// The client address, when known.
-    pub ip: Option<IpAddr>,
-    /// The `User-Agent` header (empty when absent).
-    pub user_agent: &'a str,
-    /// `console_session_absolute`.
-    pub absolute: Duration,
 }
 
-// Hand-written (Python's `__repr__`): the old session id is a credential.
-impl std::fmt::Debug for OidcSignIn<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OidcSignIn")
-            .field("provider", &self.provider)
-            .field("old_session", &self.old_session.map(|_| "<redacted>"))
-            .finish_non_exhaustive()
-    }
-}
-
-/// How an OIDC sign-in ended.
+/// How an OIDC sign-in's lookup ended.
 #[derive(Debug)]
 pub enum OidcOutcome {
-    /// Signed in (and committed): the user, the new session, and whether
+    /// The identity's user, locked in the caller's transaction, and whether
     /// the identity was linked by its verified email just now.
     SignedIn {
         /// The user.
         user: UserAuth,
-        /// The session's secrets (`Debug` redacted).
-        session: NewSession,
         /// The identity was linked in this sign-in.
         linked: bool,
     },
@@ -337,16 +311,16 @@ pub enum OidcOutcome {
     Unlinked,
 }
 
-/// Completes an OIDC sign-in in one transaction. It finds the user by
-/// `(provider, sub)`, else by the verified email (linking the identity),
-/// locks that user's row and re-reads the link under the lock. Then it ends
-/// the browser's old session, starts the new one, stamps `last_used_at`,
-/// records the `sign_in_events` row and commits. A returning identity
-/// always signs in as its own user, whatever email it now carries.
+/// The first part of an OIDC sign-in, inside the caller's transaction. It
+/// finds the user by `(provider, sub)`, else by the verified email (linking
+/// the identity), locks that user's row, re-reads the link under the lock
+/// and stamps `last_used_at`. The caller then starts the session
+/// (`signin::start_in`) and commits. A returning identity always signs in
+/// as its own user, whatever email it now carries.
 ///
 /// # Arguments
-/// * `pool` - the database.
-/// * `request` - the identity and the session to start.
+/// * `conn` - the caller's transaction (`&mut tx`).
+/// * `request` - the identity.
 /// * `now` - the server clock.
 ///
 /// # Returns
@@ -355,22 +329,21 @@ pub enum OidcOutcome {
 /// # Errors
 /// [`OkfError::Refused`] when the verified email's user already links
 /// another account at this provider (or another user took the identity
-/// meanwhile); as `user_sessions::start`; [`OkfError::Database`].
-pub async fn sign_in(
-    pool: &PgPool,
+/// meanwhile); [`OkfError::Database`].
+pub async fn sign_in_in(
+    conn: &mut PgConnection,
     request: &OidcSignIn<'_>,
     now: DateTime<Utc>,
 ) -> Result<OidcOutcome, OkfError> {
-    let mut tx = pool.begin().await?;
-    let holder = holder_of(&mut tx, request.provider, request.subject).await?;
+    let holder = holder_of(&mut *conn, request.provider, request.subject).await?;
     let (user, linked) = match holder {
         Some(holder) => {
-            let Some(user) = lock_user_auth(&mut tx, &holder).await? else {
+            let Some(user) = lock_user_auth(&mut *conn, &holder).await? else {
                 return Ok(OidcOutcome::Unlinked);
             };
             // A fresh read under the lock: an unlink that committed while
             // this waited is seen here.
-            let still = holder_of(&mut tx, request.provider, request.subject).await?;
+            let still = holder_of(&mut *conn, request.provider, request.subject).await?;
             if still.as_deref() != Some(holder.as_str()) {
                 return Ok(OidcOutcome::Unlinked);
             }
@@ -392,13 +365,13 @@ pub async fn sign_in(
                 " FROM users u WHERE u.email = $1::citext FOR NO KEY UPDATE"
             ))
             .bind(email)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
             let Some(user) = found else {
                 return Ok(OidcOutcome::NoAccount);
             };
             link_in(
-                &mut tx,
+                &mut *conn,
                 &user.id,
                 request.provider,
                 request.subject,
@@ -409,33 +382,8 @@ pub async fn sign_in(
             (user, true)
         }
     };
-    if let Some(old) = request.old_session {
-        user_sessions::revoke(&mut *tx, old).await?;
-    }
-    let start = SessionStart {
-        user_id: &user.id,
-        ip: request.ip,
-        user_agent: request.user_agent,
-        absolute: request.absolute,
-        now,
-        password: None,
-    };
-    let session = user_sessions::start(&mut *tx, &start).await?;
-    touch(&mut *tx, request.provider, request.subject, now).await?;
-    let attempt = Attempt {
-        user_id: Some(&user.id),
-        method: Method::Oidc,
-        outcome: Outcome::Ok,
-        ip: request.ip,
-        now,
-    };
-    sign_in_events::record_in(&mut tx, &attempt).await?;
-    tx.commit().await?;
-    Ok(OidcOutcome::SignedIn {
-        user,
-        session,
-        linked,
-    })
+    touch(&mut *conn, request.provider, request.subject, now).await?;
+    Ok(OidcOutcome::SignedIn { user, linked })
 }
 
 /// The user an identity is linked to, read without a lock.
@@ -678,18 +626,25 @@ mod tests {
         assert!(list(&db.pool, &alice).await.expect("list").is_empty());
     }
 
-    /// An OIDC sign-in of `subject` with this verified email, from a
-    /// browser holding no session.
+    /// An OIDC sign-in of `subject` with this verified email.
     fn oidc<'a>(subject: &'a str, email: Option<&'a str>) -> OidcSignIn<'a> {
         OidcSignIn {
             provider: "example",
             subject,
             verified_email: email,
-            old_session: None,
-            ip: None,
-            user_agent: "okf-test",
-            absolute: Duration::from_secs(3600),
         }
+    }
+
+    /// [`sign_in_in`] in a transaction of its own, committed.
+    async fn sign_in(
+        pool: &PgPool,
+        request: &OidcSignIn<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<OidcOutcome, OkfError> {
+        let mut tx = pool.begin().await?;
+        let outcome = sign_in_in(&mut tx, request, now).await?;
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -731,19 +686,6 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].email_at_link, "Alice@Example.com");
         assert_eq!(listed[0].last_used_at, Some(now()));
-        let (sessions, events): (i64, i64) = sqlx::query_as(
-            "SELECT (SELECT count(*) FROM user_sessions WHERE user_id = $1), \
-                    (SELECT count(*) FROM sign_in_events WHERE user_id = $1 AND outcome = 'ok')",
-        )
-        .bind(&alice)
-        .fetch_one(&db.pool)
-        .await
-        .expect("count");
-        assert_eq!(
-            (sessions, events),
-            (2, 2),
-            "each sign-in committed its session and event"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

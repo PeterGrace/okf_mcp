@@ -5,10 +5,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use chrono::Utc;
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
@@ -478,6 +480,55 @@ impl Browser {
         browser.csrf = Some(session.csrf);
         browser
     }
+}
+
+/// Waits (up to 10 s) until `want` backends of this database wait on a
+/// lock.
+pub(crate) async fn wait_for_lock_waiters(pool: &PgPool, want: i64) {
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("count the lock waiters");
+        if waiting >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{want} backends never waited on a lock");
+}
+
+/// Makes every statement matching `event` (`BEFORE DELETE ON
+/// user_sessions`, ...) fail, until [`allow`] drops it.
+pub(crate) async fn fail_on(pool: &PgPool, event: &str) {
+    sqlx::query(
+        "CREATE FUNCTION okf_test_fail() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("create the failing function");
+    // `AssertSqlSafe`: `event` is a literal of the calling test.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER okf_test_fail {event} EXECUTE FUNCTION okf_test_fail()"
+    )))
+    .execute(pool)
+    .await
+    .expect("create the failing trigger");
+}
+
+/// Drops [`fail_on`]'s trigger.
+pub(crate) async fn allow(pool: &PgPool, table: &str) {
+    // `AssertSqlSafe`: `table` is a literal of the calling test.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER okf_test_fail ON {table}"
+    )))
+    .execute(pool)
+    .await
+    .expect("drop the failing trigger");
 }
 
 #[cfg(test)]
