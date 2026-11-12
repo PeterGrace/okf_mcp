@@ -415,8 +415,8 @@ impl App {
     /// registered clients no grant names after [`UNBOUND_CLIENT_HOURS`],
     /// sign-in events older than [`SIGN_IN_EVENT_RETENTION_DAYS`], emailed
     /// links [`OAUTH_RETENTION_DAYS`] past their expiry and console sessions
-    /// past their absolute limit. Runs whether or not OAuth is on, so rows left from when it was are cleared too. Called
-    /// only under `polling`.
+    /// past their absolute limit. Runs whether or not OAuth is on, so rows
+    /// left from when it was are cleared too. Called only under `polling`.
     ///
     /// A failure is logged, not returned, and waits for the next hourly pass.
     async fn prune_oauth(&self) {

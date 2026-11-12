@@ -277,7 +277,11 @@ fn overlay(defaults: &AuthConfig, rows: &[StoredSetting]) -> Settings {
             continue;
         };
         if let Err(problem) = apply(&mut settings, key, &row.value) {
-            tracing::warn!(setting = %row.key, %problem, "stored setting is invalid; using the default");
+            tracing::warn!(
+                setting = %row.key,
+                %problem,
+                "stored setting is invalid; using the default"
+            );
         }
     }
     settings
