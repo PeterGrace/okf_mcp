@@ -15535,6 +15535,13 @@ Every route here acts for the signed-in user. The rules (spec "Self-service", De
 
 The ceiling check here gives a clear 422 at create time. It is not the only enforcement: the key cache caps every self-issued credential on each reload (Task 3), so a ceiling lowered between the check and the insert still wins.
 
+> **Corrected (issue #319, 2026-11-12).** What shipped differs from the code below in these ways; `src/store/keys.rs` and `src/http/api/me.rs` are authoritative.
+> - **`insert_key` holds all of `create_with_id`'s checks**, not only the name check: the self-issued rules (`check_self_issued`), the per-catalog levels and the expiry check moved with it, so `create_self_issued` gets the same refusals. `create_with_id` is the four-line wrapper.
+> - **`create_self_issued` refuses a key not marked `self_issued`** (`Refused`), because its count covers only self-issued keys. Test `create_self_issued_refuses_a_key_not_marked_self_issued`.
+> - **A setting changed in a test needs a poll before `app.settings()` sees it.** `settings::set` bumps `admin_generation`; the cached policy reloads on the next `App::poll`. `the_key_limit_counts_live_self_issued_keys` and `the_lifetime_limit_caps_and_defaults_the_expiry` call `test.app.poll()` after `settings::set` (the lifetime test fails without it: its first create would see the old, unset lifetime). The limit test also raises the limit and checks that `GET /me` and the next create follow it, with no restart. Later tasks' `oneshot` tests that set a setting do the same; browser journeys rely on the test server's poll loop.
+> - **`StatusCode` is not imported** in `me.rs` (Task 10b adds it back with its 204s).
+> - Extra tests: `concurrent_creates_at_the_limit_never_pass_it` (eight spawned creates at limit 2: exactly two pass) and `a_create_waiting_on_the_user_row_counts_the_key_made_meanwhile` (a transaction holds the user row `FOR UPDATE`, inserts a key while the create waits, and the create is then refused), both in `src/store/keys.rs`. `a_session_creates_lists_renames_and_revokes_its_own_key` also checks that no later answer holds the secret, and `a_key_above_the_ceiling_is_a_422_naming_the_limit` that a body naming `user` or `maintenance_report` is a 422 and creates nothing. `a_key_may_read_its_users_account_and_an_unassigned_key_gets_404` compares `teams` with `TEST_TEAM` (the same string as `TEST_USER`).
+
 - [ ] **Step 1: Write the failing store tests** in `src/store/keys.rs`'s test module. It already has `new_key(name, grants, default)` (actor `claude-code/test`, user `TEST_USER`) and a fixed `now()`. These tests also need Task 2's `NewKey` fields:
 
 ```rust
