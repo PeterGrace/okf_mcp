@@ -255,15 +255,15 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
         .with_state(app)
 }
 
-/// Serves until `shutdown` is cancelled, running the poll loop and the clock
-/// check beside it.
+/// Serves until `shutdown` is cancelled, running the poll loop, the clock
+/// check and (unless `[mail] worker = false`) the mail worker beside it.
 ///
 /// # Arguments
 /// * `app` - the shared state.
 /// * `listener` - a bound socket.
 /// * `shutdown` - cancelled to stop: it ends the MCP sessions, the poll loop,
-///   the clock check and the listener, and `serve` returns once open
-///   connections close.
+///   the clock check, the mail worker and the listener, and `serve` returns
+///   once open connections close and the mail worker has stopped.
 ///
 /// # Errors
 /// The listener's I/O error, after the loops and the sessions are
@@ -276,6 +276,13 @@ pub async fn serve(
     let router = router(Arc::clone(&app), &shutdown);
     let poller = tokio::spawn(Arc::clone(&app).poll_until(shutdown.clone()));
     let clock_checker = tokio::spawn(Arc::clone(&app).check_clock_until(shutdown.clone()));
+    // The mail worker (Task 6), unless this process only enqueues.
+    // `bool::then` runs the closure only for `true`, giving an `Option`.
+    let mail_worker = app
+        .config()
+        .mail
+        .worker
+        .then(|| crate::mail::queue::spawn_worker(Arc::clone(&app), shutdown.clone()));
     let stop = shutdown.clone();
     // `async move { ... }` is a future that resolves once the token is
     // cancelled; axum then stops accepting and waits for open connections.
@@ -291,6 +298,12 @@ pub async fn serve(
     }
     if let Err(error) = clock_checker.await {
         tracing::error!(%error, "the clock check panicked");
+    }
+    // It finishes the mail in hand first.
+    if let Some(mail_worker) = mail_worker {
+        if let Err(error) = mail_worker.await {
+            tracing::error!(%error, "the mail worker panicked");
+        }
     }
     served
 }
@@ -628,6 +641,50 @@ mod tests {
                 StatusCode::GONE,
                 StatusCode::UNPROCESSABLE_ENTITY,
             ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serve_runs_the_mail_worker_and_waits_for_it_on_shutdown() {
+        let db = crate::db::test_db().await;
+        // The default `[mail]`: the log provider, with a worker.
+        let app = App::load(
+            db.pool.clone(),
+            Config::default(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .await
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let shutdown = CancellationToken::new();
+        let served = tokio::spawn(serve(Arc::clone(&app), listener, shutdown.clone()));
+
+        crate::mail::queue::enqueue(
+            &db.pool,
+            "alice@example.com",
+            &crate::mail::Template::Test,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let mut status = String::new();
+        for _ in 0..200 {
+            status = sqlx::query_scalar("SELECT status FROM apalis.jobs")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+            if status == "Done" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        shutdown.cancel();
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(20), served).await;
+
+        assert_eq!(status, "Done", "the worker serve started sent it");
+        assert!(
+            matches!(stopped, Ok(Ok(Ok(())))),
+            "serve returns once the worker stops: {stopped:?}"
         );
     }
 }

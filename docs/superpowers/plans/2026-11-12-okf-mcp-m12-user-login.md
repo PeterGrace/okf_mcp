@@ -8095,7 +8095,7 @@ mod tests {
             clock: Arc::new(FixedClock(now())),
         };
         let shutdown = CancellationToken::new();
-        let worker = run_worker(context, Duration::from_millis(100), shutdown.clone());
+        let worker = run_worker(context, worker_name(), Duration::from_millis(100), shutdown.clone());
         (shutdown, worker)
     }
 
@@ -8724,7 +8724,7 @@ pub fn spawn_worker(app: Arc<App>, shutdown: CancellationToken) -> JoinHandle<()
         mailer: Arc::clone(app.mailer()),
         clock: app.clock_handle(),
     };
-    run_worker(context, POLL_INTERVAL, shutdown)
+    run_worker(context, worker_name(), POLL_INTERVAL, shutdown)
 }
 
 /// Runs one apalis worker on [`QUEUE`] until `shutdown`, restarting it
@@ -8739,17 +8739,22 @@ pub fn spawn_worker(app: Arc<App>, shutdown: CancellationToken) -> JoinHandle<()
 /// The worker's task.
 pub(crate) fn run_worker(
     context: MailContext,
+    name: String,
     poll: Duration,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let name = worker_name();
-        loop {
+        for restarts in 0_u64.. {
             let backend = PostgresStorage::<SendMail>::new(&context.pool)
                 .with_config(QueueConfig::default().queue(QUEUE))
                 .with_pubsub()
                 .poll_with_interval(poll);
-            let worker = WorkerBuilder::new(name.clone())
+            let registered = if restarts == 0 {
+                name.clone()
+            } else {
+                format!("{name}-{restarts}")
+            };
+            let worker = WorkerBuilder::new(registered)
                 .backend(backend)
                 .data(context.clone())
                 .build(send_mail);
@@ -8775,6 +8780,13 @@ pub(crate) fn run_worker(
 ```
 
 > The apalis paths are from apalis 1.0.0's prelude (`apalis::prelude::{AbortError, BoxDynError, Data, TaskBuilder, TaskId, WorkerBuilder, BackendExt}`) and `apalis_postgres::{Config, PostgresStorage, queries::push_tasks}`. If the handler's argument types do not satisfy apalis's `TaskFn` bounds as written, the fallback is `Data<Arc<MailContext>>` (Decision 10's `Arc` shape); correct the plan in the same PR.
+
+> **Corrected (issue #314, 2026-11-12).** What shipped differs from the code above in these ways; `src/mail/queue.rs` is authoritative.
+> - `run_worker` takes the worker's `name` (corrected inline above), so a test can run two workers on one queue, as two replicas would. A restart after a backend error registers as `<name>-<restarts>`, a row of its own: apalis-postgres 1.1.0's `register.sql` updates an existing worker row only under a session-scoped `pg_try_advisory_lock`, which another pooled connection may still hold, and it then refuses with `WorkerAlreadyExists`.
+> - The handler's arguments (`SendMail`, `Data<MailContext>`, `TaskId`) satisfy apalis's bounds as written; the `Data<Arc<MailContext>>` fallback was not needed.
+> - The tests go further than Step 9's (all under real apalis on the test database). `a_provider_error_reschedules_with_doubling_backoff_then_the_retry_succeeds` fails twice: 30 s then 60 s, `attempts` 1 then 2, each last error in `list`, and the job is not taken again while `run_at` is ahead. `a_mail_still_failing_after_24_hours_gives_up_and_retry_gives_a_new_window` retries the given-up job and checks it is rescheduled (`retrying`), not given up again. `two_workers_never_send_the_same_mail_twice` starts two workers, waits until both are registered, queues 30 mails, and checks each is sent exactly once and both workers took some (apalis's `get_jobs` takes rows `FOR UPDATE SKIP LOCKED`). `shutdown_finishes_the_mail_in_hand` cancels while a send is in progress and checks the job ends `Done`. `retry_and_delete_refuse_unknown_and_unfinished_jobs` also checks that a `Running` job cannot be deleted. `debug_hides_the_payloads_bodies` covers `SendMail`'s `Debug`. `Scripted` gained a `delay` and a `sent()` count, and the tests stop workers with a `stop` helper that times out after 20 s.
+> - `http::tests::serve_runs_the_mail_worker_and_waits_for_it_on_shutdown` checks that `serve` with the default `[mail]` sends a queued mail, and returns after `shutdown` once the worker has stopped.
+> - `MailConfig::validate` also refuses a blank `mail.smtp.password_env`; the constants `DEFAULT_SMTP_PORT` (587) and `DEFAULT_POSTMARK_STREAM` (`"outbound"`) back the serde defaults. `mail::tests::a_secret_never_reaches_the_error` checks that a Postmark token a header cannot hold is refused without showing it.
 
 Run: `cargo test --lib -- mail::queue`
 Expected: compile errors for `App::mailer` and `App::clock_handle` until Step 11.
