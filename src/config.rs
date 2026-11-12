@@ -53,6 +53,24 @@ pub const DEFAULT_REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60
 /// The default cap on a sign-in code's `--expires`.
 pub const DEFAULT_CODE_MAX_EXPIRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// The default number of live self-issued keys per user.
+pub const DEFAULT_MAX_KEYS_PER_USER: u32 = 20;
+
+/// The most `max_keys_per_user` may be set to.
+pub const MAX_KEYS_PER_USER_LIMIT: u32 = 1000;
+
+/// The default console session idle timeout.
+pub const DEFAULT_CONSOLE_SESSION_IDLE: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// The default console session absolute lifetime.
+pub const DEFAULT_CONSOLE_SESSION_ABSOLUTE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The default lifetime of a setup link.
+pub const DEFAULT_SETUP_LINK_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The default lifetime of a password-reset link.
+pub const DEFAULT_RESET_LINK_TTL: Duration = Duration::from_secs(60 * 60);
+
 /// The `[oauth]` section: used only when `public_url` is set.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -84,6 +102,128 @@ impl Default for OAuthConfig {
             cimd_allow_private: false,
         }
     }
+}
+
+/// The `[auth]` section: the defaults for the console's sign-in policy.
+/// The policy keys can be overridden at run time by `server_settings`
+/// (`store::settings`); `trusted_proxy_header` is config-only.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// Whether `/signin` offers email and password.
+    pub password_sign_in: bool,
+    /// Live self-issued keys a user may hold.
+    pub max_keys_per_user: u32,
+    /// The longest expiry a self-issued key may have; `None` is no limit.
+    // humantime_serde reads `Option<Duration>` too: a missing key is `None`.
+    #[serde(with = "humantime_serde")]
+    pub max_key_lifetime: Option<Duration>,
+    /// How long a console session may sit idle (`"12h"`).
+    #[serde(with = "humantime_serde")]
+    pub console_session_idle: Duration,
+    /// How long a console session lasts at most (`"7d"`).
+    #[serde(with = "humantime_serde")]
+    pub console_session_absolute: Duration,
+    /// How long a setup link works (`"24h"`).
+    #[serde(with = "humantime_serde")]
+    pub setup_link_ttl: Duration,
+    /// How long a password-reset link works (`"1h"`).
+    #[serde(with = "humantime_serde")]
+    pub reset_link_ttl: Duration,
+    /// The header whose last hop is the client's address behind a proxy
+    /// (`"x-forwarded-for"`); unset means the peer address (Decision 7).
+    pub trusted_proxy_header: Option<String>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            password_sign_in: true,
+            max_keys_per_user: DEFAULT_MAX_KEYS_PER_USER,
+            max_key_lifetime: None,
+            console_session_idle: DEFAULT_CONSOLE_SESSION_IDLE,
+            console_session_absolute: DEFAULT_CONSOLE_SESSION_ABSOLUTE,
+            setup_link_ttl: DEFAULT_SETUP_LINK_TTL,
+            reset_link_ttl: DEFAULT_RESET_LINK_TTL,
+            trusted_proxy_header: None,
+        }
+    }
+}
+
+impl AuthConfig {
+    /// Checks the values serde cannot.
+    ///
+    /// # Returns
+    /// `Ok(())`, or the problem in words.
+    ///
+    /// # Errors
+    /// A zero or out-of-range duration, `max_keys_per_user` above
+    /// [`MAX_KEYS_PER_USER_LIMIT`], or a `trusted_proxy_header` that is not
+    /// an HTTP header name.
+    fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("auth.console_session_idle", self.console_session_idle),
+            (
+                "auth.console_session_absolute",
+                self.console_session_absolute,
+            ),
+            ("auth.setup_link_ttl", self.setup_link_ttl),
+            ("auth.reset_link_ttl", self.reset_link_ttl),
+        ] {
+            check_auth_duration(name, value)?;
+        }
+        if let Some(lifetime) = self.max_key_lifetime {
+            check_auth_duration("auth.max_key_lifetime", lifetime)?;
+        }
+        if self.max_keys_per_user > MAX_KEYS_PER_USER_LIMIT {
+            return Err(format!(
+                "auth.max_keys_per_user must be at most {MAX_KEYS_PER_USER_LIMIT}"
+            ));
+        }
+        if let Some(header) = self.trusted_proxy_header.as_deref() {
+            // The same parser axum uses for request headers; it refuses an
+            // empty name too.
+            if axum::http::HeaderName::from_bytes(header.as_bytes()).is_err() {
+                return Err(format!(
+                    "auth.trusted_proxy_header {header:?} is not an HTTP header name"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The longest `[auth]` or `[oauth]` lifetime the config and settings
+/// accept: ten years, in humantime's own year (365.25 days), so
+/// `"10years"` is accepted exactly. It is far inside `DateTime<Utc>`'s
+/// calendar range: added to any real `now` it is always a valid
+/// timestamp, so a lifetime that passed the check can never make
+/// `clock::after` fail.
+pub const MAX_AUTH_DURATION: Duration = Duration::from_secs(10 * 31_557_600);
+
+/// Checks one lifetime setting: above zero and at most
+/// [`MAX_AUTH_DURATION`]. Shared by the config file (`[oauth]` and
+/// `[auth]`) and `store::settings` (both when a value is set and when a
+/// stored one is loaded), so a value is accepted or refused the same way
+/// everywhere.
+///
+/// # Arguments
+/// * `name` - the key, for the message.
+/// * `value` - the duration.
+///
+/// # Returns
+/// `Ok(())`, or the problem in words.
+///
+/// # Errors
+/// A zero duration, or one longer than [`MAX_AUTH_DURATION`].
+pub(crate) fn check_auth_duration(name: &str, value: Duration) -> Result<(), String> {
+    if value.is_zero() {
+        return Err(format!("{name} must be more than zero"));
+    }
+    if value > MAX_AUTH_DURATION {
+        return Err(format!("{name} must be at most 10 years"));
+    }
+    Ok(())
 }
 
 /// Settings read from the configuration file.
@@ -140,6 +280,8 @@ pub struct Config {
     pub public_url: Option<String>,
     /// The OAuth settings (`[oauth]`).
     pub oauth: OAuthConfig,
+    /// The console sign-in policy defaults (`[auth]`).
+    pub auth: AuthConfig,
 }
 
 impl Default for Config {
@@ -160,6 +302,7 @@ impl Default for Config {
             overlay_cache_size: DEFAULT_OVERLAY_CACHE_SIZE,
             public_url: None,
             oauth: OAuthConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -222,7 +365,8 @@ impl Config {
     /// `time_server` or one with surrounding whitespace (which the lookup
     /// would fail on every check, seen only as a `warn`), or a zero
     /// `database_max_connections` or `overlay_cache_size`, a zero OAuth
-    /// lifetime, or a `public_url` that is not an `https` origin (`http` on
+    /// lifetime, an `[auth]` value out of range (see `AuthConfig`), or a
+    /// `public_url` that is not an `https` origin (`http` on
     /// a loopback host only) whose host `allowed_hosts` admits.
     pub fn validate(&self) -> Result<(), String> {
         if self.poll_interval.is_zero() {
@@ -280,13 +424,9 @@ impl Config {
             ("oauth.refresh_token_ttl", self.oauth.refresh_token_ttl),
             ("oauth.code_max_expiry", self.oauth.code_max_expiry),
         ] {
-            if value.is_zero() {
-                return Err(format!("{name} must be more than zero"));
-            }
-            if chrono::Duration::from_std(value).is_err() {
-                return Err(format!("{name} exceeds supported duration"));
-            }
+            check_auth_duration(name, value)?;
         }
+        self.auth.validate()?;
         self.validate_public_url()
     }
 
@@ -699,5 +839,94 @@ mod tests {
 
             assert!(error.contains("more than zero"), "{error}");
         }
+    }
+
+    #[test]
+    fn auth_defaults_match_the_spec() {
+        let auth = Config::from_toml("").unwrap().auth;
+
+        assert_eq!(auth, AuthConfig::default());
+        assert!(auth.password_sign_in);
+        assert_eq!(auth.max_keys_per_user, 20);
+        assert_eq!(auth.max_key_lifetime, None);
+        assert_eq!(auth.console_session_idle, Duration::from_secs(12 * 60 * 60));
+        assert_eq!(
+            auth.console_session_absolute,
+            Duration::from_secs(7 * 24 * 60 * 60)
+        );
+        assert_eq!(auth.setup_link_ttl, Duration::from_secs(24 * 60 * 60));
+        assert_eq!(auth.reset_link_ttl, Duration::from_secs(60 * 60));
+        assert_eq!(auth.trusted_proxy_header, None);
+    }
+
+    #[test]
+    fn every_auth_key_reads_from_the_file() {
+        let text = "[auth]\n\
+                    password_sign_in = false\n\
+                    max_keys_per_user = 5\n\
+                    max_key_lifetime = \"90d\"\n\
+                    console_session_idle = \"30m\"\n\
+                    console_session_absolute = \"1d\"\n\
+                    setup_link_ttl = \"2d\"\n\
+                    reset_link_ttl = \"15m\"\n\
+                    trusted_proxy_header = \"x-forwarded-for\"\n";
+
+        let config = Config::from_toml(text).unwrap();
+        let auth = &config.auth;
+
+        assert_eq!(config.validate(), Ok(()));
+        assert!(!auth.password_sign_in);
+        assert_eq!(auth.max_keys_per_user, 5);
+        assert_eq!(
+            auth.max_key_lifetime,
+            Some(Duration::from_secs(90 * 24 * 60 * 60))
+        );
+        assert_eq!(auth.console_session_idle, Duration::from_secs(30 * 60));
+        assert_eq!(
+            auth.console_session_absolute,
+            Duration::from_secs(24 * 60 * 60)
+        );
+        assert_eq!(auth.setup_link_ttl, Duration::from_secs(2 * 24 * 60 * 60));
+        assert_eq!(auth.reset_link_ttl, Duration::from_secs(15 * 60));
+        assert_eq!(
+            auth.trusted_proxy_header.as_deref(),
+            Some("x-forwarded-for")
+        );
+    }
+
+    #[test]
+    fn auth_values_that_would_break_sign_in_are_refused() {
+        let refused = [
+            "[auth]\nconsole_session_idle = \"0s\"\n",
+            "[auth]\nconsole_session_absolute = \"0s\"\n",
+            "[auth]\nsetup_link_ttl = \"0s\"\n",
+            "[auth]\nreset_link_ttl = \"0s\"\n",
+            "[auth]\nmax_key_lifetime = \"0s\"\n",
+            "[auth]\nreset_link_ttl = \"300000000years\"\n",
+            "[auth]\nconsole_session_absolute = \"1000000years\"\n",
+            "[auth]\nsetup_link_ttl = \"10years 1s\"\n",
+            "[oauth]\nrefresh_token_ttl = \"1000000years\"\n",
+            "[auth]\nmax_keys_per_user = 1001\n",
+            "[auth]\ntrusted_proxy_header = \"not a header\"\n",
+            "[auth]\ntrusted_proxy_header = \"\"\n",
+        ];
+
+        for text in refused {
+            let config = Config::from_toml(text).unwrap();
+            assert!(config.validate().is_err(), "{text}");
+        }
+        let at_the_limit = Config::from_toml("[auth]\nmax_keys_per_user = 1000\n").unwrap();
+        assert_eq!(at_the_limit.validate(), Ok(()));
+        let longest =
+            Config::from_toml("[auth]\nconsole_session_absolute = \"10years\"\n").unwrap();
+        assert_eq!(longest.validate(), Ok(()));
+        let too_long = Config::from_toml("[auth]\nconsole_session_absolute = \"1000000years\"\n")
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(
+            too_long.contains("auth.console_session_absolute") && too_long.contains("10 years"),
+            "{too_long}"
+        );
     }
 }

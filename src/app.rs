@@ -26,7 +26,8 @@ use crate::overlay::Overlays;
 use crate::store::oauth::{
     clients as oauth_clients, codes as sign_in_codes, tokens as oauth_tokens,
 };
-use crate::store::{catalogs, changesets, email_tokens, sign_in_events};
+use crate::store::settings::{self, Settings};
+use crate::store::{catalogs, changesets, email_tokens, sign_in_events, user_sessions};
 
 /// Every loaded catalog, by name (a `BTreeMap`, so iteration is in name
 /// order, like `catalog list`).
@@ -76,6 +77,10 @@ pub struct App {
     // The `admin_generation` the key cache was loaded at. Written only under
     // `polling`, so `Relaxed` ordering is enough.
     admin_generation: AtomicI64,
+    // The effective sign-in policy (`[auth]` with `server_settings`
+    // overrides), reloaded with the key cache whenever `admin_generation`
+    // moves. As with `catalogs`, the lock is held only to clone or swap.
+    settings: RwLock<Arc<Settings>>,
     // Held for a whole `poll` pass. Without it, two overlapping passes (the
     // loop and a test's or a later milestone's direct call) could swap an
     // older key list in after a newer one while storing the newer counter,
@@ -95,7 +100,8 @@ pub struct App {
 }
 
 impl App {
-    /// Loads the key cache and every catalog's snapshot.
+    /// Loads the key cache, the effective settings and every catalog's
+    /// snapshot.
     ///
     /// A catalog whose snapshot fails to build is logged and left out, as
     /// [`App::poll`] does, and a later poll tries it again (see there for
@@ -110,7 +116,8 @@ impl App {
     /// The shared state.
     ///
     /// # Errors
-    /// [`OkfError::Database`] reading the counter, the keys or the list;
+    /// [`OkfError::Database`] reading the counter, the keys, the settings or
+    /// the list;
     /// [`OkfError::Config`] from [`OAuth::new`].
     pub async fn load(
         pool: PgPool,
@@ -122,6 +129,7 @@ impl App {
         let admin_generation = catalogs::admin_generation(&pool).await?;
         // `clock` moves into `Self` below, so the key cache gets its own handle.
         let keys = Arc::new(Keys::load(&pool, Arc::clone(&clock)).await?);
+        let settings = settings::load(&pool, &config.auth).await?;
         let mut loaded = Catalogs::new();
         let mut broken = Broken::new();
         for row in catalogs::list(&pool).await? {
@@ -153,6 +161,7 @@ impl App {
             write_queue: KeyedLocks::new(),
             catalogs: RwLock::new(Arc::new(loaded)),
             admin_generation: AtomicI64::new(admin_generation),
+            settings: RwLock::new(Arc::new(settings)),
             polling: tokio::sync::Mutex::new(broken),
             clock_status: RwLock::new(None),
             oauth,
@@ -178,6 +187,15 @@ impl App {
     /// The key cache (shared with the auth layer).
     pub fn keys(&self) -> &Arc<Keys> {
         &self.keys
+    }
+
+    /// The effective sign-in policy, as of the last key reload. Request
+    /// handlers read it here, never from `server_settings`.
+    ///
+    /// # Returns
+    /// A shared snapshot (cheap: an `Arc` clone, one atomic increment).
+    pub fn settings(&self) -> Arc<Settings> {
+        Arc::clone(&self.settings.read().expect("settings lock poisoned"))
     }
 
     /// Which key opened each MCP session (the `/mcp` session binding).
@@ -256,8 +274,8 @@ impl App {
         self.catalogs().get(name).cloned()
     }
 
-    /// One pass of the poll loop: reloads the key cache if `admin_generation`
-    /// moved, and brings the catalogs in line with the catalog list. Between
+    /// One pass of the poll loop: reloads the key cache and the settings if
+    /// `admin_generation` moved, and brings the catalogs in line with the catalog list. Between
     /// the two, it discards empty changesets unchanged for 24 hours (design
     /// "Session lifecycle"), so that runs on every pass, even one whose
     /// catalog list then fails; a prune failure is logged and retried at the
@@ -336,7 +354,8 @@ impl App {
         Ok(())
     }
 
-    /// Reloads the key cache if `admin_generation` moved since it was loaded.
+    /// Reloads the key cache and the settings if `admin_generation` moved
+    /// since they were loaded.
     /// Called only under `polling`.
     ///
     /// Failing to read the counter or to reload is logged, not returned: the
@@ -353,12 +372,23 @@ impl App {
         if admin_generation == self.admin_generation.load(Ordering::Relaxed) {
             return;
         }
-        match self.keys.reload(&self.pool).await {
+        // An async block lets `?` stop at the first failure; either way the
+        // counter is stored only when both were reloaded, so a failure is
+        // retried at the next pass. A stored setting this server cannot
+        // read is not a failure: `settings::load` falls back to the default.
+        let reloaded = async {
+            self.keys.reload(&self.pool).await?;
+            let settings = settings::load(&self.pool, &self.config.auth).await?;
+            *self.settings.write().expect("settings lock poisoned") = Arc::new(settings);
+            Ok::<(), OkfError>(())
+        }
+        .await;
+        match reloaded {
             Ok(()) => self
                 .admin_generation
                 .store(admin_generation, Ordering::Relaxed),
             Err(error) => {
-                tracing::error!(%error, "key reload failed; retrying at the next poll");
+                tracing::error!(%error, "key or settings reload failed; retrying at the next poll");
             }
         }
     }
@@ -383,10 +413,10 @@ impl App {
     /// At most once per [`OAUTH_PRUNE_EVERY`], deletes expired OAuth tokens
     /// and unredeemed codes kept [`OAUTH_RETENTION_DAYS`] past their expiry,
     /// registered clients no grant names after [`UNBOUND_CLIENT_HOURS`],
-    /// sign-in events older than [`SIGN_IN_EVENT_RETENTION_DAYS`] and emailed
-    /// links [`OAUTH_RETENTION_DAYS`] past their expiry. Runs whether or not
-    /// OAuth is on, so rows left from when it was are cleared too. Called
-    /// only under `polling`.
+    /// sign-in events older than [`SIGN_IN_EVENT_RETENTION_DAYS`], emailed
+    /// links [`OAUTH_RETENTION_DAYS`] past their expiry and console sessions
+    /// past their absolute limit. Runs whether or not OAuth is on, so rows
+    /// left from when it was are cleared too. Called only under `polling`.
     ///
     /// A failure is logged, not returned, and waits for the next hourly pass.
     async fn prune_oauth(&self) {
@@ -428,6 +458,10 @@ impl App {
         log_pruned(
             "expired emailed links",
             email_tokens::prune(&self.pool, retained).await,
+        );
+        log_pruned(
+            "expired console sessions",
+            user_sessions::prune(&self.pool, now).await,
         );
     }
 
@@ -906,6 +940,111 @@ mod tests {
         app.poll().await.unwrap();
 
         assert_eq!(names(&app), ["work"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_settings_change_reaches_the_running_app_at_the_next_poll() {
+        let db = test_db().await;
+        let app = app(&db.pool).await;
+        assert_eq!(app.settings().max_keys_per_user, 20);
+
+        settings::set(
+            &db.pool,
+            settings::SettingKey::MaxKeysPerUser,
+            "5",
+            "tester",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let before_poll = app.settings().max_keys_per_user;
+        app.poll().await.unwrap();
+        let after_set = app.settings().max_keys_per_user;
+        settings::reset(&db.pool, settings::SettingKey::MaxKeysPerUser)
+            .await
+            .unwrap();
+        app.poll().await.unwrap();
+
+        assert_eq!(before_poll, 20, "read from memory, not per call");
+        assert_eq!(after_set, 5);
+        assert_eq!(app.settings().max_keys_per_user, 20, "reset reaches it too");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreadable_stored_setting_never_stops_the_server() {
+        let db = test_db().await;
+        // A value a newer server (or a hand edit) wrote that this one cannot
+        // read, there before the server starts...
+        sqlx::query(
+            "INSERT INTO server_settings (key, value, updated_at, updated_by) \
+             VALUES ('console_session_idle', '\"forever\"', now(), 'hand')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let app = app(&db.pool).await;
+        let at_start = app.settings().console_session_idle;
+        // ...and one written while it runs, followed by a generation bump.
+        sqlx::query(
+            "INSERT INTO server_settings (key, value, updated_at, updated_by) \
+             VALUES ('max_keys_per_user', '-3', now(), 'hand')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        settings::set(
+            &db.pool,
+            settings::SettingKey::PasswordSignIn,
+            "off",
+            "tester",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        app.poll().await.unwrap();
+
+        let current = app.settings();
+        assert_eq!(at_start, crate::config::DEFAULT_CONSOLE_SESSION_IDLE);
+        assert_eq!(
+            current.console_session_idle,
+            crate::config::DEFAULT_CONSOLE_SESSION_IDLE
+        );
+        assert_eq!(current.max_keys_per_user, 20);
+        assert!(
+            !current.password_sign_in,
+            "the readable change still applies"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_settings_reload_keeps_the_old_settings_and_retries() {
+        let db = test_db().await;
+        let app = app(&db.pool).await;
+        settings::set(
+            &db.pool,
+            settings::SettingKey::MaxKeysPerUser,
+            "5",
+            "tester",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE server_settings RENAME TO server_settings_away")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        app.poll().await.unwrap();
+        let while_unreadable = app.settings().max_keys_per_user;
+        sqlx::query("ALTER TABLE server_settings_away RENAME TO server_settings")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        // No new bump: the counter was not stored, so this pass reloads.
+        app.poll().await.unwrap();
+
+        assert_eq!(while_unreadable, 20);
+        assert_eq!(app.settings().max_keys_per_user, 5);
     }
 
     #[tokio::test(flavor = "multi_thread")]
