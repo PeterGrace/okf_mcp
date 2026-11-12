@@ -1,6 +1,8 @@
 //! API key rows and their catalog grants. Only a key's SHA-256 is stored;
 //! the key itself is returned once, by [`create`].
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
@@ -102,6 +104,16 @@ pub enum Grants<'a> {
     Catalogs(&'a [String]),
 }
 
+/// One granted catalog of a new key with a level of its own (Decision 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogGrant {
+    /// The catalog's name; it must be among the key's [`Grants::Catalogs`].
+    pub catalog: String,
+    /// Its level, `Read` or `Write` and at most the key's own; `None` is
+    /// the key's own level (stored as NULL).
+    pub access: Option<Access>,
+}
+
 /// A key to create.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NewKey<'a> {
@@ -119,6 +131,14 @@ pub struct NewKey<'a> {
     pub actor: &'a str,
     /// The user it belongs to (must exist).
     pub user: &'a str,
+    /// Made by its user (console self-service), so capped by the user's
+    /// ceiling; `false` for every admin-issued key.
+    pub self_issued: bool,
+    /// When it stops working; `None` never. Must be after `now`.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Levels for some of its catalogs; empty gives every catalog the key's
+    /// own `access`. Only with [`Grants::Catalogs`], never on an admin key.
+    pub levels: &'a [CatalogGrant],
 }
 
 /// A newly issued credential. Its bearer secret is returned only once.
@@ -145,6 +165,9 @@ pub struct KeyRecord {
     pub all_catalogs: bool,
     /// Granted catalogs by name, sorted (empty with `all_catalogs`).
     pub catalogs: Vec<String>,
+    /// Each granted catalog's level: its row's own, else the key's
+    /// `access` (empty with `all_catalogs`).
+    pub catalog_access: BTreeMap<String, Access>,
     /// Its default catalog.
     pub default_catalog: Option<String>,
     /// The actor its writes are recorded as.
@@ -153,6 +176,8 @@ pub struct KeyRecord {
     pub created_at: DateTime<Utc>,
     /// When it was revoked; a revoked key authenticates nothing.
     pub revoked_at: Option<DateTime<Utc>>,
+    /// When it stops working; `None` never.
+    pub expires_at: Option<DateTime<Utc>>,
     /// An API key or an OAuth grant.
     pub kind: KeyKind,
     /// A grant's OAuth client (`None` for a key, or once the client is gone).
@@ -162,6 +187,10 @@ pub struct KeyRecord {
     /// The user it belongs to; `None` for a row from before migration 0009
     /// that no admin has assigned yet.
     pub user: Option<String>,
+    /// That user's id (`users.id`), for the ceiling; never shown by the API.
+    pub user_id: Option<String>,
+    /// Made by its user, so capped by the user's ceiling.
+    pub self_issued: bool,
 }
 
 /// The row as selected, before `access` is parsed.
@@ -182,6 +211,10 @@ struct KeyRow {
     client_id: Option<String>,
     client_name: Option<String>,
     user: Option<String>,
+    levels: Vec<String>,
+    expires_at: Option<DateTime<Utc>>,
+    user_id: Option<String>,
+    self_issued: bool,
 }
 
 /// Is `name` valid under the schema's `api_keys_name_check` constraint? Sign-in
@@ -199,20 +232,127 @@ pub(crate) fn is_valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// Refuses a self-issued key that breaks Decision 3's rules, as a 422
+/// naming the rule (the schema's `api_keys_self_issued_caps` would only
+/// fail as a 500).
+///
+/// # Arguments
+/// * `new` - the key to create.
+///
+/// # Errors
+/// [`OkfError::LimitExceeded`] for a self-issued key granted every catalog,
+/// with `admin` access, or reporting maintenance.
+fn check_self_issued(new: &NewKey<'_>) -> Result<(), OkfError> {
+    if !new.self_issued {
+        return Ok(());
+    }
+    let refusal = if matches!(new.grants, Grants::All) {
+        Some((
+            "all_catalogs",
+            "a self-issued key names its catalogs; it cannot reach every catalog",
+        ))
+    } else if new.access == Access::Admin {
+        Some(("access", "a self-issued key is read or write, never admin"))
+    } else if new.maintenance_report {
+        Some((
+            "maintenance_report",
+            "a self-issued key cannot submit maintenance reports",
+        ))
+    } else {
+        None
+    };
+    match refusal {
+        Some((limit, reason)) => Err(OkfError::LimitExceeded {
+            limit,
+            reason: reason.to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The `key_catalogs.access` value of each name in the key's grants, in
+/// the grants' order: a [`CatalogGrant`]'s level, else NULL (the key's own).
+///
+/// # Arguments
+/// * `new` - the key to create.
+///
+/// # Returns
+/// One entry per granted name (empty for [`Grants::All`]).
+///
+/// # Errors
+/// [`OkfError::Refused`] for levels with [`Grants::All`], levels on an admin
+/// key, a level for a catalog not granted, or a level that is `admin` or
+/// above the key's own.
+fn catalog_levels(new: &NewKey<'_>) -> Result<Vec<Option<&'static str>>, OkfError> {
+    let refused = |reason: String| Err(OkfError::Refused { reason });
+    let names = match new.grants {
+        Grants::Catalogs(names) => names,
+        Grants::All if new.levels.is_empty() => return Ok(Vec::new()),
+        Grants::All => {
+            return refused(format!(
+                "key {:?} is granted every catalog; per-catalog levels need named catalogs",
+                new.name
+            ))
+        }
+    };
+    if new.access == Access::Admin && !new.levels.is_empty() {
+        return refused(format!(
+            "admin key {:?} has admin on every catalog it reaches; give it no per-catalog levels",
+            new.name
+        ));
+    }
+    for level in new.levels {
+        if !names.contains(&level.catalog) {
+            return refused(format!(
+                "a level is given for {:?}, which is not granted to key {:?}",
+                level.catalog, new.name
+            ));
+        }
+        // `is_some_and`: true only for `Some(access)` that passes the test.
+        if level
+            .access
+            .is_some_and(|access| access == Access::Admin || access > new.access)
+        {
+            return refused(format!(
+                "key {:?} has {} access; {:?} can be read or write up to that",
+                new.name,
+                new.access.as_str(),
+                level.catalog
+            ));
+        }
+    }
+    // A handful of catalogs each, so a scan per name is cheaper than a map.
+    Ok(names
+        .iter()
+        .map(|name| {
+            new.levels
+                .iter()
+                .find(|level| &level.catalog == name)
+                .and_then(|level| level.access)
+                .map(Access::as_str)
+        })
+        .collect())
+}
+
 /// Creates a key and its grants, and bumps the administrative generation, in
 /// one transaction.
 ///
 /// # Arguments
 /// * `pool` - the database.
-/// * `new` - the key's name, access, grants, default catalog and actor.
+/// * `new` - the key's name, access, grants (with any per-catalog levels),
+///   default catalog, actor, user, expiry and whether it is self-issued.
 /// * `now` - the creation time (server clock).
 ///
 /// # Returns
 /// The key itself: print it once; it is not stored and cannot be shown again.
 ///
 /// # Errors
-/// [`OkfError::Refused`] for an invalid or taken id, no catalogs, or a default
-/// catalog that is not granted; [`OkfError::CatalogNotSelected`] for an unknown catalog
+/// [`OkfError::Refused`] for an invalid or taken id, no catalogs, a default
+/// catalog that is not granted, an expiry not after `now`, or per-catalog
+/// levels with every catalog, on an admin key, for a catalog not granted, or
+/// above the key's own level; [`OkfError::LimitExceeded`]
+/// for a self-issued key granted every catalog, admin or reporting
+/// maintenance; [`OkfError::CatalogNotSelected`] for an unknown catalog
 /// (granted or default); [`OkfError::UnknownName`] for an unknown user;
 /// [`OkfError::Io`] if the OS random source fails; [`OkfError::Database`]
 /// otherwise.
@@ -247,6 +387,13 @@ pub async fn create_with_id(
             ),
         });
     }
+    check_self_issued(new)?;
+    let levels = catalog_levels(new)?;
+    if new.expires_at.is_some_and(|expires_at| expires_at <= now) {
+        return Err(OkfError::Refused {
+            reason: format!("key {:?} would expire before it is created", new.name),
+        });
+    }
     let mut tx = pool.begin().await?;
     let (granted, default_catalog_id) =
         resolve_grants(&mut tx, "key", new.name, new.grants, new.default_catalog).await?;
@@ -257,8 +404,8 @@ pub async fn create_with_id(
     let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO api_keys \
          (name, sha256, access, maintenance_report, all_catalogs, default_catalog_id, actor, \
-          created_at, user_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+          created_at, user_id, self_issued, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
     )
     .bind(new.name)
     .bind(crate::keys::hash(&key).as_slice())
@@ -269,6 +416,8 @@ pub async fn create_with_id(
     .bind(new.actor)
     .bind(now)
     .bind(&user_id)
+    .bind(new.self_issued)
+    .bind(new.expires_at)
     .fetch_one(&mut *tx)
     .await;
     // Only the live name/actor constraint is a user-facing duplicate. A
@@ -292,14 +441,17 @@ pub async fn create_with_id(
         }
         Err(error) => return Err(error.into()),
     };
-    // One statement for every grant: `unnest` turns the bound array into rows.
-    // A name given twice is one grant (`ON CONFLICT DO NOTHING`).
+    // One statement for every grant: `unnest` of two arrays of equal length
+    // gives one row per (catalog id, level) pair. A name given twice is one
+    // grant (`ON CONFLICT DO NOTHING`); a NULL level is the key's own.
     sqlx::query(
-        "INSERT INTO key_catalogs (key_id, catalog_id) \
-         SELECT $1, unnest($2::bigint[]) ON CONFLICT DO NOTHING",
+        "INSERT INTO key_catalogs (key_id, catalog_id, access) \
+         SELECT $1, g.id, g.access FROM unnest($2::bigint[], $3::text[]) AS g (id, access) \
+         ON CONFLICT DO NOTHING",
     )
     .bind(&id)
     .bind(&granted)
+    .bind(&levels)
     .execute(&mut *tx)
     .await?;
     bump_admin_generation(&mut tx).await?;
@@ -434,12 +586,18 @@ pub(crate) async fn resolve_grants(
 /// # Errors
 /// [`OkfError::Database`].
 pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
+    // `levels` is aggregated in the same order as `catalogs`, so the two
+    // arrays pair up; `COALESCE(g.access, k.access)` resolves a NULL level
+    // to the key's own.
     let rows = sqlx::query_as::<_, KeyRow>(
         "SELECT k.id, k.name, k.sha256, k.access, k.maintenance_report, k.all_catalogs, \
-                d.name AS default_catalog, k.actor, k.created_at, k.revoked_at, \
-                k.kind, k.client_id, oc.client_name, u.name AS user, \
+                d.name AS default_catalog, k.actor, k.created_at, k.revoked_at, k.expires_at, \
+                k.kind, k.client_id, oc.client_name, u.name AS user, k.user_id, k.self_issued, \
                 COALESCE(array_agg(c.name ORDER BY c.name) FILTER (WHERE c.name IS NOT NULL), \
-                         '{}'::text[]) AS catalogs \
+                         '{}'::text[]) AS catalogs, \
+                COALESCE(array_agg(COALESCE(g.access, k.access) ORDER BY c.name) \
+                             FILTER (WHERE c.name IS NOT NULL), \
+                         '{}'::text[]) AS levels \
          FROM api_keys k \
          LEFT JOIN catalogs d ON d.id = k.default_catalog_id \
          LEFT JOIN oauth_clients oc ON oc.client_id = k.client_id \
@@ -452,22 +610,36 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
     .await?;
     Ok(rows
         .into_iter()
-        .map(|row| KeyRecord {
-            id: row.id,
-            name: row.name,
-            sha256: row.sha256,
-            access: Access::parse(&row.access).expect("the schema checks api_keys.access"),
-            maintenance_report: row.maintenance_report,
-            all_catalogs: row.all_catalogs,
-            catalogs: row.catalogs,
-            default_catalog: row.default_catalog,
-            actor: row.actor,
-            created_at: row.created_at,
-            revoked_at: row.revoked_at,
-            kind: KeyKind::parse(&row.kind).expect("the schema checks api_keys.kind"),
-            client_id: row.client_id,
-            client_name: row.client_name,
-            user: row.user,
+        .map(|row| {
+            let catalog_access = row
+                .catalogs
+                .iter()
+                .cloned()
+                .zip(row.levels.iter().map(|level| {
+                    Access::parse(level).expect("the schema checks key_catalogs.access")
+                }))
+                .collect();
+            KeyRecord {
+                id: row.id,
+                name: row.name,
+                sha256: row.sha256,
+                access: Access::parse(&row.access).expect("the schema checks api_keys.access"),
+                maintenance_report: row.maintenance_report,
+                all_catalogs: row.all_catalogs,
+                catalogs: row.catalogs,
+                catalog_access,
+                default_catalog: row.default_catalog,
+                actor: row.actor,
+                created_at: row.created_at,
+                revoked_at: row.revoked_at,
+                expires_at: row.expires_at,
+                kind: KeyKind::parse(&row.kind).expect("the schema checks api_keys.kind"),
+                client_id: row.client_id,
+                client_name: row.client_name,
+                user: row.user,
+                user_id: row.user_id,
+                self_issued: row.self_issued,
+            }
         })
         .collect())
 }
@@ -477,8 +649,10 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
 /// disambiguates a name, not an id. An unchanged value does not reload caches.
 ///
 /// # Errors
-/// [`OkfError::Refused`] for a revoked, absent or ambiguous key;
-/// [`OkfError::Database`] for storage failures.
+/// [`OkfError::Refused`] for a revoked, absent or ambiguous key, or for
+/// turning reporting on for an OAuth grant; [`OkfError::LimitExceeded`]
+/// (`maintenance_report`) for turning it on for a self-issued key, as at
+/// creation; [`OkfError::Database`] for storage failures.
 pub async fn set_maintenance_report_target(
     pool: &PgPool,
     target: &str,
@@ -512,18 +686,32 @@ async fn set_maintenance_report_with(
     let mut tx = pool.begin().await?;
     let id = select(&mut tx, selector).await?;
     if enabled {
-        // An OAuth grant never reports (the schema's `api_keys_oauth_caps`):
-        // refuse it here as a 409 instead of letting the CHECK fail as a 500.
-        let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM api_keys WHERE id = $1")
-            .bind(&id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if kind.as_deref() == Some(KeyKind::OAuth.as_str()) {
-            return Err(OkfError::Refused {
-                reason: format!(
-                    "key {id:?} is an OAuth grant, which cannot submit maintenance reports"
-                ),
-            });
+        // An OAuth grant and a self-issued key never report (the schema's
+        // `api_keys_oauth_caps` and `api_keys_self_issued_caps`): refuse them
+        // here, as `create_with_id` does, instead of letting a CHECK fail as
+        // a 500. `query_as` with a tuple reads both columns of the one row.
+        let caps: Option<(String, bool)> =
+            sqlx::query_as("SELECT kind, self_issued FROM api_keys WHERE id = $1")
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        // `if let Some((kind, self_issued)) = ...`: destructure the row, if any.
+        if let Some((kind, self_issued)) = caps {
+            if kind == KeyKind::OAuth.as_str() {
+                return Err(OkfError::Refused {
+                    reason: format!(
+                        "key {id:?} is an OAuth grant, which cannot submit maintenance reports"
+                    ),
+                });
+            }
+            if self_issued {
+                return Err(OkfError::LimitExceeded {
+                    limit: "maintenance_report",
+                    reason: format!(
+                        "key {id:?} is self-issued, so it cannot submit maintenance reports"
+                    ),
+                });
+            }
         }
     }
     let updated = sqlx::query(
@@ -1006,6 +1194,9 @@ mod tests {
             default_catalog: default,
             actor: "claude-code/test",
             user: crate::db::TEST_USER,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
         }
     }
 
@@ -1285,6 +1476,9 @@ mod tests {
             default_catalog: None,
             actor: "claude-code-tui",
             user: crate::db::TEST_USER,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
         };
         let web = NewKey {
             actor: "claude-ai-web",
@@ -1383,17 +1577,17 @@ mod tests {
                 .expect("a key row has a hash"),
             &replacement.key
         ));
-        let cache = crate::auth::KeyCache::from_records(records);
+        let cache = crate::auth::KeyCache::from_records(records, now());
         assert!(
-            cache.find(&first.key).is_none(),
+            cache.find(&first.key, now()).is_none(),
             "the revoked key is refused"
         );
         assert!(
-            cache.find(&second.key).is_some(),
+            cache.find(&second.key, now()).is_some(),
             "the other actor still works"
         );
         assert!(
-            cache.find(&replacement.key).is_some(),
+            cache.find(&replacement.key, now()).is_some(),
             "the reissued key works"
         );
     }
@@ -1415,6 +1609,9 @@ mod tests {
                 default_catalog: None,
                 actor: "first",
                 user: crate::db::TEST_USER,
+                self_issued: false,
+                expires_at: None,
+                levels: &[],
             },
             now(),
         )
@@ -1428,6 +1625,9 @@ mod tests {
             default_catalog: None,
             actor: "second",
             user: crate::db::TEST_USER,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
         };
         create(&db.pool, &collision, now()).await.unwrap();
 
@@ -1528,6 +1728,9 @@ mod tests {
                 default_catalog: None,
                 actor: "web",
                 user: crate::db::TEST_USER,
+                self_issued: false,
+                expires_at: None,
+                levels: &[],
             },
             now(),
         )
@@ -1562,6 +1765,9 @@ mod tests {
                 default_catalog: None,
                 actor: "terminal",
                 user: crate::db::TEST_USER,
+                self_issued: false,
+                expires_at: None,
+                levels: &[],
             },
             now(),
         )
@@ -1889,5 +2095,248 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(record(&db.pool, "legacy").await.user, None);
+    }
+
+    /// The `key_catalogs.access` of each of key `id`'s grants, by catalog name.
+    async fn stored_levels(pool: &PgPool, id: &str) -> Vec<(String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT c.name, g.access FROM key_catalogs g JOIN catalogs c ON c.id = g.catalog_id \
+             WHERE g.key_id = $1 ORDER BY c.name",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_has_a_level_per_catalog_and_a_new_grant_takes_the_keys_own() {
+        let db = test_db().await;
+        for name in ["pg", "work", "docs"] {
+            catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, now())
+                .await
+                .unwrap();
+        }
+        let names = ["pg".to_string(), "work".to_string()];
+        let read_work = [CatalogGrant {
+            catalog: "work".to_string(),
+            access: Some(Access::Read),
+        }];
+        let new = NewKey {
+            levels: &read_work,
+            ..new_key("mixed", Grants::Catalogs(&names), None)
+        };
+
+        let created = create_with_id(&db.pool, &new, now()).await.unwrap();
+        grant_by_id(&db.pool, &created.id, "docs").await.unwrap();
+
+        assert_eq!(
+            stored_levels(&db.pool, &created.id).await,
+            [
+                ("docs".to_string(), None),
+                ("pg".to_string(), None),
+                ("work".to_string(), Some("read".to_string())),
+            ]
+        );
+        let listed = record(&db.pool, &created.id).await;
+        assert_eq!(listed.catalogs, ["docs", "pg", "work"]);
+        assert_eq!(
+            listed.catalog_access,
+            BTreeMap::from([
+                ("docs".to_string(), Access::Write),
+                ("pg".to_string(), Access::Write),
+                ("work".to_string(), Access::Read),
+            ])
+        );
+        assert!(!listed.self_issued);
+        assert_eq!(listed.expires_at, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn levels_are_refused_outside_the_grants_above_the_key_or_on_an_admin_key() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
+        let names = ["pg".to_string()];
+        let level = |catalog: &str, access: Access| CatalogGrant {
+            catalog: catalog.to_string(),
+            access: Some(access),
+        };
+        let outside = [level("work", Access::Read)];
+        let above = [level("pg", Access::Write)];
+        let admin_level = [level("pg", Access::Admin)];
+        let read_pg = [level("pg", Access::Read)];
+        let cases = [
+            NewKey {
+                levels: &outside,
+                ..new_key("outside", Grants::Catalogs(&names), None)
+            },
+            NewKey {
+                access: Access::Read,
+                levels: &above,
+                ..new_key("above", Grants::Catalogs(&names), None)
+            },
+            NewKey {
+                access: Access::Admin,
+                levels: &admin_level,
+                ..new_key("admin", Grants::Catalogs(&names), None)
+            },
+            NewKey {
+                access: Access::Admin,
+                levels: &read_pg,
+                ..new_key("lowered-admin", Grants::Catalogs(&names), None)
+            },
+            NewKey {
+                levels: &read_pg,
+                ..new_key("everything", Grants::All, None)
+            },
+        ];
+
+        for new in cases {
+            let refused = create_with_id(&db.pool, &new, now()).await;
+            assert!(
+                matches!(refused, Err(OkfError::Refused { .. })),
+                "{}: {refused:?}",
+                new.name
+            );
+        }
+        assert!(
+            list(&db.pool).await.unwrap().is_empty(),
+            "nothing was stored"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_self_issued_key_names_its_catalogs_and_is_never_admin_or_a_reporter() {
+        let db = test_db().await;
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
+        let names = ["pg".to_string()];
+        let mine = NewKey {
+            self_issued: true,
+            expires_at: Some(now() + chrono::TimeDelta::days(30)),
+            ..new_key("mine", Grants::Catalogs(&names), None)
+        };
+        let refusals = [
+            (
+                "all_catalogs",
+                NewKey {
+                    grants: Grants::All,
+                    name: "all",
+                    ..mine
+                },
+            ),
+            (
+                "access",
+                NewKey {
+                    access: Access::Admin,
+                    name: "admin",
+                    ..mine
+                },
+            ),
+            (
+                "maintenance_report",
+                NewKey {
+                    maintenance_report: true,
+                    name: "reporter",
+                    ..mine
+                },
+            ),
+        ];
+
+        for (limit, new) in refusals {
+            let refused = create_with_id(&db.pool, &new, now()).await;
+            // `&refused`: match by reference, so `refused` is still there to print.
+            assert!(
+                matches!(&refused, Err(OkfError::LimitExceeded { limit: named, .. }) if *named == limit),
+                "{limit}: {refused:?}"
+            );
+        }
+        let created = create_with_id(&db.pool, &mine, now()).await.unwrap();
+
+        let listed = record(&db.pool, &created.id).await;
+        let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
+            .bind(crate::db::TEST_USER)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(listed.self_issued);
+        assert_eq!(listed.user_id.as_deref(), Some(user_id.as_str()));
+        assert_eq!(listed.expires_at, Some(now() + chrono::TimeDelta::days(30)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expiry_that_has_passed_is_refused() {
+        let db = test_db().await;
+        let new = NewKey {
+            expires_at: Some(now()),
+            ..new_key("late", Grants::All, None)
+        };
+
+        let refused = create_with_id(&db.pool, &new, now()).await;
+
+        assert!(
+            matches!(refused, Err(OkfError::Refused { .. })),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_self_issued_key_stays_within_its_rules_after_creation() {
+        let db = test_db().await;
+        for name in ["pg", "work"] {
+            catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, now())
+                .await
+                .unwrap();
+        }
+        let names = ["pg".to_string()];
+        let mine = NewKey {
+            self_issued: true,
+            ..new_key("mine", Grants::Catalogs(&names), None)
+        };
+        let created = create_with_id(&db.pool, &mine, now()).await.unwrap();
+        let generation = catalogs::admin_generation(&db.pool).await.unwrap();
+
+        // Reporting is refused by id (the web API) and by name (the CLI) as
+        // the rule it breaks, never as the schema's CHECK failing.
+        let by_id = set_maintenance_report_by_id(&db.pool, &created.id, true).await;
+        let by_name = set_maintenance_report_target(&db.pool, "mine", None, true).await;
+        // Turning it off is allowed (and a no-op).
+        let off = set_maintenance_report_by_id(&db.pool, &created.id, false).await;
+        // Granting and removing a catalog keep it within the rules: a new
+        // grant takes the key's own level (write, never admin).
+        let granted = grant_by_id(&db.pool, &created.id, "work").await;
+        let ungranted = ungrant_by_id(&db.pool, &created.id, "pg").await;
+
+        for refused in [&by_id, &by_name] {
+            assert!(
+                matches!(
+                    refused,
+                    Err(OkfError::LimitExceeded {
+                        limit: "maintenance_report",
+                        ..
+                    })
+                ),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(off.unwrap(), created.id);
+        assert_eq!(granted.unwrap(), created.id);
+        assert_eq!(ungranted.unwrap(), created.id);
+        let listed = record(&db.pool, &created.id).await;
+        assert!(listed.self_issued);
+        assert!(!listed.maintenance_report, "the flag stays off");
+        assert!(!listed.all_catalogs);
+        assert_eq!(
+            listed.catalog_access,
+            BTreeMap::from([("work".to_string(), Access::Write)])
+        );
+        assert_eq!(
+            catalogs::admin_generation(&db.pool).await.unwrap(),
+            generation + 2,
+            "only the grant and the ungrant changed anything"
+        );
     }
 }

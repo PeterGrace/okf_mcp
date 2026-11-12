@@ -724,6 +724,9 @@ async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyho
                 default_catalog: args.default.as_deref(),
                 actor: args.actor.as_deref().unwrap_or(&args.name),
                 user: &args.user,
+                self_issued: false,
+                expires_at: None,
+                levels: &[],
             };
             let created = keys::create_with_id(pool, &new, clock.now()).await?;
             println!("{}", created.key);
@@ -1426,14 +1429,21 @@ mod tests {
             maintenance_report: false,
             all_catalogs: false,
             catalogs: vec!["pg".to_string(), "work".to_string()],
+            catalog_access: [("pg", Access::Write), ("work", Access::Write)]
+                .into_iter()
+                .map(|(name, level)| (name.to_string(), level))
+                .collect(),
             default_catalog: Some("pg".to_string()),
             actor: "claude-code-tui".to_string(),
             created_at: chrono::Utc::now(),
             revoked_at: None,
+            expires_at: None,
             kind: keys::KeyKind::Key,
             client_id: None,
             client_name: None,
             user: None,
+            user_id: None,
+            self_issued: false,
         };
         let assigned = keys::KeyRecord {
             user: Some("alice".to_string()),
@@ -1700,6 +1710,9 @@ mod tests {
                 default_catalog: None,
                 actor: "example-actor",
                 user: crate::db::TEST_USER,
+                self_issued: false,
+                expires_at: None,
+                levels: &[],
             },
             clock.now(),
         )

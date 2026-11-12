@@ -840,6 +840,9 @@ mod tests {
                     default_catalog: None,
                     actor: name,
                     user: "alice",
+                    self_issued: false,
+                    expires_at: None,
+                    levels: &[],
                 },
                 Utc::now(),
             )

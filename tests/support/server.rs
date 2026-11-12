@@ -241,6 +241,9 @@ impl TestServer {
             default_catalog: default,
             actor: id,
             user: OWNER,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
         };
         let key = keys::create(&self.db.pool, &new, Utc::now())
             .await

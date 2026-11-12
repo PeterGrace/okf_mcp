@@ -104,6 +104,9 @@ mod tests {
             default_catalog: None,
             actor: "owned",
             user: TEST_USER,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
         };
         keys::create(&db.pool, &owned, now()).await.unwrap();
         let legacy_code = codes::create(&db.pool, &code("old"), now()).await.unwrap();

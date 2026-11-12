@@ -13,6 +13,7 @@
 //!   `all: true` needs a caller that reaches every catalog;
 //! - no response but `POST /keys` holds a secret, and none holds a hash.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -49,12 +50,19 @@ pub(crate) struct KeyView {
     pub all_catalogs: bool,
     /// Granted catalogs, sorted (empty with `all_catalogs`).
     pub catalogs: Vec<String>,
+    /// Each granted catalog's level (empty with `all_catalogs`).
+    pub catalog_access: BTreeMap<String, &'static str>,
     /// Its default catalog.
     pub default_catalog: Option<String>,
     /// When it was created (`2026-11-09T12:00:00Z`).
     pub created_at: String,
     /// When it was revoked, if it was.
     pub revoked_at: Option<String>,
+    /// When it stops working, if ever.
+    pub expires_at: Option<String>,
+    /// Made by its user in the console (capped by the user's ceiling)
+    /// rather than by an admin.
+    pub self_issued: bool,
     /// The user it belongs to (`None`: unassigned, from before users existed).
     pub user: Option<String>,
 }
@@ -72,15 +80,20 @@ impl From<KeyRecord> for KeyView {
             maintenance_report,
             all_catalogs,
             catalogs,
+            catalog_access,
             default_catalog,
             actor,
             created_at,
             revoked_at,
+            expires_at,
             kind,
             // `client_id: _`: a URL or UUID the console has no use for.
             client_id: _,
             client_name,
             user,
+            // The API names users; their ids stay internal.
+            user_id: _,
+            self_issued,
         } = record;
         Self {
             id,
@@ -92,10 +105,16 @@ impl From<KeyRecord> for KeyView {
             maintenance_report,
             all_catalogs,
             catalogs,
+            catalog_access: catalog_access
+                .into_iter()
+                .map(|(catalog, level)| (catalog, level.as_str()))
+                .collect(),
             default_catalog,
             created_at: format_timestamp(created_at),
             // `Option::map` with a function name applies it to the value, if any.
             revoked_at: revoked_at.map(format_timestamp),
+            expires_at: expires_at.map(format_timestamp),
+            self_issued,
             user,
         }
     }
@@ -367,6 +386,9 @@ async fn create_key(
         default_catalog,
         actor,
         user: &body.user,
+        self_issued: false,
+        expires_at: None,
+        levels: &[],
     };
     let created = key_rows::create_with_id(app.pool(), &new, app.clock().now()).await?;
     let Json(key) = changed(&app, &principal, &created.id).await?;
@@ -482,6 +504,9 @@ mod tests {
             default_catalog: None,
             actor: name,
             user: crate::db::TEST_USER,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
         };
         let created = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
             .await
@@ -839,6 +864,9 @@ mod tests {
             default_catalog: None,
             actor: "web",
             user: crate::db::TEST_USER,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
         };
         let web = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
             .await
@@ -942,5 +970,65 @@ mod tests {
         assert_eq!(revoked["client_name"], "Example Client");
         assert_eq!(revoked["maintenance_report"], false);
         assert!(revoked["revoked_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn the_key_list_shows_each_catalogs_level_expiry_and_who_issued_it() {
+        let test = app().await;
+        let keys = keys(&test).await;
+
+        let (status, listed) = send(&test, "GET", "/api/v1/keys", Some(&keys.admin), None).await;
+
+        assert_eq!(status.as_u16(), 200, "{listed}");
+        let reader = listed["keys"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .find(|key| key["name"] == "reader")
+            .expect("the reader key is listed");
+        assert_eq!(reader["catalog_access"], json!({"main": "read"}));
+        assert_eq!(reader["self_issued"], false);
+        assert!(reader["expires_at"].is_null());
+        assert!(
+            reader.get("user_id").is_none(),
+            "the API names users, not their ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn reporting_is_refused_for_a_self_issued_key() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let main = main_only();
+        let new = NewKey {
+            name: "mine",
+            access: Access::Write,
+            maintenance_report: false,
+            grants: Grants::Catalogs(&main),
+            default_catalog: None,
+            actor: "mine",
+            user: crate::db::TEST_USER,
+            self_issued: true,
+            expires_at: None,
+            levels: &[],
+        };
+        let mine = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
+            .await
+            .expect("create a self-issued key");
+        test.app.poll().await.expect("poll the key in");
+
+        let (status, refused) = send(
+            &test,
+            "PATCH",
+            &format!("/api/v1/keys/{}", mine.id),
+            Some(&keys.admin),
+            Some(json!({"maintenance_report": true})),
+        )
+        .await;
+
+        assert_eq!(status.as_u16(), 422, "{refused}");
+        assert_eq!(refused["limit"], "maintenance_report", "{refused}");
+        let (_, me) = send(&test, "GET", "/api/v1/whoami", Some(&mine.key), None).await;
+        assert_eq!(me["maintenance_report"], false);
     }
 }

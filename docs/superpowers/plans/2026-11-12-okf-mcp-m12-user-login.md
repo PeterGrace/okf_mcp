@@ -1352,6 +1352,8 @@ Rules this task adds to `store::keys::create_with_id` (checked before the transa
 
 The store returns these so a bad request is never the schema's CHECK failing as a 500. Task 10a adds the ceiling, key-count and lifetime limits on top.
 
+> **Corrected (issue #310, 2026-11-12).** The rules hold after creation too. `set_maintenance_report_with` (CLI `key maintenance-report`, `PATCH /api/v1/keys/{id}`) refuses turning reporting on for a self-issued key as `LimitExceeded { limit: "maintenance_report" }`, beside its existing OAuth-grant refusal; test `a_self_issued_key_stays_within_its_rules_after_creation` (`src/store/keys.rs`) and `reporting_is_refused_for_a_self_issued_key` (`src/http/api/keys.rs`). No other update path can break them: no route or command changes `access` or `all_catalogs`, `grant` inserts a NULL level (the key's own, never admin on a self-issued key), and `ungrant` only removes a grant.
+
 - [ ] **Step 1: Write the failing tests.** In `src/auth.rs` `mod tests`, replace `record` and `require_checks_reach_before_access`, adjust the cache tests to pass `now`, and add the new tests:
 
 ```rust
@@ -2676,7 +2678,7 @@ mod tests {
 }
 ```
 
-In `src/auth.rs` `mod tests`, add (and change every `KeyCache::from_records(records, now)` call from Task 2 to `KeyCache::from_records(records, HashMap::new(), now)`; likewise `src/store/keys.rs:1386`):
+In `src/auth.rs` `mod tests`, add (and change every `KeyCache::from_records(records, now)` call from Task 2 to `KeyCache::from_records(records, HashMap::new(), now)`; likewise the one in `src/store/keys.rs`' `names_group_actors_and_revoked_pairs_can_be_reissued`; corrected, issue #310, 2026-11-12):
 
 ```rust
     #[test]

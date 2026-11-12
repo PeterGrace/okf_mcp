@@ -636,6 +636,9 @@ async fn investigator_client_real_slice1_http_nine_tools() {
             default_catalog: None,
             actor: "reporter",
             user: crate::db::TEST_USER,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
         },
         chrono::Utc::now(),
     )
