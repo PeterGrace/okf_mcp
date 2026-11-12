@@ -6,7 +6,7 @@
 use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
 
@@ -109,6 +109,22 @@ pub struct SignInEvent {
     pub at: DateTime<Utc>,
 }
 
+/// One sign-in attempt to record.
+#[derive(Debug, Clone, Copy)]
+pub struct Attempt<'a> {
+    /// The user, when the attempt named a known one (`None` for an unknown
+    /// email: the row is kept for counting, shown to nobody).
+    pub user_id: Option<&'a str>,
+    /// How.
+    pub method: Method,
+    /// With what result.
+    pub outcome: Outcome,
+    /// The client address, when known.
+    pub ip: Option<IpAddr>,
+    /// When (server clock).
+    pub now: DateTime<Utc>,
+}
+
 /// Records an attempt and logs it at `info`.
 ///
 /// # Arguments
@@ -130,11 +146,34 @@ pub async fn record(
     ip: Option<IpAddr>,
     now: DateTime<Utc>,
 ) -> Result<(), OkfError> {
+    let attempt = Attempt {
+        user_id,
+        method,
+        outcome,
+        ip,
+        now,
+    };
+    let mut conn = pool.acquire().await?;
+    record_in(&mut conn, &attempt).await
+}
+
+/// [`record`], inside the caller's transaction: a successful sign-in
+/// records its event in the transaction that starts its session, so
+/// nothing that can block or fail runs after that commit.
+///
+/// # Arguments
+/// * `conn` - the caller's connection or transaction (`&mut tx`).
+/// * `attempt` - what to record.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn record_in(conn: &mut PgConnection, attempt: &Attempt<'_>) -> Result<(), OkfError> {
     tracing::info!(
-        user_id = user_id.unwrap_or("-"),
-        method = method.as_str(),
-        outcome = outcome.as_str(),
-        ip = ip
+        user_id = attempt.user_id.unwrap_or("-"),
+        method = attempt.method.as_str(),
+        outcome = attempt.outcome.as_str(),
+        ip = attempt
+            .ip
             .map(|address| address.to_string())
             .as_deref()
             .unwrap_or("-"),
@@ -146,12 +185,12 @@ pub async fn record(
         "INSERT INTO sign_in_events (user_id, method, outcome, ip, at) \
          VALUES ($1, $2, $3, $4::inet, $5)",
     )
-    .bind(user_id)
-    .bind(method.as_str())
-    .bind(outcome.as_str())
-    .bind(ip.map(|address| address.to_string()))
-    .bind(now)
-    .execute(pool)
+    .bind(attempt.user_id)
+    .bind(attempt.method.as_str())
+    .bind(attempt.outcome.as_str())
+    .bind(attempt.ip.map(|address| address.to_string()))
+    .bind(attempt.now)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }

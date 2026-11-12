@@ -419,6 +419,26 @@ pub async fn start_session_with(
         password,
     };
     let session = user_sessions::start(app.pool(), &request).await?;
+    Ok((session_cookie(app, &user.id, &session, absolute), session))
+}
+
+/// The `Set-Cookie` header for a session just started, and its log line
+/// (the user's id only).
+///
+/// # Arguments
+/// * `app` - the shared state (for `Secure`).
+/// * `user_id` - whose session.
+/// * `session` - the new session.
+/// * `absolute` - its lifetime (`console_session_absolute`).
+///
+/// # Returns
+/// The header.
+pub(crate) fn session_cookie(
+    app: &App,
+    user_id: &str,
+    session: &NewSession,
+    absolute: Duration,
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
@@ -431,8 +451,8 @@ pub async fn start_session_with(
         ),
     );
     // The user's id only: never the session id or its token.
-    tracing::info!(user = %user.id, "console session started");
-    Ok((headers, session))
+    tracing::info!(user = %user_id, "console session started");
+    headers
 }
 
 /// The `Set-Cookie` header that removes the session cookie.

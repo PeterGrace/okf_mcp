@@ -124,9 +124,9 @@ fn offers_passkeys(_app: &App) -> bool {
     false
 }
 
-/// The OIDC provider buttons (Task 9 fills this from the registry).
-fn provider_buttons(_app: &App) -> Vec<ProviderButton> {
-    Vec::new()
+/// The OIDC provider buttons, one per configured provider.
+fn provider_buttons(app: &App) -> Vec<ProviderButton> {
+    super::oidc::buttons(app)
 }
 
 /// What `/signin` offers on this server.
@@ -247,8 +247,17 @@ fn sign_in_response(status: StatusCode, view: &SignInView) -> Response {
     )
 }
 
-/// A page with a heading, one message and a link back to `/signin`.
-fn message_page(status: StatusCode, title: &str, message: &str) -> Response {
+/// A page with a heading, one message and a link back to `/signin`; the
+/// OIDC callback answers with it too.
+///
+/// # Arguments
+/// * `status` - the status.
+/// * `title` - the heading and title (escaped).
+/// * `message` - the message (escaped).
+///
+/// # Returns
+/// The page, under the console CSP.
+pub(crate) fn message_page(status: StatusCode, title: &str, message: &str) -> Response {
     let body = format!(
         r#"        <h1>{title}</h1>
         <p class="consent-error" id="signin-message" role="alert">{message}</p>

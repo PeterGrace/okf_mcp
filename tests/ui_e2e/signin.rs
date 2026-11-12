@@ -311,3 +311,48 @@ async fn an_admin_session_writes_through_the_console_with_its_csrf_token() {
         .await
         .expect("frank was stored");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sign_in_page_offers_each_configured_provider() {
+    // Edition 2021: `set_var` is a safe call; no other test reads this name.
+    std::env::set_var(
+        "OKF_UI_E2E_OIDC_SECRET",
+        "test-secret-at-least-32-bytes-long!!",
+    );
+    // No provider is contacted: the page lists providers from the config.
+    let server =
+        TestServer::start_with(vec![("main", files(&[("index.md", "# Main\n")]))], |base| {
+            Config {
+                public_url: Some(base.to_string()),
+                auth: okf_mcp::config::AuthConfig {
+                    oidc: vec![okf_mcp::config::OidcProviderConfig {
+                        id: "example".to_string(),
+                        label: "Example ID".to_string(),
+                        issuer: "https://id.example.com".to_string(),
+                        client_id: "okf-console".to_string(),
+                        client_secret_env: "OKF_UI_E2E_OIDC_SECRET".to_string(),
+                        scopes: vec!["openid".to_string(), "email".to_string()],
+                    }],
+                    ..okf_mcp::config::AuthConfig::default()
+                },
+                ..Config::default()
+            }
+        })
+        .await;
+    let page = format!("{}/signin?return_to=%2Fui%2F%23%2Fkeys", server.base);
+    drive(server.base.clone(), move |ui| {
+        ui.page
+            .goto(&page, GotoOptions::default())
+            .expect("open the sign-in page");
+        ui.wait_text("#signin-oidc-example", "Sign in with Example ID");
+        let href = ui.eval(
+            "() => document.querySelector('#signin-oidc-example').getAttribute('href')",
+            serde_json::json!(null),
+        );
+        assert_eq!(
+            href,
+            "/auth/oidc/example/start?return_to=%2Fui%2F%23%2Fkeys"
+        );
+    })
+    .await;
+}

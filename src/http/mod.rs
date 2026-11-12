@@ -9,6 +9,7 @@ pub(crate) mod api;
 mod archives;
 pub mod console_session;
 pub mod limits;
+pub mod oidc;
 pub(crate) mod pages;
 pub mod sessions;
 pub mod signin;
@@ -243,6 +244,12 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
             .merge(oauth::routes().layer(timeout_layer()))
     } else {
         Router::new().merge(health)
+    };
+    // The OIDC routes exist only with providers configured.
+    let open = if app.oidc().is_some() {
+        open.merge(oidc::routes())
+    } else {
+        open
     };
     open.merge(ui::routes())
         .merge(signin::routes(&app))

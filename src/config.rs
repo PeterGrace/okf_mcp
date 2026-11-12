@@ -135,6 +135,36 @@ pub struct AuthConfig {
     /// The header whose last hop is the client's address behind a proxy
     /// (`"x-forwarded-for"`); unset means the peer address (Decision 7).
     pub trusted_proxy_header: Option<String>,
+    /// The OIDC providers (`[[auth.oidc]]`); none by default.
+    pub oidc: Vec<OidcProviderConfig>,
+}
+
+/// One `[[auth.oidc]]` provider (spec "OIDC"). The client secret is read
+/// from the environment variable `client_secret_env` at start-up, never
+/// from this file.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+// A misspelt key (or an inline `client_secret`) is an error, not ignored.
+#[serde(deny_unknown_fields)]
+pub struct OidcProviderConfig {
+    /// Stable id: stored in `user_identities.provider` and part of the
+    /// redirect URI (`a-z`, `0-9`, `-`; at most 32).
+    pub id: String,
+    /// The sign-in button's text ("Sign in with `label`").
+    pub label: String,
+    /// The issuer URL; discovery reads `<issuer>/.well-known/openid-configuration`.
+    pub issuer: String,
+    /// The client id registered with the provider.
+    pub client_id: String,
+    /// The environment variable holding the client secret.
+    pub client_secret_env: String,
+    /// The scopes asked for (`openid` is always sent).
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+}
+
+/// `["openid", "email", "profile"]`.
+fn default_oidc_scopes() -> Vec<String> {
+    Vec::from(["openid", "email", "profile"].map(String::from))
 }
 
 impl Default for AuthConfig {
@@ -148,6 +178,7 @@ impl Default for AuthConfig {
             setup_link_ttl: DEFAULT_SETUP_LINK_TTL,
             reset_link_ttl: DEFAULT_RESET_LINK_TTL,
             trusted_proxy_header: None,
+            oidc: Vec::new(),
         }
     }
 }
@@ -537,7 +568,8 @@ impl Config {
     /// lifetime, an `[auth]` value out of range (see `AuthConfig`), a
     /// `[mail]` section that cannot send (see `MailConfig`), or a
     /// `public_url` that is not an `https` origin (`http` on
-    /// a loopback host only) whose host `allowed_hosts` admits.
+    /// a loopback host only) whose host `allowed_hosts` admits, or an
+    /// `[[auth.oidc]]` provider that cannot work (see `validate_oidc`).
     pub fn validate(&self) -> Result<(), String> {
         if self.poll_interval.is_zero() {
             return Err("poll_interval must be more than zero".to_string());
@@ -598,7 +630,68 @@ impl Config {
         }
         self.auth.validate()?;
         self.mail.validate()?;
+        self.validate_oidc()?;
         self.validate_public_url()
+    }
+
+    /// Checks `[[auth.oidc]]`: providers need `public_url` (the redirect
+    /// URI's origin); each has a valid, unique id, a label, a client id and
+    /// a secret variable, and an `https` issuer (`http` on loopback only)
+    /// with no query or fragment.
+    ///
+    /// # Returns
+    /// `Ok(())` without providers, or when every one is acceptable.
+    ///
+    /// # Errors
+    /// The problem in words, naming the provider and the key.
+    fn validate_oidc(&self) -> Result<(), String> {
+        if self.auth.oidc.is_empty() {
+            return Ok(());
+        }
+        if self.public_url.is_none() {
+            return Err("auth.oidc needs public_url, the origin of its redirect URIs".to_string());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for provider in &self.auth.oidc {
+            let id = provider.id.as_str();
+            let valid_id = (1..=32).contains(&id.len())
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+            if !valid_id {
+                return Err(format!(
+                    "auth.oidc id {id:?} must be 1 to 32 of a-z, 0-9 and -"
+                ));
+            }
+            // `insert` returns `false` for a value already in the set.
+            if !seen.insert(id) {
+                return Err(format!("auth.oidc id {id:?} is listed twice"));
+            }
+            for (key, value) in [
+                ("label", &provider.label),
+                ("client_id", &provider.client_id),
+                ("client_secret_env", &provider.client_secret_env),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(format!("auth.oidc.{id}: {key} is empty"));
+                }
+            }
+            let issuer = url::Url::parse(&provider.issuer).map_err(|_| {
+                format!("auth.oidc.{id}: issuer {:?} is not a URL", provider.issuer)
+            })?;
+            let loopback = issuer
+                .host_str()
+                .is_some_and(|host| is_loopback(&normalize_host(host)));
+            let secure = issuer.scheme() == "https" || (issuer.scheme() == "http" && loopback);
+            if !secure || issuer.query().is_some() || issuer.fragment().is_some() {
+                return Err(format!(
+                    "auth.oidc.{id}: issuer {:?} must be an https URL (http only on a \
+                     loopback host), with no query or fragment",
+                    provider.issuer
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Checks `public_url`: an `https` origin (`http` only on a loopback
@@ -1184,5 +1277,87 @@ mod tests {
             assert!(config.validate().is_err(), "{text}");
         }
         assert!(Config::from_toml("[mail]\nprovider = \"pigeon\"\n").is_err());
+    }
+
+    const OIDC: &str = r#"
+public_url = "https://okf.example.com"
+allowed_hosts = ["okf.example.com"]
+
+[[auth.oidc]]
+id = "example"
+label = "Example ID"
+issuer = "https://id.example.com"
+client_id = "okf-console"
+client_secret_env = "OKF_OIDC_EXAMPLE_SECRET"
+"#;
+
+    #[test]
+    fn oidc_providers_parse_from_an_array_of_tables_with_default_scopes() {
+        let config = Config::from_toml(OIDC).expect("parses");
+
+        config.validate().expect("valid");
+        assert_eq!(config.auth.oidc.len(), 1);
+        assert_eq!(config.auth.oidc[0].id, "example");
+        assert_eq!(config.auth.oidc[0].scopes, ["openid", "email", "profile"]);
+    }
+
+    #[test]
+    fn bad_oidc_providers_are_refused() {
+        let base = Config::from_toml(OIDC).expect("parses");
+        // Each case changes one thing and names a word the refusal must
+        // contain. `Change` is a plain function pointer; closures that
+        // capture nothing coerce to one.
+        type Change = fn(&mut Config);
+        let cases: [(&str, Change); 8] = [
+            ("public_url", |config| config.public_url = None),
+            ("id", |config| {
+                config.auth.oidc[0].id = "Example".to_string()
+            }),
+            ("twice", |config| {
+                let again = config.auth.oidc[0].clone();
+                config.auth.oidc.push(again);
+            }),
+            ("label", |config| {
+                config.auth.oidc[0].label = " ".to_string()
+            }),
+            ("client_id", |config| {
+                config.auth.oidc[0].client_id = String::new()
+            }),
+            ("client_secret_env", |config| {
+                config.auth.oidc[0].client_secret_env = String::new()
+            }),
+            ("issuer", |config| {
+                config.auth.oidc[0].issuer = "http://id.example.com".to_string()
+            }),
+            ("issuer", |config| {
+                config.auth.oidc[0].issuer = "https://id.example.com/?tenant=1".to_string()
+            }),
+        ];
+        for (word, change) in cases {
+            let mut config = base.clone();
+            change(&mut config);
+            let refused = config.validate().expect_err(word);
+            assert!(refused.contains(word), "{word}: {refused}");
+        }
+    }
+
+    #[test]
+    fn an_oidc_issuer_may_be_http_on_loopback_only() {
+        let mut config = Config::from_toml(OIDC).expect("parses");
+        config.auth.oidc[0].issuer = "http://127.0.0.1:9000".to_string();
+
+        config
+            .validate()
+            .expect("loopback http is allowed, for tests");
+    }
+
+    #[test]
+    fn an_unknown_oidc_key_is_refused_at_parse_time() {
+        let text = format!("{OIDC}client_secret = \"inline\"\n");
+
+        assert!(
+            Config::from_toml(&text).is_err(),
+            "secrets come from the environment only"
+        );
     }
 }

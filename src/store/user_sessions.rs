@@ -207,8 +207,13 @@ pub async fn create(
 /// the reset deletes the session, or the reset commits first and Postgres
 /// re-checks the hash on the new row version, which no longer matches.
 ///
+/// Inside a caller's transaction that already holds the user's row (a
+/// passkey sign-in, a setup link), the `FOR SHARE` is a no-op and the
+/// session commits or rolls back with the rest.
+///
 /// # Arguments
-/// * `pool` - the database.
+/// * `executor` - the database: a `&PgPool`, or a `&mut PgConnection`
+///   (such as `&mut *tx`) to run inside a caller's transaction.
 /// * `request` - the user, client details and lifetime.
 ///
 /// # Returns
@@ -219,7 +224,10 @@ pub async fn create(
 /// sign-in) their password changed since it was checked;
 /// [`OkfError::LimitExceeded`] for an absurd `absolute`; [`OkfError::Io`]
 /// if the OS random source fails; [`OkfError::Database`].
-pub async fn start(pool: &PgPool, request: &SessionStart<'_>) -> Result<NewSession, OkfError> {
+pub async fn start(
+    executor: impl PgExecutor<'_>,
+    request: &SessionStart<'_>,
+) -> Result<NewSession, OkfError> {
     let expires_at = crate::clock::after(request.now, request.absolute)?;
     let id = keys::generate_with("")?;
     let session = NewSession {
@@ -251,7 +259,7 @@ pub async fn start(pool: &PgPool, request: &SessionStart<'_>) -> Result<NewSessi
     .bind(request.ip.map(|address| address.to_string()))
     .bind(user_agent)
     .bind(request.password.map(PasswordStamp::as_str))
-    .execute(pool)
+    .execute(executor)
     .await?
     .rows_affected();
     if inserted == 0 {
@@ -376,10 +384,12 @@ pub async fn touch(
     Ok(Some(stored.into_row(id)))
 }
 
-/// Ends one session (sign-out).
+/// Ends one session (sign-out, or the browser's old session when it signs
+/// in again).
 ///
 /// # Arguments
-/// * `pool` - the database.
+/// * `executor` - the database: a `&PgPool`, or a `&mut PgConnection`
+///   (such as `&mut *tx`) to run inside a caller's transaction.
 /// * `id` - the raw id from the cookie.
 ///
 /// # Returns
@@ -387,12 +397,48 @@ pub async fn touch(
 ///
 /// # Errors
 /// [`OkfError::Database`]. An unknown id is not an error.
-pub async fn revoke(pool: &PgPool, id: &str) -> Result<(), OkfError> {
+pub async fn revoke(executor: impl PgExecutor<'_>, id: &str) -> Result<(), OkfError> {
     sqlx::query("DELETE FROM user_sessions WHERE id_hash = $1")
         .bind(keys::hash(id).as_slice())
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
+}
+
+/// Whether a session is still in force (not revoked, not past its
+/// absolute limit), holding its row `FOR SHARE` until the caller's
+/// transaction ends, so it cannot be revoked meanwhile. A change made on
+/// behalf of a session (adding a passkey) checks this after locking the
+/// user's row (lock order: the user first), so a reset that ended the
+/// session first refuses the change.
+///
+/// # Arguments
+/// * `executor` - the caller's transaction (`&mut *tx`).
+/// * `id` - the raw id from the cookie.
+/// * `user_id` - whose session it must be.
+/// * `now` - when (server clock).
+///
+/// # Returns
+/// `true` while it is in force.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn hold_live(
+    executor: impl PgExecutor<'_>,
+    id: &str,
+    user_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, OkfError> {
+    let held: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM user_sessions \
+         WHERE id_hash = $1 AND user_id = $2 AND expires_at > $3 FOR SHARE",
+    )
+    .bind(keys::hash(id).as_slice())
+    .bind(user_id)
+    .bind(now)
+    .fetch_optional(executor)
+    .await?;
+    Ok(held.is_some())
 }
 
 /// Ends every session of a user, except perhaps the one asking. The one
