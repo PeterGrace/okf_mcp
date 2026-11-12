@@ -4,6 +4,7 @@ import { store } from './core/store.js';
 import { api, ApiError, setUnauthorizedHandler } from './core/api.js';
 import { start, route } from './core/router.js';
 import { closeDrawer } from './core/drawer.js';
+import { toast } from './core/toast.js';
 import { refreshIdentity, refreshUnassigned } from './core/shell.js';
 import { refreshFindingsBadge } from './pages/findings.js';
 
@@ -75,8 +76,19 @@ $('#login-form').addEventListener('submit', async event => {
 });
 $('#signout').addEventListener('click', async () => {
     // A console session ends on the server; a pasted key only in this browser.
+    // Only a 2xx or a 401 (the session was already over) means signed out:
+    // after anything else the server session and its HttpOnly cookie may
+    // live on, and a reload would sign straight back in. So the console
+    // stays as it is and says to try again.
     if (!store.key && store.csrf) {
-        try { await api.del('/session', { quiet: true }); } catch { /* already over */ }
+        try {
+            await api.del('/session', { quiet: true });
+        } catch (error) {
+            if (!(error instanceof ApiError && error.status === 401)) {
+                toast(`Sign-out failed: ${error.message}. Try again.`, 'error');
+                return;
+            }
+        }
     }
     store.key = null;
     store.whoami = null;

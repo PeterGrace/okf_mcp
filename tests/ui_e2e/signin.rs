@@ -19,6 +19,19 @@ use crate::support::server::{files, TestServer};
 
 const PASSWORD: &str = "violet-lantern-orbit-42";
 
+/// Makes the page's next `DELETE /api/v1/session` answer 503 without
+/// reaching the server; later requests go through.
+const FAIL_NEXT_SIGN_OUT: &str = "() => { const real = window.fetch; let failed = false; \
+    window.fetch = (input, init) => { \
+      if (!failed && init?.method === 'DELETE' && String(input).endsWith('/api/v1/session')) { \
+        failed = true; \
+        return Promise.resolve(new Response(JSON.stringify({ message: 'unavailable' }), \
+          { status: 503, headers: { 'content-type': 'application/json' } })); } \
+      return real(input, init); }; }";
+
+/// The status of `GET /api/v1/session` with the page's cookie.
+const SESSION_STATUS: &str = "async () => (await fetch('/api/v1/session')).status";
+
 /// A server whose `public_url` is its own address, so the login routes exist.
 async fn server() -> TestServer {
     TestServer::start_with(vec![("main", files(&[("index.md", "# Main\n")]))], |base| {
@@ -99,8 +112,18 @@ async fn a_setup_link_sets_a_password_and_the_console_shows_the_user() {
         ui.wait_visible("#app");
         ui.wait_text("#whoami", "alice - read");
         assert!(!ui.page.is_visible("[data-need=admin]").expect("visible"));
+        // The first sign-out request fails (a 503 from a fetch wrapper):
+        // the console says so and stays signed in, on the server too.
+        ui.eval(FAIL_NEXT_SIGN_OUT, serde_json::json!(null));
+        ui.click("#signout");
+        ui.wait_text("#toasts", "Sign-out failed");
+        assert!(ui.page.is_visible("#app").expect("visible"));
+        assert!(!ui.page.is_visible("#login").expect("visible"));
+        assert_eq!(ui.eval(SESSION_STATUS, serde_json::json!(null)), 200);
+        // The retry goes through.
         ui.click("#signout");
         ui.wait_visible("#login");
+        assert_eq!(ui.eval(SESSION_STATUS, serde_json::json!(null)), 401);
         // Signed out on the server: a reload finds no session.
         ui.open("");
         ui.wait_visible("#login");
