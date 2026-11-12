@@ -27,7 +27,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
-use crate::store::users::{user_auth_columns, UserAuth};
+use crate::store::users::{is_lookup_email, user_auth_columns, UserAuth};
 
 /// The shortest password accepted, in characters (Unicode code points).
 pub const MIN_LENGTH: usize = 12;
@@ -231,13 +231,16 @@ pub async fn verify(
     password: &str,
     now: DateTime<Utc>,
 ) -> Result<SignInOutcome, OkfError> {
-    let candidate = sqlx::query_as::<_, Candidate>(concat!(
-        candidate_columns!(),
-        " WHERE u.email = $1::citext"
-    ))
-    .bind(email)
-    .fetch_optional(pool)
-    .await?;
+    // An address no user can have (a NUL, which Postgres would refuse, among
+    // others) is an unknown email: no query, and the same dummy hash below.
+    let candidate = if is_lookup_email(email) {
+        sqlx::query_as::<_, Candidate>(concat!(candidate_columns!(), " WHERE u.email = $1::citext"))
+            .bind(email)
+            .fetch_optional(pool)
+            .await?
+    } else {
+        None
+    };
     check_candidate(pool, candidate, password, now).await
 }
 

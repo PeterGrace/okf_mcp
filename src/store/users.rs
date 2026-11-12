@@ -351,6 +351,30 @@ pub(crate) fn check_email(email: &str) -> Result<(), OkfError> {
     Ok(())
 }
 
+/// The form of a typed email address that sign-in looks up: trimmed and
+/// lowercased, or `None` when it cannot be anyone's address (it fails
+/// [`check_email`]: too long, no single `@`, or a space, a control character
+/// such as NUL, or a mail-header special). Callers treat `None` as an
+/// address that names nobody, so it takes the same path as an unknown one.
+///
+/// # Arguments
+/// * `raw` - the address as the form sent it.
+///
+/// # Returns
+/// The normalized address, or `None`.
+pub(crate) fn normalize_email(raw: &str) -> Option<String> {
+    let email = raw.trim().to_lowercase();
+    is_lookup_email(&email).then_some(email)
+}
+
+/// Whether `email` may be bound in a lookup: what [`check_email`] accepts.
+/// Store functions that take a typed address check it, so text Postgres
+/// would refuse (a NUL) is an ordinary "no such user", never a database
+/// error.
+pub(crate) fn is_lookup_email(email: &str) -> bool {
+    check_email(email).is_ok()
+}
+
 /// Sets or clears a user's email address. A changed address also deletes
 /// the user's outstanding emailed links, so a link sent to the old address
 /// stops working, and bumps the administrative generation, so the key
@@ -487,6 +511,11 @@ pub async fn set_admin(
 /// # Errors
 /// [`OkfError::Database`].
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<UserAuth>, OkfError> {
+    // No user has an address `check_email` refuses, and such text (a NUL,
+    // which Postgres rejects as a database error) never reaches SQL.
+    if !is_lookup_email(email) {
+        return Ok(None);
+    }
     // `$1::citext`: without the cast, `citext = text` would compare as text,
     // case-sensitively.
     Ok(sqlx::query_as::<_, UserAuth>(concat!(

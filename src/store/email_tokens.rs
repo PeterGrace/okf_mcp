@@ -22,7 +22,7 @@ use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
 use crate::keys;
-use crate::store::users::{user_auth_columns, UserAuth};
+use crate::store::users::{is_lookup_email, user_auth_columns, UserAuth};
 
 /// What a link is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +163,10 @@ pub async fn issue_for_email(
     ttl: Duration,
     now: DateTime<Utc>,
 ) -> Result<Option<IssuedLink>, OkfError> {
+    // An address no user can have (a NUL among others) names nobody.
+    if !is_lookup_email(email) {
+        return Ok(None);
+    }
     let expires_at = crate::clock::after(now, ttl)?;
     let token = keys::generate_with("")?;
     let mut tx = pool.begin().await?;

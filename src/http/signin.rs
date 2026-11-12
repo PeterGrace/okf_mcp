@@ -305,8 +305,12 @@ async fn sign_in_post(
         view.error = Some(TOO_MANY);
         return sign_in_response(StatusCode::TOO_MANY_REQUESTS, &view);
     }
-    let email = form.email.trim();
-    let verdict = passwords::verify(app.pool(), email, &form.password, app.clock().now()).await;
+    // One normalized address for the check and the audit lookup. One that
+    // cannot be anyone's (`None`: a NUL, a control character, too long, ...)
+    // is checked as the empty address, which names nobody: the same dummy
+    // hash and the same 401 as an unknown email, never a database error.
+    let email = users::normalize_email(&form.email).unwrap_or_default();
+    let verdict = passwords::verify(app.pool(), &email, &form.password, app.clock().now()).await;
     let outcome = match verdict {
         Ok(SignInOutcome::Ok(verified)) => {
             let started = begin(
@@ -343,7 +347,7 @@ async fn sign_in_post(
     };
     // The same lookup runs for known and unknown emails, so its time says
     // nothing; it only lets the user see their failed attempts.
-    let user_id = match users::find_by_email(app.pool(), email).await {
+    let user_id = match users::find_by_email(app.pool(), &email).await {
         Ok(found) => found.map(|user| user.id),
         Err(error) => return AppError(error).into_response(),
     };
@@ -512,13 +516,17 @@ async fn forgot_post(
             TOO_MANY,
         );
     }
-    if let Ok(Form(form)) = form {
-        let email = form.email.trim().to_lowercase();
+    // `normalize_email`: the same normalized address as `/signin`; one that
+    // cannot be anyone's (a NUL, ...) does no work and gets the same answer.
+    let email = form
+        .ok()
+        .and_then(|Form(form)| users::normalize_email(&form.email));
+    if let Some(email) = email {
         // Only a plausible address takes a limiter slot, so the per-email
         // map holds short keys. Past the per-email limit the answer is the
         // same, so it never says whether the address is known. The work
         // runs after the answer for the same reason: its duration would.
-        if users::check_email(&email).is_ok() && limits.forgot_per_email.try_take(&email, now) {
+        if limits.forgot_per_email.try_take(&email, now) {
             let app = Arc::clone(&app);
             tokio::spawn(async move {
                 if let Err(error) = send_reset(&app, &email).await {
@@ -1019,6 +1027,110 @@ mod tests {
         // Apart from the echoed form, the bodies are byte-for-byte alike.
         assert_eq!(wrong.text(), unknown.text());
         assert_eq!(wrong.text(), locked.text());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_email_postgres_would_refuse_is_an_unknown_email() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let mut browser = Browser::default();
+
+        let unknown = post_sign_in(&mut browser, &test, "nobody@example.com", PASSWORD).await;
+        let mut refused = Vec::new();
+        // A NUL (Postgres refuses it in text), one after a real address, a
+        // control character, and an address past the length limit.
+        for email in [
+            "\0".to_string(),
+            "alice@example.com\0".to_string(),
+            "alice\u{7}@example.com".to_string(),
+            format!("{}@example.com", "a".repeat(300)),
+        ] {
+            refused.push(post_sign_in(&mut browser, &test, &email, PASSWORD).await);
+        }
+        // The store answers "nobody" too, never a database error, and the
+        // check still spends the dummy hash (`Failed`, not an early return).
+        let pool = test.app.pool();
+        let found = users::find_by_email(pool, "alice@example.com\0").await;
+        let checked = passwords::verify(pool, "\0", PASSWORD, Utc::now()).await;
+
+        for reply in &refused {
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
+            assert_eq!(reply.text(), unknown.text());
+            assert!(reply.set_cookie(COOKIE).is_none());
+        }
+        assert!(matches!(found, Ok(None)), "{found:?}");
+        assert!(matches!(checked, Ok(SignInOutcome::Failed)), "{checked:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgot_answers_alike_for_an_email_postgres_would_refuse() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let forgot = |email: &str| Payload::Form(vec![("email", email.to_string())]);
+
+        let unknown = Browser::default()
+            .send(
+                &test,
+                "POST",
+                "/signin/forgot",
+                forgot("nobody@example.com"),
+            )
+            .await;
+        let nul = Browser::default()
+            .send(
+                &test,
+                "POST",
+                "/signin/forgot",
+                forgot("alice@example.com\0"),
+            )
+            .await;
+        let issued = email_tokens::issue_for_email(
+            test.app.pool(),
+            "alice@example.com\0",
+            Purpose::Reset,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(nul.status, StatusCode::OK);
+        assert_eq!(nul.text(), unknown.text());
+        assert!(matches!(issued, Ok(None)), "{issued:?}");
+        assert_eq!(queued_mail(test.app.pool()).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_token_with_a_nul_is_410() {
+        let test = login_app().await;
+        let form = |token: &str| {
+            Payload::Form(vec![
+                ("token", token.to_string()),
+                ("password", PASSWORD.to_string()),
+                ("confirm", PASSWORD.to_string()),
+            ])
+        };
+
+        let mut statuses = Vec::new();
+        for path in ["/account/setup", "/account/reset"] {
+            let page = Browser::default()
+                .send(
+                    &test,
+                    "GET",
+                    &format!("{path}?token=abc%00def"),
+                    Payload::Empty,
+                )
+                .await;
+            let post = Browser::default()
+                .send(&test, "POST", path, form("abc\0def"))
+                .await;
+            statuses.push((path, page.status, post.status));
+        }
+
+        for (path, page, post) in statuses {
+            assert_eq!(page, StatusCode::GONE, "GET {path}");
+            assert_eq!(post, StatusCode::GONE, "POST {path}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
