@@ -81,6 +81,31 @@ pub(crate) async fn keys(test: &TestApp) -> Keys {
     keys
 }
 
+/// Creates an admin key, named `root`, that reaches every catalog, and
+/// polls it in. [`Keys`] has none: its `admin` reaches only `main`, which is
+/// what the scoped-admin cases need. Create it once per test, since a name
+/// and actor cannot be taken twice.
+///
+/// # Returns
+/// Its secret.
+pub(crate) async fn every_catalog_admin(test: &TestApp) -> String {
+    let new = NewKey {
+        name: "root",
+        access: Access::Admin,
+        maintenance_report: false,
+        grants: Grants::All,
+        default_catalog: Some("main"),
+        actor: "root",
+        user: crate::db::TEST_USER,
+    };
+    let key = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
+        .await
+        .expect("create the every-catalog admin key")
+        .key;
+    test.app.poll().await.expect("poll the key in");
+    key
+}
+
 /// Sends one request through the whole router (auth included).
 ///
 /// # Returns

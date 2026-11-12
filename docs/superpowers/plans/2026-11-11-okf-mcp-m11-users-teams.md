@@ -1817,6 +1817,8 @@ git commit -am "feat(cli): user, team, assign, set-owner and unassigned commands
 
 Use `require_every_catalog` from `catalogs.rs`. If it is private, move it beside `require_admin` in `mod.rs` as `pub(crate)` (Decision 3). After every mutation, call `app.poll()` (log a failure, don't return it), as `changed()` in `keys.rs` does, so the answer and the console see the change at once.
 
+> **Corrected (issue #285).** `require_every_catalog` and catalogs' `settle` (poll, log a failure) both moved to `src/http/api/mod.rs` as `pub(crate)`; `keys.rs`' `changed()`, `catalogs.rs` and `people.rs` call `settle`. The Forbidden reason no longer says "creating a catalog". `PUT /oauth/codes/{id}/user` does not poll: codes are not cached and `codes::assign_user` bumps no generation.
+
 - [ ] **Step 1: Write the failing tests** in `src/http/api/people.rs`, using the existing `testing::{app, keys, send, assert_matrix, Row}` helpers (read `assert_matrix` in `testing.rs`; it checks one route against the read/write/admin/scoped-admin keys):
 
 ```rust
@@ -1952,6 +1954,8 @@ Adapt `keys.admin` and `test.app.pool()` to the fixture if it changes. The `disp
 
 > **Corrected (issue #283).** `TestApp` has no `pool` field: use `test.app.pool()` (the legacy-key calls above already do). `testing::Keys` has no `scoped_admin`, but its `admin` key is granted only `main`, so it is the scoped admin; `stranger` is an admin on `other` only. Neither reaches every catalog.
 
+> **Corrected (issue #285).** The tests above call the guarded routes with `keys.admin`, which reaches only `main`, so they would get 403s (and a 404 for the all-catalogs legacy key). What shipped: catalogs.rs' private `every_catalog_admin` moved to `testing::every_catalog_admin(&test) -> String` (an admin key named `root` with `Grants::All`, polled in; call it once per test), and the people tests use it for every user, team, membership, `set-owner` and `/unassigned` call, keeping `keys.admin` for the scoped-admin 403 and 404 cases. Tests that also need `Keys` use `assert_matrix_with(&test, &keys, ..)`, since `assert_matrix` creates the fixture keys again. Shipped tests in `src/http/api/people.rs`: `an_admin_creates_lists_and_deletes_a_user`, `listing_needs_any_admin_and_writes_one_reaching_every_catalog` (every route against every fixture key, then each write as root), `membership_routes_and_their_refusals`, `a_missing_user_or_owner_in_a_create_body_is_a_422`, `assigning_a_legacy_key_and_listing_unassigned`, `an_assign_reaches_the_key_cache_after_the_generation_bump` (also checks `whoami`), `a_users_detail_shows_only_the_credentials_the_caller_manages` and `set_owner_on_a_catalog`. The access matrices in `keys.rs`, `oauth.rs` and `catalogs.rs` gained rows for the assign and owner routes, and `oauth::tests::an_absent_actor_is_the_name_and_a_code_is_reassigned` covers the optional actor.
+
 - [ ] **Step 2: Run them to see them fail.**
 
 - [ ] **Step 3: Implement `src/http/api/people.rs`**
@@ -1978,7 +1982,7 @@ Adapt `keys.admin` and `test.app.pool()` to the fixture if it changes. The `disp
 - [ ] **Step 4: Extend keys, codes and catalogs**
   - `CreateKeyBody.user: String` and `CreateCodeBody.user: String` are required. `CreateCodeBody.actor` becomes `Option<String>`.
   - `PUT /keys/{id}/user`, with body `{user}`: `managed(app, &principal, &id)?` (any kind, including grants), then `key_rows::assign_user_by_id`, then `changed(...)`.
-  - `PUT /oauth/codes/{id}/user`: the same scoping as the existing `DELETE /oauth/codes/{id}`. Answers `SignInCodeView`.
+  - `PUT /oauth/codes/{id}/user`: the same scoping as the existing `DELETE /oauth/codes/{id}`. Answers `SignInCodeView`. The body struct `AssignUserBody { user }` is `pub(crate)` in `keys.rs` and shared by both assign routes.
   - `NewCatalog.owner: String` (already added by Task 3, with its 422 and 404 tests). `PUT /catalogs/{name}/owner`, with body `{team}`, uses `require_every_catalog` and `catalog_rows::set_owner`, then `settle(&app)`. It answers `{name, previous, owner_team}`.
   - `CatalogSummary.owner_team` comes from `state.owner_team()` (already done by Task 3, which also returns it from `POST /catalogs`).
 

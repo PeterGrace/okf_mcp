@@ -24,7 +24,7 @@ use crate::app::App;
 use crate::auth::{Principal, Reach};
 use crate::clock::format_timestamp;
 use crate::error::OkfError;
-use crate::http::api::require_admin;
+use crate::http::api::{require_admin, settle};
 use crate::http::AppError;
 use crate::store::keys::{self as key_rows, Access, Grants, KeyRecord, NewKey};
 
@@ -165,11 +165,20 @@ struct UpdateKeyBody {
     maintenance_report: bool,
 }
 
+/// `PUT /keys/{id}/user`'s and `PUT /oauth/codes/{id}/user`'s body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssignUserBody {
+    /// The user the credential now belongs to (must exist).
+    pub user: String,
+}
+
 /// This area's routes.
 pub(crate) fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/keys", get(list_keys).post(create_key))
         .route("/keys/{id}", patch(update_key))
+        .route("/keys/{id}/user", put(assign_user))
         .route("/keys/{id}/revoke", post(revoke_key))
         .route(
             "/keys/{id}/catalogs/{catalog}",
@@ -202,7 +211,14 @@ pub(crate) fn manages_grants(
 }
 
 /// Whether `principal` may see and change `record` ([`manages_grants`]).
-fn manages(principal: &Principal, record: &KeyRecord) -> bool {
+///
+/// # Arguments
+/// * `principal` - the caller.
+/// * `record` - the key or grant.
+///
+/// # Returns
+/// As [`manages_grants`] for the record's grants.
+pub(crate) fn manages(principal: &Principal, record: &KeyRecord) -> bool {
     manages_grants(principal, record.all_catalogs, &record.catalogs)
 }
 
@@ -294,9 +310,7 @@ async fn managed(app: &App, principal: &Principal, id: &str) -> Result<KeyRecord
 /// # Errors
 /// As [`managed`].
 async fn changed(app: &App, principal: &Principal, id: &str) -> Result<Json<KeyView>, AppError> {
-    if let Err(error) = app.poll().await {
-        tracing::error!(%error, "reloading after a key change failed; the next poll retries");
-    }
+    settle(app).await;
     Ok(Json(managed(app, principal, id).await?.into()))
 }
 
@@ -375,6 +389,24 @@ async fn update_key(
 ) -> Result<Json<KeyView>, AppError> {
     let target = managed(&app, &principal, &id).await?;
     key_rows::set_maintenance_report_by_id(app.pool(), &target.id, body.maintenance_report).await?;
+    changed(&app, &principal, &target.id).await
+}
+
+/// `PUT /keys/{id}/user`: makes the key or grant (live or revoked) belong to
+/// `user`, then reloads the key cache, so the next request it makes runs as
+/// that user.
+///
+/// # Errors
+/// 403 below admin; 404 for a key the caller does not manage, or an unknown
+/// user; 422 for a body without `user`.
+async fn assign_user(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(id): Path<String>,
+    Json(body): Json<AssignUserBody>,
+) -> Result<Json<KeyView>, AppError> {
+    let target = managed(&app, &principal, &id).await?;
+    key_rows::assign_user_by_id(app.pool(), &target.id, &body.user).await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -502,6 +534,15 @@ mod tests {
                     method: "PUT",
                     uri: format!("/api/v1/keys/{first}/catalogs/main"),
                     body: None,
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 404,
+                },
+                Row {
+                    method: "PUT",
+                    uri: format!("/api/v1/keys/{first}/user"),
+                    body: Some(json!({"user": crate::db::TEST_USER})),
                     read: 403,
                     write: 403,
                     admin: 200,

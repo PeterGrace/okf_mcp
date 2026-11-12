@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, put};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use crate::app::App;
 use crate::auth::Principal;
 use crate::clock::format_timestamp;
 use crate::error::OkfError;
-use crate::http::api::keys::{manages_grants, parse_access, requested_grants};
+use crate::http::api::keys::{manages_grants, parse_access, requested_grants, AssignUserBody};
 use crate::http::api::require_admin;
 use crate::http::AppError;
 use crate::store::oauth::codes::{self, NewSignInCode, SignInCodeRecord};
@@ -72,7 +72,7 @@ impl SignInCodeView {
     ///
     /// # Returns
     /// The view, timestamps formatted.
-    fn new(record: SignInCodeRecord, now: DateTime<Utc>) -> Self {
+    pub(crate) fn new(record: SignInCodeRecord, now: DateTime<Utc>) -> Self {
         let state = record.state(now).as_str();
         // Destructuring names every field: a field added to the record later
         // fails to compile here until someone decides whether the API shows it.
@@ -144,8 +144,8 @@ impl std::fmt::Debug for CreatedSignInCodeView {
 struct CreateCodeBody {
     /// Label, `[A-Za-z0-9._-]+`.
     name: String,
-    /// The grant's actor (blank: the code's name).
-    actor: String,
+    /// The grant's actor (absent or blank: the code's name).
+    actor: Option<String>,
     /// `read` or `write`.
     access: String,
     /// Grant every catalog.
@@ -168,6 +168,7 @@ pub(crate) fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/oauth/codes", get(list_codes).post(create_code))
         .route("/oauth/codes/{id}", delete(revoke_code))
+        .route("/oauth/codes/{id}/user", put(assign_code_user))
 }
 
 /// The code with exactly this id, if `principal` is an admin that manages it.
@@ -259,7 +260,9 @@ async fn create_code(
         access,
         grants,
         default_catalog,
-        actor: &body.actor,
+        // The store trims the actor and treats a blank one as the code's
+        // name, so an absent one is passed as blank.
+        actor: body.actor.as_deref().unwrap_or(""),
         expires_at,
         user: &body.user,
     };
@@ -286,6 +289,26 @@ async fn revoke_code(
     codes::revoke(app.pool(), &target.id, now).await?;
     let record = managed_code(&app, &principal, &target.id).await?;
     Ok(Json(SignInCodeView::new(record, now)))
+}
+
+/// `PUT /oauth/codes/{id}/user`: makes the code (in any state) belong to
+/// `user`. A grant it already became keeps its own user; reassign that
+/// through `PUT /keys/{id}/user`. Codes are not cached, and this bumps no
+/// generation, so there is nothing to poll.
+///
+/// # Errors
+/// 403 below admin; 404 for a code the caller does not manage, or an
+/// unknown user; 422 for a body without `user`.
+async fn assign_code_user(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(id): Path<String>,
+    Json(body): Json<AssignUserBody>,
+) -> Result<Json<SignInCodeView>, AppError> {
+    let target = managed_code(&app, &principal, &id).await?;
+    codes::assign_user(app.pool(), &target.id, &body.user).await?;
+    let record = managed_code(&app, &principal, &target.id).await?;
+    Ok(Json(SignInCodeView::new(record, app.clock().now())))
 }
 
 #[cfg(test)]
@@ -337,6 +360,15 @@ mod tests {
                     uri: "/api/v1/oauth/codes".into(),
                     body: Some(json!({"user": crate::db::TEST_USER, "name": "made", "actor": "example-actor",
                                       "access": "read", "catalogs": ["main"]})),
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 404,
+                },
+                Row {
+                    method: "PUT",
+                    uri: format!("/api/v1/oauth/codes/{code}/user"),
+                    body: Some(json!({"user": crate::db::TEST_USER})),
                     read: 403,
                     write: 403,
                     admin: 200,
@@ -503,5 +535,62 @@ mod tests {
         .await;
         assert_eq!(stranger_view["codes"][0]["id"], theirs.as_str());
         assert_eq!(stranger_view["codes"][0]["state"], "live");
+    }
+
+    #[tokio::test]
+    async fn an_absent_actor_is_the_name_and_a_code_is_reassigned() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        crate::store::users::create(
+            test.app.pool(),
+            &crate::store::users::NewUser {
+                name: "alice",
+                display_name: "",
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("create alice");
+        let body = json!({"user": crate::db::TEST_USER, "name": "tablet", "access": "read",
+                          "catalogs": ["main"]});
+
+        let (created, view) = send(
+            &test,
+            "POST",
+            "/api/v1/oauth/codes",
+            Some(&keys.admin),
+            Some(body),
+        )
+        .await;
+        let uri = format!(
+            "/api/v1/oauth/codes/{}/user",
+            view["code"]["id"].as_str().expect("an id")
+        );
+        let (assigned, reassigned) = send(
+            &test,
+            "PUT",
+            &uri,
+            Some(&keys.admin),
+            Some(json!({"user": "alice"})),
+        )
+        .await;
+        let (unknown, error) = send(
+            &test,
+            "PUT",
+            &uri,
+            Some(&keys.admin),
+            Some(json!({"user": "nobody"})),
+        )
+        .await;
+        let (missing, _) = send(&test, "PUT", &uri, Some(&keys.admin), Some(json!({}))).await;
+
+        assert_eq!(created.as_u16(), 200, "{view}");
+        assert_eq!(view["code"]["actor"], "tablet");
+        assert_eq!(view["code"]["user"], crate::db::TEST_USER);
+        assert_eq!(assigned.as_u16(), 200, "{reassigned}");
+        assert_eq!(reassigned["user"], "alice");
+        assert_eq!(unknown.as_u16(), 404);
+        assert_eq!(error["error"], "UnknownName");
+        assert_eq!(missing.as_u16(), 422);
     }
 }
