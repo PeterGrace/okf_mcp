@@ -129,6 +129,9 @@ async fn an_admin_changes_a_catalogs_owner_and_a_scoped_admin_cannot() {
         ui.login(&root);
         ui.open("/catalogs");
         ui.click("[data-catalog=main]");
+        // The scoped admin's closed drawer still holds its disabled control
+        // until this one replaces it.
+        ui.wait_visible("#catalog-owner-select:not([disabled])");
         ui.wait_text("#catalog-owner-save", "Change owner");
         ui.select("#catalog-owner-select", "family");
         ui.click("#catalog-owner-save");

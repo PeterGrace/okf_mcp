@@ -252,8 +252,9 @@ async fn an_oauth_grant_is_marked_and_cannot_be_given_reporting() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_admin_changes_a_keys_user_and_assigns_a_legacy_key() {
     let server = server().await;
+    // Every catalog: only such a key manages the legacy key, which has them.
     let admin = server
-        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .key("console-admin", Access::Admin, &[], Some("main"))
         .await;
     server.key("laptop", Access::Read, &["main"], None).await;
     server.legacy_key("legacy").await;
