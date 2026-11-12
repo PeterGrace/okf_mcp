@@ -1196,6 +1196,88 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hostile_return_to_on_the_setup_page_becomes_the_console() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
+        let token = setup_token(&test, &alice).await;
+        let mut soft = SoftPasskey::new(true);
+        let mut browser = Browser::default();
+        let body = json!({ "token": token, "name": "Laptop", "return_to": "//evil.example" });
+
+        let start = browser
+            .send(
+                &test,
+                "POST",
+                "/auth/passkey/setup/start",
+                Payload::Json(body),
+            )
+            .await;
+        let challenge: CreationChallengeResponse =
+            serde_json::from_value(start.json()).expect("a challenge");
+        let credential = soft
+            .do_registration(origin(), challenge)
+            .expect("the authenticator registers");
+        let done = browser
+            .send(
+                &test,
+                "POST",
+                "/auth/passkey/setup/finish",
+                Payload::Json(serde_json::to_value(&credential).expect("json")),
+            )
+            .await;
+
+        assert_eq!(done.status, StatusCode::OK, "{}", done.text());
+        assert_eq!(done.json()["redirect"], "/ui/");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_passkey_routes_share_the_per_address_limit() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
+        let token = setup_token(&test, &alice).await;
+        let mut browser = Browser::default();
+        let start = || Payload::Json(json!({}));
+        // oneshot requests carry no address, so they share one bucket.
+        for attempt in 1..=30 {
+            let reply = browser
+                .send(&test, "POST", "/auth/passkey/signin/start", start())
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "attempt {attempt}");
+        }
+
+        let sign_in = browser
+            .send(&test, "POST", "/auth/passkey/signin/start", start())
+            .await;
+        let finish = browser
+            .send(
+                &test,
+                "POST",
+                "/auth/passkey/signin/finish",
+                Payload::Json(json!({
+                    "id": "AAAA", "rawId": "AAAA", "type": "public-key", "extensions": {},
+                    "response": {
+                        "authenticatorData": "AAAA", "clientDataJSON": "AAAA",
+                        "signature": "AAAA", "userHandle": null,
+                    },
+                })),
+            )
+            .await;
+        let setup = browser
+            .send(
+                &test,
+                "POST",
+                "/auth/passkey/setup/start",
+                Payload::Json(json!({ "token": token, "name": "Laptop" })),
+            )
+            .await;
+
+        assert_eq!(sign_in.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(finish.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(setup.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(sign_in.json()["error"], "TooManyRequests");
+    }
+
     /// Sends `uri` with the `Sec-Fetch-Site` another site's page would
     /// carry.
     async fn cross_site_post(test: &TestApp, uri: &str, body: serde_json::Value) -> StatusCode {
