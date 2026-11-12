@@ -623,7 +623,9 @@ mod tests {
     /// Creates catalog `pg` and the keys `alice` and `bob` (the foreign key
     /// `changesets.key_id` needs them), returning the catalog's id.
     async fn setup(pool: &PgPool) -> i64 {
-        let pg = catalogs::create(pool, "pg", "", now()).await.unwrap();
+        let pg = catalogs::create(pool, "pg", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         for id in ["alice", "bob"] {
             crate::store::keys::insert_legacy_test_key(
                 pool,
@@ -989,7 +991,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn lock_waits_for_the_holder_and_reads_its_commit() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", now()).await.unwrap();
+        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         // `changesets.key_id` is a foreign key: the key needs a row.
         crate::store::keys::insert_legacy_test_key(
             &db.pool,

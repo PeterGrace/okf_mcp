@@ -104,6 +104,10 @@ pub struct CatalogState {
     // ([`CatalogState::set_description`]). `Arc<str>` is a shared, immutable
     // string, so a reader takes a pointer copy, not a copy of the text.
     description: RwLock<Arc<str>>,
+    // The owning team's name, outside the snapshot for the same reason
+    // (`catalogs::set_owner`, [`CatalogState::set_owner_team`]); `None` for a
+    // catalog from before migration 0009 not yet assigned.
+    owner_team: RwLock<Option<Arc<str>>>,
     // `RwLock<Arc<_>>`: the lock is held only to clone or replace the `Arc`
     // (a pointer copy plus a reference count), never while a snapshot is read
     // or built. It is `std`'s lock, not tokio's: it is never held across an
@@ -143,6 +147,9 @@ impl CatalogState {
             id: catalog.id,
             name: catalog.name,
             description: RwLock::new(Arc::from(catalog.description)),
+            // `Option::map(Arc::from)` turns `Some(String)` into
+            // `Some(Arc<str>)`, leaving `None` alone.
+            owner_team: RwLock::new(catalog.owner_team.map(Arc::from)),
             current: RwLock::new(Arc::new(loaded)),
             rebuilding: tokio::sync::Mutex::new(()),
             publishing: tokio::sync::Mutex::new(()),
@@ -180,6 +187,32 @@ impl CatalogState {
             return;
         }
         *self.description.write().expect("description lock poisoned") = Arc::from(description);
+    }
+
+    /// The name of the team that owns the catalog, as of the last load or
+    /// poll.
+    ///
+    /// # Returns
+    /// A shared handle to the name (cheap to clone; derefs to `&str`), or
+    /// `None` for a catalog not yet assigned an owner.
+    pub fn owner_team(&self) -> Option<Arc<str>> {
+        // `.clone()` on an `Option<Arc<str>>` copies the pointer and bumps
+        // the reference count; the name itself is not copied.
+        self.owner_team.read().expect("owner lock poisoned").clone()
+    }
+
+    /// Replaces the owner held in memory, leaving the snapshot alone. The
+    /// poll loop calls it with each catalog row's owner.
+    ///
+    /// # Arguments
+    /// * `owner_team` - the catalog row's owner.
+    pub fn set_owner_team(&self, owner_team: Option<&str>) {
+        // As in `set_description`: compare under the read lock first, so an
+        // unchanged owner takes no write lock and allocates nothing.
+        if self.owner_team().as_deref() == owner_team {
+            return;
+        }
+        *self.owner_team.write().expect("owner lock poisoned") = owner_team.map(Arc::from);
     }
 
     /// The current loaded state. Cheap: it clones an `Arc` (bumps a
@@ -415,7 +448,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn load_builds_the_snapshot_of_the_live_documents() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         // A plain link: `okf.py` does not count an image embed (`![..](..)`) as a link.
@@ -437,11 +470,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn load_records_the_description_file_count_and_last_change() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "pgrace's world", Utc::now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            "pg",
+            "pgrace's world",
+            crate::db::TEST_TEAM,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         let empty = CatalogState::load(&db.pool, "pg").await.unwrap();
         assert_eq!(&*empty.description(), "pgrace's world");
+        assert_eq!(empty.owner_team().as_deref(), Some(crate::db::TEST_TEAM));
         assert_eq!(empty.current().files(), 0);
         assert_eq!(empty.current().last_change(), None);
         let imported = Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap();
@@ -465,7 +505,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn loaded_keeps_the_workspace_and_each_path_s_revision() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         // Typed, so the byte strings of different lengths share one type.
@@ -495,7 +535,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn refresh_swaps_in_a_new_snapshot_only_when_the_catalog_changed() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         import_into(&db.pool, &[("a.md", b"# Old\n")], false).await;
@@ -520,7 +560,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_refreshes_build_and_swap_once() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         let state = CatalogState::load(&db.pool, "pg").await.unwrap();
@@ -542,7 +582,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_deleted_catalog_cannot_be_refreshed() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", Utc::now())
+        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         let state = CatalogState::load(&db.pool, "pg").await.unwrap();
@@ -557,7 +597,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn build_names_a_catalog_deleted_before_it_read() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", Utc::now())
+        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         catalogs::delete(&db.pool, "pg", false).await.unwrap();
@@ -574,7 +614,7 @@ mod tests {
     async fn lint_flags_a_stamp_later_than_the_documents_last_revision() {
         let db = test_db().await;
         let imported = Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap();
-        catalogs::create(&db.pool, "pg", "", imported)
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, imported)
             .await
             .unwrap();
         let later = "---\ntype: Note\ngenerated: { by: t, at: 2026-11-02T12:10:00Z }\n---\nBody\n";

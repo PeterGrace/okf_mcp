@@ -49,6 +49,9 @@ pub(crate) struct CatalogSummary {
     pub name: String,
     /// Its description.
     pub description: String,
+    /// The name of the team that owns it; null for a catalog from before
+    /// users and teams not yet assigned.
+    pub owner_team: Option<String>,
     /// How many files it holds (every stored file).
     pub files: usize,
     /// How many of them are concepts.
@@ -73,6 +76,8 @@ impl CatalogSummary {
         Self {
             name: name.to_string(),
             description: state.description().to_string(),
+            // `as_deref` borrows the `Arc<str>` inside as a `&str`.
+            owner_team: state.owner_team().as_deref().map(str::to_string),
             files: loaded.files(),
             concepts: loaded.snapshot().concepts().count(),
             generation: loaded.generation(),
@@ -97,6 +102,8 @@ struct NewCatalog {
     /// Free text; empty when left out, as with the CLI.
     #[serde(default)]
     description: String,
+    /// The team that owns it. Required: a body without it is a 422.
+    owner: String,
 }
 
 /// `PATCH /catalogs/{catalog}`'s body.
@@ -160,8 +167,9 @@ async fn list_catalogs(
 /// 201 with the new catalog's summary.
 ///
 /// # Errors
-/// 403 for any other key; 409 ([`OkfError::Refused`]) for an invalid or
-/// taken name; 500 for a database failure.
+/// 403 for any other key; 404 ([`OkfError::UnknownName`]) for an unknown
+/// owner; 409 ([`OkfError::Refused`]) for an invalid or taken name; 422 for a
+/// body without `owner`; 500 for a database failure.
 async fn create_catalog(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
@@ -169,8 +177,14 @@ async fn create_catalog(
     Json(new): Json<NewCatalog>,
 ) -> Result<(StatusCode, Json<CatalogSummary>), AppError> {
     require_every_catalog(&principal)?;
-    let row =
-        catalog_rows::create(app.pool(), &new.name, &new.description, app.clock().now()).await?;
+    let row = catalog_rows::create(
+        app.pool(),
+        &new.name,
+        &new.description,
+        &new.owner,
+        app.clock().now(),
+    )
+    .await?;
     // Catalog rows record no actor (nor does the CLI); the log line does.
     tracing::info!(catalog = %row.name, key = %principal.key_id, actor = %principal.actor,
                    "catalog created");
@@ -180,6 +194,7 @@ async fn create_catalog(
     let summary = CatalogSummary {
         name: row.name,
         description: row.description,
+        owner_team: row.owner_team,
         files: 0,
         concepts: 0,
         generation: row.generation,
@@ -282,6 +297,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
+    use crate::db::TEST_TEAM;
     use crate::http::api::testing::{app, assert_matrix, keys, send, Row};
     use crate::http::archives::tarball_of;
     use crate::mcp::testing::{open, pending_entry, writer, PendingEdit, TestApp};
@@ -384,7 +400,7 @@ mod tests {
                 Row {
                     method: "POST",
                     uri: "/api/v1/catalogs".into(),
-                    body: Some(json!({ "name": "made-in-matrix" })),
+                    body: Some(json!({ "name": "made-in-matrix", "owner": TEST_TEAM })),
                     read: 403,
                     write: 403,
                     admin: 403,
@@ -429,6 +445,7 @@ mod tests {
         assert_eq!(body["catalogs"].as_array().map(Vec::len), Some(1));
         assert_eq!(main["name"], "main");
         assert_eq!(main["description"], "");
+        assert_eq!(main["owner_team"], TEST_TEAM);
         assert_eq!(main["files"], 6);
         // systems/alpha.md and systems/beta.md; index, log and AGENTS.md are not concepts.
         assert_eq!(main["concepts"], 2);
@@ -442,7 +459,7 @@ mod tests {
         let test = app().await;
         let keys = keys(&test).await;
         let root = every_catalog_admin(&test).await;
-        let new = json!({ "name": "scratch", "description": "Scratch space" });
+        let new = json!({ "name": "scratch", "description": "Scratch space", "owner": TEST_TEAM });
 
         let (status, created) = send(
             &test,
@@ -458,7 +475,23 @@ mod tests {
             "POST",
             "/api/v1/catalogs",
             Some(&root),
-            Some(json!({ "name": "Not Valid" })),
+            Some(json!({ "name": "Not Valid", "owner": TEST_TEAM })),
+        )
+        .await;
+        let (unowned, _) = send(
+            &test,
+            "POST",
+            "/api/v1/catalogs",
+            Some(&root),
+            Some(json!({ "name": "unowned" })),
+        )
+        .await;
+        let (unknown_owner, nobody) = send(
+            &test,
+            "POST",
+            "/api/v1/catalogs",
+            Some(&root),
+            Some(json!({ "name": "orphan", "owner": "nobody" })),
         )
         .await;
         let (scoped, refused) = send(
@@ -466,13 +499,14 @@ mod tests {
             "POST",
             "/api/v1/catalogs",
             Some(&keys.admin),
-            Some(json!({ "name": "mine" })),
+            Some(json!({ "name": "mine", "owner": TEST_TEAM })),
         )
         .await;
 
         assert_eq!(status, StatusCode::CREATED, "{created}");
         assert_eq!(created["name"], "scratch");
         assert_eq!(created["description"], "Scratch space");
+        assert_eq!(created["owner_team"], TEST_TEAM);
         assert_eq!(created["files"], 0);
         // Polled at once: loaded, and listed for a key that reaches it.
         assert!(test.app.catalog("scratch").is_some());
@@ -484,6 +518,10 @@ mod tests {
             .unwrap()
             .contains("already exists"));
         assert_eq!(invalid, StatusCode::CONFLICT);
+        // Every new catalog has an owner (Decision 2: a missing field is 422).
+        assert_eq!(unowned, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(unknown_owner, StatusCode::NOT_FOUND, "{nobody}");
+        assert_eq!(names(&test, &root).await, ["main", "other", "scratch"]);
         assert_eq!(scoped, StatusCode::FORBIDDEN);
         assert!(
             refused["message"]

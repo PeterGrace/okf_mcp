@@ -735,7 +735,7 @@ mod tests {
     async fn maintenance_capability_change_refreshes_cache() {
         use crate::store::{catalogs, keys as key_rows};
         let db = crate::db::test_db().await;
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         let new = key_rows::NewKey {
@@ -788,7 +788,7 @@ mod tests {
     async fn keys_load_from_the_database_and_reload_after_a_revoke() {
         use crate::store::{catalogs, keys as key_rows};
         let db = crate::db::test_db().await;
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         let names = ["pg".to_string()];

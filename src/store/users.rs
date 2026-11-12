@@ -344,18 +344,15 @@ pub(crate) mod tests {
     use crate::store::catalogs::{self, tests::until_a_lock_is_awaited};
     use crate::store::teams;
 
-    /// Gives `team` a catalog, `shared`, by writing `catalogs.owner_team_id`
-    /// directly (the store gains `catalogs::set_owner` in a later task).
+    /// Gives `team` a catalog, `shared`.
     pub(crate) async fn seed_catalog_owned_by(pool: &PgPool, team: &str) {
-        catalogs::create(pool, "shared", "", now()).await.unwrap();
-        sqlx::query(OWN_SHARED)
-            .bind(team)
-            .execute(pool)
+        catalogs::create(pool, "shared", "", team, now())
             .await
             .unwrap();
     }
 
-    /// Makes catalog `shared` belong to the team named `$1`.
+    /// Makes catalog `shared` belong to the team named `$1`, by writing
+    /// `catalogs.owner_team_id` inside a transaction the race test holds open.
     const OWN_SHARED: &str = "UPDATE catalogs SET owner_team_id = \
                               (SELECT id FROM teams WHERE name = $1) WHERE name = 'shared'";
 
@@ -641,7 +638,7 @@ pub(crate) mod tests {
         // and holds its commit while the delete runs.
         let db = test_db().await;
         create(&db.pool, &alice(), now()).await.unwrap();
-        catalogs::create(&db.pool, "shared", "", now())
+        catalogs::create(&db.pool, "shared", "", crate::db::TEST_TEAM, now())
             .await
             .unwrap();
         let mut assigning = db.pool.begin().await.unwrap();

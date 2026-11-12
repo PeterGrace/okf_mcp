@@ -89,7 +89,9 @@ mod tests {
     async fn an_export_holds_the_live_documents_exactly() {
         let db = test_db().await;
         let now = Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap();
-        catalogs::create(&db.pool, "pg", "", now).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now)
+            .await
+            .unwrap();
         let mut files = Files::new();
         files.insert("a.md".into(), stored(b"# A\n", false));
         files.insert("tools/run.sh".into(), stored(b"#!/bin/sh\n\0", true));
@@ -153,7 +155,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_empty_catalog_exports_an_empty_archive_and_unknown_ones_fail() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
 

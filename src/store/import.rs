@@ -369,7 +369,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_import_fills_an_empty_catalog() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
+            .await
+            .unwrap();
         let incoming = files(&[
             ("a.md", CONCEPT, false),
             ("index.md", b"# Index\n- [A](a.md)\n", false),
@@ -446,7 +448,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_second_import_needs_replace_and_writes_only_differences() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
+            .await
+            .unwrap();
         let first = files(&[
             ("keep.md", b"# Keep\n", false),
             ("change.md", b"# Old\n", false),
@@ -516,7 +520,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_recreated_path_continues_its_revisions_and_a_same_import_changes_nothing() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
+            .await
+            .unwrap();
         import(
             &db.pool,
             "pg",
@@ -559,7 +565,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_machinery_import_replaces_machinery_and_keeps_every_concept() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
+            .await
+            .unwrap();
         let exported = files(&[
             ("a.md", CONCEPT, false),
             ("AGENTS.md", b"# Old rules\n", false),
@@ -623,7 +631,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_import_expecting_another_generation_is_refused() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
+            .await
+            .unwrap();
         import(
             &db.pool,
             "pg",
@@ -664,7 +674,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_import_that_waited_for_a_publish_checks_the_generation_it_left() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
+            .await
+            .unwrap();
         import(
             &db.pool,
             "pg",
@@ -739,7 +751,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_changed_execute_bit_is_an_update() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
+            .await
+            .unwrap();
         import(
             &db.pool,
             "pg",
@@ -773,7 +787,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn markdown_that_is_not_text_and_unknown_catalogs_are_refused() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
+            .await
+            .unwrap();
         let binary_markdown = files(&[
             ("a.md", b"\xff\xfe", false),
             ("b.md", b"# B\n", false),
@@ -807,7 +823,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_import_that_waited_for_a_delete_finds_the_catalog_gone() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", at(0)).await.unwrap();
+        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
+            .await
+            .unwrap();
         // Hold the catalog's lock, as a delete in progress would.
         let mut holder = db.pool.begin().await.unwrap();
         catalogs::lock(&mut holder, catalog.id).await.unwrap();

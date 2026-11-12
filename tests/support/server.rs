@@ -16,14 +16,15 @@ use okf_mcp::archive::Files;
 use okf_mcp::clock::SystemClock;
 use okf_mcp::config::Config;
 use okf_mcp::okf::workspace::StoredFile;
-use okf_mcp::store::catalogs;
 use okf_mcp::store::import::{import, ImportOptions, ImportScope};
 use okf_mcp::store::keys::{self, Access, Grants, NewKey};
+use okf_mcp::store::{catalogs, users};
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{RoleClient, ServiceExt};
+use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -37,6 +38,29 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A connected MCP client.
 pub type Client = RunningService<RoleClient, ()>;
+
+/// The user every test database is given; its personal team, of the same
+/// name, owns the catalogs the tests create.
+pub const OWNER: &str = "tester";
+
+/// Migrates a fresh database and creates [`OWNER`], so catalogs have a
+/// team to belong to.
+///
+/// # Arguments
+/// * `pool` - the unmigrated database.
+///
+/// # Panics
+/// If the migration or the create fails: a broken test setup.
+pub async fn migrate_with_owner(pool: &PgPool) {
+    okf_mcp::db::migrate(pool).await.expect("migrations");
+    let owner = users::NewUser {
+        name: OWNER,
+        display_name: "",
+    };
+    users::create(pool, &owner, Utc::now())
+        .await
+        .expect("create the owner");
+}
 
 /// Literal files, as an import takes them.
 ///
@@ -118,9 +142,9 @@ impl TestServer {
         make_config: impl FnOnce(&str) -> Config,
     ) -> Self {
         let db = TestDb::start().await;
-        okf_mcp::db::migrate(&db.pool).await.expect("migrations");
+        migrate_with_owner(&db.pool).await;
         for (name, files) in catalogs_and_files {
-            catalogs::create(&db.pool, name, "", Utc::now())
+            catalogs::create(&db.pool, name, "", OWNER, Utc::now())
                 .await
                 .expect("create catalog");
             let options = ImportOptions {

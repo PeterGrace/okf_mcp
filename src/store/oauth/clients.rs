@@ -350,7 +350,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prune_keeps_bound_recent_and_document_clients() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "main", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         let old = now() - TimeDelta::hours(25);
         insert_dcr_row(&db.pool, "old-unbound", old).await;
         insert_dcr_row(&db.pool, "old-bound", old).await;
@@ -436,7 +438,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn insert_dcr_stops_at_the_cap_of_unbound_clients() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "main", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         let uris = vec!["https://client.example.com/callback".to_string()];
         let metadata = serde_json::json!({});
         let new = NewDcrClient {
@@ -501,7 +505,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn only_dcr_clients_without_a_grant_are_counted() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "main", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         insert_dcr_row(&db.pool, "unbound-1", now()).await;
         insert_dcr_row(&db.pool, "unbound-2", now()).await;
         insert_dcr_row(&db.pool, "bound", now()).await;

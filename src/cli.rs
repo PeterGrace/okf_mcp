@@ -121,6 +121,10 @@ pub enum CatalogCommand {
         /// Free text.
         #[arg(long, default_value = "")]
         description: String,
+        /// The team that owns it (a user's name names that user's personal
+        /// team).
+        #[arg(long)]
+        owner: String,
     },
     /// Change an existing catalog's description. A running server shows the
     /// new text within one `poll_interval`.
@@ -532,8 +536,12 @@ async fn run_catalog(
     clock: &dyn Clock,
 ) -> anyhow::Result<()> {
     match command {
-        CatalogCommand::Create { name, description } => {
-            let catalog = catalogs::create(pool, &name, &description, clock.now()).await?;
+        CatalogCommand::Create {
+            name,
+            description,
+            owner,
+        } => {
+            let catalog = catalogs::create(pool, &name, &description, &owner, clock.now()).await?;
             println!("created catalog {}", catalog.name);
         }
         CatalogCommand::Update { name, description } => {
@@ -821,14 +829,24 @@ mod tests {
 
     #[test]
     fn catalog_subcommands_parse() {
-        let parsed =
-            Cli::try_parse_from(["okf-mcp", "catalog", "create", "pg", "--description", "D"])
-                .unwrap();
+        let parsed = Cli::try_parse_from([
+            "okf-mcp",
+            "catalog",
+            "create",
+            "pg",
+            "--description",
+            "D",
+            "--owner",
+            "family",
+        ])
+        .unwrap();
         assert!(matches!(
             parsed.command,
-            Some(Command::Catalog(CatalogCommand::Create { ref name, ref description }))
-                if name == "pg" && description == "D"
+            Some(Command::Catalog(CatalogCommand::Create { ref name, ref description, ref owner }))
+                if name == "pg" && description == "D" && owner == "family"
         ));
+        // Every new catalog has an owner, so `--owner` is required.
+        assert!(Cli::try_parse_from(["okf-mcp", "catalog", "create", "pg"]).is_err());
         let parsed =
             Cli::try_parse_from(["okf-mcp", "catalog", "update", "pg", "--description", ""])
                 .unwrap();
@@ -849,10 +867,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn catalog_create_runs_against_the_database() {
-        let db = crate::db::pg_support::TestDb::start().await;
+        let db = crate::db::test_db().await;
         let create = CatalogCommand::Create {
             name: "pg".to_string(),
             description: String::new(),
+            owner: crate::db::TEST_TEAM.to_string(),
         };
 
         run(
@@ -1281,7 +1300,7 @@ mod tests {
         use crate::store::oauth::clients::ClientKind;
         use crate::store::oauth::codes::insert_test_client;
 
-        let db = crate::db::pg_support::TestDb::start().await;
+        let db = crate::db::test_db().await;
         let clock = fixed_now();
         let url = Some(db.url.clone());
         // Runs `okf-mcp <args>` against the test database.
@@ -1292,7 +1311,9 @@ mod tests {
                 .expect("a subcommand");
             run(cli(url.clone(), command), Arc::clone(&clock))
         };
-        okf(&["catalog", "create", "main"]).await.unwrap();
+        okf(&["catalog", "create", "main", "--owner", crate::db::TEST_TEAM])
+            .await
+            .unwrap();
 
         okf(&[
             "oauth",
@@ -1513,11 +1534,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn import_reads_a_directory() {
-        let db = crate::db::pg_support::TestDb::start().await;
+        let db = crate::db::test_db().await;
         let clock = fixed_now();
         let create = CatalogCommand::Create {
             name: "pg".to_string(),
             description: String::new(),
+            owner: crate::db::TEST_TEAM.to_string(),
         };
         run(
             cli(Some(db.url.clone()), Command::Catalog(create)),
@@ -1549,11 +1571,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn import_reads_a_tarball_file_and_explains_a_missing_one() {
-        let db = crate::db::pg_support::TestDb::start().await;
+        let db = crate::db::test_db().await;
         let clock = fixed_now();
         let create = CatalogCommand::Create {
             name: "pg".to_string(),
             description: String::new(),
+            owner: crate::db::TEST_TEAM.to_string(),
         };
         run(
             cli(Some(db.url.clone()), Command::Catalog(create)),
@@ -1633,11 +1656,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn export_writes_a_tarball_file_and_none_for_an_unknown_catalog() {
-        let db = crate::db::pg_support::TestDb::start().await;
+        let db = crate::db::test_db().await;
         let clock = fixed_now();
         let create = CatalogCommand::Create {
             name: "pg".to_string(),
             description: String::new(),
+            owner: crate::db::TEST_TEAM.to_string(),
         };
         run(
             cli(Some(db.url.clone()), Command::Catalog(create)),

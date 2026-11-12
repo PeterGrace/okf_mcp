@@ -301,9 +301,10 @@ impl App {
             let existing = current.get(&row.name).filter(|state| state.id() == row.id);
             let state = match existing {
                 Some(state) => {
-                    // Outside the snapshot, so a `catalog update` shows
-                    // without a rebuild.
+                    // Outside the snapshot, so a `catalog update` or
+                    // owner change shows without a rebuild.
                     state.set_description(&row.description);
+                    state.set_owner_team(row.owner_team.as_deref());
                     if row.generation > state.current().generation() && !failed_before {
                         if let Err(error) = state.refresh(&self.pool).await {
                             // The old snapshot stays in place.
@@ -611,6 +612,7 @@ mod tests {
             description: String::new(),
             generation: 3,
             created_at: Utc::now(),
+            owner_team: None,
         };
         let deleted = OkfError::CatalogNotSelected {
             catalog: "pg".to_string(),
@@ -635,10 +637,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn load_holds_every_catalog_and_live_key() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
-        catalogs::create(&db.pool, "work", "", Utc::now())
+        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         import_files(&db.pool, "pg", &[("a.md", "# A\n")], false).await;
@@ -654,10 +656,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn poll_notices_imports_new_and_deleted_catalogs_and_revoked_keys() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
-        catalogs::create(&db.pool, "gone", "", Utc::now())
+        catalogs::create(&db.pool, "gone", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         let key = new_key(&db.pool, "reader").await;
@@ -666,7 +668,7 @@ mod tests {
 
         // Changes made by the subcommands, beside the running server.
         import_files(&db.pool, "pg", &[("a.md", "# A\n")], false).await;
-        catalogs::create(&db.pool, "work", "", Utc::now())
+        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         catalogs::delete(&db.pool, "gone", false).await.unwrap();
@@ -703,7 +705,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn poll_picks_up_a_new_description_without_a_rebuild() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "copy", Utc::now())
+        catalogs::create(&db.pool, "pg", "copy", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         let app = app(&db.pool).await;
@@ -721,16 +723,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn poll_picks_up_a_new_owner_without_a_rebuild() {
+        let db = test_db().await;
+        let alice = crate::store::users::NewUser {
+            name: "alice",
+            display_name: "",
+        };
+        crate::store::users::create(&db.pool, &alice, Utc::now())
+            .await
+            .unwrap();
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
+            .await
+            .unwrap();
+        let app = app(&db.pool).await;
+        let pg = app.catalog("pg").unwrap();
+        let before = pg.current();
+        assert_eq!(pg.owner_team().as_deref(), Some(crate::db::TEST_TEAM));
+
+        catalogs::set_owner(&db.pool, "pg", "alice").await.unwrap();
+        app.poll().await.unwrap();
+
+        assert_eq!(pg.owner_team().as_deref(), Some("alice"));
+        assert!(Arc::ptr_eq(&before, &app.catalog("pg").unwrap().current()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn poll_reloads_a_catalog_created_again_under_the_same_name() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "first", Utc::now())
+        catalogs::create(&db.pool, "pg", "first", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         let app = app(&db.pool).await;
         let first_id = app.catalog("pg").unwrap().id();
 
         catalogs::delete(&db.pool, "pg", false).await.unwrap();
-        catalogs::create(&db.pool, "pg", "second", Utc::now())
+        catalogs::create(&db.pool, "pg", "second", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         app.poll().await.unwrap();
@@ -743,10 +770,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_catalog_that_fails_to_load_is_skipped_until_it_changes() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
-        let bad = catalogs::create(&db.pool, "bad", "", Utc::now())
+        let bad = catalogs::create(&db.pool, "bad", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         break_catalog(&db.pool, bad.id).await;
@@ -771,7 +798,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_refresh_keeps_the_old_snapshot_until_the_catalog_changes() {
         let db = test_db().await;
-        let pg = catalogs::create(&db.pool, "pg", "", Utc::now())
+        let pg = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         import_files(&db.pool, "pg", &[("a.md", "# A\n")], false).await;
@@ -796,13 +823,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_re_created_catalog_that_fails_to_load_drops_the_old_one() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         import_files(&db.pool, "pg", &[("a.md", "# A\n")], false).await;
         let app = app(&db.pool).await;
         catalogs::delete(&db.pool, "pg", false).await.unwrap();
-        let again = catalogs::create(&db.pool, "pg", "", Utc::now())
+        let again = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         break_catalog(&db.pool, again.id).await;
@@ -823,7 +850,7 @@ mod tests {
         key_rows::revoke(&db.pool, "reader", Utc::now())
             .await
             .unwrap();
-        catalogs::create(&db.pool, "work", "", Utc::now())
+        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         // With the keys table out of the way, the reload fails.
@@ -849,7 +876,7 @@ mod tests {
     async fn a_failed_admin_generation_read_does_not_stop_the_pass() {
         let db = test_db().await;
         let app = app(&db.pool).await;
-        catalogs::create(&db.pool, "work", "", Utc::now())
+        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         // With the counter's table out of the way, reading it fails.
@@ -878,7 +905,7 @@ mod tests {
             .unwrap();
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(Arc::clone(&app).poll_until(shutdown.clone()));
-        catalogs::create(&db.pool, "pg", "", Utc::now())
+        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
 
@@ -982,7 +1009,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn poll_discards_empty_changesets_a_day_old_and_keeps_the_rest() {
         let db = test_db().await;
-        let pg = catalogs::create(&db.pool, "pg", "", Utc::now())
+        let pg = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         new_key(&db.pool, "writer").await;

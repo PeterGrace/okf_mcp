@@ -648,7 +648,9 @@ mod tests {
     async fn with_catalogs(names: &[&str]) -> TestDb {
         let db = test_db().await;
         for name in names {
-            catalogs::create(&db.pool, name, "", now()).await.unwrap();
+            catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, now())
+                .await
+                .unwrap();
         }
         db
     }
@@ -1192,7 +1194,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prune_deletes_only_old_unredeemed_codes() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "main", "", now()).await.unwrap();
+        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
+            .await
+            .unwrap();
         let client = insert_client(
             &db.pool,
             "https://client.example.com/client.json",

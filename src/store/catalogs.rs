@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::error::OkfError;
+use crate::store::teams;
 
 /// The first key of every catalog lock (`okf` in ASCII), separating this
 /// crate's advisory locks from anyone else's on a shared database.
@@ -26,6 +27,19 @@ pub struct Catalog {
     pub generation: i64,
     /// When it was created (server clock).
     pub created_at: DateTime<Utc>,
+    /// The name of the team that owns it; `None` only for a catalog from
+    /// before migration 0009 not yet assigned.
+    pub owner_team: Option<String>,
+}
+
+// One SELECT shared by `list` and `find` (a macro so `concat!` can append
+// each query's tail at compile time; see `select_users!` in users.rs).
+macro_rules! select_catalogs {
+    () => {
+        "SELECT c.id, c.name, c.description, c.generation, c.created_at, \
+                (SELECT t.name FROM teams t WHERE t.id = c.owner_team_id) AS owner_team \
+         FROM catalogs c"
+    };
 }
 
 /// Is `name` a valid catalog name (non-empty, ASCII lowercase letters, digits, `-`)?
@@ -49,18 +63,21 @@ pub fn is_valid_name(name: &str) -> bool {
 /// * `pool` - the database.
 /// * `name` - the new catalog's name.
 /// * `description` - free text.
+/// * `owner_team` - the name of the team that owns it.
 /// * `now` - the creation time (server clock).
 ///
 /// # Returns
 /// The new row.
 ///
 /// # Errors
-/// [`OkfError::Refused`] for an invalid or taken name; [`OkfError::Database`]
+/// [`OkfError::Refused`] for an invalid or taken name;
+/// [`OkfError::UnknownName`] for an unknown team; [`OkfError::Database`]
 /// otherwise.
 pub async fn create(
     pool: &PgPool,
     name: &str,
     description: &str,
+    owner_team: &str,
     now: DateTime<Utc>,
 ) -> Result<Catalog, OkfError> {
     if !is_valid_name(name) {
@@ -70,13 +87,22 @@ pub async fn create(
     }
     // Dropping `tx` without `commit()` (an early `return` or `?`) rolls back.
     let mut tx = pool.begin().await?;
+    // `&mut tx` is a `&mut Transaction`, which Rust converts to the
+    // `&mut PgConnection` the helper takes (deref coercion).
+    let team_id = teams::id_of(&mut tx, owner_team).await?;
+    // `RETURNING` cannot run the owner subquery of `select_catalogs!` on the
+    // new row, but the owner's name is the one just resolved: hand it back
+    // as `$5`.
     let inserted = sqlx::query_as::<_, Catalog>(
-        "INSERT INTO catalogs (name, description, created_at) VALUES ($1, $2, $3) \
-         RETURNING id, name, description, generation, created_at",
+        "INSERT INTO catalogs (name, description, created_at, owner_team_id) \
+         VALUES ($1, $2, $3, $4) \
+         RETURNING id, name, description, generation, created_at, $5::text AS owner_team",
     )
     .bind(name)
     .bind(description)
     .bind(now)
+    .bind(&team_id)
+    .bind(owner_team)
     // `&mut *tx` borrows the transaction's connection: the query runs inside it.
     .fetch_one(&mut *tx)
     .await;
@@ -89,11 +115,49 @@ pub async fn create(
         }
         Err(error) => return Err(error.into()),
     };
-    // `&mut tx` is a `&mut Transaction`, which Rust converts to the
-    // `&mut PgConnection` the helper takes (deref coercion).
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(catalog)
+}
+
+/// Makes `team` the owner of catalog `name` (moving it, or assigning a
+/// catalog from before migration 0009), and bumps the administrative
+/// generation, in one transaction.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `name` - the catalog's name.
+/// * `team` - the new owner's team name.
+///
+/// # Returns
+/// The previous owner's name (`None` for a catalog that had none).
+///
+/// # Errors
+/// [`OkfError::CatalogNotSelected`] for an unknown catalog;
+/// [`OkfError::UnknownName`] for an unknown team; [`OkfError::Database`].
+pub async fn set_owner(pool: &PgPool, name: &str, team: &str) -> Result<Option<String>, OkfError> {
+    let mut tx = pool.begin().await?;
+    let team_id = teams::id_of(&mut tx, team).await?;
+    // As in `update_description`: the subquery reads the row as it was
+    // before the `UPDATE`, under its row lock, so this returns the owner it
+    // replaced even with two changes racing. `Option<Option<String>>`: the
+    // outer `None` is "no such catalog", the inner one "it had no owner".
+    let previous: Option<Option<String>> = sqlx::query_scalar(
+        "UPDATE catalogs c SET owner_team_id = $2 \
+         FROM (SELECT id, owner_team_id FROM catalogs WHERE name = $1 FOR UPDATE) old \
+         WHERE c.id = old.id \
+         RETURNING (SELECT t.name FROM teams t WHERE t.id = old.owner_team_id)",
+    )
+    .bind(name)
+    .bind(&team_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let previous = previous.ok_or_else(|| OkfError::CatalogNotSelected {
+        catalog: name.to_string(),
+    })?;
+    bump_admin_generation(&mut tx).await?;
+    tx.commit().await?;
+    Ok(previous)
 }
 
 /// Replaces a catalog's description and bumps the administrative
@@ -148,11 +212,9 @@ pub async fn update_description(
 /// # Errors
 /// [`OkfError::Database`].
 pub async fn list(pool: &PgPool) -> Result<Vec<Catalog>, OkfError> {
-    let catalogs = sqlx::query_as::<_, Catalog>(
-        "SELECT id, name, description, generation, created_at FROM catalogs ORDER BY name",
-    )
-    .fetch_all(pool)
-    .await?;
+    let catalogs = sqlx::query_as::<_, Catalog>(concat!(select_catalogs!(), " ORDER BY c.name"))
+        .fetch_all(pool)
+        .await?;
     Ok(catalogs)
 }
 
@@ -169,15 +231,13 @@ pub async fn list(pool: &PgPool) -> Result<Vec<Catalog>, OkfError> {
 /// [`OkfError::CatalogNotSelected`] if there is none; [`OkfError::Database`].
 // `'e` is a lifetime parameter: the executor is borrowed for the query only.
 pub async fn find<'e>(executor: impl PgExecutor<'e>, name: &str) -> Result<Catalog, OkfError> {
-    sqlx::query_as::<_, Catalog>(
-        "SELECT id, name, description, generation, created_at FROM catalogs WHERE name = $1",
-    )
-    .bind(name)
-    .fetch_optional(executor)
-    .await?
-    .ok_or_else(|| OkfError::CatalogNotSelected {
-        catalog: name.to_string(),
-    })
+    sqlx::query_as::<_, Catalog>(concat!(select_catalogs!(), " WHERE c.name = $1"))
+        .bind(name)
+        .fetch_optional(executor)
+        .await?
+        .ok_or_else(|| OkfError::CatalogNotSelected {
+            catalog: name.to_string(),
+        })
 }
 
 /// Deletes a catalog with its documents, history, changesets and grants
@@ -325,7 +385,7 @@ pub(crate) fn is_unique_violation(error: &sqlx::Error) -> bool {
 // `pub(crate)` so other store modules' tests share the lock helper below.
 pub(crate) mod tests {
     use super::*;
-    use crate::db::test_db;
+    use crate::db::{test_db, TEST_TEAM};
     use chrono::TimeZone;
 
     fn now() -> DateTime<Utc> {
@@ -338,10 +398,12 @@ pub(crate) mod tests {
         // Read first: the fixture user already bumped the generation.
         let start = admin_generation(&db.pool).await.unwrap();
 
-        let pg = create(&db.pool, "pg", "pgrace's catalog", now())
+        let pg = create(&db.pool, "pg", "pgrace's catalog", TEST_TEAM, now())
             .await
             .unwrap();
-        create(&db.pool, "aa-work", "", now()).await.unwrap();
+        create(&db.pool, "aa-work", "", TEST_TEAM, now())
+            .await
+            .unwrap();
 
         assert_eq!(
             (pg.name.as_str(), pg.generation, pg.created_at),
@@ -363,11 +425,108 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_catalog_is_owned_by_the_named_team() {
+        let db = test_db().await;
+
+        let catalog = create(&db.pool, "pg", "", TEST_TEAM, now()).await.unwrap();
+
+        assert_eq!(catalog.owner_team.as_deref(), Some(TEST_TEAM));
+        assert_eq!(find(&db.pool, "pg").await.unwrap(), catalog);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_owner_is_unknown_name_and_creates_nothing() {
+        let db = test_db().await;
+        // Read first: the fixture user already bumped the generation.
+        let start = admin_generation(&db.pool).await.unwrap();
+
+        let made = create(&db.pool, "pg", "", "nobody", now()).await;
+
+        assert!(
+            matches!(&made, Err(OkfError::UnknownName { noun: "team", name }) if name == "nobody"),
+            "{made:?}"
+        );
+        assert!(list(&db.pool).await.unwrap().is_empty());
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), start);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_owner_moves_a_catalog_and_returns_the_previous_owner() {
+        let db = test_db().await;
+        let alice = crate::store::users::NewUser {
+            name: "alice",
+            display_name: "",
+        };
+        crate::store::users::create(&db.pool, &alice, now())
+            .await
+            .unwrap();
+        create(&db.pool, "pg", "", TEST_TEAM, now()).await.unwrap();
+        let before = admin_generation(&db.pool).await.unwrap();
+
+        let previous = set_owner(&db.pool, "pg", "alice").await.unwrap();
+
+        assert_eq!(previous.as_deref(), Some(TEST_TEAM));
+        assert_eq!(
+            find(&db.pool, "pg").await.unwrap().owner_team.as_deref(),
+            Some("alice")
+        );
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), before + 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_owner_assigns_a_legacy_catalog() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO catalogs (name, created_at) VALUES ('legacy', now())")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(find(&db.pool, "legacy").await.unwrap().owner_team, None);
+
+        let previous = set_owner(&db.pool, "legacy", TEST_TEAM).await.unwrap();
+
+        assert_eq!(previous, None);
+        assert_eq!(
+            find(&db.pool, "legacy")
+                .await
+                .unwrap()
+                .owner_team
+                .as_deref(),
+            Some(TEST_TEAM)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_owner_refuses_an_unknown_catalog_or_team_and_changes_nothing() {
+        let db = test_db().await;
+        create(&db.pool, "pg", "", TEST_TEAM, now()).await.unwrap();
+        let start = admin_generation(&db.pool).await.unwrap();
+
+        let no_catalog = set_owner(&db.pool, "nope", TEST_TEAM).await;
+        let no_team = set_owner(&db.pool, "pg", "nobody").await;
+
+        assert!(
+            matches!(&no_catalog, Err(OkfError::CatalogNotSelected { catalog }) if catalog == "nope"),
+            "{no_catalog:?}"
+        );
+        assert!(
+            matches!(&no_team, Err(OkfError::UnknownName { noun: "team", .. })),
+            "{no_team:?}"
+        );
+        assert_eq!(
+            find(&db.pool, "pg").await.unwrap().owner_team.as_deref(),
+            Some(TEST_TEAM)
+        );
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), start);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn update_description_replaces_it_and_returns_the_old_text() {
         let db = test_db().await;
         // Read first: the fixture user already bumped the generation.
         let start = admin_generation(&db.pool).await.unwrap();
-        let pg = create(&db.pool, "pg", "copy", now()).await.unwrap();
+        let pg = create(&db.pool, "pg", "copy", TEST_TEAM, now())
+            .await
+            .unwrap();
 
         let previous = update_description(&db.pool, "pg", "source of truth")
             .await
@@ -389,7 +548,9 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_updates_each_return_the_text_they_replaced() {
         let db = test_db().await;
-        create(&db.pool, "pg", "start", now()).await.unwrap();
+        create(&db.pool, "pg", "start", TEST_TEAM, now())
+            .await
+            .unwrap();
         // Hold the row so both updates queue behind it and then race.
         let mut holder = db.pool.begin().await.unwrap();
         sqlx::query("SELECT id FROM catalogs WHERE name = 'pg' FOR UPDATE")
@@ -440,18 +601,18 @@ pub(crate) mod tests {
         let db = test_db().await;
         // Read first: the fixture user already bumped the generation.
         let start = admin_generation(&db.pool).await.unwrap();
-        create(&db.pool, "pg", "", now()).await.unwrap();
+        create(&db.pool, "pg", "", TEST_TEAM, now()).await.unwrap();
 
         for name in ["", "Bad Name", "a/b", "ünï"] {
             assert!(
                 matches!(
-                    create(&db.pool, name, "", now()).await,
+                    create(&db.pool, name, "", TEST_TEAM, now()).await,
                     Err(OkfError::Refused { .. })
                 ),
                 "{name}"
             );
         }
-        let duplicate = create(&db.pool, "pg", "", now()).await;
+        let duplicate = create(&db.pool, "pg", "", TEST_TEAM, now()).await;
 
         assert!(
             matches!(duplicate, Err(OkfError::Refused { reason }) if reason.contains("already exists"))
@@ -464,7 +625,7 @@ pub(crate) mod tests {
         let db = test_db().await;
         // Read first: the fixture user already bumped the generation.
         let start = admin_generation(&db.pool).await.unwrap();
-        let pg = create(&db.pool, "pg", "", now()).await.unwrap();
+        let pg = create(&db.pool, "pg", "", TEST_TEAM, now()).await.unwrap();
         let changeset: i64 = sqlx::query_scalar(
             "INSERT INTO changesets (catalog_id, actor, state, created_at, updated_at) \
              VALUES ($1, 'a', 'open', $2, $2) RETURNING id",
@@ -500,7 +661,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_empty_open_changeset_does_not_block_delete() {
         let db = test_db().await;
-        let pg = create(&db.pool, "pg", "", now()).await.unwrap();
+        let pg = create(&db.pool, "pg", "", TEST_TEAM, now()).await.unwrap();
         sqlx::query(
             "INSERT INTO changesets (catalog_id, actor, state, created_at, updated_at) \
              VALUES ($1, 'a', 'open', $2, $2)",
@@ -519,7 +680,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_lock_holds_other_transactions_off_until_commit() {
         let db = test_db().await;
-        let pg = create(&db.pool, "pg", "", now()).await.unwrap();
+        let pg = create(&db.pool, "pg", "", TEST_TEAM, now()).await.unwrap();
         let mut holder = db.pool.begin().await.unwrap();
 
         lock(&mut holder, pg.id).await.unwrap();
@@ -566,11 +727,46 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_create_that_waited_on_a_team_delete_is_unknown_name() {
+        // Arrange: a transaction deletes team `family` and holds its commit
+        // while the create runs.
+        let db = test_db().await;
+        let family = crate::store::teams::NewTeam {
+            name: "family",
+            display_name: "",
+            owner: crate::db::TEST_USER,
+        };
+        crate::store::teams::create(&db.pool, &family, now())
+            .await
+            .unwrap();
+        let mut deleting = db.pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM teams WHERE name = 'family'")
+            .execute(&mut *deleting)
+            .await
+            .unwrap();
+        // `tokio::spawn` runs the create concurrently, like a thread; its
+        // `FOR KEY SHARE` read of the team waits on the delete's row lock.
+        let pool = db.pool.clone();
+        let creating = tokio::spawn(async move { create(&pool, "pg", "", "family", now()).await });
+        until_a_lock_is_awaited(&db.pool).await;
+
+        deleting.commit().await.unwrap();
+        let outcome = creating.await.unwrap();
+
+        // Not a foreign-key violation (a 500): the team is simply unknown.
+        assert!(
+            matches!(&outcome, Err(OkfError::UnknownName { noun: "team", .. })),
+            "{outcome:?}"
+        );
+        assert!(list(&db.pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_delete_that_waited_finds_the_catalog_gone() {
         let db = test_db().await;
         // Read first: the fixture user already bumped the generation.
         let start = admin_generation(&db.pool).await.unwrap();
-        let pg = create(&db.pool, "pg", "", now()).await.unwrap();
+        let pg = create(&db.pool, "pg", "", TEST_TEAM, now()).await.unwrap();
         let mut first = db.pool.begin().await.unwrap();
         lock(&mut first, pg.id).await.unwrap();
         // `tokio::spawn` runs the second delete concurrently, like a thread;
@@ -597,7 +793,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_entry_written_during_a_delete_is_refused_not_cascaded() {
         let db = test_db().await;
-        let pg = create(&db.pool, "pg", "", now()).await.unwrap();
+        let pg = create(&db.pool, "pg", "", TEST_TEAM, now()).await.unwrap();
         let changeset: i64 = sqlx::query_scalar(
             "INSERT INTO changesets (catalog_id, actor, state, created_at, updated_at) \
              VALUES ($1, 'a', 'open', $2, $2) RETURNING id",

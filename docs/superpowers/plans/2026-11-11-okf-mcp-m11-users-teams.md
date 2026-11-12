@@ -1156,9 +1156,14 @@ async fn a_team_that_owns_a_catalog_is_not_deleted() {
 - [ ] **Step 3: Implement**
   - Add `pub owner_team: Option<String>` (doc: "The team that owns it; `None` only for a catalog from before migration 0009 not yet assigned") to `Catalog`.
   - Every `query_as::<_, Catalog>` now selects `(SELECT t.name FROM teams t WHERE t.id = c.owner_team_id) AS owner_team`, with the table aliased `c`.
-  - Add `pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String, OkfError>` to `src/store/teams.rs` (Task 2 left it out because nothing called it yet): `SELECT id FROM teams WHERE name = $1`, mapping no row to the module's `unknown(name)` (`UnknownName { noun: "team" }`).
-  - `create` gains `owner_team: &str` before `now`. It resolves `teams::id_of(&mut tx, owner_team)?` inside the transaction before the insert, and inserts `owner_team_id`. `RETURNING` cannot use the subquery, so the returned row is built from `RETURNING id, name, description, generation, created_at` plus `owner_team: Some(owner_team.to_string())`. Use a small private `#[derive(sqlx::FromRow)] struct InsertedCatalog` for the insert.
+  - Add `pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String, OkfError>` to `src/store/teams.rs` (Task 2 left it out because nothing called it yet): `SELECT id FROM teams WHERE name = $1 FOR KEY SHARE`, mapping no row to the module's `unknown(name)` (`UnknownName { noun: "team" }`).
+
+> **Corrected (issue #281).** `teams::id_of` locks the row `FOR KEY SHARE`. Without it, a create racing a team delete reads the team, then fails its foreign key once the delete commits: a 23503 database error (a 500). With it, the create waits on the delete's `FOR UPDATE` and finds no row (`UnknownName`). Test: `catalogs::tests::a_create_that_waited_on_a_team_delete_is_unknown_name`.
+
+  - `create` gains `owner_team: &str` before `now`. It resolves `teams::id_of(&mut tx, owner_team)?` inside the transaction before the insert, and inserts `owner_team_id`. `RETURNING` cannot use the subquery, so it hands back the resolved name as a parameter: `RETURNING id, name, description, generation, created_at, $5::text AS owner_team` (no `InsertedCatalog` struct). `list` and `find` share one `select_catalogs!()` macro, as `users.rs` does with `select_users!()`.
   - `set_owner(pool, name, team)`:
+
+> **Corrected (issue #281).** `set_owner` shipped as one `UPDATE catalogs c SET owner_team_id = $2 FROM (SELECT id, owner_team_id FROM catalogs WHERE name = $1 FOR UPDATE) old WHERE c.id = old.id RETURNING (SELECT t.name FROM teams t WHERE t.id = old.owner_team_id)`, the same shape as `update_description`, rather than the two statements below. Read `src/store/catalogs.rs`.
 
 ```rust
 /// Makes `team` the owner of catalog `name`, and bumps the administrative
@@ -1208,9 +1213,13 @@ Then fix by hand what the compiler still reports:
   - `src/http/api/catalogs.rs` `NewCatalog` gains `owner: String`. It is required, so a missing one is a 422 (Decision 2). `CatalogSummary` gains `owner_team: Option<String>`, taken from the loaded state (see below).
   - `src/app.rs:608` adds `owner_team: None` to its literal, or reads it from the row it builds from.
   - `tests/support/server.rs` `start_with`: after `migrate`, create the user `tester` through `okf_mcp::store::users::create` and pass `"tester"` as the owner. Also update `tests/roundtrip.rs` and `tests/smoke.rs` the same way.
+
+> **Corrected (issue #281).** `tests/support/server.rs` exports `pub const OWNER: &str = "tester"` and `pub async fn migrate_with_owner(pool)` (migrate, then create `OWNER`). `start_with`, `tests/roundtrip.rs` and `tests/smoke.rs` call it. Later tasks should use `support::server::OWNER` instead of the literal `"tester"`.
+>
+> Two more callers needed changing that the list above missed. The CLI tests that run `catalog create` now start from `crate::db::test_db()` (which has `TEST_USER`) instead of an empty `TestDb::start()`, and pass `--owner`/`owner: TEST_TEAM`. The console's create form (`src/http/ui/js/pages/catalogs.js`) would have been refused with a 422 until Task 8, so it gained a plain required `owner` text input, filled with `OWNER` in `tests/ui_e2e/catalogs.rs`. Task 8 replaces the input with the `<select>`.
   - Revert the substitution in `src/store/catalogs.rs`'s own non-test `create` definition if the regex touched it. It shouldn't: the definition is `pub async fn create(`, not `catalogs::create(`.
 
-The loaded catalog state (`CatalogState`, `src/catalog.rs`) carries the description from the row. Carry `owner_team` the same way (`fn owner_team(&self) -> Option<&str>`), so `GET /catalogs` and `catalog list` show it without a query. An owner change bumps `admin_generation`, so the poll reloads it, just as it does for a description change. Follow `description()` exactly.
+The loaded catalog state (`CatalogState`, `src/catalog.rs`) carries the description from the row. Carry `owner_team` the same way (`fn owner_team(&self) -> Option<Arc<str>>`, and `set_owner_team(Option<&str>)` called by the poll; a `&str` cannot be borrowed out through the lock), so `GET /catalogs` and `catalog list` show it without a query. An owner change bumps `admin_generation`, so the poll reloads it, just as it does for a description change. Follow `description()` exactly.
 
 - [ ] **Step 5: Run the whole suite** (`cargo test`). Expected: PASS.
 
@@ -1441,6 +1450,8 @@ Register `pub mod unassigned;` in `src/store/mod.rs`.
   - Test code under `src/` adds `user: crate::db::TEST_USER`.
   - `tests/support/server.rs` `TestServer::key` adds `user: "tester"`. So do the other `tests/` sites.
   - The CLI and the REST handlers get their real field in Tasks 6 and 7. For now, add the clap field `#[arg(long)] user: String` to `KeyCreateArgs` and the code-create args, and `user: String` to `CreateKeyBody`/`CreateCodeBody`, and pass them through.
+
+> **Note (issue #281).** A required `user` in `CreateKeyBody`/`CreateCodeBody` makes the console's key and code create forms answer 422 until Task 8. Task 3 met the same problem for catalogs by adding a plain required text input to the form (filled in the `ui_e2e` journey). Do the same in `keys.js`, and run `just test-ui`. CLI tests that create keys or codes against an empty `TestDb::start()` need a user first; switching them to `crate::db::test_db()` (which has `TEST_USER`) is the simplest fix, as Task 3 did for `catalog create`.
   - `KeyView` and `SignInCodeView` destructure every field, so they now fail to compile. Add `pub user: Option<String>` to both views and map it through.
 
 - [ ] **Step 7: Run the whole suite** (`cargo test`). Expected: PASS. CLI tests in `src/cli.rs` that run `key create` need a user. Have them run `user create` first in Task 6. For now, insert one through `store::users::create` in their setup.
@@ -1948,8 +1959,8 @@ Adapt `keys.scoped_admin` and `test.pool` to the fixture's real field names. If 
   - `CreateKeyBody.user: String` and `CreateCodeBody.user: String` are required. `CreateCodeBody.actor` becomes `Option<String>`.
   - `PUT /keys/{id}/user`, with body `{user}`: `managed(app, &principal, &id)?` (any kind, including grants), then `key_rows::assign_user_by_id`, then `changed(...)`.
   - `PUT /oauth/codes/{id}/user`: the same scoping as the existing `DELETE /oauth/codes/{id}`. Answers `SignInCodeView`.
-  - `NewCatalog.owner: String`. `PUT /catalogs/{name}/owner`, with body `{team}`, uses `require_every_catalog` and `catalog_rows::set_owner`, then `settle(&app)`. It answers `{name, previous, owner_team}`.
-  - `CatalogSummary.owner_team` comes from `state.owner_team()` (Task 3).
+  - `NewCatalog.owner: String` (already added by Task 3, with its 422 and 404 tests). `PUT /catalogs/{name}/owner`, with body `{team}`, uses `require_every_catalog` and `catalog_rows::set_owner`, then `settle(&app)`. It answers `{name, previous, owner_team}`.
+  - `CatalogSummary.owner_team` comes from `state.owner_team()` (already done by Task 3, which also returns it from `POST /catalogs`).
 
 - [ ] **Step 5: Run the tests** (`cargo test --lib http::api`), then `cargo test`. Expected: PASS.
 
@@ -2234,7 +2245,7 @@ async function renderUnassigned(main) {
 
 - [ ] **Step 5: Keys, codes, catalogs and the shell**
   - **`keys.js`** `newKey` and `newCode` forms: add `h('label', {}, 'User', h('select', { name: 'user', required: true }, ...))`, filled from `GET /users` when the drawer opens. Send `user` in the body. In `newCode`, the actor input loses `required` and gets the placeholder "defaults to the name". Add a `{ key: 'user', label: 'User', sort: k => k.user ?? '', render: k => k.user ?? h('span', { class: 'muted' }, 'unassigned') }` column to both tables. In `showKey`, every key and grant gets the same user picker, preselected with its current user (or empty when unassigned), and an `#key-assign` button labelled "Assign" when unassigned and "Change user" otherwise, that PUTs `/keys/{id}/user`. This matches the CLI and REST, which reassign an already-assigned credential too. `showCode` gets the same for codes. Extend `tests/ui_e2e/keys.rs` with a journey that changes an assigned key's user from `tester` to a second user and sees the USER column follow.
-  - **`catalogs.js`:** the create form gets an `owner` `<select>` filled from `GET /teams`, sent as `owner`. Add an `Owner` column rendering `h('span', { dataset: { test: `catalog-owner-${row.name}` } }, row.owner_team ?? 'unassigned')`. `openEdit` gets a "Change owner" select plus button, PUT `/catalogs/{name}/owner`, shown when `creator`.
+  - **`catalogs.js`:** the create form gets an `owner` `<select>` filled from `GET /teams`, sent as `owner`. (Task 3 left a plain `input[name=owner]` there; replace it, and the `ui.fill` of it in `tests/ui_e2e/catalogs.rs`.) Add an `Owner` column rendering `h('span', { dataset: { test: `catalog-owner-${row.name}` } }, row.owner_team ?? 'unassigned')`. `openEdit` gets a "Change owner" select plus button, PUT `/catalogs/{name}/owner`, shown when `creator`.
   - **`index.html`:** in the `data-need="admin"` nav group, add `<a class="nav-link" data-nav="users" href="#/users">Users <span id="unassigned-badge" class="nav-badge" hidden></span></a>` and `<a class="nav-link" data-nav="teams" href="#/teams">Teams</a>`.
   - **`shell.js`:**
 

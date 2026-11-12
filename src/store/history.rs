@@ -108,7 +108,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn revisions_come_newest_first_and_outlive_a_delete() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", Utc::now())
+        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         for (version, replace) in [("one", false), ("two", true)] {
@@ -154,7 +154,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn content_at_reads_one_revision_or_its_deletion() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", Utc::now())
+        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
             .await
             .unwrap();
         let rounds: [(&[(&str, &str)], bool); 2] = [
