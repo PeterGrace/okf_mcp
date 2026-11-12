@@ -1,5 +1,6 @@
-// Catalogs: the catalogs this key reaches. Admins edit descriptions and
-// delete; an admin key that reaches every catalog also creates them.
+// Catalogs: the catalogs this key reaches, with their owner teams. Admins
+// edit descriptions and delete; an admin key that reaches every catalog
+// also creates them and changes their owner (plan Decision 3).
 import { $, h } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
@@ -8,7 +9,8 @@ import { openDrawer, closeDrawer } from '../core/drawer.js';
 import { ago, count } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
-import { refreshIdentity } from '../core/shell.js';
+import { namesOf, picker, assignControl } from '../components/picker.js';
+import { refreshIdentity, refreshUnassigned } from '../core/shell.js';
 
 export async function render(main) {
     const admin = store.can('admin');
@@ -18,6 +20,9 @@ export async function render(main) {
           render: row => h('code', { dataset: { catalog: row.name } }, row.name) },
         { key: 'description', label: 'Description',
           render: row => row.description || h('span', { class: 'muted' }, '-') },
+        { key: 'owner_team', label: 'Owner', sort: row => row.owner_team ?? '',
+          render: row => h('span', { dataset: { test: `catalog-owner-${row.name}` },
+                                     class: row.owner_team ? 'mono' : 'muted' }, row.owner_team ?? 'unassigned') },
         { key: 'concepts', label: 'Concepts', sort: row => row.concepts, class: 'num' },
         { key: 'files', label: 'Files', sort: row => row.files, class: 'num' },
         { key: 'generation', label: 'Generation', sort: row => row.generation, class: 'num' },
@@ -36,20 +41,22 @@ export async function render(main) {
     // is shown now, so it is closed only while this page still is.
     async function settled() {
         await refreshIdentity().catch(() => {});
+        refreshUnassigned();   // a deleted catalog may have been unassigned
         if (!main.isConnected) return;
         closeDrawer();
         await load();
     }
 
-    function openCreate() {
+    async function openCreate() {
+        let teams;
+        try { teams = await namesOf('teams'); } catch { return; }
+        if (!main.isConnected) return;
         const form = h('form', { id: 'catalog-create-form' },
             h('label', {}, 'Name',
                 h('input', { name: 'name', required: true, pattern: '[a-z0-9-]+', autocomplete: 'off',
                              placeholder: 'lowercase letters, digits and -' })),
             h('label', {}, 'Description', h('textarea', { name: 'description', rows: '3' })),
-            h('label', {}, 'Owner',
-                h('input', { name: 'owner', required: true, autocomplete: 'off',
-                             placeholder: 'the owning team (a user name for its personal team)' })),
+            h('label', {}, 'Owner team', picker({ name: 'owner', required: true }, teams)),
             h('button', { type: 'submit' }, 'Create catalog'));
         form.addEventListener('submit', async event => {
             event.preventDefault();
@@ -57,7 +64,7 @@ export async function render(main) {
             const name = String(data.get('name') ?? '').trim();
             try {
                 await api.post('/catalogs', { name, description: String(data.get('description') ?? ''),
-                                              owner: String(data.get('owner') ?? '').trim() });
+                                              owner: String(data.get('owner') ?? '') });
             } catch { return; /* toasted: invalid or taken name, or unknown owner */ }
             toast(`Created catalog ${name}.`, 'ok');
             await settled();
@@ -65,7 +72,10 @@ export async function render(main) {
         openDrawer('New catalog', 'An empty catalog; import a .tar.gz into it next.', form);
     }
 
-    function openEdit(row) {
+    async function openEdit(row) {
+        let teams;
+        try { teams = await namesOf('teams'); } catch { return; }
+        if (!main.isConnected) return;
         const description = h('textarea', { id: 'catalog-description', name: 'description', rows: '3' }, row.description);
         const edit = h('form', { id: 'catalog-edit-form' },
             h('label', {}, 'Description', description),
@@ -80,6 +90,23 @@ export async function render(main) {
             closeDrawer();
             await load();
         });
+        const owner = h('section', {},
+            h('h3', {}, 'Owner'),
+            assignControl({
+                names: teams, current: row.owner_team, label: row.owner_team ? 'Change owner' : 'Assign',
+                allowed: creator, ids: { select: 'catalog-owner-select', button: 'catalog-owner-save' },
+                assign: async team => {
+                    try {
+                        await api.put(`/catalogs/${enc(row.name)}/owner`, { team });
+                    } catch { return; /* toasted: an unknown team */ }
+                    toast(`${row.name} is now owned by ${team}.`, 'ok');
+                    refreshUnassigned();
+                    if (!main.isConnected) return;
+                    closeDrawer();
+                    await load();
+                },
+            }),
+            creator ? null : h('p', { class: 'muted small' }, 'Changing the owner needs an admin key that reaches every catalog.'));
         const force = h('input', { type: 'checkbox', id: 'catalog-force' });
         const remove = h('button', { type: 'button', id: 'catalog-delete', class: 'danger' }, 'Delete catalog');
         remove.addEventListener('click', async () => {
@@ -98,6 +125,7 @@ export async function render(main) {
         });
         openDrawer(row.name, `generation ${row.generation} - ${count(row.concepts, 'concept')}, ${count(row.files, 'file')}`,
             edit,
+            owner,
             h('section', { class: 'danger-zone' },
                 h('h3', {}, 'Delete'),
                 h('label', {}, force, ' Also discard unpublished changes (force)'),

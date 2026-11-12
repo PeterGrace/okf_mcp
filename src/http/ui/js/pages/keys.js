@@ -2,6 +2,8 @@
 // secret shown once), and per-key grant, ungrant, reporting and revoke.
 // Below them, OAuth sign-in codes: mint one (shown once), list, revoke.
 // OAuth grants (the keys codes become) are marked in the key list.
+// Every key, grant and code belongs to a user, picked when it is made and
+// changed (or, for one from before users existed, assigned) in its drawer.
 // The server enforces every rule; this page only hides what cannot work.
 // Each helper takes the page's `main` and checks `main.isConnected` after an
 // await: once the user has navigated away, the drawer is another page's.
@@ -13,6 +15,8 @@ import { openDrawer, closeDrawer } from '../core/drawer.js';
 import { when } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
+import { assignControl, namesOf, picker } from '../components/picker.js';
+import { refreshUnassigned } from '../core/shell.js';
 
 const LEVELS = ['read', 'write', 'admin'];
 const CODE_LEVELS = ['read', 'write'];
@@ -35,6 +39,12 @@ function isGrant(key) {
     return key.kind === 'oauth';
 }
 
+// The User cell of both tables; `prefix` is 'key' or 'code'.
+function userCell(prefix, row) {
+    return h('span', { 'data-test': `${prefix}-user-${row.name}`, class: row.user ? 'mono' : 'muted' },
+        row.user ?? 'unassigned');
+}
+
 const COLUMNS = [
     { key: 'name', label: 'Name', sort: key => key.name,
       render: key => h('span', { class: 'key-name', 'data-test': `key-${key.name}` }, key.name,
@@ -43,6 +53,7 @@ const COLUMNS = [
               ? [' ', pill('OAuth', 'info'), ' ', h('span', { class: 'muted small client-name' }, key.client_name ?? 'unknown client')]
               : null) },
     { key: 'actor', label: 'Actor', class: 'mono', sort: key => key.actor },
+    { key: 'user', label: 'User', sort: key => key.user ?? '', render: key => userCell('key', key) },
     { key: 'access', label: 'Access', sort: key => LEVELS.indexOf(key.access),
       render: key => pill(key.access, ACCESS_KIND[key.access]) },
     { key: 'catalogs', label: 'Catalogs', render: catalogsOf },
@@ -60,6 +71,7 @@ const CODE_COLUMNS = [
     { key: 'name', label: 'Name', sort: code => code.name,
       render: code => h('span', { class: 'key-name', 'data-test': `code-${code.name}` }, code.name) },
     { key: 'actor', label: 'Actor', class: 'mono', sort: code => code.actor },
+    { key: 'user', label: 'User', sort: code => code.user ?? '', render: code => userCell('code', code) },
     { key: 'access', label: 'Access', sort: code => LEVELS.indexOf(code.access),
       render: code => pill(code.access, ACCESS_KIND[code.access]) },
     { key: 'catalogs', label: 'Catalogs', render: catalogsOf },
@@ -127,19 +139,45 @@ function readGrants(data) {
     };
 }
 
-// The User field both create forms share: a plain text input until the
-// console gets a user picker (milestone 11, Task 8).
-function userField() {
-    return h('label', {}, 'User',
-        h('input', { name: 'user', required: true, autocomplete: 'off', placeholder: 'the user it belongs to' }));
+// The User picker both create forms share: required, with no default, so
+// every new credential's user is a deliberate choice.
+function userField(users) {
+    return h('label', {}, 'User', picker({ name: 'user', required: true }, users));
+}
+
+// The Assign (unassigned) or Change user control of a key's or code's
+// drawer. `prefix` ('key' or 'code') starts the control's ids, `path` is
+// the credential's `.../user` route, and `after(updated)` runs with the
+// server's answer.
+function userAssign(main, users, { prefix, row, path, after }) {
+    return h('section', {},
+        h('h3', {}, 'User'),
+        assignControl({
+            names: users, current: row.user, label: row.user ? 'Change user' : 'Assign',
+            ids: { select: `${prefix}-user-select`, button: `${prefix}-assign` },
+            assign: async user => {
+                let updated;
+                try { updated = await api.put(path, { user }); } catch { return; /* toasted */ }
+                toast(`${row.name} now belongs to ${user}.`, 'ok');
+                refreshUnassigned();
+                if (main.isConnected) await after(updated);
+            },
+        }));
+}
+
+// The users for a picker, or null (toasted) when they cannot be read.
+async function usersOrNull() {
+    try { return await namesOf('users'); } catch { return null; }
 }
 
 // The create form, in the drawer.
-function newKey(main, reload) {
+async function newKey(main, reload) {
+    const users = await usersOrNull();
+    if (!users || !main.isConnected) return;
     const form = h('form', { id: 'key-form' },
         h('label', {}, 'Name', h('input', { name: 'name', required: true, autocomplete: 'off', placeholder: 'letters, digits, . _ -' })),
         h('label', {}, 'Actor', h('input', { name: 'actor', autocomplete: 'off', placeholder: 'defaults to the name' })),
-        userField(),
+        userField(users),
         h('label', {}, 'Access', h('select', { name: 'access' }, LEVELS.map(level => h('option', { value: level }, level)))),
         catalogFields(),
         h('label', {},
@@ -154,7 +192,7 @@ function newKey(main, reload) {
             ...readGrants(data),
             actor: String(data.get('actor') ?? '').trim() || null,
             maintenance_report: data.get('maintenance_report') === 'on',
-            user: String(data.get('user') ?? '').trim(),
+            user: String(data.get('user') ?? ''),
         };
         try {
             const created = await api.post('/keys', body);
@@ -211,8 +249,12 @@ function fact(label, value) {
     return [h('dt', {}, label), h('dd', {}, value)];
 }
 
-// One key's drawer: its facts, then grant, ungrant, reporting and revoke.
-function showKey(main, key, reload) {
+// One key's drawer: its facts and user, then grant, ungrant, reporting and
+// revoke. A revoked key keeps only its user control: history is attributed
+// too.
+async function showKey(main, key, reload) {
+    const users = await usersOrNull();
+    if (!users || !main.isConnected) return;
     const me = store.whoami;
     const mine = isMine(key);
     const grant = isGrant(key);
@@ -221,6 +263,7 @@ function showKey(main, key, reload) {
         fact('Kind', grant ? 'OAuth grant' : 'API key'),
         grant ? fact('Client', key.client_name ?? 'unknown client') : null,
         fact('Actor', h('code', {}, key.actor)),
+        fact('User', key.user ?? 'unassigned'),
         fact('Access', pill(key.access, ACCESS_KIND[key.access])),
         fact('Catalogs', catalogsOf(key)),
         fact('Default', key.default_catalog ?? '-'),
@@ -230,9 +273,18 @@ function showKey(main, key, reload) {
     const subtitle = mine
         ? 'The key this browser is signed in with'
         : grant ? `OAuth grant for ${key.client_name ?? 'an unknown client'}` : `${key.access} key`;
+    const base = `/keys/${enc(key.id)}`;
+    const user = userAssign(main, users, {
+        prefix: 'key', row: key, path: `${base}/user`,
+        after: async updated => {
+            await reload();
+            if (main.isConnected) await showKey(main, updated, reload);
+        },
+    });
     if (key.revoked_at) {
         openDrawer(key.name, subtitle, facts,
-            h('p', { class: 'muted' }, 'This key is revoked: it authenticates nothing and cannot be changed.'));
+            h('p', { class: 'muted' }, 'This key is revoked: it authenticates nothing, and only its user can change.'),
+            user);
         return;
     }
     const change = async (request, message) => {
@@ -241,10 +293,9 @@ function showKey(main, key, reload) {
             toast(message, 'ok');
             if (!main.isConnected) return;
             await reload();
-            if (main.isConnected) showKey(main, updated, reload);
+            if (main.isConnected) await showKey(main, updated, reload);
         } catch { /* toasted */ }
     };
-    const base = `/keys/${enc(key.id)}`;
     let grants;
     if (key.all_catalogs) {
         grants = h('p', { class: 'muted small' }, 'Granted every catalog: per-catalog grants do not apply.');
@@ -298,7 +349,7 @@ function showKey(main, key, reload) {
             } catch { /* toasted */ }
         },
     }, 'Revoke');
-    openDrawer(key.name, subtitle, facts, grants, h('div', { class: 'drawer-actions' }, report, revoke));
+    openDrawer(key.name, subtitle, facts, user, grants, h('div', { class: 'drawer-actions' }, report, revoke));
 }
 
 // The sign-in codes section: its own head, filter and table. Returns the
@@ -322,7 +373,7 @@ function codesPanel(main) {
                 h('h2', {}, 'Sign-in codes'),
                 h('p', { class: 'muted' },
                     'One-time codes a person enters when connecting an OAuth client such as ChatGPT. '
-                    + 'Each becomes an OAuth grant with the code\'s catalogs, access and actor.')),
+                    + 'Each becomes an OAuth grant with the code\'s catalogs, access, actor and user.')),
             h('div', { class: 'actions' },
                 h('button', { type: 'button', id: 'code-new', onclick: () => newCode(main, load) }, 'New sign-in code'))),
         h('label', { class: 'small muted' }, showAll, ' Show redeemed, expired and revoked codes'),
@@ -331,11 +382,13 @@ function codesPanel(main) {
 }
 
 // The mint form, in the drawer.
-function newCode(main, reload) {
+async function newCode(main, reload) {
+    const users = await usersOrNull();
+    if (!users || !main.isConnected) return;
     const form = h('form', { id: 'code-form' },
         h('label', {}, 'Name', h('input', { name: 'name', required: true, autocomplete: 'off', placeholder: 'letters, digits, . _ -' })),
-        h('label', {}, 'Actor', h('input', { name: 'actor', required: true, autocomplete: 'off', placeholder: 'who the grant writes as' })),
-        userField(),
+        h('label', {}, 'Actor', h('input', { name: 'actor', autocomplete: 'off', placeholder: 'defaults to the name' })),
+        userField(users),
         h('label', {}, 'Access', h('select', { name: 'access' }, CODE_LEVELS.map(level => h('option', { value: level }, level)))),
         catalogFields(),
         h('label', {}, 'Expires unused after',
@@ -347,11 +400,11 @@ function newCode(main, reload) {
         const data = new FormData(form);
         const body = {
             name: String(data.get('name') ?? '').trim(),
-            actor: String(data.get('actor') ?? '').trim(),
+            actor: String(data.get('actor') ?? '').trim() || null,
             access: String(data.get('access') ?? 'read'),
             ...readGrants(data),
             expires_in: String(data.get('expires_in') ?? '24h'),
-            user: String(data.get('user') ?? '').trim(),
+            user: String(data.get('user') ?? ''),
         };
         try {
             const created = await api.post('/oauth/codes', body);
@@ -368,11 +421,16 @@ function newCode(main, reload) {
     openDrawer('New sign-in code', 'The code is shown once, right after creation.', form);
 }
 
-// One code's drawer: its facts, and Revoke while nobody has redeemed it.
-function showCode(main, code, reload) {
+// One code's drawer: its facts and user, and Revoke while nobody has
+// redeemed it. A redeemed code's grant keeps its own user: change that in
+// the grant's drawer.
+async function showCode(main, code, reload) {
+    const users = await usersOrNull();
+    if (!users || !main.isConnected) return;
     const facts = h('dl', { class: 'facts' },
         fact('Id', h('code', {}, code.id)),
         fact('Actor', h('code', {}, code.actor)),
+        fact('User', code.user ?? 'unassigned'),
         fact('Access', pill(code.access, ACCESS_KIND[code.access])),
         fact('Catalogs', catalogsOf(code)),
         fact('Default', code.default_catalog ?? '-'),
@@ -401,7 +459,14 @@ function showCode(main, code, reload) {
             } catch { /* toasted */ }
         },
     }, 'Revoke') : null;
-    openDrawer(code.name, 'Sign-in code', facts,
+    const user = userAssign(main, users, {
+        prefix: 'code', row: code, path: `/oauth/codes/${enc(code.id)}/user`,
+        after: async updated => {
+            await reload();
+            if (main.isConnected) await showCode(main, updated, reload);
+        },
+    });
+    openDrawer(code.name, 'Sign-in code', facts, user,
         code.state === 'redeemed'
             ? h('p', { class: 'muted small' }, 'Redeemed: revoke the grant it became in the key list above.')
             : null,

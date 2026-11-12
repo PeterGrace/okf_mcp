@@ -4,7 +4,7 @@ import { store } from './core/store.js';
 import { api, ApiError, setUnauthorizedHandler } from './core/api.js';
 import { start, route } from './core/router.js';
 import { closeDrawer } from './core/drawer.js';
-import { refreshIdentity } from './core/shell.js';
+import { refreshIdentity, refreshUnassigned } from './core/shell.js';
 import { refreshFindingsBadge } from './pages/findings.js';
 
 // Surface script errors and CSP violations as console errors: the browser
@@ -36,6 +36,7 @@ async function enter() {
     $('#app').hidden = false;
     await start();
     refreshFindingsBadge();
+    refreshUnassigned();
 }
 
 // enter(), but a failure never leaves a blank page: a refused key is already
