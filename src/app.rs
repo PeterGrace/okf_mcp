@@ -384,8 +384,9 @@ impl App {
     /// and unredeemed codes kept [`OAUTH_RETENTION_DAYS`] past their expiry,
     /// registered clients no grant names after [`UNBOUND_CLIENT_HOURS`],
     /// sign-in events older than [`SIGN_IN_EVENT_RETENTION_DAYS`] and emailed
-    /// links [`OAUTH_RETENTION_DAYS`] past their expiry. Runs whether or not OAuth is on, so rows left from when it was are
-    /// cleared too. Called only under `polling`.
+    /// links [`OAUTH_RETENTION_DAYS`] past their expiry. Runs whether or not
+    /// OAuth is on, so rows left from when it was are cleared too. Called
+    /// only under `polling`.
     ///
     /// A failure is logged, not returned, and waits for the next hourly pass.
     async fn prune_oauth(&self) {
