@@ -193,10 +193,19 @@ impl AuthConfig {
     }
 }
 
-/// Checks one lifetime setting: above zero, and small enough for a
-/// timestamp. Shared by the config file (`[oauth]` and `[auth]`) and
-/// `store::settings`, so a value is accepted or refused the same way in
-/// both.
+/// The longest `[auth]` or `[oauth]` lifetime the config and settings
+/// accept: ten years, in humantime's own year (365.25 days), so
+/// `"10years"` is accepted exactly. It is far inside `DateTime<Utc>`'s
+/// calendar range: added to any real `now` it is always a valid
+/// timestamp, so a lifetime that passed the check can never make
+/// `clock::after` fail.
+pub const MAX_AUTH_DURATION: Duration = Duration::from_secs(10 * 31_557_600);
+
+/// Checks one lifetime setting: above zero and at most
+/// [`MAX_AUTH_DURATION`]. Shared by the config file (`[oauth]` and
+/// `[auth]`) and `store::settings` (both when a value is set and when a
+/// stored one is loaded), so a value is accepted or refused the same way
+/// everywhere.
 ///
 /// # Arguments
 /// * `name` - the key, for the message.
@@ -206,13 +215,13 @@ impl AuthConfig {
 /// `Ok(())`, or the problem in words.
 ///
 /// # Errors
-/// A zero duration, or one past chrono's range.
+/// A zero duration, or one longer than [`MAX_AUTH_DURATION`].
 pub(crate) fn check_auth_duration(name: &str, value: Duration) -> Result<(), String> {
     if value.is_zero() {
         return Err(format!("{name} must be more than zero"));
     }
-    if chrono::Duration::from_std(value).is_err() {
-        return Err(format!("{name} exceeds supported duration"));
+    if value > MAX_AUTH_DURATION {
+        return Err(format!("{name} must be at most 10 years"));
     }
     Ok(())
 }
@@ -894,6 +903,9 @@ mod tests {
             "[auth]\nreset_link_ttl = \"0s\"\n",
             "[auth]\nmax_key_lifetime = \"0s\"\n",
             "[auth]\nreset_link_ttl = \"300000000years\"\n",
+            "[auth]\nconsole_session_absolute = \"1000000years\"\n",
+            "[auth]\nsetup_link_ttl = \"10years 1s\"\n",
+            "[oauth]\nrefresh_token_ttl = \"1000000years\"\n",
             "[auth]\nmax_keys_per_user = 1001\n",
             "[auth]\ntrusted_proxy_header = \"not a header\"\n",
             "[auth]\ntrusted_proxy_header = \"\"\n",
@@ -905,5 +917,16 @@ mod tests {
         }
         let at_the_limit = Config::from_toml("[auth]\nmax_keys_per_user = 1000\n").unwrap();
         assert_eq!(at_the_limit.validate(), Ok(()));
+        let longest =
+            Config::from_toml("[auth]\nconsole_session_absolute = \"10years\"\n").unwrap();
+        assert_eq!(longest.validate(), Ok(()));
+        let too_long = Config::from_toml("[auth]\nconsole_session_absolute = \"1000000years\"\n")
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(
+            too_long.contains("auth.console_session_absolute") && too_long.contains("10 years"),
+            "{too_long}"
+        );
     }
 }

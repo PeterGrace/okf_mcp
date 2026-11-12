@@ -10,9 +10,11 @@
 - `App` loads the effective settings at start and reloads them with the key cache whenever `admin_generation` moves, so every replica sees a settings change within one poll interval. A failed reload keeps the old settings and the counter, so the next pass retries.
 - The hourly prune also deletes console sessions past their absolute limit.
 - `users::set_admin` ends the user's console sessions through `user_sessions::revoke_all` (in its transaction), so the session store owns all of its SQL.
-- `Config::validate` checks the `[oauth]` lifetimes with the same `check_auth_duration` as `[auth]`.
+- `Config::validate` checks the `[oauth]` lifetimes with the same `check_auth_duration` as `[auth]`. Every one of these lifetimes is capped at `MAX_AUTH_DURATION` (ten years), so a validated lifetime added to `now` is always a valid timestamp.
+- OAuth token minting computes expiries with `clock::after`, which returns an error past the calendar's range instead of panicking.
 
 ## Notes
+- A stored lifetime over ten years (written before the cap, or by hand) counts as unreadable.
 - A stored setting this server cannot read (from a newer version or a hand edit) is logged at `warn` and the config default used; it never stops the server.
 - The CSRF token is derived from the session id (SHA-256 under its own label), so `user_sessions` stores no secret: `csrf_token` holds only the token's hash. Neither raw value appears in a `Debug` output.
 - `touch`'s one write re-checks the absolute and idle limits and the write interval under the row lock, so a concurrent request can never extend a session that has been revoked or has ended, and a burst of requests writes once. A touch that writes nothing re-reads the row, so it never signs out a live session.

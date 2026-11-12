@@ -14,7 +14,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Form, Json, Router};
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
 
@@ -130,17 +130,6 @@ fn required<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, OAuthE
         .ok_or_else(|| OAuthError::InvalidRequest(format!("{name} is required")))
 }
 
-/// A lifetime from the configuration as a `chrono` delta.
-///
-/// # Errors
-/// [`OkfError::Config`] for a lifetime `chrono` cannot add to a time.
-fn delta(duration: std::time::Duration) -> Result<TimeDelta, OkfError> {
-    TimeDelta::from_std(duration).map_err(|_| OkfError::Config {
-        path: "[oauth]".to_string(),
-        message: "a token lifetime is too long".to_string(),
-    })
-}
-
 /// What a pair of tokens is bound to.
 #[derive(Debug, Clone, Copy)]
 struct Binding<'a> {
@@ -186,8 +175,10 @@ async fn mint(
     let generation = oauth.access.generation();
     let access_token = keys::generate_with(keys::ACCESS_TOKEN_PREFIX)?;
     let refresh_token = keys::generate_with(keys::REFRESH_TOKEN_PREFIX)?;
-    let access_expires = now + delta(oauth.settings.access_token_ttl)?;
-    let refresh_expires = now + delta(oauth.settings.refresh_token_ttl)?;
+    // `clock::after` returns an error past the calendar's range, where
+    // `now + delta` would panic.
+    let access_expires = crate::clock::after(now, oauth.settings.access_token_ttl)?;
+    let refresh_expires = crate::clock::after(now, oauth.settings.refresh_token_ttl)?;
     let access_hash = keys::hash(&access_token);
     for (sha256, kind, expires_at) in [
         (access_hash, TokenKind::Access, access_expires),

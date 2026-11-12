@@ -560,6 +560,15 @@ mod tests {
                 now(),
             )
             .await,
+            // Fits chrono's `TimeDelta` but not a `DateTime` once added.
+            set(
+                &db.pool,
+                SettingKey::ConsoleSessionAbsolute,
+                "1000000years",
+                "alice",
+                now(),
+            )
+            .await,
         ];
 
         for result in refused {
@@ -598,6 +607,37 @@ mod tests {
             7
         );
         assert_eq!(admin_generation(&db.pool).await.unwrap(), before + 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stored_lifetime_too_long_for_a_timestamp_falls_back_and_sessions_still_start() {
+        let db = test_db().await;
+        // Written before the ten-year cap existed, or by hand.
+        sqlx::query(
+            "INSERT INTO server_settings (key, value, updated_at, updated_by) \
+             VALUES ('console_session_absolute', '\"1000000years\"', now(), 'hand')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let alice = crate::store::users::tests::seed_user(&db.pool, "alice", None).await;
+
+        let settings = load(&db.pool, &defaults()).await.unwrap();
+        let session = crate::store::user_sessions::create(
+            &db.pool,
+            &alice.id,
+            None,
+            "",
+            settings.console_session_absolute,
+            now(),
+        )
+        .await;
+
+        assert_eq!(
+            settings.console_session_absolute,
+            crate::config::DEFAULT_CONSOLE_SESSION_ABSOLUTE
+        );
+        assert!(session.is_ok(), "{session:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
