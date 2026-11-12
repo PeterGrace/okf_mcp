@@ -34,6 +34,8 @@ pub struct GrantSummary {
     pub catalogs: String,
     /// The actor its writes are recorded as.
     pub actor: String,
+    /// The user the grant will belong to (`None` for an unassigned code).
+    pub user: Option<String>,
     /// Its default catalog.
     pub default_catalog: Option<String>,
 }
@@ -246,10 +248,19 @@ pub(crate) fn summary_page_html(
         .map_or_else(String::new, |name| {
             format!(", default catalog <strong>{}</strong>", escape(name))
         });
+    // An unassigned code keeps the wording it had before codes had users.
+    let who = match &grant.user {
+        Some(user) => format!(
+            "as <strong>{}</strong> (actor <strong>{}</strong>)",
+            escape(user),
+            escape(&grant.actor)
+        ),
+        None => format!("as actor <strong>{}</strong>", escape(&grant.actor)),
+    };
     format!(
         r#"        <h1>Allow access?</h1>
 {client}
-        <p class="consent-summary" id="consent-summary"><strong>{name}</strong> ({host}) will get <strong>{access}</strong> access to <strong>{catalogs}</strong> as actor <strong>{actor}</strong>{default}.</p>
+        <p class="consent-summary" id="consent-summary"><strong>{name}</strong> ({host}) will get <strong>{access}</strong> access to <strong>{catalogs}</strong> {who}{default}.</p>
         <form method="post" action="/oauth/authorize" id="consent-approve-form">
             {hidden}
             <input type="hidden" name="summary" value="{summary}">
@@ -264,7 +275,6 @@ pub(crate) fn summary_page_html(
         // A `&'static str` from `Access::as_str`: never client text.
         access = grant.access,
         catalogs = escape(&grant.catalogs),
-        actor = escape(&grant.actor),
         hidden = hidden_fields(view),
         summary = escape(summary_nonce),
     )
@@ -394,6 +404,7 @@ mod tests {
             access: "read",
             catalogs: "main".to_string(),
             actor: "<b>a</b>".to_string(),
+            user: Some("<i>u</i>".to_string()),
             default_catalog: None,
         };
         for html in [
@@ -402,6 +413,7 @@ mod tests {
         ] {
             assert!(!html.contains("<script>"), "{html}");
             assert!(!html.contains("<b>a</b>"), "{html}");
+            assert!(!html.contains("<i>u</i>"), "{html}");
             assert!(!html.contains("unverified"), "a CIMD client is verified");
         }
     }
@@ -412,6 +424,7 @@ mod tests {
             access: "read",
             catalogs: "main".to_string(),
             actor: "example-actor".to_string(),
+            user: Some("alice".to_string()),
             default_catalog: None,
         };
         for html in [
@@ -431,16 +444,31 @@ mod tests {
             access: "write",
             catalogs: "main, other".to_string(),
             actor: "example-actor".to_string(),
+            user: Some("alice".to_string()),
             default_catalog: Some("main".to_string()),
         };
         let html = summary_page_html(&view(), &grant, "n1");
         assert!(html.contains("<strong>write</strong>"));
         assert!(html.contains("<strong>main, other</strong>"));
-        assert!(html.contains("<strong>example-actor</strong>"));
+        assert!(html.contains("as <strong>alice</strong> (actor <strong>example-actor</strong>)"));
         assert!(html.contains("default catalog <strong>main</strong>"));
         assert!(html.contains(r#"id="consent-approve""#));
         assert!(html.contains(r#"id="consent-deny""#));
         assert!(html.contains(r#"name="summary" value="n1""#));
+    }
+
+    #[test]
+    fn the_summary_of_an_unassigned_code_names_only_the_actor() {
+        let grant = GrantSummary {
+            access: "read",
+            catalogs: "main".to_string(),
+            actor: "example-actor".to_string(),
+            user: None,
+            default_catalog: None,
+        };
+        let html = summary_page_html(&view(), &grant, "n1");
+        assert!(html.contains("as actor <strong>example-actor</strong>."));
+        assert!(!html.contains("(actor"));
     }
 
     #[test]

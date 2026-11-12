@@ -240,6 +240,7 @@ mod tests {
             default_catalog: default.map(str::to_string),
             actor: "a".to_string(),
             kind: CredentialKind::ApiKey,
+            user: None,
         }
     }
 

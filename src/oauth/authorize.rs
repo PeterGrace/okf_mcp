@@ -229,6 +229,7 @@ fn summary(record: &SignInCodeRecord) -> GrantSummary {
             record.catalogs.join(", ")
         },
         actor: record.actor.clone(),
+        user: record.user.clone(),
         default_catalog: record.default_catalog.clone(),
     }
 }
@@ -723,7 +724,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(summary.contains("<strong>write</strong> access to <strong>main</strong>"));
-        assert!(summary.contains("as actor <strong>example-actor</strong>"));
+        assert!(summary.contains(&format!(
+            "as <strong>{}</strong> (actor <strong>example-actor</strong>)",
+            crate::db::TEST_USER
+        )));
         assert!(headers["content-security-policy"]
             .to_str()
             .unwrap()

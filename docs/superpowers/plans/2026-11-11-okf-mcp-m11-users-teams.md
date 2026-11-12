@@ -1499,10 +1499,10 @@ async fn whoami_names_the_keys_user_and_its_teams() {
 async fn whoami_of_an_unassigned_key_has_no_user() {
     let test = app().await;
     let key = crate::store::keys::insert_legacy_test_key(
-        &test.pool, "legacy", crate::store::keys::Access::Read, "legacy", chrono::Utc::now(),
+        test.app.pool(), "legacy", crate::store::keys::Access::Read, "legacy", chrono::Utc::now(),
     )
     .await;
-    test.app.poll().await.unwrap();
+    keys(&test).await; // bumps the generation and polls; a bare poll skips the legacy row
 
     let (_, body) = send(&test, "GET", "/api/v1/whoami", Some(&key), None).await;
 
@@ -1511,7 +1511,7 @@ async fn whoami_of_an_unassigned_key_has_no_user() {
 }
 ```
 
-Adapt `test.pool` / `test.app` to the actual `TestApp` field names in `src/http/api/testing.rs`.
+> **Corrected (issue #283).** `TestApp` (`src/mcp/testing.rs`) has only an `app` field; the pool is `test.app.pool()`, as above. `insert_legacy_test_key` bumps no admin generation, so `test.app.poll()` alone does not load it; the test calls `keys(&test)` afterwards, which bumps and polls. The handler's team lookup is a private `identity::teams_of(pool, name)` that maps `UnknownName` to an empty list, tested directly by `a_deleted_user_has_no_teams_not_an_error`. `authorize::tests::a_code_then_approve_creates_a_grant_and_redirects_with_a_code` also asserted the old "as actor" wording; it now expects the fixture user. The consent tests add `the_summary_of_an_unassigned_code_names_only_the_actor`, and `a_hostile_host_cannot_break_out_of_its_markup` feeds a hostile user name.
 
 `src/oauth/consent.rs`, replacing the expectation in `the_summary_names_access_catalogs_actor_and_default`:
 
@@ -1890,7 +1890,7 @@ mod tests {
         let test = app().await;
         let keys = keys(&test).await;
         crate::store::keys::insert_legacy_test_key(
-            &test.pool, "legacy", crate::store::keys::Access::Read, "legacy", chrono::Utc::now(),
+            test.app.pool(), "legacy", crate::store::keys::Access::Read, "legacy", chrono::Utc::now(),
         ).await;
 
         let (_, before) = send(&test, "GET", "/api/v1/unassigned", Some(&keys.admin), None).await;
@@ -1909,11 +1909,12 @@ mod tests {
         // Spec "Testing: cache reload": the principal a request runs as
         // carries the new user once the route's poll has reloaded the cache.
         let test = app().await;
-        let keys = keys(&test).await;
         let legacy = crate::store::keys::insert_legacy_test_key(
-            &test.pool, "legacy", crate::store::keys::Access::Read, "legacy", chrono::Utc::now(),
+            test.app.pool(), "legacy", crate::store::keys::Access::Read, "legacy", chrono::Utc::now(),
         ).await;
-        test.app.poll().await.unwrap();
+        // Corrected (issue #283): the legacy insert bumps no generation, so
+        // create the fixture keys after it; `keys` bumps and polls.
+        let keys = keys(&test).await;
         assert_eq!(test.app.keys().find(&legacy).unwrap().user, None);
 
         send(&test, "PUT", "/api/v1/keys/legacy/user", Some(&keys.admin),
@@ -1940,6 +1941,8 @@ mod tests {
 ```
 
 Adapt `keys.scoped_admin` and `test.pool` to the fixture's real field names. If the `Keys` fixture has no scoped admin key, add one there (an admin granted only `main`). The `display_name` field is `#[serde(default)]`.
+
+> **Corrected (issue #283).** `TestApp` has no `pool` field: use `test.app.pool()` (the legacy-key calls above already do). `testing::Keys` has no `scoped_admin`, but its `admin` key is granted only `main`, so it is the scoped admin; `stranger` is an admin on `other` only. Neither reaches every catalog.
 
 - [ ] **Step 2: Run them to see them fail.**
 

@@ -1152,7 +1152,7 @@ read, write, admin, and an admin key that does not reach the catalog).
 
 | Method and path | Key | Does |
 |---|---|---|
-| `GET /api/v1/whoami` | any | The calling key: `key_id`, `name`, `actor`, `access`, `maintenance_report`, `all_catalogs`, `catalogs` (the loaded catalogs it reaches, sorted) and `default_catalog`. Never the key or its hash |
+| `GET /api/v1/whoami` | any | The calling key: `key_id`, `name`, `actor`, `access`, `maintenance_report`, `all_catalogs`, `catalogs` (the loaded catalogs it reaches, sorted), `default_catalog`, `user` (the user it belongs to, `null` when unassigned) and `teams` (that user's teams, sorted). Never the key or its hash |
 
 ```sh
 curl -s -H "Authorization: Bearer $OKF_MCP_KEY" https://okf-mcp.example.com/api/v1/whoami
