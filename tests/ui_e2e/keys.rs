@@ -335,3 +335,31 @@ async fn an_admin_changes_a_sign_in_codes_user() {
     let minted = codes::list(&server.db.pool).await.expect("list codes");
     assert_eq!(minted[0].user.as_deref(), Some("alice"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reassigning_the_signed_in_key_updates_the_shell_identity() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    alice(&server).await;
+    drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.wait_text("#whoami", &format!("{OWNER} / console-admin"));
+        ui.open("/keys");
+        ui.click("[data-test=key-console-admin]");
+        ui.wait_text("#key-assign", "Change user");
+        ui.select("#key-user-select", "alice");
+        ui.click("#key-assign");
+        ui.wait_text("[data-test=key-user-console-admin]", "alice");
+        // The shell follows without a reload: the identity line, and the
+        // Users page's "you" marker.
+        ui.wait_text("#whoami", "alice / console-admin");
+        ui.click("#drawer-close");
+        ui.open("/users");
+        ui.wait_text("[data-test=user-alice]", "you");
+        let tester = ui.text(&format!("[data-test=user-{OWNER}]"));
+        assert!(!tester.contains("you"), "still marked: {tester:?}");
+    })
+    .await;
+}

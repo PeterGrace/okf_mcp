@@ -16,7 +16,7 @@ import { when } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
 import { assignControl, namesOf, picker } from '../components/picker.js';
-import { refreshUnassigned } from '../core/shell.js';
+import { refreshIdentity, refreshUnassigned } from '../core/shell.js';
 
 const LEVELS = ['read', 'write', 'admin'];
 const CODE_LEVELS = ['read', 'write'];
@@ -160,6 +160,9 @@ function userAssign(main, users, { prefix, row, path, after }) {
                 try { updated = await api.put(path, { user }); } catch { return; /* toasted */ }
                 toast(`${row.name} now belongs to ${user}.`, 'ok');
                 refreshUnassigned();
+                // The signed-in key's user is shell state: #whoami and the
+                // Users page's "you" marker read it from whoami.
+                if (prefix === 'key' && isMine(row)) await refreshIdentity().catch(() => {});
                 if (main.isConnected) await after(updated);
             },
         }));
