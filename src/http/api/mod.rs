@@ -11,7 +11,7 @@ use axum::response::Response;
 use axum::Router;
 
 use crate::app::App;
-use crate::auth::{require_key, Principal};
+use crate::auth::{require_key, Principal, Reach};
 use crate::error::OkfError;
 use crate::mcp::context::ToolContext;
 use crate::store::keys::Access;
@@ -24,6 +24,7 @@ mod identity;
 mod keys;
 mod maintenance;
 mod oauth;
+mod people;
 mod search;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -48,6 +49,7 @@ pub(crate) fn routes(app: &Arc<App>) -> Router<Arc<App>> {
         .merge(maintenance::routes())
         .merge(oauth::routes())
         .merge(changesets::routes())
+        .merge(people::routes())
         // `route_layer` covers the routes merged above and runs only when one
         // matched, so an unknown API path stays 404 rather than 401.
         .route_layer(middleware::from_fn_with_state(Arc::clone(app), require_key))
@@ -101,5 +103,39 @@ pub(crate) fn require_admin(principal: &Principal) -> Result<(), OkfError> {
         Err(OkfError::Forbidden {
             reason: "this needs an admin key".into(),
         })
+    }
+}
+
+/// Refuses all but an admin key that reaches every catalog: the rule for the
+/// routes that are not about one catalog's content (catalog creation,
+/// ownership, users and teams; plan Decision 3).
+///
+/// # Arguments
+/// * `principal` - the calling key.
+///
+/// # Errors
+/// [`OkfError::Forbidden`] below `admin`, or for a key granted named catalogs.
+pub(crate) fn require_every_catalog(principal: &Principal) -> Result<(), OkfError> {
+    require_admin(principal)?;
+    match &principal.reach {
+        Reach::All => Ok(()),
+        Reach::Catalogs(_) => Err(OkfError::Forbidden {
+            reason: "this needs an admin key that reaches every catalog \
+                     (okf-mcp key create --all)"
+                .to_string(),
+        }),
+    }
+}
+
+/// Polls after an administrative change, so the key cache and the catalog
+/// list reflect it for the next request. The change has committed, so a
+/// failed poll is logged, not returned: the poll loop retries it.
+///
+/// # Arguments
+/// * `app` - the application. An `&Arc<App>` argument coerces to `&App`
+///   automatically (deref coercion).
+pub(crate) async fn settle(app: &App) {
+    if let Err(error) = app.poll().await {
+        tracing::error!(%error, "poll after an administrative change failed; the poll loop retries");
     }
 }
