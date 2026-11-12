@@ -19,6 +19,13 @@ export async function refreshIdentity() {
     select.value = store.catalog ?? '';
 }
 
+// After a key's user changed: when it is the signed-in key, its user is
+// shell state (#whoami, the Users page's "you" marker), so reload whoami.
+// Every path that assigns a key calls this.
+export async function keyUserChanged(keyId) {
+    if (keyId === store.whoami?.key_id) await refreshIdentity().catch(() => {});
+}
+
 // Whether this key may administer users, teams and ownership: an admin key
 // that reaches every catalog (plan Decision 3). Others see those controls
 // disabled.

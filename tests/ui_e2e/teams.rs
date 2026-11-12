@@ -77,7 +77,7 @@ async fn create_team_add_member_create_owned_catalog_and_key_for_user() {
 async fn a_legacy_key_is_assigned_from_the_unassigned_view() {
     let server = server().await;
     let admin = server.key("console-admin", Access::Admin, &[], None).await;
-    server.legacy_key("legacy").await;
+    server.legacy_key("legacy", Access::Read).await;
     drive(server.base.clone(), move |ui| {
         ui.login(&admin);
         ui.wait_text("#unassigned-badge", "1");
@@ -137,6 +137,27 @@ async fn the_last_owner_is_kept_then_replaced_removed_and_the_team_deleted() {
         ui.click("#team-delete");
         ui.click("#confirm-ok");
         ui.wait_hidden("[data-test=team-family]");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn assigning_the_signed_in_key_from_the_unassigned_view_updates_the_shell_identity() {
+    let server = server().await;
+    let legacy = server.legacy_key("legacy-admin", Access::Admin).await;
+    drive(server.base.clone(), move |ui| {
+        ui.login(&legacy);
+        ui.wait_text("#whoami", "legacy-admin - admin");
+        assert!(!ui.text("#whoami").contains(" / "), "no user yet");
+        ui.wait_text("#unassigned-badge", "1");
+        ui.open("/users/unassigned");
+        ui.select("[data-test=assign-key-legacy-admin] select", OWNER);
+        ui.click("[data-test=assign-key-legacy-admin] button");
+        ui.wait_text("#unassigned-empty", "Nothing is unassigned");
+        // The shell follows without a reload.
+        ui.wait_text("#whoami", &format!("{OWNER} / legacy-admin"));
+        ui.open("/users");
+        ui.wait_text(&format!("[data-test=user-{OWNER}]"), "you");
     })
     .await;
 }

@@ -13,7 +13,7 @@ import { ago, when } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
 import { assignControl, namesOf } from '../components/picker.js';
-import { canAdministerPeople, refreshUnassigned } from '../core/shell.js';
+import { canAdministerPeople, keyUserChanged, refreshUnassigned } from '../core/shell.js';
 
 const NEEDS_EVERY_CATALOG = 'Changing users needs an admin key that reaches every catalog.';
 
@@ -178,7 +178,10 @@ async function renderUnassigned(main) {
             ...rows.keys.map(key => assignRow(`key-${key.name}`,
                 [key.kind === 'oauth' ? 'Grant ' : 'Key ', h('code', {}, key.name), ` (actor ${key.actor})`,
                     key.revoked_at ? [' ', pill('revoked', 'error')] : null],
-                users, user => api.put(`/keys/${enc(key.id)}/user`, { user }), `${key.name} now belongs to`)),
+                users, async user => {
+                    await api.put(`/keys/${enc(key.id)}/user`, { user });
+                    await keyUserChanged(key.id);
+                }, `${key.name} now belongs to`)),
             ...rows.codes.map(code => assignRow(`code-${code.name}`,
                 ['Sign-in code ', h('code', {}, code.name), ' ', pill(code.state)],
                 users, user => api.put(`/oauth/codes/${enc(code.id)}/user`, { user }), `${code.name} now belongs to`)),

@@ -257,7 +257,7 @@ async fn an_admin_changes_a_keys_user_and_assigns_a_legacy_key() {
         .key("console-admin", Access::Admin, &[], Some("main"))
         .await;
     server.key("laptop", Access::Read, &["main"], None).await;
-    server.legacy_key("legacy").await;
+    server.legacy_key("legacy", Access::Read).await;
     alice(&server).await;
     let ran = drive(server.base.clone(), move |ui| {
         ui.login(&admin);
