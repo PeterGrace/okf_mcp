@@ -5,7 +5,7 @@ import { $, h } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
-import { openDrawer, closeDrawer, drawerTicket } from '../core/drawer.js';
+import { drawerTicket } from '../core/drawer.js';
 import { ago, count } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
@@ -37,14 +37,14 @@ export async function render(main) {
 
     // After a create or delete: the switcher is shell state and must follow
     // the change even if the user has navigated away meanwhile, so it is
-    // rebuilt first, before the table. The drawer belongs to whichever page
-    // is shown now, so it is closed only while this page still is.
-    async function settled() {
+    // rebuilt first, before the table. The drawer is closed only while
+    // `ticket` (the one it was opened with) is current: once replaced or
+    // dismissed it is another drawer, or none.
+    async function settled(ticket) {
         await refreshIdentity().catch(() => {});
         refreshUnassigned();   // a deleted catalog may have been unassigned
-        if (!main.isConnected) return;
-        closeDrawer();
-        await load();
+        ticket.close();
+        if (main.isConnected) await load();
     }
 
     async function openCreate() {
@@ -68,9 +68,9 @@ export async function render(main) {
                                               owner: String(data.get('owner') ?? '') });
             } catch { return; /* toasted: invalid or taken name, or unknown owner */ }
             toast(`Created catalog ${name}.`, 'ok');
-            await settled();
+            await settled(ticket);
         });
-        openDrawer('New catalog', 'An empty catalog; import a .tar.gz into it next.', form);
+        ticket.open('New catalog', 'An empty catalog; import a .tar.gz into it next.', form);
     }
 
     async function openEdit(row) {
@@ -88,9 +88,8 @@ export async function render(main) {
                 await api.patch(`/catalogs/${enc(row.name)}`, { description: description.value });
             } catch { return; }
             toast(`Saved ${row.name}'s description.`, 'ok');
-            if (!main.isConnected) return;   // navigated away: the drawer is another page's now
-            closeDrawer();
-            await load();
+            ticket.close();
+            if (main.isConnected) await load();
         });
         const owner = h('section', {},
             h('h3', {}, 'Owner'),
@@ -103,9 +102,8 @@ export async function render(main) {
                     } catch { return; /* toasted: an unknown team */ }
                     toast(`${row.name} is now owned by ${team}.`, 'ok');
                     refreshUnassigned();
-                    if (!main.isConnected) return;
-                    closeDrawer();
-                    await load();
+                    ticket.close();
+                    if (main.isConnected) await load();
                 },
             }),
             creator ? null : h('p', { class: 'muted small' }, 'Changing the owner needs an admin key that reaches every catalog.'));
@@ -123,9 +121,9 @@ export async function render(main) {
                 await api.del(`/catalogs/${enc(row.name)}${force.checked ? '?force=true' : ''}`);
             } catch { return; /* toasted: 409 names ?force=true */ }
             toast(`Deleted catalog ${row.name}.`, 'ok');
-            await settled();
+            await settled(ticket);
         });
-        openDrawer(row.name, `generation ${row.generation} - ${count(row.concepts, 'concept')}, ${count(row.files, 'file')}`,
+        ticket.open(row.name, `generation ${row.generation} - ${count(row.concepts, 'concept')}, ${count(row.files, 'file')}`,
             edit,
             owner,
             h('section', { class: 'danger-zone' },

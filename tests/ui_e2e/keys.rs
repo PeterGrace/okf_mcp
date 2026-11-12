@@ -364,32 +364,42 @@ async fn reassigning_the_signed_in_key_updates_the_shell_identity() {
     .await;
 }
 
-/// Holds the page's next `GET /api/v1/users` (the first await of every key
-/// drawer) until `window.releaseUsers()`; `window.usersReleased` turns true
-/// once that held answer has been handed back to the page.
-const HOLD_NEXT_USERS: &str = "() => {
+/// Holds the page's next request with method `arg.method` to a path ending
+/// in `arg.suffix` until `window.releaseHeld()`; `window.heldDone` turns
+/// true once that held answer has been handed back to the page. Runs
+/// through `ui.eval`, so it wraps `fetch` without touching the page's code.
+const HOLD_NEXT: &str = "(arg) => {
     const original = window.fetch;
     let release = null;
-    window.usersReleased = false;
-    window.releaseUsers = () => release();
+    window.heldDone = false;
+    window.releaseHeld = () => release();
     window.fetch = (input, init) => {
-        if (release === null && String(input).endsWith('/api/v1/users')) {
+        const method = (init && init.method) || 'GET';
+        if (release === null && method === arg.method && String(input).endsWith(arg.suffix)) {
             const held = new Promise(resolve => { release = resolve; });
             return held.then(() => original(input, init))
-                .finally(() => { window.usersReleased = true; window.fetch = original; });
+                .finally(() => { window.heldDone = true; window.fetch = original; });
         }
         return original(input, init);
     };
     return true;
 }";
 
+/// Holds the next `method` request to a path ending in `suffix` (see
+/// [`HOLD_NEXT`]).
+fn hold_next(ui: &Ui, method: &str, suffix: &str) {
+    ui.eval(
+        HOLD_NEXT,
+        serde_json::json!({ "method": method, "suffix": suffix }),
+    );
+}
+
 /// Releases the held answer, waits until the page has it, then gives the
 /// page a moment to act on it (a stale drawer would be drawn by then).
-fn release_users(ui: &Ui) {
-    ui.eval("() => window.releaseUsers()", serde_json::json!(null));
+fn release_held(ui: &Ui) {
+    ui.eval("() => window.releaseHeld()", serde_json::json!(null));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while ui.eval("() => window.usersReleased", serde_json::json!(null)) != serde_json::json!(true)
-    {
+    while ui.eval("() => window.heldDone", serde_json::json!(null)) != serde_json::json!(true) {
         assert!(
             std::time::Instant::now() < deadline,
             "the held answer never arrived"
@@ -412,11 +422,11 @@ async fn a_late_answer_for_an_earlier_drawer_never_replaces_or_reopens_it() {
         ui.open("/keys");
         ui.wait_visible("[data-test=key-bravo]");
         // alpha's drawer waits on its held answer; bravo's opens meanwhile.
-        ui.eval(HOLD_NEXT_USERS, serde_json::json!(null));
+        hold_next(ui, "GET", "/api/v1/users");
         ui.click("[data-test=key-alpha]");
         ui.click("[data-test=key-bravo]");
         ui.wait_text("#drawer-title", "bravo");
-        release_users(ui);
+        release_held(ui);
         assert_eq!(
             ui.text("#drawer-title"),
             "bravo",
@@ -425,13 +435,64 @@ async fn a_late_answer_for_an_earlier_drawer_never_replaces_or_reopens_it() {
         // Dismissing the drawer cancels a load still pending.
         ui.click("#drawer-close");
         ui.wait_hidden("#drawer");
-        ui.eval(HOLD_NEXT_USERS, serde_json::json!(null));
+        hold_next(ui, "GET", "/api/v1/users");
         ui.click("[data-test=key-alpha]");
         ui.page.press_key(None, "Escape").expect("press Escape");
-        release_users(ui);
+        release_held(ui);
         assert!(
             !ui.page.is_visible("#drawer").expect("visible"),
             "the dismissed load opened"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_assign_never_replaces_a_newer_drawer_or_reopens_a_dismissed_one() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    server.key("alpha", Access::Read, &["main"], None).await;
+    server.key("bravo", Access::Read, &["main"], None).await;
+    alice(&server).await;
+    drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        // alpha's assign is held while the user moves on to bravo.
+        ui.click("[data-test=key-alpha]");
+        ui.wait_text("#drawer-title", "alpha");
+        ui.select("#key-user-select", "alice");
+        hold_next(ui, "PUT", "/user");
+        ui.click("#key-assign");
+        ui.click("#drawer-close");
+        ui.wait_hidden("#drawer");
+        // Visible again only once bravo's drawer is drawn.
+        ui.click("[data-test=key-bravo]");
+        ui.wait_visible("#drawer");
+        ui.wait_text("#drawer-title", "bravo");
+        release_held(ui);
+        // The table follows the assign either way.
+        ui.wait_text("[data-test=key-user-alpha]", "alice");
+        let replaced = ui.text("#drawer-title") != "bravo";
+        // bravo's assign is held, and the drawer dismissed meanwhile.
+        ui.click("#drawer-close");
+        ui.wait_hidden("#drawer");
+        ui.click("[data-test=key-bravo]");
+        ui.wait_visible("#drawer");
+        ui.wait_text("#drawer-title", "bravo");
+        ui.select("#key-user-select", "alice");
+        hold_next(ui, "PUT", "/user");
+        ui.click("#key-assign");
+        ui.page.press_key(None, "Escape").expect("press Escape");
+        ui.wait_hidden("#drawer");
+        release_held(ui);
+        ui.wait_text("[data-test=key-user-bravo]", "alice");
+        let reopened = ui.page.is_visible("#drawer").expect("visible");
+        assert!(
+            !replaced && !reopened,
+            "alpha's late assign replaced bravo's drawer: {replaced}; \
+             bravo's late assign reopened the dismissed drawer: {reopened}"
         );
     })
     .await;

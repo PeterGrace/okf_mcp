@@ -5,14 +5,27 @@ import { h, clear } from './dom.js';
 // filled or dismissed the drawer since it started.
 let generation = 0;
 
-// A claim on the drawer for a load that awaits before openDrawer(). Taking
-// one invalidates every older pending load. `ticket.current()` is true only
-// while no other load, open or close has happened since, and `view` (the
-// page's container) is still shown. Check it after every await, before
-// filling the drawer.
+// A claim on the drawer, taken when a drawer is asked for (before any await)
+// and kept by everything that drawer does. Taking one invalidates every
+// older claim. `ticket.current()` is true only while no other claim, open or
+// close has happened since, and `view` (the page's container) is still
+// shown. `ticket.open(...)` opens the drawer as openDrawer does and keeps
+// the claim, so the drawer's own actions can re-render or close it later:
+// they do so only while `ticket.current()`. A dismissed or replaced drawer
+// is never reopened by a late answer.
 export function drawerTicket(view) {
-    const mine = ++generation;
-    return { current: () => mine === generation && view.isConnected };
+    let mine = ++generation;
+    return {
+        current: () => mine === generation && view.isConnected,
+        open(title, subtitle, ...content) {
+            const body = openDrawer(title, subtitle, ...content);
+            mine = generation;
+            return body;
+        },
+        close() {
+            if (mine === generation) closeDrawer();
+        },
+    };
 }
 
 // Opens the right-hand drawer and returns its body element for the caller to fill.

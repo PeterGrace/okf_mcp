@@ -8,7 +8,7 @@ import { h, pill } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
-import { openDrawer, closeDrawer, drawerTicket } from '../core/drawer.js';
+import { drawerTicket } from '../core/drawer.js';
 import { ago, when } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
@@ -60,6 +60,7 @@ export async function render(main, rest) {
     }
 
     function openCreate() {
+        const ticket = drawerTicket(main);
         const form = h('form', { id: 'user-form' },
             h('label', {}, 'Name',
                 h('input', { name: 'name', required: true, pattern: '[a-z0-9-]+', autocomplete: 'off',
@@ -74,11 +75,10 @@ export async function render(main, rest) {
                 await api.post('/users', { name, display_name: String(data.get('display_name') ?? '').trim() });
             } catch { return; /* toasted: an invalid or taken name */ }
             toast(`Created user ${name} and its personal team.`, 'ok');
-            if (!main.isConnected) return;
-            closeDrawer();
-            await load();
+            ticket.close();
+            if (main.isConnected) await load();
         });
-        openDrawer('New user', 'Creates its personal team of the same name.', form);
+        ticket.open('New user', 'Creates its personal team of the same name.', form);
     }
 
     // The drawer: the user's teams and the credentials this key manages, and
@@ -105,12 +105,11 @@ export async function render(main, rest) {
                 if (!ok) return;
                 try { await api.del(`/users/${enc(name)}`); } catch { return; }
                 toast(`Deleted user ${name}.`, 'ok');
-                if (!main.isConnected) return;
-                closeDrawer();
-                await load();
+                ticket.close();
+                if (main.isConnected) await load();
             },
         }, 'Delete user');
-        openDrawer(name, user.display_name || 'User',
+        ticket.open(name, user.display_name || 'User',
             h('div', { id: 'user-detail' },
                 h('p', {}, 'Personal team: ', h('code', {}, personal.name)),
                 h('dl', { class: 'facts' },

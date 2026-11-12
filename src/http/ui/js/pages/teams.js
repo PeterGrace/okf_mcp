@@ -7,7 +7,7 @@ import { h, pill } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
-import { openDrawer, closeDrawer, drawerTicket } from '../core/drawer.js';
+import { drawerTicket } from '../core/drawer.js';
 import { ago, count, when } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
@@ -84,26 +84,26 @@ export async function render(main) {
                 });
             } catch { return; /* toasted: an invalid or taken name, or an unknown owner */ }
             toast(`Created team ${name}.`, 'ok');
-            if (!main.isConnected) return;
-            closeDrawer();
-            await load();
+            ticket.close();
+            if (main.isConnected) await load();
         });
-        openDrawer('New team', 'A shared team; its owner is its first member.', form);
+        ticket.open('New team', 'A shared team; its owner is its first member.', form);
     }
 
-    // After a membership change: the drawer shows `team` as it now is, and
-    // the list its new member count.
-    async function changed(team, message) {
+    // After a membership change: the list shows its new member count, and
+    // the drawer, while `ticket` (the one it was opened with) is current,
+    // shows `team` as it now is.
+    async function changed(team, message, ticket) {
         toast(message, 'ok');
-        if (!main.isConnected) return;
-        await load();
-        if (main.isConnected) await openDetail(team.name, team);
+        if (main.isConnected) await load();
+        if (ticket.current()) await openDetail(team.name, team, ticket);
     }
 
     // The drawer: members with their roles, adding one, and Delete,
-    // disabled with the reason when the server would refuse it.
-    async function openDetail(name, known = null) {
-        const ticket = drawerTicket(main);
+    // disabled with the reason when the server would refuse it. A re-render
+    // passes the drawer's `ticket`, so it is dropped once the drawer is
+    // replaced or dismissed.
+    async function openDetail(name, known = null, ticket = drawerTicket(main)) {
         let team = known;
         let users;
         try {
@@ -120,7 +120,7 @@ export async function render(main) {
                     role.value = member.role;   // refused (the last owner): show the role it kept
                     return;
                 }
-                await changed(answer.team, `${member.user} is now ${role.value} of ${team.name}.`);
+                await changed(answer.team, `${member.user} is now ${role.value} of ${team.name}.`, ticket);
             });
             const personal = member.user === team.personal_of;
             const remove = h('button', {
@@ -130,7 +130,7 @@ export async function render(main) {
                 onclick: async () => {
                     let updated;
                     try { updated = await api.del(`${base}/${enc(member.user)}`); } catch { return; }
-                    await changed(updated, `Removed ${member.user} from ${team.name}.`);
+                    await changed(updated, `Removed ${member.user} from ${team.name}.`, ticket);
                 },
             }, 'Remove');
             return h('li', {}, h('span', { class: 'mono' }, member.user), role, remove);
@@ -148,7 +148,7 @@ export async function render(main) {
             try { answer = await api.put(`${base}/${enc(user)}`, { role: String(data.get('role') ?? 'member') }); } catch {
                 return;
             }
-            await changed(answer.team, `Added ${user} to ${team.name}.`);
+            await changed(answer.team, `Added ${user} to ${team.name}.`, ticket);
         });
         const reason = team.personal_of
             ? `This is ${team.personal_of}'s personal team: it is deleted with its user.`
@@ -164,12 +164,11 @@ export async function render(main) {
                 if (!ok) return;
                 try { await api.del(`/teams/${enc(team.name)}`); } catch { return; }
                 toast(`Deleted team ${team.name}.`, 'ok');
-                if (!main.isConnected) return;
-                closeDrawer();
-                await load();
+                ticket.close();
+                if (main.isConnected) await load();
             },
         }, 'Delete team');
-        openDrawer(team.name, team.display_name || (team.personal_of ? 'Personal team' : 'Team'),
+        ticket.open(team.name, team.display_name || (team.personal_of ? 'Personal team' : 'Team'),
             h('dl', { class: 'facts', id: 'team-detail' },
                 h('dt', {}, 'Catalogs'), h('dd', {}, team.catalogs.length ? team.catalogs.join(', ') : '-'),
                 h('dt', {}, 'Created'), h('dd', {}, when(team.created_at))),
