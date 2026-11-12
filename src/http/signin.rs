@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 use crate::app::App;
 use crate::error::OkfError;
-use crate::http::console_session::{client_ip, cookie, start_session_proved, SessionProof, COOKIE};
+use crate::http::console_session::{client_ip, cookie, start_session_with, COOKIE};
 use crate::http::limits::ip_key;
 use crate::http::pages::{self, escape, safe_return_to};
 use crate::http::ui::CONTENT_SECURITY_POLICY;
@@ -34,7 +34,7 @@ use crate::mail::{self, Template, RESET_PATH, SETUP_PATH};
 use crate::store::email_tokens::{self, Purpose};
 use crate::store::passwords::{self, NewPassword, PasswordStamp, SignInOutcome};
 use crate::store::sign_in_events::{self, Method, Outcome};
-use crate::store::user_sessions::{self, LinkedIdentity};
+use crate::store::user_sessions;
 use crate::store::users::{self, UserAuth};
 
 /// Every refused password sign-in says this, whatever the reason (spec).
@@ -332,11 +332,14 @@ async fn sign_in_post(
     let verdict = passwords::verify(app.pool(), &email, &form.password, app.clock().now()).await;
     let outcome = match verdict {
         Ok(SignInOutcome::Ok(verified)) => {
-            let proof = SessionProof {
-                password: Some(&verified.stamp),
-                identity: None,
-            };
-            let started = begin(&app, &parts, &verified.user, Method::Password, proof).await;
+            let started = begin(
+                &app,
+                &parts,
+                &verified.user,
+                Method::Password,
+                Some(&verified.stamp),
+            )
+            .await;
             return match started {
                 Ok(headers) => (headers, Redirect::to(&return_to)).into_response(),
                 // A reset replaced the password after it was checked: the
@@ -400,50 +403,21 @@ pub(crate) async fn sign_in(
     user: &UserAuth,
     method: Method,
 ) -> Result<HeaderMap, OkfError> {
-    begin(app, parts, user, method, SessionProof::default()).await
+    begin(app, parts, user, method, None).await
 }
 
-/// [`sign_in`] by an OIDC identity: the session is refused if the identity
-/// was unlinked from the user after it was looked up.
-///
-/// # Arguments
-/// * `app` - the shared state.
-/// * `parts` - the request (cookie, address, `User-Agent`).
-/// * `user` - the user the identity is linked to.
-/// * `identity` - the identity the ID token proved.
-///
-/// # Returns
-/// The `Set-Cookie` header to send.
+/// [`sign_in`], with the password hash a password sign-in matched, so the
+/// session is refused if a reset replaced it meanwhile.
 ///
 /// # Errors
-/// As [`sign_in`], and [`OkfError::Unauthenticated`] when the identity (or
-/// the user) is gone.
-pub(crate) async fn sign_in_linked(
-    app: &App,
-    parts: &Parts,
-    user: &UserAuth,
-    identity: LinkedIdentity<'_>,
-) -> Result<HeaderMap, OkfError> {
-    let proof = SessionProof {
-        password: None,
-        identity: Some(identity),
-    };
-    begin(app, parts, user, Method::Oidc, proof).await
-}
-
-/// [`sign_in`], with what the sign-in proved (the password hash a password
-/// sign-in matched, or the identity an OIDC one did), so the session is
-/// refused if that changed meanwhile.
-///
-/// # Errors
-/// As [`sign_in`], and [`OkfError::Unauthenticated`] when what `proof`
-/// names (or the user) changed after the check.
+/// As [`sign_in`], and [`OkfError::Unauthenticated`] when the password (or
+/// the user) changed after the check.
 async fn begin(
     app: &App,
     parts: &Parts,
     user: &UserAuth,
     method: Method,
-    proof: SessionProof<'_>,
+    password: Option<&PasswordStamp>,
 ) -> Result<HeaderMap, OkfError> {
     if let Some(old) = cookie(&parts.headers, COOKIE) {
         user_sessions::revoke(app.pool(), old).await?;
@@ -454,7 +428,7 @@ async fn begin(
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    let (headers, _session) = start_session_proved(app, user, proof, ip, user_agent).await?;
+    let (headers, _session) = start_session_with(app, user, password, ip, user_agent).await?;
     audit(app, Some(&user.id), method, Outcome::Ok, ip).await;
     Ok(headers)
 }
@@ -781,11 +755,7 @@ async fn setup_post(
     // Stamped with the hash just stored, like a password sign-in: if a
     // reset replaces the password before the session is inserted, there is
     // no session, and the person signs in with the new password instead.
-    let proof = SessionProof {
-        password: Some(&used.stamp),
-        identity: None,
-    };
-    match begin(&app, &parts, &used.user, Method::Setup, proof).await {
+    match begin(&app, &parts, &used.user, Method::Setup, Some(&used.stamp)).await {
         Ok(headers) => (headers, Redirect::to(&return_to)).into_response(),
         Err(OkfError::Unauthenticated { .. }) => Redirect::to("/signin").into_response(),
         Err(error) => AppError(error).into_response(),
@@ -948,7 +918,7 @@ mod tests {
     use crate::http::api::testing::{
         app, login_app, user_with_password, Browser, Payload, Reply, MAIN, PASSWORD,
     };
-    use crate::http::console_session::{start_session_with, COOKIE};
+    use crate::http::console_session::COOKIE;
     use crate::mcp::testing::{app_with, TestApp};
     use crate::store::settings::{self, SettingKey};
     use crate::store::sign_in_events::{Method, Outcome};

@@ -10,9 +10,9 @@
 //! `users::set_admin` and `users::delete`; `passwords::set_in` and
 //! `passwords::reset_in` (whose `UPDATE users` precedes `revoke_all`);
 //! `identities::link_for_session` (the user, then the session `FOR SHARE`,
-//! the link and `revoke_all`); and `user_sessions::start` (the user `FOR
-//! SHARE`, then, for an OIDC sign-in, the identity's link, then the
-//! insert). Two such
+//! the link and `revoke_all`); `identities::sign_in` (the user, then the
+//! identity's link, the browser's old session, the new one and the event);
+//! and `user_sessions::start` (the user `FOR SHARE`, then the insert). Two such
 //! transactions on one user therefore queue on that row and never deadlock.
 //! Statements that touch only tokens or only sessions (`touch`, `revoke`,
 //! `revoke_by_prefix`, the prunes) hold no user lock, so they cannot close a

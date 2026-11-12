@@ -35,20 +35,18 @@ use crate::app::App;
 use crate::auth::{CredentialKind, Principal};
 use crate::error::OkfError;
 use crate::http::console_session::{
-    append_all, client_ip, cookie, secure_cookies, session_user, set_cookie, ConsoleSession,
-    SameSite, COOKIE,
+    append_all, client_ip, cookie, secure_cookies, session_cookie, session_user, set_cookie,
+    ConsoleSession, SameSite, COOKIE,
 };
 use crate::http::limits::ip_key;
 use crate::http::pages::safe_return_to;
-use crate::http::signin::{
-    audit, message_page, notify_method_added, sign_in_linked, ProviderButton,
-};
+use crate::http::signin::{audit, message_page, notify_method_added, ProviderButton};
 use crate::http::{timeout_layer, AppError};
 use crate::keys;
 use crate::oidc::{Flow, Identity, LinkRequest, OidcError, OidcProviders, FLOW_TTL};
-use crate::store::identities::{self, SessionLink};
+use crate::store::identities::{self, OidcOutcome, OidcSignIn, SessionLink};
 use crate::store::sign_in_events::{Method, Outcome};
-use crate::store::user_sessions::{self, LinkedIdentity};
+use crate::store::user_sessions;
 use crate::store::users::UserAuth;
 
 /// The flow cookie: `SameSite=Lax`, so the provider's redirect carries it.
@@ -344,61 +342,75 @@ fn verified_email(identity: &Identity) -> Option<&str> {
         .filter(|_| identity.email_verified)
 }
 
+/// Queues the "a sign-in method was added" notice on a task of its own,
+/// after the commit: it is best effort (`notify_method_added` logs a
+/// failure), so a slow or failing queue can never hold back or fail the
+/// response of a committed sign-in or link.
+fn notify_detached(app: &Arc<App>, user: UserAuth, provider: &str) {
+    let app = Arc::clone(app);
+    let method = method_text(&app, provider);
+    // `tokio::spawn` runs the future on its own task, like
+    // `asyncio.create_task`; `move` hands it owned copies.
+    tokio::spawn(async move { notify_method_added(&app, &user, &method).await });
+}
+
 /// Signs in by `(provider, sub)`, else links by verified email and signs
-/// in, else refuses with 403 (spec, in that order). An identity already
-/// linked always signs in as its own user, whatever email it now carries,
-/// so a changed email at the provider never reaches another account.
+/// in, else refuses with 403 (spec, in that order), in one transaction
+/// (`identities::sign_in`) that also ends the browser's old session and
+/// records the event. An identity already linked always signs in as its
+/// own user, whatever email it now carries, so a changed email at the
+/// provider never reaches another account. After the commit only the
+/// cookie is built and the notice detached: nothing can block or fail.
 async fn finish_sign_in(
-    app: &App,
+    app: &Arc<App>,
     parts: &Parts,
     provider: &str,
     identity: &Identity,
     return_to: String,
 ) -> Result<Done, OkfError> {
-    let pool = app.pool();
-    let now = app.clock().now();
     let ip = client_ip(parts, &app.config().auth);
-    let user = match identities::find(pool, provider, &identity.subject).await? {
-        Some(user) => user,
-        None => {
-            // Only a verified email may claim an account.
-            let linked = match verified_email(identity) {
-                Some(email) => {
-                    identities::link_by_email(pool, provider, &identity.subject, email, now).await
-                }
-                None => Ok(None),
-            };
-            let user = match linked {
-                Ok(Some(user)) => user,
-                Ok(None) => {
-                    audit(app, None, Method::Oidc, Outcome::Failed, ip).await;
-                    return Ok(Done::Refused(StatusCode::FORBIDDEN, NO_ACCOUNT));
-                }
-                Err(OkfError::Refused { .. }) => {
-                    return Ok(Done::Refused(StatusCode::CONFLICT, LINKED_ELSEWHERE))
-                }
-                Err(error) => return Err(error),
-            };
-            tracing::info!(user = %user.id, provider, "OIDC identity linked by verified email");
-            notify_method_added(app, &user, &method_text(app, provider)).await;
-            user
-        }
-    };
-    let linked = LinkedIdentity {
+    let absolute = app.settings().console_session_absolute;
+    let user_agent = parts
+        .headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let request = OidcSignIn {
         provider,
         subject: &identity.subject,
+        // Only a verified email may claim an account.
+        verified_email: verified_email(identity),
+        old_session: cookie(&parts.headers, COOKIE),
+        ip,
+        user_agent,
+        absolute,
     };
-    // The session is inserted only while the identity is still linked to
-    // this user (re-read under the user's row lock).
-    let session_cookie = match sign_in_linked(app, parts, &user, linked).await {
-        Ok(session_cookie) => session_cookie,
-        Err(OkfError::Unauthenticated { .. }) => {
-            audit(app, Some(&user.id), Method::Oidc, Outcome::Failed, ip).await;
+    let outcome = identities::sign_in(app.pool(), &request, app.clock().now()).await;
+    let (user, session, linked) = match outcome {
+        Ok(OidcOutcome::SignedIn {
+            user,
+            session,
+            linked,
+        }) => (user, session, linked),
+        // Nothing was committed on these paths, so the audit may wait.
+        Ok(OidcOutcome::NoAccount) => {
+            audit(app, None, Method::Oidc, Outcome::Failed, ip).await;
+            return Ok(Done::Refused(StatusCode::FORBIDDEN, NO_ACCOUNT));
+        }
+        Ok(OidcOutcome::Unlinked) | Err(OkfError::Unauthenticated { .. }) => {
+            audit(app, None, Method::Oidc, Outcome::Failed, ip).await;
             return Ok(Done::Refused(StatusCode::BAD_REQUEST, SIGN_IN_RETRY));
+        }
+        Err(OkfError::Refused { .. }) => {
+            return Ok(Done::Refused(StatusCode::CONFLICT, LINKED_ELSEWHERE))
         }
         Err(error) => return Err(error),
     };
-    identities::touch(pool, provider, &identity.subject, now).await?;
+    let session_cookie = session_cookie(app, &user.id, &session, absolute);
+    if linked {
+        tracing::info!(user = %user.id, provider, "OIDC identity linked by verified email");
+        notify_detached(app, user, provider);
+    }
     Ok(Done::Redirect {
         session_cookie,
         to: return_to,
@@ -429,9 +441,9 @@ async fn linking_user(
 /// Links the identity to the signed-in user who started the flow, whatever
 /// its email (spec), and ends their other sessions unless kept, in one
 /// transaction. Only the browser still holding the session that started
-/// the link may finish it.
+/// the link may finish it. After the commit only the notice runs, detached.
 async fn finish_link(
-    app: &App,
+    app: &Arc<App>,
     parts: &Parts,
     provider: &str,
     identity: &Identity,
@@ -461,7 +473,8 @@ async fn finish_link(
         Err(error) => return Err(error),
     };
     tracing::info!(user = %link.user_id, provider, ended, "OIDC identity linked from the account page");
-    notify_method_added(app, &user, &method_text(app, provider)).await;
+    // After the commit: nothing that can block or fail.
+    notify_detached(app, user, provider);
     Ok(Done::Redirect {
         session_cookie: HeaderMap::new(),
         to: ACCOUNT_PAGE.to_string(),
@@ -654,6 +667,18 @@ mod tests {
             .expect("alice's id")
     }
 
+    /// Waits (up to 10 s) until `want` mails are queued: the method-added
+    /// notice is queued on a task of its own, after the response.
+    async fn wait_for_mail(test: &TestApp, want: i64) {
+        for _ in 0..200 {
+            if queued_mail(test).await == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{want} mails were never queued");
+    }
+
     async fn sessions_of(pool: &PgPool, user_id: &str) -> i64 {
         sqlx::query_scalar("SELECT count(*) FROM user_sessions WHERE user_id = $1")
             .bind(user_id)
@@ -721,7 +746,7 @@ mod tests {
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].email_at_link, "Alice@Example.com");
         assert!(linked[0].last_used_at.is_some());
-        assert_eq!(queued_mail(&test).await, 1, "the method-added notice");
+        wait_for_mail(&test, 1).await;
         let events = sign_in_events::recent(test.app.pool(), "alice", 5)
             .await
             .expect("events");
@@ -1054,7 +1079,7 @@ mod tests {
             .await;
         assert_eq!(kept.status, StatusCode::OK);
         assert_eq!(ended.status, StatusCode::UNAUTHORIZED);
-        assert_eq!(queued_mail(&test).await, 1, "the method-added notice");
+        wait_for_mail(&test, 1).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1247,6 +1272,71 @@ mod tests {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
         assert!(reply.set_cookie(COOKIE).is_none());
         assert_eq!(sessions_of(pool, &alice.id).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sign_in_commits_nothing_until_its_event_is_written_and_never_waits_on_mail() {
+        let idp = idp::start().await;
+        let test = oidc_app(&idp, "OKF_TEST_OIDC_SECRET_COMMIT").await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let bob = user_with_password(&test, "bob", "bob@example.com", Some(PASSWORD)).await;
+        let pool = test.app.pool();
+
+        // The event table is locked: the sign-in waits inside its
+        // transaction, with nothing committed, and finishes once it can.
+        idp.will_issue("sub-1", Some("alice@example.com"), Some(true));
+        let mut browser = Browser::default();
+        let query = start(&test, &idp, &mut browser).await;
+        let mut events = pool.begin().await.expect("begin");
+        sqlx::query("LOCK TABLE sign_in_events IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *events)
+            .await
+            .expect("lock the events");
+        let release = async {
+            wait_for_lock_waiters(pool, 1).await;
+            assert_eq!(sessions_of(pool, &alice.id).await, 0, "no session yet");
+            assert!(
+                identities::list(pool, &alice.id)
+                    .await
+                    .expect("list")
+                    .is_empty(),
+                "no link yet"
+            );
+            events.rollback().await.expect("release the events");
+        };
+        let (reply, ()) = tokio::join!(callback(&test, &mut browser, &query["state"]), release);
+
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.text());
+        assert!(reply.set_cookie(COOKIE).is_some());
+        assert_eq!(sessions_of(pool, &alice.id).await, 1);
+        let recorded = sign_in_events::recent(pool, "alice", 5)
+            .await
+            .expect("events");
+        assert!(matches!(
+            (&recorded[0].method, &recorded[0].outcome),
+            (Method::Oidc, Outcome::Ok)
+        ));
+
+        // The mail queue is locked: the committed sign-in answers at once,
+        // and the notice is queued once the queue is free.
+        idp.will_issue("sub-2", Some("bob@example.com"), Some(true));
+        let mut browser = Browser::default();
+        let query = start(&test, &idp, &mut browser).await;
+        let mut jobs = pool.begin().await.expect("begin");
+        sqlx::query("LOCK TABLE apalis.jobs IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *jobs)
+            .await
+            .expect("lock the mail queue");
+        let reply = tokio::time::timeout(
+            Duration::from_secs(30),
+            callback(&test, &mut browser, &query["state"]),
+        )
+        .await
+        .expect("the response never waits on the mail queue");
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.text());
+        assert_eq!(sessions_of(pool, &bob.id).await, 1);
+        jobs.rollback().await.expect("release the mail queue");
+        wait_for_mail(&test, 2).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

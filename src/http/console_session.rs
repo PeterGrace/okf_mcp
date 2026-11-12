@@ -28,7 +28,7 @@ use crate::error::OkfError;
 use crate::http::AppError;
 use crate::store::ceiling;
 use crate::store::passwords::PasswordStamp;
-use crate::store::user_sessions::{self, LinkedIdentity, NewSession, SessionStart};
+use crate::store::user_sessions::{self, NewSession, SessionStart};
 use crate::store::users::{self, UserAuth};
 
 /// The session cookie (plan Decision 9).
@@ -409,49 +409,6 @@ pub async fn start_session_with(
     ip: Option<IpAddr>,
     user_agent: &str,
 ) -> Result<(HeaderMap, NewSession), OkfError> {
-    let proof = SessionProof {
-        password,
-        identity: None,
-    };
-    start_session_proved(app, user, proof, ip, user_agent).await
-}
-
-/// What a sign-in proved, re-checked when its session is inserted
-/// (`user_sessions::start`), so a change to that method committed since the
-/// check refuses the session. Both `None` (the `Default`) checks nothing
-/// but that the user still exists.
-// `Copy`: two borrowed fields, passed by value like a tuple.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct SessionProof<'a> {
-    /// The password hash a password sign-in matched.
-    pub password: Option<&'a PasswordStamp>,
-    /// The OIDC identity an OIDC sign-in matched.
-    pub identity: Option<LinkedIdentity<'a>>,
-}
-
-/// [`start_session_with`], for any sign-in method: the session is refused
-/// if what `proof` names changed after it was checked.
-///
-/// # Arguments
-/// * `app` - the shared state.
-/// * `user` - the user who signed in.
-/// * `proof` - what to re-check.
-/// * `ip` - their address, if known.
-/// * `user_agent` - their `User-Agent`.
-///
-/// # Returns
-/// The `Set-Cookie` header and the new session.
-///
-/// # Errors
-/// As [`start_session`], and [`OkfError::Unauthenticated`] when the user
-/// is gone or what `proof` names changed meanwhile.
-pub(crate) async fn start_session_proved(
-    app: &App,
-    user: &UserAuth,
-    proof: SessionProof<'_>,
-    ip: Option<IpAddr>,
-    user_agent: &str,
-) -> Result<(HeaderMap, NewSession), OkfError> {
     let absolute = app.settings().console_session_absolute;
     let request = SessionStart {
         user_id: &user.id,
@@ -459,10 +416,29 @@ pub(crate) async fn start_session_proved(
         user_agent,
         absolute,
         now: app.clock().now(),
-        password: proof.password,
-        identity: proof.identity,
+        password,
     };
     let session = user_sessions::start(app.pool(), &request).await?;
+    Ok((session_cookie(app, &user.id, &session, absolute), session))
+}
+
+/// The `Set-Cookie` header for a session just started, and its log line
+/// (the user's id only).
+///
+/// # Arguments
+/// * `app` - the shared state (for `Secure`).
+/// * `user_id` - whose session.
+/// * `session` - the new session.
+/// * `absolute` - its lifetime (`console_session_absolute`).
+///
+/// # Returns
+/// The header.
+pub(crate) fn session_cookie(
+    app: &App,
+    user_id: &str,
+    session: &NewSession,
+    absolute: Duration,
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
@@ -475,8 +451,8 @@ pub(crate) async fn start_session_proved(
         ),
     );
     // The user's id only: never the session id or its token.
-    tracing::info!(user = %user.id, "console session started");
-    Ok((headers, session))
+    tracing::info!(user = %user_id, "console session started");
+    headers
 }
 
 /// The `Set-Cookie` header that removes the session cookie.
