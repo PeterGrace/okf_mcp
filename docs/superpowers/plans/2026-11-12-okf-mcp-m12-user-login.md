@@ -287,12 +287,17 @@ pub async fn verify(pool: &PgPool, email: &str, password: &str, now: DateTime<Ut
 pub async fn verify_user(pool: &PgPool, user_id: &str, password: &str, now: DateTime<Utc>) -> Result<SignInOutcome, OkfError>; // the same rules, by id (Task 10b's password change)
 pub struct PasswordStamp(/* the matched hash; Debug redacted */); pub struct Verified { pub user: UserAuth, pub stamp: PasswordStamp } // Task 7b (PR #337 review)
 pub async fn reset(pool: &PgPool, user_id: &str, password: &str, now: DateTime<Utc>) -> Result<u64, OkfError>; // Task 7b: set + revoke_all in one transaction
+pub struct NewPassword(/* hashed; Debug redacted */); impl NewPassword { pub async fn hash(password: &str) -> Result<Self, OkfError>; } // Task 7b
+pub async fn set_in(conn: &mut PgConnection, user_id: &str, password: &NewPassword, now: DateTime<Utc>) -> Result<(), OkfError>; // Task 7b
+pub async fn reset_in(conn: &mut PgConnection, user_id: &str, password: &NewPassword, now: DateTime<Utc>) -> Result<u64, OkfError>; // Task 7b
 pub async fn set(pool: &PgPool, user_id: &str, password: &str, now: DateTime<Utc>) -> Result<(), OkfError>;
 
 // ---- src/store/email_tokens.rs (Task 4) ----
 pub enum Purpose { Setup, Reset }
 pub async fn issue(pool: &PgPool, user_id: &str, purpose: Purpose, ttl: std::time::Duration, now: DateTime<Utc>) -> Result<String, OkfError>; // raw token; older same-purpose tokens invalidated
 pub async fn redeem(pool: &PgPool, token: &str, purpose: Purpose, now: DateTime<Utc>) -> Result<UserAuth, OkfError>; // Gone on expired/used/unknown
+pub async fn redeem_in(conn: &mut PgConnection, token: &str, purpose: Purpose, now: DateTime<Utc>) -> Result<UserAuth, OkfError>; // Task 7b: inside the caller's transaction
+pub async fn issue_for_email(pool: &PgPool, email: &str, purpose: Purpose, ttl: std::time::Duration, now: DateTime<Utc>) -> Result<Option<IssuedLink>, OkfError>; // Task 7b: lookup + issue under the row lock
 pub async fn peek(pool: &PgPool, token: &str, purpose: Purpose, now: DateTime<Utc>) -> Result<UserAuth, OkfError>;   // validate without using
 pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError>;
 
@@ -441,6 +446,7 @@ impl Browser {
 
 // ---- src/store/passkeys.rs (Task 8) ----
 pub async fn add(pool: &PgPool, user_id: &str, passkey: &Passkey, name: &str, now: DateTime<Utc>) -> Result<(), OkfError>;
+pub async fn add_in(conn: &mut PgConnection, user_id: &str, passkey: &Passkey, name: &str, now: DateTime<Utc>) -> Result<(), OkfError>; // corrected (issue #316): the setup link's passkey is stored in the redeeming transaction
 pub async fn for_user(pool: &PgPool, user_id: &str) -> Result<Vec<(String /*name*/, Passkey)>, OkfError>;
 pub async fn find(pool: &PgPool, credential_id: &[u8]) -> Result<Option<(String /*user_id*/, Passkey)>, OkfError>;
 pub async fn update(pool: &PgPool, credential_id: &[u8], passkey: &Passkey, now: DateTime<Utc>) -> Result<(), OkfError>;
@@ -10772,6 +10778,10 @@ Builds on Task 7a's pages, limits, `start_session`, `Browser` and `/api/v1/sessi
 >   - Passkey, OIDC and setup sign-ins keep calling `sign_in` / `start_session` with no stamp.
 >   - Tests: `a_sign_in_checked_before_a_reset_gets_no_session_after_it`, `a_sign_in_waiting_on_a_reset_in_progress_gets_no_session` (holds the user row so the reset and the insert queue behind it in that order) and `a_session_inserted_before_a_reset_is_ended_by_it`.
 > - Console sign-out counts as done only on a 2xx or a 401 from `DELETE /api/v1/session`. Any other failure keeps the session state and the shell, and shows a "Sign-out failed ... Try again." toast. The setup journey fails the first `DELETE` with a fetch wrapper and checks this.
+> - **Emailed links are issued and used atomically (third review of PR #337).**
+>   - *Forgot.* `email_tokens::issue_for_email(pool, email, purpose, ttl, now) -> Option<IssuedLink { user, to, token }>` (redacted `Debug`) finds the user and issues the token in one transaction. One statement finds and locks the user's row by email (`... WHERE u.email = $1::citext FOR NO KEY UPDATE`); `users::set_email` takes the same row lock when it deletes a changed user's links. Either the issue commits first and the email change deletes the link, or the change commits first and the issue finds no user. The mail goes to `to`, the address read under the lock. `issue` and `issue_for_email` share a private `replace_token`. Tests: `a_reset_link_issued_before_an_email_change_dies_with_it` and `no_reset_link_is_issued_for_an_email_changed_meanwhile`. Each holds the row and queues the two in a chosen order.
+>   - *Setup and reset.* The handlers' `use_link` hashes the new password first (`passwords::NewPassword::hash`, policy plus argon2, redacted `Debug`), outside any transaction. Then one transaction runs `email_tokens::redeem_in(&mut tx, token, purpose, now)` and either `passwords::set_in(&mut tx, user_id, &hashed, now)` (setup) or `passwords::reset_in(...) -> u64` (reset: the hash, then `revoke_all`). A failure anywhere rolls everything back: the old password, the sessions and the link stay as they were. `redeem`, `set` and `reset` are the pool wrappers. Tests: `a_reset_that_fails_changes_nothing_and_keeps_the_link` and `a_setup_that_fails_sets_nothing_and_keeps_the_link`. Each injects the failure with a trigger.
+>   - Task 8's setup-link passkey path (`setup_finish`) must do the same: redeem the link with `redeem_in` and store the passkey in the same transaction. See the note there.
 > - **One credential at a time in the console (second review of PR #337).**
 >   - At boot, `main.js` asks `GET /api/v1/session` first (a plain fetch, cookie only). A live session wins over a stored key, and the stored key is dropped. Otherwise a stored key is used; otherwise the login card is shown.
 >   - Sign-out (`endCookieSession`) always asks the server, cookie-only, whether the browser has a session. If it does, it sends `DELETE /api/v1/session` with that session's CSRF token, and only then clears the key. The failure rule is unchanged.
@@ -13220,11 +13230,17 @@ async fn setup_finish(
         return Err(expired().into());
     };
     let now = app.clock().now();
-    let user = email_tokens::redeem(app.pool(), &token, Purpose::Setup, now).await?;
+    // Corrected (issue #316): the link is used and the passkey stored in one
+    // transaction, as the password setup does (`use_link` in signin.rs), so a
+    // failure leaves the link usable. `passkey_rows::add` needs an `_in`
+    // form taking `&mut PgConnection` for this.
+    let mut tx = app.pool().begin().await?;
+    let user = email_tokens::redeem_in(&mut tx, &token, Purpose::Setup, now).await?;
     if user.id != user_id {
         return Err(OkfError::Gone { reason: LINK_EXPIRED.to_string() }.into());
     }
-    passkey_rows::add(app.pool(), &user.id, &passkey, &pending.name, now).await?;
+    passkey_rows::add_in(&mut tx, &user.id, &passkey, &pending.name, now).await?;
+    tx.commit().await?;
     append_all(&mut headers, &sign_in(&app, &parts, &user, Method::Setup).await?);
     Ok((headers, Json(serde_json::json!({ "redirect": pending.return_to }))).into_response())
 }
