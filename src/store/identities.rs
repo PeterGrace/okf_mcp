@@ -219,7 +219,7 @@ pub async fn link_for_session(
     Ok(ended)
 }
 
-/// Locks the user's row (the first lock of every write here).
+/// Locks the user's row (the first lock of every link and unlink here).
 ///
 /// # Errors
 /// [`OkfError::NotFound`] for an unknown user; [`OkfError::Database`].
