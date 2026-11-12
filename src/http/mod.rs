@@ -9,6 +9,7 @@ pub(crate) mod api;
 mod archives;
 pub mod console_session;
 pub mod limits;
+pub mod oidc;
 pub(crate) mod pages;
 pub mod passkeys;
 pub mod sessions;
@@ -249,6 +250,12 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     // `public_url`); otherwise `/auth/passkey/*` stays 404.
     let open = if app.passkeys().is_some() {
         open.merge(passkeys::routes())
+    } else {
+        open
+    };
+    // The OIDC routes exist only with providers configured.
+    let open = if app.oidc().is_some() {
+        open.merge(oidc::routes())
     } else {
         open
     };

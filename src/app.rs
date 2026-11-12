@@ -24,6 +24,7 @@ use crate::http::passkeys::Passkeys;
 use crate::http::sessions::SessionKeys;
 use crate::keyed_lock::KeyedLocks;
 use crate::oauth::OAuth;
+use crate::oidc::OidcProviders;
 use crate::overlay::Overlays;
 use crate::store::oauth::{
     clients as oauth_clients, codes as sign_in_codes, tokens as oauth_tokens,
@@ -106,6 +107,8 @@ pub struct App {
     // The WebAuthn relying party and ceremonies; `None` without a domain
     // `public_url`.
     passkeys: Option<Passkeys>,
+    // The configured OIDC providers; `None` without `public_url` or providers.
+    oidc: Option<OidcProviders>,
 }
 
 impl App {
@@ -129,7 +132,8 @@ impl App {
     /// the list;
     /// [`OkfError::Config`] from [`OAuth::new`] or [`Passkeys::new`], or from
     /// [`crate::mail::from_config`] (a mail secret missing from the
-    /// environment).
+    /// environment) or [`OidcProviders::new`] (an OIDC client secret missing
+    /// from the environment).
     pub async fn load(
         pool: PgPool,
         config: Config,
@@ -164,6 +168,8 @@ impl App {
         let overlays = Overlays::new(config.session_idle_timeout, config.overlay_cache_size);
         let mailer = crate::mail::from_config(&config.mail)?;
         let passkeys = Passkeys::new(&config)?;
+        // A provider whose secret variable is unset fails start-up here.
+        let oidc = OidcProviders::new(&config, |name| std::env::var(name).ok())?;
         Ok(Arc::new(Self {
             pool,
             config,
@@ -182,6 +188,7 @@ impl App {
             sign_in_limits: SignInLimits::new(),
             mailer,
             passkeys,
+            oidc,
         }))
     }
 
@@ -223,6 +230,14 @@ impl App {
     /// The mailer the mail worker sends with.
     pub fn mailer(&self) -> &Arc<dyn crate::mail::Mailer> {
         &self.mailer
+    }
+
+    /// The OIDC providers.
+    ///
+    /// # Returns
+    /// `None` when none are configured (or there is no `public_url`).
+    pub fn oidc(&self) -> Option<&OidcProviders> {
+        self.oidc.as_ref()
     }
 
     /// The key cache (shared with the auth layer).

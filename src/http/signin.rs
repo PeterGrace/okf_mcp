@@ -125,9 +125,9 @@ fn offers_passkeys(app: &App) -> bool {
     app.passkeys().is_some()
 }
 
-/// The OIDC provider buttons (Task 9 fills this from the registry).
-fn provider_buttons(_app: &App) -> Vec<ProviderButton> {
-    Vec::new()
+/// The OIDC provider buttons, one per configured provider.
+fn provider_buttons(app: &App) -> Vec<ProviderButton> {
+    super::oidc::buttons(app)
 }
 
 /// What `/signin` offers on this server.
@@ -249,8 +249,17 @@ fn sign_in_response(status: StatusCode, view: &SignInView) -> Response {
     )
 }
 
-/// A page with a heading, one message and a link back to `/signin`.
-fn message_page(status: StatusCode, title: &str, message: &str) -> Response {
+/// A page with a heading, one message and a link back to `/signin`; the
+/// OIDC callback answers with it too.
+///
+/// # Arguments
+/// * `status` - the status.
+/// * `title` - the heading and title (escaped).
+/// * `message` - the message (escaped).
+///
+/// # Returns
+/// The page, under the console CSP.
+pub(crate) fn message_page(status: StatusCode, title: &str, message: &str) -> Response {
     let body = format!(
         r#"        <h1>{title}</h1>
         <p class="consent-error" id="signin-message" role="alert">{message}</p>
@@ -369,39 +378,18 @@ async fn sign_in_post(
     sign_in_response(StatusCode::UNAUTHORIZED, &view)
 }
 
-/// Signs a verified user in: ends the session this browser held (rotation),
-/// starts a new one and records the event.
-///
-/// # Arguments
-/// * `app` - the shared state.
-/// * `parts` - the request (cookie, address, `User-Agent`).
-/// * `user` - the verified user.
-/// * `method` - how they proved who they are.
+/// Signs a verified user in (a password sign-in): starts a session, ends
+/// the one this browser held (rotation) and records the event, in one
+/// transaction ([`start_in`]). `password` is the hash the password matched,
+/// so the session is refused if a reset replaced it meanwhile.
 ///
 /// # Returns
 /// The `Set-Cookie` header to send.
 ///
 /// # Errors
-/// [`OkfError::Database`]; [`OkfError::Io`] from the random source.
-// `expect(dead_code)` silences "never used" until a caller lands, and
-// itself warns once one does, so it cannot be forgotten. Setup now signs in
-// through the stamped `begin`, and passkeys through `start_in`.
-#[expect(dead_code, reason = "OIDC sign-in (Task 9) calls it; delete this then")]
-pub(crate) async fn sign_in(
-    app: &App,
-    parts: &Parts,
-    user: &UserAuth,
-    method: Method,
-) -> Result<HeaderMap, OkfError> {
-    begin(app, parts, user, method, None).await
-}
-
-/// [`sign_in`], with the password hash a password sign-in matched, so the
-/// session is refused if a reset replaced it meanwhile.
-///
-/// # Errors
-/// As [`sign_in`], and [`OkfError::Unauthenticated`] when the password (or
-/// the user) changed after the check.
+/// [`OkfError::Unauthenticated`] when the password (or the user) changed
+/// after the check; [`OkfError::Database`]; [`OkfError::Io`] from the
+/// random source.
 async fn begin(
     app: &App,
     parts: &Parts,

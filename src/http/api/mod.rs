@@ -55,6 +55,9 @@ pub(crate) fn routes(app: &Arc<App>) -> Router<Arc<App>> {
         .merge(people::routes())
         .merge(me::routes())
         .merge(crate::http::passkeys::api_routes())
+        // `POST /me/identities/{provider}/link` (Task 9); it answers 404
+        // itself without providers.
+        .merge(crate::http::oidc::api_routes())
         // `route_layer` covers the routes merged above and runs only when one
         // matched, so an unknown API path stays 404 rather than 401.
         .route_layer(middleware::from_fn_with_state(

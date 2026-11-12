@@ -353,6 +353,12 @@ impl Browser {
         browser
     }
 
+    /// Adds (or replaces) one cookie, as a second tab or a stale jar would
+    /// hold it.
+    pub(crate) fn add_cookie(&mut self, name: &str, value: &str) {
+        self.cookies.insert(name.to_string(), value.to_string());
+    }
+
     /// A cookie's current value.
     pub(crate) fn cookie(&self, name: &str) -> Option<&str> {
         self.cookies.get(name).map(String::as_str)

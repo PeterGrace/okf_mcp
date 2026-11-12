@@ -6,11 +6,10 @@ use sqlx::PgConnection;
 use crate::error::OkfError;
 
 /// A user's sign-in methods: a password (0 or 1), plus passkeys, plus
-/// linked identities. Locks the user's row `FOR UPDATE` first, so two
-/// removals of different methods run one at a time and cannot both see a
-/// count of two. Call it inside the transaction that removes a method,
-/// before touching the method's own rows (lock order: the user first;
-/// `store::email_tokens`).
+/// linked identities. Locks the user's row `FOR NO KEY UPDATE` first (the
+/// lock order of `email_tokens`' module docs), so two removals of different
+/// methods run one at a time and cannot both see a count of two. Call it
+/// inside the transaction that removes a method.
 ///
 /// # Arguments
 /// * `conn` - the caller's transaction (`&mut tx`).
@@ -22,13 +21,12 @@ use crate::error::OkfError;
 /// # Errors
 /// [`OkfError::NotFound`] for an unknown user; [`OkfError::Database`].
 pub async fn count(conn: &mut PgConnection, user_id: &str) -> Result<i64, OkfError> {
-    // `&mut *conn` reborrows the connection for one query, so it can be used
-    // again for the next (a `&mut` can be lent out but not copied).
-    let has_password: Option<bool> =
-        sqlx::query_scalar("SELECT password_hash IS NOT NULL FROM users WHERE id = $1 FOR UPDATE")
-            .bind(user_id)
-            .fetch_optional(&mut *conn)
-            .await?;
+    let has_password: Option<bool> = sqlx::query_scalar(
+        "SELECT password_hash IS NOT NULL FROM users WHERE id = $1 FOR NO KEY UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
     let Some(has_password) = has_password else {
         return Err(OkfError::NotFound {
             path: format!("users/{user_id}"),
