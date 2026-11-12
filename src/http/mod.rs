@@ -1,14 +1,19 @@
 //! The HTTP server (design "Process and routes"): `/healthz`, `/mcp`, the
 //! archive routes (`archives`), the JSON API under `/api/v1` (`api`) and the
 //! web console under `/ui/` (`ui`), the OAuth routes (`crate::oauth`) when
-//! OAuth is on, with request tracing, timeouts and the key layer, and on
-//! `/mcp` the session binding (`sessions`).
+//! OAuth is on, with request tracing, timeouts and the key layer, on
+//! `/mcp` the session binding (`sessions`), and console sign-in sessions
+//! on `/api/v1` (`console_session`).
 
 pub(crate) mod api;
 mod archives;
+pub mod console_session;
+pub mod limits;
+pub(crate) mod pages;
 pub mod sessions;
 mod ui;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -239,8 +244,10 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
         Router::new().merge(health)
     };
     open.merge(ui::routes())
-        // The API applies `require_key` itself, inside its header layer, so
-        // even its 401 carries `no-store` and `nosniff`.
+        // The API applies `require_principal` (a bearer credential or a
+        // console session cookie) itself, inside its header layer, so even
+        // its 401 carries `no-store` and `nosniff`. MCP and the archive
+        // routes (`keyed`) take only a bearer credential.
         .nest("/api/v1", api::routes(&app))
         .merge(keyed)
         // One `info` line per response (status, latency) in a span naming the
@@ -286,9 +293,14 @@ pub async fn serve(
     let stop = shutdown.clone();
     // `async move { ... }` is a future that resolves once the token is
     // cancelled; axum then stops accepting and waits for open connections.
-    let served = axum::serve(listener, router)
-        .with_graceful_shutdown(async move { stop.cancelled().await })
-        .await;
+    // `ConnectInfo<SocketAddr>` in every request's extensions: the peer
+    // address `console_session::client_ip` falls back to (plan Decision 7).
+    let served = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { stop.cancelled().await })
+    .await;
     // On an error too, stop what this function started (the loops and
     // rmcp's sessions) before returning; cancelling twice is harmless.
     shutdown.cancel();

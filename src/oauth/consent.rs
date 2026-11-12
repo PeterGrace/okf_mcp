@@ -3,10 +3,16 @@
 //! be granted, and an error page ends a request that cannot go on.
 //!
 //! Client names come from client metadata, which anyone can write, so every
-//! piece of text goes through [`escape`]. There is no template engine.
+//! piece of text goes through `escape`. There is no template engine; the
+//! document shell and the response headers come from `crate::http::pages`.
 
-use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::StatusCode;
+use axum::response::Response;
+
+use crate::http::pages;
+/// Moved to `crate::http::pages`; kept here so `mail::templates` (Task 6)
+/// compiles whichever of Tasks 6 and 7a merges first (plan Decision 14).
+pub(crate) use crate::http::pages::escape;
 
 /// What every page shows about the request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,31 +46,6 @@ pub struct GrantSummary {
     pub default_catalog: Option<String>,
 }
 
-/// Escapes text for HTML element content and double- or single-quoted
-/// attribute values.
-///
-/// # Arguments
-/// * `text` - untrusted text.
-///
-/// # Returns
-/// The text with `& < > " '` as entities.
-pub fn escape(text: &str) -> String {
-    // Most text has nothing to escape; the capacity covers that case with
-    // one allocation.
-    let mut escaped = String::with_capacity(text.len());
-    for character in text.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            other => escaped.push(other),
-        }
-    }
-    escaped
-}
-
 /// The page's Content-Security-Policy.
 ///
 /// Browsers apply `form-action` to the redirect that follows a form POST,
@@ -91,62 +72,13 @@ pub(crate) fn content_security_policy(redirect_origin: Option<&str>) -> String {
     )
 }
 
-/// Wraps a page body in the document shell and the response headers.
+/// A consent page: [`pages::page`] with [`content_security_policy`].
 fn page(status: StatusCode, title: &str, body: &str, redirect_origin: Option<&str>) -> Response {
-    // The origin came from a parsed URL, so the policy is always a valid
-    // header value; a failure would be a bug, answered with a bare 500
-    // rather than a page without its policy.
-    let Ok(csp) = HeaderValue::from_str(&content_security_policy(redirect_origin)) else {
-        tracing::error!("consent CSP is not a header value");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    (
+    pages::page(
         status,
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/html; charset=utf-8"),
-            ),
-            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
-            (
-                header::REFERRER_POLICY,
-                HeaderValue::from_static("no-referrer"),
-            ),
-            (
-                header::X_CONTENT_TYPE_OPTIONS,
-                HeaderValue::from_static("nosniff"),
-            ),
-            (header::CONTENT_SECURITY_POLICY, csp),
-        ],
-        document(title, body),
-    )
-        .into_response()
-}
-
-/// The HTML document around a page body.
-fn document(title: &str, body: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="light dark">
-    <title>{title} - okf</title>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap">
-    <link rel="stylesheet" href="/ui/vendor/pico.min.css">
-    <link rel="stylesheet" href="/ui/styles.css">
-    <link rel="stylesheet" href="/ui/consent.css">
-</head>
-<body>
-    <main class="login-card consent-card">
-        <p class="brand">okf</p>
-{body}
-    </main>
-</body>
-</html>
-"#,
-        title = escape(title),
+        title,
+        body,
+        &content_security_policy(redirect_origin),
     )
 }
 
@@ -343,20 +275,6 @@ mod tests {
     }
 
     #[test]
-    fn escape_covers_the_five_html_specials() {
-        assert_eq!(
-            escape(r#"<a href="x">'&'</a>"#),
-            "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;"
-        );
-        assert_eq!(escape("plain"), "plain");
-        // Multibyte text passes through untouched.
-        assert_eq!(
-            escape("Caf\u{e9} \u{65e5}\u{672c}"),
-            "Caf\u{e9} \u{65e5}\u{672c}"
-        );
-    }
-
-    #[test]
     fn the_csp_allows_self_and_exactly_the_redirect_origin() {
         let csp = content_security_policy(Some("https://client.example.com"));
         assert!(csp.contains("form-action 'self' https://client.example.com;"));
@@ -428,9 +346,9 @@ mod tests {
             default_catalog: None,
         };
         for html in [
-            document("t", &code_page_html(&view(), Some("e"))),
-            document("t", &summary_page_html(&view(), &grant, "n1")),
-            document("t", &error_page_html("e")),
+            pages::document("t", &code_page_html(&view(), Some("e")), &[]),
+            pages::document("t", &summary_page_html(&view(), &grant, "n1"), &[]),
+            pages::document("t", &error_page_html("e"), &[]),
         ] {
             assert!(!html.contains("<script"), "{html}");
             assert!(!html.contains("<style"), "{html}");

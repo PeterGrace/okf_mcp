@@ -12,17 +12,27 @@ struct Entry<V> {
     value: V,
 }
 
+/// The entries and a lower bound on their expiries.
+struct Entries<V> {
+    by_key: HashMap<String, Entry<V>>,
+    // No entry expires before this (`None` only while empty). Removing an
+    // entry leaves it a valid lower bound, so only inserts and prunes move it.
+    earliest_expiry: Option<Instant>,
+}
+
 /// A map from string keys to values that expire `ttl` after insertion,
 /// holding at most `capacity` entries. Expired entries are dropped when
 /// touched, and all of them at once when the map is full, so a full prune
-/// runs only when needed rather than on every insert.
+/// runs only when needed rather than on every insert. A full map whose
+/// earliest entry has not expired yet refuses a new key without scanning,
+/// so a flood of new keys against a full map costs one lookup each.
 // `<V>`: generic over the value type, like `dict[str, V]` with a type variable.
 pub struct ExpiringMap<V> {
     ttl: Duration,
     capacity: usize,
     // A `std` mutex: held only for a lookup or an insert, never across an
     // `.await` (the `SessionKeys` pattern).
-    entries: Mutex<HashMap<String, Entry<V>>>,
+    entries: Mutex<Entries<V>>,
 }
 
 impl<V> ExpiringMap<V> {
@@ -38,11 +48,14 @@ impl<V> ExpiringMap<V> {
         Self {
             ttl,
             capacity,
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(Entries {
+                by_key: HashMap::new(),
+                earliest_expiry: None,
+            }),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry<V>>> {
+    fn lock(&self) -> MutexGuard<'_, Entries<V>> {
         self.entries.lock().expect("expiring map lock poisoned")
     }
 
@@ -58,21 +71,94 @@ impl<V> ExpiringMap<V> {
     /// `false`, storing nothing, when the map holds `capacity` live entries.
     pub fn insert(&self, key: String, value: V, now: Instant) -> bool {
         let mut entries = self.lock();
-        if entries.len() >= self.capacity && !entries.contains_key(&key) {
-            // `retain` keeps the entries the closure accepts, in place.
-            entries.retain(|_, entry| entry.expires > now);
-            if entries.len() >= self.capacity {
-                return false;
-            }
+        if !self.has_room_for(&mut entries, &key, now) {
+            return false;
         }
-        entries.insert(
-            key,
-            Entry {
-                expires: now + self.ttl,
-                value,
-            },
-        );
+        self.store(&mut entries, key, value, now);
         true
+    }
+
+    /// Changes the live entry of `key`, first creating it with `make` when
+    /// there is none (absent or expired), and renews its lifetime to
+    /// `now + ttl`, all under one lock: concurrent callers on one key share
+    /// one entry, and none replaces another's. The lifetime slides, so an
+    /// entry lives until `ttl` passes with no call for its key (the other
+    /// operations keep fixed lifetimes).
+    ///
+    /// # Arguments
+    /// * `key` - its key.
+    /// * `now` - the current instant.
+    /// * `make` - builds the value for a new entry (called at most once).
+    /// * `change` - what to do with the entry; its result is returned.
+    ///
+    /// # Returns
+    /// `change`'s result, or `None`, creating nothing, when the key has no
+    /// live entry and the map holds `capacity` live entries.
+    pub fn update_or_insert_sliding<R>(
+        &self,
+        key: &str,
+        now: Instant,
+        make: impl FnOnce() -> V,
+        change: impl FnOnce(&mut V) -> R,
+    ) -> Option<R> {
+        let mut entries = self.lock();
+        let live = entries
+            .by_key
+            .get(key)
+            .is_some_and(|entry| entry.expires > now);
+        if !live {
+            // An expired entry is replaced in place, so it never counts
+            // against the capacity check below.
+            entries.by_key.remove(key);
+            if !self.has_room_for(&mut entries, key, now) {
+                return None;
+            }
+            self.store(&mut entries, key.to_string(), make(), now);
+        }
+        let expires = now + self.ttl;
+        entries.by_key.get_mut(key).map(|entry| {
+            // Only ever later, so `earliest_expiry` stays a lower bound.
+            entry.expires = entry.expires.max(expires);
+            change(&mut entry.value)
+        })
+    }
+
+    /// Whether `key` may be stored now: it already has an entry, or the
+    /// map has room once its expired entries are pruned.
+    fn has_room_for(&self, entries: &mut Entries<V>, key: &str, now: Instant) -> bool {
+        if entries.by_key.len() < self.capacity || entries.by_key.contains_key(key) {
+            return true;
+        }
+        // Nothing can have expired yet: refuse without a scan.
+        if entries
+            .earliest_expiry
+            .is_some_and(|earliest| earliest > now)
+        {
+            return false;
+        }
+        // `retain` keeps the entries the closure accepts, in place; the
+        // closure also finds the earliest expiry left.
+        let mut earliest: Option<Instant> = None;
+        entries.by_key.retain(|_, entry| {
+            let live = entry.expires > now;
+            if live {
+                earliest = Some(earliest.map_or(entry.expires, |at| at.min(entry.expires)));
+            }
+            live
+        });
+        entries.earliest_expiry = earliest;
+        entries.by_key.len() < self.capacity
+    }
+
+    /// Stores an entry until `now + ttl` and keeps the expiry bound.
+    fn store(&self, entries: &mut Entries<V>, key: String, value: V, now: Instant) {
+        let expires = now + self.ttl;
+        entries.by_key.insert(key, Entry { expires, value });
+        entries.earliest_expiry = Some(
+            entries
+                .earliest_expiry
+                .map_or(expires, |earliest| earliest.min(expires)),
+        );
     }
 
     /// Removes and returns a live entry: a single-use read.
@@ -84,7 +170,7 @@ impl<V> ExpiringMap<V> {
     /// # Returns
     /// The value, or `None` if absent or expired (an expired one is dropped).
     pub fn take(&self, key: &str, now: Instant) -> Option<V> {
-        let entry = self.lock().remove(key)?;
+        let entry = self.lock().by_key.remove(key)?;
         // `then_some` is `Some(value) if condition else None`.
         (entry.expires > now).then_some(entry.value)
     }
@@ -108,12 +194,15 @@ impl<V> ExpiringMap<V> {
         change: impl FnOnce(&mut V) -> R,
     ) -> Option<R> {
         let mut entries = self.lock();
-        let live = entries.get(key).map(|entry| entry.expires > now)?;
+        let live = entries.by_key.get(key).map(|entry| entry.expires > now)?;
         if !live {
-            entries.remove(key);
+            entries.by_key.remove(key);
             return None;
         }
-        entries.get_mut(key).map(|entry| change(&mut entry.value))
+        entries
+            .by_key
+            .get_mut(key)
+            .map(|entry| change(&mut entry.value))
     }
 
     /// Drops an entry, live or not.
@@ -121,13 +210,13 @@ impl<V> ExpiringMap<V> {
     /// # Arguments
     /// * `key` - its key.
     pub fn remove(&self, key: &str) {
-        self.lock().remove(key);
+        self.lock().by_key.remove(key);
     }
 
     /// How many entries it holds, expired ones included.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.lock().len()
+        self.lock().by_key.len()
     }
 }
 
@@ -194,6 +283,59 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map.take("c", start + TTL), Some(3));
         assert_eq!(map.take("b", start + TTL), Some(4));
+    }
+
+    #[test]
+    fn a_full_map_tracks_its_earliest_expiry_through_removals_and_prunes() {
+        let map = ExpiringMap::new(TTL, 2);
+        let start = Instant::now();
+        map.insert("a".into(), 1, start);
+        map.insert("b".into(), 2, start + Duration::from_secs(10));
+        // Taking "a" leaves the bound at its old expiry, which is still a
+        // lower bound: the next prune recomputes it.
+        map.take("a", start);
+        assert!(map.insert("c".into(), 3, start + Duration::from_secs(20)));
+        // Full of live entries: refused, and the bound is now "b"'s expiry.
+        assert!(!map.insert("d".into(), 4, start + TTL));
+        assert_eq!(
+            map.lock().earliest_expiry,
+            Some(start + Duration::from_secs(10) + TTL)
+        );
+        // Before it, a new key is refused without a scan; from it, "b" goes.
+        assert!(!map.insert("d".into(), 4, start + Duration::from_secs(9) + TTL));
+        assert!(map.insert("d".into(), 4, start + Duration::from_secs(10) + TTL));
+        assert_eq!(map.take("c", start + TTL), Some(3));
+        assert_eq!(map.take("b", start + TTL), None);
+    }
+
+    #[test]
+    fn update_or_insert_sliding_creates_once_changes_in_place_and_slides() {
+        let map = ExpiringMap::new(TTL, 1);
+        let start = Instant::now();
+        let read = |at: Instant| map.update_or_insert_sliding("a", at, || 99, |value| *value);
+
+        let first = map.update_or_insert_sliding("a", start, || 10, |value| *value);
+        let second = map.update_or_insert_sliding(
+            "a",
+            start,
+            || 99,
+            |value| {
+                *value += 1;
+                *value
+            },
+        );
+        let full = map.update_or_insert_sliding("b", start, || 1, |value| *value);
+        // Each call renews "a" for a whole `TTL`, so it outlives its first one.
+        let kept = read(start + TTL / 2);
+        let still = read(start + TTL);
+        // A whole `TTL` with no call: it is made again.
+        let renewed = map.update_or_insert_sliding("a", start + TTL * 2, || 20, |value| *value);
+
+        assert_eq!(
+            (first, second, full, kept, still, renewed),
+            (Some(10), Some(11), None, Some(11), Some(11), Some(20))
+        );
+        assert_eq!(map.len(), 1);
     }
 
     #[test]
