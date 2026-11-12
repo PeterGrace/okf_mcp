@@ -19,6 +19,10 @@
   with every catalog, for a catalog not granted or above the key's access
   (409), and an expiry already past (409). It stores `self_issued`,
   `expires_at` and each grant's level in one statement.
+- `store::keys::set_maintenance_report_*` (and so `PATCH /api/v1/keys/{id}`
+  and `key maintenance-report`) refuses turning reporting on for a
+  self-issued key (422, `maintenance_report`) instead of failing the schema's
+  CHECK as a 500.
 
 ## Notes
 - Every existing key keeps its meaning: NULL levels are the key's own.

@@ -994,4 +994,41 @@ mod tests {
             "the API names users, not their ids"
         );
     }
+
+    #[tokio::test]
+    async fn reporting_is_refused_for_a_self_issued_key() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let main = main_only();
+        let new = NewKey {
+            name: "mine",
+            access: Access::Write,
+            maintenance_report: false,
+            grants: Grants::Catalogs(&main),
+            default_catalog: None,
+            actor: "mine",
+            user: crate::db::TEST_USER,
+            self_issued: true,
+            expires_at: None,
+            levels: &[],
+        };
+        let mine = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
+            .await
+            .expect("create a self-issued key");
+        test.app.poll().await.expect("poll the key in");
+
+        let (status, refused) = send(
+            &test,
+            "PATCH",
+            &format!("/api/v1/keys/{}", mine.id),
+            Some(&keys.admin),
+            Some(json!({"maintenance_report": true})),
+        )
+        .await;
+
+        assert_eq!(status.as_u16(), 422, "{refused}");
+        assert_eq!(refused["limit"], "maintenance_report", "{refused}");
+        let (_, me) = send(&test, "GET", "/api/v1/whoami", Some(&mine.key), None).await;
+        assert_eq!(me["maintenance_report"], false);
+    }
 }

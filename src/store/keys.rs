@@ -649,8 +649,10 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
 /// disambiguates a name, not an id. An unchanged value does not reload caches.
 ///
 /// # Errors
-/// [`OkfError::Refused`] for a revoked, absent or ambiguous key;
-/// [`OkfError::Database`] for storage failures.
+/// [`OkfError::Refused`] for a revoked, absent or ambiguous key, or for
+/// turning reporting on for an OAuth grant; [`OkfError::LimitExceeded`]
+/// (`maintenance_report`) for turning it on for a self-issued key, as at
+/// creation; [`OkfError::Database`] for storage failures.
 pub async fn set_maintenance_report_target(
     pool: &PgPool,
     target: &str,
@@ -684,18 +686,32 @@ async fn set_maintenance_report_with(
     let mut tx = pool.begin().await?;
     let id = select(&mut tx, selector).await?;
     if enabled {
-        // An OAuth grant never reports (the schema's `api_keys_oauth_caps`):
-        // refuse it here as a 409 instead of letting the CHECK fail as a 500.
-        let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM api_keys WHERE id = $1")
-            .bind(&id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if kind.as_deref() == Some(KeyKind::OAuth.as_str()) {
-            return Err(OkfError::Refused {
-                reason: format!(
-                    "key {id:?} is an OAuth grant, which cannot submit maintenance reports"
-                ),
-            });
+        // An OAuth grant and a self-issued key never report (the schema's
+        // `api_keys_oauth_caps` and `api_keys_self_issued_caps`): refuse them
+        // here, as `create_with_id` does, instead of letting a CHECK fail as
+        // a 500. `query_as` with a tuple reads both columns of the one row.
+        let caps: Option<(String, bool)> =
+            sqlx::query_as("SELECT kind, self_issued FROM api_keys WHERE id = $1")
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        // `if let Some((kind, self_issued)) = ...`: destructure the row, if any.
+        if let Some((kind, self_issued)) = caps {
+            if kind == KeyKind::OAuth.as_str() {
+                return Err(OkfError::Refused {
+                    reason: format!(
+                        "key {id:?} is an OAuth grant, which cannot submit maintenance reports"
+                    ),
+                });
+            }
+            if self_issued {
+                return Err(OkfError::LimitExceeded {
+                    limit: "maintenance_report",
+                    reason: format!(
+                        "key {id:?} is self-issued, so it cannot submit maintenance reports"
+                    ),
+                });
+            }
         }
     }
     let updated = sqlx::query(
@@ -2264,6 +2280,63 @@ mod tests {
         assert!(
             matches!(refused, Err(OkfError::Refused { .. })),
             "{refused:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_self_issued_key_stays_within_its_rules_after_creation() {
+        let db = test_db().await;
+        for name in ["pg", "work"] {
+            catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, now())
+                .await
+                .unwrap();
+        }
+        let names = ["pg".to_string()];
+        let mine = NewKey {
+            self_issued: true,
+            ..new_key("mine", Grants::Catalogs(&names), None)
+        };
+        let created = create_with_id(&db.pool, &mine, now()).await.unwrap();
+        let generation = catalogs::admin_generation(&db.pool).await.unwrap();
+
+        // Reporting is refused by id (the web API) and by name (the CLI) as
+        // the rule it breaks, never as the schema's CHECK failing.
+        let by_id = set_maintenance_report_by_id(&db.pool, &created.id, true).await;
+        let by_name = set_maintenance_report_target(&db.pool, "mine", None, true).await;
+        // Turning it off is allowed (and a no-op).
+        let off = set_maintenance_report_by_id(&db.pool, &created.id, false).await;
+        // Granting and removing a catalog keep it within the rules: a new
+        // grant takes the key's own level (write, never admin).
+        let granted = grant_by_id(&db.pool, &created.id, "work").await;
+        let ungranted = ungrant_by_id(&db.pool, &created.id, "pg").await;
+
+        for refused in [&by_id, &by_name] {
+            assert!(
+                matches!(
+                    refused,
+                    Err(OkfError::LimitExceeded {
+                        limit: "maintenance_report",
+                        ..
+                    })
+                ),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(off.unwrap(), created.id);
+        assert_eq!(granted.unwrap(), created.id);
+        assert_eq!(ungranted.unwrap(), created.id);
+        let listed = record(&db.pool, &created.id).await;
+        assert!(listed.self_issued);
+        assert!(!listed.maintenance_report, "the flag stays off");
+        assert!(!listed.all_catalogs);
+        assert_eq!(
+            listed.catalog_access,
+            BTreeMap::from([("work".to_string(), Access::Write)])
+        );
+        assert_eq!(
+            catalogs::admin_generation(&db.pool).await.unwrap(),
+            generation + 2,
+            "only the grant and the ungrant changed anything"
         );
     }
 }
