@@ -1039,7 +1039,8 @@ mod tests {
         let waiting = || async {
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM pg_stat_activity \
-                 WHERE wait_event_type = 'Lock' AND query LIKE '%FROM sign_in_codes%FOR UPDATE%'",
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                 AND query LIKE '%FROM sign_in_codes%FOR UPDATE%'",
             )
             .fetch_one(&db.pool)
             .await

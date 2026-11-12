@@ -56,8 +56,7 @@ pub(crate) const TEST_TEAM: &str = TEST_USER;
 /// A migrated throwaway database for one test, with [`TEST_USER`].
 #[cfg(test)]
 pub(crate) async fn test_db() -> pg_support::TestDb {
-    let db = pg_support::TestDb::start().await;
-    migrate(&db.pool).await.expect("migrations apply");
+    let db = pg_support::TestDb::start_migrated().await;
     let fixture = crate::store::users::NewUser {
         name: TEST_USER,
         display_name: "",

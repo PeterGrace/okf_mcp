@@ -551,8 +551,9 @@ key's actor.
   (create, stamp, log, lint through the changeset and publish over HTTP,
   into a throwaway copy) and the restructuring tools (move, split, a refused
   delete and publish), timed.
-- `tests/support/` - a throwaway Postgres container per test, and a test
-  server on a free port with rmcp clients.
+- `tests/support/` - a throwaway Postgres database per test (on one shared
+  server, or a container of its own), and a test server on a free port with
+  rmcp clients.
 - `Dockerfile`, `.github/workflows/image.yml` - the container image, built and
   pushed to GHCR on a `v*` tag.
 - `docs/operations.md` - the operator guide.
@@ -592,7 +593,8 @@ The report structs derive `serde::Serialize`; their JSON has `okf.py
 
 ## Testing
 
-    cargo test                                   # unit, doc, golden and database tests
+    just test                                    # every test, on one shared Postgres
+    cargo test                                   # the same, a Postgres container per test
     cargo test --test writes                     # just the end-to-end write tests
     cargo test --test restructure                # just the end-to-end restructuring tests
     cargo test --test tls                        # just the TLS-to-Postgres tests
@@ -605,10 +607,26 @@ The report structs derive `serde::Serialize`; their JSON has `okf.py
     UPDATE_GOLDEN=1 cargo test --test parity -- --ignored regenerate_goldens
     just test-ui                                 # the web console's browser journeys
 
-`cargo test` needs Docker: every test that touches the database starts its own
-throwaway `postgres:17-alpine` container (via `testcontainers`) and removes it
-when done (the end-to-end server tests too); without Docker those tests fail
-at once with "is docker reachable?". The roundtrip, storage and server smoke
+The database tests need Docker. Each test gets a throwaway database of its
+own, dropped when it is done, on the server `TEST_PG_URL` names (a
+`postgres://user:password@host:port` URL with no database name). `just test`
+and `just test-ui` run through `scripts/test-pg.sh run`, which starts one
+`postgres:17-alpine` container for the whole run (data in RAM, no fsync,
+sized for the CPU count or `TEST_PG_JOBS`) and removes it when the run ends,
+even on failure. Each process migrates once per server, into a template
+database named after a hash of the migrations, and copies it per test; a run
+that was killed leaves databases behind, and the next run drops those over an
+hour old. To keep one server across runs (the recipes then reuse it and start
+or stop nothing):
+
+    export TEST_PG_URL=$(scripts/test-pg.sh up okf-mcp-test-pg)
+    scripts/test-pg.sh down okf-mcp-test-pg      # when done
+
+Without `TEST_PG_URL` (a plain `cargo test`), every test starts its own
+container (via `testcontainers`) and removes it when done, which is several
+hundred containers per run. Without Docker the tests fail at once with "is
+docker reachable?". `tests/tls.rs` always starts its own containers, since it
+needs a server with TLS. The roundtrip, storage and server smoke
 runs need Docker too, and the real-catalog round trip needs `git` (it imports
 `git archive` of the checkout).
 

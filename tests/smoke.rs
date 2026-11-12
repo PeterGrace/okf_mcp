@@ -135,7 +135,7 @@ async fn storage_round_trip_on_a_real_catalog() {
     use okf_mcp::store::{catalogs, export};
 
     let root = std::env::var_os("OKF_PARITY_CATALOG").expect("set OKF_PARITY_CATALOG");
-    let db = support::pg::TestDb::start().await;
+    let db = support::pg::TestDb::start_migrated().await;
     support::server::migrate_with_owner(&db.pool).await;
     catalogs::create(&db.pool, "pg", "", support::server::OWNER, Utc::now())
         .await
