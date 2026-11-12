@@ -240,6 +240,11 @@ pub async fn find(pool: &PgPool, name: &str) -> Result<UserRecord, OkfError> {
 /// that got there first leaves no row, which is `UnknownName` here rather
 /// than a foreign-key failure at the caller's write.
 ///
+/// Lock order: call this before locking any team row. [`delete`] locks the
+/// user and then its personal team, so a caller holding a team while it
+/// waits here could deadlock with it (`teams::set_member` resolves the user
+/// first for this reason).
+///
 /// # Arguments
 /// * `conn` - the caller's transaction (pass `&mut tx`).
 /// * `name` - the user's name.

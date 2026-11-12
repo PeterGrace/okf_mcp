@@ -13,6 +13,7 @@
 
 ## Changed
 - `users::id_of` reads the user `FOR KEY SHARE`, as `teams::id_of` does. Every create and assign path resolves the user inside its own transaction with it.
+- `teams::set_member` and `remove_member` resolve the user before locking the team, so every path takes a user before a team, as `users::delete` does (user, then its personal team). Without this, the new `FOR KEY SHARE` made a membership change on a user's personal team deadlock with that user's deletion. Regression test: `a_membership_change_racing_a_user_delete_waits_instead_of_deadlocking`, which fails under the old order.
 - A sign-in code's blank actor defaults to the code's name instead of being refused (plan Decision 6). The REST and CLI fields stay as they were until Tasks 6 and 7 make them optional.
 - The key resolver behind `okf-mcp key ...` takes `include_grants`; only `assign_user_target` sets it (`Selector::ResolveAnyKind`).
 - `catalogs::tests::until_locks_are_awaited` is `pub(crate)` for the code race test.

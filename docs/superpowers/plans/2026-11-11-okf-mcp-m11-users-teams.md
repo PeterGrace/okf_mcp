@@ -972,8 +972,9 @@ pub async fn set_member(
     now: DateTime<Utc>,
 ) -> Result<MemberChange, OkfError> {
     let mut tx = pool.begin().await?;
-    let team_id = lock_team(&mut tx, team).await?;
+    // Corrected (issue #282): the user first, then the team (lock order).
     let user_id = users::id_of(&mut tx, user).await?;
+    let team_id = lock_team(&mut tx, team).await?;
     let current: Option<String> =
         sqlx::query_scalar("SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2")
             .bind(&team_id)
@@ -1387,7 +1388,7 @@ async fn unassigned_lists_exactly_the_rows_with_no_user_or_owner() {
   - `NewKey` gains `pub user: &'a str`, documented as "The user it belongs to (must exist)".
   - In `create_with_id`, resolve `let user_id = users::id_of(&mut tx, new.user).await?;` right after `resolve_grants`. Insert it as `user_id` (`$9`).
 
-> **Corrected (issue #282).** `users::id_of` now reads the user `FOR KEY SHARE`, as `teams::id_of` does, so a create or assign racing `users::delete` is `UnknownName`, not a foreign-key 500 (`a_create_that_waited_on_a_user_delete_is_unknown_name`, `an_assign_that_waited_on_a_user_delete_is_unknown_name`, `a_code_create_or_assign_that_waited_on_a_user_delete_is_unknown_name`). The resolver change is a `Selector::ResolveAnyKind` variant that calls `resolve_active(conn, target, actor, include_grants: true)`; both assign functions share a private `set_user(conn, id, user) -> Option<name>`.
+> **Corrected (issue #282).** `users::id_of` now reads the user `FOR KEY SHARE`, as `teams::id_of` does, so a create or assign racing `users::delete` is `UnknownName`, not a foreign-key 500 (`a_create_that_waited_on_a_user_delete_is_unknown_name`, `an_assign_that_waited_on_a_user_delete_is_unknown_name`, `a_code_create_or_assign_that_waited_on_a_user_delete_is_unknown_name`). The resolver change is a `Selector::ResolveAnyKind` variant that calls `resolve_active(conn, target, actor, include_grants: true)`; both assign functions share a private `set_user(conn, id, user) -> Option<name>`. Lock order everywhere is a user before a team (`users::delete` locks the user, then its personal team), so `teams::set_member` and `remove_member` now call `users::id_of` before `lock_team` (`a_membership_change_racing_a_user_delete_waits_instead_of_deadlocking`).
   - `KeyRecord` and `KeyRow` gain `user: Option<String>`. `list` adds `LEFT JOIN users u ON u.id = k.user_id`, selects `u.name AS user` and adds `u.name` to the `GROUP BY`.
   - `assign_user_by_id(pool, id, user)` resolves the user and runs `UPDATE api_keys SET user_id = $2 WHERE id = $1 RETURNING name` (any kind, revoked included: history is attributed too). A missing row is `OkfError::NotFound { path: format!("keys/{id}") }`. It then bumps and commits.
   - `assign_user_target(pool, target, actor, user)` resolves `target` the way `revoke_target` does (id first, then an unambiguous live name, with `actor` as the tie-break), *including* `kind = 'oauth'` rows, then delegates. Read `revoke_target`'s resolver. If it filters `kind = 'key'`, add a `include_grants: bool` parameter to the shared resolver rather than copying it.
