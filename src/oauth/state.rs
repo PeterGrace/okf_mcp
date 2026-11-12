@@ -183,6 +183,23 @@ mod tests {
     }
 
     #[test]
+    fn debug_never_prints_the_consent_nonce() {
+        let consent = UserConsent {
+            user_id: "user-id".into(),
+            nonce: "consent-nonce-that-must-not-leak".into(),
+            offered: Ceiling::new(),
+        };
+
+        let printed = format!("{consent:?}");
+
+        assert!(
+            !printed.contains("consent-nonce-that-must-not-leak"),
+            "{printed}"
+        );
+        assert!(printed.contains("user-id"), "{printed}");
+    }
+
+    #[test]
     fn debug_never_prints_the_csrf_token() {
         let pending = PendingAuthorization {
             csrf: "csrf-value-that-must-not-leak".into(),

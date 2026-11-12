@@ -99,7 +99,8 @@ struct AuthorizeQuery {
 }
 
 /// The consent form's fields.
-// `Debug` by hand: the sign-in code and the CSRF token never reach a log.
+// `Debug` by hand: the pending id, the CSRF token, the sign-in code and the
+// consent nonce never reach a log.
 #[derive(Deserialize)]
 struct ConsentForm {
     pending: String,
@@ -122,7 +123,7 @@ impl std::fmt::Debug for ConsentForm {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ConsentForm")
-            .field("pending", &self.pending)
+            .field("pending", &"<redacted>")
             .field("action", &self.action)
             .finish_non_exhaustive()
     }
@@ -2061,6 +2062,31 @@ mod tests {
         assert!(!page.contains("id=\"consent-approve\""));
         assert!(page.contains("id=\"consent-deny\""));
         assert!(page.contains("id=\"consent-use-code\""));
+    }
+
+    #[test]
+    fn debug_never_prints_the_forms_secrets() {
+        let posted = super::ConsentForm {
+            pending: "pending-id-that-must-not-leak".to_string(),
+            csrf: "csrf-token-that-must-not-leak".to_string(),
+            action: "consent".to_string(),
+            sign_in_code: Some("okfsc_code-that-must-not-leak".to_string()),
+            summary: Some("consent-nonce-that-must-not-leak".to_string()),
+            default_catalog: None,
+            choices: BTreeMap::new(),
+        };
+
+        let printed = format!("{posted:?}");
+
+        for secret in [
+            "pending-id-that-must-not-leak",
+            "csrf-token-that-must-not-leak",
+            "okfsc_code-that-must-not-leak",
+            "consent-nonce-that-must-not-leak",
+        ] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+        assert!(printed.contains("consent"), "{printed}");
     }
 
     #[test]

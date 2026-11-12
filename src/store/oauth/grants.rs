@@ -340,6 +340,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn debug_never_prints_the_session_id() {
+        let db = test_db().await;
+        let (client, user_id, _) = alice_with(&db.pool, &[("main", Access::Read)]).await;
+        let chosen = levels(&[("main", Access::Read)]);
+        let new = NewSelfIssuedGrant {
+            user_id: &user_id,
+            session_id: "session-id-that-must-not-leak",
+            client: &client,
+            levels: &chosen,
+            default_catalog: None,
+        };
+
+        let printed = format!("{new:?}");
+
+        assert!(
+            !printed.contains("session-id-that-must-not-leak"),
+            "{printed}"
+        );
+        assert!(printed.contains("test-client"), "{printed}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_self_issued_grant_records_its_user_levels_and_client() {
         let db = test_db().await;
         let (client, user_id, session_id) = alice_with(

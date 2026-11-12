@@ -15,3 +15,4 @@
 ## Notes
 - The POST checks the CSRF token, spends the page's consent nonce under the pending map's lock (one Approve per page), checks the cookie still belongs to the user the page was shown to, and refuses anything the page did not offer.
 - The grant insert locks the user's row, then the approving session's, and re-reads the ceiling in that transaction: a sign-out, reset, admin-flag change or delete either waits for it or leaves no grant, and a ceiling lowered meanwhile refuses it.
+- No `Debug` of a consent type prints a secret: `UserPage`, `PageView`, `UserConsent`, `ConsentForm` and `NewSelfIssuedGrant` redact their nonce, pending id, CSRF token, sign-in code or session id, each with a test.

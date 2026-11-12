@@ -19,7 +19,8 @@ use crate::store::ceiling::Ceiling;
 use crate::store::keys::Access;
 
 /// What every page shows about the request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Debug` by hand: the pending id and the CSRF token never reach a log.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PageView {
     /// The pending authorization's id (a hidden field).
     pub pending_id: String,
@@ -33,6 +34,20 @@ pub struct PageView {
     pub verified: bool,
     /// The redirect URI's origin, for the CSP's `form-action`.
     pub redirect_origin: String,
+}
+
+impl std::fmt::Debug for PageView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PageView")
+            .field("pending_id", &"<redacted>")
+            .field("csrf", &"<redacted>")
+            .field("client_name", &self.client_name)
+            .field("client_host", &self.client_host)
+            .field("verified", &self.verified)
+            .field("redirect_origin", &self.redirect_origin)
+            .finish()
+    }
 }
 
 /// What a sign-in code grants, for step 2.
@@ -241,7 +256,8 @@ pub fn summary_page(view: &PageView, grant: &GrantSummary, summary_nonce: &str) 
 }
 
 /// What the signed-in consent page shows beyond [`PageView`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Debug` by hand: the consent nonce never reaches a log.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UserPage<'a> {
     /// The signed-in user's name.
     pub user: &'a str,
@@ -251,6 +267,18 @@ pub struct UserPage<'a> {
     pub nonce: &'a str,
     /// The "Use a sign-in code instead" link (same-origin, unescaped).
     pub code_href: &'a str,
+}
+
+impl std::fmt::Debug for UserPage<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UserPage")
+            .field("user", &self.user)
+            .field("ceiling", &self.ceiling)
+            .field("nonce", &"<redacted>")
+            .field("code_href", &self.code_href)
+            .finish()
+    }
 }
 
 /// The signed-in consent page's HTML: a checkbox and a level select per
@@ -410,6 +438,46 @@ mod tests {
             verified: false,
             redirect_origin: "https://client.example.com".to_string(),
         }
+    }
+
+    #[test]
+    fn debug_never_prints_the_pending_id_or_the_csrf_token() {
+        let page = PageView {
+            pending_id: "pending-id-that-must-not-leak".to_string(),
+            csrf: "csrf-token-that-must-not-leak".to_string(),
+            ..view()
+        };
+
+        let printed = format!("{page:?}");
+
+        assert!(
+            !printed.contains("pending-id-that-must-not-leak"),
+            "{printed}"
+        );
+        assert!(
+            !printed.contains("csrf-token-that-must-not-leak"),
+            "{printed}"
+        );
+        assert!(printed.contains("client.example.com"), "{printed}");
+    }
+
+    #[test]
+    fn debug_never_prints_the_user_pages_nonce() {
+        let ceiling = Ceiling::new();
+        let user = UserPage {
+            user: "alice",
+            ceiling: &ceiling,
+            nonce: "consent-nonce-that-must-not-leak",
+            code_href: "/oauth/authorize?a=1&signin=code",
+        };
+
+        let printed = format!("{user:?}");
+
+        assert!(
+            !printed.contains("consent-nonce-that-must-not-leak"),
+            "{printed}"
+        );
+        assert!(printed.contains("alice"), "{printed}");
     }
 
     #[test]
