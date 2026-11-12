@@ -2,6 +2,8 @@
 //! 1): the in-memory key cache, the [`Principal`] a request acts as, the
 //! [`BearerVerifier`] seam between credential kinds, and the axum
 //! middleware that requires a credential on every route but `/healthz`.
+//! The cache caps each self-issued credential by its user's ceiling
+//! ([`crate::store::ceiling`]); admin-issued ones keep their stored levels.
 //!
 //! Keys are looked up by their SHA-256 in a `HashMap`. A timing difference
 //! in that lookup can tell an attacker only how the *hash* of a guess
@@ -27,6 +29,7 @@ use crate::error::OkfError;
 use crate::http::AppError;
 use crate::keys;
 use crate::oauth::access::OAuthVerifier;
+use crate::store::ceiling::{self, cap, Ceiling};
 use crate::store::keys::{self as key_rows, Access, KeyKind, KeyRecord};
 
 /// The catalogs a credential may reach, and at what level.
@@ -223,20 +226,71 @@ pub struct KeyCache {
     by_hash: HashMap<[u8; 32], Cached>,
     // Grants have no secret of their own: an access token names one by id.
     by_id: HashMap<String, Cached>,
+    // Each user's ceiling, by user id: self-issued credentials are capped
+    // by it here, and console sessions (Task 7a) are built from it.
+    by_user: HashMap<String, Ceiling>,
+}
+
+/// The ceiling of a self-issued credential whose user has none.
+// `BTreeMap::new` is a `const fn`, so an empty map can be a `static`.
+static NO_CEILING: Ceiling = BTreeMap::new();
+
+/// A record's principal: as stored for an admin-issued credential, capped by
+/// its user's ceiling for a self-issued one (spec "Effective access").
+///
+/// # Arguments
+/// * `record` - the row.
+/// * `ceilings` - every user's ceiling, by user id.
+///
+/// # Returns
+/// The principal.
+fn principal_of(record: KeyRecord, ceilings: &HashMap<String, Ceiling>) -> Principal {
+    // Looked up before `record` moves into the principal. `get` borrows
+    // only `ceilings`, so the reference outlives the borrow of `record`.
+    let ceiling = record.self_issued.then(|| {
+        record
+            .user_id
+            .as_deref()
+            .and_then(|user_id| ceilings.get(user_id))
+            .unwrap_or(&NO_CEILING)
+    });
+    let mut principal = Principal::from(record);
+    if let Some(ceiling) = ceiling {
+        let levels = match &principal.reach {
+            Reach::Catalogs(levels) => cap(levels, ceiling),
+            // The schema refuses a self-issued all-catalogs row; one edited
+            // by hand reaches nothing rather than everything.
+            Reach::All => Ceiling::new(),
+        };
+        // Its highest level left, for display; `Read` when nothing is left
+        // (it then reaches no catalog at all).
+        principal.access = levels.values().copied().max().unwrap_or(Access::Read);
+        principal.reach = Reach::Catalogs(levels);
+    }
+    principal
 }
 
 impl KeyCache {
     /// Builds the cache from stored rows, leaving out revoked ones and
-    /// those already expired.
+    /// those already expired, and capping self-issued ones.
     ///
     /// # Arguments
     /// * `records` - the rows, as [`key_rows::list`] returns them.
+    /// * `ceilings` - every user's ceiling by user id, as
+    ///   [`ceiling::ceilings`] returns them (kept in the cache).
     /// * `now` - the server clock.
     ///
     /// # Returns
     /// The cache.
-    pub fn from_records(records: Vec<KeyRecord>, now: DateTime<Utc>) -> Self {
-        let mut cache = Self::default();
+    pub fn from_records(
+        records: Vec<KeyRecord>,
+        ceilings: HashMap<String, Ceiling>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let mut cache = Self {
+            by_user: ceilings,
+            ..Self::default()
+        };
         for record in records
             .into_iter()
             .filter(|record| record.revoked_at.is_none() && unexpired(record.expires_at, now))
@@ -254,7 +308,7 @@ impl KeyCache {
                     else {
                         continue;
                     };
-                    let principal = Arc::new(Principal::from(record));
+                    let principal = Arc::new(principal_of(record, &cache.by_user));
                     cache.by_hash.insert(
                         hash,
                         Cached {
@@ -265,7 +319,7 @@ impl KeyCache {
                 }
                 KeyKind::OAuth => {
                     let id = record.id.clone();
-                    let principal = Arc::new(Principal::from(record));
+                    let principal = Arc::new(principal_of(record, &cache.by_user));
                     cache.by_id.insert(
                         id,
                         Cached {
@@ -279,12 +333,17 @@ impl KeyCache {
         cache
     }
 
-    /// Reads every key and builds the cache.
+    /// Reads every key and every ceiling and builds the cache.
     ///
     /// # Errors
     /// [`OkfError::Database`].
     async fn read(pool: &PgPool, now: DateTime<Utc>) -> Result<Self, OkfError> {
-        Ok(Self::from_records(key_rows::list(pool).await?, now))
+        // Both at once, on two pooled connections (`try_join!` is
+        // `asyncio.gather` that stops at the first error). A change committed
+        // between the two reads also moved `admin_generation`, which every
+        // caller reads first, so the next poll reloads again.
+        let (records, ceilings) = tokio::try_join!(key_rows::list(pool), ceiling::ceilings(pool))?;
+        Ok(Self::from_records(records, ceilings, now))
     }
 
     /// The principal of a presented key.
@@ -379,6 +438,24 @@ impl Keys {
         let cache = Arc::new(KeyCache::read(pool, self.clock.now()).await?);
         *self.cache.write().expect("key cache lock poisoned") = cache;
         Ok(())
+    }
+
+    /// A user's ceiling, from the current cache.
+    ///
+    /// # Arguments
+    /// * `user_id` - the user's id (`users.id`).
+    ///
+    /// # Returns
+    /// A copy of the ceiling; empty for an unknown user or one who reaches
+    /// nothing.
+    pub fn ceiling_of(&self, user_id: &str) -> Ceiling {
+        self.cache
+            .read()
+            .expect("key cache lock poisoned")
+            .by_user
+            .get(user_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// The principal of a presented key, from the current cache.
@@ -618,6 +695,7 @@ mod tests {
                     ..record("short", "short-key", false)
                 },
             ],
+            HashMap::new(),
             now,
         );
 
@@ -754,6 +832,7 @@ mod tests {
                 },
                 record("forever", "forever-key", false),
             ],
+            HashMap::new(),
             now,
         );
 
@@ -778,11 +857,11 @@ mod tests {
             ..record("soon", "soon-key", false)
         };
         let fresh = Keys::new(
-            KeyCache::from_records(vec![soon.clone()], now),
+            KeyCache::from_records(vec![soon.clone()], HashMap::new(), now),
             Arc::new(FixedClock(now)),
         );
         let stale = Keys::new(
-            KeyCache::from_records(vec![soon], now),
+            KeyCache::from_records(vec![soon], HashMap::new(), now),
             Arc::new(FixedClock(now + hour * 2)),
         );
 
@@ -932,6 +1011,7 @@ mod tests {
                 grant_record("grant-1", false),
                 grant_record("grant-old", true),
             ],
+            HashMap::new(),
             now,
         );
 
@@ -1064,6 +1144,222 @@ mod tests {
         db.pool.close().await;
         assert!(loaded.reload(&db.pool).await.is_err());
         assert_eq!(loaded.find(&other.key).unwrap().key_id, other.id);
+    }
+
+    #[test]
+    fn self_issued_credentials_are_capped_by_their_users_ceiling_and_admin_issued_ones_are_not() {
+        let now = Utc::now();
+        // A key of user `alice-id` granted pg and work at write.
+        let alices = |id: &str, secret: &str, self_issued: bool| KeyRecord {
+            access: Access::Write,
+            catalogs: vec!["pg".to_string(), "work".to_string()],
+            catalog_access: levels(&["pg", "work"], Access::Write),
+            user_id: Some("alice-id".to_string()),
+            self_issued,
+            ..record(id, secret, false)
+        };
+        // A self-issued OAuth grant of hers on pg at write.
+        let self_grant = KeyRecord {
+            access: Access::Write,
+            catalog_access: levels(&["pg"], Access::Write),
+            user_id: Some("alice-id".to_string()),
+            self_issued: true,
+            ..grant_record("grant-mine", false)
+        };
+        // A self-issued key of a user with no ceiling at all.
+        let stranger = KeyRecord {
+            user_id: Some("nobody-id".to_string()),
+            ..alices("stranger", "stranger-key", true)
+        };
+        let alice = BTreeMap::from([
+            ("pg".to_string(), Access::Read),
+            ("docs".to_string(), Access::Write),
+        ]);
+        let cache = KeyCache::from_records(
+            vec![
+                alices("mine", "mine-key", true),
+                alices("issued", "issued-key", false),
+                self_grant,
+                stranger,
+            ],
+            HashMap::from([("alice-id".to_string(), alice.clone())]),
+            now,
+        );
+
+        let mine = cache.find("mine-key", now).expect("live");
+        let issued = cache.find("issued-key", now).expect("live");
+        let grant = cache.find_grant("grant-mine", now).expect("live");
+        let unknown_user = cache.find("stranger-key", now).expect("live");
+
+        // pg: the lower of write and read; work: not in the ceiling; docs:
+        // not in the grant.
+        assert_eq!(mine.reach, Reach::Catalogs(levels(&["pg"], Access::Read)));
+        assert_eq!(mine.access, Access::Read, "its highest level left");
+        assert_eq!(
+            issued.reach,
+            Reach::Catalogs(levels(&["pg", "work"], Access::Write))
+        );
+        assert_eq!(issued.access, Access::Write);
+        assert_eq!(
+            grant.level("pg"),
+            Some(Access::Read),
+            "grants are capped too"
+        );
+        assert_eq!(unknown_user.reach, Reach::Catalogs(BTreeMap::new()));
+        let shared = Keys::new(cache, Arc::new(FixedClock(now)));
+        assert_eq!(shared.ceiling_of("alice-id"), alice);
+        assert!(shared.ceiling_of("nobody-id").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ceiling_change_lowers_self_issued_credentials_at_reload_and_leaves_admin_issued_ones(
+    ) {
+        use crate::store::{catalogs, ceiling, teams, users};
+        let db = crate::db::test_db().await;
+        let now = Utc::now();
+        users::create(
+            &db.pool,
+            &users::NewUser {
+                name: "alice",
+                display_name: "",
+            },
+            now,
+        )
+        .await
+        .unwrap();
+        let team = teams::NewTeam {
+            name: "family",
+            display_name: "",
+            owner: "alice",
+        };
+        teams::create(&db.pool, &team, now).await.unwrap();
+        catalogs::create(&db.pool, "shared", "", "family", now)
+            .await
+            .unwrap();
+        catalogs::create(&db.pool, "solo", "", "alice", now)
+            .await
+            .unwrap();
+        let names = ["shared".to_string(), "solo".to_string()];
+        let new = |name: &'static str, self_issued: bool| key_rows::NewKey {
+            name,
+            access: Access::Write,
+            maintenance_report: false,
+            grants: key_rows::Grants::Catalogs(&names),
+            default_catalog: None,
+            actor: name,
+            user: "alice",
+            self_issued,
+            expires_at: None,
+            levels: &[],
+        };
+        let mine = key_rows::create_with_id(&db.pool, &new("mine", true), now)
+            .await
+            .unwrap();
+        let issued = key_rows::create_with_id(&db.pool, &new("issued", false), now)
+            .await
+            .unwrap();
+        // A self-issued OAuth grant, as consent signed in as alice will make
+        // one (Task 11).
+        let client = crate::store::oauth::testing::insert_client(
+            &db.pool,
+            "https://client.example.com/client.json",
+            "Example Client",
+            now,
+        )
+        .await;
+        let grant: String = sqlx::query_scalar(
+            "INSERT INTO api_keys \
+             (name, kind, client_id, access, all_catalogs, actor, created_at, user_id, self_issued) \
+             SELECT 'laptop.example', 'oauth', $1, 'write', false, 'Example Client', $2, id, true \
+             FROM users WHERE name = 'alice' RETURNING id",
+        )
+        .bind(&client)
+        .bind(now)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO key_catalogs (key_id, catalog_id) \
+             SELECT $1, id FROM catalogs WHERE name = 'shared'",
+        )
+        .bind(&grant)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let app = crate::app::App::load(
+            db.pool.clone(),
+            crate::config::Config::default(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .await
+        .unwrap();
+        let level = |secret: &str, catalog: &str| {
+            app.keys().find(secret).expect("a live key").level(catalog)
+        };
+        let grant_level = || {
+            app.keys()
+                .find_grant(&grant)
+                .expect("a live grant")
+                .level("shared")
+        };
+        assert_eq!(level(&mine.key, "shared"), Some(Access::Write));
+        assert_eq!(level(&mine.key, "solo"), Some(Access::Write));
+        assert_eq!(grant_level(), Some(Access::Write));
+        let generation = || catalogs::admin_generation(&db.pool);
+
+        // Member access: read-only for the team's members.
+        let before = generation().await.unwrap();
+        ceiling::set_member_access(&db.pool, "shared", ceiling::MemberAccess::Read)
+            .await
+            .unwrap();
+        assert_eq!(generation().await.unwrap(), before + 1);
+        assert_eq!(
+            level(&mine.key, "shared"),
+            Some(Access::Write),
+            "until the reload"
+        );
+        app.poll().await.unwrap();
+        assert_eq!(level(&mine.key, "shared"), Some(Access::Read));
+        assert_eq!(grant_level(), Some(Access::Read));
+        assert_eq!(
+            level(&issued.key, "shared"),
+            Some(Access::Write),
+            "admin-issued: unchanged"
+        );
+
+        // An entitlement: the higher level wins.
+        ceiling::entitle(&db.pool, "alice", "shared", Access::Write, now)
+            .await
+            .unwrap();
+        app.poll().await.unwrap();
+        assert_eq!(level(&mine.key, "shared"), Some(Access::Write));
+
+        // A new owner the user is not in: the catalog leaves her ceiling.
+        catalogs::set_owner(&db.pool, "solo", crate::db::TEST_TEAM)
+            .await
+            .unwrap();
+        app.poll().await.unwrap();
+        assert_eq!(level(&mine.key, "solo"), None);
+        assert_eq!(
+            level(&issued.key, "solo"),
+            Some(Access::Write),
+            "admin-issued: unchanged"
+        );
+
+        // The entitlement goes: back to the team's read.
+        ceiling::unentitle(&db.pool, "alice", "shared")
+            .await
+            .unwrap();
+        app.poll().await.unwrap();
+        assert_eq!(level(&mine.key, "shared"), Some(Access::Read));
+        let alice_id: String = sqlx::query_scalar("SELECT id FROM users WHERE name = 'alice'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.keys().ceiling_of(&alice_id),
+            BTreeMap::from([("shared".to_string(), Access::Read)])
+        );
     }
 
     #[hegel::test]

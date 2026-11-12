@@ -1,0 +1,782 @@
+//! A user's ceiling (spec "The ceiling"): the most a self-issued credential
+//! may reach. It is the catalogs owned by the user's teams, at each one's
+//! `member_access`, merged with the user's entitlements (`user_catalogs`);
+//! the higher level wins. Every write here that changes a ceiling bumps
+//! `admin_generation`, so running servers re-cap within one poll.
+
+use std::collections::{BTreeMap, HashMap};
+
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+
+use crate::auth::{Principal, Reach};
+use crate::error::OkfError;
+use crate::store::catalogs::{self, bump_admin_generation};
+use crate::store::keys::Access;
+use crate::store::users;
+
+/// Catalog name to the highest level a user's self-issued credentials may
+/// have there: `Read` or `Write`, never `Admin`.
+pub type Ceiling = BTreeMap<String, Access>;
+
+/// What members of a catalog's owning team may reach through self-issued
+/// credentials.
+// `clap::ValueEnum` parses `--access none|read|write`; `serde::Deserialize`
+// with `rename_all = "lowercase"` reads `"none"`/`"read"`/`"write"` from REST
+// bodies. A variant named `None` is fine: `Option`'s `None` is a different
+// item, and this one is always written `MemberAccess::None`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberAccess {
+    /// Team members get nothing through the team.
+    None,
+    /// Read only.
+    Read,
+    /// Read and write (the default).
+    Write,
+}
+
+impl MemberAccess {
+    /// The stored spelling.
+    ///
+    /// # Returns
+    /// `"none"`, `"read"` or `"write"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemberAccess::None => "none",
+            MemberAccess::Read => "read",
+            MemberAccess::Write => "write",
+        }
+    }
+
+    /// Parses the stored spelling.
+    ///
+    /// # Arguments
+    /// * `text` - a `catalogs.member_access` value.
+    ///
+    /// # Returns
+    /// The value, or `None` for anything else.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "none" => Some(MemberAccess::None),
+            "read" => Some(MemberAccess::Read),
+            "write" => Some(MemberAccess::Write),
+            _ => None,
+        }
+    }
+
+    /// The level it gives a member.
+    ///
+    /// # Returns
+    /// `Read` or `Write`, or `None` for [`MemberAccess::None`].
+    pub fn level(self) -> Option<Access> {
+        match self {
+            MemberAccess::None => None,
+            MemberAccess::Read => Some(Access::Read),
+            MemberAccess::Write => Some(Access::Write),
+        }
+    }
+}
+
+/// One entitlement: a catalog given to a user beyond their teams' catalogs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entitlement {
+    /// The catalog's name.
+    pub catalog: String,
+    /// `Read` or `Write`.
+    pub access: Access,
+    /// When it was first given.
+    pub created_at: DateTime<Utc>,
+}
+
+/// One catalog of one user's ceiling, as the query below returns it.
+#[derive(sqlx::FromRow)]
+struct CeilingRow {
+    user_id: String,
+    catalog: String,
+    // `true` when any source gives write: the higher level wins.
+    write: bool,
+}
+
+/// Every user's ceiling (or one user's, with `$1`), one row per user and
+/// catalog. The union is the two sources; `bool_or` merges them.
+const CEILING_ROWS: &str = "\
+    SELECT s.user_id, c.name AS catalog, bool_or(s.access = 'write') AS write \
+    FROM (SELECT m.user_id, c.id AS catalog_id, c.member_access AS access \
+          FROM team_members m JOIN catalogs c ON c.owner_team_id = m.team_id \
+          WHERE c.member_access <> 'none' \
+          UNION ALL \
+          SELECT e.user_id, e.catalog_id, e.access FROM user_catalogs e) s \
+    JOIN catalogs c ON c.id = s.catalog_id \
+    WHERE $1::text IS NULL OR s.user_id = $1 \
+    GROUP BY s.user_id, c.name";
+
+/// The ceiling rows of every user, or of the user with this id.
+///
+/// # Errors
+/// [`OkfError::Database`].
+async fn ceiling_rows(pool: &PgPool, user_id: Option<&str>) -> Result<Vec<CeilingRow>, OkfError> {
+    Ok(sqlx::query_as::<_, CeilingRow>(CEILING_ROWS)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?)
+}
+
+/// The level a row stands for.
+fn row_level(write: bool) -> Access {
+    if write {
+        Access::Write
+    } else {
+        Access::Read
+    }
+}
+
+/// The id of the user called `name`, without locking it (a read).
+///
+/// # Errors
+/// [`OkfError::UnknownName`]; [`OkfError::Database`].
+async fn user_id(pool: &PgPool, name: &str) -> Result<String, OkfError> {
+    sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| OkfError::UnknownName {
+            noun: "user",
+            name: name.to_string(),
+        })
+}
+
+/// Every user's ceiling, for the key cache.
+///
+/// # Arguments
+/// * `pool` - the database.
+///
+/// # Returns
+/// The ceilings by user id; a user with an empty ceiling is absent.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn ceilings(pool: &PgPool) -> Result<HashMap<String, Ceiling>, OkfError> {
+    let mut by_user: HashMap<String, Ceiling> = HashMap::new();
+    for row in ceiling_rows(pool, None).await? {
+        // `entry(..).or_default()`: Python's `setdefault(key, {})`.
+        by_user
+            .entry(row.user_id)
+            .or_default()
+            .insert(row.catalog, row_level(row.write));
+    }
+    Ok(by_user)
+}
+
+/// One user's ceiling.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `user` - the user's name.
+///
+/// # Returns
+/// The ceiling (empty when the user reaches nothing).
+///
+/// # Errors
+/// [`OkfError::UnknownName`] for an unknown user; [`OkfError::Database`].
+pub async fn ceiling_of(pool: &PgPool, user: &str) -> Result<Ceiling, OkfError> {
+    let user_id = user_id(pool, user).await?;
+    Ok(ceiling_rows(pool, Some(&user_id))
+        .await?
+        .into_iter()
+        .map(|row| (row.catalog, row_level(row.write)))
+        .collect())
+}
+
+/// Sets what members of a catalog's owning team may reach, and bumps
+/// `admin_generation` when it changes.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `catalog` - the catalog's name.
+/// * `access` - the new value.
+///
+/// # Returns
+/// The value it had before.
+///
+/// # Errors
+/// [`OkfError::CatalogNotSelected`] for an unknown catalog;
+/// [`OkfError::Database`].
+pub async fn set_member_access(
+    pool: &PgPool,
+    catalog: &str,
+    access: MemberAccess,
+) -> Result<MemberAccess, OkfError> {
+    let mut tx = pool.begin().await?;
+    // As in `catalogs::set_owner`: the subquery reads the row as it was,
+    // under its row lock, so this returns the value it replaced.
+    let previous: Option<String> = sqlx::query_scalar(
+        "UPDATE catalogs c SET member_access = $2 \
+         FROM (SELECT id, member_access FROM catalogs WHERE name = $1 FOR UPDATE) old \
+         WHERE c.id = old.id RETURNING old.member_access",
+    )
+    .bind(catalog)
+    .bind(access.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let previous = previous.ok_or_else(|| OkfError::CatalogNotSelected {
+        catalog: catalog.to_string(),
+    })?;
+    let previous =
+        MemberAccess::parse(&previous).expect("the schema checks catalogs.member_access");
+    if previous != access {
+        bump_admin_generation(&mut tx).await?;
+    }
+    tx.commit().await?;
+    Ok(previous)
+}
+
+/// Gives a user a catalog at `access`, or changes the level of one already
+/// given, and bumps `admin_generation` when anything changed.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `user` - the user's name.
+/// * `catalog` - the catalog's name.
+/// * `access` - `Read` or `Write`.
+/// * `now` - when it is given (server clock); kept when only the level changes.
+///
+/// # Errors
+/// [`OkfError::Refused`] for `Admin`; [`OkfError::UnknownName`] for an
+/// unknown user; [`OkfError::CatalogNotSelected`] for an unknown catalog;
+/// [`OkfError::Database`].
+pub async fn entitle(
+    pool: &PgPool,
+    user: &str,
+    catalog: &str,
+    access: Access,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
+    if access == Access::Admin {
+        return Err(OkfError::Refused {
+            reason: "an entitlement is read or write; admin comes only from an admin key"
+                .to_string(),
+        });
+    }
+    let mut tx = pool.begin().await?;
+    // `FOR KEY SHARE` until commit: a concurrent `users::delete` waits.
+    let user_id = users::id_of(&mut tx, user).await?;
+    let catalog_id = catalogs::find(&mut *tx, catalog).await?.id;
+    // The `WHERE` on the update makes an unchanged level write nothing, so
+    // `rows_affected` is 0 and the generation stays.
+    let written = sqlx::query(
+        "INSERT INTO user_catalogs (user_id, catalog_id, access, created_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (user_id, catalog_id) DO UPDATE SET access = EXCLUDED.access \
+         WHERE user_catalogs.access <> EXCLUDED.access",
+    )
+    .bind(&user_id)
+    .bind(catalog_id)
+    .bind(access.as_str())
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    if written.rows_affected() != 0 {
+        bump_admin_generation(&mut tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Takes a catalog entitlement from a user (not given is a no-op), and
+/// bumps `admin_generation` when one was removed.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `user` - the user's name.
+/// * `catalog` - the catalog's name.
+///
+/// # Errors
+/// [`OkfError::UnknownName`] for an unknown user;
+/// [`OkfError::CatalogNotSelected`] for an unknown catalog;
+/// [`OkfError::Database`].
+pub async fn unentitle(pool: &PgPool, user: &str, catalog: &str) -> Result<(), OkfError> {
+    let mut tx = pool.begin().await?;
+    let user_id = users::id_of(&mut tx, user).await?;
+    let catalog_id = catalogs::find(&mut *tx, catalog).await?.id;
+    let removed = sqlx::query("DELETE FROM user_catalogs WHERE user_id = $1 AND catalog_id = $2")
+        .bind(&user_id)
+        .bind(catalog_id)
+        .execute(&mut *tx)
+        .await?;
+    if removed.rows_affected() != 0 {
+        bump_admin_generation(&mut tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// A user's entitlements, by catalog name.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `user` - the user's name.
+///
+/// # Returns
+/// Each entitlement, sorted by catalog.
+///
+/// # Errors
+/// [`OkfError::UnknownName`] for an unknown user; [`OkfError::Database`].
+pub async fn entitlements(pool: &PgPool, user: &str) -> Result<Vec<Entitlement>, OkfError> {
+    let user_id = user_id(pool, user).await?;
+    let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT c.name, e.access, e.created_at FROM user_catalogs e \
+         JOIN catalogs c ON c.id = e.catalog_id WHERE e.user_id = $1 ORDER BY c.name",
+    )
+    .bind(&user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(catalog, access, created_at)| Entitlement {
+            catalog,
+            access: Access::parse(&access).expect("the schema checks user_catalogs.access"),
+            created_at,
+        })
+        .collect())
+}
+
+/// May `principal` set `catalog`'s member access (or a user's
+/// entitlement to it)? The one permission check the CLI, the REST routes
+/// and the console use, so team owners can be allowed later here alone.
+///
+/// # Arguments
+/// * `principal` - the caller.
+/// * `catalog` - the catalog.
+///
+/// # Returns
+/// `true` for an admin that reaches every catalog (as M11's people routes
+/// need), today.
+pub fn may_set_member_access(principal: &Principal, catalog: &str) -> bool {
+    matches!(principal.reach, Reach::All) && principal.level(catalog) == Some(Access::Admin)
+}
+
+/// Caps a credential's levels by a ceiling.
+///
+/// # Arguments
+/// * `grant` - the credential's catalogs and levels.
+/// * `ceiling` - the user's ceiling.
+///
+/// # Returns
+/// The catalogs in both, each at the lower of the two levels.
+pub fn cap(grant: &BTreeMap<String, Access>, ceiling: &Ceiling) -> BTreeMap<String, Access> {
+    grant
+        .iter()
+        // `filter_map` keeps the `Some`s: a catalog the ceiling lacks drops out.
+        .filter_map(|(catalog, level)| {
+            ceiling
+                .get(catalog)
+                .map(|limit| (catalog.clone(), (*level).min(*limit)))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{test_db, TEST_TEAM, TEST_USER};
+    use crate::store::teams::{self, NewTeam, Role};
+    use crate::store::users::NewUser;
+    use chrono::TimeZone;
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 12, 12, 0, 0).unwrap()
+    }
+
+    /// The map `{catalog: level}` of these pairs.
+    fn ceiling(pairs: &[(&str, Access)]) -> Ceiling {
+        pairs
+            .iter()
+            .map(|(catalog, level)| (catalog.to_string(), *level))
+            .collect()
+    }
+
+    /// `users.id` of `name`.
+    async fn id(pool: &PgPool, name: &str) -> String {
+        sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Users alice and bob; team `family` (alice owner, bob member) owns
+    /// catalog `shared`; alice's personal team owns `solo`; the fixture
+    /// user's team owns `other`.
+    async fn family(pool: &PgPool) {
+        for name in ["alice", "bob"] {
+            users::create(
+                pool,
+                &NewUser {
+                    name,
+                    display_name: "",
+                },
+                now(),
+            )
+            .await
+            .unwrap();
+        }
+        let team = NewTeam {
+            name: "family",
+            display_name: "",
+            owner: "alice",
+        };
+        teams::create(pool, &team, now()).await.unwrap();
+        teams::set_member(pool, "family", "bob", Role::Member, now())
+            .await
+            .unwrap();
+        for (catalog, owner) in [
+            ("shared", "family"),
+            ("solo", "alice"),
+            ("other", TEST_TEAM),
+        ] {
+            catalogs::create(pool, catalog, "", owner, now())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn cap_keeps_the_lower_level_and_only_catalogs_in_both() {
+        let grant = ceiling(&[
+            ("pg", Access::Write),
+            ("work", Access::Read),
+            ("mine", Access::Write),
+        ]);
+        let limit = ceiling(&[
+            ("pg", Access::Read),
+            ("work", Access::Write),
+            ("docs", Access::Write),
+        ]);
+
+        let capped = cap(&grant, &limit);
+
+        assert_eq!(
+            capped,
+            ceiling(&[("pg", Access::Read), ("work", Access::Read)])
+        );
+        assert!(cap(&grant, &Ceiling::new()).is_empty());
+    }
+
+    #[hegel::test]
+    fn cap_never_raises_a_level_or_adds_a_catalog(tc: hegel::TestCase) {
+        use hegel::generators;
+        let names = ["a", "b", "c", "d"];
+        let levels = [Access::Read, Access::Write];
+        let draw = || -> Ceiling {
+            let drawn: BTreeMap<&str, Access> = tc.draw(generators::btree_maps(
+                generators::sampled_from(&names),
+                generators::sampled_from(&levels),
+            ));
+            drawn
+                .into_iter()
+                .map(|(name, level)| (name.to_string(), level))
+                .collect()
+        };
+        let grant = draw();
+        let limit = draw();
+
+        let capped = cap(&grant, &limit);
+
+        for (catalog, level) in &capped {
+            assert!(Some(level) <= grant.get(catalog), "never above the grant");
+            assert!(Some(level) <= limit.get(catalog), "never above the ceiling");
+        }
+        for catalog in grant.keys().filter(|catalog| limit.contains_key(*catalog)) {
+            assert!(capped.contains_key(catalog), "a catalog in both stays");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ceiling_is_the_teams_catalogs_at_member_access_and_the_users_entitlements() {
+        let db = test_db().await;
+        family(&db.pool).await;
+
+        let alice = ceiling_of(&db.pool, "alice").await.unwrap();
+        let bob = ceiling_of(&db.pool, "bob").await.unwrap();
+        let everyone = ceilings(&db.pool).await.unwrap();
+
+        assert_eq!(
+            alice,
+            ceiling(&[("shared", Access::Write), ("solo", Access::Write)])
+        );
+        assert_eq!(bob, ceiling(&[("shared", Access::Write)]));
+        assert_eq!(everyone.get(&id(&db.pool, "alice").await), Some(&alice));
+        assert_eq!(everyone.get(&id(&db.pool, "bob").await), Some(&bob));
+        assert_eq!(
+            everyone.get(&id(&db.pool, TEST_USER).await),
+            Some(&ceiling(&[("other", Access::Write)]))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn member_access_none_leaves_a_catalog_out_and_the_higher_level_wins() {
+        let db = test_db().await;
+        family(&db.pool).await;
+
+        set_member_access(&db.pool, "shared", MemberAccess::Read)
+            .await
+            .unwrap();
+        set_member_access(&db.pool, "solo", MemberAccess::None)
+            .await
+            .unwrap();
+        entitle(&db.pool, "bob", "shared", Access::Write, now())
+            .await
+            .unwrap();
+        entitle(&db.pool, "bob", "other", Access::Read, now())
+            .await
+            .unwrap();
+        entitle(&db.pool, "alice", "shared", Access::Read, now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ceiling_of(&db.pool, "alice").await.unwrap(),
+            ceiling(&[("shared", Access::Read)])
+        );
+        assert_eq!(
+            ceiling_of(&db.pool, "bob").await.unwrap(),
+            ceiling(&[("other", Access::Read), ("shared", Access::Write)])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_member_access_returns_the_previous_value_and_bumps_only_on_a_change() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let before = catalogs::admin_generation(&db.pool).await.unwrap();
+
+        let first = set_member_access(&db.pool, "shared", MemberAccess::Read)
+            .await
+            .unwrap();
+        let again = set_member_access(&db.pool, "shared", MemberAccess::Read)
+            .await
+            .unwrap();
+        let unknown = set_member_access(&db.pool, "nope", MemberAccess::Read).await;
+
+        assert_eq!((first, again), (MemberAccess::Write, MemberAccess::Read));
+        assert_eq!(
+            catalogs::admin_generation(&db.pool).await.unwrap(),
+            before + 1
+        );
+        assert!(
+            matches!(unknown, Err(OkfError::CatalogNotSelected { .. })),
+            "{unknown:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn entitlements_are_listed_replaced_and_removed_and_each_change_bumps() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let generation = || catalogs::admin_generation(&db.pool);
+        let before = generation().await.unwrap();
+
+        entitle(&db.pool, "bob", "other", Access::Read, now())
+            .await
+            .unwrap();
+        entitle(&db.pool, "bob", "other", Access::Read, now())
+            .await
+            .unwrap();
+        let after_entitle = generation().await.unwrap();
+        entitle(&db.pool, "bob", "other", Access::Write, now())
+            .await
+            .unwrap();
+        let listed = entitlements(&db.pool, "bob").await.unwrap();
+        unentitle(&db.pool, "bob", "other").await.unwrap();
+        let after_unentitle = generation().await.unwrap();
+        unentitle(&db.pool, "bob", "other").await.unwrap();
+
+        assert_eq!(
+            after_entitle,
+            before + 1,
+            "the same entitlement twice is one change"
+        );
+        assert_eq!(
+            listed,
+            [Entitlement {
+                catalog: "other".to_string(),
+                access: Access::Write,
+                created_at: now(),
+            }]
+        );
+        assert_eq!(after_unentitle, before + 3);
+        assert_eq!(
+            generation().await.unwrap(),
+            after_unentitle,
+            "removing nothing is a no-op"
+        );
+        assert!(entitlements(&db.pool, "bob").await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_admin_entitlement_unknown_users_and_unknown_catalogs_are_refused() {
+        let db = test_db().await;
+        family(&db.pool).await;
+
+        let admin = entitle(&db.pool, "bob", "other", Access::Admin, now()).await;
+        let nobody = entitle(&db.pool, "carol", "other", Access::Read, now()).await;
+        let nowhere = entitle(&db.pool, "bob", "nope", Access::Read, now()).await;
+        let no_ceiling = ceiling_of(&db.pool, "carol").await;
+        let no_list = entitlements(&db.pool, "carol").await;
+        let no_removal = unentitle(&db.pool, "bob", "nope").await;
+
+        assert!(matches!(admin, Err(OkfError::Refused { .. })), "{admin:?}");
+        for refused in [nobody, no_ceiling.map(|_| ()), no_list.map(|_| ())] {
+            assert!(
+                matches!(refused, Err(OkfError::UnknownName { noun: "user", .. })),
+                "{refused:?}"
+            );
+        }
+        for refused in [nowhere, no_removal] {
+            assert!(
+                matches!(refused, Err(OkfError::CatalogNotSelected { .. })),
+                "{refused:?}"
+            );
+        }
+    }
+
+    /// Checks one step of a ceiling change: `admin_generation` moved past
+    /// `last` (which becomes the new value) and the user is at `expected`.
+    async fn moved(pool: &PgPool, step: &str, last: &mut i64, user_id: &str, expected: Ceiling) {
+        let generation = catalogs::admin_generation(pool).await.unwrap();
+        assert!(generation > *last, "{step}: the generation moved");
+        *last = generation;
+        let found = ceilings(pool)
+            .await
+            .unwrap()
+            .remove(user_id)
+            .unwrap_or_default();
+        assert_eq!(found, expected, "{step}");
+    }
+
+    /// Every write that can change a ceiling's inputs (team membership,
+    /// catalog creation, ownership and deletion, member access,
+    /// entitlements and user deletion) changes `ceilings()` and bumps
+    /// `admin_generation`, so the key cache re-caps within one poll.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_write_that_moves_a_ceiling_bumps_the_generation() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let pool = &db.pool;
+        let bob = id(pool, "bob").await;
+        let mut last = catalogs::admin_generation(pool).await.unwrap();
+        let shared_write = ceiling(&[("shared", Access::Write)]);
+
+        teams::remove_member(pool, "family", "bob").await.unwrap();
+        moved(pool, "leaving the team", &mut last, &bob, Ceiling::new()).await;
+
+        teams::set_member(pool, "family", "bob", Role::Member, now())
+            .await
+            .unwrap();
+        moved(
+            pool,
+            "joining the team",
+            &mut last,
+            &bob,
+            shared_write.clone(),
+        )
+        .await;
+
+        catalogs::create(pool, "extra", "", "family", now())
+            .await
+            .unwrap();
+        let both = ceiling(&[("extra", Access::Write), ("shared", Access::Write)]);
+        moved(pool, "a new catalog of the team", &mut last, &bob, both).await;
+
+        catalogs::set_owner(pool, "extra", TEST_TEAM).await.unwrap();
+        moved(pool, "a new owner", &mut last, &bob, shared_write.clone()).await;
+
+        entitle(pool, "bob", "extra", Access::Read, now())
+            .await
+            .unwrap();
+        let entitled = ceiling(&[("extra", Access::Read), ("shared", Access::Write)]);
+        moved(pool, "an entitlement", &mut last, &bob, entitled).await;
+
+        set_member_access(pool, "shared", MemberAccess::Read)
+            .await
+            .unwrap();
+        let lowered = ceiling(&[("extra", Access::Read), ("shared", Access::Read)]);
+        moved(pool, "member access", &mut last, &bob, lowered).await;
+
+        // The entitlement to `extra` cascades with the catalog.
+        catalogs::delete(pool, "extra", false).await.unwrap();
+        let shared_read = ceiling(&[("shared", Access::Read)]);
+        moved(
+            pool,
+            "deleting a catalog",
+            &mut last,
+            &bob,
+            shared_read.clone(),
+        )
+        .await;
+
+        entitle(pool, "bob", "other", Access::Write, now())
+            .await
+            .unwrap();
+        last = catalogs::admin_generation(pool).await.unwrap();
+        unentitle(pool, "bob", "other").await.unwrap();
+        moved(
+            pool,
+            "removing an entitlement",
+            &mut last,
+            &bob,
+            shared_read,
+        )
+        .await;
+
+        // A deleted user's entitlements go with it.
+        users::create(
+            pool,
+            &NewUser {
+                name: "carol",
+                display_name: "",
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        entitle(pool, "carol", "other", Access::Read, now())
+            .await
+            .unwrap();
+        let carol = id(pool, "carol").await;
+        assert!(ceilings(pool).await.unwrap().contains_key(&carol));
+        last = catalogs::admin_generation(pool).await.unwrap();
+        users::delete(pool, "carol").await.unwrap();
+        moved(pool, "deleting a user", &mut last, &carol, Ceiling::new()).await;
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM user_catalogs WHERE user_id = $1")
+            .bind(&carol)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "the entitlement cascaded");
+    }
+
+    #[test]
+    fn member_access_round_trips_its_spelling() {
+        for access in [MemberAccess::None, MemberAccess::Read, MemberAccess::Write] {
+            assert_eq!(MemberAccess::parse(access.as_str()), Some(access));
+        }
+        assert_eq!(MemberAccess::parse("admin"), None);
+        assert_eq!(MemberAccess::None.level(), None);
+        assert_eq!(MemberAccess::Write.level(), Some(Access::Write));
+    }
+
+    #[test]
+    fn only_an_admin_that_reaches_every_catalog_may_set_member_access() {
+        let every = crate::mcp::testing::principal_as("root", Access::Admin, &[], None);
+        let scoped = crate::mcp::testing::principal_as("scoped", Access::Admin, &["pg"], None);
+        let writer = crate::mcp::testing::principal_as("writer", Access::Write, &[], None);
+
+        assert!(may_set_member_access(&every, "pg"));
+        assert!(!may_set_member_access(&scoped, "pg"));
+        assert!(!may_set_member_access(&writer, "pg"));
+    }
+}

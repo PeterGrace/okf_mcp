@@ -3,6 +3,7 @@
 //! from the caller, so every stored timestamp comes from the server clock.
 
 pub mod catalogs;
+pub mod ceiling;
 pub mod changesets;
 pub mod documents;
 pub mod export;
