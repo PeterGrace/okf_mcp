@@ -74,21 +74,34 @@ $('#login-form').addEventListener('submit', async event => {
     event.target.reset();
     await enterOrRecover();
 });
+// Ends this browser's console session, if it has one, whatever else is
+// signed in: a stored key and a cookie session can coexist (a key pasted
+// earlier, then a sign-in at /signin in another tab), and the cookie is
+// HttpOnly, so only the server can say. Both requests are plain fetches
+// with no Authorization header, so they speak for the cookie alone.
+// Resolves once no session is left: 2xx, or a 401 (none, or already over).
+// Throws on anything else, since the session may then live on.
+async function endCookieSession() {
+    const found = await fetch('/api/v1/session');
+    if (found.status === 401) return;
+    if (!found.ok) throw new Error(`HTTP ${found.status}`);
+    const { csrf } = await found.json();
+    const ended = await fetch('/api/v1/session', {
+        method: 'DELETE',
+        headers: { 'X-OKF-CSRF': csrf },
+    });
+    if (!ended.ok && ended.status !== 401) throw new Error(`HTTP ${ended.status}`);
+}
+
 $('#signout').addEventListener('click', async () => {
-    // A console session ends on the server; a pasted key only in this browser.
-    // Only a 2xx or a 401 (the session was already over) means signed out:
-    // after anything else the server session and its HttpOnly cookie may
-    // live on, and a reload would sign straight back in. So the console
-    // stays as it is and says to try again.
-    if (!store.key && store.csrf) {
-        try {
-            await api.del('/session', { quiet: true });
-        } catch (error) {
-            if (!(error instanceof ApiError && error.status === 401)) {
-                toast(`Sign-out failed: ${error.message}. Try again.`, 'error');
-                return;
-            }
-        }
+    // The session ends on the server first. If that fails (the network, a
+    // 5xx) nothing is cleared: the console stays as it is and says to try
+    // again, because a reload would otherwise sign straight back in.
+    try {
+        await endCookieSession();
+    } catch (error) {
+        toast(`Sign-out failed: ${error.message}. Try again.`, 'error');
+        return;
     }
     store.key = null;
     store.whoami = null;
@@ -109,17 +122,26 @@ $('#catalog-select').addEventListener('change', event => {
 $('#drawer-scrim').addEventListener('click', closeDrawer);
 addEventListener('keydown', event => { if (event.key === 'Escape') closeDrawer(); });
 
-// Without a stored key, a console session (its cookie) may still be live:
-// ask before showing the card. A plain fetch, so a 401 here is not "the key
-// was refused".
-async function resumeSession() {
-    let response;
-    try { response = await fetch('/api/v1/session'); } catch { showLogin(); return; }
-    if (!response.ok) { showLogin(); return; }
-    store.csrf = (await response.json()).csrf;
-    await enterOrRecover();
+// Boot. One credential is in use at a time, and a live console session
+// wins over a stored key: a session exists only after an account sign-in,
+// which is newer than any key pasted before it (the card is not shown while
+// a session resumes). The key is then dropped, so it can never come back
+// once the session ends. Without a session, a stored key is used; without
+// either, the card. A plain fetch, so a 401 here is not "the key was
+// refused".
+async function boot() {
+    let response = null;
+    try { response = await fetch('/api/v1/session'); } catch { /* the server is down */ }
+    if (response?.ok) {
+        store.csrf = (await response.json()).csrf;
+        store.key = null;
+        await enterOrRecover();
+    } else if (store.key) {
+        await enterOrRecover();
+    } else {
+        showLogin(response ? undefined : 'The server could not be reached. Reload to retry.');
+    }
 }
 
 applyTheme(store.theme);
-if (store.key) enterOrRecover();
-else resumeSession();
+boot();

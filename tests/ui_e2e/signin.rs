@@ -182,3 +182,80 @@ async fn a_refused_password_says_so_and_a_session_survives_a_reload() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_sign_in_replaces_a_stored_key_and_sign_out_ends_both() {
+    let server = server().await;
+    server
+        .user_with_password("carol", "carol@example.com", PASSWORD)
+        .await;
+    ceiling::entitle(&server.db.pool, "carol", "main", Access::Read, Utc::now())
+        .await
+        .expect("entitle");
+    let key = server
+        .key("console-carol", Access::Read, &["main"], Some("main"))
+        .await;
+
+    drive(server.base.clone(), move |ui| {
+        // A key pasted earlier stays stored in this browser.
+        ui.login(&key);
+        ui.wait_text("#whoami", "console-carol");
+        // Then an account sign-in: its session wins at boot, and the key
+        // is dropped.
+        ui.sign_in_password("carol@example.com", PASSWORD);
+        ui.wait_text("#whoami", "carol - read");
+        assert_eq!(
+            ui.eval(
+                "() => localStorage.getItem('okf.key')",
+                serde_json::json!(null)
+            ),
+            serde_json::Value::Null
+        );
+        ui.click("#signout");
+        ui.wait_visible("#login");
+        assert_eq!(ui.eval(SESSION_STATUS, serde_json::json!(null)), 401);
+        // Nothing resumes after a reload.
+        ui.open("");
+        ui.wait_visible("#login");
+        assert!(!ui.page.is_visible("#app").expect("visible"));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_out_ends_a_cookie_session_hidden_behind_a_stored_key() {
+    let server = server().await;
+    server
+        .user_with_password("dave", "dave@example.com", PASSWORD)
+        .await;
+    let key = server
+        .key("console-dave", Access::Read, &["main"], Some("main"))
+        .await;
+
+    drive(server.base.clone(), move |ui| {
+        ui.sign_in_password("dave@example.com", PASSWORD);
+        ui.wait_text("#whoami", "dave - ");
+        // A key stored on top of the live session (the console's own store
+        // module, so the page uses it at once), as a console that kept a
+        // key from before the account sign-in would hold it.
+        ui.eval(
+            "async (key) => { (await import('/ui/js/core/store.js')).store.key = key; }",
+            serde_json::json!(key),
+        );
+        ui.click("#signout");
+        ui.wait_visible("#login");
+        // The cookie session ended on the server, and the key is gone.
+        assert_eq!(ui.eval(SESSION_STATUS, serde_json::json!(null)), 401);
+        assert_eq!(
+            ui.eval(
+                "() => localStorage.getItem('okf.key')",
+                serde_json::json!(null)
+            ),
+            serde_json::Value::Null
+        );
+        ui.open("");
+        ui.wait_visible("#login");
+        assert!(!ui.page.is_visible("#app").expect("visible"));
+    })
+    .await;
+}
