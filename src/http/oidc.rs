@@ -483,7 +483,8 @@ struct LinkBody {
 ///
 /// # Errors
 /// 403 for a key or grant; 404 for an unknown provider or with OIDC off;
-/// 429 past [`crate::oidc::LINK_STARTS_PER_USER`] starts in ten minutes;
+/// 429 once the user's allowance is spent (a burst of
+/// [`crate::oidc::LINK_STARTS_PER_USER`], refilled one per minute);
 /// 503 when the provider cannot be reached.
 async fn link(
     State(app): State<Arc<App>>,

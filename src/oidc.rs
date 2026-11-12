@@ -50,9 +50,11 @@ pub const FLOW_TTL: Duration = Duration::from_secs(10 * 60);
 /// The most flows in progress at once (they start unauthenticated, so the
 /// start route also takes from the per-address sign-in limit).
 pub const MAX_FLOWS: usize = 10_000;
-/// Link flows one user may start per [`FLOW_TTL`]: each start holds a
-/// flow-map entry for ten minutes, so this bounds what one signed-in user
-/// can take from the map that every sign-in shares.
+/// The per-user link allowance: a token bucket with a burst of this many
+/// starts, refilled one per minute (this many per [`FLOW_TTL`]). Each start
+/// holds a flow-map entry for ten minutes, so one signed-in user holds at
+/// most about twice this many (the burst plus ten minutes of refill) of
+/// the map every sign-in shares.
 pub const LINK_STARTS_PER_USER: u32 = 10;
 /// The most users the per-user link limiter tracks at once.
 const MAX_LINKING_USERS: usize = 10_000;
@@ -231,7 +233,8 @@ pub struct OidcProviders {
     /// Each console session's live link flow, by the SHA-256 of the session
     /// id: a new link flow replaces (and removes) the session's previous one.
     link_flows: ExpiringMap<String>,
-    /// Link starts by user id ([`LINK_STARTS_PER_USER`] per [`FLOW_TTL`]).
+    /// Link starts by user id: a burst of [`LINK_STARTS_PER_USER`], refilled
+    /// one per minute.
     link_starts: KeyedLimiter,
 }
 
@@ -379,8 +382,8 @@ impl OidcProviders {
     /// * `now` - the current instant.
     ///
     /// # Returns
-    /// `false` once the user has started [`LINK_STARTS_PER_USER`] links in
-    /// the last [`FLOW_TTL`].
+    /// `false` once the user's bucket is empty: a burst of
+    /// [`LINK_STARTS_PER_USER`] starts, then one more per minute.
     pub fn may_start_link(&self, user_id: &str, now: Instant) -> bool {
         self.link_starts.try_take(user_id, now)
     }
@@ -977,6 +980,33 @@ mod tests {
             Some(false)
         );
         assert_eq!(claims(serde_json::json!(true)).email_verified(), Some(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn link_starts_are_a_burst_of_ten_refilled_one_per_minute() {
+        let idp = testing::start().await;
+        let providers = providers(&idp);
+        // A fixed starting instant; later ones are offsets from it, so the
+        // test controls time exactly.
+        let start = Instant::now();
+        let take = |at: Instant| providers.may_start_link("user-1", at);
+
+        let burst = (0..LINK_STARTS_PER_USER).filter(|_| take(start)).count();
+        let eleventh = take(start);
+        let after_a_minute = start + Duration::from_secs(61);
+        let one_more = take(after_a_minute);
+        let not_two = take(after_a_minute);
+        let refilled = after_a_minute + FLOW_TTL;
+        let again = (0..LINK_STARTS_PER_USER).filter(|_| take(refilled)).count();
+        let past_the_burst = take(refilled);
+
+        assert_eq!(burst, 10);
+        assert!(!eleventh, "the eleventh start in a burst is refused");
+        assert!(one_more, "a minute refills one start");
+        assert!(!not_two, "and only one");
+        assert_eq!(again, 10, "a full refill allows a whole burst again");
+        assert!(!past_the_burst);
+        assert!(providers.may_start_link("user-2", start), "users are apart");
     }
 
     #[test]
