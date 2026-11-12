@@ -29,6 +29,7 @@ use sqlx::{PgExecutor, PgPool};
 
 use crate::error::OkfError;
 use crate::keys;
+use crate::store::passwords::PasswordStamp;
 
 /// The most stale `last_seen_at` may be before a request rewrites it, so
 /// an active console writes at most once a minute per session.
@@ -144,14 +145,33 @@ fn write_resolution_of(idle: TimeDelta) -> TimeDelta {
     (idle / 4).min(MAX_LAST_SEEN_RESOLUTION)
 }
 
-/// Starts a session.
+/// What a new session needs.
+pub struct SessionStart<'a> {
+    /// Whose session.
+    pub user_id: &'a str,
+    /// The client address, when known.
+    pub ip: Option<IpAddr>,
+    /// The `User-Agent` header (empty when absent); only its first 256
+    /// characters are kept.
+    pub user_agent: &'a str,
+    /// `console_session_absolute`.
+    pub absolute: Duration,
+    /// When (server clock).
+    pub now: DateTime<Utc>,
+    /// For a password sign-in, the hash the password matched: the session
+    /// is refused if the user's hash has changed since. `None` for the other
+    /// sign-in methods.
+    pub password: Option<&'a PasswordStamp>,
+}
+
+/// Starts a session with no password condition ([`start`] with
+/// `password: None`).
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `user_id` - whose session.
 /// * `ip` - the client address, when known.
-/// * `user_agent` - the `User-Agent` header (empty when absent); only its
-///   first 256 characters are kept.
+/// * `user_agent` - the `User-Agent` header (empty when absent).
 /// * `absolute` - `console_session_absolute`.
 /// * `now` - when (server clock).
 ///
@@ -159,9 +179,7 @@ fn write_resolution_of(idle: TimeDelta) -> TimeDelta {
 /// The raw id and CSRF token. Neither is stored.
 ///
 /// # Errors
-/// [`OkfError::LimitExceeded`] for an absurd `absolute`; [`OkfError::Io`]
-/// if the OS random source fails; [`OkfError::Database`] (a foreign-key
-/// failure for an unknown user).
+/// As [`start`].
 pub async fn create(
     pool: &PgPool,
     user_id: &str,
@@ -170,7 +188,39 @@ pub async fn create(
     absolute: Duration,
     now: DateTime<Utc>,
 ) -> Result<NewSession, OkfError> {
-    let expires_at = crate::clock::after(now, absolute)?;
+    let request = SessionStart {
+        user_id,
+        ip,
+        user_agent,
+        absolute,
+        now,
+        password: None,
+    };
+    start(pool, &request).await
+}
+
+/// Starts a session.
+///
+/// The insert reads the user's row `FOR SHARE` in the same statement, so it
+/// serializes with a password change (`passwords::reset` updates that row
+/// before it deletes the sessions): either this insert commits first and
+/// the reset deletes the session, or the reset commits first and Postgres
+/// re-checks the hash on the new row version, which no longer matches.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `request` - the user, client details and lifetime.
+///
+/// # Returns
+/// The raw id and CSRF token. Neither is stored.
+///
+/// # Errors
+/// [`OkfError::Unauthenticated`] when the user is gone or (for a password
+/// sign-in) their password changed since it was checked;
+/// [`OkfError::LimitExceeded`] for an absurd `absolute`; [`OkfError::Io`]
+/// if the OS random source fails; [`OkfError::Database`].
+pub async fn start(pool: &PgPool, request: &SessionStart<'_>) -> Result<NewSession, OkfError> {
+    let expires_at = crate::clock::after(request.now, request.absolute)?;
     let id = keys::generate_with("")?;
     let session = NewSession {
         csrf: csrf_for(&id),
@@ -179,24 +229,36 @@ pub async fn create(
     // `char_indices().nth(n)` finds the byte offset of the n-th character,
     // so the cut never splits a multi-byte character (slicing a `&str`
     // mid-character panics).
-    let user_agent = user_agent
+    let user_agent = request
+        .user_agent
         .char_indices()
         .nth(USER_AGENT_LIMIT)
-        .map_or(user_agent, |(end, _)| &user_agent[..end]);
-    sqlx::query(
+        .map_or(request.user_agent, |(end, _)| &request.user_agent[..end]);
+    // `$8 IS NULL OR ...`: no condition without a stamp. `IS NOT DISTINCT
+    // FROM` would also match a user whose hash was cleared; `=` does not.
+    let inserted = sqlx::query(
         "INSERT INTO user_sessions \
              (id_hash, user_id, csrf_token, created_at, last_seen_at, expires_at, ip, user_agent) \
-         VALUES ($1, $2, encode($3, 'hex'), $4, $4, $5, $6::inet, $7)",
+         SELECT $1, u.id, encode($3, 'hex'), $4, $4, $5, $6::inet, $7 FROM users u \
+          WHERE u.id = $2 AND ($8::text IS NULL OR u.password_hash = $8) \
+            FOR SHARE",
     )
     .bind(keys::hash(&session.id).as_slice())
-    .bind(user_id)
+    .bind(request.user_id)
     .bind(keys::hash(&session.csrf).as_slice())
-    .bind(now)
+    .bind(request.now)
     .bind(expires_at)
-    .bind(ip.map(|address| address.to_string()))
+    .bind(request.ip.map(|address| address.to_string()))
     .bind(user_agent)
+    .bind(request.password.map(PasswordStamp::as_str))
     .execute(pool)
-    .await?;
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        return Err(OkfError::Unauthenticated {
+            reason: "the user is gone or their password changed; sign in again".to_string(),
+        });
+    }
     Ok(session)
 }
 

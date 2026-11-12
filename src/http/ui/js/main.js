@@ -1,9 +1,10 @@
 // Boot: theme, sign-in, the shell, the router.
 import { $ } from './core/dom.js';
 import { store } from './core/store.js';
-import { api, ApiError, setUnauthorizedHandler } from './core/api.js';
+import { api, ApiError, authHeaders, setUnauthorizedHandler } from './core/api.js';
 import { start, route } from './core/router.js';
 import { closeDrawer } from './core/drawer.js';
+import { toast } from './core/toast.js';
 import { refreshIdentity, refreshUnassigned } from './core/shell.js';
 import { refreshFindingsBadge } from './pages/findings.js';
 
@@ -53,9 +54,11 @@ async function enterOrRecover() {
 }
 
 setUnauthorizedHandler(() => {
+    const hadKey = !!store.key;
     store.key = null;
     store.whoami = null;
-    showLogin('The key was refused. Sign in again.');
+    store.csrf = null;
+    showLogin(hadKey ? 'The key was refused. Sign in again.' : 'Your session ended. Sign in again.');
 });
 
 $('#login-form').addEventListener('submit', async event => {
@@ -71,9 +74,38 @@ $('#login-form').addEventListener('submit', async event => {
     event.target.reset();
     await enterOrRecover();
 });
-$('#signout').addEventListener('click', () => {
+// Ends this browser's console session, if it has one, whatever else is
+// signed in: a stored key and a cookie session can coexist (a key pasted
+// earlier, then a sign-in at /signin in another tab), and the cookie is
+// HttpOnly, so only the server can say. Both requests go without the key
+// (`authHeaders` with `key: null`), so they speak for the cookie alone.
+// Resolves once no session is left: 2xx, or a 401 (none, or already over).
+// Throws on anything else, since the session may then live on.
+async function endCookieSession() {
+    const found = await fetch('/api/v1/session', { headers: authHeaders('GET', { key: null }) });
+    if (found.status === 401) return;
+    if (!found.ok) throw new Error(`HTTP ${found.status}`);
+    const { csrf } = await found.json();
+    const ended = await fetch('/api/v1/session', {
+        method: 'DELETE',
+        headers: authHeaders('DELETE', { key: null, csrf }),
+    });
+    if (!ended.ok && ended.status !== 401) throw new Error(`HTTP ${ended.status}`);
+}
+
+$('#signout').addEventListener('click', async () => {
+    // The session ends on the server first. If that fails (the network, a
+    // 5xx) nothing is cleared: the console stays as it is and says to try
+    // again, because a reload would otherwise sign straight back in.
+    try {
+        await endCookieSession();
+    } catch (error) {
+        toast(`Sign-out failed: ${error.message}. Try again.`, 'error');
+        return;
+    }
     store.key = null;
     store.whoami = null;
+    store.csrf = null;
     history.replaceState(null, '', '/ui/');
     showLogin();
 });
@@ -90,6 +122,28 @@ $('#catalog-select').addEventListener('change', event => {
 $('#drawer-scrim').addEventListener('click', closeDrawer);
 addEventListener('keydown', event => { if (event.key === 'Escape') closeDrawer(); });
 
+// Boot. One credential is in use at a time, and a live console session
+// wins over a stored key: a session exists only after an account sign-in,
+// which is newer than any key pasted before it (the card is not shown while
+// a session resumes). The key is then dropped, so it can never come back
+// once the session ends. Without a session, a stored key is used; without
+// either, the card. A plain fetch, so a 401 here is not "the key was
+// refused".
+async function boot() {
+    let response = null;
+    try {
+        response = await fetch('/api/v1/session', { headers: authHeaders('GET', { key: null }) });
+    } catch { /* the server is down */ }
+    if (response?.ok) {
+        store.csrf = (await response.json()).csrf;
+        store.key = null;
+        await enterOrRecover();
+    } else if (store.key) {
+        await enterOrRecover();
+    } else {
+        showLogin(response ? undefined : 'The server could not be reached. Reload to retry.');
+    }
+}
+
 applyTheme(store.theme);
-if (store.key) enterOrRecover();
-else showLogin();
+boot();

@@ -1,9 +1,8 @@
 // File choice by picker or drag and drop, and an upload with progress.
-// fetch() cannot report upload progress, so the upload uses XMLHttpRequest
-// with the same bearer header api.js sends.
+// fetch() cannot report upload progress, so the upload uses XMLHttpRequest,
+// with the headers api.js sends (a bearer key, or a session's CSRF token).
 import { h } from '../core/dom.js';
-import { store } from '../core/store.js';
-import { api, ApiError } from '../core/api.js';
+import { api, ApiError, authHeaders } from '../core/api.js';
 
 // A drop zone around a file input. onFile(file) runs on every choice.
 export function fileDrop({ accept, label, onFile }) {
@@ -33,7 +32,9 @@ export function upload(path, file, onProgress = () => {}) {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', `/api/v1${path}`);
-        xhr.setRequestHeader('Authorization', `Bearer ${store.key ?? ''}`);
+        for (const [name, value] of Object.entries(authHeaders('POST'))) {
+            xhr.setRequestHeader(name, value);
+        }
         xhr.setRequestHeader('Content-Type', 'application/gzip');
         xhr.responseType = 'json';   // a non-JSON body (413) arrives as null
         xhr.upload.addEventListener('progress', event => {
@@ -45,7 +46,8 @@ export function upload(path, file, onProgress = () => {}) {
                 resolve(xhr.response);
                 return;
             }
-            // A refused key: let api.js's shared 401 path sign the browser out.
+            // A refused key or an ended session: let api.js's shared 401 path
+            // sign the browser out.
             if (xhr.status === 401) api.get('/whoami').catch(() => {});
             reject(new ApiError(xhr.status, xhr.response));
         });

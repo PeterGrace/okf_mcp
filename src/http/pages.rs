@@ -7,15 +7,6 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 /// Where a sign-in goes when it was given no usable `return_to`.
-// `expect(dead_code)` silences "never used" until a caller lands, and
-// itself warns once one does, so it cannot be forgotten.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the sign-in pages (Task 7b) use it; delete this line then"
-    )
-)]
 pub(crate) const DEFAULT_RETURN_TO: &str = "/ui/";
 
 /// Escapes text for HTML element content and double- or single-quoted
@@ -162,13 +153,6 @@ pub(crate) fn scripted_page(
 ///
 /// # Returns
 /// `raw` when it is safe, else `/ui/`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the sign-in pages (Task 7b) use it; delete this line then"
-    )
-)]
 pub(crate) fn safe_return_to(raw: Option<&str>) -> String {
     match raw {
         Some(path) if is_safe_return_to(path) => path.to_string(),
@@ -178,13 +162,6 @@ pub(crate) fn safe_return_to(raw: Option<&str>) -> String {
 }
 
 /// Whether `path` is a same-origin console or authorize path.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the sign-in pages (Task 7b) use it; delete this line then"
-    )
-)]
 fn is_safe_return_to(path: &str) -> bool {
     // Visible ASCII only: no spaces, no control characters (a header
     // injection) and no `\`, which some browsers read as `/` (so `/\host`

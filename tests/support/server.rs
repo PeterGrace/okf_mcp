@@ -286,6 +286,45 @@ impl TestServer {
         secret
     }
 
+    /// Creates a user with an email and a password, and polls it into the
+    /// key cache.
+    ///
+    /// # Arguments
+    /// * `name` - the user's name.
+    /// * `email` - their email, which signs them in.
+    /// * `password` - their password (within the policy).
+    ///
+    /// # Returns
+    /// The user's id.
+    ///
+    /// # Panics
+    /// If the store refuses the user, the email or the password.
+    pub async fn user_with_password(&self, name: &str, email: &str, password: &str) -> String {
+        let pool = &self.db.pool;
+        users::create(
+            pool,
+            &users::NewUser {
+                name,
+                display_name: "",
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("create the user");
+        users::set_email(pool, name, Some(email))
+            .await
+            .expect("set the email");
+        let user = users::find_by_email(pool, email)
+            .await
+            .expect("find the user")
+            .expect("the user exists");
+        okf_mcp::store::passwords::set(pool, &user.id, password, Utc::now())
+            .await
+            .expect("set the password");
+        self.app.poll().await.expect("poll the user in");
+        user.id
+    }
+
     /// Creates a read-only maintenance reporter and refreshes the key cache.
     pub async fn reporter_key(&self, name: &str, catalogs: &[&str]) -> String {
         let key = self.key(name, Access::Read, catalogs, None).await;

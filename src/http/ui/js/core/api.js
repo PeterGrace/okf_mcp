@@ -1,6 +1,8 @@
-// The one way pages talk to the server: /api/v1 with the stored bearer key.
-// A non-2xx answer becomes an ApiError (already toasted unless `quiet`);
-// a 401 also signs the browser out through the handler main.js installs.
+// The one way pages talk to the server: /api/v1 with the stored bearer key,
+// or else the console session's cookie (sent by the browser itself) with
+// its CSRF token on writes. A non-2xx answer becomes an ApiError (already
+// toasted unless `quiet`); a 401 also signs the browser out through the
+// handler main.js installs.
 import { store } from './store.js';
 import { toast } from './toast.js';
 
@@ -15,8 +17,19 @@ export class ApiError extends Error {
 let unauthorized = () => {};
 export function setUnauthorizedHandler(handler) { unauthorized = handler; }
 
+// The headers that authenticate one request to /api/v1, the one place
+// that chooses them: a key as a bearer, or else nothing for the session
+// cookie (the browser sends it by itself, same origin) plus the session's
+// CSRF token on anything but a GET. `key` and `csrf` default to the stored
+// ones; pass `key: null` for a request that must speak for the cookie alone.
+export function authHeaders(method, { key = store.key, csrf = store.csrf } = {}) {
+    if (key) return { Authorization: `Bearer ${key}` };
+    if (method !== 'GET' && csrf) return { 'X-OKF-CSRF': csrf };
+    return {};
+}
+
 async function request(method, path, { body, raw = false, quiet = false, key } = {}) {
-    const headers = { Authorization: `Bearer ${key ?? store.key ?? ''}` };
+    const headers = authHeaders(method, { key: key ?? store.key });
     let payload;
     if (body instanceof Blob) {
         payload = body;
@@ -34,7 +47,8 @@ async function request(method, path, { body, raw = false, quiet = false, key } =
         let errorBody = null;
         try { errorBody = await response.json(); } catch { /* not JSON */ }
         const error = new ApiError(response.status, errorBody);
-        if (!quiet) toast(response.status === 403 ? 'Your key cannot do this.' : error.message, 'error');
+        const denied = store.key ? 'Your key cannot do this.' : 'Your account cannot do this.';
+        if (!quiet) toast(response.status === 403 ? denied : error.message, 'error');
         throw error;
     }
     if (raw) return response;

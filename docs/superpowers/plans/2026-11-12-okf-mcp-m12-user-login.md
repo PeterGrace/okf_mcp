@@ -282,15 +282,22 @@ pub struct UserAuth { pub id: String, pub name: String, pub email: Option<String
 // ---- src/store/passwords.rs (Task 4) ----
 pub fn check_policy(password: &str) -> Result<(), OkfError>;           // LimitExceeded{limit:"password"}
 pub fn hash(password: &str) -> Result<String, OkfError>;               // argon2id PHC
-pub enum SignInOutcome { Ok(UserAuth), Failed, Locked }
+pub enum SignInOutcome { Ok(Verified), Failed, Locked }   // Ok(UserAuth) until Task 7b's review
 pub async fn verify(pool: &PgPool, email: &str, password: &str, now: DateTime<Utc>) -> Result<SignInOutcome, OkfError>; // lockout, dummy hash
 pub async fn verify_user(pool: &PgPool, user_id: &str, password: &str, now: DateTime<Utc>) -> Result<SignInOutcome, OkfError>; // the same rules, by id (Task 10b's password change)
+pub struct PasswordStamp(/* the matched hash; Debug redacted */); pub struct Verified { pub user: UserAuth, pub stamp: PasswordStamp } // Task 7b (PR #337 review)
+pub async fn reset(pool: &PgPool, user_id: &str, password: &str, now: DateTime<Utc>) -> Result<u64, OkfError>; // Task 7b: set + revoke_all in one transaction
+pub struct NewPassword(/* hashed; Debug redacted */); impl NewPassword { pub async fn hash(password: &str) -> Result<Self, OkfError>; } // Task 7b
+pub async fn set_in(conn: &mut PgConnection, user_id: &str, password: &NewPassword, now: DateTime<Utc>) -> Result<(), OkfError>; // Task 7b
+pub async fn reset_in(conn: &mut PgConnection, user_id: &str, password: &NewPassword, now: DateTime<Utc>) -> Result<u64, OkfError>; // Task 7b
 pub async fn set(pool: &PgPool, user_id: &str, password: &str, now: DateTime<Utc>) -> Result<(), OkfError>;
 
 // ---- src/store/email_tokens.rs (Task 4) ----
 pub enum Purpose { Setup, Reset }
 pub async fn issue(pool: &PgPool, user_id: &str, purpose: Purpose, ttl: std::time::Duration, now: DateTime<Utc>) -> Result<String, OkfError>; // raw token; older same-purpose tokens invalidated
 pub async fn redeem(pool: &PgPool, token: &str, purpose: Purpose, now: DateTime<Utc>) -> Result<UserAuth, OkfError>; // Gone on expired/used/unknown
+pub async fn redeem_in(conn: &mut PgConnection, token: &str, purpose: Purpose, now: DateTime<Utc>) -> Result<UserAuth, OkfError>; // Task 7b: inside the caller's transaction
+pub async fn issue_for_email(pool: &PgPool, email: &str, purpose: Purpose, ttl: std::time::Duration, now: DateTime<Utc>) -> Result<Option<IssuedLink>, OkfError>; // Task 7b: lookup + issue under the row lock
 pub async fn peek(pool: &PgPool, token: &str, purpose: Purpose, now: DateTime<Utc>) -> Result<UserAuth, OkfError>;   // validate without using
 pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError>;
 
@@ -439,6 +446,7 @@ impl Browser {
 
 // ---- src/store/passkeys.rs (Task 8) ----
 pub async fn add(pool: &PgPool, user_id: &str, passkey: &Passkey, name: &str, now: DateTime<Utc>) -> Result<(), OkfError>;
+pub async fn add_in(conn: &mut PgConnection, user_id: &str, passkey: &Passkey, name: &str, now: DateTime<Utc>) -> Result<(), OkfError>; // corrected (issue #316): the setup link's passkey is stored in the redeeming transaction
 pub async fn for_user(pool: &PgPool, user_id: &str) -> Result<Vec<(String /*name*/, Passkey)>, OkfError>;
 pub async fn find(pool: &PgPool, credential_id: &[u8]) -> Result<Option<(String /*user_id*/, Passkey)>, OkfError>;
 pub async fn update(pool: &PgPool, credential_id: &[u8], passkey: &Passkey, now: DateTime<Utc>) -> Result<(), OkfError>;
@@ -10756,6 +10764,58 @@ Builds on Task 7a's pages, limits, `start_session`, `Browser` and `/api/v1/sessi
 
 > **Corrected (issue #315, 2026-11-12).** Task 7a marked `safe_return_to`, `is_safe_return_to` and `DEFAULT_RETURN_TO` in `src/http/pages.rs` with `#[cfg_attr(not(test), expect(dead_code, ...))]`; delete those three attributes when `signin.rs` starts calling them, or `just lint` fails on the unmet expectation. `ip_key` groups IPv6 addresses by /64, so tests that need two separate address buckets should use IPv4 addresses.
 
+> **Corrected (issue #316, 2026-11-12).** What shipped differs from the code below in these ways; `src/http/signin.rs` and `tests/ui_e2e/signin.rs` are authoritative.
+> - `SignInForm`'s fields all default to empty (`#[serde(default)]`, `Default`), so a malformed `POST /signin` takes the normal path: one argon2 check (the dummy hash) and the same 401 as a wrong password, not a 400.
+> - `audit` only calls `sign_in_events::record`, which already writes the `info` line; the plan's second `tracing::info!` is gone.
+> - Every POST (`/signin`, `/signin/forgot`, `/account/setup`, `/account/reset`) answers 403 when the browser's `Sec-Fetch-Site` is neither `same-origin` nor `none` (login CSRF). `Origin` cannot be used: under the pages' `Referrer-Policy: no-referrer` browsers send `Origin: null` even for same-origin form posts. A request without the header (curl, the `oneshot` tests) is let through. So `reset_post` also takes `parts: Parts`.
+> - `/signin/forgot` takes a per-email limiter slot only for an address `users::check_email` accepts, so that map holds short keys; the answer is the same either way.
+> - **The reset / sign-in protocol (review of PR #337).** A password sign-in carries the hash it matched to the session insert, so a session can't outlive a reset:
+>   - `passwords::verify` and `verify_user` return `SignInOutcome::Ok(Verified { user, stamp })`. `stamp: PasswordStamp` is the stored PHC string the password matched, with a redacted `Debug`. A new password always has a new hash, because it gets a fresh salt.
+>   - `user_sessions::start(pool, &SessionStart { user_id, ip, user_agent, absolute, now, password })` is one statement: `INSERT INTO user_sessions ... SELECT ... FROM users u WHERE u.id = $2 AND ($8::text IS NULL OR u.password_hash = $8) FOR SHARE`. If no row comes back, it returns `OkfError::Unauthenticated`, and `POST /signin` answers that with the uniform 401 (recorded as failed). `user_sessions::create` (no stamp) is unchanged for callers.
+>   - `passwords::reset(pool, user_id, password, now) -> u64` updates the hash and runs `revoke_all` in one transaction. `reset_post` uses it.
+>   - The two serialize on the user row. Either the insert commits first and the reset deletes its session, or the reset commits first and the insert re-checks the hash on the new row version and inserts nothing.
+>   - `console_session::start_session_with(app, user, password, ip, user_agent)` is the stamped form of `start_session`. In `signin.rs`, `begin(app, parts, user, method, password)` is the stamped form of `sign_in`.
+>   - Passkey, OIDC and setup sign-ins keep calling `sign_in` / `start_session` with no stamp.
+>   - Tests: `a_sign_in_checked_before_a_reset_gets_no_session_after_it`, `a_sign_in_waiting_on_a_reset_in_progress_gets_no_session` (holds the user row so the reset and the insert queue behind it in that order) and `a_session_inserted_before_a_reset_is_ended_by_it`.
+> - Console sign-out counts as done only on a 2xx or a 401 from `DELETE /api/v1/session`. Any other failure keeps the session state and the shell, and shows a "Sign-out failed ... Try again." toast. The setup journey fails the first `DELETE` with a fetch wrapper and checks this.
+> - **Emailed links are issued and used atomically (third review of PR #337).**
+>   - *Forgot.* `email_tokens::issue_for_email(pool, email, purpose, ttl, now) -> Option<IssuedLink { user, to, token }>` (redacted `Debug`) finds the user and issues the token in one transaction. One statement finds and locks the user's row by email (`... WHERE u.email = $1::citext FOR NO KEY UPDATE`); `users::set_email` takes the same row lock when it deletes a changed user's links. Either the issue commits first and the email change deletes the link, or the change commits first and the issue finds no user. The mail goes to `to`, the address read under the lock. `issue` and `issue_for_email` share a private `replace_token`. Tests: `a_reset_link_issued_before_an_email_change_dies_with_it` and `no_reset_link_is_issued_for_an_email_changed_meanwhile`. Each holds the row and queues the two in a chosen order.
+>   - *Setup and reset.* The handlers' `use_link` hashes the new password first (`passwords::NewPassword::hash`, policy plus argon2, redacted `Debug`), outside any transaction. Then one transaction runs `email_tokens::redeem_in(&mut tx, token, purpose, now)` and either `passwords::set_in(&mut tx, user_id, &hashed, now)` (setup) or `passwords::reset_in(...) -> u64` (reset: the hash, then `revoke_all`). A failure anywhere rolls everything back: the old password, the sessions and the link stay as they were. `redeem`, `set` and `reset` are the pool wrappers. Tests: `a_reset_that_fails_changes_nothing_and_keeps_the_link` and `a_setup_that_fails_sets_nothing_and_keeps_the_link`. Each injects the failure with a trigger.
+>   - Task 8's setup-link passkey path (`setup_finish`) must do the same: redeem the link with `redeem_in` and store the passkey in the same transaction. See the note there.
+> - **Lock order: the user's row first, then that user's tokens or sessions (fourth review of PR #337).** The rule is stated once, in `src/store/email_tokens.rs`'s module docs.
+>   - Every transaction that locks a `users` row and also writes `email_tokens` or `user_sessions` takes the user's row first. That covers `email_tokens::{issue, issue_for_email, redeem_in}`, `users::{set_email, set_admin, delete}`, `passwords::{set_in, reset_in}` (the `UPDATE users` comes before `revoke_all`) and `user_sessions::start` (the user row `FOR SHARE`, then the insert).
+>   - Statements that touch only tokens or only sessions (`touch`, `revoke`, `revoke_by_prefix`, the prunes) take no user lock.
+>   - `redeem_in` used to lock the token first, which could deadlock with an issue or an email change. It now reads the token's `user_id` with no lock, locks that user `FOR NO KEY UPDATE`, and then marks the token used. The update re-checks the purpose, that the token is unused and unexpired, and that `user_id` still matches.
+>   - Tests: `a_redemption_racing_a_new_link_completes_without_a_deadlock` and `a_redemption_racing_an_email_change_completes_without_a_deadlock`. Each holds the user row and queues the rival ahead of the redemption: the order that used to deadlock. With the old `redeem_in`, both fail.
+>   - Later tasks (8, 9, 10b, 12) that write these tables in a transaction with a user row must keep this order.
+> - **Every session insert in `signin.rs` is stamped (fifth review of PR #337).**
+>   - `use_link` returns `LinkUsed { user, ended, stamp }`, where `stamp` is `NewPassword::stamp()`, the hash it just stored. Setup starts its session through the stamped `begin`, just as a password sign-in does. If a reset replaces the password between setup's commit and the session insert, setup creates no session and redirects to `/signin`.
+>   - A reset signs nobody in.
+>   - The unstamped `sign_in` is kept for Tasks 8 and 9 under `#[expect(dead_code)]`; delete that attribute when the first of them calls it.
+>   - Test: `a_session_after_setup_is_refused_once_a_reset_replaced_the_password`.
+> - **A console write with CSRF has a journey:** `an_admin_session_writes_through_the_console_with_its_csrf_token`. It signs in at `/signin`, reloads, checks that no key is stored, creates a user in the UI and reads it back through the API. Removing the `X-OKF-CSRF` line from `api.js` makes it fail.
+> - **Typed text Postgres would refuse never reaches SQL on the sign-in surface (seventh review of PR #337).**
+>   - `users::normalize_email(raw) -> Option<String>` trims and lowercases an address. It returns `None` when `check_email` refuses the address: too long, no single `@`, a space, a control character such as NUL, or a header special.
+>   - `/signin` checks a `None` address as the empty address, which names nobody: the same dummy hash and the same 401. The audit lookup uses the same value. `/signin/forgot` does no work for a `None` address and gives the same answer.
+>   - The store guards its own lookups through `users::is_lookup_email`. `passwords::verify` runs the dummy hash without a query. `users::find_by_email` and `email_tokens::issue_for_email` answer "nobody".
+>   - Link tokens are only ever bound as their SHA-256, so a NUL in one is a plain 410.
+>   - `return_to` never reaches SQL, and `safe_return_to` refuses control characters.
+>   - Genuine database errors are still 500.
+>   - Tests: `an_email_postgres_would_refuse_is_an_unknown_email`, `forgot_answers_alike_for_an_email_postgres_would_refuse`, `a_link_token_with_a_nul_is_410`.
+> - **One place picks a request's credentials (sixth review of PR #337).** `core/api.js` exports `authHeaders(method, { key = store.key, csrf = store.csrf })`. With a key it returns `Authorization: Bearer`. Without one, a non-GET request gets `X-OKF-CSRF`, and the session cookie goes by itself.
+>   - `request`, the import upload (`components/upload.js`'s XMLHttpRequest) and `main.js`'s cookie-only session calls (`key: null`) all use it.
+>   - Task 14a's shared modules must not build an `Authorization` header anywhere else.
+>   - Journey: `catalogs::an_admin_signed_in_with_a_password_imports_an_archive`.
+> - **One credential at a time in the console (second review of PR #337).**
+>   - At boot, `main.js` asks `GET /api/v1/session` first (a plain fetch, cookie only). A live session wins over a stored key, and the stored key is dropped. Otherwise a stored key is used; otherwise the login card is shown.
+>   - Sign-out (`endCookieSession`) always asks the server, cookie-only, whether the browser has a session. If it does, it sends `DELETE /api/v1/session` with that session's CSRF token, and only then clears the key. The failure rule is unchanged.
+>   - Journeys: `an_account_sign_in_replaces_a_stored_key_and_sign_out_ends_both` and `sign_out_ends_a_cookie_session_hidden_behind_a_stored_key`. Task 14a builds on this boot order.
+> - Without `public_url`, `POST /signin` answers 404 (an explicit handler), not axum's 405.
+> - `http::router`'s trace span (`request_span`) records the method and the path, not the URI: `DefaultMakeSpan` logged `?token=...` of every emailed link.
+> - The console's 403 toast reads "Your account cannot do this." for a session (no stored key).
+> - `Ui::sign_in_password` also waits for `#whoami` to show an identity (`" - "`), not only for `#app` to be visible. `tests/ui_e2e/signin.rs` has a `server()` helper and a second journey (a refused password, then a session that survives a reload, via `TestServer::user_with_password`).
+> - Extra unit tests: hostile `return_to` values (`//evil.example`, `/\evil.example`, `javascript:`, encoded forms), the cross-site refusal, an expired setup and reset link, the per-address forgot limit, and the pages' CSP with no script.
+
 - [ ] **Step 1: Write the failing tests.** `src/http/signin.rs` tests (the session cookie's attributes, rotation at sign-in, the limits, the links):
 
 ```rust
@@ -13194,11 +13254,17 @@ async fn setup_finish(
         return Err(expired().into());
     };
     let now = app.clock().now();
-    let user = email_tokens::redeem(app.pool(), &token, Purpose::Setup, now).await?;
+    // Corrected (issue #316): the link is used and the passkey stored in one
+    // transaction, as the password setup does (`use_link` in signin.rs), so a
+    // failure leaves the link usable. `passkey_rows::add` needs an `_in`
+    // form taking `&mut PgConnection` for this.
+    let mut tx = app.pool().begin().await?;
+    let user = email_tokens::redeem_in(&mut tx, &token, Purpose::Setup, now).await?;
     if user.id != user_id {
         return Err(OkfError::Gone { reason: LINK_EXPIRED.to_string() }.into());
     }
-    passkey_rows::add(app.pool(), &user.id, &passkey, &pending.name, now).await?;
+    passkey_rows::add_in(&mut tx, &user.id, &passkey, &pending.name, now).await?;
+    tx.commit().await?;
     append_all(&mut headers, &sign_in(&app, &parts, &user, Method::Setup).await?);
     Ok((headers, Json(serde_json::json!({ "redirect": pending.return_to }))).into_response())
 }
@@ -21548,7 +21614,7 @@ Every page renders through `h()` and `fill()`, never `innerHTML`, never inline s
 
 Helpers from Task 7b that the journeys use (do not redefine them):
 - `TestServer::user_with_password(&self, name: &str, email: &str, password: &str) -> String` (`tests/support/server.rs`): creates the user, sets its email and password, polls, and returns the user's id.
-- `Ui::sign_in_password(&self, email: &str, password: &str)` (`tests/ui_e2e/harness.rs`): opens `{base}/signin`, fills the password form, submits it and waits for `#app`.
+- `Ui::sign_in_password(&self, email: &str, password: &str)` (`tests/ui_e2e/harness.rs`): opens `{base}/signin`, fills the password form, submits it and waits for `#app` and for `#whoami` to show the identity.
 
 - [ ] **Step 1: Add the harness helper and the shared journey fixtures.**
 

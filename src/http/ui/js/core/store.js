@@ -1,5 +1,7 @@
-// Browser-side state: the signed-in key and preferences, the whoami answer.
-// Values live in memory; localStorage only persists them across reloads.
+// Browser-side state: the signed-in key and preferences, the whoami answer
+// and a console session's CSRF token. Values live in memory; localStorage
+// only persists the key and preferences across reloads (never the token,
+// which the console reads again from /api/v1/session at boot).
 // Storage can be unavailable or throw (private windows, blocked site data),
 // and then the console still works for this page's lifetime.
 
@@ -27,6 +29,7 @@ function write(name, value) {
 
 export const store = {
     whoami: null,
+    csrf: null,
     get key() { return read(KEY); },
     set key(value) { write(KEY, value); },
     get catalog() { return read(CATALOG); },
