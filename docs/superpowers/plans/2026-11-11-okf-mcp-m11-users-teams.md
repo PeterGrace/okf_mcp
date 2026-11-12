@@ -171,7 +171,7 @@ pub(crate) const TEST_TEAM: &str = "test-user";
 | `tests/ui_e2e/{users,teams}.rs`, `tests/ui_e2e/main.rs` | 8 | create, register |
 | `tests/support/server.rs` | 3, 4 | fixture user, owner, key user |
 | `docs/operations.md`, `README.md` | 9 | user/team sections, parity table |
-| `tests/parity.rs` | 9 | create |
+| `tests/admin_parity.rs` | 9 | create (`tests/parity.rs` is taken; see Task 9) |
 
 ## Task dependencies
 
@@ -2316,10 +2316,12 @@ git commit -am "feat(console): users and teams pages, user and owner pickers, un
 
 > **Corrected (issue #284).** Also update the list-column descriptions: `key list` and `oauth code list` (around `operations.md:468` and the `oauth code list` row) end with `user U`, `catalog list` gains `owner T` before the description, and `user list` / `team list` print the labelled, tab-separated layout in Task 6 Step 4.
 - Modify: `README.md` if it shows `key create` or `catalog create`
-- Create: `tests/parity.rs`
+- Create: `tests/admin_parity.rs`
+
+> **Corrected (issue #287).** `tests/parity.rs` already exists: it holds the differential tests against `okf.py` (`cargo test --test parity`). The parity test shipped as `tests/admin_parity.rs` (`cargo test --test admin_parity`). Besides the two tests below it adds `every_parity_row_names_a_documented_route_and_a_console_control`, which parses the row and fails when its REST cell is not a single route listed in an API reference table of `docs/operations.md`, or its console cell is empty. `okf_mcp::cli` was already public, so `src/lib.rs` is unchanged. The REST routes went into a new `### Users and teams API` subsection of "Web console" (plus rows in the keys, codes and catalogs tables), and the user-facing section is `## Users and teams` before "Report-only maintenance". The catalog-owner route's path parameter is `{catalog}`, as in the other catalog routes. The follow-ups are #296-#299, labelled `enhancement` like M10's.
 - Modify: the spec's status line: "delivered in … (plan `docs/superpowers/plans/2026-11-11-okf-mcp-m11-users-teams.md`)", plus a "What shipped differently" section listing Decisions 1, 2 and 6
 
-- [ ] **Step 1: Write the failing parity test** `tests/parity.rs`:
+- [ ] **Step 1: Write the failing parity test** `tests/admin_parity.rs`:
 
 ```rust
 //! Every admin subcommand for users, teams and assignment has a documented
@@ -2369,7 +2371,7 @@ fn every_user_and_team_subcommand_is_covered() {
 }
 ```
 
-Run it: `cargo test --test parity`. It fails: the section doesn't exist yet. If `okf_mcp::cli::Cli` isn't public, make the module `pub` in `src/lib.rs` (check `src/lib.rs` first; `tests/` already uses `okf_mcp::config`).
+Run it: `cargo test --test admin_parity`. It fails: the section doesn't exist yet. If `okf_mcp::cli::Cli` isn't public, make the module `pub` in `src/lib.rs` (check `src/lib.rs` first; `tests/` already uses `okf_mcp::config`).
 
 - [ ] **Step 2: Write the docs.** In `docs/operations.md`, after the API keys section, add `## Users and teams`, covering:
   - The model in five lines: users, personal teams, teams, catalog ownership, and that ownership grants no access.
@@ -2390,12 +2392,12 @@ Run it: `cargo test --test parity`. It fails: the section doesn't exist yet. If 
 | `okf-mcp team set-role` | `PUT /api/v1/teams/{name}/members/{user}` | Teams → team → role |
 | `okf-mcp team remove-member` | `DELETE /api/v1/teams/{name}/members/{user}` | Teams → team → Remove |
 | `okf-mcp team delete` | `DELETE /api/v1/teams/{name}` | Teams → team → Delete team |
-| `okf-mcp catalog set-owner` | `PUT /api/v1/catalogs/{name}/owner` | Catalogs → catalog → Change owner |
+| `okf-mcp catalog set-owner` | `PUT /api/v1/catalogs/{catalog}/owner` | Catalogs → catalog → Change owner |
 | `okf-mcp key assign` | `PUT /api/v1/keys/{id}/user` | API keys → key → Assign / Change user; Users → Unassigned |
 | `okf-mcp oauth code assign` | `PUT /api/v1/oauth/codes/{id}/user` | API keys → code → Assign / Change user; Users → Unassigned |
 | `okf-mcp unassigned` | `GET /api/v1/unassigned` | Users → Unassigned (badge on Users) |
 
-- [ ] **Step 3: Run** `cargo test --test parity`, then `just fmt && just lint && just test`. Expected: PASS.
+- [ ] **Step 3: Run** `cargo test --test admin_parity`, then `just fmt && just lint && just test`. Expected: PASS.
 
 - [ ] **Step 4: File the follow-up issues** (spec "Future work") with `gh issue create`, one each:
   1. "Make credential user and catalog owner NOT NULL once nothing is unassigned"

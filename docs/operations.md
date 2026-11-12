@@ -428,11 +428,21 @@ out of sync in a GitOps tool). Leaving the field out lets the cluster decide.
 The subcommands run inside the pod, where `DATABASE_URL`, the TLS variables
 and `OKF_MCP_CONFIG` are already set.
 
-**Create a catalog:**
+**Create a user** for each person who will hold a credential. Every key,
+sign-in code and catalog needs one: a key or code belongs to a user, and a
+catalog to a team. Creating user `alice` also creates her personal team
+`alice` ([Users and teams](#users-and-teams) has the rest):
+
+```sh
+kubectl -n okf-mcp exec deploy/okf-mcp -- okf-mcp user create alice --display-name "Alice Example"
+```
+
+**Create a catalog**, owned by a team (a user's name names that user's
+personal team):
 
 ```sh
 kubectl -n okf-mcp exec deploy/okf-mcp -- \
-    okf-mcp catalog create notes --description "Team notes"
+    okf-mcp catalog create notes --description "Team notes" --owner alice
 ```
 
 **Change a catalog's description** (what `list_catalogs` tells agents, for
@@ -446,17 +456,18 @@ kubectl -n okf-mcp exec deploy/okf-mcp -- \
 
 **Create keys.** Access is `read`, `write` or `admin`; grant named catalogs
 with `--catalogs a,b` or every catalog, present and future, with `--all`.
-Reporting is independently opt-in via `key create --maintenance-report`: it
-requires read access to the catalog and never grants write access; write/admin
-do not enable reporting by themselves:
+`--user` names the user the key belongs to, which must exist; it changes
+nothing about what the key reaches. Reporting is independently opt-in via
+`key create --maintenance-report`: it requires read access to the catalog and
+never grants write access; write/admin do not enable reporting by themselves:
 
 ```sh
 kubectl -n okf-mcp exec deploy/okf-mcp -- \
-    okf-mcp key create claude --access write --catalogs notes --default notes --actor claude-code-tui
+    okf-mcp key create claude --access write --catalogs notes --default notes --actor claude-code-tui --user alice
 kubectl -n okf-mcp exec deploy/okf-mcp -- \
-    okf-mcp key create claude --access write --catalogs notes --default notes --actor claude-ai-web
+    okf-mcp key create claude --access write --catalogs notes --default notes --actor claude-ai-web --user alice
 kubectl -n okf-mcp exec deploy/okf-mcp -- \
-    okf-mcp key create ops-admin --access admin --all
+    okf-mcp key create ops-admin --access admin --all --user alice
 ```
 
 The positional value is a grouping name, so the two `claude` credentials are
@@ -465,8 +476,9 @@ revocation. `key create` prints the key once and its immutable administration
 id on stderr; only the key's SHA-256 is stored. Put it straight
 into a password manager or a secret store. Never paste it into logs, tickets,
 chat or shell history (a leading space keeps a command out of history in most
-shells). `key list` shows name, actor, id, access, state, grants, default and
-`maintenance_report true|false`, grouped by name. Use
+shells). `key list` shows name, actor, id, access, state, grants, `default
+X`, `maintenance_report true|false` and `user U` (`-` for a key from before
+users existed that nobody has assigned), grouped by name. Use
 `okf-mcp key maintenance-report ID --enabled true|false [--actor ACTOR]` to
 change the reporting flag. `revoke`, `grant`, `ungrant` and `maintenance-report`
 accept an id, an unambiguous live name, or `NAME --actor ACTOR` of an API key;
@@ -482,17 +494,19 @@ redeemed on the OAuth consent page, which exists only once OAuth is on
 (`public_url` is set). The code is printed once. It is single-use and expires
 unused after 24 hours unless `--expires` says otherwise, up to
 `oauth.code_max_expiry` (7 days by default). Access is `read` or `write`;
-`admin` is refused, and `--actor` is required. The person enters the code on
-the consent page, which turns it into an OAuth grant: a key row named
+`admin` is refused. `--user` (required) names the user the code and its grant
+belong to; `--actor` defaults to the code's name. The person enters the code
+on the consent page, which turns it into an OAuth grant: a key row named
 `<code name>.<client host>-<8 characters of the code id>`, with the code's
-catalogs, access, default and actor. `okf-mcp key ...` never acts on a grant;
-`okf-mcp oauth grant revoke ID` revokes one (see
+catalogs, access, default, actor and user. `okf-mcp key ...` never acts on a grant,
+except `key assign`, which gives a key or a grant its user
+([Users and teams](#users-and-teams)); `okf-mcp oauth grant revoke ID` revokes one (see
 [Managing codes and grants](#managing-codes-and-grants) for every
 subcommand, and [OAuth connectors](#oauth-connectors) for the whole flow):
 
 ```sh
 kubectl -n okf-mcp exec deploy/okf-mcp -- \
-    okf-mcp oauth code create laptop --actor example-actor --access write --catalogs notes --default notes
+    okf-mcp oauth code create laptop --actor example-actor --access write --catalogs notes --default notes --user alice
 ```
 
 **Import a catalog**, from a `git archive` tarball (exactly the tracked files)
@@ -585,6 +599,164 @@ client" and "Changesets" sections describe both.
 client on a version before `2026-07-28` gets a stateful session
 (`Mcp-Session-Id`); one on `2026-07-28` is served statelessly.
 
+## Users and teams
+
+Every API key, OAuth grant and sign-in code belongs to a **user**, and every
+catalog to a **team**:
+
+- Creating a user also creates its **personal team**, of the same name, with
+  the user as its owner. A personal team may take more members.
+- A **team** has members, each an `owner` or a `member`. The role governs
+  only the team's own membership.
+- A catalog is owned by exactly one team, and a credential belongs to exactly
+  one user (never a team). `actor` stays as each credential's provenance
+  label.
+- **Ownership grants no access.** A credential reaches exactly the catalogs
+  it is granted; owning a catalog, or being in the team that owns it, adds
+  nothing.
+
+User and team names are `[a-z0-9-]+` and are unique across both: `user
+create alice` is refused while a team `alice` exists, and the other way
+round. Every command below needs the database, as every subcommand does; the
+REST routes and console controls for each are in the
+[parity table](#cli-api-and-console-parity). A running server picks up each
+change within `poll_interval`; the same change through the API or the console
+takes effect at once.
+
+| Command | Does |
+|---|---|
+| `okf-mcp user create NAME [--display-name TEXT]` | Creates the user and its personal team `NAME` |
+| `okf-mcp user list` | One tab-separated line per user: name, `credentials N` (keys, grants and codes naming it, revoked ones included), `teams a,b`, then the display name |
+| `okf-mcp user delete NAME` | Deletes a user nothing references, with its personal team (see below) |
+| `okf-mcp team create NAME [--display-name TEXT] --owner USER` | Creates a shared team with `USER` as its first owner |
+| `okf-mcp team list` | One line per team: name, `personal U` (`-` for a shared team), `members u(role),...`, `catalogs c,...` (`-` for none), then the display name |
+| `okf-mcp team add-member TEAM USER [--role owner\|member]` | Adds a member (`member` by default), or gives a member that role |
+| `okf-mcp team set-role TEAM USER --role owner\|member` | Changes a member's role, adding the user if it is not a member |
+| `okf-mcp team remove-member TEAM USER` | Removes a member |
+| `okf-mcp team delete NAME` | Deletes a shared team that owns no catalog; its memberships go with it |
+| `okf-mcp catalog create NAME --owner TEAM [--description TEXT]` | `--owner` is required |
+| `okf-mcp catalog set-owner NAME --team TEAM` | Moves a catalog to another team, or gives a legacy catalog its first owner. Prints `catalog C: owner OLD -> NEW` (`(none)` for a legacy catalog) |
+| `okf-mcp key create NAME --user USER ...` | `--user` is required; `--actor` still defaults to `NAME` |
+| `okf-mcp key assign ID --user USER [--actor ACTOR]` | Gives a key or an OAuth grant a user, or changes it; access is unchanged. `ID` is an id, or an unambiguous live name (`--actor` narrows it). The only `key` subcommand that also acts on grants. Prints `key ID now belongs to USER` |
+| `okf-mcp oauth code create NAME --user USER ...` | `--user` is required; `--actor` defaults to `NAME` |
+| `okf-mcp oauth code assign ID --user USER` | Gives a sign-in code, in any state, a user. Prints `sign-in code ID now belongs to USER` |
+| `okf-mcp unassigned` | Every key, grant, sign-in code and catalog with no user or owner, one per line (`key NAME (id ID, actor ACTOR)`, `grant NAME (id ID)`, `code NAME (id ID)`, `catalog NAME`), or `nothing is unassigned` |
+
+`catalog list` prints name, `generation N`, `owner T` (`-` when unassigned),
+then the description. `key list`, `oauth grant list` and `oauth code list`
+end with `user U` (`-` when unassigned). Every listing is tab-separated with
+no header row, so `cut -f` works on it.
+
+A shared catalog belongs to a team with several members:
+
+```sh
+okf-mcp user create alice --display-name "Alice Example"
+okf-mcp user create bob
+okf-mcp team create family --display-name "The family" --owner alice
+okf-mcp team add-member family bob
+okf-mcp catalog create recipes --owner family
+okf-mcp key create bob-laptop --access write --catalogs recipes --default recipes --user bob
+okf-mcp team list
+```
+
+### Migrating an existing deployment
+
+Upgrading to a release with users and teams (migration `0009`) creates no
+user and assigns nothing: every key, grant, sign-in code and catalog from
+before it stays **unassigned** and keeps working exactly as before. Assign
+them as follows (inside the pod, with `kubectl exec` as in
+[First run](#6-first-run)):
+
+1. List what is unassigned:
+
+   ```sh
+   okf-mcp unassigned
+   ```
+
+2. Create a user for each person who holds a credential, and a team for each
+   group that shares a catalog:
+
+   ```sh
+   okf-mcp user create alice
+   okf-mcp team create family --owner alice
+   ```
+
+3. Give each key and grant a user (by id, or by an unambiguous live name),
+   each sign-in code a user, and each catalog an owner:
+
+   ```sh
+   okf-mcp key assign claude --actor claude-code-tui --user alice
+   okf-mcp key assign GRANT_ID --user alice     # a grant, by its id
+   okf-mcp oauth code assign CODE_ID --user alice
+   okf-mcp catalog set-owner notes --team family
+   ```
+
+4. Run `okf-mcp unassigned` again, and repeat until it prints `nothing is
+   unassigned`.
+
+The console does the same at Users → "What is unassigned"
+(`/ui/#/users/unassigned`), with a user or team picker and Assign on each
+row; the Users link shows the count while anything is unassigned. Nothing
+forces the migration to finish: assigning is bookkeeping, and an unassigned
+credential authenticates as before (`whoami` shows `user: null`). Making the
+columns `NOT NULL` once nothing is unassigned is future work (#296).
+
+### Deletion rules
+
+Users and teams that something refers to are kept, so the owner of a
+credential or catalog never disappears. Each refusal is a 409 over REST, and
+a non-zero exit naming what still refers to it on the command line:
+
+- `user delete` is refused while any key, grant (revoked ones included) or
+  sign-in code names the user, while the user belongs to a team other than
+  its personal team, or while its personal team owns a catalog. Revoked keys
+  and grants are kept, so a user is refused for as long as any of them still
+  names it; `key assign` can move even a revoked key or grant to another
+  user, and a sign-in code nobody redeemed is pruned a week after it
+  expires.
+- `team delete` is refused for a personal team (it goes with its user) and
+  for a team that owns a catalog.
+- `team remove-member` and `team set-role` never remove or demote a team's
+  last owner, and `remove-member` never removes a personal team's user.
+
+An unknown user or team is a 404 (`{"error": "UnknownName", "message": ...,
+"noun": "user", "name": ...}`) on every route that names one, including the `user` and
+`owner` of a create body; on the command line it is a non-zero exit naming
+it. A create body without its required `user` or `owner` is a 422; on the
+command line a missing `--user` or `--owner` is clap's usage error (exit 2).
+Disabling a user or team instead of deleting it is future work (#297).
+
+### CLI, API and console parity
+
+Every admin command for users, teams and assignment has a REST route and a
+console control. `tests/admin_parity.rs` fails when a `user` or `team`
+subcommand, or one of the assignment commands below, has no row here or its
+row names a route the API reference does not document.
+
+| CLI | REST | Console |
+|---|---|---|
+| `okf-mcp user create` | `POST /api/v1/users` | Users → New user |
+| `okf-mcp user list` | `GET /api/v1/users` | Users |
+| `okf-mcp user delete` | `DELETE /api/v1/users/{name}` | Users → user → Delete user |
+| `okf-mcp team create` | `POST /api/v1/teams` | Teams → New team |
+| `okf-mcp team list` | `GET /api/v1/teams` | Teams |
+| `okf-mcp team add-member` | `PUT /api/v1/teams/{name}/members/{user}` | Teams → team → Add member |
+| `okf-mcp team set-role` | `PUT /api/v1/teams/{name}/members/{user}` | Teams → team → a member's role |
+| `okf-mcp team remove-member` | `DELETE /api/v1/teams/{name}/members/{user}` | Teams → team → Remove |
+| `okf-mcp team delete` | `DELETE /api/v1/teams/{name}` | Teams → team → Delete team |
+| `okf-mcp catalog set-owner` | `PUT /api/v1/catalogs/{catalog}/owner` | Catalogs → catalog → Change owner (Assign when unassigned); Users → What is unassigned |
+| `okf-mcp key assign` | `PUT /api/v1/keys/{id}/user` | API keys → key or grant → Assign / Change user; Users → What is unassigned |
+| `okf-mcp oauth code assign` | `PUT /api/v1/oauth/codes/{id}/user` | API keys → sign-in code → Assign / Change user; Users → What is unassigned |
+| `okf-mcp unassigned` | `GET /api/v1/unassigned` | Users → What is unassigned (`/ui/#/users/unassigned`), and the count on the Users link |
+
+`GET /api/v1/users/{name}` and `GET /api/v1/teams/{name}` (a user's or a
+team's drawer in the console) have no command of their own: `user list` and
+`team list` show the same facts. The users, teams and unassigned writes need
+an admin key that reaches every catalog, as `POST /api/v1/catalogs` does;
+reading users and teams needs any admin key, so a scoped admin can pick the
+user of a key it creates. For any other admin the console shows these
+controls disabled, or the Unassigned view a note, saying why.
+
 ## Report-only maintenance
 
 ### Permissions and lifecycle
@@ -603,7 +775,7 @@ Grant reporting independently of ordinary access. These examples use a synthetic
 secret environment, not report text:
 
 ```sh
-okf-mcp key create investigator --access read --catalogs demo --actor synthetic-investigator --maintenance-report
+okf-mcp key create investigator --access read --catalogs demo --actor synthetic-investigator --user alice --maintenance-report
 okf-mcp key list
 okf-mcp key maintenance-report REPORTER_ID --enabled false
 okf-mcp key maintenance-report REPORTER_ID --enabled true
@@ -1141,11 +1313,12 @@ browser out at its next request.
 
 ### API reference
 
-The API has 34 endpoints. The identity endpoint is below, and each area's
-endpoints are in its own subsection: [API keys](#api-keys) (6),
-[OAuth sign-in codes](#oauth-sign-in-codes) (3),
+The API has 48 endpoints. The identity endpoint is below, and each area's
+endpoints are in its own subsection: [API keys](#api-keys) (7),
+[OAuth sign-in codes](#oauth-sign-in-codes) (4),
+[Users and teams](#users-and-teams-api) (11),
 [Health](#health) (2), [Browse and search](#browse-and-search) (7),
-[Catalogs and import/export](#catalogs-and-importexport) (6),
+[Catalogs and import/export](#catalogs-and-importexport) (7),
 [Findings and runs](#findings-and-runs) (6) and [Changesets](#changesets) (3).
 Each area's tests check every endpoint against the access matrix (no key,
 read, write, admin, and an admin key that does not reach the catalog).
@@ -1177,11 +1350,17 @@ revoke, grant, ungrant or reporting change takes effect on the key's next
 request (the server reloads its keys at once). Key changes made here record
 no audit actor, as with the CLI.
 
+Every key belongs to a user ([Users and teams](#users-and-teams)). New key
+has a required user picker, the list has a User column (`unassigned` for a
+key from before users existed), and each key's or grant's drawer, revoked
+ones included, has Assign (unassigned) or Change user.
+
 | Method and path | Key | Does |
 |---|---|---|
-| `GET /api/v1/keys` | admin | The keys the caller manages, revoked ones included: `id`, `name`, `actor`, `access`, `maintenance_report`, `all_catalogs`, `catalogs`, `default_catalog`, `created_at`, `revoked_at`. Never a secret or hash |
-| `POST /api/v1/keys` | admin | Body `{name, access: "read"\|"write"\|"admin", all, catalogs, default_catalog, actor, maintenance_report}` (`actor` defaults to `name`). Answers `{key, secret}`. 400 for a bad `access`, 403 for `all` from a scoped caller, 404 for an unreached catalog, 409 for a bad or taken name, no catalogs, or `all` with `catalogs`, 422 for an unknown field |
+| `GET /api/v1/keys` | admin | The keys the caller manages, revoked ones included: `id`, `name`, `actor`, `access`, `maintenance_report`, `all_catalogs`, `catalogs`, `default_catalog`, `created_at`, `revoked_at`, `user` (`null` when unassigned). Never a secret or hash |
+| `POST /api/v1/keys` | admin | Body `{name, user, access: "read"\|"write"\|"admin", all, catalogs, default_catalog, actor, maintenance_report}` (`user` required; `actor` defaults to `name`). Answers `{key, secret}`. 400 for a bad `access`, 403 for `all` from a scoped caller, 404 for an unreached catalog or an unknown user, 409 for a bad or taken name, no catalogs, or `all` with `catalogs`, 422 for an unknown field or a missing `user` |
 | `PATCH /api/v1/keys/{id}` | admin | Body `{maintenance_report: bool}`. 409 for a revoked key, or for enabling reporting on an OAuth grant |
+| `PUT /api/v1/keys/{id}/user` | admin | Body `{user}`. Gives the key or OAuth grant (live or revoked) that user, or changes it; access is unchanged. Answers its view, and its next request runs as that user. 404 for an unmanaged key or an unknown user, 422 without `user` |
 | `POST /api/v1/keys/{id}/revoke` | admin | Refused from the key's next request on. 409 if already revoked |
 | `PUT /api/v1/keys/{id}/catalogs/{catalog}` | admin | Grants a catalog. 404 for an unreached catalog or an unmanaged key; 409 for a revoked or all-catalogs key |
 | `DELETE /api/v1/keys/{id}/catalogs/{catalog}` | admin | Removes a grant, and the default if it was that catalog. Errors as for the grant |
@@ -1216,14 +1395,46 @@ OAuth on and connect a client.
 
 | Method and path | Key | Does |
 |---|---|---|
-| `GET /api/v1/oauth/codes` | admin | The codes the caller manages, newest first: `id`, `name`, `actor`, `access`, `all_catalogs`, `catalogs`, `default_catalog`, `state`, `created_at`, `expires_at`, `redeemed_at`, `grant_id`, `revoked_at`. Never a code or hash |
-| `POST /api/v1/oauth/codes` | admin | Body `{name, actor, access: "read"\|"write", all, catalogs, default_catalog, expires_in}` (`expires_in` like `2h` or `3d`, default 24h). Answers `{code, secret}`. 400 for a bad `access` or `expires_in`, 403 for `all` from a scoped caller, 404 for an unreached catalog, 409 for `admin`, a bad name, an empty actor, no catalogs, `all` with `catalogs` or too long an expiry, 422 for an unknown field |
+| `GET /api/v1/oauth/codes` | admin | The codes the caller manages, newest first: `id`, `name`, `actor`, `access`, `all_catalogs`, `catalogs`, `default_catalog`, `state`, `created_at`, `expires_at`, `redeemed_at`, `grant_id`, `revoked_at`, `user` (`null` when unassigned). Never a code or hash |
+| `POST /api/v1/oauth/codes` | admin | Body `{name, user, actor, access: "read"\|"write", all, catalogs, default_catalog, expires_in}` (`user` required; `actor` optional, and absent or blank means `name`; `expires_in` like `2h` or `3d`, default 24h). Answers `{code, secret}`. 400 for a bad `access` or `expires_in`, 403 for `all` from a scoped caller, 404 for an unreached catalog or an unknown user, 409 for `admin`, a bad name, no catalogs, `all` with `catalogs` or too long an expiry, 422 for an unknown field or a missing `user` |
 | `DELETE /api/v1/oauth/codes/{id}` | admin | Revokes an unredeemed code; answers its view. 404 for an unmanaged code, 409 if redeemed or already revoked |
+| `PUT /api/v1/oauth/codes/{id}/user` | admin | Body `{user}`. Gives the code (in any state) that user; answers its view. A grant the code already became keeps its own user (`PUT /api/v1/keys/{id}/user`). 404 for an unmanaged code or an unknown user, 422 without `user` |
 
 ```sh
 curl -fsS -H "Authorization: Bearer $OKF_MCP_KEY" -H 'Content-Type: application/json' \
-    -d '{"name":"laptop","actor":"example-actor","access":"read","catalogs":["main"]}' \
+    -d '{"name":"laptop","user":"alice","access":"read","catalogs":["main"]}' \
     https://okf-mcp.example.com/api/v1/oauth/codes
+```
+
+### Users and teams API
+
+The routes behind `okf-mcp user ...`, `team ...` and `unassigned`
+([Users and teams](#users-and-teams) has the model and the
+[parity table](#cli-api-and-console-parity)). Writes and `GET /unassigned`
+need an admin key that reaches every catalog (403 for any other key), since
+users and teams are not catalog-scoped; reads need any admin key (403 below
+admin). Every change takes effect at once. A refusal under the
+[deletion rules](#deletion-rules) is 409, and an unknown user or team 404
+(`UnknownName`).
+
+| Method and path | Key | Does |
+|---|---|---|
+| `GET /api/v1/users` | admin | `{users}`, by name: `name`, `display_name`, `created_at`, `credentials` (keys, grants and codes naming it, whoever manages them), `teams` |
+| `POST /api/v1/users` | admin, every catalog | Body `{name, display_name}` (`display_name` optional). Creates the user and its personal team; 201 with the user. 409 for an invalid or taken name, 422 without `name` |
+| `GET /api/v1/users/{name}` | admin | `{user, keys, codes}`: the user, and the keys, grants and codes naming it that the caller manages |
+| `DELETE /api/v1/users/{name}` | admin, every catalog | Deletes the user with its personal team; 204. 409 while something refers to it |
+| `GET /api/v1/teams` | admin | `{teams}`, by name: `name`, `display_name`, `personal_of` (the user whose personal team it is, or `null`), `created_at`, `members` (`[{user, role}]`, by user), `catalogs` (the names it owns) |
+| `POST /api/v1/teams` | admin, every catalog | Body `{name, display_name, owner}` (`owner` required: the first owner's user name). 201 with the team. 404 for an unknown owner, 409 for an invalid or taken name, 422 without `owner` |
+| `GET /api/v1/teams/{name}` | admin | The team, as in the list |
+| `DELETE /api/v1/teams/{name}` | admin, every catalog | Deletes a shared team that owns no catalog; 204. 409 for a personal team or one that owns a catalog |
+| `PUT /api/v1/teams/{name}/members/{user}` | admin, every catalog | Body `{role: "owner"\|"member"}`. Adds the user, or gives a member that role; answers `{change: "added"\|"role_changed"\|"unchanged", team}`. 409 for demoting the last owner, 422 for a missing or unknown `role` |
+| `DELETE /api/v1/teams/{name}/members/{user}` | admin, every catalog | Removes a member; answers the team. 409 for a non-member, the last owner, or a personal team's user |
+| `GET /api/v1/unassigned` | admin, every catalog | `{keys, codes, catalogs}`: the keys and grants (live and revoked) and codes with no user, as in their own lists, and the names of the catalogs with no owner |
+
+```sh
+curl -fsS -H "Authorization: Bearer $OKF_MCP_KEY" -H 'Content-Type: application/json' \
+    -d '{"name":"family","owner":"alice"}' \
+    https://okf-mcp.example.com/api/v1/teams
 ```
 
 ### Health
@@ -1296,15 +1507,17 @@ curl -s -H "Authorization: Bearer $OKF_MCP_KEY" \
 
 | Method and path | Key | Does |
 |---|---|---|
-| `GET /api/v1/catalogs` | any | The catalogs the key reaches, by name: `name`, `description`, `files`, `concepts`, `generation` (of the loaded snapshot, what `expect_generation` compares against) and `last_change` (`null` when empty) |
-| `POST /api/v1/catalogs` | admin, every catalog | `{name, description}` (`description` optional). 201 with the new catalog's summary; 409 for an invalid or taken name; 403 for a key granted named catalogs, since it would not reach the new one |
+| `GET /api/v1/catalogs` | any | The catalogs the key reaches, by name: `name`, `description`, `owner_team` (`null` when unassigned), `files`, `concepts`, `generation` (of the loaded snapshot, what `expect_generation` compares against) and `last_change` (`null` when empty) |
+| `POST /api/v1/catalogs` | admin, every catalog | `{name, description, owner}` (`description` optional; `owner` required, a team's name). 201 with the new catalog's summary; 403 for a key granted named catalogs, since it would not reach the new one; 404 for an unknown owner; 409 for an invalid or taken name; 422 without `owner` |
 | `PATCH /api/v1/catalogs/{catalog}` | admin | `{description}`. Answers `{name, previous, description}` |
+| `PUT /api/v1/catalogs/{catalog}/owner` | admin, every catalog | `{team}`. Makes the team the owner; answers `{name, previous, owner_team}` (`previous` is `null` for a legacy catalog). 404 for an unknown catalog or team, 422 without `team`. Ownership grants no access |
 | `DELETE /api/v1/catalogs/{catalog}[?force=true]` | admin | Deletes the catalog with its documents, history, changesets and grants; answers `{name}`. 409 while an open changeset holds unpublished changes, unless `force=true` |
 | `GET /api/v1/catalogs/{catalog}/export` | read | The same handler and 120 s timeout as `/catalogs/{name}/export` |
 | `POST /api/v1/catalogs/{catalog}/import[?replace=true&only_machinery=true&expect_generation=N]` | admin | The same handler, body cap and upload deadline as `/catalogs/{name}/import` |
 
 A catalog the key does not reach, or that does not exist, is 404 on every
-route but the list and the create.
+route but the list, the create and the owner change (which reaches every
+catalog).
 
 - Catalog changes take effect at once: the handler polls after each one, so
   the next request (and the console's catalog switcher) sees it.
@@ -1320,10 +1533,11 @@ route but the list and the create.
 curl -s -H "Authorization: Bearer $OKF_MCP_KEY" https://okf-mcp.example.com/api/v1/catalogs
 ```
 
-The Catalogs page lists the catalogs with their counts. An admin opens a row
-to change its description or delete it (typing its name to confirm, with a
-force box for unpublished changes); an admin key that reaches every catalog
-also gets New catalog. The Import & export page exports the selected catalog
+The Catalogs page lists the catalogs with their owner team and counts. An
+admin opens a row to change its description or delete it (typing its name to
+confirm, with a force box for unpublished changes); an admin key that reaches
+every catalog also gets New catalog (with a required owner team) and the
+drawer's Change owner (Assign for an unassigned catalog). The Import & export page exports the selected catalog
 as a `.tar.gz` download, and, for an admin, uploads one with the import
 options, a progress bar and the import report (or the refusal and its
 problems). It pre-fills the expected generation from `GET /api/v1/catalogs`,
@@ -1476,7 +1690,7 @@ change over time, so they are described generically here.
    ```sh
    kubectl -n okf-mcp exec deploy/okf-mcp -- \
        okf-mcp oauth code create chatgpt --actor example-actor \
-       --access write --catalogs notes --default notes
+       --access write --catalogs notes --default notes --user alice
    ```
 
    The command prints the code (`okfsc_...`) once on stdout, and its id and
@@ -1518,10 +1732,11 @@ people, or the same client again after a revoke, takes a new code each time.
 
 | Command | Does |
 |---|---|
-| `okf-mcp oauth code create NAME --actor ACTOR --access read\|write (--catalogs C,C... \| --all) [--default C] [--expires 24h]` | Mints a single-use code. Prints the `okfsc_` code once (stdout) and its id and expiry (stderr). `NAME` is a label in `[A-Za-z0-9._-]+`; `--catalogs` is comma-separated, as for `key create`; `--default` must be granted. `--access admin` is refused. `--expires` (`24h`, `3d`) defaults to 24 hours and may not exceed `oauth.code_max_expiry` |
-| `okf-mcp oauth code list` | Every code, never the code itself. Tab-separated: name, actor, id, access, state (`live`, `expired`, `redeemed` or `revoked`), catalogs (`*` for all), `default`, `expires`, `grant` (the grant a redeemed code became) |
+| `okf-mcp oauth code create NAME --user USER [--actor ACTOR] --access read\|write (--catalogs C,C... \| --all) [--default C] [--expires 24h]` | Mints a single-use code. Prints the `okfsc_` code once (stdout) and its id and expiry (stderr). `NAME` is a label in `[A-Za-z0-9._-]+`; `--user` names the user the code and its grant belong to (it must exist); `--actor` defaults to `NAME`; `--catalogs` is comma-separated, as for `key create`; `--default` must be granted. `--access admin` is refused. `--expires` (`24h`, `3d`) defaults to 24 hours and may not exceed `oauth.code_max_expiry` |
+| `okf-mcp oauth code list` | Every code, never the code itself. Tab-separated: name, actor, id, access, state (`live`, `expired`, `redeemed` or `revoked`), catalogs (`*` for all), `default D`, `expires T`, `grant G` (the grant a redeemed code became), `user U`; an empty cell is `-` |
 | `okf-mcp oauth code revoke ID` | Revokes a code nobody has redeemed. Refuses a redeemed or already revoked one |
-| `okf-mcp oauth grant list` | The OAuth grants, revoked ones included, with `key list`'s columns and `client <name>` |
+| `okf-mcp oauth code assign ID --user USER` | Gives a code, in any state, a user. The grant a redeemed code became keeps its own user: assign that with `okf-mcp key assign` ([Users and teams](#users-and-teams)) |
+| `okf-mcp oauth grant list` | The OAuth grants, revoked ones included, with `key list`'s columns (ending in `user U`) and `client <name>` |
 | `okf-mcp oauth grant revoke ID` | Revokes a grant by its exact id, and with it every token it holds. Refuses a plain key's id |
 
 Each takes `--database-url` and `--config` like every subcommand; inside the
@@ -1535,7 +1750,8 @@ apart grants made from codes of the same name. `okf-mcp key revoke`,
 `grant`, `ungrant` and `maintenance-report` act on API keys only: they never
 match a grant, even one whose name and actor equal a key's. Reach a grant by
 its id, with `okf-mcp oauth grant revoke` or the `/api/v1/keys/{id}` routes
-("API keys").
+("API keys"). The one `key` subcommand that does reach grants is
+`okf-mcp key assign`, which changes only a grant's user.
 
 **Revoking.**
 
@@ -1563,10 +1779,12 @@ server's poll loop.
 The API keys page (`/ui/#/keys`):
 
 - **Sign-in codes**, below the keys. "New sign-in code" mints one (name,
-  actor, `read` or `write`, catalogs, default, an expiry of 1 hour to 7 days)
+  user, an optional actor, `read` or `write`, catalogs, default, an expiry of
+  1 hour to 7 days)
   and shows it once, in a dialog that keeps it only until "I have stored it"
   is clicked. The list shows live codes; "Show redeemed, expired and revoked
-  codes" shows the rest. A live or expired code's drawer revokes it.
+  codes" shows the rest. A live or expired code's drawer revokes it, and
+  every code's drawer has Assign or Change user.
 - **OAuth grants**, in the key list, marked `OAuth` with their client's name.
   A grant's drawer shows its kind ("OAuth grant") and client, revokes it, and
   changes its catalogs. It has no maintenance-reporting switch: a grant never
