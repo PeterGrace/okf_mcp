@@ -2442,7 +2442,7 @@ git commit -m "feat(auth): per-catalog levels, self-issued keys and key expiry" 
 
 **Files:**
 - Create: `src/store/ceiling.rs`
-- Modify: `src/store/mod.rs` (`pub mod ceiling;`, after `catalogs`), `src/auth.rs` (`KeyCache::by_user`, capping in `from_records`, `KeyCache::read` loads ceilings, `Keys::ceiling_of`), `src/store/keys.rs:1386` (test call of `from_records`)
+- Modify: `src/store/mod.rs` (`pub mod ceiling;`, after `catalogs`), `src/auth.rs` (`KeyCache::by_user`, capping in `from_records`, `KeyCache::read` loads ceilings, `Keys::ceiling_of`), `src/store/keys.rs` (the test call of `from_records` in `names_group_actors_and_revoked_pairs_can_be_reissued`)
 - Test: `src/store/ceiling.rs`, `src/auth.rs` (`mod tests`)
 
 The rules (spec "The ceiling" and "Effective access"):
@@ -2453,6 +2453,8 @@ The rules (spec "The ceiling" and "Effective access"):
 | self-issued credential | each catalog at the lower of its own level and the ceiling's; a catalog missing from either is not reached |
 | admin-issued credential | unchanged |
 | bumps `admin_generation` | `set_member_access` (on a change), `entitle` (on a change), `unentitle` (when it removes a row); team membership and catalog owner changes already bump (M11) |
+
+> **Corrected (issue #311, 2026-11-12).** Every other write to a ceiling's inputs was checked, and each already bumps: `teams::set_member` and `remove_member`, `catalogs::create`, `set_owner` and `delete`, and `users::delete` (entitlements cascade with their catalog and their user). Nothing else writes `team_members`, `catalogs.owner_team_id`, `catalogs.member_access` or `user_catalogs`. The shipped tests add `every_write_that_moves_a_ceiling_bumps_the_generation` in `src/store/ceiling.rs`, which walks each of those writes and checks both the bump and the new ceiling. A later task that adds a write to any of those tables or columns must bump `admin_generation` in the same transaction and extend that test.
 
 - [ ] **Step 1: Write the failing tests** at the bottom of `src/store/ceiling.rs` (create the file with its module doc and an empty `#[cfg(test)] mod tests` first, and register it in `src/store/mod.rs`):
 
