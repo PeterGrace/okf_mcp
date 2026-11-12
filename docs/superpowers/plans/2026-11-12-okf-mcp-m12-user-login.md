@@ -10794,6 +10794,10 @@ Builds on Task 7a's pages, limits, `start_session`, `Browser` and `/api/v1/sessi
 >   - The unstamped `sign_in` is kept for Tasks 8 and 9 under `#[expect(dead_code)]`; delete that attribute when the first of them calls it.
 >   - Test: `a_session_after_setup_is_refused_once_a_reset_replaced_the_password`.
 > - **A console write with CSRF has a journey:** `an_admin_session_writes_through_the_console_with_its_csrf_token`. It signs in at `/signin`, reloads, checks that no key is stored, creates a user in the UI and reads it back through the API. Removing the `X-OKF-CSRF` line from `api.js` makes it fail.
+> - **One place picks a request's credentials (sixth review of PR #337).** `core/api.js` exports `authHeaders(method, { key = store.key, csrf = store.csrf })`. With a key it returns `Authorization: Bearer`. Without one, a non-GET request gets `X-OKF-CSRF`, and the session cookie goes by itself.
+>   - `request`, the import upload (`components/upload.js`'s XMLHttpRequest) and `main.js`'s cookie-only session calls (`key: null`) all use it.
+>   - Task 14a's shared modules must not build an `Authorization` header anywhere else.
+>   - Journey: `catalogs::an_admin_signed_in_with_a_password_imports_an_archive`.
 > - **One credential at a time in the console (second review of PR #337).**
 >   - At boot, `main.js` asks `GET /api/v1/session` first (a plain fetch, cookie only). A live session wins over a stored key, and the stored key is dropped. Otherwise a stored key is used; otherwise the login card is shown.
 >   - Sign-out (`endCookieSession`) always asks the server, cookie-only, whether the browser has a session. If it does, it sends `DELETE /api/v1/session` with that session's CSRF token, and only then clears the key. The failure rule is unchanged.
