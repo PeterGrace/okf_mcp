@@ -240,6 +240,7 @@ impl TestServer {
             grants,
             default_catalog: default,
             actor: id,
+            user: OWNER,
         };
         let key = keys::create(&self.db.pool, &new, Utc::now())
             .await

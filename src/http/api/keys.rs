@@ -55,6 +55,8 @@ pub(crate) struct KeyView {
     pub created_at: String,
     /// When it was revoked, if it was.
     pub revoked_at: Option<String>,
+    /// The user it belongs to (`None`: unassigned, from before users existed).
+    pub user: Option<String>,
 }
 
 impl From<KeyRecord> for KeyView {
@@ -78,6 +80,7 @@ impl From<KeyRecord> for KeyView {
             // `client_id: _`: a URL or UUID the console has no use for.
             client_id: _,
             client_name,
+            user,
         } = record;
         Self {
             id,
@@ -93,6 +96,7 @@ impl From<KeyRecord> for KeyView {
             created_at: format_timestamp(created_at),
             // `Option::map` with a function name applies it to the value, if any.
             revoked_at: revoked_at.map(format_timestamp),
+            user,
         }
     }
 }
@@ -149,6 +153,8 @@ struct CreateKeyBody {
     /// May submit maintenance reports.
     #[serde(default)]
     maintenance_report: bool,
+    /// The user it belongs to (required; must exist).
+    user: String,
 }
 
 /// `PATCH /keys/{id}`'s body.
@@ -317,8 +323,9 @@ async fn list_keys(
 /// # Errors
 /// 403 below admin, or `all: true` from a caller that does not reach every
 /// catalog; 404 for a catalog the caller does not reach (or that does not
-/// exist); 400 for an unknown `access`; 409 for a bad or taken name, no
-/// catalogs, `all` together with `catalogs`, or an ungranted default.
+/// exist) or an unknown user; 400 for an unknown `access`; 409 for a bad or
+/// taken name, no catalogs, `all` together with `catalogs`, or an ungranted
+/// default; 422 for a body without `user`.
 async fn create_key(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
@@ -345,6 +352,7 @@ async fn create_key(
         grants,
         default_catalog,
         actor,
+        user: &body.user,
     };
     let created = key_rows::create_with_id(app.pool(), &new, app.clock().now()).await?;
     let Json(key) = changed(&app, &principal, &created.id).await?;
@@ -441,6 +449,7 @@ mod tests {
             grants,
             default_catalog: None,
             actor: name,
+            user: crate::db::TEST_USER,
         };
         let created = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
             .await
@@ -480,8 +489,10 @@ mod tests {
                 Row {
                     method: "POST",
                     uri: "/api/v1/keys".into(),
-                    body: Some(json!({"name": "made", "access": "read",
-                                        "catalogs": ["main"], "default_catalog": "main"})),
+                    body: Some(
+                        json!({"user": crate::db::TEST_USER, "name": "made", "access": "read",
+                                        "catalogs": ["main"], "default_catalog": "main"}),
+                    ),
                     read: 403,
                     write: 403,
                     admin: 200,
@@ -532,7 +543,7 @@ mod tests {
     async fn create_returns_the_secret_once_and_the_new_key_works() {
         let test = app().await;
         let keys = keys(&test).await;
-        let body = json!({"name": "fresh", "access": "write", "catalogs": ["main"],
+        let body = json!({"user": crate::db::TEST_USER, "name": "fresh", "access": "write", "catalogs": ["main"],
                           "default_catalog": "main", "actor": "agent/fresh"});
         let (status, created) =
             send(&test, "POST", "/api/v1/keys", Some(&keys.admin), Some(body)).await;
@@ -568,7 +579,7 @@ mod tests {
     async fn the_actor_defaults_to_the_name() {
         let test = app().await;
         let keys = keys(&test).await;
-        let body = json!({"name": "plain", "access": "read", "catalogs": ["main"]});
+        let body = json!({"user": crate::db::TEST_USER, "name": "plain", "access": "read", "catalogs": ["main"]});
         let (status, created) =
             send(&test, "POST", "/api/v1/keys", Some(&keys.admin), Some(body)).await;
         assert_eq!(status.as_u16(), 200, "{created}");
@@ -587,46 +598,46 @@ mod tests {
         };
         // A catalog the admin does not reach looks like an unknown one.
         let (status, _) = post(
-            json!({"name": "x1", "access": "read", "catalogs": ["other"]}),
+            json!({"user": crate::db::TEST_USER, "name": "x1", "access": "read", "catalogs": ["other"]}),
             keys.admin.clone(),
         )
         .await;
         assert_eq!(status.as_u16(), 404);
         // Only a key that reaches every catalog may make one that does.
         let (status, _) = post(
-            json!({"name": "x2", "access": "read", "all": true}),
+            json!({"user": crate::db::TEST_USER, "name": "x2", "access": "read", "all": true}),
             keys.admin.clone(),
         )
         .await;
         assert_eq!(status.as_u16(), 403);
         let (status, _) = post(
-            json!({"name": "x3", "access": "read", "all": true}),
+            json!({"user": crate::db::TEST_USER, "name": "x3", "access": "read", "all": true}),
             root.key.clone(),
         )
         .await;
         assert_eq!(status.as_u16(), 200);
         // Bad input.
         let (status, body) = post(
-            json!({"name": "x4", "access": "owner", "catalogs": ["main"]}),
+            json!({"user": crate::db::TEST_USER, "name": "x4", "access": "owner", "catalogs": ["main"]}),
             keys.admin.clone(),
         )
         .await;
         assert_eq!(status.as_u16(), 400);
         assert_eq!(body["error"], "InvalidPath");
         let (status, _) = post(
-            json!({"name": "bad name", "access": "read", "catalogs": ["main"]}),
+            json!({"user": crate::db::TEST_USER, "name": "bad name", "access": "read", "catalogs": ["main"]}),
             keys.admin.clone(),
         )
         .await;
         assert_eq!(status.as_u16(), 409);
         let (status, _) = post(
-            json!({"name": "x5", "access": "read", "all": true, "catalogs": ["main"]}),
+            json!({"user": crate::db::TEST_USER, "name": "x5", "access": "read", "all": true, "catalogs": ["main"]}),
             root.key.clone(),
         )
         .await;
         assert_eq!(status.as_u16(), 409);
         let (status, _) = post(
-            json!({"name": "x6", "access": "read", "catalogs": ["main"], "extra": 1}),
+            json!({"user": crate::db::TEST_USER, "name": "x6", "access": "read", "catalogs": ["main"], "extra": 1}),
             keys.admin.clone(),
         )
         .await;
@@ -635,6 +646,19 @@ mod tests {
             422,
             "unknown fields are refused by the Json extractor"
         );
+        let (status, body) = post(
+            json!({"user": "nobody", "name": "x7", "access": "read", "catalogs": ["main"]}),
+            keys.admin.clone(),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 404);
+        assert_eq!(body["error"], "UnknownName");
+        let (status, _) = post(
+            json!({"name": "x8", "access": "read", "catalogs": ["main"]}),
+            keys.admin.clone(),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 422, "a key names its user");
 
         // The scoped admin does not see the all-catalogs keys; root sees every key.
         let names = |listed: &serde_json::Value| -> Vec<String> {
@@ -773,6 +797,7 @@ mod tests {
             grants: Grants::Catalogs(&main_only()),
             default_catalog: None,
             actor: "web",
+            user: crate::db::TEST_USER,
         };
         let web = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
             .await

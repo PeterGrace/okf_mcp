@@ -59,6 +59,8 @@ pub(crate) struct SignInCodeView {
     pub grant_id: Option<String>,
     /// When it was revoked.
     pub revoked_at: Option<String>,
+    /// The user it belongs to (`None`: unassigned, from before users existed).
+    pub user: Option<String>,
 }
 
 impl SignInCodeView {
@@ -87,6 +89,7 @@ impl SignInCodeView {
             redeemed_at,
             grant_id,
             revoked_at,
+            user,
         } = record;
         Self {
             id,
@@ -102,6 +105,7 @@ impl SignInCodeView {
             redeemed_at: redeemed_at.map(format_timestamp),
             grant_id,
             revoked_at: revoked_at.map(format_timestamp),
+            user,
         }
     }
 }
@@ -140,7 +144,7 @@ impl std::fmt::Debug for CreatedSignInCodeView {
 struct CreateCodeBody {
     /// Label, `[A-Za-z0-9._-]+`.
     name: String,
-    /// The grant's actor (required).
+    /// The grant's actor (blank: the code's name).
     actor: String,
     /// `read` or `write`.
     access: String,
@@ -154,6 +158,9 @@ struct CreateCodeBody {
     default_catalog: Option<String>,
     /// How long it stays valid (`humantime`: `2h`, `3d`; absent or empty: 24h).
     expires_in: Option<String>,
+    /// The user the code, and the grant it becomes, belongs to (required;
+    /// must exist).
+    user: String,
 }
 
 /// This area's routes.
@@ -214,10 +221,10 @@ async fn list_codes(
 ///
 /// # Errors
 /// 403 below admin, or `all` from a scoped caller; 404 for a catalog the
-/// caller does not reach; 400 for an unknown `access` or an unparsable
-/// `expires_in`; 409 for `admin` access, a bad name, an empty actor, no
+/// caller does not reach, or an unknown user; 400 for an unknown `access` or
+/// an unparsable `expires_in`; 409 for `admin` access, a bad name, no
 /// catalogs, `all` with `catalogs`, an ungranted default, or an expiry past
-/// `oauth.code_max_expiry`; 422 for an unknown field.
+/// `oauth.code_max_expiry`; 422 for an unknown or missing field.
 async fn create_code(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
@@ -254,6 +261,7 @@ async fn create_code(
         default_catalog,
         actor: &body.actor,
         expires_at,
+        user: &body.user,
     };
     let created = codes::create(app.pool(), &new, now).await?;
     let record = managed_code(&app, &principal, &created.id).await?;
@@ -300,6 +308,7 @@ mod tests {
             default_catalog: None,
             actor: "example-actor",
             expires_at: Utc::now() + TimeDelta::hours(1),
+            user: crate::db::TEST_USER,
         };
         codes::create(test.app.pool(), &new, Utc::now())
             .await
@@ -326,7 +335,7 @@ mod tests {
                 Row {
                     method: "POST",
                     uri: "/api/v1/oauth/codes".into(),
-                    body: Some(json!({"name": "made", "actor": "example-actor",
+                    body: Some(json!({"user": crate::db::TEST_USER, "name": "made", "actor": "example-actor",
                                       "access": "read", "catalogs": ["main"]})),
                     read: 403,
                     write: 403,
@@ -351,7 +360,7 @@ mod tests {
     async fn create_returns_the_code_once_and_the_list_never_shows_it() {
         let test = app().await;
         let keys = keys(&test).await;
-        let body = json!({"name": "laptop", "actor": "example-actor", "access": "write",
+        let body = json!({"user": crate::db::TEST_USER, "name": "laptop", "actor": "example-actor", "access": "write",
                           "catalogs": ["main"], "default_catalog": "main", "expires_in": "2h"});
 
         let (status, created) = send(
@@ -409,7 +418,7 @@ mod tests {
                     .as_u16()
             }
         };
-        let base = json!({"name": "c", "actor": "example-actor", "access": "read",
+        let base = json!({"user": crate::db::TEST_USER, "name": "c", "actor": "example-actor", "access": "read",
                           "catalogs": ["main"]});
         let with = |field: &str, value: serde_json::Value| {
             let mut body = base.clone();
@@ -421,7 +430,10 @@ mod tests {
         assert_eq!(post(with("access", json!("root"))).await, 400);
         assert_eq!(post(with("expires_in", json!("8d"))).await, 409);
         assert_eq!(post(with("expires_in", json!("soon"))).await, 400);
-        assert_eq!(post(with("actor", json!(" "))).await, 409);
+        assert_eq!(post(with("user", json!("nobody"))).await, 404);
+        let mut no_user = base.clone();
+        no_user.as_object_mut().unwrap().remove("user");
+        assert_eq!(post(no_user).await, 422, "a code names its user");
         assert_eq!(post(with("name", json!("bad name"))).await, 409);
         assert_eq!(post(with("catalogs", json!([]))).await, 409);
         assert_eq!(
@@ -430,7 +442,7 @@ mod tests {
             "all and catalogs"
         );
         assert_eq!(
-            post(json!({"name": "c", "actor": "example-actor", "access": "read", "all": true}))
+            post(json!({"user": crate::db::TEST_USER, "name": "c", "actor": "example-actor", "access": "read", "all": true}))
                 .await,
             403,
             "a scoped admin cannot mint an all-catalogs code"

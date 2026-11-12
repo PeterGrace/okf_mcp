@@ -106,6 +106,7 @@ pub async fn sign_in_code(server: &TestServer, access: Access, catalogs: &[&str]
             default_catalog: catalogs.first().copied(),
             actor: "example-actor",
             expires_at: Utc::now() + TimeDelta::hours(1),
+            user: crate::support::server::OWNER,
         },
         Utc::now(),
     )

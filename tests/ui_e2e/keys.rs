@@ -9,7 +9,7 @@ use okf_mcp::store::oauth::clients;
 use okf_mcp::store::oauth::codes::{self, NewSignInCode};
 
 use crate::harness::drive;
-use crate::support::server::{files, TestServer};
+use crate::support::server::{files, TestServer, OWNER};
 
 async fn server() -> TestServer {
     TestServer::start(
@@ -31,6 +31,7 @@ async fn an_admin_creates_a_key_sees_its_secret_once_and_signs_in_with_it() {
         ui.wait_visible("[data-test=key-console-admin]");
         ui.click("#key-new");
         ui.fill("#key-form input[name=name]", "console-made");
+        ui.fill("#key-form input[name=user]", OWNER);
         ui.click("#key-form input[name=catalog][value=main]");
         ui.click("#key-form button[type=submit]");
         ui.wait_visible("#key-secret");
@@ -102,17 +103,21 @@ async fn an_admin_mints_a_sign_in_code_sees_it_once_and_revokes_it() {
         ui.click("#code-new");
         ui.fill("#code-form input[name=name]", "console-code");
         ui.fill("#code-form input[name=actor]", "example-actor");
+        ui.fill("#code-form input[name=user]", OWNER);
         // No catalog: the server refuses (409), which the page toasts. No
         // code was minted, so no dialog opens, and the form stays filled.
         ui.click("#code-form button[type=submit]");
         ui.wait_text("#toasts", "must be granted a catalog");
         assert!(!ui.page.is_visible("#code-secret-dialog").expect("visible"));
         let kept = ui.eval(
-            "() => ['name', 'actor'].map(field => \
+            "() => ['name', 'actor', 'user'].map(field => \
                  document.querySelector(`#code-form input[name=${field}]`).value)",
             serde_json::json!(null),
         );
-        assert_eq!(kept, serde_json::json!(["console-code", "example-actor"]));
+        assert_eq!(
+            kept,
+            serde_json::json!(["console-code", "example-actor", OWNER])
+        );
         // The retry, with a catalog, mints the code.
         ui.click("#code-form input[name=catalog][value=main]");
         ui.click("#code-form button[type=submit]");
@@ -196,6 +201,7 @@ async fn an_oauth_grant_is_marked_and_cannot_be_given_reporting() {
             default_catalog: Some("main"),
             actor: "example-actor",
             expires_at: Utc::now() + TimeDelta::hours(1),
+            user: OWNER,
         },
         Utc::now(),
     )

@@ -470,6 +470,7 @@ mod tests {
             kind: KeyKind::Key,
             client_id: None,
             client_name: None,
+            user: None,
         }
     }
 
@@ -635,6 +636,7 @@ mod tests {
                 grants: key_rows::Grants::Catalogs(&names),
                 default_catalog: Some("main"),
                 actor: "example-actor",
+                user: crate::db::TEST_USER,
             },
             Utc::now(),
         )
@@ -745,6 +747,7 @@ mod tests {
             default_catalog: Some("pg"),
             actor: "tester",
             maintenance_report: true,
+            user: crate::db::TEST_USER,
         };
         let created = key_rows::create_with_id(&db.pool, &new, Utc::now())
             .await
@@ -799,6 +802,7 @@ mod tests {
             grants: key_rows::Grants::Catalogs(&names),
             default_catalog: Some("pg"),
             actor: "tester",
+            user: crate::db::TEST_USER,
         };
         let created = key_rows::create_with_id(&db.pool, &new, Utc::now())
             .await

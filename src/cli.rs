@@ -226,6 +226,9 @@ pub struct KeyCreateArgs {
     /// The actor its writes are recorded as (default: the name).
     #[arg(long)]
     pub actor: Option<String>,
+    /// The user it belongs to (must exist).
+    #[arg(long)]
+    pub user: String,
 }
 
 /// `okf-mcp oauth ...`.
@@ -296,6 +299,9 @@ pub struct CodeCreateArgs {
     // becomes clap's usage error.
     #[arg(long, default_value = "24h", value_parser = parse_expiry)]
     pub expires: Duration,
+    /// The user the code, and the grant it becomes, belongs to (must exist).
+    #[arg(long)]
+    pub user: String,
 }
 
 /// Parses `--expires` (`humantime` syntax: `90m`, `24h`, `3d`).
@@ -591,6 +597,7 @@ async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyho
                 grants,
                 default_catalog: args.default.as_deref(),
                 actor: args.actor.as_deref().unwrap_or(&args.name),
+                user: &args.user,
             };
             let created = keys::create_with_id(pool, &new, clock.now()).await?;
             println!("{}", created.key);
@@ -680,6 +687,7 @@ async fn run_oauth(
                 default_catalog: args.default.as_deref(),
                 actor: &args.actor,
                 expires_at,
+                user: &args.user,
             };
             let created = codes::create(pool, &new, now).await?;
             println!("{}", created.code);
@@ -899,12 +907,15 @@ mod tests {
             "write",
             "--catalogs",
             "pg,work",
+            "--user",
+            "alice",
         ])
         .unwrap();
         let Some(Command::Key(KeyCommand::Create(args))) = parsed.command else {
             panic!("expected key create");
         };
         assert_eq!(args.name, "k");
+        assert_eq!(args.user, "alice");
         assert_eq!(
             (args.access, args.catalogs, args.all),
             (
@@ -924,8 +935,15 @@ mod tests {
             "--catalogs",
             "pg",
             "--all",
+            "--user",
+            "alice",
         ]);
-        let neither = Cli::try_parse_from(["okf-mcp", "key", "create", "k", "--access", "read"]);
+        let neither = Cli::try_parse_from([
+            "okf-mcp", "key", "create", "k", "--access", "read", "--user", "alice",
+        ]);
+        // Every new key names its user, so `--user` is required.
+        let no_user =
+            Cli::try_parse_from(["okf-mcp", "key", "create", "k", "--access", "read", "--all"]);
         assert_eq!(
             both.unwrap_err().kind(),
             clap::error::ErrorKind::ArgumentConflict
@@ -934,11 +952,15 @@ mod tests {
             neither.unwrap_err().kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
+        assert_eq!(
+            no_user.unwrap_err().kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn key_subcommands_run_against_the_database() {
-        let db = crate::db::pg_support::TestDb::start().await;
+        let db = crate::db::test_db().await;
         let clock = fixed_now();
         let url = Some(db.url.clone());
         let create = KeyCommand::Create(KeyCreateArgs {
@@ -949,6 +971,7 @@ mod tests {
             all: true,
             default: None,
             actor: None,
+            user: crate::db::TEST_USER.to_string(),
         });
 
         run(cli(url.clone(), Command::Key(create)), Arc::clone(&clock))
@@ -979,7 +1002,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn maintenance_capability_cli_resolves_actor_and_reissued_names() {
-        let db = crate::db::pg_support::TestDb::start().await;
+        let db = crate::db::test_db().await;
         let clock = fixed_now();
         let url = Some(db.url.clone());
         for actor in ["terminal", "web"] {
@@ -994,6 +1017,8 @@ mod tests {
                 "--actor",
                 actor,
                 "--maintenance-report",
+                "--user",
+                crate::db::TEST_USER,
             ])
             .unwrap();
             let Some(Command::Key(command)) = parsed.command else {
@@ -1020,7 +1045,15 @@ mod tests {
                 .id
         );
         let without_flag = Cli::try_parse_from([
-            "okf-mcp", "key", "create", "ordinary", "--access", "admin", "--all",
+            "okf-mcp",
+            "key",
+            "create",
+            "ordinary",
+            "--access",
+            "admin",
+            "--all",
+            "--user",
+            crate::db::TEST_USER,
         ])
         .unwrap();
         let Some(Command::Key(ordinary)) = without_flag.command else {
@@ -1112,8 +1145,17 @@ mod tests {
         .await
         .unwrap();
         let parsed = Cli::try_parse_from([
-            "okf-mcp", "key", "create", "shared", "--access", "read", "--all", "--actor",
+            "okf-mcp",
+            "key",
+            "create",
+            "shared",
+            "--access",
+            "read",
+            "--all",
+            "--actor",
             "terminal",
+            "--user",
+            crate::db::TEST_USER,
         ])
         .unwrap();
         let Some(Command::Key(command)) = parsed.command else {
@@ -1199,6 +1241,7 @@ mod tests {
             kind: keys::KeyKind::Key,
             client_id: None,
             client_name: None,
+            user: None,
         };
 
         assert_eq!(
@@ -1225,9 +1268,14 @@ mod tests {
             "main",
             "--expires",
             "3d",
+            "--user",
+            "alice",
         ])
         .unwrap();
-        let defaulted = parse(&["c", "--actor", "a", "--access", "read", "--all"]).unwrap();
+        let defaulted = parse(&[
+            "c", "--actor", "a", "--access", "read", "--all", "--user", "a",
+        ])
+        .unwrap();
 
         let Some(Command::Oauth(OauthCommand::Code(CodeCommand::Create(args)))) = parsed.command
         else {
@@ -1235,6 +1283,7 @@ mod tests {
         };
         assert_eq!(args.name, "laptop");
         assert_eq!(args.actor, "example-actor");
+        assert_eq!(args.user, "alice");
         assert_eq!(args.access, Access::Write);
         assert_eq!(args.catalogs, ["main", "other"]);
         assert!(!args.all);
@@ -1247,10 +1296,16 @@ mod tests {
         assert!(args.all);
         // `default_value = "24h"` and the store's constant agree.
         assert_eq!(args.expires, codes::DEFAULT_EXPIRY);
-        // `--actor` is required, `--expires` must parse, and `--catalogs`
-        // and `--all` exclude each other.
+        // `--actor` and `--user` are required, `--expires` must parse, and
+        // `--catalogs` and `--all` exclude each other.
         assert_eq!(
-            parse(&["c", "--access", "read", "--all"])
+            parse(&["c", "--access", "read", "--all", "--user", "a"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            parse(&["c", "--actor", "a", "--access", "read", "--all"])
                 .unwrap_err()
                 .kind(),
             clap::error::ErrorKind::MissingRequiredArgument
@@ -1264,7 +1319,9 @@ mod tests {
                 "read",
                 "--all",
                 "--expires",
-                "soon"
+                "soon",
+                "--user",
+                "a"
             ])
             .unwrap_err()
             .kind(),
@@ -1279,7 +1336,9 @@ mod tests {
                 "read",
                 "--all",
                 "--catalogs",
-                "main"
+                "main",
+                "--user",
+                "a"
             ])
             .unwrap_err()
             .kind(),
@@ -1326,6 +1385,8 @@ mod tests {
             "read",
             "--catalogs",
             "main",
+            "--user",
+            crate::db::TEST_USER,
         ])
         .await
         .unwrap();
@@ -1341,6 +1402,8 @@ mod tests {
             "--all",
             "--expires",
             "8d",
+            "--user",
+            crate::db::TEST_USER,
         ])
         .await;
         let admin = okf(&[
@@ -1353,6 +1416,8 @@ mod tests {
             "--access",
             "admin",
             "--all",
+            "--user",
+            crate::db::TEST_USER,
         ])
         .await;
         okf(&["oauth", "code", "list"]).await.unwrap();
@@ -1386,6 +1451,7 @@ mod tests {
                 default_catalog: None,
                 actor: "example-actor",
                 expires_at: clock.now() + chrono::TimeDelta::hours(1),
+                user: crate::db::TEST_USER,
             },
             clock.now(),
         )
@@ -1419,6 +1485,7 @@ mod tests {
                 grants: Grants::All,
                 default_catalog: None,
                 actor: "example-actor",
+                user: crate::db::TEST_USER,
             },
             clock.now(),
         )
@@ -1472,6 +1539,7 @@ mod tests {
             redeemed_at: None,
             grant_id: None,
             revoked_at: None,
+            user: None,
         };
         let redeemed = SignInCodeRecord {
             all_catalogs: true,
