@@ -259,3 +259,55 @@ async fn sign_out_ends_a_cookie_session_hidden_behind_a_stored_key() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admin_session_writes_through_the_console_with_its_csrf_token() {
+    let server = server().await;
+    server
+        .user_with_password("erin", "erin@example.com", PASSWORD)
+        .await;
+    users::set_admin(&server.db.pool, "erin", true, false)
+        .await
+        .expect("make erin an admin");
+    server.app.poll().await.expect("poll");
+
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.sign_in_password("erin@example.com", PASSWORD);
+        ui.wait_text("#whoami", "erin - admin");
+        // After a reload the console runs on the cookie session alone.
+        ui.open("");
+        ui.wait_text("#whoami", "erin - admin");
+        assert_eq!(
+            ui.eval(
+                "() => localStorage.getItem('okf.key')",
+                serde_json::json!(null)
+            ),
+            serde_json::Value::Null
+        );
+        // A write through the UI: without its X-OKF-CSRF header the server
+        // refuses it (403) and the user never appears.
+        ui.open("/users");
+        ui.click("#user-new");
+        ui.fill("#user-form input[name=name]", "frank");
+        ui.click("#user-form button[type=submit]");
+        ui.wait_visible("[data-test=user-frank]");
+        // Read back through the API, with the cookie.
+        let names = ui.eval(
+            "async () => (await (await fetch('/api/v1/users')).json()).users.map(u => u.name)",
+            serde_json::json!(null),
+        );
+        assert!(
+            names
+                .as_array()
+                .is_some_and(|names| names.iter().any(|name| name == "frank")),
+            "{names}"
+        );
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    users::find(&server.db.pool, "frank")
+        .await
+        .expect("frank was stored");
+}
