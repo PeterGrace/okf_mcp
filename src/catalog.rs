@@ -105,7 +105,7 @@ pub struct CatalogState {
     // string, so a reader takes a pointer copy, not a copy of the text.
     description: RwLock<Arc<str>>,
     // The owning team's name, outside the snapshot for the same reason
-    // (`catalog set-owner`, [`CatalogState::set_owner_team`]); `None` for a
+    // (`catalogs::set_owner`, [`CatalogState::set_owner_team`]); `None` for a
     // catalog from before migration 0009 not yet assigned.
     owner_team: RwLock<Option<Arc<str>>>,
     // `RwLock<Arc<_>>`: the lock is held only to clone or replace the `Arc`

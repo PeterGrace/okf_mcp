@@ -302,7 +302,7 @@ impl App {
             let state = match existing {
                 Some(state) => {
                     // Outside the snapshot, so a `catalog update` or
-                    // `set-owner` shows without a rebuild.
+                    // owner change shows without a rebuild.
                     state.set_description(&row.description);
                     state.set_owner_team(row.owner_team.as_deref());
                     if row.generation > state.current().generation() && !failed_before {
