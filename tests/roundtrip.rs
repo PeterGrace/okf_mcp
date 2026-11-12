@@ -24,7 +24,7 @@ use support::pg::TestDb;
 /// # Returns
 /// The files read from the export, and the second import's report.
 async fn round_trip(files: &Files) -> (Files, ImportReport) {
-    let db = TestDb::start().await;
+    let db = TestDb::start_migrated().await;
     support::server::migrate_with_owner(&db.pool).await;
     catalogs::create(&db.pool, "rt", "", support::server::OWNER, Utc::now())
         .await

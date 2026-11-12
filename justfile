@@ -8,13 +8,15 @@ lint:
     cargo clippy --all-targets -- -D warnings
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
+# One Postgres server for the whole run (scripts/test-pg.sh); set
+# TEST_PG_URL to reuse one already running.
 test:
-    cargo test
+    scripts/test-pg.sh run cargo test
 
 # Browser end-to-end tests of the web console (needs Docker and Chromium;
 # RUSTWRIGHT_CHROMIUM names the binary if it is not on PATH).
 test-ui:
-    cargo test --test ui_e2e -- --test-threads=2
+    scripts/test-pg.sh run cargo test --test ui_e2e -- --test-threads=2
 
 # Prepare locally; ship through a PR, then publish the merged commit's tag.
 release-prepare patchlevel:

@@ -704,6 +704,12 @@ pub(crate) mod tests {
         assert!(taken, "the lock outlived its transaction");
     }
 
+    /// Counts the lock requests blocked in this test's own database: the
+    /// test server may be shared by other tests, whose waits are not ours.
+    pub(crate) const AWAITED_LOCKS: &str = "SELECT count(*) FROM pg_locks l \
+         JOIN pg_stat_activity a ON a.pid = l.pid \
+         WHERE NOT l.granted AND a.datname = current_database()";
+
     /// Waits until some backend is blocked on a lock, so a test knows the
     /// spawned delete (or import) has reached the point it should wait at.
     pub(crate) async fn until_a_lock_is_awaited(pool: &PgPool) {
@@ -713,11 +719,10 @@ pub(crate) mod tests {
     /// Waits until at least `count` lock requests are blocked.
     pub(crate) async fn until_locks_are_awaited(pool: &PgPool, count: i64) {
         for _ in 0..200 {
-            let waiting: i64 =
-                sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE NOT granted")
-                    .fetch_one(pool)
-                    .await
-                    .unwrap();
+            let waiting: i64 = sqlx::query_scalar(AWAITED_LOCKS)
+                .fetch_one(pool)
+                .await
+                .unwrap();
             if waiting >= count {
                 return;
             }

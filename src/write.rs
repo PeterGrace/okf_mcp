@@ -362,7 +362,7 @@ mod tests {
         store_key, writer, PendingEdit, TestApp,
     };
     use crate::okf::workspace::Workspace;
-    use crate::store::catalogs::tests::until_a_lock_is_awaited;
+    use crate::store::catalogs::tests::{until_a_lock_is_awaited, AWAITED_LOCKS};
     use crate::store::import::{import, ImportOptions, ImportScope};
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -550,7 +550,7 @@ mod tests {
         until_a_lock_is_awaited(test.app.pool()).await;
         // Time for the other two to reach the database, if they were going to.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let blocked = count(&test, "SELECT count(*) FROM pg_locks WHERE NOT granted").await;
+        let blocked = count(&test, AWAITED_LOCKS).await;
         holder.rollback().await.unwrap();
         for writer in writers {
             writer.await.unwrap().unwrap();

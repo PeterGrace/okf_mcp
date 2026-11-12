@@ -141,7 +141,7 @@ impl TestServer {
         catalogs_and_files: Vec<(&str, Files)>,
         make_config: impl FnOnce(&str) -> Config,
     ) -> Self {
-        let db = TestDb::start().await;
+        let db = TestDb::start_migrated().await;
         migrate_with_owner(&db.pool).await;
         for (name, files) in catalogs_and_files {
             catalogs::create(&db.pool, name, "", OWNER, Utc::now())
