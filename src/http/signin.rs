@@ -21,10 +21,13 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Form, Router};
 use serde::Deserialize;
+use sqlx::PgConnection;
 
 use crate::app::App;
 use crate::error::OkfError;
-use crate::http::console_session::{client_ip, cookie, start_session_with, COOKIE};
+use crate::http::console_session::{
+    client_ip, cookie, start_session_in, start_session_with, COOKIE,
+};
 use crate::http::limits::ip_key;
 use crate::http::pages::{self, escape, safe_return_to};
 use crate::http::ui::CONTENT_SECURITY_POLICY;
@@ -118,10 +121,10 @@ pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
     router.layer(timeout_layer())
 }
 
-/// Whether the pages offer a passkey (Task 8 makes this
-/// `app.passkeys().is_some()`).
-fn offers_passkeys(_app: &App) -> bool {
-    false
+/// Whether the pages offer a passkey: only when passkeys are on (a
+/// domain `public_url`).
+fn offers_passkeys(app: &App) -> bool {
+    app.passkeys().is_some()
 }
 
 /// The OIDC provider buttons (Task 9 fills this from the registry).
@@ -151,8 +154,9 @@ fn sign_in_view(app: &App, return_to: String) -> SignInView {
 /// as the attacker). The header is set by the browser, not by page script,
 /// and unlike `Origin` it does not turn into `null` under the pages'
 /// `Referrer-Policy: no-referrer`. A client that sends none (curl, an old
-/// browser) is let through: it is not a browser being steered.
-fn cross_site(headers: &HeaderMap) -> bool {
+/// browser) is let through: it is not a browser being steered. The passkey
+/// routes (`http::passkeys`) check it too.
+pub(crate) fn cross_site(headers: &HeaderMap) -> bool {
     headers
         .get("sec-fetch-site")
         .is_some_and(|value| !matches!(value.as_bytes(), b"same-origin" | b"none"))
@@ -373,11 +377,8 @@ async fn sign_in_post(
 /// [`OkfError::Database`]; [`OkfError::Io`] from the random source.
 // `expect(dead_code)` silences "never used" until a caller lands, and
 // itself warns once one does, so it cannot be forgotten. Setup now signs in
-// through the stamped `begin`.
-#[expect(
-    dead_code,
-    reason = "passkey (Task 8) and OIDC (Task 9) sign-ins call it; delete this then"
-)]
+// through the stamped `begin`, and passkeys through `start_in`.
+#[expect(dead_code, reason = "OIDC sign-in (Task 9) calls it; delete this then")]
 pub(crate) async fn sign_in(
     app: &App,
     parts: &Parts,
@@ -403,15 +404,74 @@ async fn begin(
     if let Some(old) = cookie(&parts.headers, COOKIE) {
         user_sessions::revoke(app.pool(), old).await?;
     }
-    let ip = client_ip(parts, &app.config().auth);
+    let (ip, user_agent) = client_of(app, parts);
+    let (headers, _session) = start_session_with(app, user, password, ip, user_agent).await?;
+    audit(app, Some(&user.id), method, Outcome::Ok, ip).await;
+    Ok(headers)
+}
+
+/// The client address and `User-Agent` a new session records.
+fn client_of<'a>(app: &App, parts: &'a Parts) -> (Option<IpAddr>, &'a str) {
     let user_agent = parts
         .headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    let (headers, _session) = start_session_with(app, user, password, ip, user_agent).await?;
-    audit(app, Some(&user.id), method, Outcome::Ok, ip).await;
+    (client_ip(parts, &app.config().auth), user_agent)
+}
+
+/// Starts a session for `user` inside the caller's transaction, which
+/// holds the user's row and has just checked the credential under that
+/// lock (a passkey sign-in, a passkey setup link). Unlike [`sign_in`],
+/// nothing can change the credential between that check and the insert,
+/// and the session exists only if the transaction commits. Once it has,
+/// call [`finish_sign_in`].
+///
+/// # Arguments
+/// * `app` - the shared state.
+/// * `conn` - the caller's transaction (`&mut tx`).
+/// * `parts` - the request (address, `User-Agent`).
+/// * `user` - the verified user.
+///
+/// # Returns
+/// The `Set-Cookie` header to send.
+///
+/// # Errors
+/// As [`sign_in`].
+pub(crate) async fn start_in(
+    app: &App,
+    conn: &mut PgConnection,
+    parts: &Parts,
+    user: &UserAuth,
+) -> Result<HeaderMap, OkfError> {
+    let (ip, user_agent) = client_of(app, parts);
+    let (headers, _session) = start_session_in(app, conn, user, ip, user_agent).await?;
     Ok(headers)
+}
+
+/// After a session from [`start_in`] committed: ends the session this
+/// browser held before (rotation) and records the sign-in.
+///
+/// # Arguments
+/// * `app` - the shared state.
+/// * `parts` - the request (its old session cookie and address).
+/// * `user` - the user now signed in.
+/// * `method` - how they proved who they are.
+///
+/// # Errors
+/// [`OkfError::Database`] ending the old session.
+pub(crate) async fn finish_sign_in(
+    app: &App,
+    parts: &Parts,
+    user: &UserAuth,
+    method: Method,
+) -> Result<(), OkfError> {
+    if let Some(old) = cookie(&parts.headers, COOKIE) {
+        user_sessions::revoke(app.pool(), old).await?;
+    }
+    let ip = client_ip(parts, &app.config().auth);
+    audit(app, Some(&user.id), method, Outcome::Ok, ip).await;
+    Ok(())
 }
 
 /// Records a sign-in attempt as a `sign_in_events` row (which also logs an
@@ -897,7 +957,8 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::http::api::testing::{
-        app, login_app, user_with_password, Browser, Payload, Reply, MAIN, PASSWORD,
+        allow, app, fail_on, login_app, user_with_password, wait_for_lock_waiters, Browser,
+        Payload, Reply, MAIN, PASSWORD,
     };
     use crate::http::console_session::COOKIE;
     use crate::mcp::testing::{app_with, TestApp};
@@ -1409,10 +1470,9 @@ mod tests {
             page.headers["content-security-policy"],
             CONTENT_SECURITY_POLICY
         );
-        assert!(
-            !page.text().contains("<script"),
-            "no script without passkeys"
-        );
+        // Passkeys are on for this domain, so only their script loads.
+        assert_eq!(page.text().matches("<script").count(), 1);
+        assert!(page.text().contains(PASSKEY_SCRIPT));
         assert_eq!(done.status, StatusCode::SEE_OTHER);
         assert_eq!(done.location(), "/ui/");
         assert_eq!(session.json()["user"], "alice");
@@ -1705,25 +1765,6 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("count the sessions")
-    }
-
-    /// Waits (up to 10 s) until `want` backends of this database wait on a
-    /// lock.
-    async fn wait_for_lock_waiters(pool: &PgPool, want: i64) {
-        for _ in 0..200 {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity \
-                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
-            )
-            .fetch_one(pool)
-            .await
-            .expect("count the lock waiters");
-            if waiting >= want {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("{want} backends never waited on a lock");
     }
 
     /// The password alice signs in with, checked: what `POST /signin`
@@ -2063,36 +2104,6 @@ mod tests {
         assert!(matches!(old, SignInOutcome::Ok(_)));
     }
 
-    /// Makes every statement matching `event` (`BEFORE DELETE ON
-    /// user_sessions`, ...) fail, until [`allow`] drops it.
-    async fn fail_on(pool: &PgPool, event: &str) {
-        sqlx::query(
-            "CREATE FUNCTION okf_test_fail() RETURNS trigger LANGUAGE plpgsql AS \
-             $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
-        )
-        .execute(pool)
-        .await
-        .expect("create the failing function");
-        // `AssertSqlSafe`: `event` is one of this module's literals.
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE TRIGGER okf_test_fail {event} EXECUTE FUNCTION okf_test_fail()"
-        )))
-        .execute(pool)
-        .await
-        .expect("create the failing trigger");
-    }
-
-    /// Drops [`fail_on`]'s trigger.
-    async fn allow(pool: &PgPool, table: &str) {
-        // `AssertSqlSafe`: `table` is one of this module's literals.
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP TRIGGER okf_test_fail ON {table}"
-        )))
-        .execute(pool)
-        .await
-        .expect("drop the failing trigger");
-    }
-
     fn new_password_form(token: &str, password: &str) -> Payload {
         Payload::Form(vec![
             ("token", token.to_string()),
@@ -2245,7 +2256,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_pages_carry_the_console_policy_and_load_no_script() {
+    async fn the_pages_carry_the_console_policy_and_load_only_the_passkey_script() {
         let test = login_app().await;
 
         for path in ["/signin", "/signin/forgot", "/account/reset?token=nope"] {
@@ -2258,7 +2269,11 @@ mod tests {
             );
             assert_eq!(reply.headers["referrer-policy"], "no-referrer", "{path}");
             assert_eq!(reply.headers["cache-control"], "no-store", "{path}");
-            assert!(!reply.text().contains("<script"), "{path}");
+            // Only the sign-in page offers a passkey (the setup page too,
+            // with a token: `http::passkeys`'s tests).
+            let scripts = usize::from(path == "/signin");
+            assert_eq!(reply.text().matches("<script").count(), scripts, "{path}");
+            assert_eq!(reply.text().contains(PASSKEY_SCRIPT), path == "/signin");
         }
     }
 

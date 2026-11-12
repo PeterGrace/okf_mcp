@@ -360,6 +360,8 @@ pub async fn create(pool: &PgPool, user_id: &str, ip: Option<IpAddr>, user_agent
 pub async fn touch(pool: &PgPool, id: &str, idle: Duration, now: DateTime<Utc>) -> Result<Option<SessionRow>, OkfError>; // None when absent/expired/idle (idle + resolution with no use)/revoked meanwhile; writes last_seen_at at most once per min(1 minute, idle/4), once even under concurrent touches
 pub async fn revoke(pool: &PgPool, id: &str) -> Result<(), OkfError>;
 pub async fn revoke_all(executor: impl PgExecutor<'_>, user_id: &str, except: Option<&str>) -> Result<u64, OkfError>; // `except` is the raw cookie id; a &PgPool or &mut *tx (users::set_admin)
+pub async fn start(executor: impl PgExecutor<'_>, request: &SessionStart<'_>) -> Result<NewSession, OkfError>; // Task 7b; an executor since Task 8 (corrected, issue #317), so a passkey sign-in inserts inside its transaction
+pub async fn hold_live(executor: impl PgExecutor<'_>, id: &str, user_id: &str, now: DateTime<Utc>) -> Result<bool, OkfError>; // Task 8: the session still in force, its row held FOR SHARE (after the user's row)
 pub struct SessionInfo { pub id_prefix: String, pub created_at: DateTime<Utc>, pub last_seen_at: DateTime<Utc>, pub ip: Option<IpAddr>, pub user_agent: String, pub current: bool }
 pub async fn list(pool: &PgPool, user_id: &str, current: Option<&str>) -> Result<Vec<SessionInfo>, OkfError>; // `current` is the raw cookie id
 pub async fn revoke_by_prefix(pool: &PgPool, user_id: &str, id_prefix: &str) -> Result<(), OkfError>; // id_prefix = first 12 hex chars of the stored hash
@@ -395,6 +397,7 @@ pub enum SameSite { Lax, Strict }
 pub async fn require_principal(State(app): State<Arc<App>>, request: Request, next: Next) -> Response; // bearer, else cookie (+CSRF on writes)
 pub fn client_ip(request_parts: &Parts, config: &AuthConfig) -> Option<IpAddr>;
 pub async fn start_session(app: &App, user: &UserAuth, ip: Option<IpAddr>, user_agent: &str) -> Result<(HeaderMap /*Set-Cookie*/, NewSession), OkfError>;
+pub async fn start_session_in(app: &App, conn: &mut PgConnection, user: &UserAuth, ip: Option<IpAddr>, user_agent: &str) -> Result<(HeaderMap, NewSession), OkfError>; // Task 8: inside the caller's transaction
 pub fn clear_cookie(app: &App) -> HeaderMap;
 pub(crate) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str>;
 pub(crate) fn set_cookie(name: &str, value: &str, max_age: Duration, same_site: SameSite, secure: bool) -> HeaderValue;
@@ -422,6 +425,9 @@ pub(crate) fn safe_return_to(raw: Option<&str>) -> String;  // same-origin /ui/.
 pub const SIGN_IN_FAILED: &str; pub const LINK_EXPIRED: &str; pub const FORGOT_SENT: &str;
 pub struct ProviderButton { pub id: String, pub label: String }  // Task 9's buttons
 pub(crate) async fn sign_in(app: &App, parts: &Parts, user: &UserAuth, method: Method) -> Result<HeaderMap, OkfError>; // ends this browser's old session, starts one, records the event
+pub(crate) async fn start_in(app: &App, conn: &mut PgConnection, parts: &Parts, user: &UserAuth) -> Result<HeaderMap, OkfError>; // Task 8: the session inside the transaction that checked the credential
+pub(crate) async fn finish_sign_in(app: &App, parts: &Parts, user: &UserAuth, method: Method) -> Result<(), OkfError>; // Task 8: after that commit, ends the old session and records the event
+pub(crate) fn cross_site(headers: &HeaderMap) -> bool;    // Task 7b; pub(crate) from Task 8 (the passkey routes check it too)
 pub(crate) async fn audit(app: &App, user_id: Option<&str>, method: Method, outcome: Outcome, ip: Option<IpAddr>);
 pub(crate) async fn notify_method_added(app: &App, user: &UserAuth, method: &str); // queues Template::MethodAdded; logs a failure
 pub(crate) fn message_page(status: StatusCode, title: &str, message: &str) -> Response; // pub(crate) from Task 9
@@ -441,6 +447,11 @@ impl Browser {
     pub(crate) async fn signed_in(test: &TestApp, email: &str, password: &str) -> Self;
     pub(crate) async fn session_for(test: &TestApp, name: &str) -> Self;  // no password; polls first
 }
+// Task 8 moved these from signin.rs's tests (corrected, issue #317):
+pub(crate) async fn wait_for_lock_waiters(pool: &PgPool, want: i64);   // pg_stat_activity, for deterministic race tests
+pub(crate) async fn fail_on(pool: &PgPool, event: &str);              // a failing trigger, e.g. "BEFORE INSERT ON user_sessions FOR EACH ROW"
+pub(crate) async fn allow(pool: &PgPool, table: &str);                // drops it
+// tests/ui_e2e/harness.rs (Task 8): Ui::virtual_authenticator() -> VirtualAuthenticator (Chromium DevTools WebAuthn; dev-dependency tungstenite)
 // tests/support/server.rs (Task 7b): TestServer::user_with_password(&self, name, email, password) -> String
 // tests/ui_e2e/harness.rs (Task 7b): Ui::sign_in_password(&self, email, password)
 
@@ -448,12 +459,15 @@ impl Browser {
 pub async fn add(pool: &PgPool, user_id: &str, passkey: &Passkey, name: &str, now: DateTime<Utc>) -> Result<(), OkfError>;
 pub async fn add_in(conn: &mut PgConnection, user_id: &str, passkey: &Passkey, name: &str, now: DateTime<Utc>) -> Result<(), OkfError>; // corrected (issue #316): the setup link's passkey is stored in the redeeming transaction
 pub async fn for_user(pool: &PgPool, user_id: &str) -> Result<Vec<(String /*name*/, Passkey)>, OkfError>;
-pub async fn find(pool: &PgPool, credential_id: &[u8]) -> Result<Option<(String /*user_id*/, Passkey)>, OkfError>;
-pub async fn update(pool: &PgPool, credential_id: &[u8], passkey: &Passkey, now: DateTime<Utc>) -> Result<(), OkfError>;
+pub async fn find(pool: &PgPool, credential_id: &[u8]) -> Result<Option<(String /*user_id*/, Passkey)>, OkfError>; // no lock
+pub async fn lock_for_sign_in(conn: &mut PgConnection, credential_id: &[u8]) -> Result<Option<(UserAuth, Passkey)>, OkfError>; // corrected (issue #317): the owner FOR SHARE, then the passkey FOR UPDATE
+pub async fn update_in(conn: &mut PgConnection, credential_id: &[u8], passkey: &Passkey, now: DateTime<Utc>) -> Result<(), OkfError>; // corrected (issue #317): replaces `update(pool, ...)`
+pub struct SessionRegistration<'a> { pub user_id: &'a str, pub session_id: &'a str, pub passkey: &'a Passkey, pub name: &'a str, pub keep_sessions: bool, pub now: DateTime<Utc> }
+pub async fn add_from_session(pool: &PgPool, registration: &SessionRegistration<'_>) -> Result<u64 /*sessions ended*/, OkfError>; // corrected (issue #317): user locked, session checked, passkey stored, other sessions ended, one transaction
 pub struct PasskeyInfo { pub id: String /*base64url*/, pub name: String, pub created_at: DateTime<Utc>, pub last_used_at: Option<DateTime<Utc>> }
 pub async fn list(pool: &PgPool, user_id: &str) -> Result<Vec<PasskeyInfo>, OkfError>;
 pub async fn rename(pool: &PgPool, user_id: &str, id: &str, name: &str) -> Result<(), OkfError>; // 404 for another user's
-pub async fn remove(pool: &PgPool, user_id: &str, id: &str) -> Result<(), OkfError>; // 409 if last sign-in method
+pub async fn remove(pool: &PgPool, user_id: &str, id: &str) -> Result<(), OkfError>; // 409 if last sign-in method; 404 for an unknown user too
 // src/http/passkeys.rs: POST /auth/passkey/{setup,signin}/{start,finish}; POST /api/v1/me/passkeys/register/{start,finish}
 // src/http/ui/js/signin/webauthn.js: toBuffer, toBase64url, creationOptions, requestOptions, registrationJson, assertionJson, createCredential(challenge)
 
@@ -12150,6 +12164,16 @@ webauthn-rs facts this task relies on (verified in the probe, `crate-probe/tests
 - `finish_discoverable_authentication_v2(&credential, state, &passkey)` refuses a counter that did not move (`CredentialPossibleCompromise`), and `Passkey::update_credential` raises the stored counter.
 - `SoftPasskey::new(true)` (it fakes user verification) cannot discover credentials and sends no `userHandle`. HTTP tests therefore put the credential id in `allowCredentials` and the user's UUID bytes in `response.userHandle`; neither is covered by the signature.
 - `WebauthnBuilder::new` needs a domain: an address origin fails. Passkeys are off for an address `public_url`.
+
+> **Corrected (issue #317, 2026-11-12).** What shipped differs from the code below in these ways; `src/http/passkeys.rs` and `src/store/passkeys.rs` are authoritative.
+> - **Passkey sign-in checks and inserts under one lock.** `verify_assertion` (unlocked `find`, then `update` and `sign_in` on the pool) let a removal or a reset commit between the check and the session insert. `verify_and_start` opens one transaction: `passkey_rows::lock_for_sign_in` reads the owner without a lock, locks the user `FOR SHARE`, then the passkey `FOR UPDATE`; the handle is checked against that user, the assertion verified, `update_in` stores the counter and `signin::start_in` inserts the session, then it commits. Two sign-ins with one passkey run one at a time, so the counter never goes back. `CredentialPossibleCompromise` is logged at `warn` and recorded as a failed sign-in. `update(pool, ...)` became `update_in(conn, ...)`.
+> - **The setup link's session is in its transaction too.** `use_setup_link` runs `redeem_in`, the user check, `add_in` and `start_in` in one transaction; `signin::finish_sign_in` (old session out, event recorded) runs after the commit. `sign_in` is still unused (Task 9's OIDC calls it), so its `expect(dead_code)` stays.
+> - **Signed-in registration is one transaction** (`passkey_rows::add_from_session`): the user `FOR NO KEY UPDATE`, then `user_sessions::hold_live` on the registering session, then `add_in` and `revoke_all`. A reset that ended the session first leaves no passkey (401). The finishing session must be the one that started the ceremony (403 otherwise).
+> - `user_sessions::start` takes an executor; `console_session::start_session_in` and `signin::{start_in, finish_sign_in}` are new; `signin::cross_site` is `pub(crate)`.
+> - **The open routes refuse another site** (`cross_site`, 403) and the two starts and the sign-in finish take the per-address sign-in limit (429). `remember` and `take_ceremony` take the `Instant`, so a test checks the five-minute expiry.
+> - `passkey_rows::remove` answers 404 (not the user path's 404) for an unknown user, and deletes before deciding, rolling back when it was the last method.
+> - The 7b tests that asserted "no script" on `/signin` and the setup page now expect the passkey script, since `login_config`'s domain turns passkeys on. `fail_on`, `allow` and `wait_for_lock_waiters` moved to `http::api::testing`.
+> - **The browser journey registers and signs in for real.** `Ui::virtual_authenticator` adds a Chromium virtual authenticator over a raw DevTools connection (dev-dependency `tungstenite` 0.29, already in the tree through rustwright). `a_setup_link_registers_a_passkey_that_then_signs_in_from_the_sign_in_page` registers on the setup page, signs out, signs in with the passkey button and checks the stored passkey and events.
 
 - [ ] **Step 1: Write the failing store tests.** `src/store/passkeys.rs`:
 

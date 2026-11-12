@@ -11,7 +11,7 @@ use okf_mcp::mail::{queue as mail_queue, Template};
 use okf_mcp::store::email_tokens::{self, Purpose};
 use okf_mcp::store::keys::Access;
 use okf_mcp::store::sign_in_events::{self, Method, Outcome};
-use okf_mcp::store::{ceiling, users};
+use okf_mcp::store::{ceiling, passkeys, users};
 use rustwright::GotoOptions;
 
 use crate::harness::drive;
@@ -310,4 +310,115 @@ async fn an_admin_session_writes_through_the_console_with_its_csrf_token() {
     users::find(&server.db.pool, "frank")
         .await
         .expect("frank was stored");
+}
+
+/// A server whose `public_url` is its own address under the name
+/// `localhost`, since WebAuthn needs a domain; the browser goes there too.
+async fn passkey_server() -> (TestServer, String) {
+    let server =
+        TestServer::start_with(vec![("main", files(&[("index.md", "# Main\n")]))], |base| {
+            Config {
+                public_url: Some(base.replace("127.0.0.1", "localhost")),
+                ..Config::default()
+            }
+        })
+        .await;
+    let base = server.base.replace("127.0.0.1", "localhost");
+    (server, base)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sign_in_page_offers_a_passkey_under_the_console_csp() {
+    let (_server, base) = passkey_server().await;
+    let page = format!("{base}/signin");
+    drive(base, move |ui| {
+        ui.page
+            .goto(&page, GotoOptions::default())
+            .expect("open the sign-in page");
+        // `data-ready` is set by passkey.js, so its module (and webauthn.js)
+        // loaded under the CSP; `drive` fails on any console error.
+        ui.wait_visible("#signin-passkey[data-ready=true]");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_setup_link_registers_a_passkey_that_then_signs_in_from_the_sign_in_page() {
+    let (server, base) = passkey_server().await;
+    let pool = &server.db.pool;
+    users::create(
+        pool,
+        &users::NewUser {
+            name: "alice",
+            display_name: "Alice",
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("create alice");
+    users::set_email(pool, "alice", Some("alice@example.com"))
+        .await
+        .expect("set the email");
+    ceiling::entitle(pool, "alice", "main", Access::Read, Utc::now())
+        .await
+        .expect("entitle");
+    server.app.poll().await.expect("poll");
+    let alice = users::find_by_email(pool, "alice@example.com")
+        .await
+        .expect("find alice")
+        .expect("alice exists");
+    let token = email_tokens::issue(
+        pool,
+        &alice.id,
+        Purpose::Setup,
+        Duration::from_secs(3600),
+        Utc::now(),
+    )
+    .await
+    .expect("issue a setup link");
+    let setup = link(&base, SETUP_PATH, &token);
+
+    let ran = drive(base.clone(), move |ui| {
+        ui.page
+            .goto(&setup, GotoOptions::default())
+            .expect("open the setup link");
+        let _authenticator = ui.virtual_authenticator();
+        ui.wait_visible("#setup-passkey[data-ready=true]");
+        ui.fill("#setup-passkey-name", "Laptop");
+        ui.click("#setup-passkey");
+        ui.wait_text("#whoami", "alice - read");
+        ui.click("#signout");
+        ui.wait_visible("#login");
+        assert_eq!(ui.eval(SESSION_STATUS, serde_json::json!(null)), 401);
+        // No email typed: the authenticator offers alice's passkey.
+        ui.page
+            .goto(&format!("{base}/signin"), GotoOptions::default())
+            .expect("open the sign-in page");
+        ui.wait_visible("#signin-passkey[data-ready=true]");
+        ui.click("#signin-passkey");
+        ui.wait_text("#whoami", "alice - read");
+        assert_eq!(ui.eval(SESSION_STATUS, serde_json::json!(null)), 200);
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let stored = passkeys::list(pool, &alice.id).await.expect("list");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].name, "Laptop");
+    assert!(stored[0].last_used_at.is_some(), "it signed in");
+    let used = email_tokens::peek(pool, &token, Purpose::Setup, Utc::now()).await;
+    assert!(used.is_err(), "the setup link is used");
+    let events = sign_in_events::recent(pool, "alice", 10)
+        .await
+        .expect("events");
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        (&events[0].method, &events[0].outcome),
+        (Method::Passkey, Outcome::Ok)
+    ));
+    assert!(matches!(
+        (&events[1].method, &events[1].outcome),
+        (Method::Setup, Outcome::Ok)
+    ));
 }

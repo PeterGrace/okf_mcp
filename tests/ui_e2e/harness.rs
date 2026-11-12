@@ -17,7 +17,7 @@ pub struct Ui {
     pub page: Page,
     // Declared after `page`, so the page is dropped before its browser
     // (Rust drops struct fields in declaration order).
-    _browser: Browser,
+    browser: Browser,
 }
 
 /// Runs `journey` in a fresh headless Chromium, then fails it on any console
@@ -45,7 +45,7 @@ where
         let ui = Ui {
             base,
             page,
-            _browser: browser,
+            browser,
         };
         journey(&ui);
         ui.assert_no_console_errors();
@@ -165,6 +165,46 @@ impl Ui {
             .expect("evaluate")
     }
 
+    /// Gives the page a virtual WebAuthn authenticator (Chromium DevTools'
+    /// `WebAuthn` domain): a platform authenticator that keeps discoverable
+    /// credentials, verifies the user and needs no touch. It lives while the
+    /// returned value does.
+    ///
+    /// # Panics
+    /// If Chromium refuses a DevTools call.
+    pub fn virtual_authenticator(&self) -> VirtualAuthenticator {
+        let (socket, _) =
+            tungstenite::connect(self.browser.ws_endpoint()).expect("connect to DevTools");
+        let mut devtools = VirtualAuthenticator { socket, next_id: 0 };
+        let attached = devtools.call(
+            None,
+            "Target.attachToTarget",
+            serde_json::json!({ "targetId": self.page.target_id(), "flatten": true }),
+        );
+        let session = attached["sessionId"]
+            .as_str()
+            .expect("a DevTools session")
+            .to_string();
+        devtools.call(
+            Some(&session),
+            "WebAuthn.enable",
+            serde_json::json!({ "enableUI": false }),
+        );
+        devtools.call(
+            Some(&session),
+            "WebAuthn.addVirtualAuthenticator",
+            serde_json::json!({ "options": {
+                "protocol": "ctap2",
+                "transport": "internal",
+                "hasResidentKey": true,
+                "hasUserVerification": true,
+                "isUserVerified": true,
+                "automaticPresenceSimulation": true,
+            }}),
+        );
+        devtools
+    }
+
     /// Fails on any console record of type "error" since the page opened.
     /// Chromium's own "Failed to load resource" line for an HTTP error
     /// status is ignored: journeys provoke 401, 403 and 409 on purpose, and
@@ -182,5 +222,50 @@ impl Ui {
             .map(|record| record.text.as_str())
             .collect();
         assert!(errors.is_empty(), "console errors: {errors:?}");
+    }
+}
+
+/// A DevTools connection holding a virtual authenticator
+/// ([`Ui::virtual_authenticator`]); dropping it closes the connection,
+/// which removes the authenticator.
+pub struct VirtualAuthenticator {
+    socket: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    next_id: u64,
+}
+
+impl VirtualAuthenticator {
+    /// Sends one DevTools command and waits for its answer, skipping the
+    /// events that arrive meanwhile.
+    ///
+    /// # Panics
+    /// If the connection fails or Chromium answers with an error.
+    fn call(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        self.next_id += 1;
+        let mut command =
+            serde_json::json!({ "id": self.next_id, "method": method, "params": params });
+        if let Some(session) = session {
+            command["sessionId"] = serde_json::json!(session);
+        }
+        self.socket
+            .send(tungstenite::Message::text(command.to_string()))
+            .expect("send a DevTools command");
+        loop {
+            let message = self.socket.read().expect("read from DevTools");
+            let Ok(text) = message.to_text() else {
+                continue;
+            };
+            let Ok(reply) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            if reply["id"] == self.next_id {
+                assert!(reply.get("error").is_none(), "{method}: {reply}");
+                return reply["result"].clone();
+            }
+        }
     }
 }

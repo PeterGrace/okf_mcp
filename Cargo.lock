@@ -2578,6 +2578,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
  "url",
  "webauthn-authenticator-rs",
  "webauthn-rs",

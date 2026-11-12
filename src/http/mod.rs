@@ -10,6 +10,7 @@ mod archives;
 pub mod console_session;
 pub mod limits;
 pub(crate) mod pages;
+pub mod passkeys;
 pub mod sessions;
 pub mod signin;
 mod ui;
@@ -243,6 +244,13 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
             .merge(oauth::routes().layer(timeout_layer()))
     } else {
         Router::new().merge(health)
+    };
+    // The passkey routes exist only with passkeys on (a domain
+    // `public_url`); otherwise `/auth/passkey/*` stays 404.
+    let open = if app.passkeys().is_some() {
+        open.merge(passkeys::routes())
+    } else {
+        open
     };
     open.merge(ui::routes())
         .merge(signin::routes(&app))
