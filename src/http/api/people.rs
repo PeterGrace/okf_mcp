@@ -51,6 +51,12 @@ pub(crate) struct UserView {
     pub credentials: i64,
     /// Its teams' names, sorted; the personal team included.
     pub teams: Vec<String>,
+    /// Its email address, if set.
+    pub email: Option<String>,
+    /// Whether its console session acts as an admin.
+    pub is_admin: bool,
+    /// Whether it has a local password.
+    pub has_password: bool,
 }
 
 impl From<UserRecord> for UserView {
@@ -63,6 +69,9 @@ impl From<UserRecord> for UserView {
             created_at,
             credentials,
             teams,
+            email,
+            is_admin,
+            has_password,
         } = record;
         Self {
             name,
@@ -70,6 +79,9 @@ impl From<UserRecord> for UserView {
             created_at: format_timestamp(created_at),
             credentials,
             teams,
+            email,
+            is_admin,
+            has_password,
         }
     }
 }
@@ -519,6 +531,10 @@ mod tests {
         assert_eq!(body["display_name"], "Alice Example");
         assert_eq!(body["credentials"], 0);
         assert_eq!(body["teams"], json!(["alice"]));
+        assert_eq!(body["email"], serde_json::Value::Null);
+        assert_eq!(body["is_admin"], false);
+        assert_eq!(body["has_password"], false);
+        assert!(body.get("password_hash").is_none(), "{body}");
         assert!(listed["users"]
             .as_array()
             .expect("a list")

@@ -153,3 +153,11 @@ tower = { version = "0.5.3", features = ["util"] }
 rustwright = "0.3.0"
 # A software passkey for the passkey tests (Task 8); no system libraries.
 webauthn-authenticator-rs = { version = "0.6.2", default-features = false, features = ["softpasskey"] }
+
+# argon2 is roughly a hundred times slower unoptimized, and the password
+# tests hash dozens of times; optimize it (and its BLAKE2) in debug builds.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
