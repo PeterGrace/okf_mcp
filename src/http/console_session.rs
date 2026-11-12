@@ -19,7 +19,6 @@ use axum::http::{header, HeaderMap, HeaderValue, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
-use sqlx::PgConnection;
 use subtle::ConstantTimeEq;
 
 use crate::app::App;
@@ -432,46 +431,23 @@ pub async fn start_session_with(
     Ok((session_cookie(app, &user.id, &session, absolute), session))
 }
 
-/// [`start_session`], inside the caller's transaction, which already holds
-/// the user's row (lock order: the user first). The session exists only if
-/// that transaction commits, so it cannot outlive a credential change the
-/// transaction checked under the same lock (a passkey sign-in, a setup
-/// link).
+/// The `Set-Cookie` header for a session just started, and its log line
+/// (the user's id only).
 ///
 /// # Arguments
-/// * `app` - the shared state.
-/// * `conn` - the caller's transaction (`&mut tx`).
-/// * `user` - the user who signed in.
-/// * `ip` - their address, if known.
-/// * `user_agent` - their `User-Agent`.
+/// * `app` - the shared state (for `Secure`).
+/// * `user_id` - whose session.
+/// * `session` - the new session.
+/// * `absolute` - its lifetime (`console_session_absolute`).
 ///
 /// # Returns
-/// The `Set-Cookie` header and the new session.
-///
-/// # Errors
-/// As [`start_session`].
-pub async fn start_session_in(
+/// The header.
+pub(crate) fn session_cookie(
     app: &App,
-    conn: &mut PgConnection,
-    user: &UserAuth,
-    ip: Option<IpAddr>,
-    user_agent: &str,
-) -> Result<(HeaderMap, NewSession), OkfError> {
-    let absolute = app.settings().console_session_absolute;
-    let request = SessionStart {
-        user_id: &user.id,
-        ip,
-        user_agent,
-        absolute,
-        now: app.clock().now(),
-        password: None,
-    };
-    let session = user_sessions::start(&mut *conn, &request).await?;
-    Ok((session_cookie(app, &user.id, &session, absolute), session))
-}
-
-/// The `Set-Cookie` header for a session just started, and its log line.
-fn session_cookie(app: &App, user_id: &str, session: &NewSession, absolute: Duration) -> HeaderMap {
+    user_id: &str,
+    session: &NewSession,
+    absolute: Duration,
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,

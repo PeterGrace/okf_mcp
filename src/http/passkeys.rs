@@ -46,9 +46,7 @@ use crate::http::console_session::{
 };
 use crate::http::limits::ip_key;
 use crate::http::pages::safe_return_to;
-use crate::http::signin::{
-    audit, cross_site, finish_sign_in, notify_method_added, start_in, LINK_EXPIRED,
-};
+use crate::http::signin::{audit, cross_site, notify_method_added, start_in, LINK_EXPIRED};
 use crate::http::{timeout_layer, AppError};
 use crate::keys;
 use crate::oauth::expiring::ExpiringMap;
@@ -79,6 +77,9 @@ const CROSS_SITE: &str = "passkey requests can only come from this site";
 pub struct Passkeys {
     webauthn: Webauthn,
     ceremonies: ExpiringMap<Ceremony>,
+    // The ceremony id each console session's registration holds, keyed by
+    // the hash of the session id: a session has at most one at a time.
+    by_session: ExpiringMap<String>,
 }
 
 impl Passkeys {
@@ -117,6 +118,7 @@ impl Passkeys {
         Ok(Some(Self {
             webauthn,
             ceremonies: ExpiringMap::new(CEREMONY_TTL, MAX_CEREMONIES),
+            by_session: ExpiringMap::new(CEREMONY_TTL, MAX_CEREMONIES),
         }))
     }
 }
@@ -264,7 +266,41 @@ fn screen(app: &App, parts: &Parts, limited: bool) -> Option<Response> {
     (!admitted).then(too_many)
 }
 
-/// Stores a ceremony and returns the cookie that names it.
+/// The 503 for a full ceremony map.
+fn busy() -> OkfError {
+    OkfError::Busy {
+        reason: "too many passkey requests in progress; try again shortly".to_string(),
+    }
+}
+
+/// The console session a registration ceremony belongs to, as the key of
+/// `Passkeys::by_session` (the hash, not the raw id).
+fn session_key(ceremony: &Ceremony) -> Option<String> {
+    let Ceremony::Register(registration) = ceremony else {
+        return None;
+    };
+    match &registration.pending.via {
+        RegisterVia::Session { session_id, .. } => {
+            Some(URL_SAFE_NO_PAD.encode(keys::hash(session_id)))
+        }
+        RegisterVia::Setup { .. } => None,
+    }
+}
+
+/// Stores a ceremony and returns the cookie that names it. Each actor
+/// holds at most one ceremony at a time, so no one can grow the map
+/// beyond the per-address limit on the open starts:
+/// - the ceremony the request's old cookie names is dropped (a browser
+///   that starts again replaces its previous one);
+/// - a console session's new registration replaces that session's previous
+///   one, cookie or not.
+///
+/// # Arguments
+/// * `app` - the shared state (for `Secure`).
+/// * `passkeys` - the ceremonies.
+/// * `headers` - the request's headers (its old ceremony cookie).
+/// * `ceremony` - the state to keep.
+/// * `now` - the current instant.
 ///
 /// # Errors
 /// [`OkfError::Busy`] when [`MAX_CEREMONIES`] are in progress;
@@ -272,16 +308,39 @@ fn screen(app: &App, parts: &Parts, limited: bool) -> Option<Response> {
 fn remember(
     app: &App,
     passkeys: &Passkeys,
+    headers: &HeaderMap,
     ceremony: Ceremony,
     now: Instant,
 ) -> Result<HeaderMap, OkfError> {
+    if let Some(old) = cookie(headers, CEREMONY_COOKIE) {
+        passkeys.ceremonies.remove(old);
+    }
+    let session = session_key(&ceremony);
     // A server-chosen random id, so no client can pick (or replace) another
     // browser's entry.
     let id = keys::generate_with("")?;
     if !passkeys.ceremonies.insert(id.clone(), ceremony, now) {
-        return Err(OkfError::Busy {
-            reason: "too many passkey requests in progress; try again shortly".to_string(),
-        });
+        return Err(busy());
+    }
+    if let Some(session) = session {
+        // Find-or-create and swap under one lock (`std::mem::replace` puts
+        // the new id in and hands back the old one), so of two concurrent
+        // starts by one session each drops what it replaced and one
+        // ceremony is left.
+        let replaced = passkeys.by_session.update_or_insert_sliding(
+            &session,
+            now,
+            || id.clone(),
+            |held| std::mem::replace(held, id.clone()),
+        );
+        match replaced {
+            Some(previous) if previous != id => passkeys.ceremonies.remove(&previous),
+            Some(_) => {}
+            None => {
+                passkeys.ceremonies.remove(&id);
+                return Err(busy());
+            }
+        }
     }
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -331,6 +390,7 @@ fn take_ceremony(
 async fn begin_registration(
     app: &App,
     passkeys: &Passkeys,
+    headers: &HeaderMap,
     user: &UserAuth,
     pending: Pending,
 ) -> Result<Response, OkfError> {
@@ -360,8 +420,8 @@ async fn begin_registration(
         user_id: user.id.clone(),
         pending,
     }));
-    let headers = remember(app, passkeys, ceremony, Instant::now())?;
-    Ok((headers, Json(challenge)).into_response())
+    let cookie = remember(app, passkeys, headers, ceremony, Instant::now())?;
+    Ok((cookie, Json(challenge)).into_response())
 }
 
 /// A verified registration: the new passkey, what it was started with, its
@@ -440,7 +500,7 @@ async fn setup_start(
         via: RegisterVia::Setup { token: body.token },
         return_to: safe_return_to(body.return_to.as_deref()),
     };
-    Ok(begin_registration(&app, passkeys, &user, pending).await?)
+    Ok(begin_registration(&app, passkeys, &parts.headers, &user, pending).await?)
 }
 
 /// `POST /auth/passkey/setup/finish`: stores the passkey, uses the link and
@@ -478,7 +538,9 @@ async fn setup_finish(
     };
     let (user, cookie) = use_setup_link(&app, &parts, &set_up).await?;
     append_all(&mut headers, &cookie);
-    finish_sign_in(&app, &parts, &user, Method::Setup).await?;
+    // After the commit, only what cannot fail: the browser gets its cookie.
+    let ip = client_ip(&parts, &app.config().auth);
+    audit(&app, Some(&user.id), Method::Setup, Outcome::Ok, ip).await;
     Ok((
         headers,
         Json(serde_json::json!({ "redirect": pending.return_to })),
@@ -525,7 +587,7 @@ async fn use_setup_link(
         });
     }
     passkey_rows::add_in(&mut tx, &user.id, set_up.passkey, set_up.name, now).await?;
-    let cookie = start_in(app, &mut tx, parts, &user).await?;
+    let cookie = start_in(app, &mut tx, parts, &user, None).await?;
     tx.commit().await?;
     tracing::info!(user = %user.id, "passkey added from a setup link");
     Ok((user, cookie))
@@ -562,7 +624,7 @@ async fn sign_in_start(
     challenge.mediation = None;
     let return_to = safe_return_to(body.return_to.as_deref());
     let ceremony = Ceremony::SignIn { state, return_to };
-    let headers = remember(&app, passkeys, ceremony, Instant::now())?;
+    let headers = remember(&app, passkeys, &parts.headers, ceremony, Instant::now())?;
     Ok((headers, Json(challenge)).into_response())
 }
 
@@ -637,7 +699,7 @@ async fn verify_and_start(
         });
     }
     passkey_rows::update_in(&mut tx, credential_id, &passkey, app.clock().now()).await?;
-    let cookie = start_in(app, &mut tx, parts, &user).await?;
+    let cookie = start_in(app, &mut tx, parts, &user, None).await?;
     tx.commit().await?;
     Ok(Verdict::SignedIn { user, cookie })
 }
@@ -665,7 +727,9 @@ async fn sign_in_finish(
     match verify_and_start(&app, passkeys, &parts, &credential, state).await? {
         Verdict::SignedIn { user, cookie } => {
             append_all(&mut headers, &cookie);
-            finish_sign_in(&app, &parts, &user, Method::Passkey).await?;
+            // After the commit, only what cannot fail.
+            let ip = client_ip(&parts, &app.config().auth);
+            audit(&app, Some(&user.id), Method::Passkey, Outcome::Ok, ip).await;
             Ok((headers, Json(serde_json::json!({ "redirect": return_to }))).into_response())
         }
         Verdict::Refused { user_id } => {
@@ -720,6 +784,7 @@ async fn register_start(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
     session: Option<Extension<ConsoleSession>>,
+    headers: HeaderMap,
     Json(body): Json<RegisterStart>,
 ) -> Result<Response, AppError> {
     let (user_id, session) = signed_in(&principal, session)?;
@@ -738,7 +803,7 @@ async fn register_start(
         },
         return_to: "/ui/#/account".to_string(),
     };
-    Ok(begin_registration(&app, passkeys, &user, pending).await?)
+    Ok(begin_registration(&app, passkeys, &headers, &user, pending).await?)
 }
 
 /// `POST /api/v1/me/passkeys/register/finish`: stores the passkey, ends the
@@ -788,8 +853,14 @@ async fn register_finish(
     };
     let ended = passkey_rows::add_from_session(app.pool(), &registration).await?;
     tracing::info!(user = %user_id, ended, "passkey added; other sessions ended unless kept");
-    if let Some(user) = session_user(&app, &user_id).await? {
-        notify_method_added(&app, &user, "a passkey").await;
+    // After the commit, nothing may turn the 201 into an error: a failed
+    // lookup only skips the notice.
+    match session_user(&app, &user_id).await {
+        Ok(Some(user)) => notify_method_added(&app, &user, "a passkey").await,
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, user = %user_id, "no passkey notice: the user lookup failed");
+        }
     }
     let body = serde_json::json!({
         "id": URL_SAFE_NO_PAD.encode(passkey.cred_id().as_slice()),
@@ -1135,10 +1206,26 @@ mod tests {
             headers.insert(header::COOKIE, pair.parse().expect("a header"));
             headers
         };
-        let late =
-            presenting(remember(&test.app, passkeys, ceremony(passkeys), start).expect("remember"));
-        let on_time =
-            presenting(remember(&test.app, passkeys, ceremony(passkeys), start).expect("remember"));
+        let late = presenting(
+            remember(
+                &test.app,
+                passkeys,
+                &HeaderMap::new(),
+                ceremony(passkeys),
+                start,
+            )
+            .expect("remember"),
+        );
+        let on_time = presenting(
+            remember(
+                &test.app,
+                passkeys,
+                &HeaderMap::new(),
+                ceremony(passkeys),
+                start,
+            )
+            .expect("remember"),
+        );
 
         let after = take_ceremony(&test.app, passkeys, &late, start + CEREMONY_TTL);
         let within = take_ceremony(&test.app, passkeys, &on_time, start + CEREMONY_TTL / 2);
@@ -1350,6 +1437,132 @@ mod tests {
         assert!(link.is_ok(), "the link was not used");
         assert!(stored.is_empty(), "no passkey was stored");
         assert_eq!(retried.status, StatusCode::OK, "{}", retried.text());
+    }
+
+    /// The trigger that makes ending the browser's old session fail.
+    const FAIL_SESSION_DELETE: &str = "BEFORE DELETE ON user_sessions FOR EACH STATEMENT";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_passkey_sign_in_whose_old_session_cannot_end_changes_nothing() {
+        let test = login_app().await;
+        let (alice, mut soft) = alice_with_passkey(&test, Some(PASSWORD)).await;
+        let pool = test.app.pool();
+        let mut browser = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let old = browser.cookie(COOKIE).expect("a session").to_string();
+        let before = sessions_of(&test, &alice).await;
+        fail_on(pool, FAIL_SESSION_DELETE).await;
+
+        let signed = assertion(&test, &mut browser, &mut soft, &alice, "/ui/").await;
+        let failed = finish(&test, &mut browser, signed).await;
+        let counter = stored_counter(&test, &alice).await;
+        let after_failure = sessions_of(&test, &alice).await;
+        allow(pool, "user_sessions").await;
+        let signed = assertion(&test, &mut browser, &mut soft, &alice, "/ui/").await;
+        let retried = finish(&test, &mut browser, signed).await;
+        let session = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        // All or nothing: the counter, the new session and the old one's
+        // end commit together.
+        assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(failed.set_cookie(COOKIE).is_none());
+        assert_eq!(
+            counter, 0,
+            "the registration's counter, not the failed sign-in's"
+        );
+        assert_eq!(after_failure, before);
+        assert_eq!(retried.status, StatusCode::OK, "{}", retried.text());
+        assert_ne!(browser.cookie(COOKIE), Some(old.as_str()));
+        assert_eq!(session.json()["user"], "alice");
+        assert_eq!(
+            sessions_of(&test, &alice).await,
+            before,
+            "the old one ended"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_passkey_setup_whose_old_session_cannot_end_keeps_the_link() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
+        user_with_password(&test, "bob", "bob@example.com", Some(PASSWORD)).await;
+        let token = setup_token(&test, &alice).await;
+        let pool = test.app.pool();
+        // The browser is still signed in as someone else.
+        let mut browser = Browser::signed_in(&test, "bob@example.com", PASSWORD).await;
+        let mut soft = SoftPasskey::new(true);
+        fail_on(pool, FAIL_SESSION_DELETE).await;
+
+        let failed = register_by_setup(&test, &mut browser, &mut soft, &token).await;
+        let link = email_tokens::peek(pool, &token, Purpose::Setup, Utc::now()).await;
+        let stored = passkey_rows::list(pool, &alice.id).await.expect("list");
+        allow(pool, "user_sessions").await;
+        let retried = register_by_setup(&test, &mut browser, &mut soft, &token).await;
+        let session = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(failed.set_cookie(COOKIE).is_none());
+        assert!(link.is_ok(), "the link was not used");
+        assert!(stored.is_empty(), "no passkey was stored");
+        assert_eq!(retried.status, StatusCode::OK, "{}", retried.text());
+        assert_eq!(session.json()["user"], "alice");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_actors_repeated_starts_hold_one_ceremony() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let passkeys = test.app.passkeys().expect("passkeys are on");
+        let mut browser = Browser::default();
+        let anonymous = || Payload::Json(json!({}));
+
+        // A browser that starts again (its cookie kept) replaces its ceremony.
+        for _ in 0..5 {
+            let reply = browser
+                .send(&test, "POST", "/auth/passkey/signin/start", anonymous())
+                .await;
+            assert_eq!(reply.status, StatusCode::OK);
+        }
+        let after_one_browser = passkeys.ceremonies.len();
+        let other = Browser::default()
+            .send(&test, "POST", "/auth/passkey/signin/start", anonymous())
+            .await;
+        let after_another = passkeys.ceremonies.len();
+        // A session holds one registration, even when it drops the cookie.
+        let session = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        for _ in 0..5 {
+            let mut cookieless = Browser::with_cookie(COOKIE, session.cookie(COOKIE).expect("id"));
+            cookieless.csrf.clone_from(&session.csrf);
+            let reply = cookieless
+                .send(
+                    &test,
+                    "POST",
+                    "/api/v1/me/passkeys/register/start",
+                    Payload::Json(json!({ "name": "Phone" })),
+                )
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+        }
+        let after_one_session = passkeys.ceremonies.len();
+        let mut second = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let started = second
+            .send(
+                &test,
+                "POST",
+                "/api/v1/me/passkeys/register/start",
+                Payload::Json(json!({ "name": "Laptop" })),
+            )
+            .await;
+
+        assert_eq!(after_one_browser, 1);
+        assert_eq!(other.status, StatusCode::OK, "others can still start");
+        assert_eq!(after_another, 2);
+        assert_eq!(after_one_session, 3);
+        assert_eq!(started.status, StatusCode::OK, "others can still start");
+        assert_eq!(passkeys.ceremonies.len(), 4);
     }
 
     #[tokio::test(flavor = "multi_thread")]

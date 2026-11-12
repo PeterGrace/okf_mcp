@@ -25,9 +25,7 @@ use sqlx::PgConnection;
 
 use crate::app::App;
 use crate::error::OkfError;
-use crate::http::console_session::{
-    client_ip, cookie, start_session_in, start_session_with, COOKIE,
-};
+use crate::http::console_session::{client_ip, cookie, session_cookie, COOKIE};
 use crate::http::limits::ip_key;
 use crate::http::pages::{self, escape, safe_return_to};
 use crate::http::ui::CONTENT_SECURITY_POLICY;
@@ -37,7 +35,7 @@ use crate::mail::{self, Template, RESET_PATH, SETUP_PATH};
 use crate::store::email_tokens::{self, Purpose};
 use crate::store::passwords::{self, NewPassword, PasswordStamp, SignInOutcome};
 use crate::store::sign_in_events::{self, Method, Outcome};
-use crate::store::user_sessions;
+use crate::store::user_sessions::{self, SessionStart};
 use crate::store::users::{self, UserAuth};
 
 /// Every refused password sign-in says this, whatever the reason (spec).
@@ -401,12 +399,20 @@ async fn begin(
     method: Method,
     password: Option<&PasswordStamp>,
 ) -> Result<HeaderMap, OkfError> {
-    if let Some(old) = cookie(&parts.headers, COOKIE) {
-        user_sessions::revoke(app.pool(), old).await?;
-    }
-    let (ip, user_agent) = client_of(app, parts);
-    let (headers, _session) = start_session_with(app, user, password, ip, user_agent).await?;
-    audit(app, Some(&user.id), method, Outcome::Ok, ip).await;
+    // The new session and the end of the old one commit together, so a
+    // failure leaves the browser as it was and nothing after the commit
+    // can fail.
+    let mut tx = app.pool().begin().await?;
+    let headers = start_in(app, &mut tx, parts, user, password).await?;
+    tx.commit().await?;
+    audit(
+        app,
+        Some(&user.id),
+        method,
+        Outcome::Ok,
+        client_ip(parts, &app.config().auth),
+    )
+    .await;
     Ok(headers)
 }
 
@@ -420,58 +426,55 @@ fn client_of<'a>(app: &App, parts: &'a Parts) -> (Option<IpAddr>, &'a str) {
     (client_ip(parts, &app.config().auth), user_agent)
 }
 
-/// Starts a session for `user` inside the caller's transaction, which
-/// holds the user's row and has just checked the credential under that
-/// lock (a passkey sign-in, a passkey setup link). Unlike [`sign_in`],
-/// nothing can change the credential between that check and the insert,
-/// and the session exists only if the transaction commits. Once it has,
-/// call [`finish_sign_in`].
+/// Starts a session for `user` inside the caller's transaction and ends
+/// the session this browser held before (rotation), in that order: the
+/// insert reads the user's row `FOR SHARE` first, then the old session's
+/// row is deleted (lock order: the user first). The caller commits, and
+/// then only records the event ([`audit`], which cannot fail), so a
+/// committed sign-in always reaches the browser with its cookie, and a
+/// failure before the commit changes nothing.
+///
+/// A passkey sign-in or a setup link calls this inside the transaction
+/// that checked the credential under the user's lock, so nothing can
+/// change the credential between that check and the insert.
 ///
 /// # Arguments
 /// * `app` - the shared state.
 /// * `conn` - the caller's transaction (`&mut tx`).
-/// * `parts` - the request (address, `User-Agent`).
+/// * `parts` - the request (old session cookie, address, `User-Agent`).
 /// * `user` - the verified user.
+/// * `password` - for a password sign-in, the hash the password matched
+///   (`user_sessions::start`); `None` otherwise.
 ///
 /// # Returns
 /// The `Set-Cookie` header to send.
 ///
 /// # Errors
-/// As [`sign_in`].
+/// [`OkfError::Unauthenticated`] when the user is gone or the stamped
+/// password changed; [`OkfError::Database`]; [`OkfError::Io`] from the
+/// random source.
 pub(crate) async fn start_in(
     app: &App,
     conn: &mut PgConnection,
     parts: &Parts,
     user: &UserAuth,
+    password: Option<&PasswordStamp>,
 ) -> Result<HeaderMap, OkfError> {
     let (ip, user_agent) = client_of(app, parts);
-    let (headers, _session) = start_session_in(app, conn, user, ip, user_agent).await?;
-    Ok(headers)
-}
-
-/// After a session from [`start_in`] committed: ends the session this
-/// browser held before (rotation) and records the sign-in.
-///
-/// # Arguments
-/// * `app` - the shared state.
-/// * `parts` - the request (its old session cookie and address).
-/// * `user` - the user now signed in.
-/// * `method` - how they proved who they are.
-///
-/// # Errors
-/// [`OkfError::Database`] ending the old session.
-pub(crate) async fn finish_sign_in(
-    app: &App,
-    parts: &Parts,
-    user: &UserAuth,
-    method: Method,
-) -> Result<(), OkfError> {
+    let absolute = app.settings().console_session_absolute;
+    let request = SessionStart {
+        user_id: &user.id,
+        ip,
+        user_agent,
+        absolute,
+        now: app.clock().now(),
+        password,
+    };
+    let session = user_sessions::start(&mut *conn, &request).await?;
     if let Some(old) = cookie(&parts.headers, COOKIE) {
-        user_sessions::revoke(app.pool(), old).await?;
+        user_sessions::revoke(&mut *conn, old).await?;
     }
-    let ip = client_ip(parts, &app.config().auth);
-    audit(app, Some(&user.id), method, Outcome::Ok, ip).await;
-    Ok(())
+    Ok(session_cookie(app, &user.id, &session, absolute))
 }
 
 /// Records a sign-in attempt as a `sign_in_events` row (which also logs an
@@ -789,37 +792,40 @@ async fn setup_post(
         };
         return setup_response(StatusCode::UNPROCESSABLE_ENTITY, &view);
     }
-    let used = match use_link(&app, &form.token, Purpose::Setup, &form.password, now).await {
+    // The session starts in the link's transaction, so a reset cannot
+    // replace the password between the setup and the session, and the
+    // committed setup always reaches the browser with its cookie.
+    let used = match use_link(&app, &parts, &form.token, Purpose::Setup, &form.password).await {
         Ok(used) => used,
         Err(error) => return link_error(error),
     };
-    // Stamped with the hash just stored, like a password sign-in: if a
-    // reset replaces the password before the session is inserted, there is
-    // no session, and the person signs in with the new password instead.
-    match begin(&app, &parts, &used.user, Method::Setup, Some(&used.stamp)).await {
-        Ok(headers) => (headers, Redirect::to(&return_to)).into_response(),
-        Err(OkfError::Unauthenticated { .. }) => Redirect::to("/signin").into_response(),
-        Err(error) => AppError(error).into_response(),
-    }
+    let ip = client_ip(&parts, &app.config().auth);
+    audit(&app, Some(&used.user.id), Method::Setup, Outcome::Ok, ip).await;
+    // `unwrap_or_default`: a setup link always starts a session; an empty
+    // header map would only mean no cookie to send.
+    let cookie = used.cookie.unwrap_or_default();
+    (cookie, Redirect::to(&return_to)).into_response()
 }
 
 /// Uses an emailed link and stores the new password it was for, in one
 /// transaction, so the link is used only if the password change commits:
 /// a failure anywhere leaves the old password, the sessions and the link
-/// as they were. A reset link also ends every session of the user
-/// (`passwords::reset_in`). The password is hashed before the transaction
-/// opens, so no row lock is held during argon2.
+/// as they were. A setup link also starts the session (and ends this
+/// browser's old one) in that transaction ([`start_in`]); a reset link
+/// ends every session of the user (`passwords::reset_in`). The password is
+/// hashed before the transaction opens, so no row lock is held during
+/// argon2.
 ///
 /// # Arguments
 /// * `app` - the shared state.
+/// * `parts` - the request (for the setup link's session).
 /// * `token` - the raw token from the form.
 /// * `purpose` - which link the page is for.
 /// * `password` - the new password (already through [`check_new_password`]).
-/// * `now` - when (server clock).
 ///
 /// # Returns
-/// The link's user, how many sessions ended (0 for setup) and the stamp of
-/// the stored password.
+/// The link's user, how many sessions ended (0 for setup) and, for setup,
+/// the new session's `Set-Cookie` header.
 ///
 /// # Errors
 /// [`OkfError::Gone`] for a link that no longer works (also when a
@@ -827,41 +833,45 @@ async fn setup_post(
 /// [`OkfError::Io`] or [`OkfError::Database`] otherwise.
 async fn use_link(
     app: &App,
+    parts: &Parts,
     token: &str,
     purpose: Purpose,
     password: &str,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<LinkUsed, OkfError> {
     let hashed = NewPassword::hash(password).await?;
+    let now = app.clock().now();
     let mut tx = app.pool().begin().await?;
     // The token's row stays locked until the commit, so of two concurrent
     // posts the second waits and then finds the link used.
     let user = email_tokens::redeem_in(&mut tx, token, purpose, now).await?;
     // `match` on the purpose is exhaustive: a new purpose must say here what
     // its link changes.
-    let ended = match purpose {
+    let (ended, cookie) = match purpose {
         Purpose::Setup => {
             passwords::set_in(&mut tx, &user.id, &hashed, now).await?;
-            0
+            (0, Some(start_in(app, &mut tx, parts, &user, None).await?))
         }
-        Purpose::Reset => passwords::reset_in(&mut tx, &user.id, &hashed, now).await?,
+        Purpose::Reset => (
+            passwords::reset_in(&mut tx, &user.id, &hashed, now).await?,
+            None,
+        ),
     };
     tx.commit().await?;
     Ok(LinkUsed {
         user,
         ended,
-        stamp: hashed.stamp(),
+        cookie,
     })
 }
 
-/// What [`use_link`] did. No `Debug`: the stamp is a password hash.
+/// What [`use_link`] did. No `Debug`, as for the forms.
 struct LinkUsed {
     /// The link's user.
     user: UserAuth,
     /// How many sessions it ended (a reset; 0 for setup).
     ended: u64,
-    /// The stored password's stamp, for a session started from it.
-    stamp: PasswordStamp,
+    /// The setup link's session cookie (`None` for a reset).
+    cookie: Option<HeaderMap>,
 }
 
 /// The reset page's body.
@@ -933,7 +943,7 @@ async fn reset_post(
     // A reset signs nobody in: the person signs in with the new password,
     // through the stamped password path.
     let LinkUsed { user, ended, .. } =
-        match use_link(&app, &form.token, Purpose::Reset, &form.password, now).await {
+        match use_link(&app, &parts, &form.token, Purpose::Reset, &form.password).await {
             Ok(used) => used,
             Err(error) => return link_error(error),
         };
@@ -960,7 +970,7 @@ mod tests {
         allow, app, fail_on, login_app, user_with_password, wait_for_lock_waiters, Browser,
         Payload, Reply, MAIN, PASSWORD,
     };
-    use crate::http::console_session::COOKIE;
+    use crate::http::console_session::{start_session_with, COOKIE};
     use crate::mcp::testing::{app_with, TestApp};
     use crate::store::settings::{self, SettingKey};
     use crate::store::sign_in_events::{Method, Outcome};
@@ -1956,7 +1966,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_session_after_setup_is_refused_once_a_reset_replaced_the_password() {
+    async fn a_reset_after_setup_ends_the_session_the_setup_started() {
         let test = login_app().await;
         let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
         let pool = test.app.pool();
@@ -1970,21 +1980,28 @@ mod tests {
         .await
         .expect("issue a setup token");
 
-        // Setup commits; its session start is delayed past a reset.
-        let used = use_link(&test.app, &token, Purpose::Setup, PASSWORD, Utc::now())
+        // The session commits with the setup, so no reset can land between
+        // the two; a reset after it ends the session.
+        let used = use_link(&test.app, &no_request(), &token, Purpose::Setup, PASSWORD)
             .await
             .expect("use the setup link");
+        let started = sessions_of(pool, &alice.id).await;
         passwords::reset(pool, &alice.id, "amber-quarry-signal-77", Utc::now())
             .await
             .expect("reset");
-        let late = start_session_with(&test.app, &used.user, Some(&used.stamp), None, "").await;
 
-        assert!(
-            matches!(late, Err(OkfError::Unauthenticated { .. })),
-            "{:?}",
-            late.map(|_| ())
-        );
+        assert!(used.cookie.is_some(), "the setup started a session");
+        assert_eq!(started, 1);
         assert_eq!(sessions_of(pool, &alice.id).await, 0);
+    }
+
+    /// A request with no headers, for calling [`use_link`] directly.
+    fn no_request() -> Parts {
+        Request::builder()
+            .body(())
+            .expect("a request")
+            .into_parts()
+            .0
     }
 
     /// The other side of a race with a link's redemption.
@@ -2048,10 +2065,10 @@ mod tests {
             tokio::spawn(async move {
                 use_link(
                     &app,
+                    &no_request(),
                     &token,
                     Purpose::Reset,
                     "amber-quarry-signal-77",
-                    Utc::now(),
                 )
                 .await
                 .map(|_| ())
@@ -2217,6 +2234,88 @@ mod tests {
         assert!(link.is_ok(), "the link was not used");
         assert_eq!(password, SignInOutcome::Failed, "no password was set");
         assert_eq!(retried.status, StatusCode::SEE_OTHER, "{}", retried.text());
+    }
+
+    /// The trigger that makes ending the browser's old session fail.
+    const FAIL_SESSION_DELETE: &str = "BEFORE DELETE ON user_sessions FOR EACH STATEMENT";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_password_sign_in_whose_old_session_cannot_end_changes_nothing() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let pool = test.app.pool();
+        let mut browser = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let old = browser.cookie(COOKIE).expect("a session").to_string();
+        fail_on(pool, FAIL_SESSION_DELETE).await;
+
+        let failed = post_sign_in(&mut browser, &test, "alice@example.com", PASSWORD).await;
+        let after_failure = sessions_of(pool, &alice.id).await;
+        allow(pool, "user_sessions").await;
+        let retried = post_sign_in(&mut browser, &test, "alice@example.com", PASSWORD).await;
+        let session = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        // All or nothing: no new session without the old one ending.
+        assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(failed.set_cookie(COOKIE).is_none());
+        assert_eq!(after_failure, 1, "only the old session");
+        assert_eq!(retried.status, StatusCode::SEE_OTHER, "{}", retried.text());
+        assert_ne!(browser.cookie(COOKIE), Some(old.as_str()));
+        assert_eq!(session.json()["user"], "alice");
+        assert_eq!(sessions_of(pool, &alice.id).await, 1, "the old one ended");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_setup_whose_old_session_cannot_end_keeps_the_link() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
+        user_with_password(&test, "bob", "bob@example.com", Some(PASSWORD)).await;
+        let pool = test.app.pool();
+        let token = email_tokens::issue(
+            pool,
+            &alice.id,
+            Purpose::Setup,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await
+        .expect("issue a setup token");
+        // The browser is still signed in as someone else.
+        let mut browser = Browser::signed_in(&test, "bob@example.com", PASSWORD).await;
+        fail_on(pool, FAIL_SESSION_DELETE).await;
+
+        let failed = browser
+            .send(
+                &test,
+                "POST",
+                "/account/setup",
+                new_password_form(&token, PASSWORD),
+            )
+            .await;
+        let link = email_tokens::peek(pool, &token, Purpose::Setup, Utc::now()).await;
+        allow(pool, "user_sessions").await;
+        let password = passwords::verify(pool, "alice@example.com", PASSWORD, Utc::now())
+            .await
+            .expect("check the password");
+        let retried = browser
+            .send(
+                &test,
+                "POST",
+                "/account/setup",
+                new_password_form(&token, PASSWORD),
+            )
+            .await;
+        let session = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(failed.set_cookie(COOKIE).is_none());
+        assert!(link.is_ok(), "the link was not used");
+        assert_eq!(password, SignInOutcome::Failed, "no password was set");
+        assert_eq!(retried.status, StatusCode::SEE_OTHER, "{}", retried.text());
+        assert_eq!(session.json()["user"], "alice");
     }
 
     #[tokio::test(flavor = "multi_thread")]

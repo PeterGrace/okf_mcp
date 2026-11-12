@@ -384,10 +384,12 @@ pub async fn touch(
     Ok(Some(stored.into_row(id)))
 }
 
-/// Ends one session (sign-out).
+/// Ends one session (sign-out, or the browser's old session when it signs
+/// in again).
 ///
 /// # Arguments
-/// * `pool` - the database.
+/// * `executor` - the database: a `&PgPool`, or a `&mut PgConnection`
+///   (such as `&mut *tx`) to run inside a caller's transaction.
 /// * `id` - the raw id from the cookie.
 ///
 /// # Returns
@@ -395,10 +397,10 @@ pub async fn touch(
 ///
 /// # Errors
 /// [`OkfError::Database`]. An unknown id is not an error.
-pub async fn revoke(pool: &PgPool, id: &str) -> Result<(), OkfError> {
+pub async fn revoke(executor: impl PgExecutor<'_>, id: &str) -> Result<(), OkfError> {
     sqlx::query("DELETE FROM user_sessions WHERE id_hash = $1")
         .bind(keys::hash(id).as_slice())
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }
