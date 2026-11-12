@@ -8,8 +8,8 @@
 //! (`store`), the write path every write tool goes through (`write`), the
 //! configuration file (`config`), the server's shared state and poll loop
 //! (`app`), per-changeset async locks (`keyed_lock`), outgoing mail and its
-//! job queue (`mail`), the MCP handler and its tools (`mcp`), the SNTP client (`ntp`)
-//! and the clock check that uses it (`clock_check`), the HTTP router and
+//! job queue (`mail`), the MCP handler and its tools (`mcp`), the SNTP client (`ntp`),
+//! OIDC providers (`oidc`) and the clock check that uses it (`clock_check`), the HTTP router and
 //! server (`http`), the OAuth authorization server (`oauth`), the
 //! command line (`cli`), errors, and the clock.
 //! `main.rs` only starts it.
@@ -45,6 +45,7 @@ pub mod mail;
 pub mod mcp;
 pub mod ntp;
 pub mod oauth;
+pub mod oidc;
 pub mod okf;
 pub mod overlay;
 pub mod render;

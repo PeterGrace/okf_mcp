@@ -422,6 +422,7 @@ pub(crate) fn safe_return_to(raw: Option<&str>) -> String;  // same-origin /ui/.
 pub const SIGN_IN_FAILED: &str; pub const LINK_EXPIRED: &str; pub const FORGOT_SENT: &str;
 pub struct ProviderButton { pub id: String, pub label: String }  // Task 9's buttons
 pub(crate) async fn sign_in(app: &App, parts: &Parts, user: &UserAuth, method: Method) -> Result<HeaderMap, OkfError>; // ends this browser's old session, starts one, records the event
+pub(crate) async fn sign_in_linked(app: &App, parts: &Parts, user: &UserAuth, identity: LinkedIdentity<'_>) -> Result<HeaderMap, OkfError>; // corrected (issue #318): OIDC; refused once the identity is unlinked
 pub(crate) async fn audit(app: &App, user_id: Option<&str>, method: Method, outcome: Outcome, ip: Option<IpAddr>);
 pub(crate) async fn notify_method_added(app: &App, user: &UserAuth, method: &str); // queues Template::MethodAdded; logs a failure
 pub(crate) fn message_page(status: StatusCode, title: &str, message: &str) -> Response; // pub(crate) from Task 9
@@ -460,6 +461,8 @@ pub async fn remove(pool: &PgPool, user_id: &str, id: &str) -> Result<(), OkfErr
 // ---- src/store/identities.rs (Task 9) ----
 pub async fn find(pool: &PgPool, provider: &str, subject: &str) -> Result<Option<UserAuth>, OkfError>;
 pub async fn link(pool: &PgPool, user_id: &str, provider: &str, subject: &str, email: &str, now: DateTime<Utc>) -> Result<(), OkfError>; // one subject per provider per user
+pub async fn link_by_email(pool: &PgPool, provider: &str, subject: &str, email: &str, now: DateTime<Utc>) -> Result<Option<UserAuth>, OkfError>; // corrected (issue #318): find and lock by email, then link
+pub async fn link_for_session(pool: &PgPool, request: &SessionLink<'_>, now: DateTime<Utc>) -> Result<u64 /*ended*/, OkfError>; // corrected (issue #318): user, session FOR SHARE, link, revoke_all
 pub async fn touch(pool: &PgPool, provider: &str, subject: &str, now: DateTime<Utc>) -> Result<(), OkfError>;
 pub struct IdentityInfo { pub provider: String, pub email_at_link: String, pub created_at: DateTime<Utc>, pub last_used_at: Option<DateTime<Utc>> }
 pub async fn list(pool: &PgPool, user_id: &str) -> Result<Vec<IdentityInfo>, OkfError>;
@@ -12336,6 +12339,8 @@ Expected: compile errors (the modules do not exist).
 
 - [ ] **Step 3: Implement `src/store/sign_in_methods.rs`**
 
+> **Corrected (issue #318, 2026-11-12).** Task 9 merged first and needed `count` for `identities::unlink`, so it created `src/store/sign_in_methods.rs` (and its `pub mod` line) with the code below, except that the user row is locked `FOR NO KEY UPDATE` (the lock order of `email_tokens`' module docs), not `FOR UPDATE`. Its test inserts the passkey row with SQL, because `store::passkeys` did not exist yet. If you merge after it, keep the file on `main` and only swap your `passkey_for` test in; if you merge first, Task 9 takes yours.
+
 ```rust
 //! How many ways a user can sign in: the guard that keeps the last one
 //! from being removed (spec "Self-service": 409).
@@ -13720,6 +13725,16 @@ openidconnect 4.1.0 facts this task relies on (verified in `crate-probe/tests/oi
 - The discovered client's type is `CoreClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointMaybeSet, EndpointMaybeSet>`. `exchange_code` returns a `Result` (the token endpoint may be absent), and the `openid` scope is always added.
 - The crate does not compare `state`; the app does, in constant time. `IdToken::claims(&verifier, &nonce)` checks the issuer, audience, expiry, signature and nonce.
 - Test ID tokens are HS256 with `CoreHmacKey::new(client_secret)`, listed in `id_token_signing_alg_values_supported`, with an empty JWKS.
+
+> **Corrected (issue #318, 2026-11-12).** What shipped differs from the code below in these ways; `src/http/oidc.rs`, `src/store/identities.rs` and `src/oidc.rs` are authoritative.
+> - **The OIDC session re-checks its identity.** `user_sessions::SessionStart` gained `identity: Option<LinkedIdentity { provider, subject }>`. With it, `start` locks the user's row `FOR SHARE` in a transaction, re-reads the identity's link with a fresh statement, and inserts only while it is still the user's: a sign-in queued behind an unlink gets no session (`a_sign_in_waiting_on_an_unlink_gets_no_session`). `console_session::start_session_proved(app, user, SessionProof { password, identity }, ip, user_agent)` carries it (`start_session_with` is unchanged and calls it), `signin::begin` takes a `SessionProof`, and the OIDC callback signs in through the new `signin::sign_in_linked(app, parts, user, LinkedIdentity)`. So `signin::sign_in` still has no caller; its `expect(dead_code)` stays for Task 8. A reset or admin change ends an OIDC session as it does any other (`an_oidc_session_ends_with_a_reset_or_an_admin_change`).
+> - **Linking by verified email** is `identities::link_by_email(pool, provider, subject, email, now) -> Option<UserAuth>`: one transaction that finds and locks the user by `email = $1::citext FOR NO KEY UPDATE`, so an address changed meanwhile drops out. The callback no longer calls `users::find_by_email` and then `link`.
+> - **Linking from the account page** is `identities::link_for_session(pool, &SessionLink { user_id, session_id, provider, subject, email, keep_sessions }, now) -> u64`: the user's row, then `user_sessions::lock_live` (the session `FOR SHARE`, new), the link and `revoke_all` in one transaction. Before it, the callback requires the browser to send the very session that started the link (compared in constant time, touched, same user), else 400 `LINK_RETRY`. Tests `a_link_callback_needs_the_live_session_that_started_it` and `keep_sessions_keeps_the_other_sessions_when_linking`.
+> - Every `identities` write locks the user `FOR NO KEY UPDATE` (not `FOR UPDATE`). `email_at_link` is stored empty for text no address can be (a NUL), and a `sub` that is empty, over 255 bytes or holds a control character is refused as a bad ID token (400, `a_subject_postgres_would_refuse_is_400_not_500`). `IdentityInfo` derives `sqlx::FromRow`.
+> - `GET /auth/oidc/{provider}/start` answers an unknown provider's 404 before any discovery and takes from `sign_in_limits().sign_in_per_ip` (429), so no one address fills the flow map. `identities::touch` runs after the session is started.
+> - `LINKED_ELSEWHERE` reads "This account cannot be linked: it is linked to another user, or another account at this provider is already linked to yours." (the 409 for both refusals); `SIGN_IN_RETRY` and the new `LINK_RETRY` are `pub`. Test `a_second_subject_claiming_a_linked_users_email_is_409` was added; the 409 test checks "linked to another user".
+> - `oidc_app` creates the `main` and `other` catalogs (the `keys` helper needs both). `Browser::add_cookie(name, value)` was added to `src/http/api/testing.rs`. `OidcProviders` has a hand-written `Debug` (ids only); `no_secret_reaches_debug_output`, `email_verified_may_be_the_string_true` and `a_subject_postgres_would_refuse_or_too_long_is_invalid` are in `src/oidc.rs`.
+> - `src/store/sign_in_methods.rs` shipped here (see Task 8's Step 3 note).
 
 - [ ] **Step 1: Write the failing tests.** `src/config.rs` tests:
 

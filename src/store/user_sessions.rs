@@ -25,7 +25,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::{DateTime, TimeDelta, Utc};
-use sqlx::{PgExecutor, PgPool};
+use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::error::OkfError;
 use crate::keys;
@@ -162,6 +162,19 @@ pub struct SessionStart<'a> {
     /// is refused if the user's hash has changed since. `None` for the other
     /// sign-in methods.
     pub password: Option<&'a PasswordStamp>,
+    /// For an OIDC sign-in, the identity it proved: the session is refused
+    /// if the identity was unlinked from the user since it was looked up.
+    /// `None` for the other sign-in methods.
+    pub identity: Option<LinkedIdentity<'a>>,
+}
+
+/// An OIDC identity, by provider and subject (`user_identities`' key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkedIdentity<'a> {
+    /// The configured provider id.
+    pub provider: &'a str,
+    /// The provider's `sub`.
+    pub subject: &'a str,
 }
 
 /// Starts a session with no password condition ([`start`] with
@@ -195,6 +208,7 @@ pub async fn create(
         absolute,
         now,
         password: None,
+        identity: None,
     };
     start(pool, &request).await
 }
@@ -207,6 +221,15 @@ pub async fn create(
 /// the reset deletes the session, or the reset commits first and Postgres
 /// re-checks the hash on the new row version, which no longer matches.
 ///
+/// With an `identity`, the user's row is locked `FOR SHARE` first, in a
+/// transaction, and the identity's link is read after that, by a statement
+/// with a snapshot of its own. Unlinking takes the user's row `FOR NO KEY
+/// UPDATE` (`sign_in_methods::count`), so it either commits before the
+/// lock is granted, and the read sees the identity gone, or waits for this
+/// session to commit, and then sees (and may end) it. A single statement
+/// would not do: unlinking does not change the user's row, so Postgres
+/// would not re-check the statement's older view of `user_identities`.
+///
 /// # Arguments
 /// * `pool` - the database.
 /// * `request` - the user, client details and lifetime.
@@ -215,8 +238,9 @@ pub async fn create(
 /// The raw id and CSRF token. Neither is stored.
 ///
 /// # Errors
-/// [`OkfError::Unauthenticated`] when the user is gone or (for a password
-/// sign-in) their password changed since it was checked;
+/// [`OkfError::Unauthenticated`] when the user is gone, (for a password
+/// sign-in) their password changed since it was checked, or (for an OIDC
+/// sign-in) the identity is no longer linked to them;
 /// [`OkfError::LimitExceeded`] for an absurd `absolute`; [`OkfError::Io`]
 /// if the OS random source fails; [`OkfError::Database`].
 pub async fn start(pool: &PgPool, request: &SessionStart<'_>) -> Result<NewSession, OkfError> {
@@ -236,7 +260,7 @@ pub async fn start(pool: &PgPool, request: &SessionStart<'_>) -> Result<NewSessi
         .map_or(request.user_agent, |(end, _)| &request.user_agent[..end]);
     // `$8 IS NULL OR ...`: no condition without a stamp. `IS NOT DISTINCT
     // FROM` would also match a user whose hash was cleared; `=` does not.
-    let inserted = sqlx::query(
+    let insert = sqlx::query(
         "INSERT INTO user_sessions \
              (id_hash, user_id, csrf_token, created_at, last_seen_at, expires_at, ip, user_agent) \
          SELECT $1, u.id, encode($3, 'hex'), $4, $4, $5, $6::inet, $7 FROM users u \
@@ -250,13 +274,38 @@ pub async fn start(pool: &PgPool, request: &SessionStart<'_>) -> Result<NewSessi
     .bind(expires_at)
     .bind(request.ip.map(|address| address.to_string()))
     .bind(user_agent)
-    .bind(request.password.map(PasswordStamp::as_str))
-    .execute(pool)
-    .await?
-    .rows_affected();
+    .bind(request.password.map(PasswordStamp::as_str));
+    let inserted = match request.identity {
+        None => insert.execute(pool).await?.rows_affected(),
+        Some(identity) => {
+            let mut tx = pool.begin().await?;
+            let user: Option<i32> =
+                sqlx::query_scalar("SELECT 1 FROM users WHERE id = $1 FOR SHARE")
+                    .bind(request.user_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let linked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM user_identities \
+                  WHERE provider = $1 AND subject = $2 AND user_id = $3)",
+            )
+            .bind(identity.provider)
+            .bind(identity.subject)
+            .bind(request.user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if user.is_none() || !linked {
+                // Dropping `tx` rolls back and releases the lock.
+                0
+            } else {
+                let inserted = insert.execute(&mut *tx).await?.rows_affected();
+                tx.commit().await?;
+                inserted
+            }
+        }
+    };
     if inserted == 0 {
         return Err(OkfError::Unauthenticated {
-            reason: "the user is gone or their password changed; sign in again".to_string(),
+            reason: "the user is gone or their sign-in method changed; sign in again".to_string(),
         });
     }
     Ok(session)
@@ -425,6 +474,42 @@ pub async fn revoke_all(
     .execute(executor)
     .await?
     .rows_affected())
+}
+
+/// Locks a live session of `user_id` `FOR SHARE`, inside the caller's
+/// transaction, which already holds the user's row (the lock order of
+/// `email_tokens`' module docs). A sign-out or revocation of it then waits
+/// for the caller to commit, so the caller acts for a session that was
+/// live when it committed.
+///
+/// # Arguments
+/// * `conn` - the caller's transaction (`&mut *tx`).
+/// * `id` - the raw session id from the cookie.
+/// * `user_id` - the user it must belong to.
+/// * `now` - the server clock (a session past its absolute limit is not
+///   live; the idle limit is [`touch`]'s, which callers run first).
+///
+/// # Returns
+/// Whether the session exists, belongs to the user and has not expired.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn lock_live(
+    conn: &mut PgConnection,
+    id: &str,
+    user_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, OkfError> {
+    let found: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM user_sessions \
+          WHERE id_hash = $1 AND user_id = $2 AND expires_at > $3 FOR SHARE",
+    )
+    .bind(keys::hash(id).as_slice())
+    .bind(user_id)
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(found.is_some())
 }
 
 /// One row of [`list`] as read.
