@@ -23,6 +23,21 @@ path = "src/bin/okf-maintenance.rs"
 axum = "0.8.9"
 # Application-level errors in the command line (the library uses OkfError).
 anyhow = "1.0.104"
+# Background jobs (Task 6 sends mail through them). Default features: the
+# retry, timeout and tracing layers.
+apalis = "1.0.0"
+# apalis' job storage in the server's own Postgres. Default features
+# (`migrate`, `tokio-comp`) use sqlx 0.9 with `tls-rustls-ring-webpki`, the
+# same TLS backend as ours, so no second sqlx or TLS stack is linked. Its
+# query macros check a live database when DATABASE_URL is set at build time:
+# the justfile exports SQLX_OFFLINE=true.
+apalis-postgres = "1.0.0"
+# Password hashing (Task 4). Argon2id at OWASP's parameters by default;
+# `hash_password` draws its own salt through getrandom.
+argon2 = "0.6.0"
+# `#[async_trait]` makes the `Mailer` trait usable as `Arc<dyn Mailer>`
+# (Decision 10): native `async fn` in traits is not dyn-compatible.
+async-trait = "0.1.92"
 # API keys are 32 random bytes in unpadded base64url (`keys::generate`).
 base64 = "0.23.1"
 # Sizes with units in the configuration ("64MiB").
@@ -42,6 +57,14 @@ getrandom = "0.4.3"
 humantime-serde = "1.1.1"
 # Insertion-ordered maps, matching Python dict order for frontmatter mappings.
 indexmap = "2.14.2"
+# SMTP (Task 6) in pure Rust: rustls with ring (as sqlx uses) and the
+# webpki root store; `hostname` sends the real host name in EHLO. No
+# default features: they pull in native-tls (OpenSSL).
+lettre = { version = "0.11.23", default-features = false, features = ["tokio1-rustls", "smtp-transport", "builder", "ring", "webpki-roots", "hostname"] }
+# OIDC sign-in (Task 9). No default features: they bring reqwest 0.12;
+# `src/oidc.rs` adapts our reqwest 0.13 client instead (Decision 12).
+# `accept-string-booleans`: some providers send `"email_verified": "true"`.
+openidconnect = { version = "4.1.0", default-features = false, features = ["accept-string-booleans"] }
 # Markdown to HTML for the web console (src/render.rs), which escapes raw
 # HTML and filters link schemes itself. No default features: they only add
 # getopts for pulldown-cmark's own command-line tool.
@@ -97,6 +120,14 @@ tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
 # (`src/oauth/clients.rs`). Already in the tree through reqwest; pinned to
 # the same version so there is one copy.
 url = "2.5.8"
+# Passkeys (Task 8), pure RustCrypto. `conditional-ui` enables
+# discoverable (username-less) sign-in. Ceremony state stays typed in
+# memory (Decision 13), so no state-serialisation feature is needed.
+webauthn-rs = { version = "0.6.2", features = ["conditional-ui"] }
+# The WebAuthn types webauthn-rs' prelude does not re-export
+# (`ResidentKeyRequirement`, and `AllowCredentials` in the tests; Decision 13).
+# Pinned exactly, as webauthn-rs pins it.
+webauthn-rs-proto = "=0.6.2"
 
 [dev-dependencies]
 # Property-based tests (Hypothesis-backed); the library is imported as `hegel`.
@@ -120,3 +151,5 @@ tower = { version = "0.5.3", features = ["util"] }
 # Browser end-to-end tests of the web console (tests/ui_e2e): a native Rust
 # Chromium driver (no Node). Its API is blocking; call it from spawn_blocking.
 rustwright = "0.3.0"
+# A software passkey for the passkey tests (Task 8); no system libraries.
+webauthn-authenticator-rs = { version = "0.6.2", default-features = false, features = ["softpasskey"] }

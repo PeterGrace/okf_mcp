@@ -156,6 +156,36 @@ pub enum OkfError {
         reason: String,
     },
 
+    /// The request proves no identity: a wrong password, an unknown email,
+    /// a locked account (all worded alike, spec "Passwords"), or no live
+    /// session.
+    #[error("{reason}")]
+    Unauthenticated {
+        /// What the person is told.
+        reason: String,
+    },
+
+    /// A single-use link or token that has expired, been used, or never
+    /// existed (worded alike, so a link cannot be probed).
+    #[error("{reason}")]
+    Gone {
+        /// What the person is told.
+        reason: String,
+    },
+
+    /// A self-service request goes past a limit: the user's ceiling, the
+    /// key count, the key lifetime, the password policy, or a rule of
+    /// self-issued credentials.
+    #[error("{reason}")]
+    LimitExceeded {
+        /// Which limit, as a setting or rule name (`"ceiling"`,
+        /// `"max_keys_per_user"`, `"max_key_lifetime"`, `"password"`, ...).
+        /// `&'static str`: always a literal from the code.
+        limit: &'static str,
+        /// What the person is told.
+        reason: String,
+    },
+
     /// The database aborted the request to keep others going (a deadlock or
     /// serialization failure), or the changeset changed under it. Nothing
     /// was stored: retry.
@@ -269,6 +299,9 @@ impl OkfError {
             OkfError::UnknownName { .. } => "UnknownName",
             OkfError::Forbidden { .. } => "Forbidden",
             OkfError::Refused { .. } => "Refused",
+            OkfError::Unauthenticated { .. } => "Unauthenticated",
+            OkfError::Gone { .. } => "Gone",
+            OkfError::LimitExceeded { .. } => "LimitExceeded",
             OkfError::Busy { .. } => "Busy",
             OkfError::LintFailed { .. } => "LintFailed",
             OkfError::Conflict { .. } => "Conflict",
@@ -359,11 +392,14 @@ impl OkfError {
                 body["path"] = path.as_str().into();
                 body["links"] = json_list(links);
             }
+            OkfError::LimitExceeded { limit, .. } => body["limit"] = (*limit).into(),
             OkfError::Database { .. }
             | OkfError::Migrate { .. }
             | OkfError::Config { .. }
             | OkfError::Forbidden { .. }
             | OkfError::Refused { .. }
+            | OkfError::Unauthenticated { .. }
+            | OkfError::Gone { .. }
             | OkfError::Busy { .. } => {}
         }
         body
@@ -726,5 +762,43 @@ mod tests {
         );
         // Empty: as given, not `/`.
         assert_eq!(invalid("").to_json()["path"], "");
+    }
+
+    #[test]
+    fn sign_in_errors_carry_their_reason_and_a_limit_names_itself() {
+        let unauthenticated = OkfError::Unauthenticated {
+            reason: "Email or password is incorrect".to_string(),
+        };
+        let gone = OkfError::Gone {
+            reason: "This link has expired. Ask for a new one.".to_string(),
+        };
+        let limit = OkfError::LimitExceeded {
+            limit: "max_keys_per_user",
+            reason: "you already have 20 live keys".to_string(),
+        };
+
+        let bodies = [unauthenticated.to_json(), gone.to_json(), limit.to_json()];
+
+        assert_eq!(
+            bodies,
+            [
+                serde_json::json!({
+                    "error": "Unauthenticated",
+                    "message": "Email or password is incorrect",
+                }),
+                serde_json::json!({
+                    "error": "Gone",
+                    "message": "This link has expired. Ask for a new one.",
+                }),
+                serde_json::json!({
+                    "error": "LimitExceeded",
+                    "message": "you already have 20 live keys",
+                    "limit": "max_keys_per_user",
+                }),
+            ]
+        );
+        assert!(![&unauthenticated, &gone, &limit]
+            .iter()
+            .any(|error| error.is_internal()));
     }
 }

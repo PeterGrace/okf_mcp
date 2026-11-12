@@ -474,6 +474,7 @@ pub async fn count(conn: &mut PgConnection, user_id: &str) -> Result<i64, OkfErr
 | `migrations/0010_user_login.sql` | 1 | create |
 | `Cargo.toml`, `justfile` | 1 | dependencies (with `webauthn-rs-proto`); `SQLX_OFFLINE=true` |
 | `src/db.rs` | 1 | apalis setup in `migrate`; table list; upgrade test |
+| `tests/support/pg.rs` | 1 | the test template runs apalis' migrations too (corrected, issue #309) |
 | `src/error.rs`, `src/http/mod.rs` | 1 | three variants, statuses |
 | `src/auth.rs`, `src/selection.rs`, `src/mcp/testing.rs`, `src/http/archives.rs`, `src/http/api/{identity,mod,keys}.rs` | 2 | per-catalog `Reach`, `level()`, expiry in `find`; `KeyView` fields |
 | `src/store/keys.rs`, `src/store/oauth/codes.rs` | 2 | `key_catalogs.access`, `expires_at`, `self_issued`, `user_id` |
@@ -532,8 +533,10 @@ pub async fn count(conn: &mut PgConnection, user_id: &str) -> Result<i64, OkfErr
 
 **Files:**
 - Create: `migrations/0010_user_login.sql`
-- Modify: `Cargo.toml` (dependencies for the whole milestone), `justfile` (`SQLX_OFFLINE`), `src/db.rs` (`migrate` runs apalis setup; table list; upgrade and constraint tests), `src/error.rs` (three variants), `src/http/mod.rs` (`AppError::status`)
+- Modify: `Cargo.toml` (dependencies for the whole milestone), `justfile` (`SQLX_OFFLINE`), `src/db.rs` (`migrate` runs apalis setup; table list; upgrade and constraint tests), `src/error.rs` (three variants), `src/http/mod.rs` (`AppError::status`), `tests/support/pg.rs` (the test template runs apalis' migrations too)
 - Test: `src/db.rs` `mod tests`, `src/error.rs` `mod tests`, `src/http/mod.rs` `mod tests`
+
+> **Corrected (issue #309).** Test databases are no longer migrated by `db::migrate`: since #304 every migrated `TestDb` is a copy of a per-server template that `tests/support/pg.rs` builds with its own embedded `MIGRATOR`. So Task 1 also changes `tests/support/pg.rs`: `build_template` (and the per-container fallback in `TestDb::create`) runs `PostgresStorage::<()>::migrations()` after okf's, and `template_name` hashes both migrators, so every migrated test database has the `apalis` schema (Task 6's mail tests and Decision 19's `apalis.jobs` reads rely on it). The dependency versions and features below built together unchanged (`cargo build --all-targets`, no OpenSSL, one sqlx).
 
 What the migration adds (spec "Data model", corrected by Decisions 1-4 and 8; no `mail_outbox`, mail lives in apalis):
 
@@ -1193,8 +1196,18 @@ fn apalis_error(error: apalis_postgres::Error) -> OkfError {
             OkfError::Migrate { source: *source }
         }
         apalis_postgres::Error::Database(source) => OkfError::from(source),
-        // Every other variant is about running jobs, not setup; keep its text.
-        other => OkfError::Migrate {
+        // `setup` returns `UpgradeRequired` for a pre-1.0 apalis history; the
+        // other variants are about running jobs, not setup. Each keeps its
+        // text. Listed rather than `_`, so a new apalis variant is a compile
+        // error here until someone decides what it means. `other @ (...)`
+        // binds the whole matched value to `other`.
+        other @ (apalis_postgres::Error::UpgradeRequired { .. }
+        | apalis_postgres::Error::JsonError(_)
+        | apalis_postgres::Error::ReenqueueMismatch { .. }
+        | apalis_postgres::Error::TaskIdError(_)
+        | apalis_postgres::Error::StatusError(_)
+        | apalis_postgres::Error::WorkerOutOfSync
+        | apalis_postgres::Error::WorkerAlreadyExists(_)) => OkfError::Migrate {
             source: sqlx::migrate::MigrateError::Source(Box::new(std::io::Error::other(
                 other.to_string(),
             ))),
@@ -1276,7 +1289,7 @@ In `src/http/mod.rs` `AppError::status`, add the two new arms after `Forbidden` 
 Run: `cargo test --lib -- db::tests error::tests http::tests`
 Expected: PASS. Then `cargo test --lib cli::tests` (the `migrate` command test counts `_sqlx_migrations` unqualified, which resolves to `public`; it passes unchanged).
 
-- [ ] **Step 8: Gates, changelog and commit.** Run `cargo fmt --all`, then `just fmt && just lint && just test`. Every test database now also runs apalis' migrations in `test_db()`, which adds a little to each database test.
+- [ ] **Step 8: Gates, changelog and commit.** Run `cargo fmt --all`, then `just fmt && just lint && just test`. Every migrated test database now also has apalis' schema, from the template `tests/support/pg.rs` builds once per server (corrected, issue #309: `test_db()` copies that template and never calls `db::migrate`).
 
 Write `changelog/<ts>-m12-task-01-migration.md` (`date -u +%Y-%m-%dT%H-%M-%SZ`):
 
@@ -1306,7 +1319,7 @@ Write `changelog/<ts>-m12-task-01-migration.md` (`date -u +%Y-%m-%dT%H-%M-%SZ`):
 
 ```bash
 git add Cargo.toml Cargo.lock justfile migrations/0010_user_login.sql src/db.rs src/error.rs \
-  src/http/mod.rs changelog
+  src/http/mod.rs tests/support/pg.rs docs/superpowers/plans changelog
 git commit -m "feat(store): migration 0010 for user login, sign-in errors, apalis setup" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -6734,7 +6747,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Modify: `src/config.rs` (`MailConfig`, `MailProvider`, `SmtpConfig`, `PostmarkConfig`; `Config.mail`; validation)
 - Modify: `src/app.rs` (the mailer on `App`, `clock_handle`, mail queue prune in the hourly prune)
 - Modify: `src/http/mod.rs:265-292` (`serve` spawns the worker and awaits it on shutdown)
-- Modify: `tests/support/pg.rs:74` (test pool 4 -> 8, Decision 19), `tests/support/server.rs` (`serve_app` turns the worker off), `src/mcp/testing.rs` (`app_at` turns it off)
+- Modify: `tests/support/pg.rs` `POOL_SIZE` (test pool 4 -> 8, Decision 19; corrected, issue #309: since #304 the size is the `POOL_SIZE` constant, not a literal at line 74), `tests/support/server.rs` (`serve_app` turns the worker off), `src/mcp/testing.rs` (`app_at` turns it off)
 - Test: unit tests in each `mail` module, `config::tests`
 
 This task relies on Task 1 for the `apalis`, `apalis-postgres`, `lettre` (features `tokio1-rustls`, `smtp-transport`, `builder`, `ring`, `webpki-roots`, `hostname`), `async-trait` and existing `reqwest` dependencies, for `db::migrate` running `PostgresStorage::setup` (so `test_db()` has the `apalis` schema), and for `SQLX_OFFLINE=true` in the justfile. It relies on Task 4's `users::check_email`.
@@ -8807,7 +8820,7 @@ Tests don't run workers unless they are about mail (Decision 19):
 ```
 
   - `src/mcp/testing.rs`, in `app_at` (the investigator client test serves such an app): `let mut config = config;` and `config.mail.worker = false;` before its `App::load`.
-  - `tests/support/pg.rs:74`: `.max_connections(8)` (a worker holds a LISTEN connection and fetches, acks and heartbeats on others), and the doc comment above `TestDb` gains "with up to 8 connections".
+  - `tests/support/pg.rs`: `const POOL_SIZE: u32 = 8;` (corrected, issue #309: the constant `TestDb::create` passes to `.max_connections`) (a worker holds a LISTEN connection and fetches, acks and heartbeats on others), and the doc comment above `TestDb` gains "with up to 8 connections".
 
 - [ ] **Step 12: Run the mail tests and the gates**
 

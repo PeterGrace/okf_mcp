@@ -12,7 +12,8 @@
 //! per-process server is a server per test.
 //!
 //! **Migrations run once per server.** [`template_name`] hashes the
-//! migrations, and [`ensure_template`] builds a database of that name under a
+//! migrations (okf's and apalis-postgres', which `okf_mcp::db::migrate` runs
+//! after okf's), and [`ensure_template`] builds a database of that name under a
 //! session advisory lock: concurrent processes race safely, and a server kept
 //! running across schema changes gets a new template rather than serving a
 //! stale one. A migrated test database ([`TestDb::start_migrated`]) is a
@@ -90,6 +91,14 @@ const POOL_SIZE: u32 = 4;
 /// `okf_mcp::db` in the integration tests).
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+/// apalis-postgres' migrations (schema `apalis`, history in
+/// `apalis._sqlx_migrations`), which `okf_mcp::db::migrate` runs after
+/// [`MIGRATOR`].
+fn apalis_migrator() -> Migrator {
+    // `::<()>`: the job type a storage carries does not matter for its schema.
+    apalis_postgres::PostgresStorage::<()>::migrations()
+}
+
 /// The shared server's template, prepared once per process. A
 /// `tokio::sync::OnceCell` runs its async initializer once, however many
 /// tests ask at the same time (like a lock-guarded lazy global in Python).
@@ -153,6 +162,10 @@ impl TestDb {
             .expect("connect to the test database");
         if migrated && container.is_some() {
             MIGRATOR.run(&pool).await.expect("migrations apply");
+            apalis_migrator()
+                .run(&pool)
+                .await
+                .expect("apalis migrations apply");
         }
         Self {
             pool,
@@ -261,7 +274,7 @@ async fn shared_template(server_url: &str) -> String {
 /// version and checksum, so a schema change gets a template of its own.
 pub fn template_name() -> String {
     let mut hasher = Sha256::new();
-    for migration in MIGRATOR.iter() {
+    for migration in MIGRATOR.iter().chain(apalis_migrator().iter()) {
         hasher.update(migration.version.to_le_bytes());
         hasher.update(&migration.checksum);
     }
@@ -274,7 +287,8 @@ pub fn template_name() -> String {
     format!("okf_tpl_{hex}")
 }
 
-/// How many migrations a migrated database has applied.
+/// How many okf migrations a migrated database has applied (in
+/// `public._sqlx_migrations`; apalis keeps its own history).
 pub fn migration_count() -> usize {
     MIGRATOR.iter().count()
 }
@@ -325,7 +339,8 @@ pub async fn ensure_template(server_url: &str, name: &str) -> Result<bool, sqlx:
     Ok(built)
 }
 
-/// Creates `name`, migrates it, then marks it a template.
+/// Creates `name`, migrates it (okf's migrations, then apalis'), then marks
+/// it a template.
 async fn build_template(
     admin: &mut PgConnection,
     server_url: &str,
@@ -334,6 +349,7 @@ async fn build_template(
     execute_ddl(admin, format!("CREATE DATABASE {}", quoted(name))).await?;
     let mut template = PgConnection::connect(&format!("{server_url}/{name}")).await?;
     MIGRATOR.run(&mut template).await?;
+    apalis_migrator().run(&mut template).await?;
     // A copy needs the template to have no connections.
     template.close().await?;
     execute_ddl(

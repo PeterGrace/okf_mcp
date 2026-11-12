@@ -1,6 +1,11 @@
 # Common local validation commands. Keep these recipes as the stable interface
 # used by contributors and issue-to-PR automation.
 
+# apalis-postgres' query macros check a live database whenever DATABASE_URL
+# is set at build time (the CLI reads that variable too). Build from its
+# shipped offline cache instead.
+export SQLX_OFFLINE := "true"
+
 fmt:
     cargo fmt --all --check
 
