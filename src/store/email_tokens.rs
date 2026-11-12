@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
 use crate::keys;
@@ -85,24 +85,124 @@ pub async fn issue(
             name: user_id.to_string(),
         });
     }
+    replace_token(&mut tx, user_id, purpose, &token, now, expires_at).await?;
+    tx.commit().await?;
+    Ok(token)
+}
+
+/// A link issued to the address a user had when it was issued.
+pub struct IssuedLink {
+    /// The user.
+    pub user: UserAuth,
+    /// The address read under the user's row lock: the one to mail.
+    pub to: String,
+    /// The raw token. Never stored or logged.
+    pub token: String,
+}
+
+// Hand-written (Python's `__repr__`), so `{:?}` never prints the token.
+impl std::fmt::Debug for IssuedLink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuedLink")
+            .field("user", &self.user)
+            .field("to", &self.to)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The user an email names, and that email as stored.
+#[derive(sqlx::FromRow)]
+struct Holder {
+    // `flatten` reads `UserAuth`'s columns from the same row.
+    #[sqlx(flatten)]
+    user: UserAuth,
+    mail_to: String,
+}
+
+/// Issues a link token to whichever user has `email` now (a forgotten
+/// password), in one transaction with the lookup.
+///
+/// The user's row is found and locked by its email in one statement, the
+/// lock `users::set_email` also takes. So the two serialize: if the email
+/// changes first, Postgres re-checks the `WHERE` on the new row version and
+/// nothing is issued; if this issues first, the change deletes the token
+/// (`set_email` deletes every link of a user whose email changes). A link
+/// mailed to an address the user no longer has never works.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `email` - the address asked for (compared case-insensitively).
+/// * `purpose` - setup or reset.
+/// * `ttl` - how long it works.
+/// * `now` - when it is issued (server clock).
+///
+/// # Returns
+/// The user, the address to mail (as stored, read under the lock) and the
+/// token; `None` when no user has that email.
+///
+/// # Errors
+/// As [`issue`].
+pub async fn issue_for_email(
+    pool: &PgPool,
+    email: &str,
+    purpose: Purpose,
+    ttl: Duration,
+    now: DateTime<Utc>,
+) -> Result<Option<IssuedLink>, OkfError> {
+    let expires_at = crate::clock::after(now, ttl)?;
+    let token = keys::generate_with("")?;
+    let mut tx = pool.begin().await?;
+    // `mail_to`: the stored spelling, for the mail's `To`.
+    let found = sqlx::query_as::<_, Holder>(concat!(
+        "SELECT ",
+        user_auth_columns!(),
+        ", u.email::text AS mail_to FROM users u \
+         WHERE u.email = $1::citext FOR NO KEY UPDATE"
+    ))
+    .bind(email)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(Holder { user, mail_to }) = found else {
+        return Ok(None);
+    };
+    replace_token(&mut tx, &user.id, purpose, &token, now, expires_at).await?;
+    tx.commit().await?;
+    Ok(Some(IssuedLink {
+        user,
+        to: mail_to,
+        token,
+    }))
+}
+
+/// Deletes a user's tokens of `purpose` and stores the new one, inside the
+/// caller's transaction (which holds the user's row lock).
+async fn replace_token(
+    conn: &mut PgConnection,
+    user_id: &str,
+    purpose: Purpose,
+    token: &str,
+    now: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Result<(), OkfError> {
     sqlx::query("DELETE FROM email_tokens WHERE user_id = $1 AND purpose = $2")
         .bind(user_id)
         .bind(purpose.as_str())
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     sqlx::query(
         "INSERT INTO email_tokens (hash, user_id, purpose, created_at, expires_at) \
          VALUES ($1, $2, $3, $4, $5)",
     )
-    .bind(keys::hash(&token).as_slice())
+    .bind(keys::hash(token).as_slice())
     .bind(user_id)
     .bind(purpose.as_str())
     .bind(now)
     .bind(expires_at)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
-    tx.commit().await?;
-    Ok(token)
+    Ok(())
 }
 
 /// Uses a link token: marks it used and returns its user, in one statement,
@@ -127,6 +227,33 @@ pub async fn redeem(
     purpose: Purpose,
     now: DateTime<Utc>,
 ) -> Result<UserAuth, OkfError> {
+    let mut conn = pool.acquire().await?;
+    redeem_in(&mut conn, token, purpose, now).await
+}
+
+/// [`redeem`] inside the caller's transaction, so using the link and the
+/// change it makes (a password, a passkey) commit or roll back together:
+/// a failure after this leaves the link unused. The token's row stays
+/// locked until the transaction ends, so a concurrent use waits and then
+/// finds it used (or, after a rollback, unused).
+///
+/// # Arguments
+/// * `conn` - the transaction (`&mut *tx`).
+/// * `token` - the raw token from the link.
+/// * `purpose` - what the page expects.
+/// * `now` - when (server clock).
+///
+/// # Returns
+/// The token's user.
+///
+/// # Errors
+/// As [`redeem`].
+pub async fn redeem_in(
+    conn: &mut PgConnection,
+    token: &str,
+    purpose: Purpose,
+    now: DateTime<Utc>,
+) -> Result<UserAuth, OkfError> {
     sqlx::query_as::<_, UserAuth>(concat!(
         "WITH used AS (UPDATE email_tokens SET used_at = $3 \
                        WHERE hash = $1 AND purpose = $2 AND used_at IS NULL \
@@ -139,7 +266,7 @@ pub async fn redeem(
     .bind(keys::hash(token).as_slice())
     .bind(purpose.as_str())
     .bind(now)
-    .fetch_optional(pool)
+    .fetch_optional(conn)
     .await?
     .ok_or_else(gone)
 }

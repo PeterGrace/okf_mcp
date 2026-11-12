@@ -32,7 +32,7 @@ use crate::http::{timeout_layer, AppError};
 use crate::mail::queue as mail_queue;
 use crate::mail::{self, Template, RESET_PATH, SETUP_PATH};
 use crate::store::email_tokens::{self, Purpose};
-use crate::store::passwords::{self, PasswordStamp, SignInOutcome};
+use crate::store::passwords::{self, NewPassword, PasswordStamp, SignInOutcome};
 use crate::store::sign_in_events::{self, Method, Outcome};
 use crate::store::user_sessions;
 use crate::store::users::{self, UserAuth};
@@ -536,18 +536,20 @@ async fn send_reset(app: &App, email: &str) -> Result<(), OkfError> {
     let Some(public_url) = app.config().public_url.as_deref() else {
         return Ok(());
     };
-    let Some(user) = users::find_by_email(app.pool(), email).await? else {
-        return Ok(());
-    };
-    let Some(to) = user.email.as_deref() else {
-        return Ok(());
-    };
+    // The lookup and the issue are one transaction under the user's row
+    // lock, so the link goes to the address the user has while it is live
+    // (an email change deletes it): `email_tokens::issue_for_email`.
     let ttl = app.settings().reset_link_ttl;
-    let token =
-        email_tokens::issue(app.pool(), &user.id, Purpose::Reset, ttl, app.clock().now()).await?;
-    let link = mail::link(public_url, RESET_PATH, &token);
-    mail_queue::enqueue(app.pool(), to, &Template::Reset { link }, app.clock().now()).await?;
-    tracing::info!(user = %user.id, "password reset link queued");
+    let issued =
+        email_tokens::issue_for_email(app.pool(), email, Purpose::Reset, ttl, app.clock().now())
+            .await?;
+    let Some(issued) = issued else {
+        return Ok(());
+    };
+    let link = mail::link(public_url, RESET_PATH, &issued.token);
+    let template = Template::Reset { link };
+    mail_queue::enqueue(app.pool(), &issued.to, &template, app.clock().now()).await?;
+    tracing::info!(user = %issued.user.id, "password reset link queued");
     Ok(())
 }
 
@@ -712,19 +714,60 @@ async fn setup_post(
         };
         return setup_response(StatusCode::UNPROCESSABLE_ENTITY, &view);
     }
-    // `redeem` marks the token used in one statement, so of two concurrent
-    // posts only one gets past here.
-    let user = match email_tokens::redeem(app.pool(), &form.token, Purpose::Setup, now).await {
-        Ok(user) => user,
+    let user = match use_link(&app, &form.token, Purpose::Setup, &form.password, now).await {
+        Ok((user, _)) => user,
         Err(error) => return link_error(error),
     };
-    if let Err(error) = passwords::set(app.pool(), &user.id, &form.password, now).await {
-        return AppError(error).into_response();
-    }
     match sign_in(&app, &parts, &user, Method::Setup).await {
         Ok(headers) => (headers, Redirect::to(&return_to)).into_response(),
         Err(error) => AppError(error).into_response(),
     }
+}
+
+/// Uses an emailed link and stores the new password it was for, in one
+/// transaction, so the link is used only if the password change commits:
+/// a failure anywhere leaves the old password, the sessions and the link
+/// as they were. A reset link also ends every session of the user
+/// (`passwords::reset_in`). The password is hashed before the transaction
+/// opens, so no row lock is held during argon2.
+///
+/// # Arguments
+/// * `app` - the shared state.
+/// * `token` - the raw token from the form.
+/// * `purpose` - which link the page is for.
+/// * `password` - the new password (already through [`check_new_password`]).
+/// * `now` - when (server clock).
+///
+/// # Returns
+/// The link's user and how many sessions ended (0 for setup).
+///
+/// # Errors
+/// [`OkfError::Gone`] for a link that no longer works (also when a
+/// concurrent post used it first); [`OkfError::LimitExceeded`],
+/// [`OkfError::Io`] or [`OkfError::Database`] otherwise.
+async fn use_link(
+    app: &App,
+    token: &str,
+    purpose: Purpose,
+    password: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(UserAuth, u64), OkfError> {
+    let hashed = NewPassword::hash(password).await?;
+    let mut tx = app.pool().begin().await?;
+    // The token's row stays locked until the commit, so of two concurrent
+    // posts the second waits and then finds the link used.
+    let user = email_tokens::redeem_in(&mut tx, token, purpose, now).await?;
+    // `match` on the purpose is exhaustive: a new purpose must say here what
+    // its link changes.
+    let ended = match purpose {
+        Purpose::Setup => {
+            passwords::set_in(&mut tx, &user.id, &hashed, now).await?;
+            0
+        }
+        Purpose::Reset => passwords::reset_in(&mut tx, &user.id, &hashed, now).await?,
+    };
+    tx.commit().await?;
+    Ok((user, ended))
 }
 
 /// The reset page's body.
@@ -793,15 +836,10 @@ async fn reset_post(
             Some(&problem),
         );
     }
-    let user = match email_tokens::redeem(app.pool(), &form.token, Purpose::Reset, now).await {
-        Ok(user) => user,
+    let (user, ended) = match use_link(&app, &form.token, Purpose::Reset, &form.password, now).await
+    {
+        Ok(done) => done,
         Err(error) => return link_error(error),
-    };
-    // One transaction: the password changes and every session ends, and a
-    // password sign-in racing it cannot add one (`passwords::reset`).
-    let ended = match passwords::reset(app.pool(), &user.id, &form.password, now).await {
-        Ok(ended) => ended,
-        Err(error) => return AppError(error).into_response(),
     };
     tracing::info!(user = %user.id, ended, "password reset; every session ended");
     notify_method_added(&app, &user, "a new password").await;
@@ -1639,6 +1677,246 @@ mod tests {
 
         assert_eq!(ended, 1);
         assert_eq!(sessions_of(pool, &checked.user.id).await, 0);
+    }
+
+    /// Which of two waiting transactions takes alice's row first.
+    #[derive(Debug, Clone, Copy)]
+    enum First {
+        Forgot,
+        EmailChange,
+    }
+
+    /// Holds alice's row, queues `first` and then the other of a forgotten
+    /// password link and an email change behind it, and releases the row.
+    ///
+    /// # Returns
+    /// What the forgot flow issued, if anything.
+    async fn forgot_racing_an_email_change(first: First) -> (TestApp, Option<String>) {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let pool = test.app.pool().clone();
+        let mut holder = pool.begin().await.expect("begin");
+        sqlx::query("SELECT 1 FROM users WHERE name = 'alice' FOR UPDATE")
+            .execute(&mut *holder)
+            .await
+            .expect("hold the row");
+        let forgot = || {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                email_tokens::issue_for_email(
+                    &pool,
+                    "alice@example.com",
+                    Purpose::Reset,
+                    Duration::from_secs(3600),
+                    Utc::now(),
+                )
+                .await
+            })
+        };
+        let change = || {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                users::set_email(&pool, "alice", Some("alice@example.net")).await
+            })
+        };
+        // Each task is queued only once the one before it waits on the row.
+        let (issued, changed) = match first {
+            First::Forgot => {
+                let issued = forgot();
+                wait_for_lock_waiters(&pool, 1).await;
+                let changed = change();
+                wait_for_lock_waiters(&pool, 2).await;
+                (issued, changed)
+            }
+            First::EmailChange => {
+                let changed = change();
+                wait_for_lock_waiters(&pool, 1).await;
+                let issued = forgot();
+                wait_for_lock_waiters(&pool, 2).await;
+                (issued, changed)
+            }
+        };
+
+        holder.commit().await.expect("release the row");
+        let issued = issued.await.expect("the forgot task").expect("issue");
+        changed
+            .await
+            .expect("the change task")
+            .expect("change the email");
+
+        let token = issued.map(|link| {
+            assert_eq!(link.to, "alice@example.com", "mailed to the address it had");
+            link.token
+        });
+        (test, token)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_link_issued_before_an_email_change_dies_with_it() {
+        let (test, token) = forgot_racing_an_email_change(First::Forgot).await;
+
+        let token = token.expect("issued while the email was still alice's");
+        let peeked = email_tokens::peek(test.app.pool(), &token, Purpose::Reset, Utc::now()).await;
+
+        assert!(matches!(peeked, Err(OkfError::Gone { .. })), "{peeked:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_reset_link_is_issued_for_an_email_changed_meanwhile() {
+        let (test, token) = forgot_racing_an_email_change(First::EmailChange).await;
+
+        let live: i64 = sqlx::query_scalar("SELECT count(*) FROM email_tokens")
+            .fetch_one(test.app.pool())
+            .await
+            .expect("count the links");
+
+        assert!(token.is_none(), "the old address no longer names alice");
+        assert_eq!(live, 0);
+    }
+
+    /// Makes every statement matching `event` (`BEFORE DELETE ON
+    /// user_sessions`, ...) fail, until [`allow`] drops it.
+    async fn fail_on(pool: &PgPool, event: &str) {
+        sqlx::query(
+            "CREATE FUNCTION okf_test_fail() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$",
+        )
+        .execute(pool)
+        .await
+        .expect("create the failing function");
+        // `AssertSqlSafe`: `event` is one of this module's literals.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER okf_test_fail {event} EXECUTE FUNCTION okf_test_fail()"
+        )))
+        .execute(pool)
+        .await
+        .expect("create the failing trigger");
+    }
+
+    /// Drops [`fail_on`]'s trigger.
+    async fn allow(pool: &PgPool, table: &str) {
+        // `AssertSqlSafe`: `table` is one of this module's literals.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER okf_test_fail ON {table}"
+        )))
+        .execute(pool)
+        .await
+        .expect("drop the failing trigger");
+    }
+
+    fn new_password_form(token: &str, password: &str) -> Payload {
+        Payload::Form(vec![
+            ("token", token.to_string()),
+            ("password", password.to_string()),
+            ("confirm", password.to_string()),
+        ])
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_that_fails_changes_nothing_and_keeps_the_link() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let mut signed_in = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let pool = test.app.pool();
+        let token = email_tokens::issue(
+            pool,
+            &alice.id,
+            Purpose::Reset,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await
+        .expect("issue a reset token");
+        let new_password = "amber-quarry-signal-77";
+        // The session delete fails, after the token and the hash were
+        // written in the same transaction.
+        fail_on(pool, "BEFORE DELETE ON user_sessions FOR EACH STATEMENT").await;
+
+        let failed = Browser::default()
+            .send(
+                &test,
+                "POST",
+                "/account/reset",
+                new_password_form(&token, new_password),
+            )
+            .await;
+        let session = signed_in
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+        let old = passwords::verify(pool, "alice@example.com", PASSWORD, Utc::now())
+            .await
+            .expect("check the old password");
+        let link = email_tokens::peek(pool, &token, Purpose::Reset, Utc::now()).await;
+        allow(pool, "user_sessions").await;
+        let retried = Browser::default()
+            .send(
+                &test,
+                "POST",
+                "/account/reset",
+                new_password_form(&token, new_password),
+            )
+            .await;
+
+        assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(session.status, StatusCode::OK, "the session is intact");
+        assert!(
+            matches!(old, SignInOutcome::Ok(_)),
+            "the old password works"
+        );
+        assert!(link.is_ok(), "the link was not used");
+        assert_eq!(retried.status, StatusCode::SEE_OTHER, "{}", retried.text());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_setup_that_fails_sets_nothing_and_keeps_the_link() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
+        let pool = test.app.pool();
+        let token = email_tokens::issue(
+            pool,
+            &alice.id,
+            Purpose::Setup,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await
+        .expect("issue a setup token");
+        // The password write fails, after the token was used in the same
+        // transaction.
+        fail_on(
+            pool,
+            "BEFORE UPDATE ON users FOR EACH ROW \
+             WHEN (OLD.password_hash IS DISTINCT FROM NEW.password_hash)",
+        )
+        .await;
+
+        let failed = Browser::default()
+            .send(
+                &test,
+                "POST",
+                "/account/setup",
+                new_password_form(&token, PASSWORD),
+            )
+            .await;
+        let link = email_tokens::peek(pool, &token, Purpose::Setup, Utc::now()).await;
+        allow(pool, "users").await;
+        let password = passwords::verify(pool, "alice@example.com", PASSWORD, Utc::now())
+            .await
+            .expect("check the password");
+        let retried = Browser::default()
+            .send(
+                &test,
+                "POST",
+                "/account/setup",
+                new_password_form(&token, PASSWORD),
+            )
+            .await;
+
+        assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(failed.set_cookie(COOKIE).is_none());
+        assert!(link.is_ok(), "the link was not used");
+        assert_eq!(password, SignInOutcome::Failed, "no password was set");
+        assert_eq!(retried.status, StatusCode::SEE_OTHER, "{}", retried.text());
     }
 
     #[tokio::test(flavor = "multi_thread")]

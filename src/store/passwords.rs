@@ -24,7 +24,7 @@ use std::sync::LazyLock;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::{Argon2, PasswordHash};
 use chrono::{DateTime, TimeDelta, Utc};
-use sqlx::{PgExecutor, PgPool};
+use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
 use crate::store::users::{user_auth_columns, UserAuth};
@@ -402,19 +402,13 @@ pub async fn set(
     password: &str,
     now: DateTime<Utc>,
 ) -> Result<(), OkfError> {
-    let hashed = policy_hash(password).await?;
-    write_hash(pool, user_id, &hashed, now).await
+    let hashed = NewPassword::hash(password).await?;
+    let mut conn = pool.acquire().await?;
+    set_in(&mut conn, user_id, &hashed, now).await
 }
 
 /// Sets a user's password and ends every console session they have, in one
-/// transaction (a reset link, spec "Revocation").
-///
-/// The `UPDATE` takes the user's row lock before the sessions are deleted,
-/// and a password sign-in inserts its session only while holding a share
-/// lock on that row with the hash it verified (`user_sessions::start`). So
-/// the two serialize: a session inserted first is deleted here, and one
-/// inserted after finds the hash changed and is refused. No old-password
-/// session outlives the reset.
+/// transaction ([`reset_in`]).
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -433,34 +427,67 @@ pub async fn reset(
     password: &str,
     now: DateTime<Utc>,
 ) -> Result<u64, OkfError> {
-    let hashed = policy_hash(password).await?;
+    let hashed = NewPassword::hash(password).await?;
     let mut tx = pool.begin().await?;
-    write_hash(&mut *tx, user_id, &hashed, now).await?;
-    let ended = crate::store::user_sessions::revoke_all(&mut *tx, user_id, None).await?;
+    let ended = reset_in(&mut tx, user_id, &hashed, now).await?;
     tx.commit().await?;
     Ok(ended)
 }
 
-/// [`check_policy`], then [`hash`] on tokio's blocking pool.
-async fn policy_hash(password: &str) -> Result<String, OkfError> {
-    check_policy(password)?;
-    let owned = password.to_string();
-    // The first `?` is the task's (did it run?), the second `hash`'s own.
-    tokio::task::spawn_blocking(move || hash(&owned))
-        .await
-        .map_err(hasher_error)?
+/// A new password, already through the policy and hashed, ready to store
+/// inside a transaction. Hashing takes tens of milliseconds, so it is done
+/// before the transaction opens, never while it holds row locks. `Debug`
+/// is redacted: the hash is never logged.
+pub struct NewPassword(String);
+
+impl NewPassword {
+    /// Checks `password` against the policy and hashes it (argon2id) on
+    /// tokio's blocking pool.
+    ///
+    /// # Arguments
+    /// * `password` - the proposed password.
+    ///
+    /// # Returns
+    /// The hash, to pass to [`set_in`] or [`reset_in`].
+    ///
+    /// # Errors
+    /// [`OkfError::LimitExceeded`] from [`check_policy`]; [`OkfError::Io`]
+    /// if hashing fails.
+    pub async fn hash(password: &str) -> Result<Self, OkfError> {
+        check_policy(password)?;
+        let owned = password.to_string();
+        // The first `?` is the task's (did it run?), the second `hash`'s own.
+        let hashed = tokio::task::spawn_blocking(move || hash(&owned))
+            .await
+            .map_err(hasher_error)??;
+        Ok(Self(hashed))
+    }
 }
 
-/// Stores a new hash, records when, and clears the lockout counters.
+// Hand-written (Python's `__repr__`), so `{:?}` never prints the hash.
+impl std::fmt::Debug for NewPassword {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NewPassword(<redacted>)")
+    }
+}
+
+/// Stores a new password, records when, and clears the lockout counters,
+/// inside the caller's transaction (so an emailed link's redemption and the
+/// change commit together). The `UPDATE` holds the user's row lock until the
+/// transaction ends.
+///
+/// # Arguments
+/// * `conn` - the transaction (`&mut *tx`), or a pooled connection.
+/// * `user_id` - a `users.id`.
+/// * `password` - from [`NewPassword::hash`].
+/// * `now` - when (server clock).
 ///
 /// # Errors
 /// [`OkfError::UnknownName`] for an unknown id; [`OkfError::Database`].
-// `impl PgExecutor<'_>`: a `&PgPool` or a transaction's `&mut PgConnection`,
-// like a Python function that takes either a pool or a cursor.
-async fn write_hash(
-    executor: impl PgExecutor<'_>,
+pub async fn set_in(
+    conn: &mut PgConnection,
     user_id: &str,
-    hashed: &str,
+    password: &NewPassword,
     now: DateTime<Utc>,
 ) -> Result<(), OkfError> {
     let updated = sqlx::query(
@@ -469,9 +496,9 @@ async fn write_hash(
          WHERE id = $1",
     )
     .bind(user_id)
-    .bind(hashed)
+    .bind(&password.0)
     .bind(now)
-    .execute(executor)
+    .execute(conn)
     .await?
     .rows_affected();
     if updated == 0 {
@@ -481,6 +508,37 @@ async fn write_hash(
         });
     }
     Ok(())
+}
+
+/// [`set_in`], then ends every console session of the user, in the caller's
+/// transaction (a reset link, spec "Revocation").
+///
+/// The `UPDATE` takes the user's row lock before the sessions are deleted,
+/// and a password sign-in inserts its session only while holding a share
+/// lock on that row with the hash it verified (`user_sessions::start`). So
+/// the two serialize: a session inserted first is deleted here, and one
+/// inserted after finds the hash changed and is refused. A failure anywhere
+/// in the transaction rolls the password and the revocation back together.
+///
+/// # Arguments
+/// * `conn` - the transaction (`&mut *tx`).
+/// * `user_id` - a `users.id`.
+/// * `password` - from [`NewPassword::hash`].
+/// * `now` - when (server clock).
+///
+/// # Returns
+/// How many sessions ended.
+///
+/// # Errors
+/// As [`set_in`].
+pub async fn reset_in(
+    conn: &mut PgConnection,
+    user_id: &str,
+    password: &NewPassword,
+    now: DateTime<Utc>,
+) -> Result<u64, OkfError> {
+    set_in(&mut *conn, user_id, password, now).await?;
+    crate::store::user_sessions::revoke_all(&mut *conn, user_id, None).await
 }
 
 #[cfg(test)]
