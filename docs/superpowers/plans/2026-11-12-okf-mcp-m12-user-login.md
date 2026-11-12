@@ -10772,6 +10772,10 @@ Builds on Task 7a's pages, limits, `start_session`, `Browser` and `/api/v1/sessi
 >   - Passkey, OIDC and setup sign-ins keep calling `sign_in` / `start_session` with no stamp.
 >   - Tests: `a_sign_in_checked_before_a_reset_gets_no_session_after_it`, `a_sign_in_waiting_on_a_reset_in_progress_gets_no_session` (holds the user row so the reset and the insert queue behind it in that order) and `a_session_inserted_before_a_reset_is_ended_by_it`.
 > - Console sign-out counts as done only on a 2xx or a 401 from `DELETE /api/v1/session`. Any other failure keeps the session state and the shell, and shows a "Sign-out failed ... Try again." toast. The setup journey fails the first `DELETE` with a fetch wrapper and checks this.
+> - **One credential at a time in the console (second review of PR #337).**
+>   - At boot, `main.js` asks `GET /api/v1/session` first (a plain fetch, cookie only). A live session wins over a stored key, and the stored key is dropped. Otherwise a stored key is used; otherwise the login card is shown.
+>   - Sign-out (`endCookieSession`) always asks the server, cookie-only, whether the browser has a session. If it does, it sends `DELETE /api/v1/session` with that session's CSRF token, and only then clears the key. The failure rule is unchanged.
+>   - Journeys: `an_account_sign_in_replaces_a_stored_key_and_sign_out_ends_both` and `sign_out_ends_a_cookie_session_hidden_behind_a_stored_key`. Task 14a builds on this boot order.
 > - Without `public_url`, `POST /signin` answers 404 (an explicit handler), not axum's 405.
 > - `http::router`'s trace span (`request_span`) records the method and the path, not the URI: `DefaultMakeSpan` logged `?token=...` of every emailed link.
 > - The console's 403 toast reads "Your account cannot do this." for a session (no stored key).
