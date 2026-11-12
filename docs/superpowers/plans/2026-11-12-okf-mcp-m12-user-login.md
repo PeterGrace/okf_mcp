@@ -12,7 +12,7 @@
 - **Mail through apalis.** A `SendMail` job on `apalis-postgres`. The handler sends through a `Mailer` trait object (SMTP, Postmark or log), and on failure it reschedules itself durably.
 
 **Tech Stack:** Rust 2021, axum 0.8, sqlx 0.9 (Postgres), clap, the vanilla-JS console, rustwright browser tests. New dependencies:
-- `apalis` and `apalis-postgres` 1.0;
+- `apalis` and `apalis-postgres` 1.0 (the lock resolves apalis 1.1.1 and apalis-postgres 1.1.0; corrected, issue #309, 2026-11-12);
 - `webauthn-rs` 0.6 (feature `conditional-ui`) and `webauthn-rs-proto` (pinned `=0.6.2`, as webauthn-rs pins it);
 - `openidconnect` 4.1 (no default features);
 - `lettre` 0.11;
@@ -139,6 +139,7 @@ The research notes with crate file:line citations are in the session scratchpad.
 - **The `/api/v1` router** (`http/api/mod.rs:41`) applies `require_key` at `:55`. Handlers take `Extension<Arc<Principal>>`. `require_admin` is at `:99`, `require_every_catalog` at `:118` and `settle` at `:137`.
 - **Consent.** `GET /oauth/authorize` (`oauth/authorize.rs:289`) inserts into `oauth.pending` before rendering. The redirect to `/signin` must come after client and redirect validation and before that insert. `codes::redeem` (`store/oauth/codes.rs:477`) is the grant-insert pattern to copy.
 - **apalis-postgres 1.0.0:**
+  > **Corrected (issue #309, 2026-11-12).** The `"1.0.0"` requirement locks apalis-postgres 1.1.0 (apalis and apalis-core 1.1.1). 1.1.0 changes no API these facts rely on. It adds one migration (`20261019120000_add_recent_jobs_indexes`, 24 in all) and a faster `list_queues` query. Its `tokio-comp` feature turns on `sqlx/tls-rustls`, which in sqlx 0.9 is an alias for `tls-rustls-ring-webpki`.
   - `PostgresStorage::setup(&PgPool)` creates schema `apalis` and records its migrations in `apalis._sqlx_migrations`.
   - It uses sqlx 0.9 with the project's TLS feature (`tls-rustls-ring-webpki`).
   - It needs `pgcrypto` and `hstore`.
@@ -536,7 +537,7 @@ pub async fn count(conn: &mut PgConnection, user_id: &str) -> Result<i64, OkfErr
 - Modify: `Cargo.toml` (dependencies for the whole milestone), `justfile` (`SQLX_OFFLINE`), `src/db.rs` (`migrate` runs apalis setup; table list; upgrade and constraint tests), `src/error.rs` (three variants), `src/http/mod.rs` (`AppError::status`), `tests/support/pg.rs` (the test template runs apalis' migrations too)
 - Test: `src/db.rs` `mod tests`, `src/error.rs` `mod tests`, `src/http/mod.rs` `mod tests`
 
-> **Corrected (issue #309).** Test databases are no longer migrated by `db::migrate`: since #304 every migrated `TestDb` is a copy of a per-server template that `tests/support/pg.rs` builds with its own embedded `MIGRATOR`. So Task 1 also changes `tests/support/pg.rs`: `build_template` (and the per-container fallback in `TestDb::create`) runs `PostgresStorage::<()>::migrations()` after okf's, and `template_name` hashes both migrators, so every migrated test database has the `apalis` schema (Task 6's mail tests and Decision 19's `apalis.jobs` reads rely on it). The dependency versions and features below built together unchanged (`cargo build --all-targets`, no OpenSSL, one sqlx).
+> **Corrected (issue #309, 2026-11-12).** Test databases are no longer migrated by `db::migrate`: since #304 every migrated `TestDb` is a copy of a per-server template that `tests/support/pg.rs` builds with its own embedded `MIGRATOR`. So Task 1 also changes `tests/support/pg.rs`: `build_template` (and the per-container fallback in `TestDb::create`) runs `PostgresStorage::<()>::migrations()` after okf's, and `template_name` hashes both migrators, so every migrated test database has the `apalis` schema (Task 6's mail tests and Decision 19's `apalis.jobs` reads rely on it). The dependency requirements and features below built together unchanged (`cargo build --all-targets`, no OpenSSL, one sqlx); apalis resolves to 1.1.1 and apalis-postgres to 1.1.0 (see "Verified facts").
 
 What the migration adds (spec "Data model", corrected by Decisions 1-4 and 8; no `mail_outbox`, mail lives in apalis):
 
@@ -1154,6 +1155,8 @@ CREATE TABLE server_settings (
 ```
 
 - [ ] **Step 5: Run apalis setup in `db::migrate`.** In `src/db.rs`, replace `migrate` and add `apalis_error` below it:
+
+> **Corrected (issue #309, 2026-11-12).** `apalis_error` lists every `apalis_postgres::Error` variant instead of ending in an `other =>` catch-all (the enum is not `#[non_exhaustive]`), so a new variant fails to compile until it is mapped. The code below is what shipped.
 
 ```rust
 /// Applies every okf migration not yet applied, then apalis' own (both are
@@ -6750,7 +6753,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Modify: `tests/support/pg.rs` `POOL_SIZE` (test pool 4 -> 8, Decision 19; corrected, issue #309: since #304 the size is the `POOL_SIZE` constant, not a literal at line 74), `tests/support/server.rs` (`serve_app` turns the worker off), `src/mcp/testing.rs` (`app_at` turns it off)
 - Test: unit tests in each `mail` module, `config::tests`
 
-This task relies on Task 1 for the `apalis`, `apalis-postgres`, `lettre` (features `tokio1-rustls`, `smtp-transport`, `builder`, `ring`, `webpki-roots`, `hostname`), `async-trait` and existing `reqwest` dependencies, for `db::migrate` running `PostgresStorage::setup` (so `test_db()` has the `apalis` schema), and for `SQLX_OFFLINE=true` in the justfile. It relies on Task 4's `users::check_email`.
+This task relies on Task 1 for the `apalis`, `apalis-postgres`, `lettre` (features `tokio1-rustls`, `smtp-transport`, `builder`, `ring`, `webpki-roots`, `hostname`), `async-trait` and existing `reqwest` dependencies, for `db::migrate` running `PostgresStorage::setup` and the test template in `tests/support/pg.rs` running apalis' migrations (so every migrated test database, `test_db()` included, has the `apalis` schema; corrected, issue #309, 2026-11-12), and for `SQLX_OFFLINE=true` in the justfile. It relies on Task 4's `users::check_email`.
 
 **How a mail is sent** (Decisions 10, 11 and 19, spec "Background jobs"):
 
