@@ -1,7 +1,7 @@
 // Boot: theme, sign-in, the shell, the router.
 import { $ } from './core/dom.js';
 import { store } from './core/store.js';
-import { api, ApiError, setUnauthorizedHandler } from './core/api.js';
+import { api, ApiError, authHeaders, setUnauthorizedHandler } from './core/api.js';
 import { start, route } from './core/router.js';
 import { closeDrawer } from './core/drawer.js';
 import { toast } from './core/toast.js';
@@ -77,18 +77,18 @@ $('#login-form').addEventListener('submit', async event => {
 // Ends this browser's console session, if it has one, whatever else is
 // signed in: a stored key and a cookie session can coexist (a key pasted
 // earlier, then a sign-in at /signin in another tab), and the cookie is
-// HttpOnly, so only the server can say. Both requests are plain fetches
-// with no Authorization header, so they speak for the cookie alone.
+// HttpOnly, so only the server can say. Both requests go without the key
+// (`authHeaders` with `key: null`), so they speak for the cookie alone.
 // Resolves once no session is left: 2xx, or a 401 (none, or already over).
 // Throws on anything else, since the session may then live on.
 async function endCookieSession() {
-    const found = await fetch('/api/v1/session');
+    const found = await fetch('/api/v1/session', { headers: authHeaders('GET', { key: null }) });
     if (found.status === 401) return;
     if (!found.ok) throw new Error(`HTTP ${found.status}`);
     const { csrf } = await found.json();
     const ended = await fetch('/api/v1/session', {
         method: 'DELETE',
-        headers: { 'X-OKF-CSRF': csrf },
+        headers: authHeaders('DELETE', { key: null, csrf }),
     });
     if (!ended.ok && ended.status !== 401) throw new Error(`HTTP ${ended.status}`);
 }
@@ -131,7 +131,9 @@ addEventListener('keydown', event => { if (event.key === 'Escape') closeDrawer()
 // refused".
 async function boot() {
     let response = null;
-    try { response = await fetch('/api/v1/session'); } catch { /* the server is down */ }
+    try {
+        response = await fetch('/api/v1/session', { headers: authHeaders('GET', { key: null }) });
+    } catch { /* the server is down */ }
     if (response?.ok) {
         store.csrf = (await response.json()).csrf;
         store.key = null;

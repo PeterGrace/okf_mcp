@@ -17,13 +17,19 @@ export class ApiError extends Error {
 let unauthorized = () => {};
 export function setUnauthorizedHandler(handler) { unauthorized = handler; }
 
+// The headers that authenticate one request to /api/v1, the one place
+// that chooses them: a key as a bearer, or else nothing for the session
+// cookie (the browser sends it by itself, same origin) plus the session's
+// CSRF token on anything but a GET. `key` and `csrf` default to the stored
+// ones; pass `key: null` for a request that must speak for the cookie alone.
+export function authHeaders(method, { key = store.key, csrf = store.csrf } = {}) {
+    if (key) return { Authorization: `Bearer ${key}` };
+    if (method !== 'GET' && csrf) return { 'X-OKF-CSRF': csrf };
+    return {};
+}
+
 async function request(method, path, { body, raw = false, quiet = false, key } = {}) {
-    const headers = {};
-    const bearer = key ?? store.key;
-    // A pasted key goes as a bearer. Without one, the session cookie goes
-    // by itself (same origin), and a write carries the session's CSRF token.
-    if (bearer) headers.Authorization = `Bearer ${bearer}`;
-    else if (method !== 'GET' && store.csrf) headers['X-OKF-CSRF'] = store.csrf;
+    const headers = authHeaders(method, { key: key ?? store.key });
     let payload;
     if (body instanceof Blob) {
         payload = body;

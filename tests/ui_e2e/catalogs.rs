@@ -376,3 +376,71 @@ async fn an_export_or_import_in_flight_locks_the_catalog_and_admits_no_second_im
         generation + 1
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admin_signed_in_with_a_password_imports_an_archive() {
+    // `public_url` is the server's own address, so `/signin` exists.
+    let server = TestServer::start_with(
+        vec![(
+            "main",
+            files(&[("index.md", "# Main\n"), ("systems/alpha.md", ALPHA)]),
+        )],
+        |base| Config {
+            public_url: Some(base.to_string()),
+            ..Config::default()
+        },
+    )
+    .await;
+    let password = "violet-lantern-orbit-42";
+    server
+        .user_with_password("erin", "erin@example.com", password)
+        .await;
+    okf_mcp::store::users::set_admin(&server.db.pool, "erin", true, false)
+        .await
+        .expect("make erin an admin");
+    server.app.poll().await.expect("poll");
+    let generation = server
+        .app
+        .catalog("main")
+        .expect("main")
+        .current()
+        .generation();
+    let archive = tarball(&[
+        ("index.md", "# Main\n\nImported by a session.\n"),
+        ("systems/alpha.md", ALPHA),
+    ]);
+
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.sign_in_password("erin@example.com", password);
+        ui.wait_text("#whoami", "erin - admin");
+        // The cookie session alone: no key in this browser.
+        assert_eq!(
+            ui.eval("() => localStorage.getItem('okf.key')", json!(null)),
+            serde_json::Value::Null
+        );
+        ui.open("/transfer");
+        ui.wait_text("#transfer-generation", &format!("generation {generation}"));
+        ui.wait_visible("#upload-file");
+        let chosen = ui.eval(
+            CHOOSE_FILE,
+            json!({ "name": "main.tar.gz", "data": STANDARD.encode(&archive) }),
+        );
+        assert_eq!(chosen, json!(1));
+        ui.wait_text("#upload-name", "main.tar.gz");
+        ui.click("#import-replace");
+        // The upload is a write, so it carries the session's CSRF token.
+        ui.click("#import-btn");
+        ui.wait_visible("#import-report");
+        assert_eq!(ui.text("#import-updated"), "1");
+        ui.wait_text(
+            "#transfer-generation",
+            &format!("generation {}", generation + 1),
+        );
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let current = server.app.catalog("main").expect("main").current();
+    assert_eq!(current.generation(), generation + 1);
+}
