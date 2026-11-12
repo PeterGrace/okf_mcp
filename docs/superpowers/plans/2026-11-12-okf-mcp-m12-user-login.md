@@ -2676,7 +2676,7 @@ mod tests {
 }
 ```
 
-In `src/auth.rs` `mod tests`, add (and change every `KeyCache::from_records(records, now)` call from Task 2 to `KeyCache::from_records(records, HashMap::new(), now)`; likewise the one in `src/store/keys.rs`' `names_group_actors_and_revoked_pairs_can_be_reissued`; corrected, issue #310):
+In `src/auth.rs` `mod tests`, add (and change every `KeyCache::from_records(records, now)` call from Task 2 to `KeyCache::from_records(records, HashMap::new(), now)`; likewise the one in `src/store/keys.rs`' `names_group_actors_and_revoked_pairs_can_be_reissued`; corrected, issue #310, 2026-11-12):
 
 ```rust
     #[test]
