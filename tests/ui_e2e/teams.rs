@@ -2,10 +2,17 @@
 //! design's journey (a team, a member, a catalog it owns, a key for the
 //! member), membership changes and team deletion (the last-owner refusal,
 //! Remove, Delete, and what a personal team keeps), and assigning a key
-//! from before users existed.
+//! from before users existed, and an OAuth grant, a sign-in code and a
+//! catalog.
 
+use chrono::{TimeDelta, Utc};
 use okf_mcp::config::Config;
-use okf_mcp::store::keys::Access;
+use okf_mcp::store::keys::{self as key_rows, Access, Grants};
+use okf_mcp::store::oauth::clients;
+use okf_mcp::store::oauth::codes::{self, NewSignInCode};
+use okf_mcp::store::teams::{self, NewTeam};
+use okf_mcp::store::users::{self, NewUser};
+use serde_json::json;
 
 use crate::harness::drive;
 use crate::support::server::{files, TestServer, OWNER};
@@ -160,4 +167,162 @@ async fn assigning_the_signed_in_key_from_the_unassigned_view_updates_the_shell_
         ui.wait_text(&format!("[data-test=user-{OWNER}]"), "you");
     })
     .await;
+}
+
+/// A sign-in code called `name` on `main`, for the fixture user.
+fn new_code<'a>(name: &'a str, main: &'a [String]) -> NewSignInCode<'a> {
+    NewSignInCode {
+        name,
+        access: Access::Read,
+        grants: Grants::Catalogs(main),
+        default_catalog: None,
+        actor: "",
+        expires_at: Utc::now() + TimeDelta::hours(1),
+        user: OWNER,
+    }
+}
+
+/// Seeds what a deployment from before users existed holds: an OAuth grant
+/// and a sign-in code with no user, and a catalog (`orphan`) with no owner.
+/// No store function makes those any more, so each is made the current way
+/// and its user or owner cleared with SQL; the admin generation is bumped
+/// so the poll reloads the keys and catalogs.
+///
+/// # Returns
+/// The grant's name.
+async fn seed_unassigned(server: &TestServer) -> String {
+    let pool = &server.db.pool;
+    let client_id = "https://client.example.com/client.json";
+    sqlx::query(
+        "INSERT INTO oauth_clients \
+         (client_id, kind, client_name, redirect_uris, metadata, fetched_at, cache_expires_at, \
+          created_at) \
+         VALUES ($1, 'cimd', 'Example Client', ARRAY['https://client.example.com/callback'], \
+                 '{}'::jsonb, now(), now() + interval '1 hour', now())",
+    )
+    .bind(client_id)
+    .execute(pool)
+    .await
+    .expect("insert a client");
+    let client = clients::find(pool, client_id)
+        .await
+        .expect("read the client")
+        .expect("the client exists");
+    let main = ["main".to_string()];
+    let redeemed = codes::create(pool, &new_code("laptop", &main), Utc::now())
+        .await
+        .expect("mint the code a grant comes from");
+    let grant_id = codes::redeem(pool, &redeemed.id, &client, Utc::now())
+        .await
+        .expect("redeem the code");
+    codes::create(pool, &new_code("tablet", &main), Utc::now())
+        .await
+        .expect("mint a code");
+    sqlx::query("UPDATE api_keys SET user_id = NULL WHERE id = $1")
+        .bind(&grant_id)
+        .execute(pool)
+        .await
+        .expect("clear the grant's user");
+    let statements = [
+        "UPDATE sign_in_codes SET user_id = NULL WHERE name = 'tablet'",
+        "UPDATE catalogs SET owner_team_id = NULL WHERE name = 'orphan'",
+        "UPDATE server_state SET admin_generation = admin_generation + 1",
+    ];
+    for statement in statements {
+        sqlx::query(statement)
+            .execute(pool)
+            .await
+            .expect("clear a user or owner");
+    }
+    server.app.poll().await.expect("poll");
+    key_rows::list(pool)
+        .await
+        .expect("list keys")
+        .into_iter()
+        .find(|key| key.id == grant_id)
+        .expect("the grant")
+        .name
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_a_code_and_a_catalog_are_assigned_from_the_unassigned_view() {
+    let server = TestServer::start(
+        vec![
+            ("main", files(&[("index.md", "# Main\n")])),
+            ("orphan", files(&[("index.md", "# Orphan\n")])),
+        ],
+        Config::default(),
+    )
+    .await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let alice = NewUser {
+        name: "alice",
+        display_name: "",
+    };
+    users::create(&server.db.pool, &alice, Utc::now())
+        .await
+        .expect("create alice");
+    let family = NewTeam {
+        name: "family",
+        display_name: "",
+        owner: "alice",
+    };
+    teams::create(&server.db.pool, &family, Utc::now())
+        .await
+        .expect("create a team");
+    let grant = seed_unassigned(&server).await;
+    // Quoted: a grant's name has dots.
+    let grant_row = format!("[data-test=\"assign-key-{grant}\"]");
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.wait_text("#unassigned-badge", "3");
+        ui.open("/users/unassigned");
+        ui.wait_text(&grant_row, "Grant");
+        ui.select(&format!("{grant_row} select"), "alice");
+        ui.click(&format!("{grant_row} button"));
+        ui.wait_hidden(&grant_row);
+        ui.wait_text("#unassigned-badge", "2");
+        ui.select("[data-test=assign-code-tablet] select", "alice");
+        ui.click("[data-test=assign-code-tablet] button");
+        ui.wait_hidden("[data-test=assign-code-tablet]");
+        ui.wait_text("#unassigned-badge", "1");
+        ui.select("[data-test=assign-catalog-orphan] select", "family");
+        ui.click("[data-test=assign-catalog-orphan] button");
+        ui.wait_text("#unassigned-empty", "Nothing is unassigned");
+        ui.wait_hidden("#unassigned-badge");
+        // The list pages show what was persisted.
+        ui.open("/catalogs");
+        ui.wait_text("[data-test=catalog-owner-orphan]", "family");
+        ui.open("/keys");
+        ui.wait_text("[data-test=code-user-tablet]", "alice");
+        let users = ui.eval(
+            "() => [...document.querySelectorAll('[data-test^=\"key-user-\"]')] \
+             .map(cell => cell.textContent)",
+            json!(null),
+        );
+        assert!(
+            !users.to_string().contains("unassigned"),
+            "every key has a user: {users}"
+        );
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let pool = &server.db.pool;
+    let keys = key_rows::list(pool).await.expect("list keys");
+    let grant_user = keys
+        .iter()
+        .find(|key| key.name == grant)
+        .and_then(|key| key.user.clone());
+    assert_eq!(grant_user.as_deref(), Some("alice"));
+    let code_user = codes::list(pool)
+        .await
+        .expect("list codes")
+        .into_iter()
+        .find(|code| code.name == "tablet")
+        .and_then(|code| code.user);
+    assert_eq!(code_user.as_deref(), Some("alice"));
+    let owned = teams::find(pool, "family").await.expect("read the team");
+    assert_eq!(owned.catalogs, ["orphan"]);
 }
