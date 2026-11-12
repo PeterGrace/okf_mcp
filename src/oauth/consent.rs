@@ -1,6 +1,8 @@
 //! The consent page (spec "Consent flow"): server-rendered HTML, a plain
 //! form, no script. Step 1 asks for the sign-in code, step 2 states what will
-//! be granted, and an error page ends a request that cannot go on.
+//! be granted, and an error page ends a request that cannot go on. A
+//! signed-in person instead sees [`user_page`] (spec "OAuth consent as the
+//! user"): their ceiling's catalogs to choose from.
 //!
 //! Client names come from client metadata, which anyone can write, so every
 //! piece of text goes through `escape`. There is no template engine; the
@@ -13,6 +15,8 @@ use crate::http::pages;
 /// Moved to `crate::http::pages`; kept here so `mail::templates` (Task 6)
 /// compiles whichever of Tasks 6 and 7a merges first (plan Decision 14).
 pub(crate) use crate::http::pages::escape;
+use crate::store::ceiling::Ceiling;
+use crate::store::keys::Access;
 
 /// What every page shows about the request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +111,17 @@ fn hidden_fields(view: &PageView) -> String {
     )
 }
 
+/// A refusal's line above a form, or nothing.
+fn error_line(error: Option<&str>) -> String {
+    error.map_or_else(String::new, |message| {
+        format!(
+            r#"        <p class="error consent-error" id="consent-error" role="alert">{}</p>
+"#,
+            escape(message)
+        )
+    })
+}
+
 /// Step 1's HTML.
 ///
 /// # Arguments
@@ -116,13 +131,7 @@ fn hidden_fields(view: &PageView) -> String {
 /// # Returns
 /// The page body.
 pub(crate) fn code_page_html(view: &PageView, error: Option<&str>) -> String {
-    let error = error.map_or_else(String::new, |message| {
-        format!(
-            r#"        <p class="error consent-error" id="consent-error" role="alert">{}</p>
-"#,
-            escape(message)
-        )
-    });
+    let error = error_line(error);
     format!(
         r#"        <h1>Connect a client</h1>
 {client}
@@ -227,6 +236,135 @@ pub fn summary_page(view: &PageView, grant: &GrantSummary, summary_nonce: &str) 
         StatusCode::OK,
         "Allow access?",
         &summary_page_html(view, grant, summary_nonce),
+        Some(&view.redirect_origin),
+    )
+}
+
+/// What the signed-in consent page shows beyond [`PageView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserPage<'a> {
+    /// The signed-in user's name.
+    pub user: &'a str,
+    /// The ceiling it offers: the catalogs and levels the user may grant.
+    pub ceiling: &'a Ceiling,
+    /// The page's consent nonce (the hidden `summary` input).
+    pub nonce: &'a str,
+    /// The "Use a sign-in code instead" link (same-origin, unescaped).
+    pub code_href: &'a str,
+}
+
+/// The signed-in consent page's HTML: a checkbox and a level select per
+/// ceiling catalog (only the levels the ceiling allows), a default catalog
+/// select, Approve and Deny, and the sign-in code link. With an empty
+/// ceiling there is nothing to approve: Deny and the link only.
+///
+/// # Arguments
+/// * `view` - the request.
+/// * `user` - the user, ceiling, nonce and link.
+/// * `error` - a message from a refused choice, if any.
+///
+/// # Returns
+/// The page body.
+pub(crate) fn user_page_html(view: &PageView, user: &UserPage<'_>, error: Option<&str>) -> String {
+    let link = format!(
+        r#"        <p class="muted"><a href="{}" id="consent-use-code">Use a sign-in code instead</a></p>"#,
+        escape(user.code_href)
+    );
+    if user.ceiling.is_empty() {
+        return format!(
+            r#"        <h1>Allow access?</h1>
+{client}
+        <p class="error consent-error" id="consent-empty">You have no catalogs to share yet. Ask an admin for access, or use a sign-in code.</p>
+        <form method="post" action="/oauth/authorize" id="consent-user-form">
+            {hidden}
+            <div class="consent-actions">
+                <button type="submit" name="action" value="deny" id="consent-deny" class="secondary">Deny</button>
+            </div>
+        </form>
+{link}"#,
+            client = client_block(view),
+            hidden = hidden_fields(view),
+        );
+    }
+    // Catalog names are `[a-z0-9-]+` (a schema CHECK), so they are safe in
+    // ids and names; they are escaped anyway, as everything is.
+    let rows: String = user
+        .ceiling
+        .iter()
+        .map(|(catalog, &allowed)| {
+            let name = escape(catalog);
+            let write = if allowed >= Access::Write {
+                r#"
+                        <option value="write">write</option>"#
+            } else {
+                ""
+            };
+            format!(
+                r#"                <div class="consent-catalog">
+                    <label><input type="checkbox" name="grant.{name}" value="on" id="consent-catalog-{name}"> {name}</label>
+                    <select name="level.{name}" id="consent-level-{name}" aria-label="Access to {name}">
+                        <option value="read">read</option>{write}
+                    </select>
+                </div>
+"#
+            )
+        })
+        .collect();
+    let defaults: String = user
+        .ceiling
+        .keys()
+        .map(|catalog| {
+            let name = escape(catalog);
+            format!(
+                r#"                    <option value="{name}">{name}</option>
+"#
+            )
+        })
+        .collect();
+    format!(
+        r#"        <h1>Allow access?</h1>
+{client}
+        <p class="muted">Signed in as <strong id="consent-user">{user}</strong>. Choose what <strong>{name}</strong> may use. You can grant up to your own access.</p>
+{error}        <form method="post" action="/oauth/authorize" id="consent-user-form">
+            {hidden}
+            <input type="hidden" name="summary" value="{nonce}">
+            <fieldset id="consent-catalogs">
+                <legend>Catalogs</legend>
+{rows}            </fieldset>
+            <label>Default catalog
+                <select name="default_catalog" id="consent-default">
+                    <option value="">None</option>
+{defaults}                </select>
+            </label>
+            <div class="consent-actions">
+                <button type="submit" name="action" value="consent" id="consent-approve">Approve</button>
+                <button type="submit" name="action" value="deny" id="consent-deny" class="secondary" formnovalidate>Deny</button>
+            </div>
+        </form>
+{link}"#,
+        client = client_block(view),
+        user = escape(user.user),
+        name = escape(&view.client_name),
+        error = error_line(error),
+        hidden = hidden_fields(view),
+        nonce = escape(user.nonce),
+    )
+}
+
+/// The signed-in consent page.
+///
+/// # Arguments
+/// * `view` - the request.
+/// * `user` - the user, ceiling, nonce and link.
+/// * `error` - a message from a refused choice, if any.
+///
+/// # Returns
+/// 200 with the page.
+pub fn user_page(view: &PageView, user: &UserPage<'_>, error: Option<&str>) -> Response {
+    page(
+        StatusCode::OK,
+        "Allow access?",
+        &user_page_html(view, user, error),
         Some(&view.redirect_origin),
     )
 }
@@ -387,6 +525,63 @@ mod tests {
         let html = summary_page_html(&view(), &grant, "n1");
         assert!(html.contains("as actor <strong>example-actor</strong>."));
         assert!(!html.contains("(actor"));
+    }
+
+    fn ceiling() -> Ceiling {
+        [
+            ("main".to_string(), Access::Write),
+            ("other".to_string(), Access::Read),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn the_user_page_offers_each_catalog_at_most_at_its_ceiling() {
+        let ceiling = ceiling();
+        let user = UserPage {
+            user: "<alice>",
+            ceiling: &ceiling,
+            nonce: "n1",
+            code_href: "/oauth/authorize?a=1&signin=code",
+        };
+
+        let html = user_page_html(&view(), &user, Some("bad <choice>"));
+
+        assert!(html.contains(r#"<strong id="consent-user">&lt;alice&gt;</strong>"#));
+        assert!(html.contains(r#"name="grant.main""#));
+        assert!(html.contains(r#"name="grant.other""#));
+        // `main` offers write, `other` only read.
+        let other = &html[html.find(r#"name="level.other""#).expect("other's select")..];
+        let other = &other[..other.find("</select>").expect("its end")];
+        assert!(!other.contains("write"), "{other}");
+        assert!(html.contains(r#"<option value="write">write</option>"#));
+        assert!(html.contains(r#"name="summary" value="n1""#));
+        assert!(html.contains(r#"href="/oauth/authorize?a=1&amp;signin=code""#));
+        assert!(html.contains("bad &lt;choice&gt;"));
+        assert!(html.contains(r#"id="consent-approve""#));
+        let document = pages::document("t", &html, &[]);
+        assert!(!document.contains("<script"));
+        assert!(!document.contains("style="));
+    }
+
+    #[test]
+    fn an_empty_ceiling_offers_only_deny_and_the_code_link() {
+        let empty = Ceiling::new();
+        let user = UserPage {
+            user: "alice",
+            ceiling: &empty,
+            nonce: "n1",
+            code_href: "/oauth/authorize?a=1&signin=code",
+        };
+
+        let html = user_page_html(&view(), &user, None);
+
+        assert!(html.contains(r#"id="consent-empty""#));
+        assert!(html.contains(r#"id="consent-deny""#));
+        assert!(html.contains(r#"id="consent-use-code""#));
+        assert!(!html.contains(r#"id="consent-approve""#));
+        assert!(!html.contains(r#"name="summary""#), "nothing to approve");
     }
 
     #[test]

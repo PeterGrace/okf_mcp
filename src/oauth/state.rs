@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use crate::store::ceiling::Ceiling;
 use crate::store::oauth::clients::ClientRecord;
 
 /// How long a consent page may stay open.
@@ -43,6 +44,12 @@ pub struct PendingAuthorization {
     pub accepted: Option<AcceptedCode>,
     /// Wrong codes entered so far.
     pub failed_attempts: u8,
+    /// Set when a signed-in person's consent page was shown (the user
+    /// path); `None` on the sign-in code path.
+    pub consent: Option<UserConsent>,
+    /// The request's validated parameters as a query string (no `?`, no
+    /// `signin`), for the sign-in code link when the page is shown again.
+    pub query: String,
 }
 
 // Written by hand, not derived, so a stray `{:?}` never prints the CSRF token.
@@ -55,6 +62,7 @@ impl std::fmt::Debug for PendingAuthorization {
             .field("redirect_uri", &self.redirect_uri)
             .field("accepted", &self.accepted)
             .field("failed_attempts", &self.failed_attempts)
+            .field("consent", &self.consent)
             .finish_non_exhaustive()
     }
 }
@@ -79,6 +87,35 @@ impl std::fmt::Debug for AcceptedCode {
             .debug_struct("AcceptedCode")
             .field("code_id", &self.code_id)
             .field("summary_nonce", &"<redacted>")
+            .finish()
+    }
+}
+
+/// A signed-in person's consent page: who it was shown to, what it
+/// offered, and the random token its Approve must echo. Each Approve spends
+/// the token (it is replaced under the pending map's lock), so one page
+/// approves at most once.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UserConsent {
+    /// The `users.id` the page was rendered for; the POST's session must
+    /// still be this user.
+    pub user_id: String,
+    /// A random token in the page's form (its hidden `summary` input),
+    /// compared in constant time.
+    pub nonce: String,
+    /// The ceiling the page offered. The POST may choose only from it, and
+    /// the store checks the choice against the ceiling again at insert.
+    pub offered: Ceiling,
+}
+
+// Written by hand, not derived, so a stray `{:?}` never prints the nonce.
+impl std::fmt::Debug for UserConsent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UserConsent")
+            .field("user_id", &self.user_id)
+            .field("nonce", &"<redacted>")
+            .field("offered", &self.offered)
             .finish()
     }
 }
@@ -168,12 +205,21 @@ mod tests {
                 summary_nonce: "nonce-value-that-must-not-leak".into(),
             }),
             failed_attempts: 0,
+            consent: Some(UserConsent {
+                user_id: "user-id".into(),
+                nonce: "consent-nonce-that-must-not-leak".into(),
+                offered: Ceiling::new(),
+            }),
+            query: "state=state-that-stays-out".into(),
         };
 
         let printed = format!("{pending:?}");
 
         assert!(!printed.contains("csrf-value-that-must-not-leak"));
         assert!(!printed.contains("nonce-value-that-must-not-leak"));
+        assert!(!printed.contains("consent-nonce-that-must-not-leak"));
+        assert!(!printed.contains("state-that-stays-out"));
+        assert!(printed.contains("user-id"));
         assert!(printed.contains("code-id"));
         assert!(printed.contains("<redacted>"));
     }

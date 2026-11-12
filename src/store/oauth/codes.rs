@@ -570,7 +570,7 @@ fn grant_name(code_name: &str, client: &ClientRecord, code_id: &str) -> String {
 ///
 /// # Returns
 /// A non-empty string in the key name charset.
-fn client_host(client: &ClientRecord) -> String {
+pub(crate) fn client_host(client: &ClientRecord) -> String {
     let source = match client.kind {
         ClientKind::Cimd => client.client_id.as_str(),
         ClientKind::Dcr => client.redirect_uris.first().map_or("", String::as_str),

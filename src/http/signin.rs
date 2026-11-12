@@ -148,11 +148,12 @@ fn sign_in_view(app: &App, return_to: String) -> SignInView {
 
 /// Whether a form post came from another site, by the browser's
 /// `Sec-Fetch-Site` header (login CSRF: another site signing the browser in
-/// as the attacker). The header is set by the browser, not by page script,
+/// as the attacker). `/oauth/authorize`'s consent form uses it too. The
+/// header is set by the browser, not by page script,
 /// and unlike `Origin` it does not turn into `null` under the pages'
 /// `Referrer-Policy: no-referrer`. A client that sends none (curl, an old
 /// browser) is let through: it is not a browser being steered.
-fn cross_site(headers: &HeaderMap) -> bool {
+pub(crate) fn cross_site(headers: &HeaderMap) -> bool {
     headers
         .get("sec-fetch-site")
         .is_some_and(|value| !matches!(value.as_bytes(), b"same-origin" | b"none"))
@@ -222,6 +223,15 @@ pub(crate) fn sign_in_html(view: &SignInView) -> String {
         "        <p class=\"muted signin-alt\">\
          <a href=\"/ui/\" id=\"signin-api-key\">Use an API key instead</a></p>",
     );
+    // People with an admin-minted sign-in code and no account still need a
+    // way through an OAuth sign-in (spec "OAuth consent as the user").
+    if let Some(href) = crate::oauth::authorize::code_path_href(&view.return_to) {
+        html.push_str(&format!(
+            "\n        <p class=\"muted signin-alt\">\
+             <a href=\"{}\" id=\"signin-use-code\">Use a sign-in code instead</a></p>",
+            escape(&href)
+        ));
+    }
     html
 }
 
@@ -2286,6 +2296,23 @@ mod tests {
         assert!(html.contains("Sign in with Example &lt;ID&gt;"));
         assert!(html.contains(SIGN_IN_FAILED));
         assert!(html.contains(r#"id="signin-api-key""#));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sign_in_page_offers_the_code_path_for_an_authorize_return() {
+        let test = crate::oauth::testing::oauth_app().await;
+        let back: String =
+            form_urlencoded::byte_serialize(b"/oauth/authorize?client_id=x").collect();
+
+        let (_, _, oauth_page) =
+            crate::oauth::testing::send(&test, "GET", &format!("/signin?return_to={back}"), None)
+                .await;
+        let (_, _, console_page) =
+            crate::oauth::testing::send(&test, "GET", "/signin?return_to=%2Fui%2F", None).await;
+
+        assert!(oauth_page.contains(r#"id="signin-use-code""#));
+        assert!(oauth_page.contains(r#"href="/oauth/authorize?client_id=x&amp;signin=code""#));
+        assert!(!console_page.contains("signin-use-code"));
     }
 
     #[test]

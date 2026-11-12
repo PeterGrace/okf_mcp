@@ -10,7 +10,8 @@ use chrono::{TimeDelta, Utc};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
-use crate::http::api::testing::MAIN;
+use crate::http::api::testing::{Browser, MAIN};
+use crate::http::console_session::COOKIE;
 use crate::http::router;
 use crate::mcp::testing::{app_with, TestApp};
 use crate::store::keys::{Access, Grants};
@@ -79,11 +80,22 @@ pub(crate) async fn sign_in_code(test: &TestApp, access: Access) -> String {
         .code
 }
 
-/// A valid authorization request's query string (the client's `state` is `xyz`).
+/// A valid authorization request's query string on the sign-in code path
+/// (`signin=code`; the client's `state` is `xyz`).
 ///
 /// # Returns
 /// The encoded query, without the `?`.
 pub(crate) fn authorize_query() -> String {
+    format!("{}&signin=code", user_authorize_query())
+}
+
+/// A valid authorization request's query string for a signed-in person:
+/// [`authorize_query`] without `signin=code`. Its pairs are in the order
+/// the server rebuilds a request in, so it is also `/signin`'s `return_to`.
+///
+/// # Returns
+/// The encoded query, without the `?`.
+pub(crate) fn user_authorize_query() -> String {
     form(&[
         ("response_type", "code"),
         ("client_id", CLIENT_ID),
@@ -127,9 +139,39 @@ pub(crate) async fn send(
     uri: &str,
     body: Option<String>,
 ) -> (StatusCode, HeaderMap, String) {
+    send_as(test, method, uri, body, None).await
+}
+
+/// As [`send`], with a console session's cookie when `session` is given.
+///
+/// # Arguments
+/// * `test` - the app.
+/// * `method` - `GET` or `POST`.
+/// * `uri` - the path and query.
+/// * `body` - a form body, if any.
+/// * `session` - a signed-in browser (Task 7a's `Browser`) whose session
+///   cookie to send, if any.
+///
+/// # Returns
+/// The status, the headers and the body as text.
+///
+/// # Panics
+/// If the request cannot be built or the body cannot be read.
+pub(crate) async fn send_as(
+    test: &TestApp,
+    method: &str,
+    uri: &str,
+    body: Option<String>,
+    session: Option<&Browser>,
+) -> (StatusCode, HeaderMap, String) {
     let mut request = Request::builder().method(method).uri(uri);
     if body.is_some() {
         request = request.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    }
+    // Only the cookie: these are top-level navigations and form posts,
+    // which carry no CSRF header (the consent form has its own token).
+    if let Some(id) = session.and_then(|browser| browser.cookie(COOKIE)) {
+        request = request.header(header::COOKIE, format!("{COOKIE}={id}"));
     }
     let request = request
         .body(body.map_or_else(Body::empty, Body::from))
