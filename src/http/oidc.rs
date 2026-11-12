@@ -611,6 +611,13 @@ mod tests {
             .expect("count")
     }
 
+    async fn user_id(test: &TestApp) -> String {
+        sqlx::query_scalar("SELECT id FROM users WHERE name = 'alice'")
+            .fetch_one(test.app.pool())
+            .await
+            .expect("alice's id")
+    }
+
     async fn sessions_of(pool: &PgPool, user_id: &str) -> i64 {
         sqlx::query_scalar("SELECT count(*) FROM user_sessions WHERE user_id = $1")
             .bind(user_id)
@@ -810,6 +817,43 @@ mod tests {
             assert!(reply.set_cookie(COOKIE).is_none(), "{what}");
         }
         assert_eq!(first.status, StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_token_from_another_issuer_for_another_client_or_expired_is_400() {
+        let idp = idp::start().await;
+        let test = oidc_app(&idp, "OKF_TEST_OIDC_SECRET_CLAIMS").await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        idp.will_issue("sub-1", Some("alice@example.com"), Some(true));
+
+        for (what, issuer, audience, expired) in [
+            ("issuer", Some("https://id.example.com"), None, false),
+            ("audience", None, Some("another-client"), false),
+            ("expiry", None, None, true),
+        ] {
+            idp.will_sign_badly(issuer, audience, expired);
+            let mut browser = Browser::default();
+            let query = start(&test, &idp, &mut browser).await;
+            let reply = callback(&test, &mut browser, &query["state"]).await;
+
+            assert_eq!(
+                reply.status,
+                StatusCode::BAD_REQUEST,
+                "{what}: {}",
+                reply.text()
+            );
+            assert!(reply.set_cookie(COOKIE).is_none(), "{what}");
+        }
+        idp.will_sign_badly(None, None, false);
+        let mut browser = Browser::default();
+        let query = start(&test, &idp, &mut browser).await;
+        let good = callback(&test, &mut browser, &query["state"]).await;
+        assert_eq!(
+            good.status,
+            StatusCode::SEE_OTHER,
+            "a good token still works"
+        );
+        assert_eq!(sessions_of(test.app.pool(), &user_id(&test).await).await, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -3,9 +3,11 @@
 //! Identities are not part of the key cache, so nothing here bumps
 //! `admin_generation`.
 //!
-//! Every write takes the user's row first (`FOR NO KEY UPDATE`), then the
-//! identity, session or token rows: the lock order of `email_tokens`'
-//! module docs. So a link, an unlink and a password reset of one user run
+//! Every write that links or unlinks takes the user's row first (`FOR NO
+//! KEY UPDATE`), then the identity, session or token rows: the lock order
+//! of `email_tokens`' module docs. [`touch`] is the exception: it only
+//! records `last_used_at` on one identity row, decides nothing, and waits
+//! on no other lock, so it cannot close a lock cycle. So a link, an unlink and a password reset of one user run
 //! one at a time, and `user_sessions::start` (which re-reads an OIDC
 //! sign-in's link under the user's row) never starts a session for an
 //! identity unlinked meanwhile.

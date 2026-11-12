@@ -535,6 +535,12 @@ pub(crate) mod testing {
         email: Option<String>,
         email_verified: Option<bool>,
         nonce: Option<String>,
+        /// Overrides the `iss` claim (a token from another issuer).
+        issuer: Option<String>,
+        /// Overrides the `aud` claim (a token for another client).
+        audience: Option<String>,
+        /// Issues a token that expired a minute ago.
+        expired: bool,
     }
 
     /// A running mock provider.
@@ -560,6 +566,20 @@ pub(crate) mod testing {
             next.subject = subject.to_string();
             next.email = email.map(str::to_string);
             next.email_verified = email_verified;
+        }
+
+        /// Makes the next ID tokens bad: another `iss`, another `aud`, or
+        /// already expired.
+        pub(crate) fn will_sign_badly(
+            &self,
+            issuer: Option<&str>,
+            audience: Option<&str>,
+            expired: bool,
+        ) {
+            let mut next = self.next.lock().expect("mock lock");
+            next.issuer = issuer.map(str::to_string);
+            next.audience = audience.map(str::to_string);
+            next.expired = expired;
         }
 
         /// Sets the nonce of the next ID tokens.
@@ -598,6 +618,9 @@ pub(crate) mod testing {
                 email: None,
                 email_verified: None,
                 nonce: None,
+                issuer: None,
+                audience: None,
+                expired: false,
             })),
             discoveries: Arc::default(),
             discovery_down: Arc::default(),
@@ -664,11 +687,21 @@ pub(crate) mod testing {
         }
         let next = idp.next.lock().expect("mock lock").clone();
         let now = chrono::Utc::now();
+        let issuer = next.issuer.unwrap_or_else(|| idp.issuer.clone());
+        let audience = next.audience.unwrap_or_else(|| CLIENT_ID.to_string());
+        let (issued, expires) = if next.expired {
+            (
+                now - chrono::Duration::minutes(10),
+                now - chrono::Duration::minutes(1),
+            )
+        } else {
+            (now, now + chrono::Duration::minutes(5))
+        };
         let claims = CoreIdTokenClaims::new(
-            IssuerUrl::new(idp.issuer.clone()).expect("the issuer"),
-            vec![Audience::new(CLIENT_ID.to_string())],
-            now + chrono::Duration::minutes(5),
-            now,
+            IssuerUrl::new(issuer).expect("the issuer"),
+            vec![Audience::new(audience)],
+            expires,
+            issued,
             StandardClaims::new(SubjectIdentifier::new(next.subject))
                 .set_email(next.email.map(EndUserEmail::new))
                 .set_email_verified(next.email_verified),
