@@ -3,7 +3,7 @@
 ## Added
 - `[auth]` in the config file: `password_sign_in`, `max_keys_per_user`, `max_key_lifetime`, `console_session_idle`, `console_session_absolute`, `setup_link_ttl`, `reset_link_ttl` (the policy defaults) and `trusted_proxy_header`, validated by `Config::validate`.
 - `store::settings`: `load`, `set` (validated per key; bumps `admin_generation`), `reset` and `list` over `server_settings`.
-- `store::user_sessions`: console sessions stored by SHA-256 of a 256-bit id, with idle and absolute expiry, `last_seen_at` written at most once a minute, revoke, revoke-all with an exception, listing by 12-hex-character id prefix, revoke by prefix, and prune.
+- `store::user_sessions`: console sessions stored by SHA-256 of a 256-bit id, with idle and absolute expiry, `last_seen_at` written at most once per `min(1 minute, idle / 4)` (once even under concurrent requests), revoke, revoke-all with an exception, listing by 12-hex-character id prefix, revoke by prefix, and prune.
 - `App::settings()`: the effective settings.
 
 ## Changed
@@ -15,6 +15,7 @@
 ## Notes
 - A stored setting this server cannot read (from a newer version or a hand edit) is logged at `warn` and the config default used; it never stops the server.
 - The CSRF token is derived from the session id (SHA-256 under its own label), so `user_sessions` stores no secret: `csrf_token` holds only the token's hash. Neither raw value appears in a `Debug` output.
-- `touch`'s writes re-check the absolute and idle limits under the row lock, so a concurrent request can never extend a session that has been revoked or has ended.
+- `touch`'s one write re-checks the absolute and idle limits and the write interval under the row lock, so a concurrent request can never extend a session that has been revoked or has ended, and a burst of requests writes once. A touch that writes nothing re-reads the row, so it never signs out a live session.
+- The write resolution follows the idle limit, so a short `console_session_idle` (such as `30s`) still keeps an active session alive.
 - Console session settings are `console_session_*`, apart from MCP's `session_idle_timeout` (Decision 9).
 - The plan's Task 5 carries a Corrected (issue #313) note for these differences.

@@ -11,6 +11,11 @@
 //! A session ends when its absolute limit passes, when it sits idle too
 //! long, or when it is revoked. [`touch`] never brings an ended session
 //! back: its writes re-check both limits under the row lock.
+//!
+//! Activity is recorded at most once per write resolution: a quarter of
+//! the idle limit, and never more than a minute. Recording it every minute
+//! regardless would let a session with an idle limit of a minute or less
+//! expire while in use.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -23,9 +28,9 @@ use sqlx::{PgExecutor, PgPool};
 use crate::error::OkfError;
 use crate::keys;
 
-/// How stale `last_seen_at` may be before a request rewrites it, so an
-/// active console writes at most once a minute per session.
-const LAST_SEEN_RESOLUTION: TimeDelta = TimeDelta::minutes(1);
+/// The most stale `last_seen_at` may be before a request rewrites it, so
+/// an active console writes at most once a minute per session.
+const MAX_LAST_SEEN_RESOLUTION: TimeDelta = TimeDelta::minutes(1);
 
 /// The length of [`SessionInfo::id_prefix`], in hex characters (6 bytes).
 pub const ID_PREFIX_LENGTH: usize = 12;
@@ -118,6 +123,17 @@ fn idle_cutoff(idle: Duration, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         .filter(|cutoff| *cutoff > DateTime::UNIX_EPOCH)
 }
 
+/// How stale `last_seen_at` may be before a request rewrites it: a
+/// quarter of `idle`, at most [`MAX_LAST_SEEN_RESOLUTION`]. A session used
+/// more often than every `idle` therefore always has a recent enough
+/// `last_seen_at` to stay alive, however short `idle` is.
+fn write_resolution(idle: Duration) -> TimeDelta {
+    // `idle / 4` past chrono's range is far above the cap, so the cap wins.
+    TimeDelta::from_std(idle / 4).map_or(MAX_LAST_SEEN_RESOLUTION, |quarter| {
+        quarter.min(MAX_LAST_SEEN_RESOLUTION)
+    })
+}
+
 /// Starts a session.
 ///
 /// # Arguments
@@ -180,17 +196,37 @@ struct Stored {
     user_id: String,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
+    // Read so the activity write and the live check share one row type;
+    // only the live check looks at it.
     last_seen_at: DateTime<Utc>,
 }
 
+impl Stored {
+    /// The session as a request sees it, given the raw id it was found by.
+    fn into_row(self, id: &str) -> SessionRow {
+        SessionRow {
+            user_id: self.user_id,
+            csrf: csrf_for(id),
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
 /// Looks a session up for a request: ends it if it is past its absolute
-/// limit or idle for `idle`, and otherwise records the activity (at most
-/// once a minute).
+/// limit or idle for `idle`, and otherwise records the activity, at most
+/// once per write resolution (`idle / 4`, capped at a minute).
 ///
-/// Safe under concurrency: the activity write re-checks both limits under
-/// the row lock (and never moves `last_seen_at` backwards), so a request
-/// racing the one that ends a session, or a revocation, cannot extend it;
-/// it gets `None` instead.
+/// Safe under concurrency:
+/// - The activity write is one `UPDATE` whose `WHERE` requires the session
+///   to be live and its `last_seen_at` stale. Postgres re-checks that
+///   `WHERE` on the newest row version once it holds the row lock. So of
+///   several concurrent touches, one writes and the rest find the row
+///   fresh and write nothing. A session revoked or ended meanwhile matches
+///   nothing either.
+/// - A touch that wrote nothing reads the row again to tell "live, no write
+///   needed" (the session) from "gone or ended" (`None`). A concurrent
+///   writer never turns into a false sign-out.
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -199,7 +235,7 @@ struct Stored {
 /// * `now` - the request's time (server clock).
 ///
 /// # Returns
-/// The session, or `None` when there is none or it just ended.
+/// The session, or `None` when there is none or it has ended.
 ///
 /// # Errors
 /// [`OkfError::Database`].
@@ -211,6 +247,29 @@ pub async fn touch(
 ) -> Result<Option<SessionRow>, OkfError> {
     let hash = keys::hash(id);
     let cutoff = idle_cutoff(idle, now);
+    // `last_seen_at` at or before this is stale enough to rewrite. It is
+    // always before `now`, so the write never moves `last_seen_at` back.
+    let stale_before = now - write_resolution(idle);
+    // `x > NULL` is NULL, so `$3 IS NULL` is spelled out for "no idle
+    // limit".
+    let written = sqlx::query_as::<_, Stored>(
+        "UPDATE user_sessions SET last_seen_at = $2 \
+         WHERE id_hash = $1 AND expires_at > $2 \
+           AND ($3::timestamptz IS NULL OR last_seen_at > $3) \
+           AND last_seen_at <= $4 \
+         RETURNING user_id, created_at, expires_at, last_seen_at",
+    )
+    .bind(hash.as_slice())
+    .bind(now)
+    .bind(cutoff)
+    .bind(stale_before)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(stored) = written {
+        return Ok(Some(stored.into_row(id)));
+    }
+    // Nothing written: the session is live and fresh, or it has ended, or
+    // it does not exist. A fresh read tells them apart.
     let Some(stored) = sqlx::query_as::<_, Stored>(
         "SELECT user_id, created_at, expires_at, last_seen_at \
          FROM user_sessions WHERE id_hash = $1",
@@ -237,33 +296,7 @@ pub async fn touch(
         .await?;
         return Ok(None);
     }
-    if now - stored.last_seen_at >= LAST_SEEN_RESOLUTION {
-        // Postgres re-evaluates the WHERE on the latest row version once it
-        // holds the row lock, so a session deleted or ended meanwhile
-        // matches nothing. (`x > NULL` is NULL, so `$3 IS NULL` is spelled
-        // out for "no idle limit".)
-        let still_live = sqlx::query(
-            "UPDATE user_sessions SET last_seen_at = GREATEST(last_seen_at, $2) \
-             WHERE id_hash = $1 AND expires_at > $2 \
-               AND ($3::timestamptz IS NULL OR last_seen_at > $3)",
-        )
-        .bind(hash.as_slice())
-        .bind(now)
-        .bind(cutoff)
-        .execute(pool)
-        .await?
-        .rows_affected()
-            > 0;
-        if !still_live {
-            return Ok(None);
-        }
-    }
-    Ok(Some(SessionRow {
-        user_id: stored.user_id,
-        csrf: csrf_for(id),
-        created_at: stored.created_at,
-        expires_at: stored.expires_at,
-    }))
+    Ok(Some(stored.into_row(id)))
 }
 
 /// Ends one session (sign-out).
@@ -602,7 +635,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_revoked_session_is_not_revived_by_a_touch_that_read_it_first() {
+    async fn a_revoked_session_is_not_revived_by_a_touch_waiting_on_its_lock() {
         let db = test_db().await;
         let alice = seed_user(&db.pool, "alice", None).await;
         let session = create(&db.pool, &alice.id, None, "", ABSOLUTE, now())
@@ -633,6 +666,114 @@ mod tests {
 
         assert!(racing.await.unwrap().is_none());
         assert!(list(&db.pool, &alice.id, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_short_idle_limit_keeps_an_active_session_alive() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        // (idle limit, time between touches), both in seconds: at and below
+        // the one-minute cap on the write resolution.
+        for (idle_secs, every_secs) in [(30, 10), (60, 20)] {
+            let idle = Duration::from_secs(idle_secs);
+            let session = create(&db.pool, &alice.id, None, "", ABSOLUTE, now())
+                .await
+                .unwrap();
+
+            // Two minutes of use, never idle for `idle`.
+            let mut at = now();
+            while at < now() + TimeDelta::minutes(2) {
+                at += TimeDelta::seconds(every_secs);
+                let alive = touch(&db.pool, &session.id, idle, at).await.unwrap();
+                assert!(alive.is_some(), "idle {idle_secs}s, touched at {at}");
+            }
+            // Then left alone for exactly the idle limit.
+            let idle_end = at + TimeDelta::seconds(idle_secs as i64);
+            let ended = touch(&db.pool, &session.id, idle, idle_end).await.unwrap();
+
+            assert!(ended.is_none(), "idle {idle_secs}s ends once idle");
+        }
+    }
+
+    /// Counts every write to `user_sessions` (in `session_writes`), so a
+    /// test can see how many activity updates ran.
+    async fn count_session_writes(pool: &PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE session_writes (n integer NOT NULL); \
+             INSERT INTO session_writes VALUES (0); \
+             CREATE FUNCTION count_session_write() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$ BEGIN UPDATE session_writes SET n = n + 1; RETURN NULL; END $$; \
+             CREATE TRIGGER count_session_writes AFTER UPDATE ON user_sessions \
+                 FOR EACH ROW EXECUTE FUNCTION count_session_write();",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn session_writes(pool: &PgPool) -> i32 {
+        sqlx::query_scalar("SELECT n FROM session_writes")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn touches_queued_on_the_row_lock_write_once_and_all_stay_signed_in() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        let session = create(&db.pool, &alice.id, None, "", ABSOLUTE, now())
+            .await
+            .unwrap();
+        count_session_writes(&db.pool).await;
+        // Hold the row lock so both touches, each needing a write, queue
+        // behind it before either runs.
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM user_sessions WHERE id_hash = $1 FOR UPDATE")
+            .bind(keys::hash(&session.id).as_slice())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let at = now() + TimeDelta::hours(1);
+        let racing: Vec<_> = (0..2)
+            .map(|_| {
+                let pool = db.pool.clone();
+                let id = session.id.clone();
+                tokio::spawn(async move { touch(&pool, &id, IDLE, at).await.unwrap() })
+            })
+            .collect();
+        crate::store::catalogs::tests::until_locks_are_awaited(&db.pool, 2).await;
+        tx.commit().await.unwrap();
+
+        for handle in racing {
+            assert!(handle.await.unwrap().is_some(), "no false sign-out");
+        }
+        assert_eq!(session_writes(&db.pool).await, 1);
+        assert_eq!(last_seen(&db.pool, &session.id).await, at);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_burst_of_concurrent_touches_writes_once() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        let session = create(&db.pool, &alice.id, None, "", ABSOLUTE, now())
+            .await
+            .unwrap();
+        count_session_writes(&db.pool).await;
+        let at = now() + TimeDelta::hours(1);
+
+        let burst: Vec<_> = (0..16)
+            .map(|_| {
+                let pool = db.pool.clone();
+                let id = session.id.clone();
+                tokio::spawn(async move { touch(&pool, &id, IDLE, at).await.unwrap() })
+            })
+            .collect();
+        for handle in burst {
+            assert!(handle.await.unwrap().is_some());
+        }
+
+        assert_eq!(session_writes(&db.pool).await, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
