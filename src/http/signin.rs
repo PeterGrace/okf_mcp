@@ -758,13 +758,22 @@ async fn reset_post(
         Ok(user) => user,
         Err(error) => return link_error(error),
     };
+    // Sessions end before the password changes, so a failure further on
+    // never leaves the old sessions alive with the link already used. They
+    // end again afterwards: a sign-in with the old password between the
+    // two statements must not survive the reset either.
+    let mut ended = match user_sessions::revoke_all(app.pool(), &user.id, None).await {
+        Ok(ended) => ended,
+        Err(error) => return AppError(error).into_response(),
+    };
     if let Err(error) = passwords::set(app.pool(), &user.id, &form.password, now).await {
         return AppError(error).into_response();
     }
     match user_sessions::revoke_all(app.pool(), &user.id, None).await {
-        Ok(ended) => tracing::info!(user = %user.id, ended, "password reset; every session ended"),
+        Ok(late) => ended += late,
         Err(error) => return AppError(error).into_response(),
     }
+    tracing::info!(user = %user.id, ended, "password reset; every session ended");
     notify_method_added(&app, &user, "a new password").await;
     Redirect::to("/signin?notice=reset").into_response()
 }
@@ -1306,6 +1315,39 @@ mod tests {
         assert_eq!(page.status, StatusCode::GONE);
         assert_eq!(post.status, StatusCode::GONE);
         assert!(post.set_cookie(COOKIE).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_reset_link_is_410_and_changes_nothing() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let mut signed_in = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        // Issued two hours ago with a one-hour lifetime.
+        let token = email_tokens::issue(
+            test.app.pool(),
+            &alice.id,
+            Purpose::Reset,
+            Duration::from_secs(3600),
+            Utc::now() - chrono::TimeDelta::hours(2),
+        )
+        .await
+        .expect("issue a reset token");
+        let form = Payload::Form(vec![
+            ("token", token.clone()),
+            ("password", "amber-quarry-signal-77".to_string()),
+            ("confirm", "amber-quarry-signal-77".to_string()),
+        ]);
+
+        let post = Browser::default()
+            .send(&test, "POST", "/account/reset", form)
+            .await;
+        let session = signed_in
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        assert_eq!(post.status, StatusCode::GONE);
+        assert!(post.text().contains(LINK_EXPIRED));
+        assert_eq!(session.status, StatusCode::OK, "nothing was reset");
     }
 
     #[tokio::test(flavor = "multi_thread")]
