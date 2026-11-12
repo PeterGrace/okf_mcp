@@ -10794,6 +10794,14 @@ Builds on Task 7a's pages, limits, `start_session`, `Browser` and `/api/v1/sessi
 >   - The unstamped `sign_in` is kept for Tasks 8 and 9 under `#[expect(dead_code)]`; delete that attribute when the first of them calls it.
 >   - Test: `a_session_after_setup_is_refused_once_a_reset_replaced_the_password`.
 > - **A console write with CSRF has a journey:** `an_admin_session_writes_through_the_console_with_its_csrf_token`. It signs in at `/signin`, reloads, checks that no key is stored, creates a user in the UI and reads it back through the API. Removing the `X-OKF-CSRF` line from `api.js` makes it fail.
+> - **Typed text Postgres would refuse never reaches SQL on the sign-in surface (seventh review of PR #337).**
+>   - `users::normalize_email(raw) -> Option<String>` trims and lowercases an address. It returns `None` when `check_email` refuses the address: too long, no single `@`, a space, a control character such as NUL, or a header special.
+>   - `/signin` checks a `None` address as the empty address, which names nobody: the same dummy hash and the same 401. The audit lookup uses the same value. `/signin/forgot` does no work for a `None` address and gives the same answer.
+>   - The store guards its own lookups through `users::is_lookup_email`. `passwords::verify` runs the dummy hash without a query. `users::find_by_email` and `email_tokens::issue_for_email` answer "nobody".
+>   - Link tokens are only ever bound as their SHA-256, so a NUL in one is a plain 410.
+>   - `return_to` never reaches SQL, and `safe_return_to` refuses control characters.
+>   - Genuine database errors are still 500.
+>   - Tests: `an_email_postgres_would_refuse_is_an_unknown_email`, `forgot_answers_alike_for_an_email_postgres_would_refuse`, `a_link_token_with_a_nul_is_410`.
 > - **One place picks a request's credentials (sixth review of PR #337).** `core/api.js` exports `authHeaders(method, { key = store.key, csrf = store.csrf })`. With a key it returns `Authorization: Bearer`. Without one, a non-GET request gets `X-OKF-CSRF`, and the session cookie goes by itself.
 >   - `request`, the import upload (`components/upload.js`'s XMLHttpRequest) and `main.js`'s cookie-only session calls (`key: null`) all use it.
 >   - Task 14a's shared modules must not build an `Authorization` header anywhere else.
