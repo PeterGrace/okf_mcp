@@ -134,6 +134,7 @@ pub(crate) fn principal_with_reporting(
         default_catalog: default.map(str::to_string),
         actor: key_id.to_string(),
         kind: CredentialKind::ApiKey,
+        user: None,
     })
 }
 

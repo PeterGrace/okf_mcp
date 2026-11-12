@@ -67,6 +67,10 @@ pub struct Principal {
     pub actor: String,
     /// An API key or an OAuth grant.
     pub kind: CredentialKind,
+    /// The user this credential belongs to; `None` for one not yet
+    /// assigned. Display only: it grants nothing, so `reaches` and
+    /// `require` never read it.
+    pub user: Option<String>,
 }
 
 impl Principal {
@@ -156,6 +160,7 @@ impl From<KeyRecord> for Principal {
             default_catalog: record.default_catalog,
             actor: record.actor,
             kind,
+            user: record.user,
         }
     }
 }
@@ -470,7 +475,7 @@ mod tests {
             kind: KeyKind::Key,
             client_id: None,
             client_name: None,
-            user: None,
+            user: Some(crate::db::TEST_USER.to_string()),
         }
     }
 
@@ -505,6 +510,7 @@ mod tests {
 
         assert_eq!(found.key_id, "reader");
         assert_eq!(found.actor, "actor-reader");
+        assert_eq!(found.user.as_deref(), Some(crate::db::TEST_USER));
         assert_eq!(found.default_catalog.as_deref(), Some("pg"));
         assert!(cache.find("old-key").is_none());
         // A stored hash of the wrong length is left out, not a panic.
