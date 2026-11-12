@@ -282,9 +282,11 @@ pub struct UserAuth { pub id: String, pub name: String, pub email: Option<String
 // ---- src/store/passwords.rs (Task 4) ----
 pub fn check_policy(password: &str) -> Result<(), OkfError>;           // LimitExceeded{limit:"password"}
 pub fn hash(password: &str) -> Result<String, OkfError>;               // argon2id PHC
-pub enum SignInOutcome { Ok(UserAuth), Failed, Locked }
+pub enum SignInOutcome { Ok(Verified), Failed, Locked }   // Ok(UserAuth) until Task 7b's review
 pub async fn verify(pool: &PgPool, email: &str, password: &str, now: DateTime<Utc>) -> Result<SignInOutcome, OkfError>; // lockout, dummy hash
 pub async fn verify_user(pool: &PgPool, user_id: &str, password: &str, now: DateTime<Utc>) -> Result<SignInOutcome, OkfError>; // the same rules, by id (Task 10b's password change)
+pub struct PasswordStamp(/* the matched hash; Debug redacted */); pub struct Verified { pub user: UserAuth, pub stamp: PasswordStamp } // Task 7b (PR #337 review)
+pub async fn reset(pool: &PgPool, user_id: &str, password: &str, now: DateTime<Utc>) -> Result<u64, OkfError>; // Task 7b: set + revoke_all in one transaction
 pub async fn set(pool: &PgPool, user_id: &str, password: &str, now: DateTime<Utc>) -> Result<(), OkfError>;
 
 // ---- src/store/email_tokens.rs (Task 4) ----
@@ -10761,7 +10763,15 @@ Builds on Task 7a's pages, limits, `start_session`, `Browser` and `/api/v1/sessi
 > - `audit` only calls `sign_in_events::record`, which already writes the `info` line; the plan's second `tracing::info!` is gone.
 > - Every POST (`/signin`, `/signin/forgot`, `/account/setup`, `/account/reset`) answers 403 when the browser's `Sec-Fetch-Site` is neither `same-origin` nor `none` (login CSRF). `Origin` cannot be used: under the pages' `Referrer-Policy: no-referrer` browsers send `Origin: null` even for same-origin form posts. A request without the header (curl, the `oneshot` tests) is let through. So `reset_post` also takes `parts: Parts`.
 > - `/signin/forgot` takes a per-email limiter slot only for an address `users::check_email` accepts, so that map holds short keys; the answer is the same either way.
-> - `reset_post` ends the user's sessions before `passwords::set` as well as after it, so a failure after the link is used never leaves the old sessions alive.
+> - **The reset / sign-in protocol (review of PR #337).** A password sign-in carries the hash it matched to the session insert, so a session can't outlive a reset:
+>   - `passwords::verify` and `verify_user` return `SignInOutcome::Ok(Verified { user, stamp })`. `stamp: PasswordStamp` is the stored PHC string the password matched, with a redacted `Debug`. A new password always has a new hash, because it gets a fresh salt.
+>   - `user_sessions::start(pool, &SessionStart { user_id, ip, user_agent, absolute, now, password })` is one statement: `INSERT INTO user_sessions ... SELECT ... FROM users u WHERE u.id = $2 AND ($8::text IS NULL OR u.password_hash = $8) FOR SHARE`. If no row comes back, it returns `OkfError::Unauthenticated`, and `POST /signin` answers that with the uniform 401 (recorded as failed). `user_sessions::create` (no stamp) is unchanged for callers.
+>   - `passwords::reset(pool, user_id, password, now) -> u64` updates the hash and runs `revoke_all` in one transaction. `reset_post` uses it.
+>   - The two serialize on the user row. Either the insert commits first and the reset deletes its session, or the reset commits first and the insert re-checks the hash on the new row version and inserts nothing.
+>   - `console_session::start_session_with(app, user, password, ip, user_agent)` is the stamped form of `start_session`. In `signin.rs`, `begin(app, parts, user, method, password)` is the stamped form of `sign_in`.
+>   - Passkey, OIDC and setup sign-ins keep calling `sign_in` / `start_session` with no stamp.
+>   - Tests: `a_sign_in_checked_before_a_reset_gets_no_session_after_it`, `a_sign_in_waiting_on_a_reset_in_progress_gets_no_session` (holds the user row so the reset and the insert queue behind it in that order) and `a_session_inserted_before_a_reset_is_ended_by_it`.
+> - Console sign-out counts as done only on a 2xx or a 401 from `DELETE /api/v1/session`. Any other failure keeps the session state and the shell, and shows a "Sign-out failed ... Try again." toast. The setup journey fails the first `DELETE` with a fetch wrapper and checks this.
 > - Without `public_url`, `POST /signin` answers 404 (an explicit handler), not axum's 405.
 > - `http::router`'s trace span (`request_span`) records the method and the path, not the URI: `DefaultMakeSpan` logged `?token=...` of every emailed link.
 > - The console's 403 toast reads "Your account cannot do this." for a session (no stored key).
