@@ -1660,6 +1660,8 @@ async fn deleting_a_user_with_a_key_fails_and_says_why() {
 
 > **Corrected (issue #282).** Tasks 3 and 4 already did this: those tests run on `crate::db::test_db()` and pass `--owner TEST_TEAM` / `--user TEST_USER`. `KeyCreateArgs.user` and `CodeCreateArgs.user` (`#[arg(long)] String`) already exist. `keys::assign_user_target` returns the resolved id, `assign_user_by_id` the row's name.
 
+> **Corrected (issue #284).** There was no `run_cli`: `cli::run` prints straight to stdout. What shipped: the new handlers in `src/cli/people.rs` (`user`, `team`, `unassigned`, `set_owner`, `assign_key`, `assign_code`) return the text to print, `\n`-terminated, and `cli.rs`'s arms `print!` it. The tests live in `src/cli/people.rs`'s test module, on `crate::db::test_db()` (so `user list` also shows `test-user`), through an `okf(&db, args)` helper that parses the line and calls those handlers (any other command goes through `cli::run` and returns `""`). Besides the five tests above it adds `removing_the_last_owner_is_refused`, `set_owner_names_no_previous_owner_for_a_legacy_catalog` and `code_assign_gives_a_code_a_user`. The list layouts differ from Step 4: see the note there.
+
 - [ ] **Step 2: Run them to see them fail.**
 
 - [ ] **Step 3: Implement the clap definitions** in `src/cli.rs`:
@@ -1778,14 +1780,20 @@ pub enum TeamCommand {
 
 Make the code-create `--actor` optional (`Option<String>`, passed as `""` when absent).
 
-- [ ] **Step 4: Implement the handlers** in `src/cli/people.rs`: `pub(super) async fn user(pool, clock, command: UserCommand) -> anyhow::Result<()>`, `team(...)`, `unassigned(pool)`. They print exactly the strings the tests assert:
-  - `user list`: `NAME  DISPLAY NAME  CREDENTIALS  TEAMS`, teams comma-joined.
-  - `team list`: `NAME  PERSONAL  MEMBERS  CATALOGS`, members as `user(role)` comma-joined.
+- [ ] **Step 4: Implement the handlers** in `src/cli/people.rs`: `pub(super) async fn user(pool, command: UserCommand, now) -> anyhow::Result<String>`, `team(...)`, `unassigned(pool)`, plus `set_owner`, `assign_key` and `assign_code` for the `catalog`/`key`/`oauth code` arms. They return exactly the strings the tests assert:
+  - `user list`: no header, tab-separated like `key list`: `NAME`, `credentials N`, `teams T1,T2`, then the display name last (free text, like `catalog list`'s description).
+  - `team list`: `NAME`, `personal U` (`-` for a shared team), `members user(role),...`, `catalogs C1,C2` (`-` for none), then the display name last.
   - `unassigned`: one line per row, `key NAME (id ID, actor ACTOR)`, `grant NAME (id ID)`, `code NAME (id ID)` and `catalog NAME`, or `nothing is unassigned`.
+  - `team add-member` and `team set-role` both call `teams::set_member` (an upsert) and print by its `MemberChange`: `added U to team T as R`, `U is now R of team T`, or `U is already R of team T`. So `set-role` on a non-member adds it.
+  - `catalog set-owner`: `catalog C: owner OLD -> NEW`, `(none)` for a legacy catalog. `oauth code assign`: `sign-in code ID now belongs to U`.
+
+> **Corrected (issue #284).** The header rows above were dropped: no existing `list` prints one, and `cut -f` scripts would have to skip it. `cli.rs` factors `tab_row(&[&str])` and `labelled(label, Option<&str>)` (`label value`, `-` for none) out of `format_key_record`; every listing uses them.
 
   Each mutating handler calls nothing else: a store function already bumps `admin_generation`, which is how a running server notices. In `cli.rs`'s dispatcher, add the arms and `mod people;`.
 
 `key list` and `oauth code list` gain a `USER` column, and `catalog list` an `OWNER` column, each showing `-` for `None`.
+
+> **Corrected (issue #284).** As labelled cells: `key list` (and so `oauth grant list`, before `client X`) and `oauth code list` end with `user U`; `catalog list` is `NAME`, `generation N`, `owner T`, description (owner goes before the description so the free text stays last). Task 9's `operations.md` column descriptions must say so.
 
 - [ ] **Step 5: Run the tests** (`cargo test --lib cli`), then `cargo test`. Expected: PASS.
 
@@ -2292,6 +2300,8 @@ git commit -am "feat(console): users and teams pages, user and owner pickers, un
 
 **Files:**
 - Modify: `docs/operations.md` (new "Users and teams" section, REST rows, parity table, updated `key create` / `oauth code create` / `catalog create` examples with `--user` / `--owner`; `--actor` no longer required for codes)
+
+> **Corrected (issue #284).** Also update the list-column descriptions: `key list` and `oauth code list` (around `operations.md:468` and the `oauth code list` row) end with `user U`, `catalog list` gains `owner T` before the description, and `user list` / `team list` print the labelled, tab-separated layout in Task 6 Step 4.
 - Modify: `README.md` if it shows `key create` or `catalog create`
 - Create: `tests/parity.rs`
 - Modify: the spec's status line: "delivered in … (plan `docs/superpowers/plans/2026-11-11-okf-mcp-m11-users-teams.md`)", plus a "What shipped differently" section listing Decisions 1, 2 and 6

@@ -30,6 +30,10 @@ use crate::store::export;
 use crate::store::import::{self, ImportOptions, ImportScope};
 use crate::store::keys::{self, Access, Grants, KeyKind, NewKey};
 use crate::store::oauth::codes::{self, NewSignInCode, SignInCodeRecord};
+use crate::store::teams::Role;
+
+// `src/cli/people.rs`: the user, team, assignment and `unassigned` handlers.
+mod people;
 
 /// `okf-mcp`: an MCP server for OKF knowledge catalogs.
 // `derive(Parser)` generates the argument parser from the struct, as
@@ -70,6 +74,14 @@ pub enum Command {
     // `oauth` (an `OAuth` variant would be `o-auth`).
     #[command(subcommand)]
     Oauth(OauthCommand),
+    /// Create, list or delete users (each with a personal team).
+    #[command(subcommand)]
+    User(UserCommand),
+    /// Create, list or delete teams, and manage their members.
+    #[command(subcommand)]
+    Team(TeamCommand),
+    /// List keys, grants, sign-in codes and catalogs with no user or owner.
+    Unassigned,
     /// Import a directory or a .tar.gz into an existing catalog.
     Import {
         /// The catalog.
@@ -137,6 +149,15 @@ pub enum CatalogCommand {
     },
     /// List catalogs.
     List,
+    /// Make a team the owner of a catalog.
+    SetOwner {
+        /// The catalog.
+        name: String,
+        /// The team that owns it from now on (a user's name names that
+        /// user's personal team).
+        #[arg(long)]
+        team: String,
+    },
     /// Delete a catalog with its documents, history, pending changes and grants.
     Delete {
         /// Its name.
@@ -192,6 +213,90 @@ pub enum KeyCommand {
         actor: Option<String>,
         /// The catalog.
         catalog: String,
+    },
+    /// Give a key or OAuth grant a user (its access is unchanged).
+    Assign {
+        /// The key's or grant's id, or an unambiguous active name.
+        id: String,
+        /// Select this actor when `id` is a name.
+        #[arg(long)]
+        actor: Option<String>,
+        /// The user it belongs to (must exist).
+        #[arg(long)]
+        user: String,
+    },
+}
+
+/// `okf-mcp user ...`.
+#[derive(Debug, Subcommand)]
+pub enum UserCommand {
+    /// Create a user and its personal team of the same name.
+    Create {
+        /// Its name (`[a-z0-9-]+`); also its personal team's.
+        name: String,
+        /// Free text shown beside the name.
+        #[arg(long, default_value = "")]
+        display_name: String,
+    },
+    /// List users with their credential counts and teams.
+    List,
+    /// Delete a user nothing references, with its personal team.
+    Delete {
+        /// Its name.
+        name: String,
+    },
+}
+
+/// `okf-mcp team ...`.
+#[derive(Debug, Subcommand)]
+pub enum TeamCommand {
+    /// Create a team with its first owner.
+    Create {
+        /// Its name (`[a-z0-9-]+`, not taken by a user or team).
+        name: String,
+        /// Free text shown beside the name.
+        #[arg(long, default_value = "")]
+        display_name: String,
+        /// The user who owns it first.
+        #[arg(long)]
+        owner: String,
+    },
+    /// List teams with their members and the catalogs they own.
+    List,
+    /// Add a user to a team (or change its role if it is a member).
+    AddMember {
+        /// The team.
+        team: String,
+        /// The user.
+        user: String,
+        /// Its role.
+        // `value_enum`: clap accepts the variants' kebab-case names,
+        // `owner` and `member`.
+        #[arg(long, value_enum, default_value = "member")]
+        role: Role,
+    },
+    /// Change a member's role (adding the user if it is not a member).
+    SetRole {
+        /// The team.
+        team: String,
+        /// The member.
+        user: String,
+        /// The new role.
+        #[arg(long, value_enum)]
+        role: Role,
+    },
+    /// Remove a member (never a team's last owner, nor a user from its
+    /// personal team).
+    RemoveMember {
+        /// The team.
+        team: String,
+        /// The member.
+        user: String,
+    },
+    /// Delete a team that owns no catalog (never a personal team).
+    Delete {
+        /// Its name.
+        name: String,
     },
 }
 
@@ -254,6 +359,15 @@ pub enum CodeCommand {
         /// The code's id (from `oauth code list`).
         id: String,
     },
+    /// Give an unassigned sign-in code a user (the grant it became is
+    /// assigned with `key assign`).
+    Assign {
+        /// The code's id (from `oauth code list`).
+        id: String,
+        /// The user it belongs to (must exist).
+        #[arg(long)]
+        user: String,
+    },
 }
 
 /// `okf-mcp oauth grant ...`.
@@ -273,9 +387,9 @@ pub enum GrantCommand {
 pub struct CodeCreateArgs {
     /// A label (`[A-Za-z0-9._-]+`); the grant's name starts with it.
     pub name: String,
-    /// The actor the grant's writes are recorded as.
+    /// The actor the grant's writes are recorded as (default: the name).
     #[arg(long)]
-    pub actor: String,
+    pub actor: Option<String>,
     /// Access level: `read` or `write` (`admin` is refused).
     #[arg(long, value_enum)]
     pub access: Access,
@@ -366,6 +480,18 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
         Command::Oauth(command) => {
             let pool = connect(cli.database_url.as_deref(), &config).await?;
             run_oauth(&pool, command, &config, clock.as_ref()).await?;
+        }
+        Command::User(command) => {
+            let pool = connect(cli.database_url.as_deref(), &config).await?;
+            print!("{}", people::user(&pool, command, clock.now()).await?);
+        }
+        Command::Team(command) => {
+            let pool = connect(cli.database_url.as_deref(), &config).await?;
+            print!("{}", people::team(&pool, command, clock.now()).await?);
+        }
+        Command::Unassigned => {
+            let pool = connect(cli.database_url.as_deref(), &config).await?;
+            print!("{}", people::unassigned(&pool).await?);
         }
         Command::Import {
             catalog,
@@ -557,11 +683,11 @@ async fn run_catalog(
         }
         CatalogCommand::List => {
             for catalog in catalogs::list(pool).await? {
-                println!(
-                    "{}\tgeneration {}\t{}",
-                    catalog.name, catalog.generation, catalog.description
-                );
+                println!("{}", format_catalog(&catalog));
             }
+        }
+        CatalogCommand::SetOwner { name, team } => {
+            print!("{}", people::set_owner(pool, &name, &team).await?);
         }
         CatalogCommand::Delete { name, force } => {
             catalogs::delete(pool, &name, force).await?;
@@ -628,10 +754,68 @@ async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyho
             let resolved = keys::ungrant_target(pool, &id, actor.as_deref(), &catalog).await?;
             println!("removed {catalog} from key {resolved}");
         }
+        KeyCommand::Assign { id, actor, user } => {
+            print!(
+                "{}",
+                people::assign_key(pool, &id, actor.as_deref(), &user).await?
+            );
+        }
     }
     Ok(())
 }
 
+/// Joins one listing line's cells with tabs: the layout of every `list`
+/// subcommand, so `cut -f` can pick a column.
+///
+/// # Arguments
+/// * `cells` - the cells, in column order.
+///
+/// # Returns
+/// The line, without a newline.
+fn tab_row(cells: &[&str]) -> String {
+    cells.join("\t")
+}
+
+/// A labelled listing cell, `label value`, with `-` for no value (as in
+/// `default -`).
+///
+/// # Arguments
+/// * `label` - the column's name.
+/// * `value` - its value, if any.
+///
+/// # Returns
+/// The cell.
+fn labelled(label: &str, value: Option<&str>) -> String {
+    format!("{label} {}", value.unwrap_or("-"))
+}
+
+/// One `catalog list` line, tab-separated: name, `generation N`, `owner T`
+/// (`-` for none), then the free-text description last, since it may
+/// contain anything.
+///
+/// # Arguments
+/// * `catalog` - the catalog.
+///
+/// # Returns
+/// The line, without a newline.
+fn format_catalog(catalog: &catalogs::Catalog) -> String {
+    tab_row(&[
+        &catalog.name,
+        &format!("generation {}", catalog.generation),
+        &labelled("owner", catalog.owner_team.as_deref()),
+        &catalog.description,
+    ])
+}
+
+/// One `key list` line, tab-separated: name, actor, id, access, state,
+/// catalogs (`*` for all), `default X`, `maintenance_report B`, `user U`
+/// (`-` for none).
+///
+/// # Arguments
+/// * `key` - the key or grant.
+///
+/// # Returns
+/// The line, without a newline.
 fn format_key_record(key: &keys::KeyRecord) -> String {
     let catalogs = if key.all_catalogs {
         "*".to_string()
@@ -643,15 +827,17 @@ fn format_key_record(key: &keys::KeyRecord) -> String {
     } else {
         "active"
     };
-    format!(
-        "{}\t{}\t{}\t{}\t{state}\t{catalogs}\tdefault {}\tmaintenance_report {}",
-        key.name,
-        key.actor,
-        key.id,
+    tab_row(&[
+        &key.name,
+        &key.actor,
+        &key.id,
         key.access.as_str(),
-        key.default_catalog.as_deref().unwrap_or("-"),
-        key.maintenance_report
-    )
+        state,
+        &catalogs,
+        &labelled("default", key.default_catalog.as_deref()),
+        &format!("maintenance_report {}", key.maintenance_report),
+        &labelled("user", key.user.as_deref()),
+    ])
 }
 
 /// Runs one `okf-mcp oauth ...` subcommand. `code create` prints the code
@@ -685,7 +871,8 @@ async fn run_oauth(
                 access: args.access,
                 grants,
                 default_catalog: args.default.as_deref(),
-                actor: &args.actor,
+                // The store treats a blank actor as the code's name.
+                actor: args.actor.as_deref().unwrap_or(""),
                 expires_at,
                 user: &args.user,
             };
@@ -706,13 +893,16 @@ async fn run_oauth(
             codes::revoke(pool, &id, now).await?;
             println!("revoked sign-in code {id}");
         }
+        OauthCommand::Code(CodeCommand::Assign { id, user }) => {
+            print!("{}", people::assign_code(pool, &id, &user).await?);
+        }
         OauthCommand::Grant(GrantCommand::List) => {
             for grant in keys::list(pool).await? {
                 if grant.kind == KeyKind::OAuth {
                     println!(
-                        "{}\tclient {}",
+                        "{}\t{}",
                         format_key_record(&grant),
-                        grant.client_name.as_deref().unwrap_or("-")
+                        labelled("client", grant.client_name.as_deref())
                     );
                 }
             }
@@ -735,7 +925,8 @@ async fn run_oauth(
 }
 
 /// One `oauth code list` line, tab-separated: name, actor, id, access,
-/// state, catalogs (`*` for all), `default X`, `expires T`, `grant G`.
+/// state, catalogs (`*` for all), `default X`, `expires T`, `grant G`,
+/// `user U` (`-` for none).
 ///
 /// # Arguments
 /// * `code` - the code.
@@ -749,17 +940,18 @@ fn format_code_record(code: &SignInCodeRecord, now: chrono::DateTime<chrono::Utc
     } else {
         code.catalogs.join(",")
     };
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{catalogs}\tdefault {}\texpires {}\tgrant {}",
-        code.name,
-        code.actor,
-        code.id,
+    tab_row(&[
+        &code.name,
+        &code.actor,
+        &code.id,
         code.access.as_str(),
         code.state(now).as_str(),
-        code.default_catalog.as_deref().unwrap_or("-"),
-        format_timestamp(code.expires_at),
-        code.grant_id.as_deref().unwrap_or("-")
-    )
+        &catalogs,
+        &labelled("default", code.default_catalog.as_deref()),
+        &format!("expires {}", format_timestamp(code.expires_at)),
+        &labelled("grant", code.grant_id.as_deref()),
+        &labelled("user", code.user.as_deref()),
+    ])
 }
 
 /// Connects to the database and applies the migrations.
@@ -1130,7 +1322,7 @@ mod tests {
         );
         assert!(
             format_key_record(records.iter().find(|record| record.id == old_id).unwrap())
-                .ends_with("\tmaintenance_report false")
+                .ends_with("\tmaintenance_report false\tuser test-user")
         );
         run(
             cli(
@@ -1243,11 +1435,40 @@ mod tests {
             client_name: None,
             user: None,
         };
+        let assigned = keys::KeyRecord {
+            user: Some("alice".to_string()),
+            ..record.clone()
+        };
 
         assert_eq!(
             format_key_record(&record),
-            "claude\tclaude-code-tui\tcredential-id\twrite\tactive\tpg,work\tdefault pg\tmaintenance_report false"
+            "claude\tclaude-code-tui\tcredential-id\twrite\tactive\tpg,work\tdefault pg\t\
+             maintenance_report false\tuser -"
         );
+        assert!(format_key_record(&assigned).ends_with("\tuser alice"));
+    }
+
+    #[test]
+    fn catalog_list_columns_have_the_documented_order() {
+        let catalog = catalogs::Catalog {
+            id: 1,
+            name: "pg".to_string(),
+            description: "Notes\tand more".to_string(),
+            generation: 3,
+            created_at: chrono::Utc::now(),
+            owner_team: Some("family".to_string()),
+        };
+        let legacy = catalogs::Catalog {
+            owner_team: None,
+            description: String::new(),
+            ..catalog.clone()
+        };
+
+        assert_eq!(
+            format_catalog(&catalog),
+            "pg\tgeneration 3\towner family\tNotes\tand more"
+        );
+        assert_eq!(format_catalog(&legacy), "pg\tgeneration 3\towner -\t");
     }
 
     #[test]
@@ -1272,17 +1493,14 @@ mod tests {
             "alice",
         ])
         .unwrap();
-        let defaulted = parse(&[
-            "c", "--actor", "a", "--access", "read", "--all", "--user", "a",
-        ])
-        .unwrap();
+        let defaulted = parse(&["c", "--access", "read", "--all", "--user", "a"]).unwrap();
 
         let Some(Command::Oauth(OauthCommand::Code(CodeCommand::Create(args)))) = parsed.command
         else {
             panic!("expected oauth code create");
         };
         assert_eq!(args.name, "laptop");
-        assert_eq!(args.actor, "example-actor");
+        assert_eq!(args.actor.as_deref(), Some("example-actor"));
         assert_eq!(args.user, "alice");
         assert_eq!(args.access, Access::Write);
         assert_eq!(args.catalogs, ["main", "other"]);
@@ -1294,16 +1512,12 @@ mod tests {
             panic!("expected oauth code create");
         };
         assert!(args.all);
+        // `--actor` is optional: the store defaults it to the code's name.
+        assert_eq!(args.actor, None);
         // `default_value = "24h"` and the store's constant agree.
         assert_eq!(args.expires, codes::DEFAULT_EXPIRY);
-        // `--actor` and `--user` are required, `--expires` must parse, and
-        // `--catalogs` and `--all` exclude each other.
-        assert_eq!(
-            parse(&["c", "--access", "read", "--all", "--user", "a"])
-                .unwrap_err()
-                .kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+        // `--user` is required, `--expires` must parse, and `--catalogs`
+        // and `--all` exclude each other.
         assert_eq!(
             parse(&["c", "--actor", "a", "--access", "read", "--all"])
                 .unwrap_err()
@@ -1539,7 +1753,7 @@ mod tests {
             redeemed_at: None,
             grant_id: None,
             revoked_at: None,
-            user: None,
+            user: Some("alice".to_string()),
         };
         let redeemed = SignInCodeRecord {
             all_catalogs: true,
@@ -1547,18 +1761,19 @@ mod tests {
             default_catalog: Some("main".to_string()),
             redeemed_at: Some(at("2026-11-11T13:00:00Z")),
             grant_id: Some("grant-id".to_string()),
+            user: None,
             ..record.clone()
         };
 
         assert_eq!(
             format_code_record(&record, at("2026-11-11T12:00:00Z")),
             "laptop\texample-actor\tcode-id\tread\tlive\tmain,other\tdefault -\t\
-             expires 2026-11-12T12:00:00Z\tgrant -"
+             expires 2026-11-12T12:00:00Z\tgrant -\tuser alice"
         );
         assert_eq!(
             format_code_record(&redeemed, at("2026-11-11T14:00:00Z")),
             "laptop\texample-actor\tcode-id\tread\tredeemed\t*\tdefault main\t\
-             expires 2026-11-12T12:00:00Z\tgrant grant-id"
+             expires 2026-11-12T12:00:00Z\tgrant grant-id\tuser -"
         );
     }
 
