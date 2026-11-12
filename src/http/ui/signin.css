@@ -1,1 +1,17 @@
-/* Styles for the server-rendered sign-in pages; Task 7b adds them. */
+/* The server-rendered sign-in pages (src/http/signin.rs), layered on
+ * consent.css: the alternatives under the password form. */
+
+.signin-providers {
+    display: grid;
+    gap: 0.5rem;
+    margin-block: 1rem;
+}
+
+.signin-alt,
+.signin-passkey {
+    margin-top: 1.5rem;
+}
+
+.notice {
+    color: var(--ok);
+}

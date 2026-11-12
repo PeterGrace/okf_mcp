@@ -9,7 +9,10 @@ import { api } from './api.js';
 export async function refreshIdentity() {
     store.whoami = await api.get('/whoami');
     const me = store.whoami;
-    $('#whoami').textContent = `${me.user ? `${me.user} / ` : ''}${me.name ?? me.key_id} - ${me.access}`;
+    // A console session is its user; a key shows its user and its name.
+    $('#whoami').textContent = me.kind === 'session'
+        ? `${me.user} - ${me.access}`
+        : `${me.user ? `${me.user} / ` : ''}${me.name ?? me.key_id} - ${me.access}`;
     document.querySelectorAll('[data-need]').forEach(el => { el.hidden = !store.can(el.dataset.need); });
     if (!me.catalogs.includes(store.catalog)) {
         store.catalog = me.catalogs.includes(me.default_catalog) ? me.default_catalog : (me.catalogs[0] ?? null);

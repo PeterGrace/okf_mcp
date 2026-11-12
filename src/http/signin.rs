@@ -1,0 +1,1545 @@
+//! The server-rendered sign-in pages (spec "Signing in"): `/signin` with
+//! the password form, `/signin/forgot`, and the emailed `/account/setup`
+//! and `/account/reset` links. They use the console's CSP, so the passkey
+//! script (Task 8) and provider links (Task 9) fit, and they run no inline
+//! script. Without `public_url` only `GET /signin` exists, offering the
+//! API-key sign-in (plan Decision 18).
+//!
+//! Secrets stay out of logs: the forms and the link query have no `Debug`,
+//! and the request span records the path without its query (`http::router`),
+//! so an emailed link's token never reaches a log line.
+
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::extract::rejection::FormRejection;
+use axum::extract::{Query, State};
+use axum::http::request::Parts;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::get;
+use axum::{Form, Router};
+use serde::Deserialize;
+
+use crate::app::App;
+use crate::error::OkfError;
+use crate::http::console_session::{client_ip, cookie, start_session, COOKIE};
+use crate::http::limits::ip_key;
+use crate::http::pages::{self, escape, safe_return_to};
+use crate::http::ui::CONTENT_SECURITY_POLICY;
+use crate::http::{timeout_layer, AppError};
+use crate::mail::queue as mail_queue;
+use crate::mail::{self, Template, RESET_PATH, SETUP_PATH};
+use crate::store::email_tokens::{self, Purpose};
+use crate::store::passwords::{self, SignInOutcome};
+use crate::store::sign_in_events::{self, Method, Outcome};
+use crate::store::user_sessions;
+use crate::store::users::{self, UserAuth};
+
+/// Every refused password sign-in says this, whatever the reason (spec).
+pub const SIGN_IN_FAILED: &str = "Email or password is incorrect";
+/// An expired, used or unknown emailed link (410).
+pub const LINK_EXPIRED: &str = "This link has expired. Ask for a new one.";
+/// `/signin/forgot`'s one answer.
+pub const FORGOT_SENT: &str = "If an account exists, we sent a link.";
+/// After a reset (`/signin?notice=reset`).
+const PASSWORD_CHANGED: &str = "Your password was changed. Sign in with it.";
+/// Over the per-address limit (429).
+const TOO_MANY: &str = "Too many attempts from this address. Wait a few minutes and try again.";
+/// A form posted from another site (403).
+const CROSS_SITE: &str = "This form can only be sent from this site. Open it here and try again.";
+/// The sign-in and setup pages' passkey script (Task 8).
+pub(crate) const PASSKEY_SCRIPT: &str = "/ui/js/signin/passkey.js";
+
+/// A configured OIDC provider's button on the sign-in page (Task 9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderButton {
+    /// The provider's id (`[a-z0-9-]+`, checked at config load).
+    pub id: String,
+    /// Its button text.
+    pub label: String,
+}
+
+/// What the sign-in page offers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SignInView {
+    /// The email and password form.
+    pub password: bool,
+    /// The passkey button (Task 8).
+    pub passkey: bool,
+    /// Where to go after signing in ([`safe_return_to`]).
+    pub return_to: String,
+    /// A refusal to show.
+    pub error: Option<&'static str>,
+    /// A notice to show.
+    pub notice: Option<&'static str>,
+    /// One button per OIDC provider (Task 9).
+    pub providers: Vec<ProviderButton>,
+}
+
+/// What the setup page shows. No `Debug`: it holds the setup token.
+pub(crate) struct SetupView<'a> {
+    /// The user's name.
+    pub user: &'a str,
+    /// The setup token (a hidden field; the page is `no-store`, `no-referrer`).
+    pub token: &'a str,
+    /// Where to go after setting up.
+    pub return_to: &'a str,
+    /// A problem with the last attempt.
+    pub error: Option<&'a str>,
+    /// The passkey option (Task 8).
+    pub passkey: bool,
+}
+
+/// The login routes; without `public_url`, only the API-key sign-in page.
+///
+/// # Arguments
+/// * `app` - the shared state (its `public_url`).
+///
+/// # Returns
+/// The router, with the request timeout.
+pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
+    let router = if app.config().public_url.is_some() {
+        Router::new()
+            .route("/signin", get(sign_in_page).post(sign_in_post))
+            .route("/signin/forgot", get(forgot_page).post(forgot_post))
+            // The paths the emailed links point at (`mail::link`, Task 6).
+            .route(SETUP_PATH, get(setup_page).post(setup_post))
+            .route(RESET_PATH, get(reset_page).post(reset_post))
+    } else {
+        // The post answers 404, as every login route does here, rather
+        // than axum's 405 for a method the path lacks.
+        Router::new().route(
+            "/signin",
+            get(sign_in_page).post(|| async { StatusCode::NOT_FOUND }),
+        )
+    };
+    router.layer(timeout_layer())
+}
+
+/// Whether the pages offer a passkey (Task 8 makes this
+/// `app.passkeys().is_some()`).
+fn offers_passkeys(_app: &App) -> bool {
+    false
+}
+
+/// The OIDC provider buttons (Task 9 fills this from the registry).
+fn provider_buttons(_app: &App) -> Vec<ProviderButton> {
+    Vec::new()
+}
+
+/// What `/signin` offers on this server.
+fn sign_in_view(app: &App, return_to: String) -> SignInView {
+    let login = app.config().public_url.is_some();
+    SignInView {
+        password: login && app.settings().password_sign_in,
+        passkey: login && offers_passkeys(app),
+        return_to,
+        error: None,
+        notice: None,
+        providers: if login {
+            provider_buttons(app)
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// Whether a form post came from another site, by the browser's
+/// `Sec-Fetch-Site` header (login CSRF: another site signing the browser in
+/// as the attacker). The header is set by the browser, not by page script,
+/// and unlike `Origin` it does not turn into `null` under the pages'
+/// `Referrer-Policy: no-referrer`. A client that sends none (curl, an old
+/// browser) is let through: it is not a browser being steered.
+fn cross_site(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .is_some_and(|value| !matches!(value.as_bytes(), b"same-origin" | b"none"))
+}
+
+/// The sign-in page's body.
+///
+/// # Arguments
+/// * `view` - what to offer.
+///
+/// # Returns
+/// The HTML, every value escaped.
+pub(crate) fn sign_in_html(view: &SignInView) -> String {
+    let return_to = escape(&view.return_to);
+    let mut html = String::from("        <h1>Sign in</h1>\n");
+    if let Some(notice) = view.notice {
+        html.push_str(&format!(
+            "        <p class=\"notice\" id=\"signin-notice\" role=\"status\">{}</p>\n",
+            escape(notice)
+        ));
+    }
+    if let Some(error) = view.error {
+        html.push_str(&format!(
+            "        <p class=\"error consent-error\" id=\"signin-error\" role=\"alert\">{}</p>\n",
+            escape(error)
+        ));
+    }
+    if view.password {
+        html.push_str(&format!(
+            r#"        <form method="post" action="/signin" id="signin-form">
+            <input type="hidden" name="return_to" value="{return_to}">
+            <label>Email
+                <input type="email" name="email" id="signin-email" autocomplete="username" required>
+            </label>
+            <label>Password
+                <input type="password" name="password" id="signin-password" autocomplete="current-password" required>
+            </label>
+            <button type="submit" id="signin-submit">Sign in</button>
+        </form>
+        <p class="small"><a href="/signin/forgot" id="signin-forgot">Forgot your password?</a></p>
+"#
+        ));
+    }
+    if view.passkey {
+        html.push_str(&format!(
+            r#"        <button type="button" id="signin-passkey" class="secondary" data-return-to="{return_to}">Sign in with a passkey</button>
+        <p class="error" id="passkey-error" role="alert" hidden></p>
+"#
+        ));
+    }
+    if !view.providers.is_empty() {
+        // The query value is URL-encoded, then the whole href HTML-escaped.
+        let encoded: String = form_urlencoded::byte_serialize(view.return_to.as_bytes()).collect();
+        html.push_str("        <div class=\"signin-providers\">\n");
+        for provider in &view.providers {
+            html.push_str(&format!(
+                "            <a role=\"button\" class=\"secondary\" id=\"signin-oidc-{id}\" \
+                 href=\"/auth/oidc/{id}/start?return_to={query}\">Sign in with {label}</a>\n",
+                id = escape(&provider.id),
+                query = escape(&encoded),
+                label = escape(&provider.label),
+            ));
+        }
+        html.push_str("        </div>\n");
+    }
+    html.push_str(
+        "        <p class=\"muted signin-alt\">\
+         <a href=\"/ui/\" id=\"signin-api-key\">Use an API key instead</a></p>",
+    );
+    html
+}
+
+/// `/signin` with `status`; the passkey script only when offered.
+fn sign_in_response(status: StatusCode, view: &SignInView) -> Response {
+    let scripts: &[&str] = if view.passkey { &[PASSKEY_SCRIPT] } else { &[] };
+    pages::scripted_page(
+        status,
+        "Sign in",
+        &sign_in_html(view),
+        scripts,
+        CONTENT_SECURITY_POLICY,
+    )
+}
+
+/// A page with a heading, one message and a link back to `/signin`.
+fn message_page(status: StatusCode, title: &str, message: &str) -> Response {
+    let body = format!(
+        r#"        <h1>{title}</h1>
+        <p class="consent-error" id="signin-message" role="alert">{message}</p>
+        <p><a href="/signin">Back to sign in</a></p>"#,
+        title = escape(title),
+        message = escape(message),
+    );
+    pages::page(status, title, &body, CONTENT_SECURITY_POLICY)
+}
+
+/// `GET /signin`'s query.
+#[derive(Debug, Default, Deserialize)]
+struct SignInQuery {
+    return_to: Option<String>,
+    notice: Option<String>,
+}
+
+/// `GET /signin`.
+async fn sign_in_page(State(app): State<Arc<App>>, Query(query): Query<SignInQuery>) -> Response {
+    let mut view = sign_in_view(&app, safe_return_to(query.return_to.as_deref()));
+    // Only a known notice is shown: the page never echoes text from its URL.
+    view.notice = (query.notice.as_deref() == Some("reset")).then_some(PASSWORD_CHANGED);
+    sign_in_response(StatusCode::OK, &view)
+}
+
+/// `POST /signin`'s form. No `Debug`: it holds a password. Every field
+/// defaults to empty, so a malformed post takes the same path (and the same
+/// password check) as a wrong password.
+#[derive(Default, Deserialize)]
+struct SignInForm {
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    return_to: Option<String>,
+}
+
+/// `POST /signin`: 303 to `return_to` with the session cookie, or 401 with
+/// the one message, 429 past the per-address limit, or 403 from another
+/// site. Every 401 costs one argon2 verification (`passwords::verify` checks
+/// a dummy hash when there is no real one).
+async fn sign_in_post(
+    State(app): State<Arc<App>>,
+    parts: Parts,
+    form: Result<Form<SignInForm>, FormRejection>,
+) -> Response {
+    if !app.settings().password_sign_in {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if cross_site(&parts.headers) {
+        return message_page(StatusCode::FORBIDDEN, "Sign in", CROSS_SITE);
+    }
+    // `unwrap_or_default`: a body that is not a form is an empty form.
+    let form = form.map(|Form(form)| form).unwrap_or_default();
+    let return_to = safe_return_to(form.return_to.as_deref());
+    let ip = client_ip(&parts, &app.config().auth);
+    if !app
+        .sign_in_limits()
+        .sign_in_per_ip
+        .try_take(&ip_key(ip), Instant::now())
+    {
+        let mut view = sign_in_view(&app, return_to);
+        view.error = Some(TOO_MANY);
+        return sign_in_response(StatusCode::TOO_MANY_REQUESTS, &view);
+    }
+    let email = form.email.trim();
+    let verdict = passwords::verify(app.pool(), email, &form.password, app.clock().now()).await;
+    let outcome = match verdict {
+        Ok(SignInOutcome::Ok(user)) => {
+            return match sign_in(&app, &parts, &user, Method::Password).await {
+                Ok(headers) => (headers, Redirect::to(&return_to)).into_response(),
+                Err(error) => AppError(error).into_response(),
+            };
+        }
+        Ok(SignInOutcome::Failed) => Outcome::Failed,
+        Ok(SignInOutcome::Locked) => Outcome::Locked,
+        Err(error) => return AppError(error).into_response(),
+    };
+    // The same lookup runs for known and unknown emails, so its time says
+    // nothing; it only lets the user see their failed attempts.
+    let user_id = match users::find_by_email(app.pool(), email).await {
+        Ok(found) => found.map(|user| user.id),
+        Err(error) => return AppError(error).into_response(),
+    };
+    audit(&app, user_id.as_deref(), Method::Password, outcome, ip).await;
+    let mut view = sign_in_view(&app, return_to);
+    view.error = Some(SIGN_IN_FAILED);
+    sign_in_response(StatusCode::UNAUTHORIZED, &view)
+}
+
+/// Signs a verified user in: ends the session this browser held (rotation),
+/// starts a new one and records the event.
+///
+/// # Arguments
+/// * `app` - the shared state.
+/// * `parts` - the request (cookie, address, `User-Agent`).
+/// * `user` - the verified user.
+/// * `method` - how they proved who they are.
+///
+/// # Returns
+/// The `Set-Cookie` header to send.
+///
+/// # Errors
+/// [`OkfError::Database`]; [`OkfError::Io`] from the random source.
+pub(crate) async fn sign_in(
+    app: &App,
+    parts: &Parts,
+    user: &UserAuth,
+    method: Method,
+) -> Result<HeaderMap, OkfError> {
+    if let Some(old) = cookie(&parts.headers, COOKIE) {
+        user_sessions::revoke(app.pool(), old).await?;
+    }
+    let ip = client_ip(parts, &app.config().auth);
+    let user_agent = parts
+        .headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let (headers, _session) = start_session(app, user, ip, user_agent).await?;
+    audit(app, Some(&user.id), method, Outcome::Ok, ip).await;
+    Ok(headers)
+}
+
+/// Records a sign-in attempt as a `sign_in_events` row (which also logs an
+/// `info` line). A failure to record is logged; it never decides the
+/// sign-in.
+///
+/// # Arguments
+/// * `app` - the shared state.
+/// * `user_id` - the user, when known.
+/// * `method` - how they tried.
+/// * `outcome` - what happened.
+/// * `ip` - their address, if known.
+pub(crate) async fn audit(
+    app: &App,
+    user_id: Option<&str>,
+    method: Method,
+    outcome: Outcome,
+    ip: Option<IpAddr>,
+) {
+    let now = app.clock().now();
+    if let Err(error) = sign_in_events::record(app.pool(), user_id, method, outcome, ip, now).await
+    {
+        tracing::error!(%error, "recording a sign-in event failed");
+    }
+}
+
+/// Queues the "a sign-in method was added" notice to the user's email.
+/// A user without an email, or a failure to queue (logged), sends nothing.
+///
+/// # Arguments
+/// * `app` - the shared state.
+/// * `user` - the user.
+/// * `method` - what was added, in words ("a new password", "a passkey").
+pub(crate) async fn notify_method_added(app: &App, user: &UserAuth, method: &str) {
+    let Some(to) = user.email.as_deref() else {
+        return;
+    };
+    let template = Template::MethodAdded {
+        method: method.to_string(),
+    };
+    if let Err(error) = mail_queue::enqueue(app.pool(), to, &template, app.clock().now()).await {
+        tracing::error!(%error, user = %user.id, "queueing the sign-in method notice failed");
+    }
+}
+
+/// The forgot page's body: the form, or the one answer.
+fn forgot_html(sent: bool) -> String {
+    if sent {
+        return format!(
+            r#"        <h1>Check your email</h1>
+        <p id="forgot-sent" role="status">{}</p>
+        <p><a href="/signin">Back to sign in</a></p>"#,
+            escape(FORGOT_SENT)
+        );
+    }
+    r#"        <h1>Forgot your password?</h1>
+        <p class="muted">Enter your email address and we will send you a link to choose a new password.</p>
+        <form method="post" action="/signin/forgot" id="forgot-form">
+            <label>Email
+                <input type="email" name="email" id="forgot-email" autocomplete="username" required>
+            </label>
+            <button type="submit" id="forgot-submit">Send the link</button>
+        </form>
+        <p><a href="/signin">Back to sign in</a></p>"#
+        .to_string()
+}
+
+/// `GET /signin/forgot`.
+async fn forgot_page() -> Response {
+    pages::page(
+        StatusCode::OK,
+        "Forgot your password?",
+        &forgot_html(false),
+        CONTENT_SECURITY_POLICY,
+    )
+}
+
+/// `POST /signin/forgot`'s form. No `Debug`: an email typed here may belong
+/// to nobody, and it has no place in a log line.
+#[derive(Deserialize)]
+struct ForgotForm {
+    email: String,
+}
+
+/// `POST /signin/forgot`: always the same answer (spec), 429 only past the
+/// per-address limit, 403 from another site.
+async fn forgot_post(
+    State(app): State<Arc<App>>,
+    parts: Parts,
+    form: Result<Form<ForgotForm>, FormRejection>,
+) -> Response {
+    if cross_site(&parts.headers) {
+        return message_page(StatusCode::FORBIDDEN, "Forgot your password?", CROSS_SITE);
+    }
+    let now = Instant::now();
+    let limits = app.sign_in_limits();
+    let ip = client_ip(&parts, &app.config().auth);
+    if !limits.forgot_per_ip.try_take(&ip_key(ip), now) {
+        return message_page(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Forgot your password?",
+            TOO_MANY,
+        );
+    }
+    if let Ok(Form(form)) = form {
+        let email = form.email.trim().to_lowercase();
+        // Only a plausible address takes a limiter slot, so the per-email
+        // map holds short keys. Past the per-email limit the answer is the
+        // same, so it never says whether the address is known. The work
+        // runs after the answer for the same reason: its duration would.
+        if users::check_email(&email).is_ok() && limits.forgot_per_email.try_take(&email, now) {
+            let app = Arc::clone(&app);
+            tokio::spawn(async move {
+                if let Err(error) = send_reset(&app, &email).await {
+                    tracing::error!(%error, "sending a password reset link failed");
+                }
+            });
+        }
+    }
+    pages::page(
+        StatusCode::OK,
+        "Check your email",
+        &forgot_html(true),
+        CONTENT_SECURITY_POLICY,
+    )
+}
+
+/// Issues a reset link and queues it, when `email` names a user.
+///
+/// # Errors
+/// [`OkfError::Database`]; [`OkfError::Io`] from the random source.
+async fn send_reset(app: &App, email: &str) -> Result<(), OkfError> {
+    let Some(public_url) = app.config().public_url.as_deref() else {
+        return Ok(());
+    };
+    let Some(user) = users::find_by_email(app.pool(), email).await? else {
+        return Ok(());
+    };
+    let Some(to) = user.email.as_deref() else {
+        return Ok(());
+    };
+    let ttl = app.settings().reset_link_ttl;
+    let token =
+        email_tokens::issue(app.pool(), &user.id, Purpose::Reset, ttl, app.clock().now()).await?;
+    let link = mail::link(public_url, RESET_PATH, &token);
+    mail_queue::enqueue(app.pool(), to, &Template::Reset { link }, app.clock().now()).await?;
+    tracing::info!(user = %user.id, "password reset link queued");
+    Ok(())
+}
+
+/// A token in a link's query. No `Debug`: it holds the token.
+#[derive(Deserialize)]
+struct TokenQuery {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    return_to: Option<String>,
+}
+
+/// The answer to an emailed link that does not work: 410 for an expired,
+/// used or unknown one, else the error.
+fn link_error(error: OkfError) -> Response {
+    match error {
+        OkfError::Gone { .. } => message_page(StatusCode::GONE, "Link expired", LINK_EXPIRED),
+        other => AppError(other).into_response(),
+    }
+}
+
+/// A new password and its confirmation: equal, and within the policy.
+///
+/// # Returns
+/// `Err` with what to tell the person (never the password itself).
+fn check_new_password(password: &str, confirm: &str) -> Result<(), String> {
+    if password != confirm {
+        return Err("The two passwords do not match.".to_string());
+    }
+    match passwords::check_policy(password) {
+        Ok(()) => Ok(()),
+        Err(OkfError::LimitExceeded { reason, .. }) => Err(reason),
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+/// The error line of a form page.
+fn error_line(error: Option<&str>) -> String {
+    error.map_or_else(String::new, |message| {
+        format!(
+            "        <p class=\"error consent-error\" id=\"form-error\" role=\"alert\">{}</p>\n",
+            escape(message)
+        )
+    })
+}
+
+/// The setup page's body.
+///
+/// # Arguments
+/// * `view` - the user, token and options.
+///
+/// # Returns
+/// The HTML, every value escaped.
+pub(crate) fn setup_html(view: &SetupView<'_>) -> String {
+    let return_to = escape(view.return_to);
+    let passkey = if view.passkey {
+        format!(
+            r#"
+        <section class="signin-passkey" id="setup-passkey-section">
+            <h2>Or use a passkey</h2>
+            <label>Passkey name
+                <input type="text" id="setup-passkey-name" value="Passkey" maxlength="64">
+            </label>
+            <button type="button" id="setup-passkey" class="secondary" data-return-to="{return_to}">Register a passkey and sign in</button>
+            <p class="error" id="passkey-error" role="alert" hidden></p>
+        </section>"#
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"        <h1>Set up your account</h1>
+        <p>Welcome, <strong>{user}</strong>. Choose a password to sign in with.</p>
+{error}        <form method="post" action="/account/setup" id="setup-form">
+            <input type="hidden" name="token" value="{token}">
+            <input type="hidden" name="return_to" value="{return_to}">
+            <label>Password (at least 12 characters)
+                <input type="password" name="password" id="setup-password" autocomplete="new-password" minlength="12" required>
+            </label>
+            <label>Confirm the password
+                <input type="password" name="confirm" id="setup-confirm" autocomplete="new-password" required>
+            </label>
+            <button type="submit" id="setup-submit">Set password and sign in</button>
+        </form>{passkey}"#,
+        user = escape(view.user),
+        error = error_line(view.error),
+        token = escape(view.token),
+    )
+}
+
+/// The setup page with `status`.
+fn setup_response(status: StatusCode, view: &SetupView<'_>) -> Response {
+    let scripts: &[&str] = if view.passkey { &[PASSKEY_SCRIPT] } else { &[] };
+    pages::scripted_page(
+        status,
+        "Set up your account",
+        &setup_html(view),
+        scripts,
+        CONTENT_SECURITY_POLICY,
+    )
+}
+
+/// `GET /account/setup?token=...`.
+async fn setup_page(State(app): State<Arc<App>>, Query(query): Query<TokenQuery>) -> Response {
+    let return_to = safe_return_to(query.return_to.as_deref());
+    match email_tokens::peek(app.pool(), &query.token, Purpose::Setup, app.clock().now()).await {
+        Ok(user) => setup_response(
+            StatusCode::OK,
+            &SetupView {
+                user: &user.name,
+                token: &query.token,
+                return_to: &return_to,
+                error: None,
+                passkey: offers_passkeys(&app),
+            },
+        ),
+        Err(error) => link_error(error),
+    }
+}
+
+/// `POST /account/setup` and `/account/reset`'s form. No `Debug`: it holds
+/// the token and the passwords.
+#[derive(Deserialize)]
+struct NewPasswordForm {
+    token: String,
+    password: String,
+    confirm: String,
+    #[serde(default)]
+    return_to: Option<String>,
+}
+
+/// `POST /account/setup`: sets the password and signs in. The link is used
+/// only once the password passes, so a weak one can be retried.
+async fn setup_post(
+    State(app): State<Arc<App>>,
+    parts: Parts,
+    form: Result<Form<NewPasswordForm>, FormRejection>,
+) -> Response {
+    if cross_site(&parts.headers) {
+        return message_page(StatusCode::FORBIDDEN, "Set up your account", CROSS_SITE);
+    }
+    let Ok(Form(form)) = form else {
+        return message_page(
+            StatusCode::BAD_REQUEST,
+            "Set up your account",
+            "Open the link from your email again.",
+        );
+    };
+    let return_to = safe_return_to(form.return_to.as_deref());
+    let now = app.clock().now();
+    let user = match email_tokens::peek(app.pool(), &form.token, Purpose::Setup, now).await {
+        Ok(user) => user,
+        Err(error) => return link_error(error),
+    };
+    if let Err(problem) = check_new_password(&form.password, &form.confirm) {
+        let view = SetupView {
+            user: &user.name,
+            token: &form.token,
+            return_to: &return_to,
+            error: Some(&problem),
+            passkey: offers_passkeys(&app),
+        };
+        return setup_response(StatusCode::UNPROCESSABLE_ENTITY, &view);
+    }
+    // `redeem` marks the token used in one statement, so of two concurrent
+    // posts only one gets past here.
+    let user = match email_tokens::redeem(app.pool(), &form.token, Purpose::Setup, now).await {
+        Ok(user) => user,
+        Err(error) => return link_error(error),
+    };
+    if let Err(error) = passwords::set(app.pool(), &user.id, &form.password, now).await {
+        return AppError(error).into_response();
+    }
+    match sign_in(&app, &parts, &user, Method::Setup).await {
+        Ok(headers) => (headers, Redirect::to(&return_to)).into_response(),
+        Err(error) => AppError(error).into_response(),
+    }
+}
+
+/// The reset page's body.
+fn reset_html(token: &str, error: Option<&str>) -> String {
+    format!(
+        r#"        <h1>Choose a new password</h1>
+        <p class="muted">Every session you have open will be signed out.</p>
+{error}        <form method="post" action="/account/reset" id="reset-form">
+            <input type="hidden" name="token" value="{token}">
+            <label>New password (at least 12 characters)
+                <input type="password" name="password" id="reset-password" autocomplete="new-password" minlength="12" required>
+            </label>
+            <label>Confirm the password
+                <input type="password" name="confirm" id="reset-confirm" autocomplete="new-password" required>
+            </label>
+            <button type="submit" id="reset-submit">Change password</button>
+        </form>"#,
+        error = error_line(error),
+        token = escape(token),
+    )
+}
+
+/// The reset page with `status`.
+fn reset_response(status: StatusCode, token: &str, error: Option<&str>) -> Response {
+    pages::page(
+        status,
+        "Choose a new password",
+        &reset_html(token, error),
+        CONTENT_SECURITY_POLICY,
+    )
+}
+
+/// `GET /account/reset?token=...`.
+async fn reset_page(State(app): State<Arc<App>>, Query(query): Query<TokenQuery>) -> Response {
+    match email_tokens::peek(app.pool(), &query.token, Purpose::Reset, app.clock().now()).await {
+        Ok(_) => reset_response(StatusCode::OK, &query.token, None),
+        Err(error) => link_error(error),
+    }
+}
+
+/// `POST /account/reset`: sets the password, ends every session (spec),
+/// sends the notice and returns to `/signin`.
+async fn reset_post(
+    State(app): State<Arc<App>>,
+    parts: Parts,
+    form: Result<Form<NewPasswordForm>, FormRejection>,
+) -> Response {
+    if cross_site(&parts.headers) {
+        return message_page(StatusCode::FORBIDDEN, "Choose a new password", CROSS_SITE);
+    }
+    let Ok(Form(form)) = form else {
+        return message_page(
+            StatusCode::BAD_REQUEST,
+            "Choose a new password",
+            "Open the link from your email again.",
+        );
+    };
+    let now = app.clock().now();
+    if let Err(error) = email_tokens::peek(app.pool(), &form.token, Purpose::Reset, now).await {
+        return link_error(error);
+    }
+    if let Err(problem) = check_new_password(&form.password, &form.confirm) {
+        return reset_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &form.token,
+            Some(&problem),
+        );
+    }
+    let user = match email_tokens::redeem(app.pool(), &form.token, Purpose::Reset, now).await {
+        Ok(user) => user,
+        Err(error) => return link_error(error),
+    };
+    if let Err(error) = passwords::set(app.pool(), &user.id, &form.password, now).await {
+        return AppError(error).into_response();
+    }
+    match user_sessions::revoke_all(app.pool(), &user.id, None).await {
+        Ok(ended) => tracing::info!(user = %user.id, ended, "password reset; every session ended"),
+        Err(error) => return AppError(error).into_response(),
+    }
+    notify_method_added(&app, &user, "a new password").await;
+    Redirect::to("/signin?notice=reset").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use chrono::Utc;
+    use sqlx::PgPool;
+    use tokio_util::sync::CancellationToken;
+    // `oneshot` sends one request through a router without a socket.
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::http::api::testing::{
+        app, login_app, user_with_password, Browser, Payload, Reply, MAIN, PASSWORD,
+    };
+    use crate::http::console_session::COOKIE;
+    use crate::mcp::testing::{app_with, TestApp};
+    use crate::store::settings::{self, SettingKey};
+    use crate::store::sign_in_events::{Method, Outcome};
+
+    async fn post_sign_in(
+        browser: &mut Browser,
+        test: &TestApp,
+        email: &str,
+        password: &str,
+    ) -> Reply {
+        let form = vec![
+            ("email", email.to_string()),
+            ("password", password.to_string()),
+        ];
+        browser
+            .send(test, "POST", "/signin", Payload::Form(form))
+            .await
+    }
+
+    async fn queued_mail(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM apalis.jobs")
+            .fetch_one(pool)
+            .await
+            .expect("count the queued mail")
+    }
+
+    /// Waits (up to 10 s) for `want` queued mails: `forgot` queues after it
+    /// answers.
+    async fn wait_for_mail(pool: &PgPool, want: i64) {
+        for _ in 0..200 {
+            if queued_mail(pool).await >= want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{want} mails never queued; {} did", queued_mail(pool).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_right_password_signs_in_with_an_http_only_cookie() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let mut browser = Browser::default();
+
+        let reply = post_sign_in(&mut browser, &test, "Alice@Example.com", PASSWORD).await;
+
+        assert_eq!(reply.status, StatusCode::SEE_OTHER);
+        assert_eq!(reply.location(), "/ui/");
+        let line = reply.set_cookie(COOKIE).expect("a session cookie");
+        for attribute in [
+            "HttpOnly",
+            "SameSite=Lax",
+            "Path=/",
+            "Secure",
+            "Max-Age=604800",
+        ] {
+            assert!(line.contains(attribute), "{attribute} in {line}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cookie_is_not_secure_on_a_loopback_http_origin() {
+        let test = app_with(
+            &[("main", MAIN)],
+            Config {
+                public_url: Some("http://127.0.0.1:8080".to_string()),
+                ..Config::default()
+            },
+        )
+        .await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+
+        let reply = post_sign_in(
+            &mut Browser::default(),
+            &test,
+            "alice@example.com",
+            PASSWORD,
+        )
+        .await;
+
+        let line = reply.set_cookie(COOKIE).expect("a session cookie");
+        assert!(!line.contains("Secure"), "{line}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_refused_sign_in_answers_401_with_one_message() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        user_with_password(&test, "bob", "bob@example.com", None).await;
+        let mut browser = Browser::default();
+
+        let wrong = post_sign_in(
+            &mut browser,
+            &test,
+            "alice@example.com",
+            "not-the-password-at-all",
+        )
+        .await;
+        let unknown = post_sign_in(&mut browser, &test, "nobody@example.com", PASSWORD).await;
+        let no_password = post_sign_in(&mut browser, &test, "bob@example.com", PASSWORD).await;
+        let malformed = browser
+            .send(
+                &test,
+                "POST",
+                "/signin",
+                Payload::Form(vec![("email", "alice@example.com".to_string())]),
+            )
+            .await;
+        for _ in 0..8 {
+            post_sign_in(
+                &mut browser,
+                &test,
+                "alice@example.com",
+                "still-not-the-password",
+            )
+            .await;
+        }
+        let locked = post_sign_in(&mut browser, &test, "alice@example.com", PASSWORD).await;
+
+        for reply in [&wrong, &unknown, &no_password, &malformed, &locked] {
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+            assert!(reply.text().contains(SIGN_IN_FAILED), "{}", reply.text());
+            assert!(reply.set_cookie(COOKIE).is_none());
+        }
+        // Apart from the echoed form, the bodies are byte-for-byte alike.
+        assert_eq!(wrong.text(), unknown.text());
+        assert_eq!(wrong.text(), locked.text());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sign_in_attempts_are_recorded_for_the_user() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let mut browser = Browser::default();
+        post_sign_in(
+            &mut browser,
+            &test,
+            "alice@example.com",
+            "not-the-password-at-all",
+        )
+        .await;
+        post_sign_in(&mut browser, &test, "alice@example.com", PASSWORD).await;
+
+        let events = sign_in_events::recent(test.app.pool(), "alice", 10)
+            .await
+            .expect("events");
+
+        assert_eq!(events.len(), 2);
+        // Newest first.
+        assert!(matches!(
+            (&events[0].method, &events[0].outcome),
+            (Method::Password, Outcome::Ok)
+        ));
+        assert!(matches!(
+            (&events[1].method, &events[1].outcome),
+            (Method::Password, Outcome::Failed)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_thirty_first_attempt_from_one_address_is_429() {
+        let test = login_app().await;
+        let mut browser = Browser::default();
+        for attempt in 0..30 {
+            let reply = post_sign_in(
+                &mut browser,
+                &test,
+                "nobody@example.com",
+                "whatever-password",
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "attempt {attempt}");
+        }
+
+        let limited = post_sign_in(
+            &mut browser,
+            &test,
+            "nobody@example.com",
+            "whatever-password",
+        )
+        .await;
+
+        assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_public_url_only_the_api_key_option_exists() {
+        let test = app().await;
+        let mut browser = Browser::default();
+
+        let page = browser.send(&test, "GET", "/signin", Payload::Empty).await;
+        let post = post_sign_in(&mut browser, &test, "alice@example.com", PASSWORD).await;
+        let forgot = browser
+            .send(&test, "GET", "/signin/forgot", Payload::Empty)
+            .await;
+        let setup = browser
+            .send(&test, "GET", "/account/setup?token=x", Payload::Empty)
+            .await;
+        let reset = browser
+            .send(&test, "GET", "/account/reset?token=x", Payload::Empty)
+            .await;
+
+        assert_eq!(page.status, StatusCode::OK);
+        assert!(page.text().contains(r#"id="signin-api-key""#));
+        assert!(!page.text().contains(r#"id="signin-form""#));
+        assert_eq!(post.status, StatusCode::NOT_FOUND);
+        assert_eq!(forgot.status, StatusCode::NOT_FOUND);
+        assert_eq!(setup.status, StatusCode::NOT_FOUND);
+        assert_eq!(reset.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turning_password_sign_in_off_hides_the_form_and_refuses_the_post() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        settings::set(
+            test.app.pool(),
+            SettingKey::PasswordSignIn,
+            "false",
+            "test",
+            Utc::now(),
+        )
+        .await
+        .expect("turn passwords off");
+        test.app.poll().await.expect("poll");
+        let mut browser = Browser::default();
+
+        let page = browser.send(&test, "GET", "/signin", Payload::Empty).await;
+        let post = post_sign_in(&mut browser, &test, "alice@example.com", PASSWORD).await;
+
+        assert!(!page.text().contains(r#"id="signin-form""#));
+        assert_eq!(post.status, StatusCode::NOT_FOUND);
+        assert!(post.set_cookie(COOKIE).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn return_to_survives_sign_in_only_when_it_is_same_origin() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let sign_in_to = |return_to: &str| {
+            Payload::Form(vec![
+                ("email", "alice@example.com".to_string()),
+                ("password", PASSWORD.to_string()),
+                ("return_to", return_to.to_string()),
+            ])
+        };
+
+        let kept = Browser::default()
+            .send(&test, "POST", "/signin", sign_in_to("/ui/#/keys"))
+            .await;
+        let page = Browser::default()
+            .send(
+                &test,
+                "GET",
+                "/signin?return_to=%2Foauth%2Fauthorize%3Fx%3D1",
+                Payload::Empty,
+            )
+            .await;
+
+        assert_eq!(kept.location(), "/ui/#/keys");
+        assert!(page
+            .text()
+            .contains(r#"name="return_to" value="/oauth/authorize?x=1""#));
+        // Each value is sent as the form's text, so the `%..` ones arrive
+        // still encoded once (a double-encoded link).
+        for hostile in [
+            "https://evil.example/",
+            "//evil.example",
+            "/\\evil.example",
+            "\\\\evil.example",
+            "javascript:alert(1)",
+            "%2F%2Fevil.example",
+            "/%5Cevil.example",
+            "%2Fui%2F",
+            "/ui/\r\nSet-Cookie: x=y",
+            "https://okf.example.com.evil.example/ui/",
+        ] {
+            let dropped = Browser::default()
+                .send(&test, "POST", "/signin", sign_in_to(hostile))
+                .await;
+            assert_eq!(dropped.status, StatusCode::SEE_OTHER, "{hostile:?}");
+            assert_eq!(dropped.location(), "/ui/", "{hostile:?}");
+        }
+        // In the page's query the encoded forms are decoded once, then
+        // checked: none survives into the form.
+        for hostile in [
+            "%2F%2Fevil.example",
+            "%2F%5Cevil.example",
+            "https%3A%2F%2Fevil.example",
+            "javascript%3Aalert(1)",
+        ] {
+            let page = Browser::default()
+                .send(
+                    &test,
+                    "GET",
+                    &format!("/signin?return_to={hostile}"),
+                    Payload::Empty,
+                )
+                .await;
+            assert!(
+                page.text().contains(r#"name="return_to" value="/ui/""#),
+                "{hostile}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_form_posted_from_another_site_is_refused() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let post = |path: &str, site: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("sec-fetch-site", site)
+                .body(Body::from(body.to_string()))
+                .expect("a request")
+        };
+        let credentials = format!("email=alice%40example.com&password={PASSWORD}");
+
+        let mut statuses = Vec::new();
+        for (path, site, body) in [
+            ("/signin", "cross-site", credentials.as_str()),
+            ("/signin", "same-site", credentials.as_str()),
+            ("/signin/forgot", "cross-site", "email=alice%40example.com"),
+            (
+                "/account/setup",
+                "cross-site",
+                "token=x&password=y&confirm=y",
+            ),
+            (
+                "/account/reset",
+                "cross-site",
+                "token=x&password=y&confirm=y",
+            ),
+            ("/signin", "same-origin", credentials.as_str()),
+        ] {
+            let response = crate::http::router(Arc::clone(&test.app), &CancellationToken::new())
+                .oneshot(post(path, site, body))
+                .await
+                .expect("the router answers");
+            statuses.push(response.status());
+        }
+
+        assert_eq!(
+            statuses,
+            [
+                StatusCode::FORBIDDEN,
+                StatusCode::FORBIDDEN,
+                StatusCode::FORBIDDEN,
+                StatusCode::FORBIDDEN,
+                StatusCode::FORBIDDEN,
+                StatusCode::SEE_OTHER,
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_setup_link_sets_a_password_and_signs_in_once() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
+        let token = email_tokens::issue(
+            test.app.pool(),
+            &alice.id,
+            Purpose::Setup,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await
+        .expect("issue a setup token");
+        let mut browser = Browser::default();
+        let setup = |password: &str| {
+            Payload::Form(vec![
+                ("token", token.clone()),
+                ("password", password.to_string()),
+                ("confirm", password.to_string()),
+            ])
+        };
+
+        let page = browser
+            .send(
+                &test,
+                "GET",
+                &format!("/account/setup?token={token}"),
+                Payload::Empty,
+            )
+            .await;
+        let done = browser
+            .send(&test, "POST", "/account/setup", setup(PASSWORD))
+            .await;
+        let again = Browser::default()
+            .send(&test, "POST", "/account/setup", setup(PASSWORD))
+            .await;
+        let session = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        assert_eq!(page.status, StatusCode::OK);
+        assert!(page.text().contains(r#"id="setup-form""#));
+        assert!(page.text().contains("<strong>alice</strong>"));
+        assert_eq!(
+            page.headers["content-security-policy"],
+            CONTENT_SECURITY_POLICY
+        );
+        assert!(
+            !page.text().contains("<script"),
+            "no script without passkeys"
+        );
+        assert_eq!(done.status, StatusCode::SEE_OTHER);
+        assert_eq!(done.location(), "/ui/");
+        assert_eq!(session.json()["user"], "alice");
+        assert_eq!(again.status, StatusCode::GONE, "the link is single-use");
+        assert!(again.text().contains(LINK_EXPIRED));
+        let events = sign_in_events::recent(test.app.pool(), "alice", 5)
+            .await
+            .expect("events");
+        assert!(matches!(
+            (&events[0].method, &events[0].outcome),
+            (Method::Setup, Outcome::Ok)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_weak_or_mismatched_password_keeps_the_setup_link_usable() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
+        let token = email_tokens::issue(
+            test.app.pool(),
+            &alice.id,
+            Purpose::Setup,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await
+        .expect("issue a setup token");
+        let post = |password: &str, confirm: &str| {
+            Payload::Form(vec![
+                ("token", token.clone()),
+                ("password", password.to_string()),
+                ("confirm", confirm.to_string()),
+            ])
+        };
+
+        let short = Browser::default()
+            .send(&test, "POST", "/account/setup", post("short", "short"))
+            .await;
+        let mismatch = Browser::default()
+            .send(
+                &test,
+                "POST",
+                "/account/setup",
+                post(PASSWORD, "violet-lantern-orbit-43"),
+            )
+            .await;
+
+        assert_eq!(short.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(mismatch.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(mismatch.text().contains("do not match"));
+        assert!(
+            !mismatch.text().contains(PASSWORD),
+            "never echoes a password"
+        );
+        email_tokens::peek(test.app.pool(), &token, Purpose::Setup, Utc::now())
+            .await
+            .expect("the link still works");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_link_is_410() {
+        let test = login_app().await;
+
+        let setup = Browser::default()
+            .send(&test, "GET", "/account/setup?token=nope", Payload::Empty)
+            .await;
+        let reset = Browser::default()
+            .send(&test, "GET", "/account/reset?token=nope", Payload::Empty)
+            .await;
+
+        assert_eq!(setup.status, StatusCode::GONE);
+        assert_eq!(reset.status, StatusCode::GONE);
+        assert!(reset.text().contains(LINK_EXPIRED));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_link_is_410() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", None).await;
+        // Issued two hours ago with a one-hour lifetime.
+        let token = email_tokens::issue(
+            test.app.pool(),
+            &alice.id,
+            Purpose::Setup,
+            Duration::from_secs(3600),
+            Utc::now() - chrono::TimeDelta::hours(2),
+        )
+        .await
+        .expect("issue a setup token");
+        let form = Payload::Form(vec![
+            ("token", token.clone()),
+            ("password", PASSWORD.to_string()),
+            ("confirm", PASSWORD.to_string()),
+        ]);
+
+        let page = Browser::default()
+            .send(
+                &test,
+                "GET",
+                &format!("/account/setup?token={token}"),
+                Payload::Empty,
+            )
+            .await;
+        let post = Browser::default()
+            .send(&test, "POST", "/account/setup", form)
+            .await;
+
+        assert_eq!(page.status, StatusCode::GONE);
+        assert_eq!(post.status, StatusCode::GONE);
+        assert!(post.set_cookie(COOKIE).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgot_answers_alike_for_known_and_unknown_emails_and_mails_only_the_known() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let forgot = |email: &str| Payload::Form(vec![("email", email.to_string())]);
+
+        let unknown = Browser::default()
+            .send(
+                &test,
+                "POST",
+                "/signin/forgot",
+                forgot("nobody@example.com"),
+            )
+            .await;
+        let known = Browser::default()
+            .send(&test, "POST", "/signin/forgot", forgot("alice@example.com"))
+            .await;
+        wait_for_mail(test.app.pool(), 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(unknown.status, StatusCode::OK);
+        assert_eq!(known.status, StatusCode::OK);
+        assert_eq!(unknown.text(), known.text());
+        assert!(known.text().contains(FORGOT_SENT));
+        assert_eq!(queued_mail(test.app.pool()).await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgot_mails_at_most_three_links_per_email_an_hour() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+
+        // Letter case and spaces do not make a new address.
+        for email in [
+            "alice@example.com",
+            "Alice@Example.com",
+            " alice@example.com ",
+            "ALICE@EXAMPLE.COM",
+            "alice@example.com",
+        ] {
+            let form = Payload::Form(vec![("email", email.to_string())]);
+            let reply = Browser::default()
+                .send(&test, "POST", "/signin/forgot", form)
+                .await;
+            assert_eq!(reply.status, StatusCode::OK);
+        }
+        wait_for_mail(test.app.pool(), 3).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(queued_mail(test.app.pool()).await, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_twenty_first_forgot_from_one_address_is_429() {
+        let test = login_app().await;
+
+        for attempt in 0..20 {
+            let form = Payload::Form(vec![("email", format!("nobody{attempt}@example.com"))]);
+            let reply = Browser::default()
+                .send(&test, "POST", "/signin/forgot", form)
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "attempt {attempt}");
+        }
+        let form = Payload::Form(vec![("email", "nobody@example.com".to_string())]);
+        let limited = Browser::default()
+            .send(&test, "POST", "/signin/forgot", form)
+            .await;
+
+        assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_link_changes_the_password_and_ends_every_session() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let mut first = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let mut second = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let token = email_tokens::issue(
+            test.app.pool(),
+            &alice.id,
+            Purpose::Reset,
+            Duration::from_secs(3600),
+            Utc::now(),
+        )
+        .await
+        .expect("issue a reset token");
+        let new_password = "amber-quarry-signal-77";
+        let form = || {
+            Payload::Form(vec![
+                ("token", token.clone()),
+                ("password", new_password.to_string()),
+                ("confirm", new_password.to_string()),
+            ])
+        };
+
+        let page = Browser::default()
+            .send(
+                &test,
+                "GET",
+                &format!("/account/reset?token={token}"),
+                Payload::Empty,
+            )
+            .await;
+        let done = Browser::default()
+            .send(&test, "POST", "/account/reset", form())
+            .await;
+        let again = Browser::default()
+            .send(&test, "POST", "/account/reset", form())
+            .await;
+
+        assert!(page.text().contains(r#"id="reset-form""#));
+        assert_eq!(done.status, StatusCode::SEE_OTHER);
+        assert_eq!(done.location(), "/signin?notice=reset");
+        assert_eq!(again.status, StatusCode::GONE, "the link is single-use");
+        for browser in [&mut first, &mut second] {
+            let reply = browser
+                .send(&test, "GET", "/api/v1/session", Payload::Empty)
+                .await;
+            assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+        }
+        let old = post_sign_in(
+            &mut Browser::default(),
+            &test,
+            "alice@example.com",
+            PASSWORD,
+        )
+        .await;
+        let new = post_sign_in(
+            &mut Browser::default(),
+            &test,
+            "alice@example.com",
+            new_password,
+        )
+        .await;
+        assert_eq!(old.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(new.status, StatusCode::SEE_OTHER);
+        // The "a new password" notice went to alice.
+        assert_eq!(queued_mail(test.app.pool()).await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signing_in_again_ends_the_previous_session() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let mut browser = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let first = browser.cookie(COOKIE).expect("a session").to_string();
+
+        let again = browser
+            .send(
+                &test,
+                "POST",
+                "/signin",
+                Payload::Form(vec![
+                    ("email", "alice@example.com".to_string()),
+                    ("password", PASSWORD.to_string()),
+                ]),
+            )
+            .await;
+        let mut old = Browser::with_cookie(COOKIE, &first);
+        let old_reply = old
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+        let new_reply = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+
+        assert_eq!(again.status, StatusCode::SEE_OTHER);
+        assert_ne!(
+            browser.cookie(COOKIE),
+            Some(first.as_str()),
+            "a new id at sign-in"
+        );
+        assert_eq!(old_reply.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(new_reply.status, StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pages_carry_the_console_policy_and_load_no_script() {
+        let test = login_app().await;
+
+        for path in ["/signin", "/signin/forgot", "/account/reset?token=nope"] {
+            let reply = Browser::default()
+                .send(&test, "GET", path, Payload::Empty)
+                .await;
+            assert_eq!(
+                reply.headers["content-security-policy"], CONTENT_SECURITY_POLICY,
+                "{path}"
+            );
+            assert_eq!(reply.headers["referrer-policy"], "no-referrer", "{path}");
+            assert_eq!(reply.headers["cache-control"], "no-store", "{path}");
+            assert!(!reply.text().contains("<script"), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_sign_in_page_renders_every_option_it_is_given() {
+        let view = SignInView {
+            password: true,
+            passkey: true,
+            return_to: "/ui/#/keys".to_string(),
+            error: Some(SIGN_IN_FAILED),
+            notice: None,
+            providers: vec![ProviderButton {
+                id: "example".to_string(),
+                label: "Example <ID>".to_string(),
+            }],
+        };
+
+        let html = sign_in_html(&view);
+
+        assert!(html.contains(r#"id="signin-form""#));
+        assert!(
+            html.contains(r#"id="signin-passkey" class="secondary" data-return-to="/ui/#/keys""#)
+        );
+        assert!(html.contains(r#"href="/auth/oidc/example/start?return_to=%2Fui%2F%23%2Fkeys""#));
+        assert!(html.contains("Sign in with Example &lt;ID&gt;"));
+        assert!(html.contains(SIGN_IN_FAILED));
+        assert!(html.contains(r#"id="signin-api-key""#));
+    }
+
+    #[test]
+    fn only_a_browser_saying_another_site_is_cross_site() {
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-site", value.parse().expect("a header value"));
+            headers
+        };
+
+        assert!(!cross_site(&HeaderMap::new()));
+        assert!(!cross_site(&with("same-origin")));
+        assert!(!cross_site(&with("none")));
+        assert!(cross_site(&with("same-site")));
+        assert!(cross_site(&with("cross-site")));
+    }
+}

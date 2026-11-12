@@ -10756,6 +10756,17 @@ Builds on Task 7a's pages, limits, `start_session`, `Browser` and `/api/v1/sessi
 
 > **Corrected (issue #315, 2026-11-12).** Task 7a marked `safe_return_to`, `is_safe_return_to` and `DEFAULT_RETURN_TO` in `src/http/pages.rs` with `#[cfg_attr(not(test), expect(dead_code, ...))]`; delete those three attributes when `signin.rs` starts calling them, or `just lint` fails on the unmet expectation. `ip_key` groups IPv6 addresses by /64, so tests that need two separate address buckets should use IPv4 addresses.
 
+> **Corrected (issue #316, 2026-11-12).** What shipped differs from the code below in these ways; `src/http/signin.rs` and `tests/ui_e2e/signin.rs` are authoritative.
+> - `SignInForm`'s fields all default to empty (`#[serde(default)]`, `Default`), so a malformed `POST /signin` takes the normal path: one argon2 check (the dummy hash) and the same 401 as a wrong password, not a 400.
+> - `audit` only calls `sign_in_events::record`, which already writes the `info` line; the plan's second `tracing::info!` is gone.
+> - Every POST (`/signin`, `/signin/forgot`, `/account/setup`, `/account/reset`) answers 403 when the browser's `Sec-Fetch-Site` is neither `same-origin` nor `none` (login CSRF). `Origin` cannot be used: under the pages' `Referrer-Policy: no-referrer` browsers send `Origin: null` even for same-origin form posts. A request without the header (curl, the `oneshot` tests) is let through. So `reset_post` also takes `parts: Parts`.
+> - `/signin/forgot` takes a per-email limiter slot only for an address `users::check_email` accepts, so that map holds short keys; the answer is the same either way.
+> - Without `public_url`, `POST /signin` answers 404 (an explicit handler), not axum's 405.
+> - `http::router`'s trace span (`request_span`) records the method and the path, not the URI: `DefaultMakeSpan` logged `?token=...` of every emailed link.
+> - The console's 403 toast reads "Your account cannot do this." for a session (no stored key).
+> - `Ui::sign_in_password` also waits for `#whoami` to show an identity (`" - "`), not only for `#app` to be visible. `tests/ui_e2e/signin.rs` has a `server()` helper and a second journey (a refused password, then a session that survives a reload, via `TestServer::user_with_password`).
+> - Extra unit tests: hostile `return_to` values (`//evil.example`, `/\evil.example`, `javascript:`, encoded forms), the cross-site refusal, an expired link, the per-address forgot limit, and the pages' CSP with no script.
+
 - [ ] **Step 1: Write the failing tests.** `src/http/signin.rs` tests (the session cookie's attributes, rotation at sign-in, the limits, the links):
 
 ```rust
@@ -21541,7 +21552,7 @@ Every page renders through `h()` and `fill()`, never `innerHTML`, never inline s
 
 Helpers from Task 7b that the journeys use (do not redefine them):
 - `TestServer::user_with_password(&self, name: &str, email: &str, password: &str) -> String` (`tests/support/server.rs`): creates the user, sets its email and password, polls, and returns the user's id.
-- `Ui::sign_in_password(&self, email: &str, password: &str)` (`tests/ui_e2e/harness.rs`): opens `{base}/signin`, fills the password form, submits it and waits for `#app`.
+- `Ui::sign_in_password(&self, email: &str, password: &str)` (`tests/ui_e2e/harness.rs`): opens `{base}/signin`, fills the password form, submits it and waits for `#app` and for `#whoami` to show the identity.
 
 - [ ] **Step 1: Add the harness helper and the shared journey fixtures.**
 

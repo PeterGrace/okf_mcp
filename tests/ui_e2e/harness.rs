@@ -75,6 +75,21 @@ impl Ui {
         self.wait_visible("#app");
     }
 
+    /// Signs in on `/signin` with an email and password, and waits for the
+    /// console to show who is signed in (its content, not only the shell:
+    /// the shell is visible before `whoami` answers).
+    pub fn sign_in_password(&self, email: &str, password: &str) {
+        self.page
+            .goto(&format!("{}/signin", self.base), GotoOptions::default())
+            .expect("open the sign-in page");
+        self.fill("#signin-email", email);
+        self.fill("#signin-password", password);
+        self.click("#signin-submit");
+        self.wait_visible("#app");
+        // `#whoami` reads "<user> - <level>" once the identity is loaded.
+        self.wait_text("#whoami", " - ");
+    }
+
     fn poll(&self, what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + WAIT;
         while Instant::now() < deadline {

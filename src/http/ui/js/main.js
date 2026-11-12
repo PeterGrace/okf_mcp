@@ -53,9 +53,11 @@ async function enterOrRecover() {
 }
 
 setUnauthorizedHandler(() => {
+    const hadKey = !!store.key;
     store.key = null;
     store.whoami = null;
-    showLogin('The key was refused. Sign in again.');
+    store.csrf = null;
+    showLogin(hadKey ? 'The key was refused. Sign in again.' : 'Your session ended. Sign in again.');
 });
 
 $('#login-form').addEventListener('submit', async event => {
@@ -71,9 +73,14 @@ $('#login-form').addEventListener('submit', async event => {
     event.target.reset();
     await enterOrRecover();
 });
-$('#signout').addEventListener('click', () => {
+$('#signout').addEventListener('click', async () => {
+    // A console session ends on the server; a pasted key only in this browser.
+    if (!store.key && store.csrf) {
+        try { await api.del('/session', { quiet: true }); } catch { /* already over */ }
+    }
     store.key = null;
     store.whoami = null;
+    store.csrf = null;
     history.replaceState(null, '', '/ui/');
     showLogin();
 });
@@ -90,6 +97,17 @@ $('#catalog-select').addEventListener('change', event => {
 $('#drawer-scrim').addEventListener('click', closeDrawer);
 addEventListener('keydown', event => { if (event.key === 'Escape') closeDrawer(); });
 
+// Without a stored key, a console session (its cookie) may still be live:
+// ask before showing the card. A plain fetch, so a 401 here is not "the key
+// was refused".
+async function resumeSession() {
+    let response;
+    try { response = await fetch('/api/v1/session'); } catch { showLogin(); return; }
+    if (!response.ok) { showLogin(); return; }
+    store.csrf = (await response.json()).csrf;
+    await enterOrRecover();
+}
+
 applyTheme(store.theme);
 if (store.key) enterOrRecover();
-else showLogin();
+else resumeSession();

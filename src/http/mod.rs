@@ -11,6 +11,7 @@ pub mod console_session;
 pub mod limits;
 pub(crate) mod pages;
 pub mod sessions;
+pub mod signin;
 mod ui;
 
 use std::net::SocketAddr;
@@ -29,7 +30,7 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 use crate::app::App;
@@ -244,6 +245,7 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
         Router::new().merge(health)
     };
     open.merge(ui::routes())
+        .merge(signin::routes(&app))
         // The API applies `require_principal` (a bearer credential or a
         // console session cookie) itself, inside its header layer, so even
         // its 401 carries `no-store` and `nosniff`. MCP and the archive
@@ -251,15 +253,33 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
         .nest("/api/v1", api::routes(&app))
         .merge(keyed)
         // One `info` line per response (status, latency) in a span naming the
-        // method and URI. The default span records no headers, so a bearer key
-        // never reaches the log.
+        // method and path. The span records no headers, so a bearer key never
+        // reaches the log, and no query, so neither does an emailed link's
+        // token (`/account/setup?token=...`) or an OAuth code.
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .make_span_with(request_span)
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
         // Hands `app` to every handler that asks for `State<Arc<App>>`.
         .with_state(app)
+}
+
+/// The request span: method, path and HTTP version, without the query
+/// (which can carry a single-use token) and without any header.
+///
+/// # Arguments
+/// * `request` - the incoming request.
+///
+/// # Returns
+/// An `info` span named `request`.
+fn request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
+    tracing::info_span!(
+        "request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        version = ?request.version(),
+    )
 }
 
 /// Serves until `shutdown` is cancelled, running the poll loop, the clock
