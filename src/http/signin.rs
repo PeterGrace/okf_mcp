@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 use crate::app::App;
 use crate::error::OkfError;
-use crate::http::console_session::{client_ip, cookie, start_session, COOKIE};
+use crate::http::console_session::{client_ip, cookie, start_session_with, COOKIE};
 use crate::http::limits::ip_key;
 use crate::http::pages::{self, escape, safe_return_to};
 use crate::http::ui::CONTENT_SECURITY_POLICY;
@@ -32,7 +32,7 @@ use crate::http::{timeout_layer, AppError};
 use crate::mail::queue as mail_queue;
 use crate::mail::{self, Template, RESET_PATH, SETUP_PATH};
 use crate::store::email_tokens::{self, Purpose};
-use crate::store::passwords::{self, SignInOutcome};
+use crate::store::passwords::{self, PasswordStamp, SignInOutcome};
 use crate::store::sign_in_events::{self, Method, Outcome};
 use crate::store::user_sessions;
 use crate::store::users::{self, UserAuth};
@@ -308,9 +308,32 @@ async fn sign_in_post(
     let email = form.email.trim();
     let verdict = passwords::verify(app.pool(), email, &form.password, app.clock().now()).await;
     let outcome = match verdict {
-        Ok(SignInOutcome::Ok(user)) => {
-            return match sign_in(&app, &parts, &user, Method::Password).await {
+        Ok(SignInOutcome::Ok(verified)) => {
+            let started = begin(
+                &app,
+                &parts,
+                &verified.user,
+                Method::Password,
+                Some(&verified.stamp),
+            )
+            .await;
+            return match started {
                 Ok(headers) => (headers, Redirect::to(&return_to)).into_response(),
+                // A reset replaced the password after it was checked: the
+                // same answer as a wrong password (recorded as failed).
+                Err(OkfError::Unauthenticated { .. }) => {
+                    audit(
+                        &app,
+                        Some(&verified.user.id),
+                        Method::Password,
+                        Outcome::Failed,
+                        ip,
+                    )
+                    .await;
+                    let mut view = sign_in_view(&app, return_to);
+                    view.error = Some(SIGN_IN_FAILED);
+                    sign_in_response(StatusCode::UNAUTHORIZED, &view)
+                }
                 Err(error) => AppError(error).into_response(),
             };
         }
@@ -350,6 +373,22 @@ pub(crate) async fn sign_in(
     user: &UserAuth,
     method: Method,
 ) -> Result<HeaderMap, OkfError> {
+    begin(app, parts, user, method, None).await
+}
+
+/// [`sign_in`], with the password hash a password sign-in matched, so the
+/// session is refused if a reset replaced it meanwhile.
+///
+/// # Errors
+/// As [`sign_in`], and [`OkfError::Unauthenticated`] when the password (or
+/// the user) changed after the check.
+async fn begin(
+    app: &App,
+    parts: &Parts,
+    user: &UserAuth,
+    method: Method,
+    password: Option<&PasswordStamp>,
+) -> Result<HeaderMap, OkfError> {
     if let Some(old) = cookie(&parts.headers, COOKIE) {
         user_sessions::revoke(app.pool(), old).await?;
     }
@@ -359,7 +398,7 @@ pub(crate) async fn sign_in(
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    let (headers, _session) = start_session(app, user, ip, user_agent).await?;
+    let (headers, _session) = start_session_with(app, user, password, ip, user_agent).await?;
     audit(app, Some(&user.id), method, Outcome::Ok, ip).await;
     Ok(headers)
 }
@@ -758,21 +797,12 @@ async fn reset_post(
         Ok(user) => user,
         Err(error) => return link_error(error),
     };
-    // Sessions end before the password changes, so a failure further on
-    // never leaves the old sessions alive with the link already used. They
-    // end again afterwards: a sign-in with the old password between the
-    // two statements must not survive the reset either.
-    let mut ended = match user_sessions::revoke_all(app.pool(), &user.id, None).await {
+    // One transaction: the password changes and every session ends, and a
+    // password sign-in racing it cannot add one (`passwords::reset`).
+    let ended = match passwords::reset(app.pool(), &user.id, &form.password, now).await {
         Ok(ended) => ended,
         Err(error) => return AppError(error).into_response(),
     };
-    if let Err(error) = passwords::set(app.pool(), &user.id, &form.password, now).await {
-        return AppError(error).into_response();
-    }
-    match user_sessions::revoke_all(app.pool(), &user.id, None).await {
-        Ok(late) => ended += late,
-        Err(error) => return AppError(error).into_response(),
-    }
     tracing::info!(user = %user.id, ended, "password reset; every session ended");
     notify_method_added(&app, &user, "a new password").await;
     Redirect::to("/signin?notice=reset").into_response()
@@ -1488,6 +1518,127 @@ mod tests {
         assert_eq!(new.status, StatusCode::SEE_OTHER);
         // The "a new password" notice went to alice.
         assert_eq!(queued_mail(test.app.pool()).await, 1);
+    }
+
+    /// Alice's sessions in the database, live or not.
+    async fn sessions_of(pool: &PgPool, user_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM user_sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("count the sessions")
+    }
+
+    /// Waits (up to 10 s) until `want` backends of this database wait on a
+    /// lock.
+    async fn wait_for_lock_waiters(pool: &PgPool, want: i64) {
+        for _ in 0..200 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("count the lock waiters");
+            if waiting >= want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{want} backends never waited on a lock");
+    }
+
+    /// The password alice signs in with, checked: what `POST /signin`
+    /// holds between the check and the session insert.
+    async fn verified(test: &TestApp, password: &str) -> passwords::Verified {
+        match passwords::verify(test.app.pool(), "alice@example.com", password, Utc::now()).await {
+            Ok(SignInOutcome::Ok(verified)) => verified,
+            other => panic!("the password was refused: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sign_in_checked_before_a_reset_gets_no_session_after_it() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let checked = verified(&test, PASSWORD).await;
+        let pool = test.app.pool();
+
+        // The reset commits between the password check and the insert.
+        passwords::reset(pool, &checked.user.id, "amber-quarry-signal-77", Utc::now())
+            .await
+            .expect("reset");
+        let late =
+            start_session_with(&test.app, &checked.user, Some(&checked.stamp), None, "").await;
+
+        assert!(
+            matches!(late, Err(OkfError::Unauthenticated { .. })),
+            "{:?}",
+            late.map(|_| ())
+        );
+        assert_eq!(sessions_of(pool, &checked.user.id).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sign_in_waiting_on_a_reset_in_progress_gets_no_session() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let checked = verified(&test, PASSWORD).await;
+        let pool = test.app.pool().clone();
+        // Hold alice's row, so the reset and then the insert queue up behind
+        // it in that order, whatever the scheduler does.
+        let mut holder = pool.begin().await.expect("begin");
+        sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
+            .bind(&checked.user.id)
+            .execute(&mut *holder)
+            .await
+            .expect("hold the row");
+        // `tokio::spawn` runs each future on its own task, like
+        // `asyncio.create_task`; `move` hands it owned copies.
+        let reset = tokio::spawn({
+            let pool = pool.clone();
+            let user_id = checked.user.id.clone();
+            async move { passwords::reset(&pool, &user_id, "amber-quarry-signal-77", Utc::now()).await }
+        });
+        wait_for_lock_waiters(&pool, 1).await;
+        let insert = tokio::spawn({
+            let app = Arc::clone(&test.app);
+            let checked = checked.clone();
+            async move {
+                start_session_with(&app, &checked.user, Some(&checked.stamp), None, "")
+                    .await
+                    .map(|_| ())
+            }
+        });
+        wait_for_lock_waiters(&pool, 2).await;
+
+        holder.commit().await.expect("release the row");
+        reset.await.expect("the reset task").expect("reset");
+        let late = insert.await.expect("the insert task");
+
+        assert!(
+            matches!(late, Err(OkfError::Unauthenticated { .. })),
+            "{late:?}"
+        );
+        assert_eq!(sessions_of(&pool, &checked.user.id).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_inserted_before_a_reset_is_ended_by_it() {
+        let test = login_app().await;
+        user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let checked = verified(&test, PASSWORD).await;
+        let pool = test.app.pool();
+        start_session_with(&test.app, &checked.user, Some(&checked.stamp), None, "")
+            .await
+            .expect("the session starts while the password is current");
+
+        let ended = passwords::reset(pool, &checked.user.id, "amber-quarry-signal-77", Utc::now())
+            .await
+            .expect("reset");
+
+        assert_eq!(ended, 1);
+        assert_eq!(sessions_of(pool, &checked.user.id).await, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

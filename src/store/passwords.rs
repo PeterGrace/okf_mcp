@@ -24,7 +24,7 @@ use std::sync::LazyLock;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::{Argon2, PasswordHash};
 use chrono::{DateTime, TimeDelta, Utc};
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 
 use crate::error::OkfError;
 use crate::store::users::{user_auth_columns, UserAuth};
@@ -63,12 +63,45 @@ static COMMON: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 const DUMMY_HASH: &str =
     "$argon2id$v=19$m=19456,t=2,p=1$NB4HZTkJ899VClQMrRFf1A$AD++Ro8hQJ2TjI7miH3beMHlHNF6h4497/Tz+IIY5FM";
 
+/// Which password a sign-in proved: the stored hash it was checked
+/// against. A console session started from it is inserted only while the
+/// user still has that hash (`user_sessions::start`), so a sign-in that
+/// verified a password a reset has since replaced never gets a session.
+/// A new password always has a new hash (a fresh salt), even when the
+/// text is the same. `Debug` is redacted: the hash is never logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PasswordStamp(String);
+
+impl PasswordStamp {
+    /// The stored PHC string, for the session insert's comparison.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+// Hand-written (Python's `__repr__`), so `{:?}` never prints the hash.
+impl std::fmt::Debug for PasswordStamp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PasswordStamp(<redacted>)")
+    }
+}
+
+/// A password that matched: the user and the [`PasswordStamp`] it matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    /// The user.
+    pub user: UserAuth,
+    /// The hash the password matched, for a session start that must not
+    /// outlive a password change.
+    pub stamp: PasswordStamp,
+}
+
 /// The outcome of a password sign-in. Every non-`Ok` outcome answers the
 /// same 401 to the client; the difference is for the audit log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignInOutcome {
     /// The password matched an unlocked account.
-    Ok(UserAuth),
+    Ok(Verified),
     /// Unknown email, no password set, or a wrong password.
     Failed,
     /// The account is locked (or this failure locked it).
@@ -298,7 +331,10 @@ async fn record_success(
     .fetch_optional(pool)
     .await?;
     Ok(match locked {
-        Some(false) => SignInOutcome::Ok(user),
+        Some(false) => SignInOutcome::Ok(Verified {
+            user,
+            stamp: PasswordStamp(stored.to_string()),
+        }),
         Some(true) => SignInOutcome::Locked,
         None => SignInOutcome::Failed,
     })
@@ -349,7 +385,7 @@ async fn record_failure(
 
 /// Sets a user's password (after the policy), records when, and clears the
 /// lockout counters. Revoking other sessions is the caller's choice (spec
-/// "Revocation").
+/// "Revocation"); [`reset`] ends them all in the same transaction.
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -366,21 +402,76 @@ pub async fn set(
     password: &str,
     now: DateTime<Utc>,
 ) -> Result<(), OkfError> {
+    let hashed = policy_hash(password).await?;
+    write_hash(pool, user_id, &hashed, now).await
+}
+
+/// Sets a user's password and ends every console session they have, in one
+/// transaction (a reset link, spec "Revocation").
+///
+/// The `UPDATE` takes the user's row lock before the sessions are deleted,
+/// and a password sign-in inserts its session only while holding a share
+/// lock on that row with the hash it verified (`user_sessions::start`). So
+/// the two serialize: a session inserted first is deleted here, and one
+/// inserted after finds the hash changed and is refused. No old-password
+/// session outlives the reset.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `user_id` - a `users.id`.
+/// * `password` - the new password.
+/// * `now` - when (server clock).
+///
+/// # Returns
+/// How many sessions ended.
+///
+/// # Errors
+/// As [`set`].
+pub async fn reset(
+    pool: &PgPool,
+    user_id: &str,
+    password: &str,
+    now: DateTime<Utc>,
+) -> Result<u64, OkfError> {
+    let hashed = policy_hash(password).await?;
+    let mut tx = pool.begin().await?;
+    write_hash(&mut *tx, user_id, &hashed, now).await?;
+    let ended = crate::store::user_sessions::revoke_all(&mut *tx, user_id, None).await?;
+    tx.commit().await?;
+    Ok(ended)
+}
+
+/// [`check_policy`], then [`hash`] on tokio's blocking pool.
+async fn policy_hash(password: &str) -> Result<String, OkfError> {
     check_policy(password)?;
     let owned = password.to_string();
     // The first `?` is the task's (did it run?), the second `hash`'s own.
-    let hashed = tokio::task::spawn_blocking(move || hash(&owned))
+    tokio::task::spawn_blocking(move || hash(&owned))
         .await
-        .map_err(hasher_error)??;
+        .map_err(hasher_error)?
+}
+
+/// Stores a new hash, records when, and clears the lockout counters.
+///
+/// # Errors
+/// [`OkfError::UnknownName`] for an unknown id; [`OkfError::Database`].
+// `impl PgExecutor<'_>`: a `&PgPool` or a transaction's `&mut PgConnection`,
+// like a Python function that takes either a pool or a cursor.
+async fn write_hash(
+    executor: impl PgExecutor<'_>,
+    user_id: &str,
+    hashed: &str,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
     let updated = sqlx::query(
         "UPDATE users SET password_hash = $2, password_changed_at = $3, \
                           failed_sign_ins = 0, locked_until = NULL \
          WHERE id = $1",
     )
     .bind(user_id)
-    .bind(&hashed)
+    .bind(hashed)
     .bind(now)
-    .execute(pool)
+    .execute(executor)
     .await?
     .rows_affected();
     if updated == 0 {
@@ -508,7 +599,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, SignInOutcome::Ok(alice));
+        assert!(matches!(outcome, SignInOutcome::Ok(ref verified) if verified.user == alice));
         let changed: Option<DateTime<Utc>> =
             sqlx::query_scalar("SELECT password_changed_at FROM users WHERE name = 'alice'")
                 .fetch_one(&db.pool)
@@ -553,7 +644,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(right, SignInOutcome::Ok(ref user) if user.id == alice.id));
+        assert!(matches!(right, SignInOutcome::Ok(ref verified) if verified.user.id == alice.id));
         assert_eq!(wrong, SignInOutcome::Failed);
         assert_eq!(unknown, SignInOutcome::Failed);
     }
@@ -594,7 +685,7 @@ mod tests {
         assert_eq!(while_locked, SignInOutcome::Locked);
         assert_eq!(by_id_while_locked, SignInOutcome::Locked);
         assert_eq!(still_locked, SignInOutcome::Locked);
-        assert_eq!(unlocked, SignInOutcome::Ok(alice));
+        assert!(matches!(unlocked, SignInOutcome::Ok(ref verified) if verified.user == alice));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -746,11 +837,9 @@ mod tests {
             unknown,
             Err(OkfError::UnknownName { noun: "user", .. })
         ));
-        assert_eq!(
-            verify(&db.pool, "alice@example.com", GOOD, now())
-                .await
-                .unwrap(),
-            SignInOutcome::Ok(alice)
-        );
+        let outcome = verify(&db.pool, "alice@example.com", GOOD, now())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SignInOutcome::Ok(ref verified) if verified.user == alice));
     }
 }

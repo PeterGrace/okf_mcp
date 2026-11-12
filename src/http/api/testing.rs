@@ -436,7 +436,7 @@ impl Browser {
         let outcome = passwords::verify(test.app.pool(), email, password, Utc::now())
             .await
             .expect("check the password");
-        let passwords::SignInOutcome::Ok(user) = outcome else {
+        let passwords::SignInOutcome::Ok(passwords::Verified { user, .. }) = outcome else {
             panic!("the password for {email} was refused");
         };
         Self::for_user(test, &user).await

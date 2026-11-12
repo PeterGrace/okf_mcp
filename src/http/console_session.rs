@@ -27,7 +27,8 @@ use crate::config::AuthConfig;
 use crate::error::OkfError;
 use crate::http::AppError;
 use crate::store::ceiling;
-use crate::store::user_sessions::{self, NewSession};
+use crate::store::passwords::PasswordStamp;
+use crate::store::user_sessions::{self, NewSession, SessionStart};
 use crate::store::users::{self, UserAuth};
 
 /// The session cookie (plan Decision 9).
@@ -381,23 +382,52 @@ pub async fn require_principal(
 ///
 /// # Errors
 /// [`OkfError::Database`]; [`OkfError::Io`] if the random source fails;
-/// [`OkfError::LimitExceeded`] for an absolute lifetime past the calendar.
+/// [`OkfError::LimitExceeded`] for an absolute lifetime past the calendar;
+/// [`OkfError::Unauthenticated`] once the user is gone.
 pub async fn start_session(
     app: &App,
     user: &UserAuth,
     ip: Option<IpAddr>,
     user_agent: &str,
 ) -> Result<(HeaderMap, NewSession), OkfError> {
+    start_session_with(app, user, None, ip, user_agent).await
+}
+
+/// [`start_session`], for a password sign-in: the session is refused if the
+/// user's password changed after `password` was checked (a reset racing
+/// the sign-in; `user_sessions::start`).
+///
+/// # Arguments
+/// * `app` - the shared state.
+/// * `user` - the user who signed in.
+/// * `password` - the hash their password matched, or `None` for the
+///   other sign-in methods.
+/// * `ip` - their address, if known.
+/// * `user_agent` - their `User-Agent`.
+///
+/// # Returns
+/// The `Set-Cookie` header and the new session.
+///
+/// # Errors
+/// As [`start_session`], and [`OkfError::Unauthenticated`] when the user
+/// is gone or the password changed meanwhile.
+pub async fn start_session_with(
+    app: &App,
+    user: &UserAuth,
+    password: Option<&PasswordStamp>,
+    ip: Option<IpAddr>,
+    user_agent: &str,
+) -> Result<(HeaderMap, NewSession), OkfError> {
     let absolute = app.settings().console_session_absolute;
-    let session = user_sessions::create(
-        app.pool(),
-        &user.id,
+    let request = SessionStart {
+        user_id: &user.id,
         ip,
         user_agent,
         absolute,
-        app.clock().now(),
-    )
-    .await?;
+        now: app.clock().now(),
+        password,
+    };
+    let session = user_sessions::start(app.pool(), &request).await?;
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
@@ -735,7 +765,7 @@ mod http_tests {
             .await
             .expect("set admin");
         test.app.poll().await.expect("poll");
-        let passwords::SignInOutcome::Ok(checked) =
+        let passwords::SignInOutcome::Ok(passwords::Verified { user: checked, .. }) =
             passwords::verify(test.app.pool(), "alice@example.com", PASSWORD, Utc::now())
                 .await
                 .expect("check the password")
