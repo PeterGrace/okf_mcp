@@ -20,6 +20,7 @@ use crate::clock::format_timestamp;
 use crate::error::OkfError;
 use crate::http::{archives, AppError};
 use crate::store::catalogs as catalog_rows;
+use crate::store::ceiling::{self, MemberAccess};
 use crate::store::keys::Access;
 
 /// This area's routes.
@@ -39,6 +40,10 @@ pub(crate) fn routes(app: &App) -> Router<Arc<App>> {
             patch(update_catalog).delete(delete_catalog),
         )
         .route("/catalogs/{catalog}/owner", put(set_owner))
+        .route(
+            "/catalogs/{catalog}/member-access",
+            get(member_access).put(set_member_access),
+        )
         .route("/catalogs/{catalog}/export", archives::export_route())
         .route("/catalogs/{catalog}/import", archives::import_route(app))
 }
@@ -275,6 +280,88 @@ async fn set_owner(
     }))
 }
 
+/// `PUT /catalogs/{catalog}/member-access`'s body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemberAccessBody {
+    /// `none`, `read` or `write`.
+    access: String,
+}
+
+/// `GET /catalogs/{catalog}/member-access`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct MemberAccessView {
+    /// The catalog.
+    pub name: String,
+    /// `none`, `read` or `write`.
+    pub member_access: &'static str,
+}
+
+/// `PUT /catalogs/{catalog}/member-access`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct MemberAccessChanged {
+    /// The catalog.
+    pub name: String,
+    /// The level before.
+    pub previous: &'static str,
+    /// The level now.
+    pub member_access: &'static str,
+}
+
+/// `GET /catalogs/{catalog}/member-access`: what the owning team's members
+/// may reach through their self-issued credentials.
+///
+/// # Errors
+/// 404 for a catalog the caller does not reach or that does not exist; 403
+/// below `admin` on it.
+async fn member_access(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(catalog): Path<String>,
+) -> Result<Json<MemberAccessView>, AppError> {
+    principal.require(Access::Admin, &catalog)?;
+    let access = ceiling::member_access(app.pool(), &catalog).await?;
+    Ok(Json(MemberAccessView {
+        name: catalog,
+        member_access: access.as_str(),
+    }))
+}
+
+/// `PUT /catalogs/{catalog}/member-access`: sets it, then polls so every
+/// member's self-issued credentials are re-capped at once. The permission
+/// is `ceiling::may_set_member_access`, the one hook team owners will
+/// later share (spec "Admin surface").
+///
+/// # Errors
+/// 403 for a caller `may_set_member_access` refuses; 400 for an unknown
+/// level; 404 for an unknown catalog; 422 without `access`.
+async fn set_member_access(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(catalog): Path<String>,
+    Json(body): Json<MemberAccessBody>,
+) -> Result<Json<MemberAccessChanged>, AppError> {
+    if !ceiling::may_set_member_access(&principal, &catalog) {
+        return Err(OkfError::Forbidden {
+            reason: "this needs an admin key that reaches every catalog".to_string(),
+        }
+        .into());
+    }
+    let access = MemberAccess::parse(&body.access).ok_or_else(|| OkfError::InvalidPath {
+        path: "access".to_string(),
+        reason: format!("must be none, read or write, not {:?}", body.access),
+    })?;
+    let previous = ceiling::set_member_access(app.pool(), &catalog, access).await?;
+    tracing::info!(%catalog, previous = previous.as_str(), access = access.as_str(),
+                   key = %principal.key_id, actor = %principal.actor, "member access set");
+    settle(&app).await;
+    Ok(Json(MemberAccessChanged {
+        name: catalog,
+        previous: previous.as_str(),
+        member_access: access.as_str(),
+    }))
+}
+
 /// `DELETE /catalogs/{catalog}[?force=true]`: deletes the catalog with its
 /// documents, history, changesets and grants (`admin` on the catalog), then
 /// polls so it is gone at once.
@@ -316,7 +403,10 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::db::TEST_TEAM;
-    use crate::http::api::testing::{app, assert_matrix, every_catalog_admin, keys, send, Row};
+    use crate::http::api::testing::{
+        app, assert_matrix, assert_matrix_with, every_catalog_admin, keys, send, Browser, Payload,
+        Row,
+    };
     use crate::http::archives::tarball_of;
     use crate::mcp::testing::{open, pending_entry, writer, PendingEdit, TestApp};
 
@@ -357,6 +447,141 @@ mod tests {
             .iter()
             .map(|catalog| catalog["name"].as_str().expect("a name").to_string())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn member_access_reads_need_admin_on_the_catalog_and_writes_an_every_catalog_admin() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let root = every_catalog_admin(&test).await;
+        assert_matrix_with(
+            &test,
+            &keys,
+            &[
+                Row {
+                    method: "GET",
+                    uri: "/api/v1/catalogs/main/member-access".to_string(),
+                    body: None,
+                    read: 403,
+                    write: 403,
+                    admin: 200,
+                    stranger: 404,
+                },
+                Row {
+                    method: "PUT",
+                    uri: "/api/v1/catalogs/main/member-access".to_string(),
+                    body: Some(json!({"access": "read"})),
+                    read: 403,
+                    write: 403,
+                    admin: 403,
+                    stranger: 403,
+                },
+            ],
+        )
+        .await;
+        let put = |catalog: &str, access: &str| {
+            let uri = format!("/api/v1/catalogs/{catalog}/member-access");
+            let body = json!({ "access": access });
+            let (test, root) = (&test, root.as_str());
+            async move { send(test, "PUT", &uri, Some(root), Some(body)).await }
+        };
+
+        let (_, before) = send(
+            &test,
+            "GET",
+            "/api/v1/catalogs/main/member-access",
+            Some(&root),
+            None,
+        )
+        .await;
+        let (set, body) = put("main", "read").await;
+        let (_, now) = send(
+            &test,
+            "GET",
+            "/api/v1/catalogs/main/member-access",
+            Some(&root),
+            None,
+        )
+        .await;
+        let (bad, _) = put("main", "admin").await;
+        let (unknown, _) = put("nowhere", "read").await;
+        let (unknown_read, _) = send(
+            &test,
+            "GET",
+            "/api/v1/catalogs/nowhere/member-access",
+            Some(&root),
+            None,
+        )
+        .await;
+
+        assert_eq!(before, json!({"name": "main", "member_access": "write"}));
+        assert_eq!(set.as_u16(), 200, "{body}");
+        assert_eq!(
+            body,
+            json!({"name": "main", "previous": "write", "member_access": "read"})
+        );
+        assert_eq!(now, json!({"name": "main", "member_access": "read"}));
+        assert_eq!(bad.as_u16(), 400);
+        assert_eq!(unknown.as_u16(), 404);
+        assert_eq!(unknown_read.as_u16(), 404);
+    }
+
+    #[tokio::test]
+    async fn member_access_follows_the_session_rules_too() {
+        // An admin user's session reaches every catalog and may set member
+        // access; a plain user's session is below admin everywhere.
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        let (status, body) = send(
+            &test,
+            "POST",
+            "/api/v1/users",
+            Some(&root),
+            Some(json!({"name": "alice"})),
+        )
+        .await;
+        assert_eq!(status.as_u16(), 201, "{body}");
+        let mut plain = Browser::session_for(&test, "alice").await;
+        let (read_plain, _) = plain
+            .send(
+                &test,
+                "GET",
+                "/api/v1/catalogs/main/member-access",
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (write_plain, _) = plain
+            .send(
+                &test,
+                "PUT",
+                "/api/v1/catalogs/main/member-access",
+                Payload::Json(json!({"access": "none"})),
+            )
+            .await
+            .parts();
+        crate::store::users::set_admin(test.app.pool(), "alice", true, false)
+            .await
+            .expect("make alice an admin");
+        let mut admin = Browser::session_for(&test, "alice").await;
+        let (write_admin, answer) = admin
+            .send(
+                &test,
+                "PUT",
+                "/api/v1/catalogs/main/member-access",
+                Payload::Json(json!({"access": "none"})),
+            )
+            .await
+            .parts();
+
+        assert_eq!(
+            read_plain.as_u16(),
+            404,
+            "a plain session that does not reach the catalog"
+        );
+        assert_eq!(write_plain.as_u16(), 403);
+        assert_eq!(write_admin.as_u16(), 200, "{answer}");
+        assert_eq!(answer["member_access"], "none");
     }
 
     #[tokio::test(flavor = "multi_thread")]

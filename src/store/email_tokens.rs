@@ -6,8 +6,9 @@
 //! **Lock order: the user's row first, then their tokens or sessions.**
 //! Every transaction that locks a `users` row and also writes
 //! `email_tokens` or `user_sessions` takes the user's row first: [`issue`],
-//! [`issue_for_email`] and [`redeem_in`] here; `users::set_email`,
-//! `users::set_admin` and `users::delete`; `passwords::set_in` and
+//! [`issue_for_email`], [`issue_for_user_in`] and [`redeem_in`] here;
+//! `users::set_email`, `users::set_admin`, `users::end_sessions` and
+//! `users::delete`; `passwords::set_in` and
 //! `passwords::reset_in` (whose `UPDATE users` precedes `revoke_all`);
 //! `identities::link_for_session_in` (the user, then the session `FOR
 //! SHARE`, the link and `revoke_all`); `identities::sign_in_in` (the user,
@@ -26,7 +27,8 @@ use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
 use crate::keys;
-use crate::store::users::{is_lookup_email, user_auth_columns, UserAuth};
+use crate::store::catalogs::is_valid_name;
+use crate::store::users::{self, is_lookup_email, user_auth_columns, UserAuth};
 
 /// What a link is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +196,62 @@ pub async fn issue_for_email(
         to: mail_to,
         token,
     }))
+}
+
+/// Issues a link token to the user called `name`, at the address it has
+/// now, inside the caller's transaction (an admin's setup email:
+/// `mail::invite::send_setup`, which queues the mail in the same
+/// transaction).
+///
+/// The user's row is locked (`FOR NO KEY UPDATE`, the lock
+/// `users::set_email` waits on) before its email is read, so the address
+/// returned is the one the user has when the caller commits: an email
+/// change either commits first and is read here, or waits for the caller
+/// and then deletes the new token with the rest.
+///
+/// # Arguments
+/// * `conn` - the caller's transaction (`&mut tx`).
+/// * `name` - the user's name.
+/// * `purpose` - setup or reset.
+/// * `ttl` - how long it works.
+/// * `now` - when it is issued (server clock).
+///
+/// # Returns
+/// The user, the address to mail and the token; `None`, with nothing
+/// written, when the user has no email.
+///
+/// # Errors
+/// [`OkfError::UnknownName`] for an unknown or malformed name; otherwise
+/// as [`issue`].
+pub async fn issue_for_user_in(
+    conn: &mut PgConnection,
+    name: &str,
+    purpose: Purpose,
+    ttl: Duration,
+    now: DateTime<Utc>,
+) -> Result<Option<IssuedLink>, OkfError> {
+    // A malformed name (a NUL, which Postgres refuses) names nobody.
+    if !is_valid_name(name) {
+        return Err(users::unknown(name));
+    }
+    let expires_at = crate::clock::after(now, ttl)?;
+    let user = sqlx::query_as::<_, UserAuth>(concat!(
+        "SELECT ",
+        user_auth_columns!(),
+        " FROM users u WHERE u.name = $1 FOR NO KEY UPDATE"
+    ))
+    .bind(name)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| users::unknown(name))?;
+    // `let ... else`: bind the address, or leave with `None` (Python's
+    // `if user.email is None: return None`).
+    let Some(to) = user.email.clone() else {
+        return Ok(None);
+    };
+    let token = keys::generate_with("")?;
+    replace_token(conn, &user.id, purpose, &token, now, expires_at).await?;
+    Ok(Some(IssuedLink { user, to, token }))
 }
 
 /// Deletes a user's tokens of `purpose` and stores the new one, inside the

@@ -43,8 +43,9 @@ use crate::store::keys::{
 use crate::store::passwords::{self, NewPassword, SessionChange, SignInOutcome};
 use crate::store::{identities, passkeys, sign_in_events, user_sessions, users};
 
-/// How many recent sign-ins `GET /me/sign-ins` shows.
-const RECENT_SIGN_INS: i64 = 50;
+/// How many recent sign-ins `GET /me/sign-ins` and the admin's
+/// `GET /users/{name}/sign-ins` show.
+pub(crate) const RECENT_SIGN_INS: i64 = 50;
 
 /// The signed-in user a self-service request acts for.
 // `Copy`: two borrowed strings, cheap to pass by value.

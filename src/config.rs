@@ -300,6 +300,20 @@ pub enum MailProvider {
     Log,
 }
 
+impl MailProvider {
+    /// The config spelling.
+    ///
+    /// # Returns
+    /// `"smtp"`, `"postmark"` or `"log"`, as `[mail] provider` takes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MailProvider::Smtp => "smtp",
+            MailProvider::Postmark => "postmark",
+            MailProvider::Log => "log",
+        }
+    }
+}
+
 /// `[mail.smtp]`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SmtpConfig {
@@ -831,6 +845,21 @@ fn is_loopback(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mail_providers_name_is_the_spelling_the_config_takes() {
+        for provider in [
+            MailProvider::Smtp,
+            MailProvider::Postmark,
+            MailProvider::Log,
+        ] {
+            // serde reads a bare enum variant from a JSON string.
+            let parsed: MailProvider =
+                serde_json::from_value(serde_json::Value::from(provider.as_str())).unwrap();
+
+            assert_eq!(parsed, provider);
+        }
+    }
 
     #[test]
     fn an_empty_file_gives_the_defaults() {

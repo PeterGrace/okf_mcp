@@ -1,0 +1,193 @@
+//! Setup emails (spec "Emailed links": Setup): an admin sends a user a
+//! single-use link to choose a password or register a passkey. The API's
+//! `POST /api/v1/users/{name}/invite` and the CLI's `user invite` (Task 13)
+//! share this.
+
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+
+use crate::config::Config;
+use crate::error::OkfError;
+use crate::mail::{link, queue, Template, SETUP_PATH};
+use crate::store::email_tokens::{self, Purpose};
+use crate::store::settings;
+
+/// Issues a setup link for `user` and queues the setup email, in one
+/// transaction under the user's row lock: the link goes to the address the
+/// user has at the commit, and a link exists only if its mail is queued.
+/// Any older setup link of the user stops working. The link is never
+/// returned or logged: only the queued job holds it.
+///
+/// # Arguments
+/// * `pool` - the database (the job goes into apalis on it).
+/// * `config` - for `public_url` (the link's origin) and the `[auth]`
+///   defaults under the stored settings (`setup_link_ttl`).
+/// * `user` - the user's name.
+/// * `now` - the server clock.
+///
+/// # Returns
+/// The address the email goes to.
+///
+/// # Errors
+/// [`OkfError::Refused`] without `public_url` or without an email;
+/// [`OkfError::UnknownName`] for an unknown user; [`OkfError::Database`].
+pub async fn send_setup(
+    pool: &PgPool,
+    config: &Config,
+    user: &str,
+    now: DateTime<Utc>,
+) -> Result<String, OkfError> {
+    let Some(public_url) = config.public_url.as_deref() else {
+        return Err(OkfError::Refused {
+            reason: "setup links need public_url in the config".to_string(),
+        });
+    };
+    // Code without an `App` reads the settings itself (plan Decision 24).
+    let policy = settings::load(pool, &config.auth).await?;
+    let mut tx = pool.begin().await?;
+    let issued =
+        email_tokens::issue_for_user_in(&mut tx, user, Purpose::Setup, policy.setup_link_ttl, now)
+            .await?;
+    let Some(issued) = issued else {
+        // Nothing was written; dropping `tx` rolls back and releases the lock.
+        return Err(OkfError::Refused {
+            reason: format!("user {user} has no email; set one first"),
+        });
+    };
+    let template = Template::Setup {
+        // The one link builder, so the path matches the setup page.
+        link: link(public_url, SETUP_PATH, &issued.token),
+        user: issued.user.name.clone(),
+    };
+    queue::enqueue_in(&mut tx, &issued.to, &template, now).await?;
+    tx.commit().await?;
+    tracing::info!(%user, "setup email queued");
+    Ok(issued.to)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use chrono::Utc;
+
+    use super::send_setup;
+    use crate::config::Config;
+    use crate::db::{test_db, TEST_USER};
+    use crate::error::OkfError;
+    use crate::http::api::testing::wait_for_lock_waiters;
+    use crate::mail::queue;
+    use crate::store::users;
+
+    fn with_public_url() -> Config {
+        Config {
+            public_url: Some("https://okf.example.com".to_string()),
+            ..Config::default()
+        }
+    }
+
+    /// How many setup tokens exist.
+    async fn setup_tokens(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM email_tokens WHERE purpose = 'setup'")
+            .fetch_one(pool)
+            .await
+            .expect("count")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_setup_link_is_queued_for_a_user_with_an_email() {
+        let db = test_db().await;
+        users::set_email(&db.pool, TEST_USER, Some("tester@example.com"))
+            .await
+            .expect("email");
+
+        let first = send_setup(&db.pool, &with_public_url(), TEST_USER, Utc::now()).await;
+        let second = send_setup(&db.pool, &with_public_url(), TEST_USER, Utc::now()).await;
+
+        assert_eq!(first.expect("queued"), "tester@example.com");
+        assert_eq!(second.expect("queued again"), "tester@example.com");
+        let queued = queue::list(&db.pool).await.expect("the queue");
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].to, "tester@example.com");
+        assert_eq!(queued[0].template, "setup");
+        assert_eq!(
+            setup_tokens(&db.pool).await,
+            1,
+            "a new link replaces the old"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_email_or_no_public_url_is_refused_and_queues_nothing() {
+        let db = test_db().await;
+
+        let no_email = send_setup(&db.pool, &with_public_url(), TEST_USER, Utc::now()).await;
+        users::set_email(&db.pool, TEST_USER, Some("tester@example.com"))
+            .await
+            .expect("email");
+        let no_url = send_setup(&db.pool, &Config::default(), TEST_USER, Utc::now()).await;
+        let unknown = send_setup(&db.pool, &with_public_url(), "nobody", Utc::now()).await;
+        let malformed = send_setup(&db.pool, &with_public_url(), "a\0b", Utc::now()).await;
+
+        assert!(
+            matches!(no_email, Err(OkfError::Refused { .. })),
+            "{no_email:?}"
+        );
+        assert!(
+            matches!(no_url, Err(OkfError::Refused { .. })),
+            "{no_url:?}"
+        );
+        assert!(
+            matches!(unknown, Err(OkfError::UnknownName { .. })),
+            "{unknown:?}"
+        );
+        assert!(
+            matches!(malformed, Err(OkfError::UnknownName { .. })),
+            "a NUL is an unknown user, not a database error: {malformed:?}"
+        );
+        assert!(queue::list(&db.pool).await.expect("the queue").is_empty());
+        assert_eq!(setup_tokens(&db.pool).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_setup_link_goes_to_the_address_the_user_has_when_it_commits() {
+        // An email change that holds the user's row while the invite starts
+        // commits first; the invite must then read the new address, never
+        // mail a working link to the old one.
+        let db = test_db().await;
+        users::set_email(&db.pool, TEST_USER, Some("old@example.com"))
+            .await
+            .expect("email");
+        let mut holder = db.pool.begin().await.expect("begin");
+        sqlx::query("SELECT id FROM users WHERE name = $1 FOR NO KEY UPDATE")
+            .bind(TEST_USER)
+            .execute(&mut *holder)
+            .await
+            .expect("hold the user");
+        let pool = db.pool.clone();
+        // `tokio::spawn` runs the invite on another task, so it can wait on
+        // the row while this task commits the change.
+        let invite = tokio::spawn(async move {
+            send_setup(&pool, &with_public_url(), TEST_USER, Utc::now()).await
+        });
+        tokio::time::timeout(Duration::from_secs(30), wait_for_lock_waiters(&db.pool, 1))
+            .await
+            .expect("the invite never waited on the user's row");
+        sqlx::query("UPDATE users SET email = 'new@example.com' WHERE name = $1")
+            .bind(TEST_USER)
+            .execute(&mut *holder)
+            .await
+            .expect("change the email");
+        holder.commit().await.expect("commit the change");
+
+        let sent = tokio::time::timeout(Duration::from_secs(30), invite)
+            .await
+            .expect("the invite never finished")
+            .expect("the invite task");
+
+        assert_eq!(sent.expect("queued"), "new@example.com");
+        let queued = queue::list(&db.pool).await.expect("the queue");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].to, "new@example.com");
+    }
+}
