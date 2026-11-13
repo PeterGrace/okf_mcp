@@ -5,7 +5,7 @@ import { api, ApiError, authHeaders, setUnauthorizedHandler } from './core/api.j
 import { start, route } from './core/router.js';
 import { closeDrawer } from './core/drawer.js';
 import { toast } from './core/toast.js';
-import { refreshIdentity, refreshUnassigned } from './core/shell.js';
+import { refreshIdentity, refreshUnassigned, setSignedOutHandler } from './core/shell.js';
 import { refreshFindingsBadge } from './pages/findings.js';
 
 // Surface script errors and CSP violations as console errors: the browser
@@ -100,6 +100,19 @@ async function endCookieSession() {
     if (!ended.ok && ended.status !== 401) throw new Error(`HTTP ${ended.status}`);
 }
 
+// Forgets the credential once the server has no session left for it, and
+// shows the card at the console's root. The Sign out button calls it, and
+// so does the Account page after signing this browser's session out.
+function signedOut() {
+    store.key = null;
+    store.whoami = null;
+    store.csrf = null;
+    store.session = null;
+    history.replaceState(null, '', '/ui/');
+    showLogin();
+}
+setSignedOutHandler(signedOut);
+
 $('#signout').addEventListener('click', async () => {
     // The session ends on the server first. If that fails (the network, a
     // 5xx) nothing is cleared: the console stays as it is and says to try
@@ -110,12 +123,7 @@ $('#signout').addEventListener('click', async () => {
         toast(`Sign-out failed: ${error.message}. Try again.`, 'error');
         return;
     }
-    store.key = null;
-    store.whoami = null;
-    store.csrf = null;
-    store.session = null;
-    history.replaceState(null, '', '/ui/');
-    showLogin();
+    signedOut();
 });
 $('#theme-toggle').addEventListener('click', () => {
     const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';

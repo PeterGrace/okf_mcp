@@ -4,7 +4,8 @@
 //! console for an admin user, sign-out ending the server's session, and My
 //! keys: a key created within the ceiling (its secret shown once), a key
 //! the ceiling no longer allows refused with the reason, the key limit,
-//! rename and revoke. Task 14b adds My grants.
+//! rename and revoke. Task 14b adds My grants: revoking an OAuth grant, its
+//! cap note following the ceiling `/me` gives now.
 //!
 //! The fixtures here (`login_server`, `console_base`, `member`, `PASSWORD`,
 //! `EMAIL`) are shared with `account.rs` (Task 14b) and with `users.rs`,
@@ -14,8 +15,10 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use okf_mcp::config::Config;
+use okf_mcp::oauth::clients::MAX_UNBOUND_DCR;
 use okf_mcp::store::ceiling;
 use okf_mcp::store::keys::{self as key_rows, Access, CatalogGrant, Grants, NewKey};
+use okf_mcp::store::oauth::clients::{self as client_rows, NewDcrClient};
 use okf_mcp::store::settings::{self, SettingKey};
 use okf_mcp::store::users;
 use serde_json::json;
@@ -126,6 +129,58 @@ async fn alices_key(server: &TestServer, name: &str) {
     server.app.poll().await.expect("poll");
 }
 
+/// Inserts an OAuth grant of alice's, from consent signed in as her: read
+/// on `main`, for a client called "Example Client". No store function
+/// makes a grant without a consent round trip, so this writes the rows
+/// itself and bumps the administrative generation so the poll sees it.
+///
+/// # Returns
+/// The grant's id.
+async fn alices_grant(server: &TestServer) -> String {
+    let pool = &server.db.pool;
+    let redirect_uris = ["https://client.example.com/callback".to_string()];
+    let metadata = json!({ "redirect_uris": redirect_uris });
+    let client = client_rows::insert_dcr(
+        pool,
+        &NewDcrClient {
+            client_name: Some("Example Client"),
+            redirect_uris: &redirect_uris,
+            metadata: &metadata,
+        },
+        Utc::now(),
+        MAX_UNBOUND_DCR,
+    )
+    .await
+    .expect("register the client")
+    .expect("under the cap");
+    // `query_scalar` reads one column of one row, like `cursor.fetchone()[0]`.
+    let id: String = sqlx::query_scalar(
+        "INSERT INTO api_keys \
+             (name, access, all_catalogs, actor, created_at, kind, client_id, user_id, self_issued) \
+         SELECT 'example-client', 'read', false, 'Example Client', now(), 'oauth', $1, u.id, true \
+         FROM users u WHERE u.name = 'alice' \
+         RETURNING id",
+    )
+    .bind(&client.client_id)
+    .fetch_one(pool)
+    .await
+    .expect("insert alice's grant");
+    sqlx::query(
+        "INSERT INTO key_catalogs (key_id, catalog_id, access) \
+         SELECT $1, c.id, 'read' FROM catalogs c WHERE c.name = 'main'",
+    )
+    .bind(&id)
+    .execute(pool)
+    .await
+    .expect("grant main");
+    sqlx::query("UPDATE server_state SET admin_generation = admin_generation + 1")
+        .execute(pool)
+        .await
+        .expect("bump the admin generation");
+    server.app.poll().await.expect("poll");
+    id
+}
+
 /// The key called `name`, if the store has one.
 async fn key_named(server: &TestServer, name: &str) -> Option<key_rows::KeyRecord> {
     key_rows::list(&server.db.pool)
@@ -154,8 +209,11 @@ async fn a_member_signs_in_from_the_card_and_sees_only_their_pages() {
         ui.wait_text("#my-keys-note", "0 of 20");
         ui.wait_text("#whoami", "alice - write");
         ui.wait_visible("a[data-nav=my-keys]");
-        // (My grants and Account join the group in Task 14b: until their
-        // pages exist, the manifest hides their links.)
+        assert!(ui
+            .page
+            .is_visible("a[data-nav=my-grants]")
+            .expect("visible"));
+        assert!(ui.page.is_visible("a[data-nav=account]").expect("visible"));
         assert!(!ui.page.is_visible("[data-need=admin]").expect("visible"));
         // Hidden is not the only guard: the API refuses her admin routes.
         assert_eq!(
@@ -557,4 +615,50 @@ async fn the_my_keys_page_says_so_to_a_key() {
         );
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_revokes_an_oauth_grant() {
+    let server = login_server().await;
+    member(&server, Access::Write).await;
+    let grant = alices_grant(&server).await;
+    let pool = server.db.pool.clone();
+    let app = Arc::clone(&server.app);
+    // The journey runs on a blocking thread; this handle lets it run the
+    // admin's change on the test's runtime mid-session.
+    let runtime = tokio::runtime::Handle::current();
+    let ran = drive(console_base(&server), move |ui| {
+        ui.sign_in_password(EMAIL, PASSWORD);
+        // Signed in with main in her ceiling, then an admin takes it away:
+        // the page compares with the ceiling /me gives now.
+        runtime.block_on(async {
+            ceiling::unentitle(&pool, "alice", "main")
+                .await
+                .expect("take main away");
+            app.poll().await.expect("poll");
+        });
+        ui.open("/my-grants");
+        ui.wait_text("[data-test=my-grant-example-client]", "Example Client");
+        ui.wait_text(
+            "#my-grants-table tr:has([data-test=my-grant-example-client]) td:nth-child(2)",
+            "(outside your ceiling now)",
+        );
+        ui.click("[data-test=my-grant-example-client]");
+        ui.wait_text("#drawer dl.facts", "your consent");
+        ui.click("#my-grant-revoke");
+        ui.click("#confirm-ok");
+        ui.wait_text("#toasts", "Revoked the grant for Example Client");
+        ui.wait_hidden("[data-test=my-grant-example-client]");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let record = key_rows::list(&server.db.pool)
+        .await
+        .expect("list keys")
+        .into_iter()
+        .find(|record| record.id == grant)
+        .expect("the grant");
+    assert!(record.revoked_at.is_some());
 }

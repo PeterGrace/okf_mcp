@@ -5,6 +5,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod account;
 mod browse;
 mod catalogs;
 mod changesets;
