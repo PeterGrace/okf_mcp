@@ -17,11 +17,11 @@
 # The limit counts time spent waiting for the lock (flock -w), so a gate stuck
 # behind a hung holder also fails instead of waiting forever.
 #
-# The gate runs in its own session (setsid), so its whole process group can be
-# stopped. On timeout the group gets TERM, then KILL after a grace period
-# (AGENTIC_GATE_KILL_AFTER, default 60 s). On every other exit too (pass,
-# failure, a killed gate, or INT/TERM to gate.sh), whatever is left of the
-# group is stopped the same way. gate.sh returns only once the group is empty,
+# The gate runs in its own session (setsid, via lib.sh's agentic_run_bounded),
+# so its whole process group can be stopped. On timeout the group gets TERM,
+# then KILL after a grace period (AGENTIC_GATE_KILL_AFTER, default 60 s). On
+# every other exit too (pass, failure, a killed gate, or INT/TERM to gate.sh),
+# whatever is left of the group is stopped the same way. gate.sh returns only once the group is empty,
 # so nothing it started (a test that ignores TERM, a stray background job)
 # outlives it or keeps holding the lock it inherited.
 #
@@ -29,7 +29,8 @@
 #   the gate's own, when it exits by itself; if it left processes behind they
 #     are stopped and a warning on stderr says how many;
 #   124 on timeout, or when the gate was killed (137), with a hint on stderr;
-#   130 when gate.sh itself is interrupted (INT or TERM).
+#   130 or 143 when gate.sh itself gets INT or TERM (it stops the gate, then
+#     dies of the same signal).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source-path=SCRIPTDIR source=lib.sh
@@ -66,61 +67,13 @@ if [ "$locked" = 1 ]; then
     cmd=(flock -E 124 -w "$limit_s" "$lock" "${cmd[@]}")
 fi
 
-# True while any process of the gate's group is alive.
-group_alive() { kill -0 -- "-$pgid" 2>/dev/null; }
-
-# How many processes are in the gate's group.
-group_size() { pgrep -c -g "$pgid" || true; }
-
-# stop_group: TERM what is left of the group, KILL it after the grace period,
-# and return once it is empty. Returns at once when the group is already empty.
-stop_group() {
-    local tick
-    kill -TERM -- "-$pgid" 2>/dev/null || return 0
-    for ((tick = 0; tick < kill_after * 10; tick++)); do
-        group_alive || return 0
-        sleep 0.1
-    done
-    kill -KILL -- "-$pgid" 2>/dev/null || return 0
-    # KILL can't be ignored; allow a few seconds for the dead to be reaped.
-    for ((tick = 0; tick < 50; tick++)); do
-        group_alive || return 0
-        sleep 0.1
-    done
-}
-
-# A background job of a non-interactive shell is not a group leader, so setsid
-# makes the job itself the leader of a new session: its pid is the group id.
-setsid "${cmd[@]}" &
-pgid=$!
-trap 'stop_group; exit 130' INT TERM
-deadline=$((SECONDS + limit_s))
-timed_out=0
-while kill -0 "$pgid" 2>/dev/null; do
-    if [ "$SECONDS" -ge "$deadline" ]; then
-        timed_out=1
-        break
-    fi
-    sleep 0.5
-done
+# lib.sh's agentic_run_bounded runs the gate in its own process group and
+# empties that group on every exit; the grace period here is the gate's.
+agentic_kill_after=$kill_after
 status=0
-if [ "$timed_out" = 1 ]; then
-    stop_group
-    wait "$pgid" 2>/dev/null || true
-    status=124
-else
-    wait "$pgid" || status=$?
-    # The gate has exited; anything still in its group is a leak.
-    leftover=$(group_size)
-    if [ "$leftover" -gt 0 ]; then
-        stop_group
-        echo "gate.sh: warning: '$gate' exited (status $status) leaving $leftover" \
-            "process(es) behind; stopped them" >&2
-    fi
-fi
-trap - INT TERM
+agentic_run_bounded "$limit_s" "${cmd[@]}" || status=$?
 if [ "$status" = 124 ] || [ "$status" = 137 ]; then
-    if [ "$timed_out" = 1 ]; then
+    if [ "$agentic_timed_out" = 1 ]; then
         reason="hit its ${limit} limit"
     else
         reason="was killed or timed out (exit $status)"

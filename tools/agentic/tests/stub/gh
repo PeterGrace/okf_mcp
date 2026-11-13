@@ -9,10 +9,20 @@
 #   api repos/O/R/<path>  api/<path with / as _>.<page>.json; every page with
 #                         --paginate, only page 1 without; fails if
 #                         api/<name>.fail exists; [] when there are no pages
-# --jq is applied to each page, as real gh does.
+# --jq is applied to each page, as real gh does. With a `block` file every call
+# hangs instead (see below).
 set -u
 fixtures=${GH_FIXTURES:?GH_FIXTURES is not set}
 printf '%s\n' "$*" >>"$fixtures/calls.log"
+
+# A stalled gh: with a `block` fixture every call hangs (in a child, as a real
+# gh's helpers would) far longer than any budget, recording its pids.
+if [ -e "$fixtures/block" ]; then
+    sleep 300 &
+    printf '%s\n' "$$" "$!" >>"$fixtures/blocked.pids"
+    wait
+    exit 1
+fi
 
 jq_expr=""
 paginate=0

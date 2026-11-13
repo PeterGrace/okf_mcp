@@ -8,6 +8,8 @@
 #   2. every top-level inline comment from the bot has a reply in its thread;
 #   3. GitHub reports the PR as CLEAN (mergeable, up to date as required).
 # The merge is pinned to the inspected head, so a concurrent push makes it fail.
+# Every gh and git call is bounded ($AGENTIC_CALL_TIMEOUT, default 60 s); a call
+# that runs out of time is a refusal.
 # Then fetches origin so the next worktree starts from the new main.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -15,10 +17,10 @@ here=$(cd "$(dirname "$0")" && pwd)
 source "$here/lib.sh"
 
 pr=${1:?usage: merge-reviewed.sh <pr>}
-repo=$(agentic_repo)
+repo=$(agentic_repo) || { echo "REFUSE: could not resolve the repository"; exit 1; }
 bot=$(agentic_reviewer)
 
-info=$(gh pr view "$pr" -R "$repo" --json headRefOid,mergeStateStatus) \
+info=$(agentic_gh pr view "$pr" -R "$repo" --json headRefOid,mergeStateStatus) \
     || { echo "REFUSE: could not read PR $pr"; exit 1; }
 head=$(jq -r .headRefOid <<<"$info")
 state=$(jq -r .mergeStateStatus <<<"$info")
@@ -62,7 +64,14 @@ fi
 
 # --match-head-commit makes GitHub refuse the merge if someone pushed after the
 # checks above, so only the reviewed commit can ever be merged.
-gh pr merge "$pr" -R "$repo" --merge --match-head-commit "$head" \
-    || { echo "REFUSE: GitHub rejected the merge of ${head:0:7} (did the head change?)"; exit 1; }
-git -C "$(agentic_main_checkout)" fetch -q origin
-echo "MERGED PR $pr -> main $(git -C "$(agentic_main_checkout)" rev-parse --short origin/main)"
+agentic_gh pr merge "$pr" -R "$repo" --merge --match-head-commit "$head" \
+    || { echo "REFUSE: the merge of ${head:0:7} failed: GitHub rejected it (did the head" \
+        "change?) or the call timed out (check the PR before retrying)"; exit 1; }
+# The merge is done; a failure from here on only means the local view is stale.
+if main_checkout=$(agentic_main_checkout) \
+    && agentic_git -C "$main_checkout" fetch -q origin \
+    && main=$(agentic_git -C "$main_checkout" rev-parse --short origin/main); then
+    echo "MERGED PR $pr -> main $main"
+else
+    echo "MERGED PR $pr; warning: could not fetch origin afterwards"
+fi

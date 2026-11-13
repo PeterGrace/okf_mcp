@@ -89,9 +89,26 @@ want_out() { grep -qF -- "$1" <<<"$out" || die "output lacks '$1'"; }
 want_no_out() { ! grep -qF -- "$1" <<<"$out" || die "output has '$1'"; }
 want_not_merged() { [ ! -e "$fx/merged" ] || die "merged $(cat "$fx/merged")"; }
 
+# The real-time timeout only stops a broken script from hanging the suite.
 run_merge() {
-    out=$(cd "$repo" && "$tools/merge-reviewed.sh" 7 2>&1)
+    out=$(cd "$repo" && timeout 15 "$tools/merge-reviewed.sh" 7 2>&1)
     rc=$?
+}
+
+# block_gh: every gh call hangs from now on; the EXIT trap kills whatever the
+# stub started, in case a script under test leaves it behind.
+block_gh() {
+    touch "$fx/block"
+    trap '[ -s "$fx/blocked.pids" ] && xargs kill -KILL <"$fx/blocked.pids" 2>/dev/null' EXIT
+}
+
+# want_no_blocked_left: every process the blocking stub started is gone.
+want_no_blocked_left() {
+    [ -s "$fx/blocked.pids" ] || die "the stub was never called"
+    local pid
+    while read -r pid; do
+        ! kill -0 "$pid" 2>/dev/null || die "stub process $pid outlived the script"
+    done <"$fx/blocked.pids"
 }
 
 # The watcher on a fake clock starting at 1000 s. The real-time timeout only
@@ -174,11 +191,20 @@ test_merge_matches_bot_login_without_suffix() {
     want_rc 0; want_out "MERGED PR 7"
 }
 
+test_merge_refuses_on_hung_call() {
+    new_fixtures; good_pr "$head_a"; block_gh
+    started=$SECONDS
+    AGENTIC_CALL_TIMEOUT=1 run_merge
+    want_rc 1; want_out "REFUSE: could not read PR 7"; want_not_merged
+    [ $((SECONDS - started)) -le 4 ] || die "took $((SECONDS - started)) s"
+    want_no_blocked_left
+}
+
 test_merge_refuses_head_changed_before_merge() {
     new_fixtures; good_pr "$head_a"
     echo "$head_b" >"$fx/merge-head"
     run_merge
-    want_rc 1; want_out "REFUSE: GitHub rejected the merge"; want_not_merged
+    want_rc 1; want_out "REFUSE: the merge of aaaaaaa failed"; want_not_merged
 }
 
 test_merge_finds_review_on_page_two() {
@@ -304,6 +330,27 @@ test_watch_bot_reaction_delays_retrigger() {
     run_watch
     [ "$(cat "$fx/comment-times" 2>/dev/null)" = 1390 ] \
         || die "re-triggered at $(cat "$fx/comment-times" 2>/dev/null), want 1390"
+}
+
+test_watch_never_retriggers_while_behind_main() {
+    new_fixtures; good_pr "$head_a"
+    echo '[]' >"$fx/api/pulls_7_reviews.1.json"
+    printf '{"headRefOid":"%s","mergeStateStatus":"BEHIND"}\n' "$head_a" >"$fx/pr-view.json"
+    run_watch
+    want_rc 2; want_out "behind main: merge origin/main and push"
+    ! grep -q '^pr comment' "$fx/calls.log" || die "re-triggered while behind main"
+}
+
+test_watch_stalled_gh_still_ends_at_deadline() {
+    new_fixtures; good_pr "$head_a"; block_gh
+    # Real clock with a 2 s deadline: a stalled gh must not hold the watcher
+    # past it, and the diagnostics get only their own few seconds.
+    started=$SECONDS
+    out=$(cd "$repo" && AGENTIC_WATCH_TIMEOUT=2 timeout 15 "$tools/watch-review.sh" 7 2>&1)
+    rc=$?
+    want_rc 2; want_out "TIMEOUT"
+    [ $((SECONDS - started)) -le 8 ] || die "took $((SECONDS - started)) s, want about 5"
+    want_no_blocked_left
 }
 
 test_watchdog_covers_worktrees_outside_main_checkout() {

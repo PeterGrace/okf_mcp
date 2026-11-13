@@ -42,6 +42,8 @@ tools/agentic/gate.sh narrow --lib -- <filter>   # while iterating
 ## When main moves
 Run `git merge origin/main`. Never rebase or force-push. Keep both sides of a conflict, then re-run the gates before pushing. The review bot skips a PR that is behind `main`.
 
+**Before asking for a review or a re-review** (`/prrb`), always bring the PR up to date with `main` first: merge `origin/main`, re-run the gates, push, and only then ask. The bot skips a PR that is behind `main`, so a request made before that is wasted.
+
 ## Review replies
 When you address a review, reply in each inline thread (as a reply to that comment), not only in a top-level comment. `merge-reviewed.sh` refuses to merge while any reviewer thread has no reply. Keep the PR description and its claims in step with the final code after every round.
 

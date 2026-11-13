@@ -37,10 +37,11 @@ in_checkout() {
 }
 
 while :; do
-    # Re-read every round: worktrees come and go during an epic.
+    # Re-read every round: worktrees come and go during an epic. The call is
+    # bounded (lib.sh: agentic_git), so a stuck git can't stall the watchdog.
     checkouts=("$root")
     while read -r path; do checkouts+=("$path"); done \
-        < <(git -C "$root" worktree list --porcelain | sed -n 's/^worktree //p')
+        < <(agentic_git -C "$root" worktree list --porcelain | sed -n 's/^worktree //p')
     found=""
     while read -r pid elapsed args; do
         cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
