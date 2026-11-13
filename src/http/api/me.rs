@@ -20,7 +20,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::routing::{delete, get, patch};
+use axum::http::StatusCode;
+use axum::routing::{delete, get, patch, put};
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
@@ -31,12 +32,19 @@ use crate::clock::format_timestamp;
 use crate::error::OkfError;
 use crate::http::api::keys::{parse_access, CreatedKeyView, KeyView};
 use crate::http::api::settle;
+use crate::http::console_session::ConsoleSession;
+use crate::http::passkeys::passkey_name;
+use crate::http::signin::notify_method_added;
 use crate::http::AppError;
 use crate::store::ceiling::{self, Ceiling};
 use crate::store::keys::{
     self as key_rows, Access, CatalogGrant, Grants, KeyKind, KeyRecord, NewKey,
 };
-use crate::store::users;
+use crate::store::passwords::{self, NewPassword, SessionChange, SignInOutcome};
+use crate::store::{identities, passkeys, sign_in_events, user_sessions, users};
+
+/// How many recent sign-ins `GET /me/sign-ins` shows.
+const RECENT_SIGN_INS: i64 = 50;
 
 /// The signed-in user a self-service request acts for.
 // `Copy`: two borrowed strings, cheap to pass by value.
@@ -66,12 +74,42 @@ fn session_user(principal: &Principal) -> Result<SessionUser<'_>, OkfError> {
         (
             CredentialKind::ApiKey | CredentialKind::OAuth { .. } | CredentialKind::Session { .. },
             _,
-        ) => Err(OkfError::Forbidden {
-            reason: "this needs a console session: sign in at /signin \
-                         (a key cannot manage keys for itself)"
-                .to_string(),
-        }),
+        ) => Err(needs_session()),
     }
+}
+
+/// The 403 for a self-service route called with a key or an OAuth token.
+fn needs_session() -> OkfError {
+    OkfError::Forbidden {
+        reason: "this needs a console session: sign in at /signin \
+                 (a key cannot manage keys for itself)"
+            .to_string(),
+    }
+}
+
+/// The session user behind `principal`, and the console session the
+/// request came with (for routes that act on "the other sessions").
+///
+/// # Arguments
+/// * `principal` - the caller, from `require_principal`.
+/// * `session` - the request's [`ConsoleSession`] extension, if any.
+///
+/// # Returns
+/// The user and the session.
+///
+/// # Errors
+/// [`OkfError::Forbidden`] for a bearer key or OAuth token.
+fn session_and_user(
+    principal: &Principal,
+    session: Option<Extension<ConsoleSession>>,
+) -> Result<(SessionUser<'_>, ConsoleSession), OkfError> {
+    let user = session_user(principal)?;
+    // `Option<Extension<T>>` is `None` when the middleware put no such
+    // extension in the request; a session principal always has one.
+    let Some(Extension(session)) = session else {
+        return Err(needs_session());
+    };
+    Ok((user, session))
 }
 
 /// One catalog of a ceiling.
@@ -151,6 +189,177 @@ pub(crate) struct OwnGrants {
     pub grants: Vec<KeyView>,
 }
 
+/// One passkey, never its public key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PasskeyView {
+    /// Its credential id, unpadded base64url (the `{id}` of the other routes).
+    pub id: String,
+    /// The name its owner gave it.
+    pub name: String,
+    /// When it was registered.
+    pub created_at: String,
+    /// When it last signed in.
+    pub last_used_at: Option<String>,
+}
+
+impl From<passkeys::PasskeyInfo> for PasskeyView {
+    fn from(info: passkeys::PasskeyInfo) -> Self {
+        // Destructured, so a new field fails to compile here until someone
+        // decides whether the API shows it.
+        let passkeys::PasskeyInfo {
+            id,
+            name,
+            created_at,
+            last_used_at,
+        } = info;
+        Self {
+            id,
+            name,
+            created_at: format_timestamp(created_at),
+            last_used_at: last_used_at.map(format_timestamp),
+        }
+    }
+}
+
+/// `GET /me/passkeys`' answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PasskeyList {
+    /// The user's passkeys, oldest first.
+    pub passkeys: Vec<PasskeyView>,
+}
+
+/// One linked OIDC identity, never its subject.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct IdentityView {
+    /// The provider's id (the `{provider}` of the unlink route).
+    pub provider: String,
+    /// The provider's email when it was linked (may be empty).
+    pub email_at_link: String,
+    /// When it was linked.
+    pub created_at: String,
+    /// When it last signed in.
+    pub last_used_at: Option<String>,
+}
+
+impl From<identities::IdentityInfo> for IdentityView {
+    fn from(info: identities::IdentityInfo) -> Self {
+        let identities::IdentityInfo {
+            provider,
+            email_at_link,
+            created_at,
+            last_used_at,
+        } = info;
+        Self {
+            provider,
+            email_at_link,
+            created_at: format_timestamp(created_at),
+            last_used_at: last_used_at.map(format_timestamp),
+        }
+    }
+}
+
+/// A configured OIDC provider, never its secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ProviderView {
+    /// The provider's id (the `{provider}` of the link and unlink routes).
+    pub id: String,
+    /// Its button label.
+    pub label: String,
+}
+
+/// `GET /me/identities`' answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct IdentityList {
+    /// The user's identities, by provider.
+    pub identities: Vec<IdentityView>,
+    /// Every configured provider, for the account page's Link buttons.
+    pub providers: Vec<ProviderView>,
+}
+
+/// One console session, never its id or CSRF token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionView {
+    /// The first 12 hex characters of the stored hash: enough to revoke
+    /// it, never enough to sign in.
+    pub id_prefix: String,
+    /// When it started.
+    pub created_at: String,
+    /// When it was last used (to the minute).
+    pub last_seen_at: String,
+    /// The address it started from, if known.
+    pub ip: Option<String>,
+    /// The browser it started in.
+    pub user_agent: String,
+    /// Whether it is the session making this request.
+    pub current: bool,
+}
+
+impl From<user_sessions::SessionInfo> for SessionView {
+    fn from(info: user_sessions::SessionInfo) -> Self {
+        let user_sessions::SessionInfo {
+            id_prefix,
+            created_at,
+            last_seen_at,
+            ip,
+            user_agent,
+            current,
+        } = info;
+        Self {
+            id_prefix,
+            created_at: format_timestamp(created_at),
+            last_seen_at: format_timestamp(last_seen_at),
+            // `IpAddr` prints as `192.0.2.1` or an IPv6 literal.
+            ip: ip.map(|address| address.to_string()),
+            user_agent,
+            current,
+        }
+    }
+}
+
+/// A list of sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionList {
+    /// The sessions, most recently used first.
+    pub sessions: Vec<SessionView>,
+}
+
+/// One sign-in attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SignInView {
+    /// `password`, `passkey`, `oidc` or `setup`.
+    pub method: &'static str,
+    /// `ok`, `failed` or `locked`.
+    pub outcome: &'static str,
+    /// The address it came from, if known.
+    pub ip: Option<String>,
+    /// When it happened.
+    pub at: String,
+}
+
+impl From<sign_in_events::SignInEvent> for SignInView {
+    fn from(event: sign_in_events::SignInEvent) -> Self {
+        let sign_in_events::SignInEvent {
+            method,
+            outcome,
+            ip,
+            at,
+        } = event;
+        Self {
+            method: method.as_str(),
+            outcome: outcome.as_str(),
+            ip: ip.map(|address| address.to_string()),
+            at: format_timestamp(at),
+        }
+    }
+}
+
+/// A list of sign-in attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SignInList {
+    /// Newest first.
+    pub sign_ins: Vec<SignInView>,
+}
+
 /// One catalog and level in `POST /me/keys`' body.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -186,6 +395,32 @@ struct RenameBody {
     name: String,
 }
 
+/// `PUT /me/password`'s body.
+// `Debug` by hand (Python's `__repr__`): neither password may reach a log
+// line.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasswordBody {
+    /// The password now set; required when there is one.
+    current_password: Option<String>,
+    /// The new password (12 to 1024 characters, not a common one).
+    new_password: String,
+    /// Keep the user's other sessions (default: end them).
+    #[serde(default)]
+    keep_sessions: bool,
+}
+
+impl std::fmt::Debug for PasswordBody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PasswordBody")
+            .field("current_password", &"<redacted>")
+            .field("new_password", &"<redacted>")
+            .field("keep_sessions", &self.keep_sessions)
+            .finish()
+    }
+}
+
 /// This area's routes.
 pub(crate) fn routes() -> Router<Arc<App>> {
     Router::new()
@@ -194,6 +429,17 @@ pub(crate) fn routes() -> Router<Arc<App>> {
         .route("/me/keys/{id}", patch(rename_key).delete(revoke_key))
         .route("/me/grants", get(list_grants))
         .route("/me/grants/{id}", delete(revoke_grant))
+        .route("/me/password", put(change_password))
+        .route("/me/passkeys", get(list_passkeys))
+        .route(
+            "/me/passkeys/{id}",
+            patch(rename_passkey).delete(remove_passkey),
+        )
+        .route("/me/identities", get(list_identities))
+        .route("/me/identities/{provider}", delete(unlink_identity))
+        .route("/me/sessions", get(list_sessions))
+        .route("/me/sessions/{id_prefix}", delete(revoke_session))
+        .route("/me/sign-ins", get(list_sign_ins))
 }
 
 /// The levels a create body asks for, by catalog.
@@ -586,22 +832,298 @@ async fn revoke_own(
     Ok(Json(own(app, user, kind, &target.id).await?.into()))
 }
 
+/// `PUT /me/password`: sets or changes the user's password. The current
+/// password is required when one is set. The change, the end of the
+/// user's other sessions (unless `keep_sessions`) and the notice mail are
+/// one transaction, which also refuses a session that ended, or a
+/// password that changed, after the current password was checked.
+///
+/// # Returns
+/// 204.
+///
+/// # Errors
+/// 403 for a bearer caller, a wrong current password, a locked account or
+/// a password that changed meanwhile (never 401 for these, which the
+/// console reads as "signed out"); 401 once this session has ended; 422
+/// for a password the policy refuses (`limit: "password"`) or a body
+/// without `new_password`.
+async fn change_password(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    session: Option<Extension<ConsoleSession>>,
+    Json(body): Json<PasswordBody>,
+) -> Result<StatusCode, AppError> {
+    let (user, session) = session_and_user(&principal, session)?;
+    // The cheap policy check first, so a refused password costs no argon2
+    // check and counts no failure.
+    passwords::check_policy(&body.new_password)?;
+    let now = app.clock().now();
+    let record = users::find(app.pool(), user.name).await?;
+    let replaces = if record.has_password {
+        let current = body.current_password.as_deref().unwrap_or_default();
+        match passwords::verify_user(app.pool(), user.id, current, now).await? {
+            SignInOutcome::Ok(verified) => Some(verified.stamp),
+            SignInOutcome::Failed => {
+                return Err(OkfError::Forbidden {
+                    reason: "the current password is incorrect".to_string(),
+                }
+                .into())
+            }
+            SignInOutcome::Locked => {
+                return Err(OkfError::Forbidden {
+                    reason: "too many wrong passwords; try again in a few minutes".to_string(),
+                }
+                .into())
+            }
+        }
+    } else {
+        None
+    };
+    // Hashed before the transaction opens, never while it holds the lock.
+    let password = NewPassword::hash(&body.new_password).await?;
+    // For the notice's address, from the database: the key cache can be a
+    // poll interval behind an email change, and the notice must reach the
+    // address the account has now.
+    let account = users::find_auth(app.pool(), user.id)
+        .await?
+        .ok_or_else(|| OkfError::Unauthenticated {
+            reason: "this session's user no longer exists".to_string(),
+        })?;
+    let change = SessionChange {
+        user_id: user.id,
+        session_id: &session.id,
+        replaces: replaces.as_ref(),
+        password: &password,
+        keep_sessions: body.keep_sessions,
+        now,
+    };
+    let ended = store_password_change(&app, &change, &account).await?;
+    tracing::info!(user = %user.name, ended, "password changed from the account page");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stores a password change, ends the other sessions unless kept and
+/// queues the notice, in one transaction; nothing runs after its commit
+/// but building the response.
+///
+/// # Arguments
+/// * `app` - the application.
+/// * `change` - the change.
+/// * `account` - the user, for the notice's address.
+///
+/// # Returns
+/// How many other sessions ended.
+///
+/// # Errors
+/// As [`passwords::change_from_session_in`]; [`OkfError::Database`].
+async fn store_password_change(
+    app: &App,
+    change: &SessionChange<'_>,
+    account: &users::UserAuth,
+) -> Result<u64, OkfError> {
+    let mut tx = app.pool().begin().await?;
+    let ended = passwords::change_from_session_in(&mut tx, change).await?;
+    notify_method_added(app, &mut tx, account, "a new password").await?;
+    tx.commit().await?;
+    Ok(ended)
+}
+
+/// `GET /me/passkeys`: the user's passkeys.
+///
+/// # Errors
+/// 403 for a bearer caller; 500 for a database failure.
+async fn list_passkeys(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+) -> Result<Json<PasskeyList>, AppError> {
+    let user = session_user(&principal)?;
+    let passkeys = passkeys::list(app.pool(), user.id)
+        .await?
+        .into_iter()
+        .map(PasskeyView::from)
+        .collect();
+    Ok(Json(PasskeyList { passkeys }))
+}
+
+/// `PATCH /me/passkeys/{id}`: renames one of the user's passkeys.
+///
+/// # Returns
+/// 204.
+///
+/// # Errors
+/// 403 for a bearer caller; 404 for an unknown id or another user's
+/// passkey; 422 for a name that is empty, over 64 characters or holds a
+/// control character (`limit: "passkey_name"`).
+async fn rename_passkey(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> Result<StatusCode, AppError> {
+    let user = session_user(&principal)?;
+    let name = passkey_name(&body.name)?;
+    passkeys::rename(app.pool(), user.id, &id, &name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /me/passkeys/{id}`: removes one of the user's passkeys. The
+/// last-method check runs under the user's row lock, so two removals at
+/// once cannot both pass it.
+///
+/// # Returns
+/// 204.
+///
+/// # Errors
+/// 403 for a bearer caller; 404 for an unknown id or another user's
+/// passkey; 409 when it is the user's last sign-in method.
+async fn remove_passkey(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let user = session_user(&principal)?;
+    passkeys::remove(app.pool(), user.id, &id).await?;
+    tracing::info!(user = %user.name, "passkey removed from the account page");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /me/identities`: the user's linked OIDC identities, and the
+/// configured providers.
+///
+/// # Errors
+/// 403 for a bearer caller; 500 for a database failure.
+async fn list_identities(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+) -> Result<Json<IdentityList>, AppError> {
+    let user = session_user(&principal)?;
+    let identities = identities::list(app.pool(), user.id)
+        .await?
+        .into_iter()
+        .map(IdentityView::from)
+        .collect();
+    // `oidc()` is `None` without providers; `labels()` lists them by id.
+    let providers = app.oidc().map_or_else(Vec::new, |oidc| {
+        oidc.labels()
+            .map(|(id, label)| ProviderView {
+                id: id.to_string(),
+                label: label.to_string(),
+            })
+            .collect()
+    });
+    Ok(Json(IdentityList {
+        identities,
+        providers,
+    }))
+}
+
+/// `DELETE /me/identities/{provider}`: unlinks the user's identity at that
+/// provider. The last-method check runs under the user's row lock.
+///
+/// # Returns
+/// 204.
+///
+/// # Errors
+/// 403 for a bearer caller; 404 when none is linked there (another
+/// user's included); 409 when it is the user's last sign-in method.
+async fn unlink_identity(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(provider): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let user = session_user(&principal)?;
+    identities::unlink(app.pool(), user.id, &provider).await?;
+    tracing::info!(user = %user.name, %provider, "identity unlinked from the account page");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /me/sessions`: the user's console sessions, the current one marked.
+///
+/// # Errors
+/// 403 for a bearer caller; 500 for a database failure.
+async fn list_sessions(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    session: Option<Extension<ConsoleSession>>,
+) -> Result<Json<SessionList>, AppError> {
+    let (user, session) = session_and_user(&principal, session)?;
+    let sessions = user_sessions::list(app.pool(), user.id, Some(&session.id))
+        .await?
+        .into_iter()
+        .map(SessionView::from)
+        .collect();
+    Ok(Json(SessionList { sessions }))
+}
+
+/// `DELETE /me/sessions/{id_prefix}`: ends one of the user's sessions (the
+/// current one too, which signs this browser out).
+///
+/// # Returns
+/// 204.
+///
+/// # Errors
+/// 403 for a bearer caller; 404 for a malformed prefix or one that matches
+/// none of the user's sessions (another user's included); 409 for a prefix
+/// that matches several.
+async fn revoke_session(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(id_prefix): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let user = session_user(&principal)?;
+    user_sessions::revoke_by_prefix(app.pool(), user.id, &id_prefix).await?;
+    tracing::info!(user = %user.name, %id_prefix, "session ended from the account page");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /me/sign-ins`: the user's recent sign-in attempts, newest first.
+///
+/// # Errors
+/// 403 for a bearer caller; 500 for a database failure.
+async fn list_sign_ins(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+) -> Result<Json<SignInList>, AppError> {
+    let user = session_user(&principal)?;
+    let sign_ins = sign_in_events::recent(app.pool(), user.name, RECENT_SIGN_INS)
+        .await?
+        .into_iter()
+        .map(SignInView::from)
+        .collect();
+    Ok(Json(SignInList { sign_ins }))
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
     use serde_json::json;
 
-    use super::{key_expiry, requested_levels, within_ceiling, CatalogLevelBody};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::http::StatusCode;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use tokio::time::timeout;
+
+    use super::{key_expiry, requested_levels, within_ceiling, CatalogLevelBody, PasswordBody};
     use crate::db::{TEST_TEAM, TEST_USER};
     use crate::error::OkfError;
-    use crate::http::api::testing::{app, keys, send, Browser, Payload};
+    use crate::http::api::testing::{
+        allow, app, fail_on, keys, send, wait_for_lock_waiters, Browser, Payload, Reply,
+    };
+    use crate::http::console_session::COOKIE;
+    use crate::mail::queue as mail_queue;
     use crate::mcp::testing::TestApp;
     use crate::store::ceiling::{self, Ceiling};
     use crate::store::keys::{insert_legacy_test_key, Access, Grants};
     use crate::store::oauth::clients::ClientKind;
     use crate::store::oauth::codes::{self as code_rows, insert_test_client, NewSignInCode};
+    use crate::store::passkeys::{self, testing::passkey_for};
     use crate::store::settings::{self, SettingKey};
+    use crate::store::sign_in_events::{self, Method, Outcome};
     use crate::store::users::{self, NewUser};
+    use crate::store::{identities, passwords};
 
     /// Creates user `name` with these entitlements, polls, and signs it in.
     async fn member(test: &TestApp, name: &str, grants: &[(&str, Access)]) -> Browser {
@@ -623,6 +1145,58 @@ mod tests {
         }
         test.app.poll().await.expect("poll the user in");
         Browser::session_for(test, name).await
+    }
+
+    /// How long a race test waits for another task or a lock.
+    const BOUND: Duration = Duration::from_secs(30);
+
+    /// The `users.id` of `name`.
+    async fn user_id(test: &TestApp, name: &str) -> String {
+        sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
+            .bind(name)
+            .fetch_one(test.app.pool())
+            .await
+            .expect("the user's id")
+    }
+
+    /// Gives `user_id` a software passkey called `name`.
+    ///
+    /// # Returns
+    /// Its API id (unpadded base64url).
+    async fn add_passkey(test: &TestApp, user_id: &str, name: &str) -> String {
+        let passkey = passkey_for(user_id);
+        passkeys::add(test.app.pool(), user_id, &passkey, name, Utc::now())
+            .await
+            .expect("add the passkey");
+        URL_SAFE_NO_PAD.encode(passkey.cred_id().as_slice())
+    }
+
+    /// How many passkeys and identities `user_id` has.
+    async fn methods_of(test: &TestApp, user_id: &str) -> (i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT count(*) FROM user_passkeys WHERE user_id = $1), \
+                    (SELECT count(*) FROM user_identities WHERE user_id = $1)",
+        )
+        .bind(user_id)
+        .fetch_one(test.app.pool())
+        .await
+        .expect("count the methods")
+    }
+
+    /// The stored password hash of `user_id`.
+    async fn hash_of(test: &TestApp, user_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(test.app.pool())
+            .await
+            .expect("read the hash")
+    }
+
+    /// `PUT /api/v1/me/password` with this body.
+    async fn put_password(test: &TestApp, browser: &mut Browser, body: serde_json::Value) -> Reply {
+        browser
+            .send(test, "PUT", "/api/v1/me/password", Payload::Json(body))
+            .await
     }
 
     /// A create body for one catalog at one level.
@@ -1257,5 +1831,749 @@ mod tests {
         ));
         // An empty field is "no expiry asked for", as the console sends it.
         assert_eq!(key_expiry(Some(""), None, now).expect("empty"), None);
+    }
+
+    #[tokio::test]
+    async fn every_account_route_refuses_a_bearer_key() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let rows: [(&str, &str, Option<serde_json::Value>); 9] = [
+            (
+                "PUT",
+                "/api/v1/me/password",
+                Some(json!({"new_password": "a long new password"})),
+            ),
+            ("GET", "/api/v1/me/passkeys", None),
+            ("PATCH", "/api/v1/me/passkeys/x", Some(json!({"name": "y"}))),
+            ("DELETE", "/api/v1/me/passkeys/x", None),
+            ("GET", "/api/v1/me/identities", None),
+            ("DELETE", "/api/v1/me/identities/example", None),
+            ("GET", "/api/v1/me/sessions", None),
+            ("DELETE", "/api/v1/me/sessions/abcdef012345", None),
+            ("GET", "/api/v1/me/sign-ins", None),
+        ];
+        for (method, uri, body) in rows {
+            let (status, answer) = send(&test, method, uri, Some(&keys.admin), body).await;
+            assert_eq!(status.as_u16(), 403, "{method} {uri}: {answer}");
+        }
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_needs_the_current_one_and_revokes_other_sessions() {
+        let test = app().await;
+        let mut first = member(&test, "alice", &[]).await;
+        let mut second = Browser::session_for(&test, "alice").await;
+        let id = user_id(&test, "alice").await;
+        users::set_email(test.app.pool(), "alice", Some("alice@example.com"))
+            .await
+            .expect("email");
+        passwords::set(test.app.pool(), &id, "correct horse battery", Utc::now())
+            .await
+            .expect("password");
+        let change =
+            |current: &str, new: &str| json!({"current_password": current, "new_password": new});
+
+        let (missing, _) = put_password(
+            &test,
+            &mut first,
+            json!({"new_password": "a long new password"}),
+        )
+        .await
+        .parts();
+        let (wrong, _) = put_password(
+            &test,
+            &mut first,
+            change("not it at all", "a long new password"),
+        )
+        .await
+        .parts();
+        let (weak, refused) =
+            put_password(&test, &mut first, change("correct horse battery", "short"))
+                .await
+                .parts();
+        let unchanged =
+            passwords::verify_user(test.app.pool(), &id, "correct horse battery", Utc::now())
+                .await
+                .expect("verify");
+        let (changed, _) = put_password(
+            &test,
+            &mut first,
+            change("correct horse battery", "a long new password"),
+        )
+        .await
+        .parts();
+        let (kept, _) = first
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+        let (ended, _) = second
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+        let queued = mail_queue::list(test.app.pool()).await.expect("the queue");
+        let now_set =
+            passwords::verify_user(test.app.pool(), &id, "a long new password", Utc::now())
+                .await
+                .expect("verify");
+
+        assert_eq!(missing.as_u16(), 403, "a missing current password");
+        assert_eq!(wrong.as_u16(), 403, "a wrong current password, never 401");
+        assert_eq!(weak.as_u16(), 422);
+        assert_eq!(refused["limit"], "password");
+        assert!(
+            matches!(unchanged, passwords::SignInOutcome::Ok(_)),
+            "refusals change nothing"
+        );
+        assert_eq!(changed.as_u16(), 204);
+        assert_eq!(kept.as_u16(), 200, "the session that changed it stays");
+        assert_eq!(ended.as_u16(), 401, "every other session is revoked");
+        assert!(matches!(now_set, passwords::SignInOutcome::Ok(_)));
+        assert!(
+            queued
+                .iter()
+                .any(|mail| mail.to == "alice@example.com" && mail.template == "method_added"),
+            "{queued:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_locked_account_cannot_change_its_password_and_stays_signed_in() {
+        let test = app().await;
+        let mut alice = member(&test, "alice", &[]).await;
+        let id = user_id(&test, "alice").await;
+        passwords::set(test.app.pool(), &id, "correct horse battery", Utc::now())
+            .await
+            .expect("password");
+        sqlx::query("UPDATE users SET locked_until = now() + interval '1 hour' WHERE id = $1")
+            .bind(&id)
+            .execute(test.app.pool())
+            .await
+            .expect("lock alice");
+        let before = hash_of(&test, &id).await;
+
+        // The right current password, but the account is locked.
+        let (locked, body) = put_password(
+            &test,
+            &mut alice,
+            json!({"current_password": "correct horse battery", "new_password": "a long new password"}),
+        )
+        .await
+        .parts();
+        let (still, _) = alice
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+
+        assert_eq!(locked.as_u16(), 403, "never 401: {body}");
+        assert_eq!(
+            hash_of(&test, &id).await,
+            before,
+            "the password is unchanged"
+        );
+        assert_eq!(still.as_u16(), 200, "the session stays");
+    }
+
+    #[tokio::test]
+    async fn a_first_password_needs_no_current_one_and_keep_sessions_keeps_them() {
+        let test = app().await;
+        let mut first = member(&test, "alice", &[]).await;
+        let mut second = Browser::session_for(&test, "alice").await;
+
+        let (set, _) = put_password(
+            &test,
+            &mut first,
+            json!({"new_password": "a long first password", "keep_sessions": true}),
+        )
+        .await
+        .parts();
+        let (_, me) = first
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+        let (other, _) = second
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+
+        assert_eq!(set.as_u16(), 204);
+        assert_eq!(me["has_password"], true);
+        assert_eq!(other.as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn a_password_change_that_fails_part_way_changes_nothing() {
+        let test = app().await;
+        let mut first = member(&test, "alice", &[]).await;
+        let mut second = Browser::session_for(&test, "alice").await;
+        let id = user_id(&test, "alice").await;
+        passwords::set(test.app.pool(), &id, "correct horse battery", Utc::now())
+            .await
+            .expect("password");
+        let before = hash_of(&test, &id).await;
+        // Ending the other sessions fails: the new password must not stay.
+        fail_on(
+            test.app.pool(),
+            "BEFORE DELETE ON user_sessions FOR EACH ROW",
+        )
+        .await;
+
+        let failed = put_password(
+            &test,
+            &mut first,
+            json!({"current_password": "correct horse battery", "new_password": "a long new password"}),
+        )
+        .await;
+        allow(test.app.pool(), "user_sessions").await;
+        let (other, _) = second
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+
+        assert_eq!(
+            failed.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{}",
+            failed.text()
+        );
+        assert_eq!(hash_of(&test, &id).await, before, "the old password stands");
+        assert_eq!(other.as_u16(), 200, "no session ended");
+    }
+
+    #[test]
+    fn a_password_body_debug_shows_neither_password() {
+        let body: PasswordBody = serde_json::from_value(json!({
+            "current_password": "old secret words",
+            "new_password": "new secret words",
+            "keep_sessions": true,
+        }))
+        .expect("a body");
+
+        let shown = format!("{body:?}");
+
+        assert!(shown.contains("keep_sessions: true"), "{shown}");
+        assert!(!shown.contains("secret"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn sessions_list_marks_the_current_one_and_revoke_by_prefix() {
+        let test = app().await;
+        let mut first = member(&test, "alice", &[]).await;
+        let mut second = Browser::session_for(&test, "alice").await;
+
+        let (_, listed) = first
+            .send(&test, "GET", "/api/v1/me/sessions", Payload::Empty)
+            .await
+            .parts();
+        let sessions = listed["sessions"].as_array().expect("a list").clone();
+        let other = sessions
+            .iter()
+            .find(|session| session["current"] == false)
+            .expect("the other session")["id_prefix"]
+            .as_str()
+            .expect("a prefix")
+            .to_string();
+        let (short, _) = first
+            .send(
+                &test,
+                "DELETE",
+                &format!("/api/v1/me/sessions/{}", &other[..6]),
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        // A fixed prefix with uppercase A-F: an uppercased real prefix can be
+        // all digits (about 0.36% of the time), and then it is valid.
+        let (upper, _) = first
+            .send(
+                &test,
+                "DELETE",
+                "/api/v1/me/sessions/ABCDEF012345",
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (revoked, _) = first
+            .send(
+                &test,
+                "DELETE",
+                &format!("/api/v1/me/sessions/{other}"),
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (ended, _) = second
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+        let (_, after) = first
+            .send(&test, "GET", "/api/v1/me/sessions", Payload::Empty)
+            .await
+            .parts();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.iter().filter(|s| s["current"] == true).count(), 1);
+        // Exactly these fields: never the id or the CSRF token.
+        let mut fields: Vec<&str> = sessions[0]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "created_at",
+                "current",
+                "id_prefix",
+                "ip",
+                "last_seen_at",
+                "user_agent"
+            ]
+        );
+        let text = listed.to_string();
+        for secret in [first.cookie(COOKIE), first.csrf.as_deref()] {
+            assert!(!text.contains(secret.expect("a secret")), "{text}");
+        }
+        assert_eq!(short.as_u16(), 404, "a short prefix");
+        assert_eq!(upper.as_u16(), 404, "only lowercase hex");
+        assert_eq!(revoked.as_u16(), 204);
+        assert_eq!(ended.as_u16(), 401);
+        assert_eq!(after["sessions"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_session_prefix_shared_by_two_sessions_is_refused() {
+        let test = app().await;
+        let mut alice = member(&test, "alice", &[]).await;
+        let id = user_id(&test, "alice").await;
+        for last in [1_u8, 2] {
+            let mut hash = vec![0xcd_u8; 32];
+            hash[31] = last;
+            sqlx::query(
+                "INSERT INTO user_sessions \
+                     (id_hash, user_id, csrf_token, created_at, last_seen_at, expires_at) \
+                 VALUES ($1, $2, '', now(), now(), now() + interval '1 day')",
+            )
+            .bind(hash)
+            .bind(&id)
+            .execute(test.app.pool())
+            .await
+            .expect("insert a session");
+        }
+
+        let (status, body) = alice
+            .send(
+                &test,
+                "DELETE",
+                "/api/v1/me/sessions/cdcdcdcdcdcd",
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (_, listed) = alice
+            .send(&test, "GET", "/api/v1/me/sessions", Payload::Empty)
+            .await
+            .parts();
+
+        assert_eq!(status.as_u16(), 409, "{body}");
+        assert_eq!(
+            listed["sessions"].as_array().map(Vec::len),
+            Some(3),
+            "none ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_users_passkey_identity_and_session_are_404s() {
+        let test = app().await;
+        let mut alice = member(&test, "alice", &[]).await;
+        let mut bob = member(&test, "bob", &[]).await;
+        let bob_id = user_id(&test, "bob").await;
+        passwords::set(
+            test.app.pool(),
+            &bob_id,
+            "a long first password",
+            Utc::now(),
+        )
+        .await
+        .expect("password");
+        let bobs_passkey = add_passkey(&test, &bob_id, "Bob's phone").await;
+        identities::link(
+            test.app.pool(),
+            &bob_id,
+            "example",
+            "sub-b",
+            "bob@example.com",
+            Utc::now(),
+        )
+        .await
+        .expect("link");
+        let (_, bobs) = bob
+            .send(&test, "GET", "/api/v1/me/sessions", Payload::Empty)
+            .await
+            .parts();
+        let bobs_prefix = bobs["sessions"][0]["id_prefix"]
+            .as_str()
+            .expect("a prefix")
+            .to_string();
+
+        let (rename, _) = alice
+            .send(
+                &test,
+                "PATCH",
+                &format!("/api/v1/me/passkeys/{bobs_passkey}"),
+                Payload::Json(json!({"name": "mine now"})),
+            )
+            .await
+            .parts();
+        let (remove, _) = alice
+            .send(
+                &test,
+                "DELETE",
+                &format!("/api/v1/me/passkeys/{bobs_passkey}"),
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (unlink, _) = alice
+            .send(
+                &test,
+                "DELETE",
+                "/api/v1/me/identities/example",
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (revoke, _) = alice
+            .send(
+                &test,
+                "DELETE",
+                &format!("/api/v1/me/sessions/{bobs_prefix}"),
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (_, alices_passkeys) = alice
+            .send(&test, "GET", "/api/v1/me/passkeys", Payload::Empty)
+            .await
+            .parts();
+        let (bob_still, _) = bob
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+        let (_, bobs_passkeys) = bob
+            .send(&test, "GET", "/api/v1/me/passkeys", Payload::Empty)
+            .await
+            .parts();
+
+        assert_eq!(rename.as_u16(), 404);
+        assert_eq!(remove.as_u16(), 404);
+        assert_eq!(unlink.as_u16(), 404);
+        assert_eq!(revoke.as_u16(), 404);
+        assert_eq!(alices_passkeys, json!({"passkeys": []}));
+        assert_eq!(bob_still.as_u16(), 200, "bob's session lives");
+        assert_eq!(bobs_passkeys["passkeys"][0]["name"], "Bob's phone");
+        assert_eq!(methods_of(&test, &bob_id).await, (1, 1), "bob keeps both");
+    }
+
+    #[tokio::test]
+    async fn passkeys_list_rename_and_remove_while_another_method_remains() {
+        let test = app().await;
+        let mut alice = member(&test, "alice", &[]).await;
+        let id = user_id(&test, "alice").await;
+        let laptop = add_passkey(&test, &id, "Laptop").await;
+        let phone = add_passkey(&test, &id, "Phone").await;
+
+        let (_, listed) = alice
+            .send(&test, "GET", "/api/v1/me/passkeys", Payload::Empty)
+            .await
+            .parts();
+        let (renamed, _) = alice
+            .send(
+                &test,
+                "PATCH",
+                &format!("/api/v1/me/passkeys/{laptop}"),
+                Payload::Json(json!({"name": "  Work laptop  "})),
+            )
+            .await
+            .parts();
+        let (bad_name, bad) = alice
+            .send(
+                &test,
+                "PATCH",
+                &format!("/api/v1/me/passkeys/{laptop}"),
+                Payload::Json(json!({"name": "a\u{0}b"})),
+            )
+            .await
+            .parts();
+        let (removed, _) = alice
+            .send(
+                &test,
+                "DELETE",
+                &format!("/api/v1/me/passkeys/{phone}"),
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (last, _) = alice
+            .send(
+                &test,
+                "DELETE",
+                &format!("/api/v1/me/passkeys/{laptop}"),
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (_, after) = alice
+            .send(&test, "GET", "/api/v1/me/passkeys", Payload::Empty)
+            .await
+            .parts();
+
+        let mut fields: Vec<&str> = listed["passkeys"][0]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            ["created_at", "id", "last_used_at", "name"],
+            "no public key"
+        );
+        assert_eq!(listed["passkeys"][0]["id"], laptop.as_str());
+        assert_eq!(renamed.as_u16(), 204);
+        assert_eq!(bad_name.as_u16(), 422);
+        assert_eq!(bad["limit"], "passkey_name");
+        assert_eq!(removed.as_u16(), 204);
+        assert_eq!(last.as_u16(), 409, "the last sign-in method stays");
+        assert_eq!(after["passkeys"][0]["name"], "Work laptop");
+        assert_eq!(after["passkeys"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn sign_ins_list_the_users_recent_events_newest_first() {
+        let test = app().await;
+        let mut alice = member(&test, "alice", &[]).await;
+        member(&test, "bob", &[]).await;
+        let id = user_id(&test, "alice").await;
+        let bob_id = user_id(&test, "bob").await;
+        let earlier = Utc::now() - TimeDelta::minutes(5);
+        let pool = test.app.pool();
+        sign_in_events::record(
+            pool,
+            Some(&id),
+            Method::Password,
+            Outcome::Failed,
+            None,
+            earlier,
+        )
+        .await
+        .expect("record");
+        sign_in_events::record(
+            pool,
+            Some(&id),
+            Method::Passkey,
+            Outcome::Ok,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("record");
+        sign_in_events::record(
+            pool,
+            Some(&bob_id),
+            Method::Oidc,
+            Outcome::Ok,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("record");
+
+        let (status, body) = alice
+            .send(&test, "GET", "/api/v1/me/sign-ins", Payload::Empty)
+            .await
+            .parts();
+
+        assert_eq!(status.as_u16(), 200, "{body}");
+        let events = body["sign_ins"].as_array().expect("a list");
+        assert_eq!(events.len(), 2, "only alice's: {body}");
+        assert_eq!(events[0]["method"], "passkey");
+        assert_eq!(events[0]["outcome"], "ok");
+        assert_eq!(events[1]["method"], "password");
+        assert_eq!(events[1]["outcome"], "failed");
+        assert_eq!(events[1]["ip"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn identities_unlink_unless_last_and_passkey_routes_answer_404_for_unknown_ids() {
+        let test = app().await;
+        let mut alice = member(&test, "alice", &[]).await;
+        let id = user_id(&test, "alice").await;
+        identities::link(
+            test.app.pool(),
+            &id,
+            "example",
+            "sub-1",
+            "alice@example.com",
+            Utc::now(),
+        )
+        .await
+        .expect("link");
+
+        let (_, listed) = alice
+            .send(&test, "GET", "/api/v1/me/identities", Payload::Empty)
+            .await
+            .parts();
+        let (last, _) = alice
+            .send(
+                &test,
+                "DELETE",
+                "/api/v1/me/identities/example",
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        passwords::set(test.app.pool(), &id, "a long first password", Utc::now())
+            .await
+            .expect("password");
+        // A NUL, which Postgres refuses, is an unknown provider, not a 500.
+        let (malformed, _) = alice
+            .send(
+                &test,
+                "DELETE",
+                "/api/v1/me/identities/ex%00ample",
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (unlinked, _) = alice
+            .send(
+                &test,
+                "DELETE",
+                "/api/v1/me/identities/example",
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (again, _) = alice
+            .send(
+                &test,
+                "DELETE",
+                "/api/v1/me/identities/example",
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (_, passkeys) = alice
+            .send(&test, "GET", "/api/v1/me/passkeys", Payload::Empty)
+            .await
+            .parts();
+        let (rename, _) = alice
+            .send(
+                &test,
+                "PATCH",
+                "/api/v1/me/passkeys/AAAA",
+                Payload::Json(json!({"name": "phone"})),
+            )
+            .await
+            .parts();
+        let (remove, _) = alice
+            .send(&test, "DELETE", "/api/v1/me/passkeys/AAAA", Payload::Empty)
+            .await
+            .parts();
+        let (not_base64, _) = alice
+            .send(
+                &test,
+                "DELETE",
+                "/api/v1/me/passkeys/%00%21",
+                Payload::Empty,
+            )
+            .await
+            .parts();
+
+        assert_eq!(listed["identities"][0]["provider"], "example");
+        assert_eq!(
+            listed["identities"][0]["email_at_link"],
+            "alice@example.com"
+        );
+        assert!(listed["identities"][0].get("subject").is_none(), "{listed}");
+        assert_eq!(
+            listed["providers"],
+            json!([]),
+            "this app configures no provider"
+        );
+        assert_eq!(last.as_u16(), 409, "the last sign-in method stays");
+        assert_eq!(malformed.as_u16(), 404);
+        assert_eq!(unlinked.as_u16(), 204);
+        assert_eq!(again.as_u16(), 404);
+        assert_eq!(passkeys, json!({"passkeys": []}));
+        assert_eq!(rename.as_u16(), 404);
+        assert_eq!(remove.as_u16(), 404);
+        assert_eq!(not_base64.as_u16(), 404);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_removals_at_once_leave_the_last_sign_in_method() {
+        let test = Arc::new(app().await);
+        let first = member(&test, "alice", &[]).await;
+        let id = user_id(&test, "alice").await;
+        let passkey = add_passkey(&test, &id, "Phone").await;
+        identities::link(
+            test.app.pool(),
+            &id,
+            "example",
+            "sub-1",
+            "alice@example.com",
+            Utc::now(),
+        )
+        .await
+        .expect("link");
+        // Started before alice's row is held: a session insert takes that
+        // row `FOR SHARE`, so it would wait on the holder below forever.
+        let second = Browser::session_for(&test, "alice").await;
+        let pool = test.app.pool().clone();
+        // Hold alice's row, so both removals are queued on it before either
+        // counts her methods: each would see two without the lock.
+        let mut holder = pool.begin().await.expect("begin");
+        sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(&id)
+            .execute(&mut *holder)
+            .await
+            .expect("hold alice");
+        // `tokio::spawn` runs each removal on its own task, like
+        // `asyncio.create_task`; `move` hands each owned copies.
+        let remove = |mut browser: Browser, uri: String| {
+            let test = Arc::clone(&test);
+            tokio::spawn(async move {
+                browser
+                    .send(&test, "DELETE", &uri, Payload::Empty)
+                    .await
+                    .status
+            })
+        };
+        let passkey_removal = remove(first, format!("/api/v1/me/passkeys/{passkey}"));
+        let identity_removal = remove(second, "/api/v1/me/identities/example".to_string());
+        // Bounded, and the holder is released before any failure is
+        // reported, so a broken lock order fails fast instead of hanging.
+        let queued = timeout(BOUND, wait_for_lock_waiters(&pool, 2)).await;
+        holder.commit().await.expect("release alice");
+        queued.expect("both removals to queue on alice's row within 30 s");
+        let passkey_status = timeout(BOUND, passkey_removal)
+            .await
+            .expect("the passkey removal to finish within 30 s")
+            .expect("the passkey task");
+        let identity_status = timeout(BOUND, identity_removal)
+            .await
+            .expect("the identity removal to finish within 30 s")
+            .expect("the identity task");
+        let mut statuses = [passkey_status.as_u16(), identity_status.as_u16()];
+        statuses.sort_unstable();
+
+        assert_eq!(statuses, [204, 409], "exactly one removal passes");
+        let (passkeys, identities) = methods_of(&test, &id).await;
+        assert_eq!(passkeys + identities, 1, "one way to sign in remains");
     }
 }

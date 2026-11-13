@@ -22,6 +22,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgExecutor, PgPool};
 
+use crate::config::is_provider_id;
 use crate::error::OkfError;
 use crate::store::catalogs::is_unique_violation;
 use crate::store::sign_in_methods;
@@ -450,9 +451,21 @@ pub async fn list(pool: &PgPool, user_id: &str) -> Result<Vec<IdentityInfo>, Okf
 /// unknown); [`OkfError::Refused`] for the last sign-in method;
 /// [`OkfError::Database`].
 pub async fn unlink(pool: &PgPool, user_id: &str, provider: &str) -> Result<(), OkfError> {
+    let not_linked = || OkfError::NotFound {
+        path: format!("me/identities/{provider}"),
+    };
+    // Only a well-formed provider id can be linked, so anything else (a
+    // NUL, which Postgres would refuse with a 500, included) is unknown.
+    if !is_provider_id(provider) {
+        return Err(not_linked());
+    }
     let mut tx = pool.begin().await?;
-    // Locks the user's row first.
-    let methods = sign_in_methods::count(&mut tx, user_id).await?;
+    // Locks the user's row first, so two removals of different methods run
+    // one at a time. An unknown user has nothing linked.
+    let methods = match sign_in_methods::count(&mut tx, user_id).await {
+        Err(OkfError::NotFound { .. }) => return Err(not_linked()),
+        other => other?,
+    };
     let linked: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM user_identities WHERE user_id = $1 AND provider = $2",
     )
@@ -461,9 +474,7 @@ pub async fn unlink(pool: &PgPool, user_id: &str, provider: &str) -> Result<(), 
     .fetch_one(&mut *tx)
     .await?;
     if linked == 0 {
-        return Err(OkfError::NotFound {
-            path: format!("me/identities/{provider}"),
-        });
+        return Err(not_linked());
     }
     if methods - linked < 1 {
         return Err(OkfError::Refused {

@@ -527,7 +527,9 @@ pub async fn list(
         .collect())
 }
 
-/// Ends one of a user's sessions by its [`SessionInfo::id_prefix`].
+/// Ends one of a user's sessions by its [`SessionInfo::id_prefix`]. A
+/// prefix that matches more than one of the user's sessions (48 bits make
+/// that rare, but possible) ends none of them: a revoke names one session.
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -539,7 +541,8 @@ pub async fn list(
 ///
 /// # Errors
 /// [`OkfError::UnknownName`] with `noun: "session"` for a malformed prefix
-/// or one that matches none of the user's sessions; [`OkfError::Database`].
+/// or one that matches none of the user's sessions; [`OkfError::Refused`]
+/// for one that matches several; [`OkfError::Database`].
 pub async fn revoke_by_prefix(
     pool: &PgPool,
     user_id: &str,
@@ -556,18 +559,37 @@ pub async fn revoke_by_prefix(
     if !well_formed {
         return Err(unknown());
     }
-    let deleted = sqlx::query(
-        "DELETE FROM user_sessions \
-         WHERE user_id = $1 AND encode(substring(id_hash FROM 1 FOR 6), 'hex') = $2",
+    // The matches are locked, then deleted only when there is exactly one.
+    // Session rows only, no user row: nothing here can close a lock cycle
+    // with a transaction that takes the user first (`email_tokens`' docs).
+    let mut tx = pool.begin().await?;
+    let matched: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT id_hash FROM user_sessions \
+         WHERE user_id = $1 AND encode(substring(id_hash FROM 1 FOR 6), 'hex') = $2 \
+         FOR UPDATE",
     )
     .bind(user_id)
     .bind(id_prefix)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    if deleted == 0 {
-        return Err(unknown());
-    }
+    .fetch_all(&mut *tx)
+    .await?;
+    // A slice pattern, like matching on `len()` and indexing in one step.
+    let [only] = matched.as_slice() else {
+        return Err(if matched.is_empty() {
+            unknown()
+        } else {
+            OkfError::Refused {
+                reason: format!(
+                    "{} sessions start with {id_prefix}; revoke them another way",
+                    matched.len()
+                ),
+            }
+        });
+    };
+    sqlx::query("DELETE FROM user_sessions WHERE id_hash = $1")
+        .bind(only.as_slice())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1086,6 +1108,37 @@ mod tests {
 
         assert!(matches!(refused, Err(OkfError::UnknownName { .. })));
         assert_eq!(list(&db.pool, &bob.id, None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prefix_two_sessions_share_ends_neither() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        // Two stored hashes with the same first six bytes, as two random
+        // ids could have (no real id is needed to list or revoke).
+        for last in [1_u8, 2] {
+            let mut hash = vec![0xab_u8; 32];
+            hash[31] = last;
+            sqlx::query(
+                "INSERT INTO user_sessions \
+                     (id_hash, user_id, csrf_token, created_at, last_seen_at, expires_at) \
+                 VALUES ($1, $2, '', $3, $3, $3 + interval '1 day')",
+            )
+            .bind(hash)
+            .bind(&alice.id)
+            .bind(now())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        let refused = revoke_by_prefix(&db.pool, &alice.id, "abababababab").await;
+
+        assert!(
+            matches!(refused, Err(OkfError::Refused { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(list(&db.pool, &alice.id, None).await.unwrap().len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
