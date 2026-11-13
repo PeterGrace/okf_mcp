@@ -14,8 +14,13 @@ export function accessPill(access) {
 // `ceiling` ({catalog: level}, as GET /api/v1/session gives it): where the
 // ceiling lowers a level, or no longer reaches the catalog, the cell says
 // so (the server caps the credential at its next key reload). An
-// admin-issued one keeps its levels.
+// admin-issued one keeps its levels. One granted every catalog (only an
+// admin issues those) has an empty `catalog_access`: its one level is
+// `access`.
 export function levelsCell(credential, ceiling = {}) {
+    if (credential.all_catalogs) {
+        return h('span', {}, 'All catalogs ', accessPill(credential.access));
+    }
     const granted = Object.entries(credential.catalog_access ?? {});
     if (!granted.length) return '-';
     return h('ul', { class: 'level-list' }, granted.map(([catalog, access]) => {

@@ -288,6 +288,108 @@ async fn a_member_creates_a_key_within_the_ceiling_and_sees_its_secret_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lifetime_limit_shapes_the_expiry_choices_and_the_longest_is_the_default() {
+    let server = login_server().await;
+    member(&server, Access::Write).await;
+    settings::set(
+        &server.db.pool,
+        SettingKey::MaxKeyLifetime,
+        "30d",
+        "tester",
+        Utc::now(),
+    )
+    .await
+    .expect("limit key lifetimes to 30 days");
+    server.app.poll().await.expect("poll");
+    // The expiry the API reports for the new key, handed out of the
+    // journey's thread.
+    let reported = Arc::new(Mutex::new(String::new()));
+    let seen = Arc::clone(&reported);
+    let ran = drive(console_base(&server), move |ui| {
+        ui.sign_in_password(EMAIL, PASSWORD);
+        ui.open("/my-keys");
+        ui.click("#my-key-new");
+        ui.wait_visible("#my-key-form");
+        // 7 days fits under the limit; 30 days is the limit itself (offered
+        // once, as "the longest allowed", and chosen); 90 days, a year and
+        // Never are past it.
+        assert_eq!(
+            ui.eval(
+                "() => { const select = document.querySelector('#my-key-form select[name=expires_in]'); \
+                 return { values: [...select.options].map(option => option.value), \
+                 chosen: select.value, label: select.selectedOptions[0].textContent }; }",
+                json!(null)
+            ),
+            json!({
+                "values": ["7d", "longest"],
+                "chosen": "longest",
+                "label": "30 days (the longest allowed)",
+            })
+        );
+        ui.fill("#my-key-form input[name=name]", "bounded");
+        ui.click("#my-key-form input[name=catalog][value=main]");
+        ui.click("#my-key-form button[type=submit]");
+        ui.wait_visible("#my-key-secret");
+        ui.click("#my-key-secret-done");
+        ui.wait_text("[data-test=my-key-bounded]", "bounded");
+        let expires = ui.eval(
+            "async () => (await (await fetch('/api/v1/me/keys')).json()) \
+             .keys.find(key => key.name === 'bounded').expires_at",
+            json!(null),
+        );
+        *seen.lock().expect("the expiry's lock") =
+            expires.as_str().expect("an expiry").to_string();
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    // The page sent no expiry, so the server set its limit: about now + 30d.
+    let expires = chrono::DateTime::parse_from_rfc3339(&reported.lock().expect("lock"))
+        .expect("an RFC 3339 expiry")
+        .with_timezone(&Utc);
+    let expected = Utc::now() + chrono::TimeDelta::days(30);
+    assert!(
+        (expected - expires).num_seconds().abs() < 300,
+        "expires {expires}, expected about {expected}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admin_issued_key_for_every_catalog_shows_its_level() {
+    let server = login_server().await;
+    member(&server, Access::Write).await;
+    let new = NewKey {
+        name: "ops",
+        access: Access::Admin,
+        maintenance_report: false,
+        grants: Grants::All,
+        default_catalog: None,
+        actor: "ops",
+        user: "alice",
+        self_issued: false,
+        expires_at: None,
+        levels: &[],
+    };
+    key_rows::create(&server.db.pool, &new, Utc::now())
+        .await
+        .expect("an admin issues alice a key for every catalog");
+    server.app.poll().await.expect("poll");
+    drive(console_base(&server), |ui| {
+        ui.sign_in_password(EMAIL, PASSWORD);
+        ui.open("/my-keys");
+        ui.wait_text(
+            "#my-keys-table tr:has([data-test=my-key-ops]) td:nth-child(2)",
+            "All catalogs admin",
+        );
+        ui.click("[data-test=my-key-ops]");
+        ui.wait_text("#drawer dl.facts", "All catalogs admin");
+        ui.wait_text("#drawer dl.facts", "an admin (not capped by your ceiling)");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_key_the_ceiling_no_longer_allows_is_refused_and_names_the_limit() {
     let server = login_server().await;
     member(&server, Access::Write).await;
