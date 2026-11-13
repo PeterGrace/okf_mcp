@@ -49,6 +49,27 @@ export function requireSession(main, id) {
     return false;
 }
 
+// GET /api/v1/me, fresh on every load of an account page: the ceiling and
+// everything else it shows come from this answer, never from the sign-in
+// snapshot, since an admin may have changed them since. Its ceiling
+// ([{catalog, access}]) replaces the session's ({catalog: level}, as GET
+// /api/v1/session spells it), so the cap notes and `store.can` follow too.
+// Rejects as api.get does (already toasted).
+export async function freshAccount() {
+    const account = await api.get('/me');
+    if (store.session) {
+        store.session.ceiling = Object.fromEntries(account.ceiling.map(({ catalog, access }) => [catalog, access]));
+    }
+    return account;
+}
+
+// How the console leaves a session it ended itself: main.js installs it
+// (the shell's Sign out uses the same one), and the Account page calls
+// signedOut() after signing this browser's own session out.
+let leave = () => {};
+export function setSignedOutHandler(handler) { leave = handler; }
+export function signedOut() { leave(); }
+
 // After a key's user changed: when it is the signed-in key, its user is
 // shell state (#whoami, the Users page's "you" marker), so reload whoami.
 // Every path that assigns a key calls this.

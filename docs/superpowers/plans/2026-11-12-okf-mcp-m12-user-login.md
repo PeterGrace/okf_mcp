@@ -22216,9 +22216,11 @@ const OUTCOME_KIND = { ok: 'ok', failed: 'warn', locked: 'error' };
 
 // sessions: [{id_prefix, created_at, last_seen_at, ip, user_agent, current?}].
 // Each row but the current one has a Sign out button calling revoke(row);
-// `prefix` starts its data-test (`<prefix>-<id_prefix>`,
-// `<prefix>-revoke-<id_prefix>`), and `allowed` false disables it.
-export function sessionTable({ id, sessions, prefix, revoke, allowed = true }) {
+// with `revokeCurrent`, the current one has one too (the Account page signs
+// this browser out with it). `prefix` starts its data-test
+// (`<prefix>-<id_prefix>`, `<prefix>-revoke-<id_prefix>`), and `allowed`
+// false disables it.
+export function sessionTable({ id, sessions, prefix, revoke, allowed = true, revokeCurrent = false }) {
     const table = listTable([
         { key: 'user_agent', label: 'Browser',
           render: row => h('span', { class: 'small', dataset: { test: `${prefix}-${row.id_prefix}` } },
@@ -22227,7 +22229,7 @@ export function sessionTable({ id, sessions, prefix, revoke, allowed = true }) {
         { key: 'created_at', label: 'Signed in', sort: row => row.created_at, render: row => when(row.created_at) },
         { key: 'last_seen_at', label: 'Last seen', sort: row => row.last_seen_at, render: row => ago(row.last_seen_at) },
         { key: 'actions', label: '',
-          render: row => row.current ? '-' : h('button', {
+          render: row => row.current && !revokeCurrent ? '-' : h('button', {
               type: 'button', class: 'text-btn', disabled: !allowed,
               dataset: { test: `${prefix}-revoke-${row.id_prefix}` }, onclick: () => revoke(row),
           }, 'Sign out') },
@@ -22793,6 +22795,15 @@ Routes this task calls:
 - Test: `tests/ui_e2e/account.rs`, `tests/ui_e2e/self_service.rs`
 
 The rendering rules of Task 14a hold (`h()` and `fill()` only; no conditional `null` to the DOM's native methods).
+
+> **Corrected (issue #325, 2026-11-13).** What shipped differs from the code below in these ways; read `src/http/ui/js/pages/my-grants.js`, `pages/account.js` and `tests/ui_e2e/account.rs` for the final form.
+> - **The ceiling comes from `/me` on every load.** `core/shell.js` gained `freshAccount()`: it GETs `/api/v1/me` and makes `store.session.ceiling` the ceiling it gives (the `{catalog: level}` map). My keys (replacing its local `ceilingMap`), My grants (beside `/me/grants`, so its cap notes follow an admin's change) and Account (`drawAccount`) all call it; none reads the sign-in snapshot.
+> - **Refusals show the server's reason.** `PUT /me/password` and `register/finish` are sent `quiet`, and the page toasts the reason (minus the `forbidden: ` prefix): a wrong current password says "the current password is incorrect", not api.js's generic 403 text, and keeps the session. A cancelled passkey prompt is an `info` toast, not an error.
+> - **This browser's session has a Sign out too.** `sessionTable` takes `revokeCurrent` (default `false`, so Task 15's drawer is unchanged). On Account, signing the current session out asks first, then calls `shell.signedOut()`, the same path the shell's Sign out uses (`main.js` registers it with `setSignedOutHandler`): the card at `/ui/`, no credential kept.
+> - **The client cell** carries `class: 'key-name'` (no wrapping), so a click lands on it.
+> - **A credential that fails verification is 422, not 401** (`src/http/passkeys.rs`, `registration_refused`): `register/finish` (and `setup/finish`, and a refused `start`) answered 401 for it, which the console reads as "signed out" though the session is live. It is `LimitExceeded { limit: "passkey" }` now, like a bad passkey name; 401 stays only for a session that ended. Passkey sign-in keeps its 401. Test: `http::passkeys::tests::a_credential_that_does_not_verify_is_422_and_the_session_lives_on`.
+> - **The OIDC mock is its own file**, `src/oidc/testing.rs` (was inline in `src/oidc.rs`), so the browser tests compile it in (`tests/ui_e2e/main.rs`, `mod oidc_mock`); `self_service::login_server_with(auth)` starts a login server with OIDC providers.
+> - **More journeys:** `a_bad_credential_at_finish_shows_the_reason_and_keeps_the_session`, `a_member_links_an_identity_and_keeps_their_other_sessions` (the mock provider, round trip back to `#/account`, other session kept), `a_refused_link_shows_the_reason_and_stays_on_the_page`, `a_wrong_current_password_is_refused_and_keeps_the_session`, `a_member_adds_a_passkey_with_the_browser_and_other_sessions_end` (Task 8's virtual authenticator), `the_last_sign_in_method_stays_and_the_page_says_why` (the 409) and `signing_this_browser_out_from_the_account_page_ends_its_session`. The ceiling journey also entitles alice to `other` mid-session and sees it on Account, and the My grants journey takes `main` out of her ceiling after sign-in and expects "(outside your ceiling now)".
 
 - [ ] **Step 1: Write the failing account journeys.** Add `mod account;` to `tests/ui_e2e/main.rs` (first, in alphabetical order). Create `tests/ui_e2e/account.rs`:
 
