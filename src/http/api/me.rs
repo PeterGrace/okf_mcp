@@ -1937,6 +1937,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_locked_account_cannot_change_its_password_and_stays_signed_in() {
+        let test = app().await;
+        let mut alice = member(&test, "alice", &[]).await;
+        let id = user_id(&test, "alice").await;
+        passwords::set(test.app.pool(), &id, "correct horse battery", Utc::now())
+            .await
+            .expect("password");
+        sqlx::query("UPDATE users SET locked_until = now() + interval '1 hour' WHERE id = $1")
+            .bind(&id)
+            .execute(test.app.pool())
+            .await
+            .expect("lock alice");
+        let before = hash_of(&test, &id).await;
+
+        // The right current password, but the account is locked.
+        let (locked, body) = put_password(
+            &test,
+            &mut alice,
+            json!({"current_password": "correct horse battery", "new_password": "a long new password"}),
+        )
+        .await
+        .parts();
+        let (still, _) = alice
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+
+        assert_eq!(locked.as_u16(), 403, "never 401: {body}");
+        assert_eq!(
+            hash_of(&test, &id).await,
+            before,
+            "the password is unchanged"
+        );
+        assert_eq!(still.as_u16(), 200, "the session stays");
+    }
+
+    #[tokio::test]
     async fn a_first_password_needs_no_current_one_and_keep_sessions_keeps_them() {
         let test = app().await;
         let mut first = member(&test, "alice", &[]).await;
@@ -2044,11 +2081,13 @@ mod tests {
             )
             .await
             .parts();
+        // A fixed prefix with uppercase A-F: an uppercased real prefix can be
+        // all digits (about 0.36% of the time), and then it is valid.
         let (upper, _) = first
             .send(
                 &test,
                 "DELETE",
-                &format!("/api/v1/me/sessions/{}", other.to_uppercase()),
+                "/api/v1/me/sessions/ABCDEF012345",
                 Payload::Empty,
             )
             .await
