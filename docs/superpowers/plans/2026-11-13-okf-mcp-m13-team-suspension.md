@@ -6,7 +6,7 @@
 
 **Architecture:**
 - **One additive migration (`0011`):** `teams.suspended_at` and `teams.suspension_notice`.
-- **Suspension in the key cache.** `KeyCache` loads a map of suspended catalogs (catalog name to `{team, notice}`), and every `Principal` it builds, including console sessions, shares it through an `Arc`. Suspending and lifting bump `admin_generation`, and the route settles (polls) before answering, so the next request sees it.
+- **Suspension in the key cache.** `KeyCache` loads a map of suspended catalogs (catalog name to `{team, notice}`), and every `Principal` it builds, including console sessions, shares it through an `Arc`. Suspending and lifting bump `admin_generation`, and the route settles (polls) before answering, so the next request sees it when that poll succeeds; if the poll or reload fails, the committed change takes effect at the poll loop's next successful pass (within `poll_interval`), as for every other team write. *(Qualified, PR #360 review, 2026-11-13.)*
 - **Two choke points.** `Principal::require` (every write, every pinned changeset, every REST route that checks access itself) and `selection::resolve` (every MCP read, and every REST route that runs a tool through a `ToolContext`). Admin credentials are exempt. A new `Principal::require_export` skips the suspension check, and the export handler uses it.
 - **Listing stays honest.** `list_catalogs` and `GET /api/v1/catalogs` mark a suspended catalog instead of hiding it.
 
