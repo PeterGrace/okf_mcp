@@ -628,8 +628,7 @@ async fn revoke_session(
     require_every_catalog(&principal)?;
     let id = users::id_by_name(app.pool(), &name).await?;
     user_sessions::revoke_by_prefix(app.pool(), &id, &id_prefix).await?;
-    // The prefix tells sessions apart and signs nobody in, so it may be logged.
-    tracing::info!(user = %name, %id_prefix, key = %principal.key_id, actor = %principal.actor,
+    tracing::info!(user = %name, key = %principal.key_id, actor = %principal.actor,
                    "session ended by an admin");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1385,6 +1384,50 @@ mod tests {
         assert_eq!(second_out.as_u16(), 401);
         assert_eq!(unknown.as_u16(), 404);
         assert_eq!(unknown_sign_ins.as_u16(), 404);
+    }
+
+    #[tokio::test]
+    async fn a_prefix_several_sessions_share_is_a_409_and_ends_none() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        let id = detail_id(&test, "alice").await;
+        // Two stored hashes with the same first six bytes, as two random ids
+        // could have (no real id is needed to list or revoke).
+        for last in [1_u8, 2] {
+            let mut hash = vec![0xab_u8; 32];
+            hash[31] = last;
+            sqlx::query(
+                "INSERT INTO user_sessions \
+                     (id_hash, user_id, csrf_token, created_at, last_seen_at, expires_at) \
+                 VALUES ($1, $2, '', now(), now(), now() + interval '1 day')",
+            )
+            .bind(hash)
+            .bind(&id)
+            .execute(test.app.pool())
+            .await
+            .expect("seed a session");
+        }
+
+        let (status, _) = send(
+            &test,
+            "DELETE",
+            "/api/v1/users/alice/sessions/abababababab",
+            Some(&root),
+            None,
+        )
+        .await;
+        let (_, listed) = send(
+            &test,
+            "GET",
+            "/api/v1/users/alice/sessions",
+            Some(&root),
+            None,
+        )
+        .await;
+
+        assert_eq!(status.as_u16(), 409);
+        assert_eq!(listed["sessions"].as_array().map(Vec::len), Some(2));
     }
 
     #[tokio::test]

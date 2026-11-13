@@ -172,7 +172,10 @@ mod tests {
     use crate::http::api::testing::{
         app, assert_matrix_with, every_catalog_admin, keys, send, Row,
     };
+    use crate::http::api::testing::{Browser, Payload};
     use crate::mail::{queue, Template};
+    use crate::mcp::testing::TestApp;
+    use crate::store::users;
 
     #[tokio::test]
     async fn mail_routes_need_an_admin_to_read_and_one_reaching_every_catalog_to_write() {
@@ -309,5 +312,76 @@ mod tests {
         assert_eq!(deleted.as_u16(), 204);
         assert_eq!(empty, json!({"mail": []}));
         assert_eq!(unknown.as_u16(), 404);
+    }
+
+    /// Browsers for user `plain` (no admin) and user `boss` (an admin).
+    async fn sessions(test: &TestApp) -> (Browser, Browser) {
+        for name in ["plain", "boss"] {
+            users::create(
+                test.app.pool(),
+                &users::NewUser {
+                    name,
+                    display_name: "",
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("create the user");
+        }
+        users::set_admin(test.app.pool(), "boss", true, false)
+            .await
+            .expect("make boss an admin");
+        (
+            Browser::session_for(test, "plain").await,
+            Browser::session_for(test, "boss").await,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_non_admin_session_is_refused_and_an_admin_session_may_use_the_queue() {
+        let test = app().await;
+        let (mut plain, mut boss) = sessions(&test).await;
+        let to = || Payload::Json(json!({"to": "ops@example.com"}));
+        queue::enqueue(
+            test.app.pool(),
+            "ops@example.com",
+            &Template::Test,
+            Utc::now(),
+        )
+        .await
+        .expect("queue one");
+        let id = queue::list(test.app.pool()).await.expect("list")[0]
+            .id
+            .clone();
+        let one = format!("/api/v1/mail/queue/{id}");
+        let retry = format!("{one}/retry");
+
+        let mut refused = Vec::new();
+        for (method, uri, payload) in [
+            ("GET", "/api/v1/mail/queue", Payload::Empty),
+            ("POST", "/api/v1/mail/test", to()),
+            ("POST", retry.as_str(), Payload::Empty),
+            ("DELETE", one.as_str(), Payload::Empty),
+        ] {
+            let (status, _) = plain.send(&test, method, uri, payload).await.parts();
+            refused.push(status.as_u16());
+        }
+        let (listed, _) = boss
+            .send(&test, "GET", "/api/v1/mail/queue", Payload::Empty)
+            .await
+            .parts();
+        let (queued, _) = boss
+            .send(&test, "POST", "/api/v1/mail/test", to())
+            .await
+            .parts();
+        let (deleted, _) = boss
+            .send(&test, "DELETE", &one, Payload::Empty)
+            .await
+            .parts();
+
+        assert_eq!(refused, [403, 403, 403, 403]);
+        assert_eq!(listed.as_u16(), 200);
+        assert_eq!(queued.as_u16(), 202);
+        assert_eq!(deleted.as_u16(), 204);
     }
 }

@@ -214,7 +214,10 @@ mod tests {
     use crate::http::api::testing::{
         app, assert_matrix_with, every_catalog_admin, keys, send, Row,
     };
+    use crate::http::api::testing::{Browser, Payload};
     use crate::mcp::testing::TestApp;
+    use crate::store::users;
+    use chrono::Utc;
 
     #[tokio::test]
     async fn settings_need_an_admin_to_read_and_one_reaching_every_catalog_to_write() {
@@ -308,5 +311,68 @@ mod tests {
         assert_eq!(back["value"], "20");
         assert_eq!(back["overridden"], false);
         assert_eq!(back["updated_by"], serde_json::Value::Null);
+    }
+
+    /// Browsers for user `plain` (no admin) and user `boss` (an admin).
+    async fn sessions(test: &TestApp) -> (Browser, Browser) {
+        for name in ["plain", "boss"] {
+            users::create(
+                test.app.pool(),
+                &users::NewUser {
+                    name,
+                    display_name: "",
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("create the user");
+        }
+        users::set_admin(test.app.pool(), "boss", true, false)
+            .await
+            .expect("make boss an admin");
+        (
+            Browser::session_for(test, "plain").await,
+            Browser::session_for(test, "boss").await,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_non_admin_session_is_refused_and_an_admin_session_may_change_settings() {
+        let test = app().await;
+        let (mut plain, mut boss) = sessions(&test).await;
+        let value = || Payload::Json(json!({"value": "5"}));
+        let uri = "/api/v1/settings/max_keys_per_user";
+
+        let (plain_read, _) = plain
+            .send(&test, "GET", "/api/v1/settings", Payload::Empty)
+            .await
+            .parts();
+        let (plain_write, _) = plain.send(&test, "PUT", uri, value()).await.parts();
+        let (plain_reset, _) = plain
+            .send(&test, "DELETE", uri, Payload::Empty)
+            .await
+            .parts();
+        let (boss_read, _) = boss
+            .send(&test, "GET", "/api/v1/settings", Payload::Empty)
+            .await
+            .parts();
+        let (boss_write, row) = boss.send(&test, "PUT", uri, value()).await.parts();
+        let (boss_reset, _) = boss
+            .send(&test, "DELETE", uri, Payload::Empty)
+            .await
+            .parts();
+
+        assert_eq!(
+            [
+                plain_read.as_u16(),
+                plain_write.as_u16(),
+                plain_reset.as_u16()
+            ],
+            [403, 403, 403]
+        );
+        assert_eq!(boss_read.as_u16(), 200);
+        assert_eq!(boss_write.as_u16(), 200, "{row}");
+        assert_eq!(row["updated_by"], "boss");
+        assert_eq!(boss_reset.as_u16(), 200);
     }
 }
