@@ -7,7 +7,7 @@
 **Goal:** An operator's own tooling can drive okf-mcp safely and leave a trail: the product name people see is the operator's; a user can be found by email and deleted in one call; a narrow "provisioner" key manages accounts, teams and catalogs but can read nothing; every administrative change, catalog write, export and admin read of other people's data is in a stored, append-only audit log that admins read in full and team owners read for their team; and, on a server that turns it on, operator staff must unlock a customer's catalog (with a reason and a time limit) before opening it.
 
 **Architecture:**
-- **One audit table, written in the change's own transaction.** `store::audit::record(&mut tx, actor, entry, now)` is called inside every instrumented store function, so a change and its entry commit or roll back together. People are referred to through `audit_people` (deletion renames the row to `deleted user #N`); personal teams, whose names are user names, are written as `person:<id>` team references for the same reason. A trigger refuses `UPDATE` and any `DELETE` of an entry younger than the retention period.
+- **One audit table, written in the change's own transaction.** `store::audit::record(&mut tx, actor, entry, now)` is called inside every instrumented store function, so a change and its entry commit or roll back together. Immutable columns never hold a person's name or a reusable name: people are `audit_people` ids (deletion renames the row to `deleted user #N`), teams are `audit_teams` ids that follow the never-reused `teams.id` (so a team created again under an old name never sees the old team's entries), and credentials are `audit_credentials` ids whose mutable id and label deletion clears. *(Corrected, PR #375 review, 2026-11-13: teams were scoped by name and names were copied into entries.)* A trigger refuses `UPDATE` and any `DELETE` of an entry younger than the retention period.
 - **The actor travels as an argument.** Every instrumented store function takes `actor: &AuditActor`: the credential id, the acting user's id (for `audit_people`), its actor label, whether it is an operator credential (admin or provisioner), whether it is a provisioner, the client IP and the source (`cli`, `api`, `console`, `system`). REST handlers get it from an axum extractor; the CLI builds `AuditActor::cli()` (the operating-system user name).
 - **Provisioner: one allow-list.** A `provisioner` key reaches no catalog (no grants, refused by a trigger) and is refused by MCP and the archive routes. A middleware on `/api/v1` refuses it on every route not in `PROVISIONER_ROUTES` (matched route template and method); the store functions behind the allowed routes refuse it on admin users, under the row locks they already take.
 - **Access gates in the key cache.** The key cache loads an `AccessGates` value (team memberships per user, admin users, entitlements, `require_unlock`, active unlocks, catalogs with maintenance off) shared by every principal, as M13 shares its suspension map. `Principal::admission(catalog, access, now)` decides whether a content read or write is a customer's, the maintenance runner's, an unlocked operator's, an admin read to record, or refused with `UnlockRequired` / `MaintenanceOff`. It runs at the content choke points only: `selection::resolve`, `ToolContext::changeset`, the REST routes that read the store directly, export and import. Administrative routes keep `require`, so deleting a catalog or suspending a team never needs an unlock.
@@ -77,11 +77,13 @@ Each item is defined in the task on its comment line. Later tasks use these exac
 ```rust
 // ---- src/store/audit.rs (Task 1) ----
 pub enum Source { Cli, Api, Console, System }               // as_str: "cli" | "api" | "console" | "system"
+pub enum Via { Session, Key, Grant, Cli, System }           // Corrected, PR #375 review
 pub struct AuditActor {
     pub source: Source,
     pub credential: Option<String>,  // key or grant id; None for sessions, the CLI and the system
     pub user_id: Option<String>,     // users.id of the acting person, for audit_people
     pub label: String,               // the credential's actor, the OS user, or a system label
+    pub via: Via,                    // what the entry's actor_label says (stored_label())
     pub operator: bool,              // admin credential or provisioner: owners see "an operator"
     pub provisioner: bool,           // refuses admin targets in the store (Task 5 sets it)
     pub ip: Option<std::net::IpAddr>,
@@ -95,12 +97,12 @@ pub enum Action { /* one variant per action name; as_str() gives "user.created" 
 pub enum Target<'a> { User(&'a str /* users.id */), Team(&'a str), Catalog(&'a str),
                       Key(&'a str), Grant(&'a str), Code(&'a str), Setting(&'a str), Unlock(i64) }
 pub struct Entry<'a> { pub action: Action, pub target: Target<'a>, pub person: Option<&'a str>,
-                       pub teams: &'a [String], pub details: serde_json::Value }
+                       pub teams: &'a [i64] /* audit_teams ids */, pub details: serde_json::Value }
 pub async fn record(conn: &mut PgConnection, actor: &AuditActor, entry: &Entry<'_>,
                     now: DateTime<Utc>) -> Result<i64, OkfError>;
-pub async fn team_ref(conn: &mut PgConnection, team: &str) -> Result<String, OkfError>;
-pub async fn catalog_teams(conn: &mut PgConnection, catalog_id: i64) -> Result<Vec<String>, OkfError>;
-pub async fn key_teams(conn: &mut PgConnection, key_id: &str) -> Result<Vec<String>, OkfError>;
+pub async fn team_ref(conn: &mut PgConnection, team: &str) -> Result<i64, OkfError>;
+pub async fn catalog_teams(conn: &mut PgConnection, catalog_id: i64) -> Result<Vec<i64>, OkfError>;
+pub async fn key_teams(conn: &mut PgConnection, key_id: &str) -> Result<Vec<i64>, OkfError>;
 pub async fn forget_person(conn: &mut PgConnection, user_id: &str) -> Result<(), OkfError>;
 pub fn refuse_admin_target(actor: &AuditActor, is_admin: bool, user: &str) -> Result<(), OkfError>;
 pub async fn record_admin_read(pool: &PgPool, actor: &AuditActor, catalog: &str,
@@ -168,7 +170,7 @@ wave 2:  4 (1)         7a (1)        6d (1, 2)
 wave 3:  6a (4)        6b (4)
 wave 4:  5 (3, 6a, 6b)
 wave 5:  6c (5)        8a (5)        9a (5, 6d)
-wave 6:  7b (6c, 7a)   8b (8a)       8c (8a)       9d (9a)
+wave 6:  7b (6c, 7a)   8b (8a)       8c (8a)       9d (9a, 8a)
 wave 7:  9b (7b, 9a)
 wave 8:  9c (9b)
 wave 9:  9e (8c, 9c, 9d)
@@ -181,7 +183,7 @@ Why each edge, and the shared files to merge with care:
 - **6a and 6b need 4**: 6a rewrites the rest of `users.rs`, and 6b's guards call `users::id_and_admin_of`, which 4 adds. 6a and 6b run in parallel; both change `src/cli/people.rs`, `src/http/api/people.rs` and `src/store/ceiling.rs`, in different functions (6a the user and entitlement ones, 6b the team and member-access ones). Merge `main` before review and keep both sides.
 - **5 needs 3, 6a and 6b**: its allow-list includes the lookup (3), and its admin-target refusals are the guards 4, 6a and 6b put in the store, which only refuse once 5 sets `AuditActor.provisioner`.
 - **6c, 8a and 9a need 5.** 6c changes `keys.rs` after 5's `create_provisioner`; 8a's provisioner viewer needs `Principal.provisioner`; 9a's migration `0015` must follow 5's `0014` (migrations merge in number order: `0012` Task 1, `0013` Task 4, `0014` Task 5, `0015` Task 9a, `0016` Task 9c). 9a also needs 6d (`settings.rs`). 6c, 8a and 9a share no file but `docs/operations.md`.
-- **7b needs 6c and 7a**: its tests create keys with 6c's signatures, and its `ToolContext::admit` uses 7a's requester. **8b and 8c need 8a** (the reader and the routes); 8b and 9d both add a command group to `src/cli.rs` and `tests/admin_parity.rs`: keep both. **9d needs 9a** (`store::unlocks`) and can run beside 9b.
+- **7b needs 6c and 7a**: its tests create keys with 6c's signatures, and its `ToolContext::admit` uses 7a's requester. **8b and 8c need 8a** (the reader and the routes); 8b and 9d both add a command group to `src/cli.rs` and `tests/admin_parity.rs`: keep both. **9d needs 9a** (`store::unlocks`) **and 8a** (its owner test reads `/api/v1/audit` and its export; *corrected, PR #375 review, 2026-11-13*), and can run beside 9b.
 - **9b needs 7b and 9a** (it extends `AccessGates` and `admission`, and reads `unlocks::live`). **9c needs 9b** (its runner test needs the `MaintenanceOff` refusal at the choke points). **9e needs 8c, 9c and 9d** (the console for all three; it and 8c both add nav links to `index.html` and the manifest).
 - **10** last: it edits the sections of `docs/operations.md` the tasks leave alone.
 
@@ -313,41 +315,81 @@ CREATE TABLE audit_people (
     display_name text NOT NULL DEFAULT ''
 );
 
+-- Teams as entries refer to them: by this id, never by name. teams.id is a
+-- UUID that is never reused, so a team deleted and created again under the
+-- same name gets a new row here, and its new owners never see the old
+-- team's entries. `name` is a display snapshot of a shared team; a
+-- personal team (whose name is its user's) is shown through its person.
+CREATE TABLE audit_teams (
+    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    team_id   text NOT NULL UNIQUE,
+    name      text,
+    person_id bigint REFERENCES audit_people (id),
+    CHECK ((name IS NULL) <> (person_id IS NULL))
+);
+
+-- Credentials (keys, grants, sign-in codes) as entries refer to them. The
+-- id and the label are mutable, so deleting a user clears them: a legacy
+-- key's id was its name, and a self-issued key's label defaults to a name
+-- its user chose.
+CREATE TABLE audit_credentials (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    credential_id text UNIQUE,
+    person_id     bigint REFERENCES audit_people (id),
+    label         text
+);
+CREATE INDEX audit_credentials_person_id ON audit_credentials (person_id);
+
 CREATE TABLE audit_entries (
-    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    at               timestamptz NOT NULL,
-    action           text NOT NULL CHECK (action ~ '^[a-z]+\.[a-z_]+$'),
-    source           text NOT NULL CHECK (source IN ('cli', 'api', 'console', 'system')),
-    -- A key or grant id; NULL for a console session, the CLI and the system.
-    actor_credential text,
-    actor_person_id  bigint REFERENCES audit_people (id),
-    actor_label      text NOT NULL,
+    id                    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    at                    timestamptz NOT NULL,
+    action                text NOT NULL CHECK (action ~ '^[a-z]+\.[a-z_]+$'),
+    source                text NOT NULL CHECK (source IN ('cli', 'api', 'console', 'system')),
+    actor_credential_ref  bigint REFERENCES audit_credentials (id),
+    actor_person_id       bigint REFERENCES audit_people (id),
+    -- Never a person's name: 'console session', 'api key', 'oauth grant',
+    -- 'cli:<os user>', 'system:<what>', or the label of a key with no user.
+    -- A credential's own label is in audit_credentials.
+    actor_label           text NOT NULL,
     -- An admin credential or a provisioner: owners see "an operator".
-    actor_operator   boolean NOT NULL,
-    client_ip        inet,
-    target_kind      text NOT NULL CHECK (target_kind IN
-                         ('user', 'team', 'catalog', 'key', 'grant', 'code', 'setting', 'unlock')),
-    -- NULL for a user target, which is named only through target_person_id.
-    target_name      text,
-    target_person_id bigint REFERENCES audit_people (id),
-    -- Team references the entry belongs to: a shared team's name, or
-    -- 'person:<audit_people.id>' for a personal team (whose name is a user's).
-    teams            text[] NOT NULL DEFAULT '{}',
-    details          jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(details) = 'object'),
-    CONSTRAINT audit_entries_user_target CHECK (
-        (target_kind = 'user') = (target_name IS NULL)
-        AND (target_kind <> 'user' OR target_person_id IS NOT NULL)
+    actor_operator        boolean NOT NULL,
+    client_ip             inet,
+    target_kind           text NOT NULL CHECK (target_kind IN
+                              ('user', 'team', 'catalog', 'key', 'grant', 'code', 'setting', 'unlock')),
+    -- Only for a catalog, setting or unlock target; a team target is in
+    -- target_team_ref, a credential in target_credential_ref, a user in
+    -- target_person_id.
+    target_name           text,
+    target_team_ref       bigint REFERENCES audit_teams (id),
+    target_credential_ref bigint REFERENCES audit_credentials (id),
+    target_person_id      bigint REFERENCES audit_people (id),
+    -- The target person was an admin user when the entry was written:
+    -- operator staff, hidden from team owners.
+    target_operator       boolean NOT NULL DEFAULT false,
+    -- The audit_teams ids the entry belongs to (the scope of an owner's view).
+    teams                 bigint[] NOT NULL DEFAULT '{}',
+    details               jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(details) = 'object'),
+    CONSTRAINT audit_entries_target_shape CHECK (
+        CASE target_kind
+            WHEN 'user' THEN target_person_id IS NOT NULL AND target_name IS NULL
+            WHEN 'team' THEN target_team_ref IS NOT NULL AND target_name IS NULL
+            WHEN 'key' THEN target_credential_ref IS NOT NULL AND target_name IS NULL
+            WHEN 'grant' THEN target_credential_ref IS NOT NULL AND target_name IS NULL
+            WHEN 'code' THEN target_credential_ref IS NOT NULL AND target_name IS NULL
+            ELSE target_name IS NOT NULL
+        END
     )
 );
 -- Newest first is `ORDER BY id DESC` (the primary key); these serve the
 -- time window, the retention prune, a team's view and a credential's view.
 CREATE INDEX audit_entries_at ON audit_entries (at);
 CREATE INDEX audit_entries_teams ON audit_entries USING gin (teams);
-CREATE INDEX audit_entries_credential ON audit_entries (actor_credential)
-    WHERE actor_credential IS NOT NULL;
+CREATE INDEX audit_entries_credential ON audit_entries (actor_credential_ref)
+    WHERE actor_credential_ref IS NOT NULL;
 
 -- Request counts of the hourly catalog.admin_read entries (Task 7b). The
--- entry itself never changes; its count lives here.
+-- entry itself never changes; its count lives here. The bucket names the
+-- actor by its audit_credentials or audit_people id, never by a name.
 CREATE TABLE audit_access_counts (
     bucket   text PRIMARY KEY,
     entry_id bigint REFERENCES audit_entries (id) ON DELETE CASCADE,
@@ -365,11 +407,28 @@ CREATE FUNCTION audit_person(p_user_id text) RETURNS bigint LANGUAGE sql AS $$
     RETURNING id
 $$;
 
--- How an entry names a team: its name, or 'person:<id>' for a personal team.
-CREATE FUNCTION audit_team_ref(p_team_id text) RETURNS text LANGUAGE sql AS $$
-    SELECT CASE WHEN t.personal_of IS NULL THEN t.name
-                ELSE 'person:' || audit_person(t.personal_of) END
+-- The audit_teams row of a team (its id never changes): created on first
+-- use, its shared-team name snapshot refreshed. NULL for an unknown team.
+CREATE FUNCTION audit_team_ref(p_team_id text) RETURNS bigint LANGUAGE sql AS $$
+    INSERT INTO audit_teams (team_id, name, person_id)
+    SELECT t.id,
+           CASE WHEN t.personal_of IS NULL THEN t.name END,
+           CASE WHEN t.personal_of IS NOT NULL THEN audit_person(t.personal_of) END
     FROM teams t WHERE t.id = p_team_id
+    ON CONFLICT (team_id) DO UPDATE SET name = EXCLUDED.name
+    RETURNING id
+$$;
+
+-- The audit_credentials row of a credential id, created or refreshed; a
+-- NULL label or person keeps the stored one. NULL for a NULL id.
+CREATE FUNCTION audit_credential(p_credential_id text, p_person_id bigint, p_label text)
+RETURNS bigint LANGUAGE sql AS $$
+    INSERT INTO audit_credentials (credential_id, person_id, label)
+    SELECT p_credential_id, p_person_id, p_label WHERE p_credential_id IS NOT NULL
+    ON CONFLICT (credential_id) DO UPDATE
+        SET label = COALESCE(EXCLUDED.label, audit_credentials.label),
+            person_id = COALESCE(EXCLUDED.person_id, audit_credentials.person_id)
+    RETURNING id
 $$;
 
 -- Append-only: no UPDATE ever; a DELETE only of an entry older than the
@@ -401,6 +460,8 @@ CREATE TRIGGER audit_entries_no_truncate BEFORE TRUNCATE ON audit_entries
 
 (The trigger compares against the database clock: it only decides whether a delete is allowed, it writes no timestamp. The prune in Task 6d leaves a one-hour margin so a small skew never trips it.)
 
+> **Corrected (PR #375 review, 2026-11-13).** Entries first scoped teams by name and stored personal teams as `person:<id>` text, console sessions' user names as `actor_label`, and credential ids directly. A team deleted and created again under the same name then exposed the old team's entries to the new owners, and a deleted user's name stayed in immutable columns. Now teams are `audit_teams` ids (one per `teams.id`, a UUID never reused), credentials are `audit_credentials` ids (their mutable id and label are cleared when their user is deleted), and `actor_label` never holds a person's name. See Decisions 16 and 17.
+
 - [ ] **Step 2: Write the failing store tests** (in `src/store/audit.rs`'s `mod tests`)
 
 ```rust
@@ -429,6 +490,7 @@ mod tests {
             credential: Some("k1".to_string()),
             user_id: Some(user_id.to_string()),
             label: "root".to_string(),
+            via: Via::Key,
             operator: true,
             provisioner: false,
             ip: Some("192.0.2.7".parse().unwrap()),
@@ -458,11 +520,12 @@ mod tests {
         .unwrap();
         tx.commit().await.unwrap();
 
-        let row: (String, String, Option<String>, String, bool, Option<String>, String, Vec<String>) =
+        let row: (String, String, Option<String>, Option<String>, String, String, bool, Option<String>, String, Vec<i64>) =
             sqlx::query_as(
-                "SELECT e.action, e.source, e.actor_credential, p.name, e.actor_operator, \
-                        e.client_ip::text, e.target_name, e.teams \
+                "SELECT e.action, e.source, c.credential_id, c.label, e.actor_label, p.name, \
+                        e.actor_operator, e.client_ip::text, e.target_name, e.teams \
                  FROM audit_entries e JOIN audit_people p ON p.id = e.actor_person_id \
+                 JOIN audit_credentials c ON c.id = e.actor_credential_ref \
                  WHERE e.id = $1",
             )
             .bind(id)
@@ -472,12 +535,86 @@ mod tests {
         assert_eq!(row.0, "catalog.created");
         assert_eq!(row.1, "api");
         assert_eq!(row.2.as_deref(), Some("k1"));
-        assert_eq!(row.3, TEST_USER);
-        assert!(row.4);
-        assert_eq!(row.5.as_deref(), Some("192.0.2.7/32"));
-        assert_eq!(row.6, "main");
-        // TEST_TEAM is TEST_USER's personal team: a person reference, never its name.
-        assert!(row.7[0].starts_with("person:"), "{:?}", row.7);
+        assert_eq!(row.3.as_deref(), Some("root"), "the key's own label, in the mutable table");
+        assert_eq!(row.4, "api key", "the immutable label names no one");
+        assert_eq!(row.5, TEST_USER);
+        assert!(row.6);
+        assert_eq!(row.7.as_deref(), Some("192.0.2.7/32"));
+        assert_eq!(row.8, "main");
+        assert_eq!(row.9, [team]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_team_created_again_under_its_old_name_gets_a_new_audit_id() {
+        let db = test_db().await;
+        crate::store::teams::create(
+            &db.pool,
+            &crate::store::teams::NewTeam { name: "family", display_name: "", owner: TEST_USER },
+            now(),
+        )
+        .await
+        .unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        let first = team_ref(&mut tx, "family").await.unwrap();
+        tx.commit().await.unwrap();
+        crate::store::teams::delete(&db.pool, "family").await.unwrap();
+        crate::store::teams::create(
+            &db.pool,
+            &crate::store::teams::NewTeam { name: "family", display_name: "", owner: TEST_USER },
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let mut tx = db.pool.begin().await.unwrap();
+        let second = team_ref(&mut tx, "family").await.unwrap();
+
+        assert_ne!(first, second, "scope follows teams.id, never the reusable name");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_actor_leaves_no_name_in_the_entry_once_its_user_is_forgotten() {
+        let db = test_db().await;
+        users::create(&db.pool, &NewUser { name: "alice", display_name: "Alice Example" }, now())
+            .await
+            .unwrap();
+        let alice = users::find_auth(&db.pool, &user_id(&db.pool, "alice").await).await.unwrap().unwrap();
+        // A real console-session principal: its `actor` is the user's name.
+        // (M13's three arguments; Task 7b adds the gates: pass
+        // `Default::default()` once more.)
+        let principal = Principal::for_session(&alice, Default::default(), Default::default());
+        let requester = Requester { ip: None, source: Source::Console };
+        let mut tx = db.pool.begin().await.unwrap();
+        record(
+            &mut tx,
+            &AuditActor::of(&principal, &requester),
+            &Entry {
+                action: Action::CatalogCreated,
+                target: Target::Catalog("main"),
+                person: None,
+                teams: &[],
+                details: serde_json::json!({}),
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+
+        forget_person(&mut tx, &alice.id).await.unwrap();
+        tx.commit().await.unwrap();
+
+        // Every stored column of the entry, and every row it refers to.
+        let stored: String = sqlx::query_scalar(
+            "SELECT row_to_json(e)::text || coalesce(row_to_json(p)::text, '') \
+                    || coalesce(row_to_json(c)::text, '') \
+             FROM audit_entries e LEFT JOIN audit_people p ON p.id = e.actor_person_id \
+             LEFT JOIN audit_credentials c ON c.id = e.actor_credential_ref",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!stored.contains("alice") && !stored.contains("Alice"), "{stored}");
+        assert!(stored.contains("console session"), "{stored}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -651,14 +788,17 @@ Expected: compile errors (`store::audit`, `http::requester` do not exist).
 
 - [ ] **Step 4: Implement `src/store/audit.rs`**
 
+> **Corrected (PR #375 review, 2026-11-13).** `AuditActor` gains `via` and `stored_label()`, so a console session's user name (`Principal::for_session` sets `actor` to it) and a self-issued key's label (its key name by default) never reach the entry; `record` resolves teams and credentials to their audit ids and sets `target_operator`; `team_ref`, `catalog_teams` and `key_teams` return `audit_teams` ids; `forget_person` also clears the user's credentials. Decisions 16 to 18.
+
 ```rust
 //! The audit log (spec "Part 5"): one row per administrative change,
 //! catalog write, export and admin read, written by [`record`] inside the
-//! transaction of the change it records. People are referred to through
-//! `audit_people` ([`forget_person`] anonymizes a deleted user), and a
-//! personal team is written as `person:<id>` ([`team_ref`]) because its
-//! name is its user's. Never a secret: no key, token, password, link,
-//! session id or email address goes into an entry.
+//! transaction of the change it records. Immutable columns never hold a
+//! person's name or a reusable name: people are `audit_people` ids, teams
+//! `audit_teams` ids (one per `teams.id`, never reused), credentials
+//! `audit_credentials` ids; [`forget_person`] clears what identifies a
+//! deleted user in those rows. Never a secret: no key, token, password,
+//! link, session id or email address goes into an entry.
 
 use std::net::IpAddr;
 
@@ -698,6 +838,22 @@ impl Source {
     }
 }
 
+/// What kind of credential acted: what an entry's immutable `actor_label`
+/// says, so it never needs a person's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// A console session.
+    Session,
+    /// An API key.
+    Key,
+    /// An OAuth grant.
+    Grant,
+    /// The command line.
+    Cli,
+    /// The server itself.
+    System,
+}
+
 /// Who made a change, as an entry records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditActor {
@@ -707,8 +863,12 @@ pub struct AuditActor {
     pub credential: Option<String>,
     /// The acting user's `users.id`, if any (a legacy key has none).
     pub user_id: Option<String>,
-    /// The credential's actor, the OS user, or a system label.
+    /// The credential's actor, the OS user, or a system label. For a
+    /// credential it goes to the mutable `audit_credentials.label`, never
+    /// into the entry ([`AuditActor::stored_label`]).
     pub label: String,
+    /// What kind of credential acted.
+    pub via: Via,
     /// An admin credential or a provisioner: owners see "an operator".
     pub operator: bool,
     /// A provisioner key: store functions refuse it an admin target.
@@ -734,6 +894,7 @@ impl AuditActor {
             credential: None,
             user_id: None,
             label,
+            via: Via::Cli,
             operator: true,
             provisioner: false,
             ip: None,
@@ -753,6 +914,7 @@ impl AuditActor {
             credential: None,
             user_id: None,
             label: label.to_string(),
+            via: Via::System,
             operator: false,
             provisioner: false,
             ip: None,
@@ -769,20 +931,43 @@ impl AuditActor {
     /// The actor. A console session has no credential id: `session:<name>`
     /// would name the person, which entries do only through `audit_people`.
     pub fn of(principal: &Principal, requester: &Requester) -> Self {
-        let credential = match principal.kind {
-            CredentialKind::Session { .. } => None,
-            CredentialKind::ApiKey | CredentialKind::OAuth { .. } => Some(principal.key_id.clone()),
+        let (credential, via) = match principal.kind {
+            CredentialKind::Session { .. } => (None, Via::Session),
+            CredentialKind::ApiKey => (Some(principal.key_id.clone()), Via::Key),
+            CredentialKind::OAuth { .. } => (Some(principal.key_id.clone()), Via::Grant),
         };
         Self {
             source: requester.source,
             credential,
             user_id: principal.user_id.clone(),
+            // A session's `actor` is its user's name: it is kept here for
+            // `settings.updated_by`, never written into an entry.
             label: principal.actor.clone(),
+            via,
             // Task 5 adds `|| principal.provisioner`.
             operator: principal.access == Access::Admin,
             // Task 5: `principal.provisioner`.
             provisioner: false,
             ip: requester.ip,
+        }
+    }
+
+    /// The entry's immutable `actor_label`: never a person's name. A
+    /// credential of a user is named by its kind (its own label goes to the
+    /// mutable `audit_credentials`); only a key with no user, the CLI's
+    /// operating-system user (operator staff, not an okf-mcp user) and the
+    /// system keep their label.
+    ///
+    /// # Returns
+    /// The label to store.
+    pub fn stored_label(&self) -> String {
+        match self.via {
+            Via::Session => "console session".to_string(),
+            Via::Key if self.user_id.is_some() => "api key".to_string(),
+            Via::Grant if self.user_id.is_some() => "oauth grant".to_string(),
+            Via::Key | Via::Grant => self.label.clone(),
+            Via::Cli => format!("cli:{}", self.label),
+            Via::System => format!("system:{}", self.label),
         }
     }
 }
@@ -884,18 +1069,30 @@ pub enum Target<'a> {
     Unlock(i64),
 }
 
-impl Target<'_> {
-    /// The stored kind and name (`None` for a user).
-    fn parts(&self) -> (&'static str, Option<String>) {
+/// Where a target is stored: its kind, and exactly one of a name, a team
+/// (by name, resolved to its `audit_teams` id) or a credential id (resolved
+/// to its `audit_credentials` id); a user is stored as a person only.
+struct TargetParts<'a> {
+    kind: &'static str,
+    name: Option<String>,
+    team: Option<&'a str>,
+    credential: Option<&'a str>,
+}
+
+impl<'a> Target<'a> {
+    /// The stored parts.
+    fn parts(&self) -> TargetParts<'a> {
+        let plain = |kind, name: String| TargetParts { kind, name: Some(name), team: None, credential: None };
+        let credential = |kind, id: &'a str| TargetParts { kind, name: None, team: None, credential: Some(id) };
         match *self {
-            Target::User(_) => ("user", None),
-            Target::Team(name) => ("team", Some(name.to_string())),
-            Target::Catalog(name) => ("catalog", Some(name.to_string())),
-            Target::Key(id) => ("key", Some(id.to_string())),
-            Target::Grant(id) => ("grant", Some(id.to_string())),
-            Target::Code(id) => ("code", Some(id.to_string())),
-            Target::Setting(key) => ("setting", Some(key.to_string())),
-            Target::Unlock(id) => ("unlock", Some(id.to_string())),
+            Target::User(_) => TargetParts { kind: "user", name: None, team: None, credential: None },
+            Target::Team(name) => TargetParts { kind: "team", name: None, team: Some(name), credential: None },
+            Target::Catalog(name) => plain("catalog", name.to_string()),
+            Target::Key(id) => credential("key", id),
+            Target::Grant(id) => credential("grant", id),
+            Target::Code(id) => credential("code", id),
+            Target::Setting(key) => plain("setting", key.to_string()),
+            Target::Unlock(id) => plain("unlock", id.to_string()),
         }
     }
 }
@@ -910,8 +1107,8 @@ pub struct Entry<'a> {
     /// A user the entry is also about (`users.id`): a member added to a
     /// team, the new user of a key. Ignored for a [`Target::User`].
     pub person: Option<&'a str>,
-    /// Team references ([`team_ref`], [`catalog_teams`], [`key_teams`]).
-    pub teams: &'a [String],
+    /// `audit_teams` ids ([`team_ref`], [`catalog_teams`], [`key_teams`]).
+    pub teams: &'a [i64],
     /// A small JSON object; never a secret or an email address.
     pub details: serde_json::Value,
 }
@@ -935,49 +1132,61 @@ pub async fn record(
     entry: &Entry<'_>,
     now: DateTime<Utc>,
 ) -> Result<i64, OkfError> {
-    let (kind, name) = entry.target.parts();
+    let target = entry.target.parts();
     let person = match entry.target {
         Target::User(user_id) => Some(user_id),
         _ => entry.person,
     };
-    // `audit_person` creates or refreshes the person; NULL in, NULL out.
+    // The subquery resolves both people once (`audit_person` creates or
+    // refreshes a row; NULL in, NULL out); the credentials and the target
+    // team resolve to their audit ids the same way. The actor's credential
+    // label goes to `audit_credentials` (mutable), the entry gets only
+    // `stored_label`. `target_operator`: the target person is an admin user
+    // now, so owners never see who it is.
     Ok(sqlx::query_scalar(
-        "INSERT INTO audit_entries (at, action, source, actor_credential, actor_person_id, \
-             actor_label, actor_operator, client_ip, target_kind, target_name, \
-             target_person_id, teams, details) \
-         VALUES ($1, $2, $3, $4, audit_person($5), $6, $7, $8::inet, $9, $10, \
-                 audit_person($11), $12, $13) \
+        "INSERT INTO audit_entries (at, action, source, actor_credential_ref, actor_person_id, \
+             actor_label, actor_operator, client_ip, target_kind, target_name, target_team_ref, \
+             target_credential_ref, target_person_id, target_operator, teams, details) \
+         SELECT $1, $2, $3, audit_credential($4, p.actor, $5), p.actor, $6, $7, $8::inet, $9, $10, \
+                audit_team_ref((SELECT id FROM teams WHERE name = $11)), \
+                audit_credential($12, p.target, NULL), p.target, \
+                COALESCE((SELECT is_admin FROM users WHERE id = $13), false), $14, $15 \
+         FROM (SELECT audit_person($16) AS actor, audit_person($13) AS target) p \
          RETURNING id",
     )
     .bind(now)
     .bind(entry.action.as_str())
     .bind(actor.source.as_str())
     .bind(&actor.credential)
-    .bind(&actor.user_id)
     .bind(&actor.label)
+    .bind(actor.stored_label())
     .bind(actor.operator)
     .bind(actor.ip.map(|ip| ip.to_string()))
-    .bind(kind)
-    .bind(name)
+    .bind(target.kind)
+    .bind(target.name)
+    .bind(target.team)
+    .bind(target.credential)
     .bind(person)
     .bind(entry.teams)
     .bind(&entry.details)
+    .bind(&actor.user_id)
     .fetch_one(&mut *conn)
     .await?)
 }
 
-/// How entries name a team.
+/// How entries name a team: its `audit_teams` id, which follows the team's
+/// immutable `teams.id`, so a later team with the same name is another id.
 ///
 /// # Arguments
 /// * `conn` - a connection or transaction.
-/// * `team` - the team's name.
+/// * `team` - the team's current name.
 ///
 /// # Returns
-/// Its name, or `person:<id>` for a personal team.
+/// Its `audit_teams` id.
 ///
 /// # Errors
 /// [`OkfError::UnknownName`]; [`OkfError::Database`].
-pub async fn team_ref(conn: &mut PgConnection, team: &str) -> Result<String, OkfError> {
+pub async fn team_ref(conn: &mut PgConnection, team: &str) -> Result<i64, OkfError> {
     sqlx::query_scalar("SELECT audit_team_ref(id) FROM teams WHERE name = $1")
         .bind(team)
         .fetch_optional(&mut *conn)
@@ -985,7 +1194,7 @@ pub async fn team_ref(conn: &mut PgConnection, team: &str) -> Result<String, Okf
         .ok_or_else(|| OkfError::UnknownName { noun: "team", name: team.to_string() })
 }
 
-/// The team reference of a catalog's owner team: what a catalog event
+/// The `audit_teams` id of a catalog's owner team: what a catalog event
 /// belongs to.
 ///
 /// # Arguments
@@ -997,8 +1206,8 @@ pub async fn team_ref(conn: &mut PgConnection, team: &str) -> Result<String, Okf
 ///
 /// # Errors
 /// [`OkfError::Database`].
-pub async fn catalog_teams(conn: &mut PgConnection, catalog_id: i64) -> Result<Vec<String>, OkfError> {
-    let team: Option<String> = sqlx::query_scalar(
+pub async fn catalog_teams(conn: &mut PgConnection, catalog_id: i64) -> Result<Vec<i64>, OkfError> {
+    let team: Option<i64> = sqlx::query_scalar(
         "SELECT audit_team_ref(owner_team_id) FROM catalogs \
          WHERE id = $1 AND owner_team_id IS NOT NULL",
     )
@@ -1009,13 +1218,13 @@ pub async fn catalog_teams(conn: &mut PgConnection, catalog_id: i64) -> Result<V
     Ok(team.into_iter().collect())
 }
 
-/// The team references of the catalogs a key or grant is granted: what a
+/// The `audit_teams` ids of the catalogs a key or grant is granted: what a
 /// credential event belongs to. An all-catalogs credential belongs to no
 /// team (operator only; plan Decision 6).
 ///
 /// # Errors
 /// [`OkfError::Database`].
-pub async fn key_teams(conn: &mut PgConnection, key_id: &str) -> Result<Vec<String>, OkfError> {
+pub async fn key_teams(conn: &mut PgConnection, key_id: &str) -> Result<Vec<i64>, OkfError> {
     Ok(sqlx::query_scalar(
         "SELECT audit_team_ref(t.owner_team_id) FROM \
            (SELECT DISTINCT c.owner_team_id FROM key_catalogs g \
@@ -1028,12 +1237,23 @@ pub async fn key_teams(conn: &mut PgConnection, key_id: &str) -> Result<Vec<Stri
     .await?)
 }
 
-/// Stops the log identifying a user that is being deleted: its person row
-/// becomes `deleted user #<id>`. Called in the deletion's transaction.
+/// Stops the log identifying a user that is being deleted, in the
+/// deletion's transaction: the person row becomes `deleted user #<id>`, and
+/// the user's credentials lose their id (a legacy key's id was its name)
+/// and their label (a self-issued key's defaults to a name the user chose),
+/// showing as `credential #<id>`. Entries themselves hold no name to clear.
 ///
 /// # Errors
 /// [`OkfError::Database`].
 pub async fn forget_person(conn: &mut PgConnection, user_id: &str) -> Result<(), OkfError> {
+    // Credentials first: they find the person through its `user_id`.
+    sqlx::query(
+        "UPDATE audit_credentials SET credential_id = NULL, label = NULL \
+         WHERE person_id = (SELECT id FROM audit_people WHERE user_id = $1)",
+    )
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await?;
     sqlx::query(
         "UPDATE audit_people SET user_id = NULL, name = 'deleted user #' || id, \
                 display_name = '' WHERE user_id = $1",
@@ -1082,9 +1302,12 @@ pub(crate) mod testing {
         /// The actor's person name, if any.
         pub actor_person: Option<String>,
         pub target_kind: String,
+        /// The target's name: a catalog, setting or unlock name, a team's
+        /// name (or its person's), or a credential id.
         pub target: Option<String>,
         /// The target person's name (a user target, or `Entry.person`).
         pub person: Option<String>,
+        /// The teams' display names, personal teams as their person.
         pub teams: Vec<String>,
         pub details: serde_json::Value,
         /// A `catalog.admin_read` entry's request count.
@@ -1095,11 +1318,19 @@ pub(crate) mod testing {
     pub(crate) async fn entries(pool: &PgPool, action: &str) -> Vec<RecordedEntry> {
         sqlx::query_as::<_, RecordedEntry>(
             "SELECT e.source, e.actor_label, e.actor_operator, ap.name AS actor_person, \
-                    e.target_kind, e.target_name AS target, tp.name AS person, e.teams, \
+                    e.target_kind, \
+                    COALESCE(e.target_name, tt.name, ttp.name, tc.credential_id) AS target, \
+                    tp.name AS person, \
+                    ARRAY(SELECT COALESCE(t.name, p.name) FROM unnest(e.teams) WITH ORDINALITY AS r (id, n) \
+                          JOIN audit_teams t ON t.id = r.id \
+                          LEFT JOIN audit_people p ON p.id = t.person_id ORDER BY r.n) AS teams, \
                     e.details, c.requests \
              FROM audit_entries e \
              LEFT JOIN audit_people ap ON ap.id = e.actor_person_id \
              LEFT JOIN audit_people tp ON tp.id = e.target_person_id \
+             LEFT JOIN audit_teams tt ON tt.id = e.target_team_ref \
+             LEFT JOIN audit_people ttp ON ttp.id = tt.person_id \
+             LEFT JOIN audit_credentials tc ON tc.id = e.target_credential_ref \
              LEFT JOIN audit_access_counts c ON c.entry_id = e.id \
              WHERE e.action = $1 ORDER BY e.id",
         )
@@ -2944,7 +3175,7 @@ git commit -m "feat(audit): record user, entitlement, invitation and session cha
 | `ceiling::set_member_access(pool, catalog, access, actor, now)` | `catalog.member_access_changed` (when changed) | `Catalog` | `catalog_teams` | `{"from", "to"}` | |
 | `import::import(pool, catalog, files, &ImportOptions { ..., audit: &AuditActor })` | `catalog.imported` | `Catalog` | `catalog_teams` | `{"replace", "scope", "written": n, "deleted": n, "generation": n}` | |
 
-`team_ref` and `catalog_teams` are read in the change's transaction, so a personal team is written as `person:<id>` (Task 1). M13's `set_suspension` handler and `team suspend` / `unsuspend` commands pass the actor. `catalogs::create` is called from many tests (`grep -rn "catalogs::create(" src tests` finds about 90): the change is mechanical (`&NewCatalog { name, description, owner_team }, &AuditActor::cli(),`).
+`team_ref` and `catalog_teams` are read in the change's transaction and return `audit_teams` ids, so a personal team shows as its person and a team deleted and created again under the same name is a different team in the log (Task 1). `teams::delete` records `team.deleted` before deleting the row (the entry's `target_team_ref` is resolved from it). *(Corrected, PR #375 review, 2026-11-13: these were team names and `person:<id>` text.)* M13's `set_suspension` handler and `team suspend` / `unsuspend` commands pass the actor. `catalogs::create` is called from many tests (`grep -rn "catalogs::create(" src tests` finds about 90): the change is mechanical (`&NewCatalog { name, description, owner_team }, &AuditActor::cli(),`).
 
 Commit:
 
@@ -3576,14 +3807,23 @@ pub async fn record_admin_read(
 ) -> Result<(), OkfError> {
     // `DurationRound::duration_trunc`: the start of the clock hour.
     let hour = now.duration_trunc(TimeDelta::hours(1)).unwrap_or(now);
-    let who = actor
-        .credential
-        .clone()
-        .or_else(|| actor.user_id.as_ref().map(|id| format!("user:{id}")))
-        .unwrap_or_else(|| actor.label.clone());
+    let mut tx = pool.begin().await?;
+    // The bucket names the actor by its audit id (`c<credential>`, else
+    // `p<person>`, else `l<label>` for the CLI or system), never by a
+    // credential id or name a deletion could not clear. *(Corrected, PR
+    // #375 review, 2026-11-13.)*
+    let who: String = sqlx::query_scalar(
+        "SELECT COALESCE('c' || audit_credential($1, audit_person($2), $3), \
+                         'p' || audit_person($2), 'l' || $4)",
+    )
+    .bind(&actor.credential)
+    .bind(&actor.user_id)
+    .bind(&actor.label)
+    .bind(actor.stored_label())
+    .fetch_one(&mut *tx)
+    .await?;
     // U+001F (unit separator) cannot occur in an id or a catalog name.
     let bucket = format!("{who}\u{1f}{catalog}\u{1f}{}", hour.timestamp());
-    let mut tx = pool.begin().await?;
     let entry_id: Option<i64> = sqlx::query_scalar(
         "INSERT INTO audit_access_counts (bucket, requests) VALUES ($1, 1) \
          ON CONFLICT (bucket) DO UPDATE SET requests = audit_access_counts.requests + 1 \
@@ -3718,7 +3958,7 @@ git commit -m "feat(audit): access gates; record every export and operators' rea
 
 **Files:**
 - Create: `src/http/api/audit.rs`
-- Modify: `src/store/audit.rs` (`Viewer`, `AuditQuery`, `AuditRecord`, `ActorView`, `list`, `team_ref_for_reading`), `src/store/teams.rs` (`owned_by`, `owned_names`), `src/http/api/mod.rs` (`mod audit`, merge its routes), `src/http/api/me.rs` (`AccountView.owned_teams`), `docs/operations.md` (API reference rows)
+- Modify: `src/store/audit.rs` (`Viewer`, `AuditQuery`, `AuditRecord`, `ActorView`, `list`, `audit_teams_named`), `src/store/teams.rs` (`owned_by`, `owned_names`), `src/http/api/mod.rs` (`mod audit`, merge its routes), `src/http/api/me.rs` (`AccountView.owned_teams`), `docs/operations.md` (API reference rows)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3844,19 +4084,39 @@ mod tests {
 And a store test of the redaction rules (`src/store/audit.rs`):
 
 ```rust
+    /// `team_id` and audit id of TEST_TEAM, for an owner viewer.
+    async fn owner_of_test_team(pool: &PgPool) -> Viewer {
+        let mut conn = pool.acquire().await.unwrap();
+        let audit_team = team_ref(&mut conn, TEST_TEAM).await.unwrap();
+        let team_id: String = sqlx::query_scalar("SELECT id FROM teams WHERE name = $1")
+            .bind(TEST_TEAM)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        Viewer::Owner { team_id, audit_team }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn owners_never_see_an_operators_identity_ip_or_unlock_reason() {
+    async fn owners_never_see_an_operators_identity_ip_unlock_reason_or_unlocked_staff() {
         let db = test_db().await;
         let me = user_id(&db.pool, TEST_USER).await;
+        users::create(&db.pool, &NewUser { name: "staff", display_name: "Staff Member" }, &AuditActor::cli(), now())
+            .await
+            .unwrap();
+        users::set_admin(&db.pool, "staff", users::AdminChange { on: true, allow_last: true }, &AuditActor::cli(), now())
+            .await
+            .unwrap();
+        let staff = user_id(&db.pool, "staff").await;
         let mut tx = db.pool.begin().await.unwrap();
         let team = team_ref(&mut tx, TEST_TEAM).await.unwrap();
         record(
             &mut tx,
-            &admin_actor(&me),
+            &AuditActor { credential: Some("staff-key".to_string()), user_id: Some(staff.clone()), ..admin_actor(&me) },
             &Entry {
                 action: Action::CatalogUnlocked,
                 target: Target::Catalog("main"),
-                person: Some(&me),
+                // The unlocked admin: operator staff.
+                person: Some(&staff),
                 teams: std::slice::from_ref(&team),
                 details: serde_json::json!({"category": "support", "reason": "ticket 12", "unlock": 1}),
             },
@@ -3865,29 +4125,122 @@ And a store test of the redaction rules (`src/store/audit.rs`):
         .await
         .unwrap();
         tx.commit().await.unwrap();
-        let team_id: String = sqlx::query_scalar("SELECT id FROM teams WHERE name = $1")
-            .bind(TEST_TEAM)
-            .fetch_one(&db.pool)
+        let owner_view = owner_of_test_team(&db.pool).await;
+
+        let owner = list(&db.pool, &owner_view, &AuditQuery::default()).await.unwrap();
+        // Owners cannot use the filters as an identity oracle.
+        let by_target = list(&db.pool, &owner_view, &AuditQuery { target: Some("staff"), ..AuditQuery::default() })
             .await
             .unwrap();
-
-        let owner = list(&db.pool, &Viewer::Owner { team_id, team_ref: team.clone() }, &AuditQuery::default())
+        let by_actor = list(&db.pool, &owner_view, &AuditQuery { actor: Some("staff-key"), ..AuditQuery::default() })
             .await
             .unwrap();
         let admin = list(&db.pool, &Viewer::Admin, &AuditQuery::default()).await.unwrap();
 
         assert_eq!(owner[0].actor, ActorView::Operator);
         assert_eq!(owner[0].ip, None);
+        assert_eq!(owner[0].target.person, None, "the unlocked staff member is hidden");
         assert_eq!(owner[0].details, serde_json::json!({"category": "support", "unlock": 1}));
+        // The whole record, as the API would send it.
+        let whole = serde_json::to_string(&owner).unwrap();
+        assert!(!whole.contains("staff") && !whole.contains("Staff") && !whole.contains("ticket"), "{whole}");
+        assert!(by_target.is_empty() && by_actor.is_empty());
         assert_eq!(admin[0].details["reason"], "ticket 12");
+        assert_eq!(admin[0].target.person.as_deref(), Some("staff"));
         assert_eq!(admin[0].ip.as_deref(), Some("192.0.2.7"));
         assert_eq!(admin[0].teams, [TEST_USER], "a personal team reads as its user");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_session_user_is_named_nowhere_in_the_admin_or_owner_view() {
+        let db = test_db().await;
+        crate::store::teams::create(
+            &db.pool,
+            &crate::store::teams::NewTeam { name: "family", display_name: "", owner: TEST_USER },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        users::create(&db.pool, &NewUser { name: "alice", display_name: "Alice Example" }, &AuditActor::cli(), now())
+            .await
+            .unwrap();
+        let alice = users::find_auth(&db.pool, &user_id(&db.pool, "alice").await).await.unwrap().unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        let family = team_ref(&mut tx, "family").await.unwrap();
+        // The actor `AuditActor::of` builds for alice's console session (Task
+        // 1 tests that path; `for_session` gains arguments in M13 and Task
+        // 7b): its label is her name. It acts on a credential whose
+        // legacy-style id carries the name too.
+        let actor = AuditActor {
+            source: Source::Console,
+            credential: Some("alice-laptop".to_string()),
+            user_id: Some(alice.id.clone()),
+            label: "alice".to_string(),
+            via: Via::Session,
+            operator: false,
+            provisioner: false,
+            ip: Some("192.0.2.8".parse().unwrap()),
+        };
+        record(
+            &mut tx,
+            &actor,
+            &Entry {
+                action: Action::KeyCreated,
+                target: Target::Key("alice-laptop"),
+                person: Some(&alice.id),
+                teams: std::slice::from_ref(&family),
+                details: serde_json::json!({"self_issued": true}),
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        users::delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await.unwrap();
+
+        let team_id: String = sqlx::query_scalar("SELECT id FROM teams WHERE name = 'family'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let admin = list(&db.pool, &Viewer::Admin, &AuditQuery::default()).await.unwrap();
+        let owner = list(&db.pool, &Viewer::Owner { team_id, audit_team: family }, &AuditQuery::default())
+            .await
+            .unwrap();
+        for (view, records) in [("admin", &admin), ("owner", &owner)] {
+            let whole = serde_json::to_string(records).unwrap();
+            assert!(!whole.contains("alice") && !whole.contains("Alice"), "{view}: {whole}");
+        }
+        assert!(serde_json::to_string(&admin).unwrap().contains("deleted user #"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_team_under_an_old_name_cannot_read_the_old_teams_entries() {
+        let db = test_db().await;
+        users::create(&db.pool, &NewUser { name: "bob", display_name: "" }, &AuditActor::cli(), now()).await.unwrap();
+        let new_team = |owner: &'static str| crate::store::teams::NewTeam { name: "family", display_name: "", owner };
+        crate::store::teams::create(&db.pool, &new_team(TEST_USER), &AuditActor::cli(), now()).await.unwrap();
+        crate::store::teams::delete(&db.pool, "family", &AuditActor::cli(), now()).await.unwrap();
+        // Another customer's team, same name.
+        crate::store::teams::create(&db.pool, &new_team("bob"), &AuditActor::cli(), now()).await.unwrap();
+        let mut conn = db.pool.acquire().await.unwrap();
+        let audit_team = team_ref(&mut conn, "family").await.unwrap();
+        let team_id: String = sqlx::query_scalar("SELECT id FROM teams WHERE name = 'family'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+        let seen = list(&db.pool, &Viewer::Owner { team_id, audit_team }, &AuditQuery::default()).await.unwrap();
+
+        let actions: Vec<&str> = seen.iter().map(|record| record.action.as_str()).collect();
+        assert_eq!(actions, ["team.created"], "only the new team's own creation, never the old team's entries");
     }
 ```
 
 - [ ] **Step 2: Run them and see them fail**
 
-Run: `tools/agentic/gate.sh narrow --lib http::api::audit::tests`, then `tools/agentic/gate.sh narrow --lib store::audit::tests::owners_never`
+Run: `tools/agentic/gate.sh narrow --lib http::api::audit::tests`, then `tools/agentic/gate.sh narrow --lib store::audit::tests::owners_never`, `tools/agentic/gate.sh narrow --lib store::audit::tests::a_deleted_session_user`, `tools/agentic/gate.sh narrow --lib store::audit::tests::a_new_team_under`
 Expected: compile errors; then 404 for the routes.
 
 - [ ] **Step 3: Implement the reader** (`src/store/audit.rs`)
@@ -3903,8 +4256,10 @@ pub enum Viewer {
     Owner {
         /// The team's `teams.id` (for the member-IP rule).
         team_id: String,
-        /// Its reference as entries store it ([`team_ref`]).
-        team_ref: String,
+        /// Its `audit_teams` id ([`team_ref`]): the scope. It follows the
+        /// immutable `teams.id`, so a later team with the same name has
+        /// another and sees none of this one's entries.
+        audit_team: i64,
     },
     /// A provisioner: only the entries it wrote.
     Credential(String),
@@ -4002,21 +4357,21 @@ const OWNER_REDACTED: &[(&str, &[&str])] = &[("catalog.unlocked", &["reason"])];
 /// # Errors
 /// [`OkfError::Database`].
 pub async fn list(pool: &PgPool, viewer: &Viewer, query: &AuditQuery<'_>) -> Result<Vec<AuditRecord>, OkfError> {
-    let (team, team_id, credential, owner) = match viewer {
+    // `teams`: the audit team ids an entry must overlap (`None`: any).
+    let (teams, team_id, credential, owner): (Option<Vec<i64>>, _, _, _) = match viewer {
         Viewer::Admin => {
-            let mut conn = pool.acquire().await?;
-            let team = match query.team {
-                Some(name) => Some(team_ref_for_reading(&mut conn, name).await?),
+            let teams = match query.team {
+                Some(name) => Some(audit_teams_named(pool, name).await?),
                 None => None,
             };
-            (team, None, None, false)
+            (teams, None, None, false)
         }
-        Viewer::Owner { team_id, team_ref } => (Some(team_ref.clone()), Some(team_id.as_str()), None, true),
+        Viewer::Owner { team_id, audit_team } => (Some(vec![*audit_team]), Some(team_id.as_str()), None, true),
         Viewer::Credential(id) => (None, None, Some(id.as_str()), false),
     };
     let limit = if query.limit <= 0 { 100 } else { query.limit.min(500) };
     let rows = sqlx::query_as::<_, ListedRow>(LIST_SQL)
-        .bind(team)
+        .bind(teams)
         .bind(query.action.map(Action::as_str))
         .bind(query.actor)
         .bind(query.target)
@@ -4032,35 +4387,47 @@ pub async fn list(pool: &PgPool, viewer: &Viewer, query: &AuditQuery<'_>) -> Res
     Ok(rows.into_iter().map(|row| row.into_record(owner)).collect())
 }
 
-/// The listing. `$1` team reference, `$2` action, `$3` actor, `$4` target,
+/// The listing. `$1` audit team ids, `$2` action, `$3` actor, `$4` target,
 /// `$5` since, `$6` until, `$7` cursor, `$8` credential, `$9` the owner's
-/// team id, `$10` owner view, `$11` limit.
+/// team id, `$10` owner view, `$11` limit. For an owner view (`$10`), the
+/// actor filter never matches an operator's entry and the target filter
+/// never matches a hidden (operator) person or credential, so the filters
+/// cannot reveal who operator staff are. *(Corrected, PR #375 review,
+/// 2026-11-13.)*
 const LIST_SQL: &str = "\
-    SELECT e.id, e.at, e.action, e.source, e.actor_operator, e.actor_credential, e.actor_label, \
-           ap.name AS actor_person, host(e.client_ip) AS ip, e.target_kind, e.target_name, \
-           tp.name AS target_person, \
-           ARRAY(SELECT CASE WHEN r LIKE 'person:%' \
-                             THEN COALESCE((SELECT p.name FROM audit_people p \
-                                            WHERE p.id = substr(r, 8)::bigint), r) \
-                             ELSE r END \
-                 FROM unnest(e.teams) AS r) AS teams, \
+    SELECT e.id, e.at, e.action, e.source, e.actor_operator, \
+           COALESCE(ac.credential_id, 'credential #' || ac.id) AS actor_credential, \
+           COALESCE(ac.label, e.actor_label) AS actor_label, \
+           ap.name AS actor_person, host(e.client_ip) AS ip, e.target_kind, \
+           COALESCE(e.target_name, tt.name, ttp.name, tc.credential_id, 'credential #' || tc.id) \
+               AS target_name, \
+           tp.name AS target_person, e.target_operator, \
+           ARRAY(SELECT COALESCE(t.name, p.name) FROM unnest(e.teams) WITH ORDINALITY AS r (id, n) \
+                 JOIN audit_teams t ON t.id = r.id \
+                 LEFT JOIN audit_people p ON p.id = t.person_id ORDER BY r.n) AS teams, \
            e.details, c.requests, \
            ($9::text IS NOT NULL AND EXISTS ( \
                SELECT 1 FROM audit_people p JOIN team_members m ON m.user_id = p.user_id \
                WHERE p.id = e.actor_person_id AND m.team_id = $9)) AS actor_in_team \
     FROM audit_entries e \
+    LEFT JOIN audit_credentials ac ON ac.id = e.actor_credential_ref \
     LEFT JOIN audit_people ap ON ap.id = e.actor_person_id \
     LEFT JOIN audit_people tp ON tp.id = e.target_person_id \
+    LEFT JOIN audit_teams tt ON tt.id = e.target_team_ref \
+    LEFT JOIN audit_people ttp ON ttp.id = tt.person_id \
+    LEFT JOIN audit_credentials tc ON tc.id = e.target_credential_ref \
     LEFT JOIN audit_access_counts c ON c.entry_id = e.id \
-    WHERE ($1::text IS NULL OR e.teams @> ARRAY[$1::text]) \
+    WHERE ($1::bigint[] IS NULL OR e.teams && $1) \
       AND ($2::text IS NULL OR e.action = $2) \
       AND ($3::text IS NULL OR ((NOT $10 OR NOT e.actor_operator) \
-           AND (ap.name = $3 OR e.actor_credential = $3 OR e.actor_label = $3))) \
-      AND ($4::text IS NULL OR e.target_name = $4 OR tp.name = $4) \
+           AND (ap.name = $3 OR ac.credential_id = $3 OR ac.label = $3 OR e.actor_label = $3))) \
+      AND ($4::text IS NULL OR e.target_name = $4 OR tt.name = $4 \
+           OR ((NOT $10 OR NOT e.target_operator) \
+               AND (tp.name = $4 OR ttp.name = $4 OR tc.credential_id = $4))) \
       AND ($5::timestamptz IS NULL OR e.at >= $5) \
       AND ($6::timestamptz IS NULL OR e.at < $6) \
       AND ($7::bigint IS NULL OR e.id < $7) \
-      AND ($8::text IS NULL OR e.actor_credential = $8) \
+      AND ($8::text IS NULL OR ac.credential_id = $8) \
     ORDER BY e.id DESC LIMIT $11";
 ```
 
@@ -4070,8 +4437,10 @@ const LIST_SQL: &str = "\
 impl ListedRow {
     /// The record a reader sees. For an owner: an operator becomes
     /// [`ActorView::Operator`] with no IP, other IPs are shown only for the
-    /// team's own members, and [`OWNER_REDACTED`] keys leave `details`. The
-    /// stored entry is never changed.
+    /// team's own members, [`OWNER_REDACTED`] keys leave `details`, and a
+    /// target person who is operator staff (`target_operator`, such as the
+    /// admin an unlock is for) is hidden with the credential naming them.
+    /// The stored entry is never changed.
     fn into_record(self, owner: bool) -> AuditRecord {
         let operator_hidden = owner && self.actor_operator;
         let actor = if operator_hidden {
@@ -4102,7 +4471,18 @@ impl ListedRow {
             source: self.source,
             actor,
             ip,
-            target: TargetView { kind: self.target_kind, name: self.target_name, person: self.target_person },
+            target: if owner && self.target_operator {
+                // Corrected (PR #375 review, 2026-11-13): owners learned
+                // the unlocked staff member through the target person.
+                let credential = matches!(self.target_kind.as_str(), "key" | "grant" | "code");
+                TargetView {
+                    name: if credential { None } else { self.target_name },
+                    kind: self.target_kind,
+                    person: None,
+                }
+            } else {
+                TargetView { kind: self.target_kind, name: self.target_name, person: self.target_person }
+            },
             teams: self.teams,
             details,
             requests: self.requests,
@@ -4111,16 +4491,17 @@ impl ListedRow {
 }
 ```
 
-`team_ref_for_reading(conn, name)`: the reference without creating a person: `SELECT CASE WHEN personal_of IS NULL THEN name ELSE 'person:' || (SELECT id FROM audit_people WHERE user_id = t.personal_of)::text END FROM teams t WHERE t.name = $1`; an unknown team falls back to the name itself (a deleted shared team's entries keep its name).
+`audit_teams_named(pool, name) -> Vec<i64>` (an admin's `team` filter, which may span teams that had the name): `SELECT t.id FROM audit_teams t LEFT JOIN audit_people p ON p.id = t.person_id WHERE t.name = $1 OR p.name = $1`. An owner's view never uses a name: it is scoped by the one `audit_teams` id of the team it owns now. *(Corrected, PR #375 review, 2026-11-13: this matched entries by the reusable team name.)*
 
 `src/store/teams.rs`:
 
 ```rust
-/// The team `team` if `user_id` owns it: its id and its audit reference.
+/// The team `team` if `user_id` owns it: its `teams.id` and its
+/// `audit_teams` id.
 ///
 /// # Errors
 /// [`OkfError::Database`].
-pub async fn owned_by(pool: &PgPool, user_id: &str, team: &str) -> Result<Option<(String, String)>, OkfError> {
+pub async fn owned_by(pool: &PgPool, user_id: &str, team: &str) -> Result<Option<(String, i64)>, OkfError> {
     Ok(sqlx::query_as(
         "SELECT t.id, audit_team_ref(t.id) FROM teams t \
          JOIN team_members m ON m.team_id = t.id \
@@ -4193,8 +4574,8 @@ async fn viewer(app: &App, principal: &Principal, team: Option<&str>) -> Result<
     let (CredentialKind::Session { user_id }, Some(team)) = (&principal.kind, team) else {
         return Err(refused());
     };
-    let (team_id, team_ref) = teams::owned_by(app.pool(), user_id, team).await?.ok_or_else(refused)?;
-    Ok(Viewer::Owner { team_id, team_ref })
+    let (team_id, audit_team) = teams::owned_by(app.pool(), user_id, team).await?.ok_or_else(refused)?;
+    Ok(Viewer::Owner { team_id, audit_team })
 }
 
 /// Parses the query into the store's filters.
@@ -4954,6 +5335,8 @@ pub async fn create(
 }
 ```
 
+> **Corrected (PR #375 review, 2026-11-13).** `catalog.unlocked` and `catalog.unlock_ended` name the unlocked admin as the entry's person. Because that person is an admin user, `record` sets `target_operator`, and Task 8a's owner view hides the person (and the target filter cannot match it), as it hides the actor and the `reason`. Owners see only "an operator opened <catalog>: <category>, <start> to <end>".
+
 `end(pool, id, actor, now)`: `UPDATE unlocks SET ended_at = $2 WHERE id = $1 AND ended_at IS NULL AND expires_at > $2 RETURNING catalog_id`; none is `Refused` ("unlock N has already ended or expired") or `NotFound` for an unknown id; records `catalog.unlock_ended` (`{"unlock": id}`), bumps the generation. `find(pool, id)`, `list(pool, filter)` (newest first; the `team` filter matches the catalog's current owner team), `live(pool, now) -> Vec<LiveUnlock>` (`ended_at IS NULL AND expires_at > now AND user_id IS NOT NULL`). (`tally` comes in Task 9b, with `AccessKind` from Task 7b.)
 
 `Template::Unlocked { catalog, category, until }` (name `"unlocked"`): subject `An operator opened {catalog}`; body `An operator of {product} opened your team's catalog {catalog} for {category} until {until} (UTC). The operator's reads and writes are counted and shown in the audit log of your team. If you did not expect this, contact {support or "the operator"}.` No staff name, no reason.
@@ -5244,11 +5627,16 @@ git commit -m "feat(auth): operator access to customer catalogs needs an unlock 
 -- runner's individual reads are not recorded.
 CREATE FUNCTION audit_maintenance_run() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-    INSERT INTO audit_entries (at, action, source, actor_credential, actor_label,
+    -- The runner's credential and its label go to audit_credentials (Task
+    -- 1's rule: no label in the entry); the entry says 'system:maintenance'.
+    INSERT INTO audit_entries (at, action, source, actor_credential_ref, actor_label,
                                actor_operator, target_kind, target_name, teams, details)
     SELECT COALESCE(NEW.ended_at, NEW.deadline), 'catalog.maintenance_run', 'system',
-           NEW.credential_id, NEW.actor, false, 'catalog', c.name,
-           CASE WHEN c.owner_team_id IS NULL THEN '{}'::text[]
+           audit_credential(NEW.credential_id,
+                            audit_person((SELECT user_id FROM api_keys WHERE id = NEW.key_id)),
+                            NEW.actor),
+           'system:maintenance', false, 'catalog', c.name,
+           CASE WHEN c.owner_team_id IS NULL THEN '{}'::bigint[]
                 ELSE ARRAY[audit_team_ref(c.owner_team_id)] END,
            jsonb_build_object(
                'run', NEW.id,
@@ -5578,6 +5966,23 @@ git commit -m "feat(maintenance): a per-catalog maintenance switch; runner passe
         assert_eq!(too_long, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(ended, StatusCode::OK);
         assert_eq!(after["state"], "ended");
+
+        // Corrected (PR #375 review, 2026-11-13): the owner's whole audit
+        // view, its export and its filters name no staff member.
+        let team = format!("/api/v1/audit?team={TEST_TEAM}");
+        let log = owner.send(&test, "GET", &team, Payload::Empty).await;
+        let export = owner
+            .send(&test, "GET", &format!("/api/v1/audit/export?team={TEST_TEAM}"), Payload::Empty)
+            .await;
+        let probe = owner.send(&test, "GET", &format!("{team}&target=staff"), Payload::Empty).await;
+        let probe_actor = owner.send(&test, "GET", &format!("{team}&actor=staff-root"), Payload::Empty).await;
+        let (_, log_body) = log.parts();
+        assert!(log_body.to_string().contains("catalog.unlocked"), "{log_body}");
+        for text in [log_body.to_string(), export.text()] {
+            assert!(!text.contains("staff") && !text.contains("ticket 12"), "{text}");
+        }
+        assert_eq!(probe.parts().1["entries"], json!([]));
+        assert_eq!(probe_actor.parts().1["entries"], json!([]));
     }
 ```
 
@@ -5820,7 +6225,7 @@ git commit -m "feat(console): unlock a locked catalog, the Unlocks page and the 
 
 - [ ] **Step 1: `docs/operations.md`**
   - "Users and teams": a lead paragraph on running okf-mcp for other people (branding, provisioner, audit, unlocks), linking each section.
-  - "### Audit log": what is recorded (the full action table, grouped as the spec groups it), what is not (members' reads, sign-ins, runner reads), people in entries (`audit_people`, `deleted user #N`, `person:` team references), append-only and retention, who reads it (admins, owners through a console session, provisioners their own), the redaction rules, the CLI, REST and console surfaces, and a sample entry.
+  - "### Audit log": what is recorded (the full action table, grouped as the spec groups it), what is not (members' reads, sign-ins, runner reads), people, teams and credentials in entries (`audit_people`, `audit_teams`, `audit_credentials`; `deleted user #N`; no name in an immutable column), append-only and retention, who reads it (admins, owners through a console session, provisioners their own), the redaction rules, the CLI, REST and console surfaces, and a sample entry.
   - "Upgrades": migrations `0012` to `0016`; `0013` changes three foreign keys to `CASCADE` (deleting a user now deletes its credentials); all others are additive; `require_unlock` is off until an operator turns it on.
   - "Troubleshooting": `UnlockRequired` on a key with no user (assign it a user); `maintenance_off` from the runner.
   - Check every new route has an API reference row and every new subcommand a parity row (`tools/agentic/gate.sh narrow --test admin_parity`).
@@ -5843,8 +6248,8 @@ git commit -m "docs: operator API operations, API reference and close-out (M14 t
 ## Decisions taken while planning (2026-11-13)
 
 1. **The actor is an argument**, `actor: &AuditActor`, on every instrumented store function (spec "Left to the builder"). A function that would take more than five arguments takes an input struct (`AdminChange`, `NewEntitlement`, `Membership`, `NewCatalog`, `PublishInput`). In `src/store/keys.rs` the argument is named `audit`, because `actor` there is a key's actor label.
-2. **Personal teams are written as `person:<id>`** in `teams` and in `details`. A personal team's name is its user's name, so writing the name would keep identifying a deleted person, against the founder's decision that entries must not identify deleted people. The reader shows the person's current name, or `deleted user #N`.
-3. **Users are targets only through `audit_people`** (`target_name` is NULL for a user), and a console session's credential id (`session:<name>`) is never stored, for the same reason.
+2. **Teams are `audit_teams` ids** in `teams`, `target_team_ref` and `details`, never names. A personal team's row points at its person, so it reads as the user's current name, or `deleted user #N`. *(Corrected, PR #375 review, 2026-11-13: first written as names and `person:<id>` text; see Decision 16.)*
+3. **Users are targets only through `audit_people`** (`target_name` is NULL for a user), and a console session's credential id (`session:<name>`) is never stored, for the same reason. Credentials are `audit_credentials` ids (Decision 17).
 4. **Admin-read counts live in `audit_access_counts`**, beside an immutable entry, because the trigger forbids `UPDATE` of entries. The first read of an hour creates the entry; the upsert keeps the count exact under concurrency.
 5. **Access accounting runs in the background** (`App::note_access` on a `JoinSet`), off the request path, at most once per tool call, catalog and kind. A crash between a request and its write can lose that one count; shutdown waits for every write (`settle_access`).
 6. **An all-catalogs key's events belong to no team** (operator only): "the owner teams of the catalogs it is granted" would otherwise put every operator key into every customer's log. Its uses of a customer catalog are still recorded there (admin reads, unlocks).
@@ -5857,3 +6262,6 @@ git commit -m "docs: operator API operations, API reference and close-out (M14 t
 13. **`unlock_max_hours` is 1 to 72**, `audit_retention_days` 30 to 3650 (the spec gives only the defaults and the minimum).
 14. **Owners read unlocks** both as `catalog.unlocked` entries (reason removed) and through `GET /api/v1/unlocks?team=` (with the tallies), both through a console session only.
 15. **The parity test learns flag entries** (`user list --email`, `key create --provisioner`), so the two new flags the spec lists under "Surfaces and parity" are enforced like subcommands. `settings set` already covers the new settings keys.
+16. **Owners' scope is an immutable team identity.** *(PR #375 review, 2026-11-13.)* A shared team's name can be reused: delete `family`, create a new `family` for another customer, and a scope by name (`e.teams @> ARRAY[name]`) would show the new owners the old team's retained entries. Entries now store `audit_teams` ids; an `audit_teams` row follows one `teams.id`, a UUID that is never reused, and keeps the name only as a display snapshot. An owner's view is scoped by the one id of the team it owns now; an admin's `team` filter by name may span every team that had it. Tests: Task 1 (`a_team_created_again_under_its_old_name_gets_a_new_audit_id`) and Task 8a (`a_new_team_under_an_old_name_cannot_read_the_old_teams_entries`). The spec's "teams" rule says so too.
+17. **No person's name in an immutable column.** *(PR #375 review, 2026-11-13.)* `Principal::for_session` sets a session's `actor` to the user's name (`src/auth.rs:191`), a self-issued key's actor label defaults to the key name its user chose, and a legacy key's id is its name (`migrations/0005_key_names.sql`). So `actor_label` holds only a kind (`console session`, `api key`, `oauth grant`), `cli:<os user>`, `system:<what>` or the label of a key with no user (`AuditActor::stored_label`); credential ids and labels live in `audit_credentials`, which `forget_person` clears for the deleted user's credentials (shown as `credential #N`); the admin-read bucket key uses audit ids. Grant names (`grants::grant_name`, which starts with the user's name) are never written into entries. The CLI's operating-system user stays in `actor_label` as the spec decides: it is operator staff, not an okf-mcp user. Tests: Task 1 (`a_session_actor_leaves_no_name_in_the_entry_once_its_user_is_forgotten`) and Task 8a (`a_deleted_session_user_is_named_nowhere_in_the_admin_or_owner_view`, the complete admin and owner records).
+18. **Operator staff as a target are hidden from owners too.** *(PR #375 review, 2026-11-13.)* An unlock's entries name the unlocked admin as their person; owners saw it although the actor read "an operator". `record` sets `target_operator` when the target person is an admin user, and the owner view drops that person (and a credential naming them); for owners the target filter never matches a hidden person or credential and the actor filter never matches an operator's entry, so neither is an identity oracle. Tests: Task 8a (`owners_never_see_an_operators_identity_ip_unlock_reason_or_unlocked_staff`, the whole serialized record and both filters) and Task 9d (the owner's full `GET /api/v1/audit` response, its export and its filters contain no staff name).

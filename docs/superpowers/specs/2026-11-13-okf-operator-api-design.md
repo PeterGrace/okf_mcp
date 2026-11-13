@@ -253,14 +253,27 @@ deletion's transaction, so entries stay intact and append-only but stop
 identifying the person. Email addresses are never written into entries or
 `details` (an email change records only that it changed).
 
+> **Corrected (PR #375 review, 2026-11-13).** No column of an entry ever
+> holds a person's name or a reusable name: the actor label is a kind
+> ("console session", "api key", "oauth grant", the CLI's operating-system
+> user, or the system), never a session's user name or a user's key label;
+> credentials are referred to through an `audit_credentials` table whose id
+> and label are cleared when their user is deleted (a legacy key's id was
+> its name); and teams through an `audit_teams` table keyed by the team's
+> immutable id (below). See the M14 plan's Decisions 16 to 18.
+
 ### An entry
 
 - `at` (server clock), `action`;
-- **actor:** the key or grant id, the user name at the time, and the
-  actor label; `source` (`cli`, `api`, `console`, `system`); the client
+- **actor:** the key or grant (through `audit_credentials`), the person
+  (through `audit_people`), and a non-identifying actor label; `source` (`cli`, `api`, `console`, `system`); the client
   IP for web requests;
 - **target:** kind and name (user, team, catalog, key, setting);
-- **teams:** the names of the teams the entry belongs to, for scoping.
+- **teams:** the teams the entry belongs to, for scoping, by their
+  immutable identity (an `audit_teams` id per team id, never reused), with
+  the name kept only as a display snapshot. *(Corrected, PR #375 review,
+  2026-11-13: scoping by name let a team created again under an old name
+  read the old team's entries.)*
   *My call, after the builder check:* only where the event happened, never
   a user's other teams. For a catalog event (writes, exports, admin reads,
   access changes, an entitlement on it), its owner team at the time; for a
@@ -275,9 +288,8 @@ identifying the person. Email addresses are never written into entries or
   values for a change, counts for a write or an admin read). Never a
   secret.
 
-Names are **copied** into the entry, not referenced by foreign key, so
-deleting a user, team, key or catalog never changes or removes its
-entries.
+Entries keep no foreign key to users, teams, keys or catalogs (only to the
+audit tables), so deleting one never changes or removes its entries.
 
 ### Integrity and retention
 
@@ -302,6 +314,11 @@ entries.
   with no key id, user name or IP. Admins see the full entry. The stored
   entry is never reduced; the redaction happens when owners read it.
   Owners never see client IPs of anyone but their own team's members.
+- *(Corrected, PR #375 review, 2026-11-13.)* The same holds for operator
+  staff as a **target**: an entry whose target person is an admin user
+  (such as the admin an unlock is for) shows owners no person and no
+  credential naming them, and owners' actor and target filters never match
+  an operator, so they cannot be used to find out who staff are.
 - `GET /api/v1/audit?team=&action=&actor=&target=&since=&until=&after=&limit=`,
   newest first, cursor-paged (`after`).
 - `GET /api/v1/audit/export?...` with the same filters: JSON Lines, for a
