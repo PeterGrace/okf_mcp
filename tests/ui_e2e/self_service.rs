@@ -356,6 +356,60 @@ async fn the_lifetime_limit_shapes_the_expiry_choices_and_the_longest_is_the_def
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ceiling_lowered_during_the_session_shows_on_my_keys_without_a_reload() {
+    let server = login_server().await;
+    member(&server, Access::Write).await;
+    alices_key(&server, "laptop").await;
+    let pool = server.db.pool.clone();
+    let app = Arc::clone(&server.app);
+    // The journey runs on a blocking thread; this handle lets it run the
+    // admin's changes on the test's runtime mid-session.
+    let runtime = tokio::runtime::Handle::current();
+    drive(console_base(&server), move |ui| {
+        ui.sign_in_password(EMAIL, PASSWORD);
+        ui.wait_text("#whoami", "alice - write");
+        let cell = "#my-keys-table tr:has([data-test=my-key-laptop]) td:nth-child(2)";
+        // An admin lowers main to read. The page is not reloaded: My keys
+        // is reached through the nav link (a hash change).
+        runtime.block_on(async {
+            ceiling::entitle(&pool, "alice", "main", Access::Read, Utc::now())
+                .await
+                .expect("lower main to read");
+            app.poll().await.expect("poll");
+        });
+        ui.click("a[data-nav=my-keys]");
+        ui.wait_text(cell, "(capped to read)");
+        ui.click("[data-test=my-key-laptop]");
+        ui.wait_text("#drawer dl.facts", "(capped to read)");
+        ui.click("#drawer-close");
+        // The New key form offers no more than read now.
+        ui.click("#my-key-new");
+        assert_eq!(
+            ui.eval(
+                "() => [...document.querySelectorAll('#my-key-form select[name=level-main] option')] \
+                 .map(option => option.value)",
+                json!(null)
+            ),
+            json!(["read"])
+        );
+        ui.click("#drawer-close");
+        // Then main is taken away altogether.
+        runtime.block_on(async {
+            ceiling::unentitle(&pool, "alice", "main")
+                .await
+                .expect("take main away");
+            app.poll().await.expect("poll");
+        });
+        ui.click("a[data-nav=health]");
+        ui.wait_hidden("#my-keys-table");
+        ui.click("a[data-nav=my-keys]");
+        ui.wait_text(cell, "(outside your ceiling now)");
+        ui.wait_text("#my-keys-note", "reaches no catalog");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_admin_issued_key_for_every_catalog_shows_its_level() {
     let server = login_server().await;
     member(&server, Access::Write).await;

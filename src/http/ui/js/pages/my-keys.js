@@ -77,6 +77,10 @@ export async function render(main) {
             [account, { keys }] = await Promise.all([api.get('/me'), api.get('/me/keys')]);
         } catch { return; /* toasted */ }
         if (!main.isConnected) return;
+        // The ceiling as /me gives it now, which an admin may have changed
+        // since sign-in: the table's and drawer's cap notes, the New key
+        // form and `store.can` all read this one map.
+        if (store.session) store.session.ceiling = ceilingMap(account);
         table.redraw(keys);
         // What `max_keys_per_user` counts: live self-issued keys.
         const live = keys.filter(key => key.self_issued && keyState(key) === 'active').length;
@@ -85,6 +89,12 @@ export async function render(main) {
         note.textContent = reason || `${live} of ${account.limits.max_keys_per_user} keys in use.`;
     }
     await load();
+}
+
+// /me's ceiling ([{catalog, access}]) as GET /api/v1/session spells it:
+// {catalog: level}.
+function ceilingMap({ ceiling }) {
+    return Object.fromEntries(ceiling.map(({ catalog, access }) => [catalog, access]));
 }
 
 // Why New key is unavailable, or '' when it is not.

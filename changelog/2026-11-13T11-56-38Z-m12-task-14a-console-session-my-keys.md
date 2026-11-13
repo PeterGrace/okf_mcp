@@ -8,7 +8,8 @@
 - `core/dom.js`: `fill(el, ...children)` and `fact(label, value)`. `h()` and `fill()` share one child filter that drops `null`, `undefined` and `false`.
 - `core/shell.js`: `requireSession` for the account pages.
 - `levelsCell` shows a key granted every catalog as "All catalogs" with its level (review, PR #345).
-- Journeys: `tests/ui_e2e/self_service.rs` (10, including the lifetime-limit expiry choices and an admin-issued all-catalog key), `users::no_page_prints_a_stray_null_under_its_content`, and `Ui::wait_text_gone`.
+- My keys reads the ceiling from each `GET /me` and stores it in `store.session.ceiling`, so a ceiling an admin lowered mid-session shows in its cap notes, drawer and New key form without a reload (review, PR #345).
+- Journeys: `tests/ui_e2e/self_service.rs` (11, including the lifetime-limit expiry choices, an admin-issued all-catalog key and a ceiling lowered mid-session), `users::no_page_prints_a_stray_null_under_its_content`, and `Ui::wait_text_gone`.
 
 ## Changed
 - `core/store.js`: `store.session` (the whole `GET /api/v1/session` answer, memory only) beside `store.csrf`. `store.can(level)` uses the ceiling's level on the selected catalog for a member's session.
