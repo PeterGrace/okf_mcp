@@ -556,3 +556,64 @@ async fn a_refusal_whose_reread_fails_keeps_its_reason_and_working_controls() {
         .expect("alice has the new email");
     assert!(alice.is_admin);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_that_settles_after_its_user_was_reopened_updates_the_new_drawer() {
+    let server = login_server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    server.user_with_password("alice", EMAIL, PASSWORD).await;
+    let bob = NewUser {
+        name: "bob",
+        display_name: "",
+    };
+    users::create(&server.db.pool, &bob, Utc::now())
+        .await
+        .expect("create bob");
+    server.app.poll().await.expect("poll");
+    let ran = drive(console_base(&server), move |ui| {
+        ui.login(&admin);
+        ui.open("/users");
+        ui.click("[data-test=user-alice]");
+        ui.wait_visible("#user-admin-toggle:not(:checked):not([disabled])");
+        // Make alice an admin, but hold the write while her drawer is
+        // closed and opened again: the new drawer reads her from before
+        // the write, with the switch disabled while it runs.
+        ui.hold_next("PUT", "/users/alice/admin");
+        ui.click("#user-admin-toggle");
+        ui.click("#drawer-close");
+        ui.click("[data-test=user-alice]");
+        ui.wait_visible("#user-admin-toggle:not(:checked)[disabled]");
+        // Once the write settles, the new drawer shows the server's state.
+        ui.release_held();
+        ui.wait_visible("#user-admin-toggle:checked:not([disabled])");
+        // A refusal reaches the reopened drawer too: clearing alice, the
+        // last admin user, is refused.
+        ui.hold_next("PUT", "/users/alice/admin");
+        ui.click("#user-admin-toggle");
+        ui.click("#drawer-close");
+        ui.click("[data-test=user-alice]");
+        ui.wait_visible("#user-admin-toggle[disabled]");
+        ui.release_held();
+        ui.wait_text("#user-refusal", "last admin user");
+        ui.wait_visible("#user-admin-toggle:checked:not([disabled])");
+        // Another user's drawer is left alone when alice's write settles.
+        ui.hold_next("PUT", "/users/alice/email");
+        ui.fill("#user-email-form input[name=email]", "alice@example.org");
+        ui.click("#user-email-form button[type=submit]");
+        ui.click("#drawer-close");
+        ui.click("[data-test=user-bob]");
+        ui.wait_text("#drawer-title", "bob");
+        ui.release_held();
+        assert_eq!(ui.text("#drawer-title"), "bob");
+        ui.wait_text("[data-test=user-bob-email]", "none");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let alice = users::find_by_email(&server.db.pool, "alice@example.org")
+        .await
+        .expect("find")
+        .expect("alice has the new email");
+    assert!(alice.is_admin);
+}

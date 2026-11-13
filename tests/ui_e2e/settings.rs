@@ -254,3 +254,46 @@ async fn a_member_has_no_settings_page() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_queue_read_never_draws_over_a_newer_one() {
+    let server = login_server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let failed = failed_mail(&server, "bob@example.com").await;
+    let failed_id = failed.clone();
+    let ran = drive(console_base(&server), move |ui| {
+        ui.login(&admin);
+        ui.open("/settings");
+        let status = format!("[data-test=mail-status-{failed}]");
+        let retry = format!("[data-test=mail-retry-{failed}]");
+        ui.wait_text(&status, "failed");
+        // A Refresh reads the queue while bob's mail has failed, but its
+        // answer reaches the page late.
+        ui.hold_answer("GET", "/api/v1/mail/queue", || {
+            ui.click("#mail-queue-refresh")
+        });
+        // Meanwhile Retry runs, and the read after it draws the mail pending.
+        ui.click(&retry);
+        ui.wait_text(&status, "pending");
+        // The late answer draws nothing: the mail stays pending, with no
+        // Retry to offer.
+        ui.release_held();
+        assert!(
+            ui.text(&status).contains("pending"),
+            "the late read drew the mail as {:?}",
+            ui.text(&status)
+        );
+        assert!(!ui.page.is_visible(&retry).expect("visible"));
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let mail = queue::list(&server.db.pool)
+        .await
+        .expect("list the queue")
+        .into_iter()
+        .find(|mail| mail.id == failed_id)
+        .expect("the mail is still queued (no worker runs here)");
+    assert_eq!(mail.status, "pending");
+}

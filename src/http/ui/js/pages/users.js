@@ -57,6 +57,11 @@ export async function render(main, rest) {
         manager ? null : h('p', { class: 'muted small' }, NEEDS_EVERY_CATALOG));
     await load();
 
+    // The user drawer shown or loading ({name, ticket, last}), and the count
+    // of its reads (see openDetail).
+    let shown = null;
+    let reads = 0;
+
     async function load() {
         try {
             const { users } = await api.get('/users');
@@ -96,7 +101,17 @@ export async function render(main, rest) {
     // answers the drawer showed before it: when reading the user again
     // fails, the drawer is drawn from them, marked stale, so the refusal
     // still shows and every control can be used again.
+    //
+    // `shown` is the drawer being shown (or loaded) and whose it is. A write
+    // re-renders the drawer that shows its user when it settles, through
+    // that drawer's own ticket, even when it is not the drawer the write
+    // started in (the user's drawer was closed and opened again meanwhile);
+    // a drawer of another user is left alone. Every read takes the next
+    // number in `reads`, and only the newest one draws, so a read that
+    // started before the write never draws over the one after it.
     async function openDetail(name, ticket = drawerTicket(main), { refusal = null, last = null } = {}) {
+        const read = ++reads;
+        shown = { name, ticket, last };
         let loaded;
         try {
             const [detail, personal, account] = await Promise.all([
@@ -106,8 +121,9 @@ export async function render(main, rest) {
             if (!last) return;   // the first load: no drawer to keep (toasted)
             loaded = { ...last, stale: true };
         }
-        if (!ticket.current()) return;
+        if (read !== reads || !ticket.current()) return;
         const { detail, personal, account, stale } = loaded;
+        shown.last = { detail, personal, account };
         const { user, keys, codes } = detail;
         const reason = deleteReason(user, personal);
         const changed = async refused => {
@@ -115,8 +131,9 @@ export async function render(main, rest) {
             // shell state (the Administer group, the session itself).
             if (name === store.session?.user) await refreshIdentity().catch(() => {});
             if (main.isConnected) await load();
-            if (ticket.current()) {
-                await openDetail(name, ticket, { refusal: refused, last: { detail, personal, account } });
+            const view = shown;
+            if (view?.name === name && view.ticket.current()) {
+                await openDetail(name, view.ticket, { refusal: refused, last: view.last });
             }
         };
         const remove = h('button', {

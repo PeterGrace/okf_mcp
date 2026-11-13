@@ -13,12 +13,16 @@ const WAIT: Duration = Duration::from_secs(10);
 /// in `arg.suffix` until `window.releaseHeld()`; `window.heldDone` turns
 /// true once that held answer has been handed back to the page, and
 /// `window.heldMatches` counts the matching requests the page made while it
-/// was held (the held one included). Runs through `ui.eval`, so it wraps
-/// `fetch` without touching the page's code.
+/// was held (the held one included). With `arg.early`, the request is sent
+/// at once and only its answer is held (`window.heldFetched` turns true
+/// when the server has answered): a read that finishes late with what it
+/// read early. Runs through `ui.eval`, so it wraps `fetch` without touching
+/// the page's code.
 const HOLD_NEXT: &str = "(arg) => {
     const original = window.fetch;
     let release = null;
     window.heldDone = false;
+    window.heldFetched = false;
     window.heldMatches = 0;
     window.releaseHeld = () => release();
     window.fetch = (input, init) => {
@@ -27,6 +31,13 @@ const HOLD_NEXT: &str = "(arg) => {
         if (matches) window.heldMatches += 1;
         if (release === null && matches) {
             const held = new Promise(resolve => { release = resolve; });
+            if (arg.early) {
+                const answer = original(input, init);
+                const fetched = () => { window.heldFetched = true; };
+                answer.then(fetched, fetched);
+                return held.then(() => answer)
+                    .finally(() => { window.heldDone = true; window.fetch = original; });
+            }
             return held.then(() => original(input, init))
                 .finally(() => { window.heldDone = true; window.fetch = original; });
         }
@@ -237,8 +248,32 @@ impl Ui {
     pub fn hold_next(&self, method: &str, suffix: &str) {
         self.eval(
             HOLD_NEXT,
-            serde_json::json!({ "method": method, "suffix": suffix }),
+            serde_json::json!({ "method": method, "suffix": suffix, "early": false }),
         );
+    }
+
+    /// Sends the page's next `method` request to a path ending in `suffix`
+    /// at once but holds its answer until [`Ui::release_held`], then waits
+    /// until the server has answered it (see [`HOLD_NEXT`]): the page gets,
+    /// late, what the server said early.
+    ///
+    /// # Arguments
+    /// * `method` - the HTTP method, upper case.
+    /// * `suffix` - the end of the request's URL.
+    /// * `trigger` - what makes the page send it, run after the hold is set.
+    ///
+    /// # Panics
+    /// When the server has not answered within [`WAIT`].
+    pub fn hold_answer(&self, method: &str, suffix: &str, trigger: impl FnOnce()) {
+        self.eval(
+            HOLD_NEXT,
+            serde_json::json!({ "method": method, "suffix": suffix, "early": true }),
+        );
+        trigger();
+        self.poll(&format!("the server's answer to {method} {suffix}"), || {
+            self.eval("() => window.heldFetched", serde_json::json!(null))
+                == serde_json::json!(true)
+        });
     }
 
     /// How many matching requests the page made since [`Ui::hold_next`],

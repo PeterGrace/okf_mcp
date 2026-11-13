@@ -503,6 +503,23 @@ async fn member_access_read_makes_a_team_catalog_read_only_for_its_members() {
         ui.wait_text("#toasts", "now reach shared at read");
         ui.wait_hidden("#catalog-member-access-error");
         ui.wait_text_gone("#catalog-member-access-current", "out of date");
+        // A save that settles after the drawer was closed and opened again
+        // shows in the new drawer.
+        ui.hold_next("PUT", "/member-access");
+        ui.select("#catalog-member-access-select", "write");
+        ui.click("#catalog-member-access-save");
+        ui.click("#drawer-close");
+        ui.click("[data-catalog=shared]");
+        ui.wait_text("#catalog-member-access-current", "read");
+        ui.wait_visible("#catalog-member-access-select[disabled]");
+        ui.release_held();
+        ui.wait_text("#catalog-member-access-current", "write");
+        ui.wait_visible("#catalog-member-access-select:not([disabled])");
+        // Back to read for alice, below.
+        ui.select("#catalog-member-access-select", "read");
+        ui.click("#catalog-member-access-save");
+        ui.wait_text_gone("#catalog-member-access-current", "write");
+        ui.wait_text("#catalog-member-access-current", "read");
         // The drawer stays open and shows the value read again.
         ui.wait_text("#catalog-member-access-current", "read");
         ui.wait_visible("#catalog-member-access-save[disabled]");

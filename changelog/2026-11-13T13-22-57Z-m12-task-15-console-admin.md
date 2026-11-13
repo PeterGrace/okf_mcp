@@ -12,7 +12,8 @@
 - `.settings-input`, and inputs inside `.inline-form` lose their margin.
 - `core/pending.js` (new): writes in flight by a stable key (`guard`, `once`, `recheck`). A control drawn again while its write runs (a re-sorted table, a Refresh, a reopened drawer) is drawn disabled, and a second start of a running write is ignored. `sessionTable` (so the Account page too), the user drawer, member access and Settings use it (review of PR #349, rounds 1 and 2).
 - When the read that follows an action fails, the user drawer, the catalog drawer's member access and the Settings tables are drawn again from the last answer and marked out of date (`#user-stale`, `#settings-stale`, `#mail-queue-stale`), so a refusal's reason still shows and every control works; (review of PR #349).
-- `tests/ui_e2e/harness.rs` gains `Ui::hold_next`, `held_matches`, `release_held` (moved from `keys.rs`), `fail_next`, `click_twice`, `mark`, `is_marked` and `wait_redrawn`.
+- Reads that overlap draw only the newest answer: the Settings list and the mail queue number their loads, and so do the user drawer and member access. A write that settles re-renders the drawer showing its user (or catalog) now, through that drawer's own ticket, even when it was closed and opened again while the write ran; another user's drawer is left alone (review of PR #349, round 3).
+- `tests/ui_e2e/harness.rs` gains `Ui::hold_next`, `held_matches`, `release_held` (moved from `keys.rs`), `fail_next`, `click_twice`, `mark`, `is_marked`, `wait_redrawn` and `hold_answer`.
 
 ## Notes
 - Any admin reads these; changing them needs an admin that reaches every catalog, as in M11. For a scoped admin every control renders disabled with the reason.

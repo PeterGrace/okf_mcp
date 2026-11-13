@@ -149,6 +149,10 @@ export async function render(main) {
     await load();
 }
 
+// The member-access section the catalog drawer shows (or last showed):
+// {catalog, ticket, refresh, report}. See memberAccess.
+let shownMemberAccess = null;
+
 // The drawer's "Team member access": what members of the catalog's owner
 // team reach through their accounts (the ceiling's level for it; keys and
 // grants they create are capped at it). It is read from GET
@@ -162,6 +166,13 @@ export async function render(main) {
 // answer that arrives after the drawer was replaced or dismissed is
 // dropped. Returns the section and `refresh()`, which the caller runs once
 // the drawer is open.
+//
+// A save that settles updates the section the drawer shows now if it is
+// this catalog's, through that section's own ticket, even when the drawer
+// was closed and opened again while the save ran (`shownMemberAccess`); a
+// drawer of another catalog is left alone. Each section draws only its
+// newest read, so a read that started before the save never draws over
+// the one after it.
 function memberAccess(row, allowed, ticket) {
     const path = `/catalogs/${enc(row.name)}/member-access`;
     // The pending-write key (core/pending.js): a save in flight keeps these
@@ -183,10 +194,12 @@ function memberAccess(row, allowed, ticket) {
     const sync = () => { recheck(select); recheck(save); };
     select.addEventListener('change', sync);
 
+    let reads = 0;
     async function refresh() {
+        const mine = ++reads;
         let answer = null;
         try { answer = await api.get(path); } catch { /* toasted */ }
-        if (!ticket.current()) return;
+        if (mine !== reads || !ticket.current()) return;
         loaded = true;
         stale = answer === null;
         if (!stale) {
@@ -197,16 +210,26 @@ function memberAccess(row, allowed, ticket) {
         sync();
     }
 
+    // Shows the reason a save was refused, or clears it (null).
+    const report = reason => {
+        refusal.textContent = reason ?? '';
+        refusal.hidden = reason === null;
+    };
+    const self = { catalog: row.name, ticket, refresh, report };
+    shownMemberAccess = self;
+
     save.addEventListener('click', () => once(key, async () => {
+        let refused = null;
         try {
             const answer = await api.put(path, { access: select.value });
             toast(`Members of ${row.owner_team ?? 'the owner team'} now reach ${answer.name} at ${answer.member_access}.`, 'ok');
-            refusal.hidden = true;
         } catch (error) {
-            refusal.textContent = error.message;   // already toasted
-            refusal.hidden = false;
+            refused = error.message;   // already toasted
         }
-        await refresh();
+        const shown = shownMemberAccess;
+        const view = shown?.catalog === row.name && shown.ticket.current() ? shown : self;
+        view.report(refused);
+        await view.refresh();
     }));
 
     const section = h('section', { id: 'catalog-member-access' },

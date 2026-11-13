@@ -170,6 +170,12 @@ export async function render(main) {
     // notes saying the shown values may be out of date.
     let settingRows = [];
     let queueRows = [];
+    // Each read of the settings or the queue takes the next ticket, and only
+    // the newest read draws: reads overlap (a Refresh and an action's reload)
+    // and can finish out of order, and an older answer must never draw over
+    // a newer one.
+    let settingsTicket = 0;
+    let queueTicket = 0;
     const staleNote = (id, what) => h('p', { id, class: 'error small', role: 'status', hidden: true },
         `Could not read ${what} again, so what is shown may be out of date.`);
     const settingsStale = staleNote('settings-stale', 'the settings');
@@ -195,11 +201,13 @@ export async function render(main) {
             queue));
 
     // Reads the settings and redraws them; after a failed read (toasted),
-    // redraws the last ones, marked stale, with the current refusals.
+    // redraws the last ones, marked stale, with the current refusals. A
+    // read that a newer one has overtaken draws nothing.
     async function loadSettings() {
+        const mine = ++settingsTicket;
         let answer = null;
         try { answer = await api.get('/settings'); } catch { /* toasted */ }
-        if (!main.isConnected) return;
+        if (!main.isConnected || mine !== settingsTicket) return;
         settingsStale.hidden = answer !== null;
         if (answer === null) {
             settings.redraw(settingRows);
@@ -220,9 +228,10 @@ export async function render(main) {
 
     // Reads the queue and redraws it, as loadSettings does the settings.
     async function loadQueue() {
+        const mine = ++queueTicket;
         let answer = null;
         try { answer = await api.get('/mail/queue'); } catch { /* toasted */ }
-        if (!main.isConnected) return;
+        if (!main.isConnected || mine !== queueTicket) return;
         queueStale.hidden = answer !== null;
         if (answer !== null) {
             queueRows = answer.mail;
