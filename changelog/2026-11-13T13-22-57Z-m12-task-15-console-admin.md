@@ -10,9 +10,9 @@
 ## Changed
 - After every account change the user drawer reads the user again and re-renders through its own ticket, so each control shows the server's state (a refused admin switch springs back) and a late answer never replaces a newer drawer.
 - `.settings-input`, and inputs inside `.inline-form` lose their margin.
-- `components/activity.js`: `sessionTable`'s Sign out button stays disabled until its request settles, on the Account page too (review of PR #349).
-- When the read that follows an action fails, the user drawer, the catalog drawer's member access and the Settings tables are drawn again from the last answer and marked out of date (`#user-stale`, `#settings-stale`, `#mail-queue-stale`), so a refusal's reason still shows and every control works; Settings, Retry and Delete disable their button while the request runs and restore it in a `finally` (review of PR #349).
-- `tests/ui_e2e/harness.rs` gains `Ui::hold_next`, `held_matches`, `release_held` (moved from `keys.rs`) and `fail_next`.
+- `core/pending.js` (new): writes in flight by a stable key (`guard`, `once`, `recheck`). A control drawn again while its write runs (a re-sorted table, a Refresh, a reopened drawer) is drawn disabled, and a second start of a running write is ignored. `sessionTable` (so the Account page too), the user drawer, member access and Settings use it (review of PR #349, rounds 1 and 2).
+- When the read that follows an action fails, the user drawer, the catalog drawer's member access and the Settings tables are drawn again from the last answer and marked out of date (`#user-stale`, `#settings-stale`, `#mail-queue-stale`), so a refusal's reason still shows and every control works; (review of PR #349).
+- `tests/ui_e2e/harness.rs` gains `Ui::hold_next`, `held_matches`, `release_held` (moved from `keys.rs`), `fail_next`, `click_twice`, `mark`, `is_marked` and `wait_redrawn`.
 
 ## Notes
 - Any admin reads these; changing them needs an admin that reaches every catalog, as in M11. For a scoped admin every control renders disabled with the reason.

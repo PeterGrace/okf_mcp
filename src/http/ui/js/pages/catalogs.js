@@ -11,6 +11,7 @@ import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
 import { namesOf, picker, assignControl } from '../components/picker.js';
 import { refreshIdentity, refreshUnassigned } from '../core/shell.js';
+import { guard, once, recheck } from '../core/pending.js';
 
 export async function render(main) {
     const admin = store.can('admin');
@@ -163,37 +164,40 @@ export async function render(main) {
 // the drawer is open.
 function memberAccess(row, allowed, ticket) {
     const path = `/catalogs/${enc(row.name)}/member-access`;
-    const select = h('select', { id: 'catalog-member-access-select', 'aria-label': 'Team member access', disabled: true },
-        ['none', 'read', 'write'].map(value => h('option', { value }, value)));
-    const current = h('span', { id: 'catalog-member-access-current', class: 'mono' }, '...');
-    const save = h('button', { type: 'button', id: 'catalog-member-access-save', disabled: true }, 'Save');
-    const refusal = h('p', { id: 'catalog-member-access-error', class: 'error small', role: 'alert', hidden: true });
-    // The server's value as last read (null until a read succeeds), and
-    // whether the latest read failed.
+    // The pending-write key (core/pending.js): a save in flight keeps these
+    // controls disabled, and those of a drawer reopened meanwhile too.
+    const key = `catalog:${row.name}:member-access`;
+    // Whether a read has finished, the server's value as last read (null
+    // until a read succeeds), and whether the latest read failed.
+    let loaded = false;
     let value = null;
     let stale = false;
+    const select = guard(h('select', { id: 'catalog-member-access-select', 'aria-label': 'Team member access' },
+        ['none', 'read', 'write'].map(option => h('option', { value: option }, option))), key, () => allowed && loaded);
+    const current = h('span', { id: 'catalog-member-access-current', class: 'mono' }, '...');
     // Save is offered when the choice differs from the server's value, or
     // always while that value is not known to be current.
-    const sync = () => { save.disabled = !allowed || (!stale && select.value === value); };
+    const save = guard(h('button', { type: 'button', id: 'catalog-member-access-save' }, 'Save'), key,
+        () => allowed && loaded && (stale || select.value !== value));
+    const refusal = h('p', { id: 'catalog-member-access-error', class: 'error small', role: 'alert', hidden: true });
+    const sync = () => { recheck(select); recheck(save); };
     select.addEventListener('change', sync);
 
     async function refresh() {
         let answer = null;
         try { answer = await api.get(path); } catch { /* toasted */ }
         if (!ticket.current()) return;
+        loaded = true;
         stale = answer === null;
         if (!stale) {
             value = answer.member_access;
             select.value = value;
         }
         current.textContent = `${value ?? 'unknown'}${stale ? ' (could not be read again, may be out of date)' : ''}`;
-        select.disabled = !allowed;
         sync();
     }
 
-    save.addEventListener('click', async () => {
-        save.disabled = true;
-        select.disabled = true;
+    save.addEventListener('click', () => once(key, async () => {
         try {
             const answer = await api.put(path, { access: select.value });
             toast(`Members of ${row.owner_team ?? 'the owner team'} now reach ${answer.name} at ${answer.member_access}.`, 'ok');
@@ -203,7 +207,7 @@ function memberAccess(row, allowed, ticket) {
             refusal.hidden = false;
         }
         await refresh();
-    });
+    }));
 
     const section = h('section', { id: 'catalog-member-access' },
         h('h3', {}, 'Team member access'),

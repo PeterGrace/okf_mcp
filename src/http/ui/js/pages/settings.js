@@ -9,8 +9,11 @@
 // Every value shown comes from the server's latest answer: each action is
 // followed by a fresh GET of what it changed. A refusal's reason (a value
 // the setting refuses, 422 with `limit: "setting"`) stays beside what it
-// refused until that control's next action succeeds. A control is disabled
-// while its request runs and restored when it settles. When the GET that
+// refused until that control's next action succeeds. Each action is a
+// pending write (core/pending.js) keyed `settings:<setting>`,
+// `settings:mail-test` or `settings:queue-<id>`: its controls stay disabled
+// until it and the reload after it finish, even when the table is redrawn
+// meanwhile (a Refresh, a sort), and it never runs twice at once. When the GET that
 // follows fails, the table is drawn again from the last answer and marked
 // as possibly out of date, so the reason still shows and every control can
 // be tried again.
@@ -20,6 +23,7 @@ import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
 import { ago, when } from '../core/format.js';
 import { canAdministerPeople } from '../core/shell.js';
+import { guard, once } from '../core/pending.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
 
@@ -58,26 +62,22 @@ export async function render(main) {
         ? h('p', { class: 'error small', role: 'alert', dataset: { test } }, refusals.get(control))
         : null);
 
-    // Runs `request` with `button` disabled; on success toasts
-    // `message(answer)` and forgets the refusal for `control`, on failure
-    // (already toasted) keeps its reason. Then `reload()` reads the server's
-    // state again and redraws, from the last answer if that read fails. The
-    // `finally` restores a button the redraw did not replace.
-    const act = async ({ control, button }, request, message, reload) => {
-        const was = button.disabled;
-        button.disabled = true;
+    // The pending-write key of `control`, which its buttons are guarded by.
+    const pending = control => `settings:${control}`;
+    // The write of `control`, unless it is already running: sends
+    // `request`; on success toasts `message(answer)` and forgets the
+    // control's refusal, on failure (already toasted) keeps its reason. Then
+    // `reload()` reads the server's state again and redraws, from the last
+    // answer if that read fails.
+    const act = (control, request, message, reload) => once(pending(control), async () => {
         try {
-            try {
-                toast(message(await request()), 'ok');
-                refusals.delete(control);
-            } catch (error) {
-                refusals.set(control, error.message);
-            }
-            await reload();
-        } finally {
-            button.disabled = was;
+            toast(message(await request()), 'ok');
+            refusals.delete(control);
+        } catch (error) {
+            refusals.set(control, error.message);
         }
-    };
+        await reload();
+    });
 
     const valueControl = row => {
         const attrs = { class: 'settings-input', 'aria-label': row.key, disabled: !manager,
@@ -85,18 +85,16 @@ export async function render(main) {
         const input = row.key === 'password_sign_in'
             ? h('select', attrs, ['true', 'false'].map(value => h('option', { value, selected: value === row.value }, value)))
             : h('input', { ...attrs, value: row.value, autocomplete: 'off' });
-        const save = h('button', {
-            type: 'button', class: 'secondary', disabled: !manager, dataset: { test: `setting-save-${row.key}` },
-            onclick: () => act({ control: row.key, button: save },
-                () => api.put(`/settings/${enc(row.key)}`, { value: input.value.trim() }),
+        const save = guard(h('button', {
+            type: 'button', class: 'secondary', dataset: { test: `setting-save-${row.key}` },
+            onclick: () => act(row.key, () => api.put(`/settings/${enc(row.key)}`, { value: input.value.trim() }),
                 answer => `${answer.key} is now ${answer.value}.`, loadSettings),
-        }, 'Save');
-        const reset = h('button', {
-            type: 'button', class: 'text-btn', disabled: !manager || !row.overridden,
-            dataset: { test: `setting-reset-${row.key}` },
-            onclick: () => act({ control: row.key, button: reset }, () => api.del(`/settings/${enc(row.key)}`),
+        }, 'Save'), pending(row.key), manager);
+        const reset = guard(h('button', {
+            type: 'button', class: 'text-btn', dataset: { test: `setting-reset-${row.key}` },
+            onclick: () => act(row.key, () => api.del(`/settings/${enc(row.key)}`),
                 answer => `${answer.key} is back to its default, ${answer.value}.`, loadSettings),
-        }, 'Reset');
+        }, 'Reset'), pending(row.key), manager && row.overridden);
         return [h('div', { class: 'inline-form' }, input, save, reset),
             refusalNote(row.key, `setting-error-${row.key}`)];
     };
@@ -118,20 +116,20 @@ export async function render(main) {
     const mail = h('div', { id: 'settings-mail' });
     const to = h('input', { type: 'email', name: 'to', required: true, autocomplete: 'off',
                             placeholder: 'name@example.com', 'aria-label': 'Send a test email to', disabled: !manager });
-    const send = h('button', { type: 'submit', disabled: !manager }, 'Send test email');
+    const send = guard(h('button', { type: 'submit' }, 'Send test email'), pending('mail-test'), manager);
     const testForm = h('form', { id: 'mail-test-form', class: 'inline-form' }, to, send);
     const testRefusal = h('div', { id: 'mail-test-error' });
     testForm.addEventListener('submit', async event => {
         event.preventDefault();
         const address = to.value.trim();
-        await act({ control: 'mail-test', button: send }, () => api.post('/mail/test', { to: address }),
+        await act('mail-test', () => api.post('/mail/test', { to: address }),
             answer => `Queued a test email to ${answer.to}.`, loadQueue);
         if (!refusals.has('mail-test')) testForm.reset();
         fill(testRefusal, refusalNote('mail-test', 'mail-test-error'));
     });
 
-    const queueAction = (row, button, request, message) =>
-        act({ control: `queue-${row.id}`, button }, request, message, loadQueue);
+    // Retry and Delete of one mail share its key.
+    const queueAction = (row, request, message) => act(`queue-${row.id}`, request, message, loadQueue);
     const queue = listTable([
         { key: 'to', label: 'To', class: 'mono', sort: row => row.to },
         { key: 'template', label: 'Template', sort: row => row.template },
@@ -143,28 +141,27 @@ export async function render(main) {
         { key: 'last_error', label: 'Last error',
           render: row => h('span', { class: 'small', dataset: { test: `mail-error-${row.id}` } }, row.last_error ?? '-') },
         { key: 'actions', label: '', render: row => [h('div', { class: 'inline-form' },
-            RETRYABLE.has(row.status) ? h('button', {
-                type: 'button', class: 'secondary', disabled: !manager, dataset: { test: `mail-retry-${row.id}` },
-                onclick: event => queueAction(row, event.currentTarget, () => api.post(`/mail/queue/${enc(row.id)}/retry`),
+            RETRYABLE.has(row.status) ? guard(h('button', {
+                type: 'button', class: 'secondary', dataset: { test: `mail-retry-${row.id}` },
+                onclick: () => queueAction(row, () => api.post(`/mail/queue/${enc(row.id)}/retry`),
                     () => `Sending the mail to ${row.to} again.`),
-            }, 'Retry') : null,
-            h('button', {
-                type: 'button', class: 'text-btn', disabled: !manager || row.status === SENDING,
+            }, 'Retry'), pending(`queue-${row.id}`), manager) : null,
+            guard(h('button', {
+                type: 'button', class: 'text-btn',
                 title: row.status === SENDING ? 'It is being sent right now.' : null,
                 dataset: { test: `mail-delete-${row.id}` },
-                onclick: async event => {
-                    const button = event.currentTarget;
+                onclick: async () => {
                     const ok = await confirmDialog({
                         title: `Delete the mail to ${row.to}?`,
                         message: 'It is not sent. A setup or reset link in it stays valid until it expires.',
                         action: 'Delete',
                     });
                     if (ok) {
-                        await queueAction(row, button, () => api.del(`/mail/queue/${enc(row.id)}`),
+                        await queueAction(row, () => api.del(`/mail/queue/${enc(row.id)}`),
                             () => `Deleted the mail to ${row.to}.`);
                     }
                 },
-            }, 'Delete')),
+            }, 'Delete'), pending(`queue-${row.id}`), manager && row.status !== SENDING)),
             refusalNote(`queue-${row.id}`, `mail-refusal-${row.id}`)] },
     ], [], { empty: 'No mail waiting or failed.' });
     queue.id = 'mail-queue-table';

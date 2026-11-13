@@ -284,6 +284,48 @@ impl Ui {
         );
     }
 
+    /// Clicks the element `selector` names twice in a row, in the page
+    /// (a disabled button ignores both clicks).
+    ///
+    /// # Returns
+    /// Whether the element is disabled afterwards.
+    pub fn click_twice(&self, selector: &str) -> bool {
+        self.eval(
+            "(selector) => { const element = document.querySelector(selector); \
+             element.click(); element.click(); return element.disabled; }",
+            serde_json::json!(selector),
+        ) == serde_json::json!(true)
+    }
+
+    /// Marks the element `selector` names now, so [`Ui::is_marked`] can tell
+    /// whether the page has drawn a new one in its place since.
+    pub fn mark(&self, selector: &str) {
+        self.eval(
+            "(selector) => { document.querySelector(selector).dataset.uiMarked = 'yes'; }",
+            serde_json::json!(selector),
+        );
+    }
+
+    /// Whether the element `selector` names now is the one [`Ui::mark`]
+    /// marked (false once the page has drawn a new one).
+    pub fn is_marked(&self, selector: &str) -> bool {
+        self.eval(
+            "(selector) => document.querySelector(selector)?.dataset.uiMarked === 'yes'",
+            serde_json::json!(selector),
+        ) == serde_json::json!(true)
+    }
+
+    /// Waits until the page has drawn a new element for `selector` in place
+    /// of the one [`Ui::mark`] marked.
+    ///
+    /// # Panics
+    /// When the marked one is still there after [`WAIT`].
+    pub fn wait_redrawn(&self, selector: &str) {
+        self.poll(&format!("{selector} drawn again"), || {
+            !self.is_marked(selector)
+        });
+    }
+
     /// Gives the page a virtual WebAuthn authenticator (Chromium DevTools'
     /// `WebAuthn` domain): a platform authenticator that keeps discoverable
     /// credentials, verifies the user and needs no touch. It lives while the

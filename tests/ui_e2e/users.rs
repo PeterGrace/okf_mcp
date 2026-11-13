@@ -487,13 +487,22 @@ async fn a_session_sign_out_clicked_twice_sends_one_request() {
         // Hold the DELETE, then click twice: the button is disabled while
         // the first request runs, so the second click sends nothing.
         ui.hold_next("DELETE", &format!("/sessions/{prefix}"));
-        let disabled = ui.eval(
-            "(selector) => { const button = document.querySelector(selector); \
-             button.click(); button.click(); return button.disabled; }",
-            serde_json::json!(format!("[data-test={phone}]")),
-        );
+        let selector = format!("[data-test={phone}]");
+        let disabled = ui.click_twice(&selector);
         assert_eq!(ui.held_matches(), 1, "a second DELETE was sent");
-        assert_eq!(disabled, serde_json::json!(true));
+        assert!(disabled);
+        // Sorting by Last seen draws the table again, with a new button for
+        // that session: it is disabled too, and clicking it sends nothing.
+        ui.mark(&selector);
+        ui.click("#user-session-table th:nth-child(4)");
+        assert!(!ui.is_marked(&selector), "the sort did not redraw the row");
+        let redrawn = ui.click_twice(&selector);
+        assert_eq!(
+            ui.held_matches(),
+            1,
+            "the redrawn button sent a second DELETE"
+        );
+        assert!(redrawn);
         ui.release_held();
         ui.wait_text_gone("#user-session-table", "phone browser");
         ui.wait_text("#user-session-table", "tablet browser");

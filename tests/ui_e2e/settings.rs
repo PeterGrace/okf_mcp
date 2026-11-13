@@ -182,7 +182,17 @@ async fn an_admin_sends_a_test_email_and_retries_and_deletes_failed_mail() {
         ui.wait_text("#mail-queue-table", "carol@example.com");
         ui.wait_text(&format!("[data-test=mail-status-{retried}]"), "failed");
         ui.wait_text(&format!("[data-test=mail-error-{retried}]"), "550");
-        ui.click(&format!("[data-test=mail-retry-{retried}]"));
+        // Hold the Retry, click it, Refresh the queue (which draws the row's
+        // buttons again) and click the new Retry: one request is sent.
+        let retry = format!("[data-test=mail-retry-{retried}]");
+        ui.hold_next("POST", &format!("/mail/queue/{retried}/retry"));
+        assert!(ui.click_twice(&retry));
+        ui.mark(&retry);
+        ui.click("#mail-queue-refresh");
+        ui.wait_redrawn(&retry);
+        assert!(ui.click_twice(&retry), "the redrawn Retry is enabled");
+        assert_eq!(ui.held_matches(), 1, "a second Retry was sent");
+        ui.release_held();
         ui.wait_text("#toasts", "bob@example.com");
         wait_not_failed(ui, &retried);
         // A Retry the server refuses: dave's mail was retried elsewhere

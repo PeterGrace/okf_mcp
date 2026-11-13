@@ -8,13 +8,17 @@
 // which reads the user again and re-renders the drawer while its ticket is
 // current. Every control therefore shows the server's state after the
 // action (a refused admin toggle springs back), and a refusal's reason
-// stays in the drawer (`#user-refusal`) until the next action. When that
+// stays in the drawer (`#user-refusal`) until the next action. Each action
+// is a pending write (core/pending.js) keyed `user:<name>:<what>`, so its
+// controls stay disabled until it and that re-render finish, however often
+// the drawer is drawn meanwhile, and it never runs twice at once. When that
 // read fails, the drawer is re-rendered from the last answer, marked stale
 // (`#user-stale`), so the reason still shows and every control works.
 import { h, fact } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { toast } from '../core/toast.js';
 import { count } from '../core/format.js';
+import { guard, once } from '../core/pending.js';
 import { confirmDialog } from './confirm.js';
 import { picker } from './picker.js';
 import { sessionTable, signInTable } from './activity.js';
@@ -36,63 +40,61 @@ export async function loadAccount(name) {
 // `account` loadAccount's, `refusal` the reason the previous action was
 // refused (or null).
 export function accountSections({ detail, account, manager, refusal, changed }) {
-    // `control` is disabled while the request runs (a session's Sign out
-    // button is disabled by sessionTable itself); the re-render that follows
-    // draws every control again, and the `finally` restores a control it did
-    // not replace.
-    const act = async (control, request, message) => {
-        const was = control?.disabled ?? false;
-        if (control) control.disabled = true;
-        try {
-            let refused = null;
-            try {
-                toast(message(await request()), 'ok');
-            } catch (error) {
-                refused = error.message;   // already toasted by api.js
-            }
-            await changed(refused);
-        } finally {
-            if (control) control.disabled = was;
-        }
-    };
     const { user, entitlements } = detail;
+    // `what` names an action within this user (`email`, `admin`, ...), and
+    // `pending(what)` is its full key, which its controls are guarded by.
+    const pending = what => `user:${user.name}:${what}`;
+    // Sends `request`, toasts `message(answer)` or keeps the refusal, then
+    // re-renders through `changed`.
+    const run = async (request, message) => {
+        let refused = null;
+        try {
+            toast(message(await request()), 'ok');
+        } catch (error) {
+            refused = error.message;   // already toasted by api.js
+        }
+        await changed(refused);
+    };
+    const act = (what, request, message) => once(pending(what), () => run(request, message));
+    const tools = { act, run, pending, manager };
     return [
         refusal ? h('p', { id: 'user-refusal', class: 'error small', role: 'alert' }, refusal) : null,
         manager ? null : h('p', { id: 'user-account-readonly', class: 'muted small' }, NEEDS_EVERY_CATALOG),
-        signInSection(user, manager, act),
-        entitlementSection(user.name, entitlements, account.catalogs, manager, act),
-        sessionSection(user.name, account.sessions, manager, act),
+        signInSection(user, tools),
+        entitlementSection(user.name, entitlements, account.catalogs, tools),
+        sessionSection(user.name, account.sessions, tools),
         h('section', { id: 'user-sign-ins' },
             h('h3', {}, 'Recent sign-ins'),
             signInTable({ id: 'user-sign-in-table', signIns: account.signIns })),
     ];
 }
 
-function signInSection(user, manager, act) {
+function signInSection(user, { act, pending, manager }) {
     const base = `/users/${enc(user.name)}`;
-    const email = h('input', { type: 'email', name: 'email', value: user.email ?? '', autocomplete: 'off',
-                               placeholder: 'name@example.com', 'aria-label': 'Email', disabled: !manager });
-    const save = h('button', { type: 'submit', disabled: !manager }, 'Save email');
-    const clear = user.email ? h('button', {
-        type: 'button', id: 'user-email-clear', class: 'text-btn', disabled: !manager,
-        onclick: () => act(clear, () => api.put(`${base}/email`, { email: null }),
+    const email = guard(h('input', { type: 'email', name: 'email', value: user.email ?? '', autocomplete: 'off',
+                                     placeholder: 'name@example.com', 'aria-label': 'Email' }),
+        pending('email'), manager);
+    const save = guard(h('button', { type: 'submit' }, 'Save email'), pending('email'), manager);
+    const clear = user.email ? guard(h('button', {
+        type: 'button', id: 'user-email-clear', class: 'text-btn',
+        onclick: () => act('email', () => api.put(`${base}/email`, { email: null }),
             () => `Cleared ${user.name}'s email.`),
-    }, 'Clear') : null;
+    }, 'Clear'), pending('email'), manager) : null;
     const form = h('form', { id: 'user-email-form', class: 'inline-form' }, email, save, clear);
     form.addEventListener('submit', event => {
         event.preventDefault();
         const next = email.value.trim();
-        act(save, () => api.put(`${base}/email`, { email: next || null }),
+        act('email', () => api.put(`${base}/email`, { email: next || null }),
             answer => answer.email ? `${answer.name}'s email is now ${answer.email}.` : `Cleared ${answer.name}'s email.`);
     });
-    const admin = h('input', { type: 'checkbox', role: 'switch', id: 'user-admin-toggle',
-                               checked: user.is_admin, disabled: !manager });
-    admin.addEventListener('change', () => act(admin, () => api.put(`${base}/admin`, { admin: admin.checked }),
+    const admin = guard(h('input', { type: 'checkbox', role: 'switch', id: 'user-admin-toggle', checked: user.is_admin }),
+        pending('admin'), manager);
+    admin.addEventListener('change', () => act('admin', () => api.put(`${base}/admin`, { admin: admin.checked }),
         answer => (answer.admin ? `${answer.name} is now an admin.` : `${answer.name} is no longer an admin.`)));
-    const invite = h('button', {
-        type: 'button', id: 'user-invite', class: 'secondary', disabled: !manager || !user.email,
-        onclick: () => act(invite, () => api.post(`${base}/invite`), answer => `Queued a setup email to ${answer.email}.`),
-    }, 'Send setup email');
+    const invite = guard(h('button', {
+        type: 'button', id: 'user-invite', class: 'secondary',
+        onclick: () => act('invite', () => api.post(`${base}/invite`), answer => `Queued a setup email to ${answer.email}.`),
+    }, 'Send setup email'), pending('invite'), manager && !!user.email);
     return h('section', { id: 'user-account' },
         h('h3', {}, 'Sign-in'),
         h('dl', { class: 'facts' },
@@ -105,23 +107,25 @@ function signInSection(user, manager, act) {
             'Set an email first: the setup link is sent there.'));
 }
 
-function entitlementSection(name, entitlements, catalogs, manager, act) {
+function entitlementSection(name, entitlements, catalogs, { act, pending, manager }) {
     const base = `/users/${enc(name)}/entitlements`;
     const done = answer => {
         const levels = answer.entitlements.map(entry => `${entry.access} on ${entry.catalog}`);
         return `${answer.name} now has ${levels.length ? levels.join(', ') : 'no entitlements'}.`;
     };
     const rows = entitlements.map(entry => {
-        const level = h('select', { 'aria-label': `Access to ${entry.catalog}`, disabled: !manager,
-                                    dataset: { test: `entitlement-level-${entry.catalog}` } },
-            LEVELS.map(value => h('option', { value, selected: value === entry.access }, value)));
-        level.addEventListener('change', () => act(level,
+        // A level change and a removal of one catalog share its key.
+        const what = `entitlement:${entry.catalog}`;
+        const level = guard(h('select', { 'aria-label': `Access to ${entry.catalog}`,
+                                          dataset: { test: `entitlement-level-${entry.catalog}` } },
+            LEVELS.map(value => h('option', { value, selected: value === entry.access }, value))), pending(what), manager);
+        level.addEventListener('change', () => act(what,
             () => api.put(`${base}/${enc(entry.catalog)}`, { access: level.value }), done));
-        const remove = h('button', {
-            type: 'button', class: 'text-btn', disabled: !manager,
+        const remove = guard(h('button', {
+            type: 'button', class: 'text-btn',
             dataset: { test: `entitlement-remove-${entry.catalog}` },
-            onclick: () => act(remove, () => api.del(`${base}/${enc(entry.catalog)}`), done),
-        }, 'Remove');
+            onclick: () => act(what, () => api.del(`${base}/${enc(entry.catalog)}`), done),
+        }, 'Remove'), pending(what), manager);
         return h('li', { dataset: { test: `entitlement-${entry.catalog}` } },
             h('span', { class: 'mono' }, entry.catalog), level, remove);
     });
@@ -130,11 +134,11 @@ function entitlementSection(name, entitlements, catalogs, manager, act) {
     const catalog = picker({ name: 'catalog', required: true, 'aria-label': 'Catalog to entitle', disabled: !manager }, addable);
     const level = h('select', { name: 'access', 'aria-label': 'Access', disabled: !manager },
         LEVELS.map(value => h('option', { value }, value)));
-    const submit = h('button', { type: 'submit', disabled: !manager }, 'Entitle');
+    const submit = guard(h('button', { type: 'submit' }, 'Entitle'), pending('entitle'), manager);
     const form = h('form', { id: 'entitlement-form', class: 'inline-form' }, catalog, level, submit);
     form.addEventListener('submit', event => {
         event.preventDefault();
-        act(submit, () => api.put(`${base}/${enc(catalog.value)}`, { access: level.value }), done);
+        act('entitle', () => api.put(`${base}/${enc(catalog.value)}`, { access: level.value }), done);
     });
     return h('section', { id: 'user-entitlements' },
         h('h3', {}, 'Entitlements'),
@@ -146,10 +150,10 @@ function entitlementSection(name, entitlements, catalogs, manager, act) {
         addable.length ? form : null);
 }
 
-function sessionSection(name, sessions, manager, act) {
+function sessionSection(name, sessions, { act, run, pending, manager }) {
     const base = `/users/${enc(name)}/sessions`;
-    const revokeAll = sessions.length ? h('button', {
-        type: 'button', id: 'user-sessions-revoke-all', class: 'secondary', disabled: !manager,
+    const revokeAll = sessions.length ? guard(h('button', {
+        type: 'button', id: 'user-sessions-revoke-all', class: 'secondary',
         onclick: async () => {
             const ok = await confirmDialog({
                 title: `Sign ${name} out everywhere?`,
@@ -157,16 +161,18 @@ function sessionSection(name, sessions, manager, act) {
                 action: 'Sign out everywhere',
             });
             if (ok) {
-                await act(revokeAll, () => api.del(base),
+                await act('sessions', () => api.del(base),
                     answer => `Signed ${answer.name} out of ${count(answer.revoked, 'console session')}.`);
             }
         },
-    }, 'Sign out everywhere') : null;
+    }, 'Sign out everywhere'), pending('sessions'), manager) : null;
     return h('section', { id: 'user-sessions' },
         h('h3', {}, 'Console sessions'),
         sessionTable({
             id: 'user-session-table', prefix: 'user-session', sessions, allowed: manager,
-            revoke: row => act(null, () => api.del(`${base}/${enc(row.id_prefix)}`),
+            scope: pending('session'),
+            // sessionTable keys this write itself (`<scope>:<id_prefix>`).
+            revoke: row => run(() => api.del(`${base}/${enc(row.id_prefix)}`),
                 () => `Signed ${name} out of that session.`),
         }),
         revokeAll);
