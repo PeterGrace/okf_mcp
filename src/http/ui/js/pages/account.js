@@ -180,7 +180,9 @@ export async function render(main) {
             await api.post('/me/passkeys/register/finish', credential, { quiet: true });
         } catch (error) {
             // 403: another session started this ceremony; 409: a passkey
-            // already registered; 410: the ceremony expired.
+            // already registered; 410: the ceremony expired; 422: a
+            // credential the server could not verify. Only a 401 (this
+            // session ended) signs the console out.
             if (error.status !== 401) toast(`No passkey was added: ${reason(error)}.`, 'error');
             return;
         }

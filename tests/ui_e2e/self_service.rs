@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
-use okf_mcp::config::Config;
+use okf_mcp::config::{AuthConfig, Config};
 use okf_mcp::oauth::clients::MAX_UNBOUND_DCR;
 use okf_mcp::store::ceiling;
 use okf_mcp::store::keys::{self as key_rows, Access, CatalogGrant, Grants, NewKey};
@@ -63,6 +63,17 @@ const SESSION_STATUS: &str = "async () => (await fetch('/api/v1/session')).statu
 /// # Returns
 /// The running server.
 pub(crate) async fn login_server() -> TestServer {
+    login_server_with(AuthConfig::default()).await
+}
+
+/// A [`login_server`] with this `[auth]` section (OIDC providers, say).
+///
+/// # Arguments
+/// * `auth` - the server's `[auth]` configuration.
+///
+/// # Returns
+/// The running server.
+pub(crate) async fn login_server_with(auth: AuthConfig) -> TestServer {
     TestServer::start_with(
         vec![
             ("main", files(&[("index.md", "# Main\n")])),
@@ -70,6 +81,7 @@ pub(crate) async fn login_server() -> TestServer {
         ],
         |base| Config {
             public_url: Some(base.replace("127.0.0.1", "localhost")),
+            auth,
             ..Config::default()
         },
     )

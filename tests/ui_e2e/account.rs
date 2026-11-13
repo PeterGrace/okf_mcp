@@ -4,11 +4,14 @@
 //! remove, an add the browser prompt cancels, and the last sign-in method
 //! kept), signing sessions out one at a time (another browser's, and this
 //! one's), unlinking an identity, the ceiling as `/me` gives it now and
-//! recent sign-ins, and what a key sees.
+//! recent sign-ins, linking an identity through a mock OIDC provider (and a
+//! link the server refuses), a credential that fails verification at
+//! finish, and what a key sees.
 
 use std::time::Duration;
 
 use chrono::Utc;
+use okf_mcp::config::AuthConfig;
 use okf_mcp::store::keys::Access;
 use okf_mcp::store::passwords::{self, SignInOutcome};
 use okf_mcp::store::{ceiling, identities, passkeys, user_sessions, users};
@@ -18,7 +21,9 @@ use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 use webauthn_rs::prelude::{Passkey, Url, Uuid, WebauthnBuilder};
 
 use crate::harness::{drive, Ui};
-use crate::self_service::{console_base, login_server, member, EMAIL, PASSWORD};
+use crate::oidc_mock::{self as idp, MockIdp};
+use crate::self_service::{console_base, login_server, login_server_with, member, EMAIL, PASSWORD};
+use crate::support::server::TestServer;
 
 /// The password the first journey changes to.
 const NEW_PASSWORD: &str = "a different long passphrase";
@@ -80,6 +85,27 @@ async fn another_session(pool: &sqlx::PgPool, id: &str, agent: &str) {
     )
     .await
     .expect("another session");
+}
+
+/// The environment variable that holds the mock provider's client secret.
+/// Every journey sets it to the same value, so they can share it.
+const OIDC_SECRET_ENV: &str = "OKF_UI_E2E_ACCOUNT_OIDC_SECRET";
+
+/// A [`login_server`] whose one OIDC provider, `example`, is `idp`.
+///
+/// # Arguments
+/// * `idp` - a running mock provider.
+///
+/// # Returns
+/// The running server.
+async fn oidc_server(idp_server: &MockIdp) -> TestServer {
+    // Edition 2021: `set_var` is a safe call. Every writer sets one value.
+    std::env::set_var(OIDC_SECRET_ENV, idp::SECRET);
+    login_server_with(AuthConfig {
+        oidc: vec![idp::provider(idp_server, OIDC_SECRET_ENV)],
+        ..AuthConfig::default()
+    })
+    .await
 }
 
 /// The `data-test` of the Sign out button on the session row whose text
@@ -421,6 +447,126 @@ async fn a_member_unlinks_an_identity_and_sees_their_ceiling_and_sign_ins() {
     }
     let left = identities::list(&pool, &id).await.expect("list");
     assert!(left.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bad_credential_at_finish_shows_the_reason_and_keeps_the_session() {
+    let server = login_server().await;
+    member(&server, Access::Write).await;
+    let id = alices_id(&server.db.pool).await;
+    let ran = drive(console_base(&server), |ui| {
+        ui.sign_in_password(EMAIL, PASSWORD);
+        let _authenticator = ui.virtual_authenticator();
+        ui.open("/account");
+        ui.wait_text("#passkey-list", "No passkeys yet");
+        // The page's own fetch, wrapped: the finish request's client data
+        // claims a sign-in (`webauthn.get`), so the server cannot verify it.
+        ui.eval(
+            "() => { const original = window.fetch; \
+                 const b64 = text => btoa(text).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, ''); \
+                 const unb64 = text => atob(text.replace(/-/g, '+').replace(/_/g, '/')); \
+                 window.fetch = (url, init) => { \
+                     if (String(url).endsWith('/register/finish')) { \
+                         const body = JSON.parse(init.body); \
+                         const data = unb64(body.response.clientDataJSON).replace('webauthn.create', 'webauthn.get'); \
+                         body.response.clientDataJSON = b64(data); \
+                         init = { ...init, body: JSON.stringify(body) }; \
+                     } \
+                     return original(url, init); }; \
+                 return true; }",
+            json!(null),
+        );
+        ui.fill("#passkey-name", "laptop");
+        ui.click("#passkey-add");
+        ui.wait_text("#toasts", "could not be registered");
+        // Still signed in: a bad credential is not a 401.
+        assert!(!ui.page.is_visible("#login").expect("visible"));
+        assert_eq!(ui.eval(SESSION_STATUS, json!(null)), json!(200));
+        ui.wait_text("#whoami", "alice");
+        ui.wait_text("#passkey-list", "No passkeys yet");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let stored = passkeys::list(&server.db.pool, &id).await.expect("list");
+    assert!(stored.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_links_an_identity_and_keeps_their_other_sessions() {
+    let provider = idp::start().await;
+    provider.will_issue("subject-1", Some("alice@id.example.com"), Some(true));
+    let server = oidc_server(&provider).await;
+    member(&server, Access::Write).await;
+    let pool = &server.db.pool;
+    let id = alices_id(pool).await;
+    another_session(pool, &id, "phone browser").await;
+    let ran = drive(console_base(&server), |ui| {
+        ui.sign_in_password(EMAIL, PASSWORD);
+        ui.open("/account");
+        ui.wait_text("[data-test=identity-link-example]", "Link Example ID");
+        ui.click("#identity-keep-sessions");
+        ui.click("[data-test=identity-link-example]");
+        // Off to the provider, which signs in at once and sends the browser
+        // to the callback, which links and comes back to the Account page.
+        ui.wait_text("[data-test=identity-example]", "alice@id.example.com");
+        assert_eq!(
+            ui.eval("() => location.pathname + location.hash", json!(null)),
+            json!("/ui/#/account")
+        );
+        assert!(!ui
+            .page
+            .is_visible("[data-test=identity-link-example]")
+            .expect("visible"));
+        // "Keep me signed in elsewhere" was ticked.
+        ui.wait_text("#session-table", "phone browser");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let linked = identities::list(pool, &id).await.expect("list identities");
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].provider, "example");
+    assert_eq!(linked[0].email_at_link, "alice@id.example.com");
+    let sessions = user_sessions::list(pool, &id, None)
+        .await
+        .expect("list sessions");
+    assert_eq!(sessions.len(), 2, "the phone's session is kept");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_link_shows_the_reason_and_stays_on_the_page() {
+    let provider = idp::start().await;
+    // Discovery fails, so the server cannot start the link (503).
+    provider
+        .discovery_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let server = oidc_server(&provider).await;
+    member(&server, Access::Write).await;
+    let id = alices_id(&server.db.pool).await;
+    let ran = drive(console_base(&server), |ui| {
+        ui.sign_in_password(EMAIL, PASSWORD);
+        ui.open("/account");
+        ui.click("[data-test=identity-link-example]");
+        ui.wait_text("#toasts", "discovery for example failed");
+        assert_eq!(
+            ui.eval("() => location.pathname + location.hash", json!(null)),
+            json!("/ui/#/account")
+        );
+        assert!(ui
+            .page
+            .is_visible("[data-test=identity-link-example]")
+            .expect("visible"));
+        assert_eq!(ui.eval(SESSION_STATUS, json!(null)), json!(200));
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let linked = identities::list(&server.db.pool, &id).await.expect("list");
+    assert!(linked.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
