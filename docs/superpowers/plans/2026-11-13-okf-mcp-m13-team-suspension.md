@@ -50,14 +50,13 @@ Checked against `origin/main` at `9a84af6` (v0.15.0) on 2026-11-13.
 ## Task dependencies
 
 ```
-1 -> 2 -> 3 -> 4
-          3 -> 5 -> 6
-               5 -> 7
-     4, 6, 7 -> 8
+1 -> 2 -> 3 -> 4 -> 5 -> 6
+                    5 -> 7
+               6, 7 -> 8
 ```
 
 - Task 2 needs Task 1 only for order (both are small); Task 3 needs both (`SuspendedCatalog`, `OkfError::Suspended`).
-- Tasks 4 and 5 can run in parallel after Task 3. They share no files except `changelog/`.
+- Task 5 needs Task 4 although they share no files: its member test expects `/catalogs/main/tree` to answer `Suspended` (selection, Task 4), the catalog listing's `suspended` field (Task 4) and the REST changeset filtering (Task 4 Step 5b). *(Corrected, PR #360 review, 2026-11-13: the graph first had 4 and 5 in parallel.)*
 - Tasks 6 and 7 can run in parallel after Task 5. Task 6 edits `docs/operations.md` (parity and API rows); Task 8 edits other sections of it, so it goes last.
 
 ---
