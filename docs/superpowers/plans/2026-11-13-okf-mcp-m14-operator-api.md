@@ -105,8 +105,9 @@ pub async fn catalog_teams(conn: &mut PgConnection, catalog_id: i64) -> Result<V
 pub async fn key_teams(conn: &mut PgConnection, key_id: &str) -> Result<Vec<i64>, OkfError>;
 pub async fn forget_person(conn: &mut PgConnection, user_id: &str) -> Result<(), OkfError>;
 pub fn refuse_admin_target(actor: &AuditActor, is_admin: bool, user: &str) -> Result<(), OkfError>;
-pub async fn record_admin_read(pool: &PgPool, actor: &AuditActor, catalog: &str,
-                               now: DateTime<Utc>) -> Result<(), OkfError>;          // Task 7b
+pub struct AccessRecord { /* audit ids and catalog scope, resolved at admission */ } // Task 7b
+pub async fn record_admin_read(pool: &PgPool, record: &AccessRecord)
+                               -> Result<(), OkfError>;                               // Task 7b
 pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError>;   // Task 6d
 pub enum AccessKind { Read, Write, Export }                                          // Task 7b
 pub async fn list(pool: &PgPool, viewer: &Viewer, query: &AuditQuery<'_>)
@@ -399,9 +400,13 @@ CREATE INDEX audit_access_counts_entry_id ON audit_access_counts (entry_id);
 
 -- The audit_people row of a user, created or refreshed from users. NULL
 -- for an unknown or NULL id (the INSERT then inserts nothing).
+-- `FOR KEY SHARE` on the user: a concurrent users::delete (FOR UPDATE)
+-- is waited for, and a user it deleted is then skipped, so no call that
+-- races a deletion can re-create a forgotten person's name.
 CREATE FUNCTION audit_person(p_user_id text) RETURNS bigint LANGUAGE sql AS $$
+    WITH live AS (SELECT id, name, display_name FROM users WHERE id = p_user_id FOR KEY SHARE)
     INSERT INTO audit_people (user_id, name, display_name)
-    SELECT id, name, display_name FROM users WHERE id = p_user_id
+    SELECT id, name, display_name FROM live
     ON CONFLICT (user_id) DO UPDATE
         SET name = EXCLUDED.name, display_name = EXCLUDED.display_name
     RETURNING id
@@ -426,15 +431,28 @@ $$;
 -- caller passes, so a credential from before this migration that is only
 -- ever a target (revoked, granted) still has its person, and
 -- forget_person clears it with its user.
+--
+-- The owner is locked first (through audit_person), so a user deletion
+-- cannot remove the credential meanwhile; a credential whose owner is
+-- already deleted gets no row (the owner resolves, its person does not),
+-- so a write racing a deletion cannot re-create a cleared id or label.
+-- (Corrected, PR #375 review, 2026-11-13.)
 CREATE FUNCTION audit_credential(p_credential_id text, p_person_id bigint, p_label text)
 RETURNS bigint LANGUAGE sql AS $$
+    WITH owner AS (
+        SELECT COALESCE((SELECT user_id FROM api_keys WHERE id = p_credential_id),
+                        (SELECT user_id FROM sign_in_codes WHERE id = p_credential_id)) AS user_id
+    ),
+    person AS (SELECT audit_person(user_id) AS id FROM owner)
     INSERT INTO audit_credentials (credential_id, person_id, label)
-    SELECT p_credential_id,
-           COALESCE(audit_person((SELECT user_id FROM api_keys WHERE id = p_credential_id)),
-                    audit_person((SELECT user_id FROM sign_in_codes WHERE id = p_credential_id)),
-                    p_person_id),
-           p_label
+    SELECT p_credential_id, COALESCE((SELECT id FROM person), p_person_id), p_label
     WHERE p_credential_id IS NOT NULL
+      -- A user's credential only while the user lives; a credential with no
+      -- user (a legacy key, the runner's) whenever it exists.
+      AND CASE WHEN (SELECT user_id FROM owner) IS NULL
+               THEN EXISTS (SELECT 1 FROM api_keys WHERE id = p_credential_id)
+                    OR EXISTS (SELECT 1 FROM sign_in_codes WHERE id = p_credential_id)
+               ELSE (SELECT id FROM person) IS NOT NULL END
     ON CONFLICT (credential_id) DO UPDATE
         SET label = COALESCE(EXCLUDED.label, audit_credentials.label),
             person_id = COALESCE(EXCLUDED.person_id, audit_credentials.person_id)
@@ -3566,7 +3584,7 @@ git commit -m "feat(audit): record publishes, reverts and admins' discards (M14 
 
 **Files:**
 - Create: `src/store/gates.rs`
-- Modify: `src/auth.rs` (`AccessGates`, `Admission`, `Principal.gates`, `admission`, cache wiring, `Keys::gates`), `src/http/console_session.rs` (`for_session` gets the gates), `src/store/audit.rs` (`AccessKind`, `record_admin_read`), `src/store/export.rs`, `src/http/archives.rs` (export), `src/cli.rs` (`Command::Export`), `src/mcp/context.rs` (`admit`), `src/http/api/browse.rs` (the revision route), `src/app.rs` (`note_access`, `settle_access`), `src/http/mod.rs` (`serve` settles at shutdown), every `Principal { ... }` literal (`gates: Default::default(),`), `docs/operations.md`
+- Modify: `src/auth.rs` (`AccessGates`, `Admission`, `Principal.gates`, `admission`, cache wiring, `Keys::gates`), `src/http/console_session.rs` (`for_session` gets the gates), `src/store/audit.rs` (`AccessKind`, `AccessRecord`, `record_admin_read`, `testing::access_record`), `src/store/gates.rs` (audit ids and catalog scopes), `src/store/export.rs`, `src/http/archives.rs` (export), `src/cli.rs` (`Command::Export`), `src/mcp/context.rs` (`admit`), `src/http/api/browse.rs` (the revision route), `src/app.rs` (`note_access`, `settle_access`), `src/http/mod.rs` (`serve` settles at shutdown), every `Principal { ... }` literal (`gates: Default::default(),`), `docs/operations.md`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3649,12 +3667,15 @@ git commit -m "feat(audit): record publishes, reverts and admins' discards (M14 
         let mut reads = tokio::task::JoinSet::new();
         for _ in 0..10 {
             let (pool, actor) = (db.pool.clone(), actor.clone());
-            reads.spawn(async move { record_admin_read(&pool, &actor, "main", now()).await });
+            reads.spawn(async move {
+                let record = testing::access_record(&pool, &actor, "main", now()).await;
+                record_admin_read(&pool, &record).await
+            });
         }
         while let Some(read) = reads.join_next().await {
             read.unwrap().unwrap();
         }
-        record_admin_read(&db.pool, &actor, "main", now() + TimeDelta::hours(1)).await.unwrap();
+        record_admin_read(&db.pool, &testing::access_record(&db.pool, &actor, "main", now() + TimeDelta::hours(1)).await).await.unwrap();
 
         let counts: Vec<i64> = sqlx::query_scalar(
             "SELECT c.requests FROM audit_entries e JOIN audit_access_counts c ON c.entry_id = e.id \
@@ -3681,13 +3702,13 @@ git commit -m "feat(audit): record publishes, reverts and admins' discards (M14 
         let main = |owner_team| crate::store::catalogs::NewCatalog { name: "main", description: "", owner_team };
         crate::store::catalogs::create(&db.pool, &main(TEST_TEAM), &AuditActor::cli(), now()).await.unwrap();
 
-        record_admin_read(&db.pool, &actor, "main", now()).await.unwrap();
+        record_admin_read(&db.pool, &testing::access_record(&db.pool, &actor, "main", now()).await).await.unwrap();
         crate::store::catalogs::set_owner(&db.pool, "main", "family", &AuditActor::cli(), now()).await.unwrap();
-        record_admin_read(&db.pool, &actor, "main", now() + TimeDelta::minutes(1)).await.unwrap();
-        record_admin_read(&db.pool, &actor, "main", now() + TimeDelta::minutes(2)).await.unwrap();
+        record_admin_read(&db.pool, &testing::access_record(&db.pool, &actor, "main", now() + TimeDelta::minutes(1)).await).await.unwrap();
+        record_admin_read(&db.pool, &testing::access_record(&db.pool, &actor, "main", now() + TimeDelta::minutes(2)).await).await.unwrap();
         crate::store::catalogs::delete(&db.pool, "main", true, &AuditActor::cli(), now()).await.unwrap();
         crate::store::catalogs::create(&db.pool, &main(TEST_TEAM), &AuditActor::cli(), now()).await.unwrap();
-        record_admin_read(&db.pool, &actor, "main", now() + TimeDelta::minutes(3)).await.unwrap();
+        record_admin_read(&db.pool, &testing::access_record(&db.pool, &actor, "main", now() + TimeDelta::minutes(3)).await).await.unwrap();
 
         let reads: Vec<(Vec<i64>, i64)> = sqlx::query_as(
             "SELECT e.teams, c.requests FROM audit_entries e \
@@ -3732,6 +3753,130 @@ git commit -m "feat(audit): record publishes, reverts and admins' discards (M14 
         assert_eq!(entries[0].requests, Some(2));
     }
 
+    // Corrected (PR #375 review, 2026-11-13): identities and scope are fixed
+    // at admission. Each test below holds the background write
+    // (`App::access_hold`), changes something, then lets it run.
+
+    /// An every-catalog admin key of user `staff` (outside main's owner
+    /// team), polled in.
+    async fn staff_root(test: &TestApp) -> String {
+        crate::store::users::create(test.app.pool(), &NewUser { name: "staff", display_name: "Staff Member" },
+                                    &AuditActor::cli(), Utc::now()).await.unwrap();
+        let key = key_rows::create_with_id(test.app.pool(), &NewKey {
+            name: "staff-root", access: Access::Admin, maintenance_report: false, grants: Grants::All,
+            default_catalog: None, actor: "staff-root", user: "staff", self_issued: false,
+            expires_at: None, levels: &[],
+        }, &AuditActor::cli(), Utc::now()).await.unwrap().key;
+        test.app.poll().await.unwrap();
+        key
+    }
+
+    /// Reads main as `key` with the background write held; returns the hold.
+    async fn held_read(test: &TestApp, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let hold = std::sync::Arc::clone(&test.app.access_hold).lock_owned().await;
+        let (status, _) = send(test, "GET", "/api/v1/catalogs/main/tree", Some(key), None).await;
+        assert_eq!(status, StatusCode::OK);
+        hold
+    }
+
+    async fn admin_reads(test: &TestApp) -> Vec<(Vec<i64>, serde_json::Value, String)> {
+        sqlx::query_as("SELECT teams, details, target_name FROM audit_entries \
+                        WHERE action = 'catalog.admin_read' ORDER BY id")
+            .fetch_all(test.app.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn audit_team(test: &TestApp, team: &str) -> i64 {
+        let mut conn = test.app.pool().acquire().await.unwrap();
+        crate::store::audit::team_ref(&mut conn, team).await.unwrap()
+    }
+
+    async fn catalog_id(test: &TestApp, name: &str) -> i64 {
+        sqlx::query_scalar("SELECT id FROM catalogs WHERE name = $1").bind(name)
+            .fetch_one(test.app.pool()).await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_delayed_past_the_users_deletion_stores_nothing_that_identifies_them() {
+        let test = app().await;
+        let staff = staff_root(&test).await;
+        let hold = held_read(&test, &staff).await;
+
+        crate::store::users::delete(test.app.pool(), "staff", true, &AuditActor::cli(), Utc::now())
+            .await
+            .unwrap();
+        drop(hold);
+        test.app.settle_access().await;
+
+        let stored: String = sqlx::query_scalar(
+            "SELECT coalesce((SELECT string_agg(row_to_json(e)::text, '') FROM audit_entries e), '') \
+                 || coalesce((SELECT string_agg(row_to_json(c)::text, '') FROM audit_credentials c), '') \
+                 || coalesce((SELECT string_agg(row_to_json(p)::text, '') FROM audit_people p), '') \
+                 || coalesce((SELECT string_agg(bucket, '') FROM audit_access_counts), '')",
+        )
+        .fetch_one(test.app.pool())
+        .await
+        .unwrap();
+        assert_eq!(admin_reads(&test).await.len(), 1, "the read is still recorded");
+        assert!(!stored.contains("staff") && !stored.contains("Staff"), "{stored}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_admitted_before_a_transfer_stays_with_the_old_owner() {
+        let test = app().await;
+        let staff = staff_root(&test).await;
+        crate::store::teams::create(test.app.pool(),
+            &crate::store::teams::NewTeam { name: "family", display_name: "", owner: TEST_USER },
+            &AuditActor::cli(), Utc::now()).await.unwrap();
+        let personal = audit_team(&test, TEST_TEAM).await;
+        let hold = held_read(&test, &staff).await;
+
+        crate::store::catalogs::set_owner(test.app.pool(), "main", "family", &AuditActor::cli(), Utc::now())
+            .await
+            .unwrap();
+        drop(hold);
+        test.app.settle_access().await;
+
+        let reads = admin_reads(&test).await;
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].0, [personal]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_of_a_catalog_deleted_or_replaced_before_it_is_written_keeps_its_identity() {
+        let test = app().await;
+        let staff = staff_root(&test).await;
+        crate::store::teams::create(test.app.pool(),
+            &crate::store::teams::NewTeam { name: "family", display_name: "", owner: TEST_USER },
+            &AuditActor::cli(), Utc::now()).await.unwrap();
+        let personal = audit_team(&test, TEST_TEAM).await;
+        let original = catalog_id(&test, "main").await;
+        let hold = held_read(&test, &staff).await;
+
+        // Deleted, then a new `main` for another team, before the write runs.
+        crate::store::catalogs::delete(test.app.pool(), "main", true, &AuditActor::cli(), Utc::now())
+            .await
+            .unwrap();
+        crate::store::catalogs::create(test.app.pool(),
+            &crate::store::catalogs::NewCatalog { name: "main", description: "", owner_team: "family" },
+            &AuditActor::cli(), Utc::now()).await.unwrap();
+        drop(hold);
+        test.app.settle_access().await;
+        test.app.poll().await.unwrap();
+        // A read of the replacement is another entry, in its own scope.
+        send(&test, "GET", "/api/v1/catalogs/main/tree", Some(&staff), None).await;
+        test.app.settle_access().await;
+
+        let reads = admin_reads(&test).await;
+        let family = audit_team(&test, "family").await;
+        let replacement = catalog_id(&test, "main").await;
+        assert_eq!(reads.len(), 2, "neither dropped nor merged");
+        assert_eq!((reads[0].0.clone(), reads[0].1["catalog_id"].as_i64()), (vec![personal], Some(original)));
+        assert_eq!((reads[1].0.clone(), reads[1].1["catalog_id"].as_i64()), (vec![family], Some(replacement)));
+        assert_eq!(reads[0].2, "main", "the name as it was");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn every_export_is_recorded_whoever_asks() {
         let test = app().await;
@@ -3769,7 +3914,7 @@ git commit -m "feat(audit): record publishes, reverts and admins' discards (M14 
 
 - [ ] **Step 2: Run them and see them fail**
 
-Run: `tools/agentic/gate.sh narrow --lib auth::tests`, `tools/agentic/gate.sh narrow --lib store::audit::tests::admin_reads`, `tools/agentic/gate.sh narrow --lib store::audit::tests::a_catalog_moved`, `tools/agentic/gate.sh narrow --lib http::api::browse::tests::an_operator_read`, `tools/agentic/gate.sh narrow --lib http::api::browse::tests::every_export`, `tools/agentic/gate.sh narrow --lib store::export::tests`
+Run: `tools/agentic/gate.sh narrow --lib auth::tests`, `tools/agentic/gate.sh narrow --lib store::audit::tests::admin_reads`, `tools/agentic/gate.sh narrow --lib store::audit::tests::a_catalog_moved`, `tools/agentic/gate.sh narrow --lib http::api::browse::tests::an_operator_read`, `tools/agentic/gate.sh narrow --lib http::api::browse::tests::a_write_delayed`, `tools/agentic/gate.sh narrow --lib http::api::browse::tests::a_read_`, `tools/agentic/gate.sh narrow --lib http::api::browse::tests::every_export`, `tools/agentic/gate.sh narrow --lib store::export::tests`
 Expected: compile errors.
 
 - [ ] **Step 3: Implement the gates** (`src/auth.rs`, `src/store/gates.rs`)
@@ -3784,6 +3929,23 @@ pub struct AccessGates {
     pub members: HashMap<String, HashSet<String>>,
     /// The `users.id` of every admin user.
     pub admins: HashSet<String>,
+    /// By `users.id`: the user's `audit_people` id. *(Corrected, PR #375
+    /// review, 2026-11-13: audit ids are resolved here, at load, so an
+    /// access is recorded with ids fixed at admission.)*
+    pub people: HashMap<String, i64>,
+    /// By key or grant id: its `audit_credentials` id.
+    pub credentials: HashMap<String, i64>,
+    /// By catalog name: its immutable id and its owner team's `audit_teams` id.
+    pub catalogs: HashMap<String, CatalogScope>,
+}
+
+/// A catalog as an access record names it: fixed at admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogScope {
+    /// `catalogs.id`, never reused.
+    pub id: i64,
+    /// The owner team's `audit_teams` id; `None` for an unowned catalog.
+    pub team: Option<i64>,
 }
 
 /// How a content read or write is let in (spec Parts 5 and 6).
@@ -3871,11 +4033,75 @@ pub async fn load(pool: &PgPool) -> Result<AccessGates, OkfError> {
         // `entry(..).or_default()`: Python's `setdefault(key, set())`.
         gates.members.entry(user_id).or_default().insert(catalog);
     }
+    ensure_audit_rows(pool).await?;
+    let (people, credentials, catalogs) = tokio::try_join!(
+        sqlx::query_as::<_, (String, i64)>("SELECT user_id, id FROM audit_people WHERE user_id IS NOT NULL")
+            .fetch_all(pool),
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT credential_id, id FROM audit_credentials WHERE credential_id IS NOT NULL",
+        )
+        .fetch_all(pool),
+        sqlx::query_as::<_, (String, i64, Option<i64>)>(
+            "SELECT c.name, c.id, a.id FROM catalogs c \
+             LEFT JOIN audit_teams a ON a.team_id = c.owner_team_id",
+        )
+        .fetch_all(pool),
+    )?;
+    gates.people = people.into_iter().collect();
+    gates.credentials = credentials.into_iter().collect();
+    gates.catalogs = catalogs
+        .into_iter()
+        .map(|(name, id, team)| (name, CatalogScope { id, team }))
+        .collect();
     Ok(gates)
+}
+
+/// Creates the audit rows the cache's maps need and do not have yet: the
+/// person of every user, the credential row of every live key and grant,
+/// the team row of every catalog's owner. One statement per missing row,
+/// so each locks one user at most and none can deadlock with a deletion;
+/// after the first load only new users, keys and teams need one.
+/// `audit_person` and `audit_credential` lock the user, so a row is never
+/// created for a user deleted meanwhile.
+///
+/// # Errors
+/// [`OkfError::Database`].
+async fn ensure_audit_rows(pool: &PgPool) -> Result<(), OkfError> {
+    let users: Vec<String> = sqlx::query_scalar(
+        "SELECT u.id FROM users u WHERE NOT EXISTS (SELECT 1 FROM audit_people p WHERE p.user_id = u.id)",
+    )
+    .fetch_all(pool)
+    .await?;
+    for user_id in users {
+        sqlx::query("SELECT audit_person($1)").bind(user_id).execute(pool).await?;
+    }
+    let credentials: Vec<(String, String)> = sqlx::query_as(
+        "SELECT k.id, k.actor FROM api_keys k WHERE k.revoked_at IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM audit_credentials a WHERE a.credential_id = k.id)",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (id, label) in credentials {
+        sqlx::query("SELECT audit_credential($1, NULL, $2)").bind(id).bind(label).execute(pool).await?;
+    }
+    let teams: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT c.owner_team_id FROM catalogs c WHERE c.owner_team_id IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM audit_teams a WHERE a.team_id = c.owner_team_id)",
+    )
+    .fetch_all(pool)
+    .await?;
+    for team_id in teams {
+        sqlx::query("SELECT audit_team_ref($1)").bind(team_id).execute(pool).await?;
+    }
+    Ok(())
 }
 ```
 
-> **Corrected (PR #375 review, 2026-11-13).** An hourly `catalog.admin_read` bucket is keyed by (credential or person audit id, `catalogs.id`, owner `audit_teams` id, hour), not by catalog name: reads before and after a transfer to another team, or of a catalog deleted and created again under the same name, go to separate entries, each scoped to the team that owned the catalog (Decision 20). The catalog and its owner are read when the background write runs, a few milliseconds after the request.
+(A credential's label in `audit_credentials` is its `actor`, which a key keeps for life; the change paths of Tasks 6a to 6c keep refreshing people and labels as before.)
+
+> **Corrected (PR #375 review, 2026-11-13).** An hourly `catalog.admin_read` bucket is keyed by (credential or person audit id, `catalogs.id`, owner `audit_teams` id, hour), not by catalog name: reads before and after a transfer to another team, or of a catalog deleted and created again under the same name, go to separate entries, each scoped to the team that owned the catalog (Decision 20). The catalog and its owner are captured at admission (below), never looked up by name when the write runs.
+
+> **Corrected (PR #375 review, 2026-11-13).** The background write first resolved the actor (`audit_person`, `audit_credential` from the raw credential id and label) and the catalog (by name) when it ran. A write delayed past the user's deletion could then re-create a forgotten person or credential, and a read before a transfer or deletion of the catalog could be scoped to the new owner, to a replacement catalog of the same name, or dropped. Now `ToolContext::admit` builds an `AccessRecord` at admission from the key cache's maps (`AccessGates.people`, `credentials`, `catalogs`): audit ids, the non-identifying `stored_label`, `catalogs.id` and the owner's `audit_teams` id, and the time. The background task gets only that, and inserts with those ids: it calls no function that creates an `audit_people` or `audit_credentials` row. Decisions 21 and 22.
 
 - [ ] **Step 4: Noting admissions** (`src/store/audit.rs`, `src/mcp/context.rs`, `src/app.rs`)
 
@@ -3891,60 +4117,64 @@ pub enum AccessKind {
     Export,
 }
 
+/// One operator access, as admission saw it: every identity and scope is
+/// fixed here (audit ids from the key cache), so the background write
+/// needs no lookup by name and creates no person or credential row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessRecord {
+    /// Where the request came from.
+    pub source: Source,
+    /// The actor's `audit_credentials` id (a key or grant).
+    pub actor_credential: Option<i64>,
+    /// The actor's `audit_people` id.
+    pub actor_person: Option<i64>,
+    /// [`AuditActor::stored_label`]: never a person's name.
+    pub actor_label: String,
+    /// An admin credential or a provisioner.
+    pub operator: bool,
+    /// The client address.
+    pub ip: Option<IpAddr>,
+    /// The catalog's name at admission (a display snapshot).
+    pub catalog: String,
+    /// The catalog's immutable id and owner team at admission.
+    pub scope: crate::auth::CatalogScope,
+    /// When it was admitted (server clock).
+    pub at: DateTime<Utc>,
+}
+
 /// Counts one admin read in its `catalog.admin_read` entry, one per
-/// credential, catalog identity (`catalogs.id`), owning team and clock
-/// hour, creating the entry on the bucket's first read. Exact under
-/// concurrency: the counter row is upserted, so a second first read waits
-/// for the first to commit and then increments.
+/// actor, catalog identity (`catalogs.id`), owning team and clock hour, all
+/// as admission recorded them, creating the entry on the bucket's first
+/// read. Exact under concurrency: the counter row is upserted, so a second
+/// first read waits for the first to commit and then increments. It only
+/// references audit rows that already exist: a write that runs after the
+/// actor's user was deleted (and forgotten) adds nothing that identifies
+/// them, and a catalog moved or deleted meanwhile keeps the read in the
+/// scope it was admitted in.
 ///
 /// # Arguments
 /// * `pool` - the database.
-/// * `actor` - the reading credential.
-/// * `catalog` - the catalog read.
-/// * `now` - the server clock.
+/// * `record` - the access, as admitted.
 ///
 /// # Errors
 /// [`OkfError::Database`].
-pub async fn record_admin_read(
-    pool: &PgPool,
-    actor: &AuditActor,
-    catalog: &str,
-    now: DateTime<Utc>,
-) -> Result<(), OkfError> {
+pub async fn record_admin_read(pool: &PgPool, record: &AccessRecord) -> Result<(), OkfError> {
     // `DurationRound::duration_trunc`: the start of the clock hour.
-    let hour = now.duration_trunc(TimeDelta::hours(1)).unwrap_or(now);
-    let mut tx = pool.begin().await?;
-    // The bucket names the actor by its audit id (`c<credential>`, else
-    // `p<person>`, else `l<label>` for the CLI or system), never by a
-    // credential id or name a deletion could not clear. *(Corrected, PR
-    // #375 review, 2026-11-13.)*
-    let who: String = sqlx::query_scalar(
-        "SELECT COALESCE('c' || audit_credential($1, audit_person($2), $3), \
-                         'p' || audit_person($2), 'l' || $4)",
-    )
-    .bind(&actor.credential)
-    .bind(&actor.user_id)
-    .bind(&actor.label)
-    .bind(actor.stored_label())
-    .fetch_one(&mut *tx)
-    .await?;
-    // The catalog by its immutable id and its owner team by audit id, read
-    // now: a catalog moved to another team, or deleted and created again
-    // under the same name, starts a new bucket and a new entry, scoped to
-    // the team that owns it. A catalog gone meanwhile has nothing to record.
-    // *(Corrected, PR #375 review, 2026-11-13: the bucket was keyed by name.)*
-    let Some(catalog_id) = sqlx::query_scalar::<_, i64>("SELECT id FROM catalogs WHERE name = $1")
-        .bind(catalog)
-        .fetch_optional(&mut *tx)
-        .await?
-    else {
-        return Ok(());
+    let hour = record.at.duration_trunc(TimeDelta::hours(1)).unwrap_or(record.at);
+    let who = match (record.actor_credential, record.actor_person) {
+        (Some(credential), _) => format!("c{credential}"),
+        (None, Some(person)) => format!("p{person}"),
+        (None, None) => format!("l{}", record.actor_label),
     };
-    let teams = catalog_teams(&mut tx, catalog_id).await?;
-    // `0` stands for "no owner team" (audit ids start at 1).
-    let team = teams.first().copied().unwrap_or(0);
-    // U+001F (unit separator) cannot occur in the parts.
-    let bucket = format!("{who}\u{1f}{catalog_id}\u{1f}{team}\u{1f}{}", hour.timestamp());
+    // `0` stands for "no owner team" (audit ids start at 1). U+001F (unit
+    // separator) cannot occur in the parts.
+    let bucket = format!(
+        "{who}\u{1f}{}\u{1f}{}\u{1f}{}",
+        record.scope.id,
+        record.scope.team.unwrap_or(0),
+        hour.timestamp()
+    );
+    let mut tx = pool.begin().await?;
     let entry_id: Option<i64> = sqlx::query_scalar(
         "INSERT INTO audit_access_counts (bucket, requests) VALUES ($1, 1) \
          ON CONFLICT (bucket) DO UPDATE SET requests = audit_access_counts.requests + 1 \
@@ -3954,18 +4184,29 @@ pub async fn record_admin_read(
     .fetch_one(&mut *tx)
     .await?;
     if entry_id.is_none() {
-        let id = record(
-            &mut tx,
-            actor,
-            &Entry {
-                action: Action::CatalogAdminRead,
-                target: Target::Catalog(catalog),
-                person: None,
-                teams: &teams,
-                details: serde_json::json!({"hour": crate::clock::format_timestamp(hour)}),
-            },
-            now,
+        // The ids as admission fixed them; no `audit_person` or
+        // `audit_credential` call, so nothing is created for a deleted user.
+        let teams: Vec<i64> = record.scope.team.into_iter().collect();
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO audit_entries (at, action, source, actor_credential_ref, actor_person_id, \
+                 actor_label, actor_operator, client_ip, target_kind, target_name, teams, details) \
+             VALUES ($1, 'catalog.admin_read', $2, $3, $4, $5, $6, $7::inet, 'catalog', $8, $9, $10) \
+             RETURNING id",
         )
+        .bind(record.at)
+        .bind(record.source.as_str())
+        .bind(record.actor_credential)
+        .bind(record.actor_person)
+        .bind(&record.actor_label)
+        .bind(record.operator)
+        .bind(record.ip.map(|ip| ip.to_string()))
+        .bind(&record.catalog)
+        .bind(&teams)
+        .bind(serde_json::json!({
+            "hour": crate::clock::format_timestamp(hour),
+            "catalog_id": record.scope.id,
+        }))
+        .fetch_one(&mut *tx)
         .await?;
         sqlx::query("UPDATE audit_access_counts SET entry_id = $2 WHERE bucket = $1")
             .bind(&bucket)
@@ -3976,6 +4217,71 @@ pub async fn record_admin_read(
     tx.commit().await?;
     Ok(())
 }
+```
+
+`Principal::access_record` (`src/auth.rs`) builds it from the gates, synchronously:
+
+```rust
+    /// This principal's access to `catalog` as the audit log will record
+    /// it, with every identity and scope fixed now from the key cache.
+    ///
+    /// # Returns
+    /// The record, or `None` for a catalog the cache does not know (created
+    /// since its load; the creating route settles before answering, so a
+    /// later request finds it), which is logged at `warn`.
+    pub fn access_record(&self, requester: &Requester, catalog: &str, now: DateTime<Utc>) -> Option<AccessRecord> {
+        let actor = AuditActor::of(self, requester);
+        let Some(scope) = self.gates.catalogs.get(catalog).copied() else {
+            tracing::warn!(%catalog, "an operator access to a catalog the key cache does not know yet");
+            return None;
+        };
+        Some(AccessRecord {
+            source: requester.source,
+            actor_credential: actor.credential.as_deref().and_then(|id| self.gates.credentials.get(id)).copied(),
+            actor_person: self.user_id.as_deref().and_then(|id| self.gates.people.get(id)).copied(),
+            actor_label: actor.stored_label(),
+            operator: actor.operator,
+            ip: requester.ip,
+            catalog: catalog.to_string(),
+            scope,
+            at: now,
+        })
+    }
+```
+
+And the test helper (`audit::testing`), which resolves the ids with SQL as the cache would:
+
+```rust
+    /// The `AccessRecord` admission would build for `actor` on `catalog`.
+    pub(crate) async fn access_record(
+        pool: &PgPool,
+        actor: &super::AuditActor,
+        catalog: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> super::AccessRecord {
+        let (credential, person, id, team): (Option<i64>, Option<i64>, i64, Option<i64>) = sqlx::query_as(
+            "SELECT audit_credential($1, NULL, $2), audit_person($3), c.id, audit_team_ref(c.owner_team_id) \
+             FROM catalogs c WHERE c.name = $4",
+        )
+        .bind(&actor.credential)
+        .bind(&actor.label)
+        .bind(&actor.user_id)
+        .bind(catalog)
+        .fetch_one(pool)
+        .await
+        .expect("resolve the access");
+        super::AccessRecord {
+            source: actor.source,
+            actor_credential: credential,
+            actor_person: person,
+            actor_label: actor.stored_label(),
+            operator: actor.operator,
+            ip: actor.ip,
+            catalog: catalog.to_string(),
+            scope: crate::auth::CatalogScope { id, team },
+            at,
+        }
+    }
 ```
 
 `ToolContext` gains `noted: std::sync::Mutex<HashSet<(String, AccessKind)>>` and:
@@ -3998,8 +4304,13 @@ pub async fn record_admin_read(
             .lock()
             .expect("noted lock poisoned")
             .insert((catalog.to_string(), kind));
-        if fresh {
-            self.app.note_access(self.audit_actor(), catalog.to_string(), kind, admission);
+        if !fresh {
+            return;
+        }
+        // Identities and scope are fixed now, at admission; the background
+        // write only stores them. *(Corrected, PR #375 review, 2026-11-13.)*
+        if let Some(record) = self.principal.access_record(&self.requester, catalog, self.app.clock().now()) {
+            self.app.note_access(record, kind, admission);
         }
     }
 ```
@@ -4012,6 +4323,11 @@ pub async fn record_admin_read(
     // Background writes of recorded accesses (admin reads, unlock tallies).
     // A `JoinSet` so tests and shutdown can wait for them.
     access_writes: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    // Test hook: a background access write waits for this lock first, so a
+    // test can hold it to run a deletion or a transfer between admission
+    // and persistence.
+    #[cfg(test)]
+    pub(crate) access_hold: Arc<tokio::sync::Mutex<()>>,
 ```
 
 ```rust
@@ -4019,23 +4335,26 @@ pub async fn record_admin_read(
     /// (Task 9b: also an unlock's tally). A failure is logged.
     ///
     /// # Arguments
-    /// * `actor` - who.
-    /// * `catalog` - which catalog.
+    /// * `record` - the access, with identities and scope fixed at admission.
     /// * `kind` - read, write or export.
     /// * `admission` - how it was let in.
-    pub fn note_access(&self, actor: AuditActor, catalog: String, kind: AccessKind, admission: Admission) {
+    pub fn note_access(&self, record: AccessRecord, kind: AccessKind, admission: Admission) {
         let pool = self.pool.clone();
-        let now = self.clock.now();
+        #[cfg(test)]
+        let hold = Arc::clone(&self.access_hold);
         let mut writes = self.access_writes.lock().expect("access writes lock poisoned");
         // Reap the finished ones, so the set holds only running writes.
         while writes.try_join_next().is_some() {}
         writes.spawn(async move {
+            // Tests hold this to delay the write past a deletion or transfer.
+            #[cfg(test)]
+            let _held = hold.lock().await;
             let written = match admission {
-                Admission::AdminRead => audit::record_admin_read(&pool, &actor, &catalog, now).await,
+                Admission::AdminRead => audit::record_admin_read(&pool, &record).await,
                 Admission::Customer | Admission::Untracked => Ok(()),
             };
             if let Err(error) = written {
-                tracing::error!(%error, %catalog, ?kind, "recording an operator access failed");
+                tracing::error!(%error, catalog = %record.catalog, ?kind, "recording an operator access failed");
             }
         });
     }
@@ -4057,7 +4376,7 @@ pub async fn record_admin_read(
 
 - [ ] **Step 6: Run, gate, commit**
 
-Run the narrow tests, `tools/agentic/gate.sh test`, `fmt`, `lint`. `docs/operations.md`'s audit section: exports, admin reads (one entry per credential, catalog and clock hour, with an exact request count, for an admin credential reading a catalog outside its user's teams; a key with no user always counts).
+Run the narrow tests, `tools/agentic/gate.sh test`, `fmt`, `lint`. `docs/operations.md`'s audit section: exports, admin reads (one entry per credential, catalog identity, owning team and clock hour, scoped as the read was admitted, with an exact request count, for an admin credential reading a catalog outside its user's teams; a key with no user always counts).
 
 ```bash
 git add src docs/operations.md changelog/
@@ -5487,6 +5806,8 @@ git commit -m "feat(unlocks): unlock records, settings, error kinds and the owne
             require_unlock,
             unlocks: HashMap::new(),
             maintenance_off: HashSet::new(),
+            // The audit-id maps (Task 7b) play no part in admission.
+            ..AccessGates::default()
         }
     }
 
@@ -5692,7 +6013,7 @@ Expected: compile errors (`entitled`, `require_unlock`, `Admission::Unlocked`), 
 - `http/api/search.rs` and `mcp/changesets.rs` (`list_changesets`): M13's `check_not_suspended(name).is_ok()` filter becomes `check_open(name, Access::Read, now).is_ok()`.
 - `ToolContext::changeset`: `self.principal.require_contents(access, state.name(), self.app.clock().now())?` replaces `require`; `open_changeset` (`mcp/changesets.rs:235`) likewise; the revision route (`browse.rs:328`); `maintenance_close`'s operator override (`work.rs:172`) uses `require_contents(Access::Write, ..).is_ok()`.
 - `http/archives.rs`: export keeps M13's `require_export` (reach and read level, suspension ignored), then `principal.admission(&name, Access::Read, now)?`; with `Admission::Unlocked`, `app.note_access(.., AccessKind::Export, ..)`. Import: `require(Access::Admin, ..)` then `admission(&name, Access::Write, now)?`, noted as a write.
-- `App::note_access`: `Admission::Unlocked { unlock_id } => unlocks::tally(&pool, unlock_id, kind).await`. Tallies are keyed by the unlock's id, and an unlock belongs to one `catalogs.id` (`ON DELETE CASCADE`), so a catalog deleted and created again under the same name never inherits an unlock or its counts; deleting a catalog bumps `admin_generation`, so the cache drops the unlock at once. *(Corrected, PR #375 review, 2026-11-13: checked for the same name-keying defect; none.)* In `src/store/unlocks.rs`:
+- `App::note_access`: `Admission::Unlocked { unlock_id } => unlocks::tally(&pool, unlock_id, kind).await` (the `record` is not needed for a tally). Tallies are keyed by the unlock's id, and an unlock belongs to one `catalogs.id` (`ON DELETE CASCADE`), so a catalog deleted and created again under the same name never inherits an unlock or its counts; deleting a catalog bumps `admin_generation`, so the cache drops the unlock at once. *(Corrected, PR #375 review, 2026-11-13: checked for the same name-keying defect; none. The unlock id is part of the admission, so it is fixed when the request is admitted; a tally that runs after its catalog (and with it the unlock) was deleted updates nothing, and the unlock's `catalog.unlocked` and `catalog.unlock_ended` entries keep the record.)* In `src/store/unlocks.rs`:
 
 ```rust
 /// Counts one request under an unlock.
@@ -6380,3 +6701,5 @@ git commit -m "docs: operator API operations, API reference and close-out (M14 t
 18. **Operator staff as a target are hidden from owners too.** *(PR #375 review, 2026-11-13.)* An unlock's entries name the unlocked admin as their person; owners saw it although the actor read "an operator". `record` sets `target_operator` when the target person is an admin user, and the owner view drops that person (and a credential naming them); for owners the target filter never matches a hidden person or credential and the actor filter never matches an operator's entry, so neither is an identity oracle. Tests: Task 8a (`owners_never_see_an_operators_identity_ip_unlock_reason_or_unlocked_staff`, the whole serialized record and both filters) and Task 9d (the owner's full `GET /api/v1/audit` response, its export and its filters contain no staff name).
 19. **A credential's owner comes from the credential tables.** *(PR #375 review, round 2, 2026-11-13.)* Entries that target a credential without naming a person (`key.revoked`, `key.catalog_granted`, `key.report_flag_changed`) could create an `audit_credentials` row with no person, so `forget_person` would miss it, and a legacy key whose id is its user's name would stay visible after the user is deleted. `audit_credential` now takes the owner from `api_keys.user_id` or `sign_in_codes.user_id` while the credential exists, and `forget_person` also clears every row still named by the user's keys, grants and codes; Task 4 calls it before deleting the user row, while those exist. No backfill: the table starts empty and every row is made through that function. Test: Task 6c `a_pre_m14_key_that_only_ever_is_a_target_is_forgotten_with_its_user`.
 20. **Admin-read buckets follow the catalog's identity and owner.** *(PR #375 review, round 2, 2026-11-13.)* The bucket was (credential, catalog name, hour), so reads after a transfer to another team, or of a catalog deleted and created again under the same name, counted in the first entry and showed in the wrong team's log. It is now (credential or person audit id, `catalogs.id`, owner `audit_teams` id, hour): one entry per credential, catalog identity, owning team and clock hour. Unlock tallies were checked: they are keyed by unlock id, and an unlock belongs to one `catalogs.id`. Test: Task 7b `a_catalog_moved_or_created_again_within_the_hour_starts_a_new_admin_read_entry`.
+21. **Access records carry ids resolved at admission.** *(PR #375 review, final round, 2026-11-13.)* The background write used to resolve the actor (creating `audit_people` and `audit_credentials` rows from the raw credential id and label) when it ran, so a write delayed past the user's deletion could re-create the forgotten name or credential id. Now the key cache resolves audit ids at load (`ensure_audit_rows`, one row per statement), `ToolContext::admit` builds an `AccessRecord` from them synchronously, and the write inserts with those ids only, creating no person or credential row. Separately, `audit_person` and `audit_credential` lock the user (`FOR KEY SHARE`) and create nothing for a user deleted meanwhile, so no audit write anywhere can undo a deletion. Test: Task 7b `a_write_delayed_past_the_users_deletion_stores_nothing_that_identifies_them`.
+22. **Access records carry the catalog's identity and scope from admission.** *(PR #375 review, final round, 2026-11-13.)* The write used to look the catalog up by name when it ran: a read before a transfer was scoped to the new owner, and a read of a catalog deleted (or deleted and created again) before the write was dropped or merged into the replacement. `AccessRecord.scope` (`catalogs.id`, owner `audit_teams` id) is taken from the key cache at admission, the entry's `details.catalog_id` names the identity, and the bucket key uses it. Unlock tallies were already keyed by an unlock id fixed at admission. Tests: Task 7b `a_read_admitted_before_a_transfer_stays_with_the_old_owner` and `a_read_of_a_catalog_deleted_or_replaced_before_it_is_written_keeps_its_identity`.

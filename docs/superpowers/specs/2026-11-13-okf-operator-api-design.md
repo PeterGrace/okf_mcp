@@ -241,6 +241,12 @@ owner `NOT NULL`) is unaffected.
   under the same name, starts a new entry within the hour, scoped to the
   team that owns it then. *(Corrected, PR #375 review, 2026-11-13: the
   bucket was per catalog name.)*
+  *(Corrected, PR #375 review, 2026-11-13.)* Who read, which catalog and
+  its owning team are fixed when the read is admitted: a read just before
+  a transfer stays with the old owner, a read of a catalog deleted or
+  replaced before the record is written keeps the original catalog, and
+  the record is written only with references fixed at that moment, so it
+  can never re-create anything a user's deletion removed.
 - **Not recorded:** reads by anyone else; sign-ins (already in
   `sign_in_events`, which the audit view links to); maintenance runner
   reports (already in their own tables).
