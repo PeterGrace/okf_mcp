@@ -1,7 +1,7 @@
 // Catalogs: the catalogs this key reaches, with their owner teams. Admins
 // edit descriptions and delete; an admin key that reaches every catalog
 // also creates them and changes their owner (plan Decision 3).
-import { $, h } from '../core/dom.js';
+import { $, h, fill } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
@@ -132,7 +132,8 @@ export async function render(main) {
                 remove));
     }
 
-    main.append(
+    // fill(), not native append: the note may be null (issue #302).
+    fill(main,
         h('div', { class: 'page-head' },
             h('div', {}, h('h1', {}, 'Catalogs'), h('p', { class: 'muted' }, 'The catalogs this key reaches.')),
             h('div', { class: 'actions' },

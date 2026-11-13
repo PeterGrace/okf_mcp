@@ -21656,6 +21656,14 @@ git commit -m "feat(cli): admin flag, email, invite, entitlements, sessions, mem
 
 Task 7b already lets the console run on an account session: `api.js` sends a bearer only when a key is stored and otherwise `X-OKF-CSRF` (from `store.csrf`) on writes, `main.js` resumes a live cookie with `resumeSession()` and signs out over `DELETE /api/v1/session`, `#whoami` reads `alice - write` for a session, and the login card links to `/signin`. This task extends those files, it does not replace them: it keeps the whole session answer in `store.session` (beside 7b's `store.csrf`), makes `store.can` follow the ceiling's level on the selected catalog, factors 7b's header lines into an exported `authHeaders` (so uploads send the same credentials), turns 7b's link into the card's main "Sign in with your account" button with a `return_to`, and adds a "Your account" nav group with the My keys page. A pasted key still works and still wins. The Administer group stays hidden unless the person is an admin user. Task 14b adds My grants and Account.
 
+> **Corrected (issue #324, 2026-11-13).** What shipped differs from the steps below in these ways; `src/http/ui/` and `tests/ui_e2e/self_service.rs` are authoritative:
+> - **Step 6 was mostly done by Task 7b.** `core/api.js` already exported `authHeaders(method, { key = store.key, csrf = store.csrf } = {})` (an options object, not a positional `key`), `upload.js` already used it, and the 403 toast already said "Your account cannot do this." without a key. This task only adds `export const CSRF_HEADER = 'X-OKF-CSRF'` and uses it inside `authHeaders`. There is no `refusal()`. Call `authHeaders('POST')` or `authHeaders('GET', { key: null })`, never `authHeaders(method, key)`.
+> - **Step 8:** `refreshIdentity` applies `data-need` after it settles `store.catalog`, because a member's level depends on the selected catalog.
+> - **Step 9:** the Administer group also starts `hidden`, like the "Your account" group, so neither shows before `whoami` answers.
+> - **Issue #302 is fixed here.** `pages/users.js`, `teams.js`, `catalogs.js` and `transfer.js` passed a conditional `null` to the native `main.append`; they now use `fill(main, ...)`. `tests/ui_e2e/users.rs` gains `no_page_prints_a_stray_null_under_its_content`.
+> - **Step 2's journeys** also check: the API's 403 on admin routes for a member's session (`GET /keys`, `/users`, `/teams`, `POST /users` with the CSRF token); the card's `return_to` carrying the hash (`/signin?return_to=%2Fui%2F%23%2Fmy-keys`), followed through the real `/signin` form back to My keys; that the new key's secret is gone from the DOM and storage once its dialog closes, and that it authenticates as that key; that a refused key was not stored; and that the old name is gone after a rename. There is one more journey, `a_members_level_follows_the_selected_catalog` (`store.can` per catalog). The revoke journey waits with `Ui::wait_text_gone("#my-keys-table", "desk")`.
+> - My keys' limit note reads "You have 1 live key, the most allowed." (`count()` from `core/format.js`).
+
 Routes this task calls:
 
 | Route | Defined in | Used by |
@@ -23564,7 +23572,7 @@ Routes this task calls (all defined in Task 12, with the shapes Task 12 document
 - Create: `src/http/ui/js/components/user-account.js` (the drawer's account sections)
 - Create: `src/http/ui/js/pages/settings.js`
 - Modify: `src/http/ui/js/pages/users.js` (list columns; the drawer loads and shows the account sections, and re-renders through its ticket)
-- Modify: `src/http/ui/js/pages/catalogs.js` ("Team member access" in the drawer, read from `GET /catalogs/{catalog}/member-access`; the stray-`null` append fixed)
+- Modify: `src/http/ui/js/pages/catalogs.js` ("Team member access" in the drawer, read from `GET /catalogs/{catalog}/member-access`)
 - Modify: `src/http/ui/index.html` (Settings link under Administer), `src/http/ui/styles.css` (`.settings-input`)
 - Modify: `tests/ui_e2e/users.rs`, `tests/ui_e2e/catalogs.rs`, `tests/ui_e2e/smoke.rs`, `tests/ui_e2e/main.rs` (`mod settings;`)
 - Test: `tests/ui_e2e/settings.rs`
@@ -24208,14 +24216,9 @@ In `render`, give the Name column the admin pill and add an Email column after D
           render: user => user.email ? h('span', { class: 'mono small' }, user.email) : h('span', { class: 'muted' }, '-') },
 ```
 
-Fix the stray-`null` append (issue #302) while here: replace `table, manager ? null : h('p', ...)` at the end of the `main.append(...)` call with
+> **Corrected (issue #324, 2026-11-13).** Task 14a fixed #302: `users.js`, `teams.js`, `catalogs.js` and `transfer.js` end `render` with `fill(main, ...)` (from `core/dom.js`), which drops the conditional `null`. Keep that call as it is; there is no stray-`null` step here any more.
 
-```js
-        table);
-    if (!manager) main.append(h('p', { class: 'muted small' }, NEEDS_EVERY_CATALOG));
-```
-
-(skip this line change if #302's fix has already landed on `main`). Replace `openDetail` with:
+Replace `openDetail` with:
 
 ```js
     // The drawer: the user's teams, the credentials this key manages, the
@@ -24338,20 +24341,7 @@ and extend the shell import to `import { canAdministerPeople, keyUserChanged, re
                 remove));
 ```
 
-Fix the stray-`null` append at the end of `render` (issue #302's pattern; the page's own `main.append` is native):
-
-```js
-    main.append(
-        h('div', { class: 'page-head' },
-            h('div', {}, h('h1', {}, 'Catalogs'), h('p', { class: 'muted' }, 'The catalogs this key reaches.')),
-            h('div', { class: 'actions' },
-                creator ? h('button', { type: 'button', id: 'catalog-create', onclick: openCreate }, 'New catalog') : null)),
-        table);
-    if (admin && !creator) {
-        main.append(h('p', { class: 'muted small' }, 'Creating a catalog needs an admin key that reaches every catalog.'));
-    }
-    await load();
-```
+> **Corrected (issue #324, 2026-11-13).** Task 14a already fixed this page's stray `null` (issue #302): `render` ends with `fill(main, ...)`, which drops the conditional note. Leave it as it is.
 
 - [ ] **Step 8: Create `js/pages/settings.js`.**
 

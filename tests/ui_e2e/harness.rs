@@ -123,6 +123,21 @@ impl Ui {
         last
     }
 
+    /// Waits until `selector`'s text no longer contains `gone` (an absent
+    /// element has no text, so that counts too).
+    ///
+    /// # Arguments
+    /// * `selector` - the element to watch.
+    /// * `gone` - the text that must disappear.
+    ///
+    /// # Panics
+    /// When the text is still there after [`WAIT`].
+    pub fn wait_text_gone(&self, selector: &str, gone: &str) {
+        self.poll(&format!("{selector} without {gone:?}"), || {
+            !self.text(selector).contains(gone)
+        });
+    }
+
     /// `selector`'s text content, or "" when it is absent.
     pub fn text(&self, selector: &str) -> String {
         self.page

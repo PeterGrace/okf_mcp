@@ -146,3 +146,47 @@ async fn another_team_or_an_owned_catalog_refuses_the_delete_until_cleared() {
     })
     .await;
 }
+
+/// The text nodes directly inside the page's view: a conditional `null`
+/// passed to the DOM's own `append` shows up here as `"null"` (issue #302).
+const STRAY_TEXT: &str = "() => [...document.querySelector('#main .view').childNodes] \
+    .filter(node => node.nodeType === Node.TEXT_NODE).map(node => node.textContent)";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_page_prints_a_stray_null_under_its_content() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let writer = server
+        .key("console-writer", Access::Write, &["main"], Some("main"))
+        .await;
+    drive(server.base.clone(), move |ui| {
+        // An admin reaching every catalog: no "needs every catalog" note
+        // on Users, Teams or Catalogs.
+        ui.login(&admin);
+        for (route, loaded) in [
+            ("/users", format!("[data-test=user-{OWNER}]")),
+            ("/teams", format!("[data-test=team-{OWNER}]")),
+            ("/catalogs", "code[data-catalog=main]".to_string()),
+        ] {
+            ui.open(route);
+            ui.wait_visible(&loaded);
+            assert_eq!(
+                ui.eval(STRAY_TEXT, serde_json::json!(null)),
+                serde_json::json!([]),
+                "{route}"
+            );
+        }
+        ui.click("#signout");
+        ui.wait_visible("#login");
+        // A write key: no import panel on Import & export.
+        ui.login(&writer);
+        ui.open("/transfer");
+        ui.wait_visible("#export-panel");
+        assert!(!ui.page.is_visible("#import-panel").expect("visible"));
+        assert_eq!(
+            ui.eval(STRAY_TEXT, serde_json::json!(null)),
+            serde_json::json!([])
+        );
+    })
+    .await;
+}

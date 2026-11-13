@@ -14,6 +14,7 @@ mod health;
 mod keys;
 mod login;
 mod maintenance;
+mod self_service;
 mod signin;
 mod smoke;
 mod teams;

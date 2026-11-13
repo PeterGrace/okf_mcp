@@ -4,7 +4,7 @@
 // controls render disabled. '#/users/unassigned' lists every key, grant,
 // code and catalog with no user or owner, each with an inline Assign.
 // The server enforces every rule; this page only explains what cannot work.
-import { h, pill } from '../core/dom.js';
+import { h, pill, fill } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
@@ -40,7 +40,8 @@ export async function render(main, rest) {
     ];
     const table = listTable(columns, [], { onRow: user => openDetail(user.name), empty: 'No users yet.' });
     table.id = 'users-table';
-    main.append(
+    // fill(), not native append: the note is null for a manager (issue #302).
+    fill(main,
         h('header', { class: 'page-head' },
             h('div', {},
                 h('h1', {}, 'Users'),
