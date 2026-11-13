@@ -149,6 +149,20 @@ pub enum OkfError {
         reason: String,
     },
 
+    /// The key reaches the catalog, but its owner team is suspended: only
+    /// export works until the operator lifts it.
+    // `.catalog`, `.team` and `.notice` name the variant's fields inside
+    // `#[error]`; `.as_deref()` turns `&Option<String>` into `Option<&str>`.
+    #[error("{}", suspended_message(.catalog, .team, .notice.as_deref()))]
+    Suspended {
+        /// The catalog asked for.
+        catalog: String,
+        /// Its owner team.
+        team: String,
+        /// The operator's notice, if any.
+        notice: Option<String>,
+    },
+
     /// An administrative request was refused; the reason says why and what to do.
     #[error("{reason}")]
     Refused {
@@ -298,6 +312,7 @@ impl OkfError {
             OkfError::CatalogNotSelected { .. } => "CatalogNotSelected",
             OkfError::UnknownName { .. } => "UnknownName",
             OkfError::Forbidden { .. } => "Forbidden",
+            OkfError::Suspended { .. } => "Suspended",
             OkfError::Refused { .. } => "Refused",
             OkfError::Unauthenticated { .. } => "Unauthenticated",
             OkfError::Gone { .. } => "Gone",
@@ -326,7 +341,9 @@ impl OkfError {
     }
 
     /// The error as clients see it: `{"error": kind, "message": text}`, plus
-    /// the `path`, `catalog`, `noun` and `name`, or `problems` it concerns.
+    /// the `path`, `catalog`, `noun` and `name`, or `problems` it concerns
+    /// (a `Suspended` error adds `catalog`, `team` and `notice`, `null` when
+    /// the operator left none).
     ///
     /// Every catalog path in the body is `/`-prefixed (`path`, `files[].path`,
     /// `links[].source`, `errors[].file`, `warnings[].file`). An
@@ -393,6 +410,16 @@ impl OkfError {
                 body["links"] = json_list(links);
             }
             OkfError::LimitExceeded { limit, .. } => body["limit"] = (*limit).into(),
+            OkfError::Suspended {
+                catalog,
+                team,
+                notice,
+            } => {
+                body["catalog"] = catalog.as_str().into();
+                body["team"] = team.as_str().into();
+                // `Option<&str>` into JSON: a string, or `null` for `None`.
+                body["notice"] = notice.as_deref().into();
+            }
             OkfError::Database { .. }
             | OkfError::Migrate { .. }
             | OkfError::Config { .. }
@@ -404,6 +431,27 @@ impl OkfError {
         }
         body
     }
+}
+
+/// The text of [`OkfError::Suspended`]: the catalog, the team, then the
+/// notice as its own sentence.
+///
+/// # Arguments
+/// * `catalog` - the catalog asked for.
+/// * `team` - its owner team.
+/// * `notice` - the operator's notice, if any.
+///
+/// # Returns
+/// The message, e.g. `catalog "shared" is unavailable: its team "family" is
+/// suspended. Contact the operator.`
+fn suspended_message(catalog: &str, team: &str, notice: Option<&str>) -> String {
+    // `{catalog:?}` is the `Debug` form: the name in double quotes, escaped.
+    let mut message = format!("catalog {catalog:?} is unavailable: its team {team:?} is suspended");
+    if let Some(notice) = notice {
+        message.push_str(". ");
+        message.push_str(notice);
+    }
+    message
 }
 
 /// A catalog path as clients see it: catalog-relative with a leading `/`
@@ -485,6 +533,48 @@ impl From<sqlx::Error> for OkfError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspended_names_the_catalog_team_and_notice() {
+        let error = OkfError::Suspended {
+            catalog: "shared".to_string(),
+            team: "family".to_string(),
+            notice: Some("Contact the operator.".to_string()),
+        };
+
+        let body = error.to_json();
+
+        assert_eq!(error.kind(), "Suspended");
+        assert!(!error.is_internal());
+        assert_eq!(body["error"], "Suspended");
+        assert_eq!(body["catalog"], "shared");
+        assert_eq!(body["team"], "family");
+        assert_eq!(body["notice"], "Contact the operator.");
+        assert_eq!(
+            body["message"],
+            "catalog \"shared\" is unavailable: its team \"family\" is suspended. \
+             Contact the operator."
+        );
+    }
+
+    #[test]
+    fn suspended_without_a_notice_has_a_null_notice() {
+        let error = OkfError::Suspended {
+            catalog: "shared".to_string(),
+            team: "family".to_string(),
+            notice: None,
+        };
+
+        let body = error.to_json();
+
+        // `get`, not `body["notice"]`: indexing a missing key also yields
+        // `Null`, so only `get` proves the field is present.
+        assert_eq!(body.get("notice"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            body["message"],
+            "catalog \"shared\" is unavailable: its team \"family\" is suspended"
+        );
+    }
 
     #[test]
     fn still_linked_lists_its_links_and_is_a_conflict_not_internal() {
