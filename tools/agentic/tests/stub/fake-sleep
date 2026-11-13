@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake sleep for the tests: advances $GH_FIXTURES/clock by $1 seconds at once.
+clock="${GH_FIXTURES:?}/clock"
+echo $(($(cat "$clock") + ${1:?})) >"$clock"

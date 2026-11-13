@@ -23,6 +23,10 @@ test:
 test-ui:
     scripts/test-pg.sh run cargo test --test ui_e2e -- --test-threads=2
 
+# Shell tests for tools/agentic (stub gh, fake clock; no Docker or network).
+test-agentic:
+    timeout 120 tools/agentic/tests/run.sh
+
 # Prepare locally; ship through a PR, then publish the merged commit's tag.
 release-prepare patchlevel:
     bash scripts/release-prepare.sh {{quote(patchlevel)}}
