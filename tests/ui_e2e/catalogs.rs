@@ -54,7 +54,7 @@ fn tarball(entries: &[(&str, &str)]) -> Vec<u8> {
 }
 
 /// The catalog switcher's options.
-fn switcher(ui: &Ui) -> Vec<String> {
+pub(crate) fn switcher(ui: &Ui) -> Vec<String> {
     let values = ui.eval(
         "() => [...document.querySelectorAll('#catalog-select option')] \
          .map(option => option.value)",

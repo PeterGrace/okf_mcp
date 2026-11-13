@@ -3,7 +3,7 @@
 // admin key that reaches every catalog creates, changes and deletes them
 // (plan Decision 3), and for any other the controls render disabled.
 // The server enforces every rule; this page only explains what cannot work.
-import { h, pill } from '../core/dom.js';
+import { h, pill, fill } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
@@ -42,7 +42,8 @@ export async function render(main) {
     ];
     const table = listTable(columns, [], { onRow: team => openDetail(team.name), empty: 'No teams yet.' });
     table.id = 'teams-table';
-    main.append(
+    // fill(), not native append: the note is null for a manager (issue #302).
+    fill(main,
         h('header', { class: 'page-head' },
             h('div', {},
                 h('h1', {}, 'Teams'),

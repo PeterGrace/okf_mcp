@@ -14,15 +14,15 @@
 <body>
     <section id="login" class="login-card" hidden>
         <h1 class="brand">okf</h1>
-        <p class="muted">Paste an API key to continue. It stays in this browser until you sign out.</p>
+        <a id="login-signin" role="button" href="/signin?return_to=%2Fui%2F">Sign in with your account</a>
+        <p class="muted login-alt">Or paste an API key. It stays in this browser until you sign out.</p>
         <form id="login-form">
             <label>API key
                 <input type="password" name="key" autocomplete="off" required>
             </label>
-            <button type="submit">Sign in</button>
+            <button type="submit">Sign in with the key</button>
         </form>
         <p id="login-error" class="error" hidden></p>
-        <p class="muted small"><a href="/signin" id="login-signin">Sign in with your account instead</a></p>
     </section>
 
     <div id="app" class="shell" hidden>
@@ -43,7 +43,13 @@
                 <a class="nav-link" data-nav="runs" href="#/runs">Runs</a>
                 <a class="nav-link" data-nav="changesets" href="#/changesets">Changesets</a>
             </div>
-            <div class="nav-group" data-need="admin">
+            <div class="nav-group" data-need="session" hidden>
+                <span class="nav-group-label">Your account</span>
+                <a class="nav-link" data-nav="my-keys" href="#/my-keys">My keys</a>
+                <a class="nav-link" data-nav="my-grants" href="#/my-grants">My grants</a>
+                <a class="nav-link" data-nav="account" href="#/account">Account</a>
+            </div>
+            <div class="nav-group" data-need="admin" hidden>
                 <span class="nav-group-label">Administer</span>
                 <a class="nav-link" data-nav="catalogs" href="#/catalogs">Catalogs</a>
                 <a class="nav-link" data-nav="transfer" href="#/transfer">Import &amp; export</a>

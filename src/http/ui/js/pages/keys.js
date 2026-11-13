@@ -11,7 +11,7 @@
 // for: it opens, re-renders and closes only through that ticket, and only
 // while it is current, so a late answer never replaces a newer drawer or
 // reopens a dismissed one.
-import { h, pill } from '../core/dom.js';
+import { h, pill, fact } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
@@ -20,11 +20,12 @@ import { when } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
 import { assignControl, namesOf, picker } from '../components/picker.js';
+import { showOnce } from '../components/secret.js';
+import { ACCESS_KIND } from '../components/levels.js';
 import { keyUserChanged, refreshUnassigned } from '../core/shell.js';
 
 const LEVELS = ['read', 'write', 'admin'];
 const CODE_LEVELS = ['read', 'write'];
-const ACCESS_KIND = { read: 'muted', write: 'info', admin: 'warn' };
 const CODE_STATE_KIND = { live: 'ok', expired: 'muted', redeemed: 'info', revoked: 'error' };
 // humantime spellings the server parses; the default is a day.
 const EXPIRIES = [['1h', '1 hour'], ['24h', '24 hours'], ['3d', '3 days'], ['7d', '7 days']];
@@ -215,45 +216,6 @@ async function newKey(main, reload) {
         } catch { /* the server's reason is toasted; the form stays filled */ }
     });
     ticket.open('New key', 'The secret is shown once, right after creation.', form);
-}
-
-// The one time a secret is on screen: a modal that only the explicit
-// button closes, after which the secret is removed from the page. Element
-// ids start with `prefix` (`key-secret`, `code-secret-done`, ...). The
-// secret lives only in this dialog: never logged, never stored.
-function showOnce({ prefix, title, warning, secret }) {
-    let shown = secret; // dropped on close, so not even the copy handler keeps it
-    const code = h('code', { id: `${prefix}-secret` }, shown);
-    const copy = h('button', { type: 'button', id: `${prefix}-secret-copy`, class: 'secondary' }, 'Copy');
-    const done = h('button', { type: 'button', id: `${prefix}-secret-done` }, 'I have stored it');
-    const dialog = h('dialog', { id: `${prefix}-secret-dialog`, class: 'confirm' },
-        h('article', {},
-            h('h3', {}, title),
-            h('p', { class: 'warn-text' }, warning),
-            h('pre', { class: 'secret' }, code),
-            h('footer', {}, copy, done)));
-    copy.addEventListener('click', async () => {
-        try {
-            // navigator.clipboard exists only in secure contexts (https or localhost).
-            await navigator.clipboard.writeText(shown);
-            toast('Copied to the clipboard.', 'ok');
-        } catch {
-            toast('Copying failed: select the text and copy it by hand.', 'error');
-        }
-    });
-    done.addEventListener('click', () => {
-        shown = null;
-        code.textContent = '';
-        dialog.close();
-        dialog.remove();
-    });
-    dialog.addEventListener('cancel', event => event.preventDefault()); // Escape does not close it
-    document.body.append(dialog);
-    dialog.showModal();
-}
-
-function fact(label, value) {
-    return [h('dt', {}, label), h('dd', {}, value)];
 }
 
 // One key's drawer: its facts and user, then grant, ungrant, reporting and
