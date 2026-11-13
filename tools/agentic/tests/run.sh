@@ -357,26 +357,50 @@ test_gate_returns_the_gate_exit_status() {
     want_rc 3; want_no_out "HANG"
 }
 
-test_gate_timeout_stops_term_ignoring_child_and_frees_lock() {
-    new_fixtures
-    # The gate starts a child that ignores TERM and inherits the lock's fd.
-    # Its output goes to /dev/null so it can't hold the test's pipe open.
-    fake_just "$(cat <<'EOF'
-bash -c 'trap "" TERM; exec sleep 30' >/dev/null 2>&1 &
-echo $! >"$GH_FIXTURES/child.pid"
-wait
-EOF
-)"
+# leaky_gate <then>: a fake gate that starts a child which ignores TERM and
+# inherits the lock's fd, then runs <then> (wait, exit 0, kill itself...).
+# The child's output goes to /dev/null so it can't hold the test's pipe open.
+leaky_gate() {
+    fake_just "bash -c 'trap \"\" TERM; exec sleep 30' >/dev/null 2>&1 &
+echo \$! >\"\$GH_FIXTURES/child.pid\"
+$1"
     trap '[ -s "$fx/child.pid" ] && kill -KILL "$(cat "$fx/child.pid")" 2>/dev/null' EXIT
-    local started=$SECONDS
+}
+
+# run_leaky_gate: runs the lint gate with a 1 s limit and 1 s grace.
+run_leaky_gate() {
+    started=$SECONDS
     (cd "$repo" && PATH="$fx/bin:$PATH" AGENTIC_TIMEOUT_LINT=1s AGENTIC_GATE_KILL_AFTER=1 \
         "$tools/gate.sh" lint) >"$fx/out" 2>&1
     rc=$?
     out=$(cat "$fx/out")
-    want_rc 124; want_out "Treat this as a HANG"
+}
+
+# want_nothing_left: gate.sh returned quickly, its TERM-ignoring child is gone
+# and the lock is free.
+want_nothing_left() {
     [ $((SECONDS - started)) -le 6 ] || die "took $((SECONDS - started)) s"
+    [ -s "$fx/child.pid" ] || die "the fake gate didn't start its child"
     ! kill -0 "$(cat "$fx/child.pid")" 2>/dev/null || die "the TERM-ignoring child outlived the gate"
     flock -n "$repo/.git/agentic/gates.lock" true || die "gates.lock is still held"
+}
+
+test_gate_timeout_stops_term_ignoring_child_and_frees_lock() {
+    new_fixtures; leaky_gate 'wait'
+    run_leaky_gate
+    want_rc 124; want_out "Treat this as a HANG"; want_nothing_left
+}
+
+test_gate_killed_leader_stops_child_and_frees_lock() {
+    new_fixtures; leaky_gate 'kill -KILL $$'
+    run_leaky_gate
+    want_rc 124; want_out "Treat this as a HANG"; want_nothing_left
+}
+
+test_gate_passing_leader_stops_leftover_child_and_frees_lock() {
+    new_fixtures; leaky_gate 'exit 0'
+    run_leaky_gate
+    want_rc 0; want_out "leaving 1 process(es) behind"; want_no_out "HANG"; want_nothing_left
 }
 
 test_gate_lock_wait_is_bounded() {

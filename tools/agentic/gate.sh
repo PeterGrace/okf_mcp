@@ -18,12 +18,18 @@
 # behind a hung holder also fails instead of waiting forever.
 #
 # The gate runs in its own session (setsid), so its whole process group can be
-# stopped: on timeout the group gets TERM, then KILL after a grace period
-# (AGENTIC_GATE_KILL_AFTER, default 60 s), and gate.sh returns only once every
-# process in it is gone. A test that ignores TERM can't outlive the reported
-# timeout or keep holding the lock it inherited.
+# stopped. On timeout the group gets TERM, then KILL after a grace period
+# (AGENTIC_GATE_KILL_AFTER, default 60 s). On every other exit too (pass,
+# failure, a killed gate, or INT/TERM to gate.sh), whatever is left of the
+# group is stopped the same way. gate.sh returns only once the group is empty,
+# so nothing it started (a test that ignores TERM, a stray background job)
+# outlives it or keeps holding the lock it inherited.
 #
-# Exit codes: the gate's own, or 124 on timeout (with a hint on stderr).
+# Exit codes:
+#   the gate's own, when it exits by itself; if it left processes behind they
+#     are stopped and a warning on stderr says how many;
+#   124 on timeout, or when the gate was killed (137), with a hint on stderr;
+#   130 when gate.sh itself is interrupted (INT or TERM).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source-path=SCRIPTDIR source=lib.sh
@@ -63,8 +69,11 @@ fi
 # True while any process of the gate's group is alive.
 group_alive() { kill -0 -- "-$pgid" 2>/dev/null; }
 
-# stop_group: TERM the whole group, KILL it after the grace period, and return
-# once it is gone.
+# How many processes are in the gate's group.
+group_size() { pgrep -c -g "$pgid" || true; }
+
+# stop_group: TERM what is left of the group, KILL it after the grace period,
+# and return once it is empty. Returns at once when the group is already empty.
 stop_group() {
     local tick
     kill -TERM -- "-$pgid" 2>/dev/null || return 0
@@ -101,11 +110,23 @@ if [ "$timed_out" = 1 ]; then
     status=124
 else
     wait "$pgid" || status=$?
+    # The gate has exited; anything still in its group is a leak.
+    leftover=$(group_size)
+    if [ "$leftover" -gt 0 ]; then
+        stop_group
+        echo "gate.sh: warning: '$gate' exited (status $status) leaving $leftover" \
+            "process(es) behind; stopped them" >&2
+    fi
 fi
 trap - INT TERM
 if [ "$status" = 124 ] || [ "$status" = 137 ]; then
+    if [ "$timed_out" = 1 ]; then
+        reason="hit its ${limit} limit"
+    else
+        reason="was killed or timed out (exit $status)"
+    fi
     cat >&2 <<EOF
-gate.sh: '$gate' hit its ${limit} limit (exit $status). Treat this as a HANG, not a failure:
+gate.sh: '$gate' $reason. Treat this as a HANG, not a failure:
   - run the suspect tests alone with: tools/agentic/gate.sh narrow <filter> -- --test-threads=1
   - in the test's Postgres container, check lock waits:
       SELECT pid, state, wait_event_type, left(query, 120) FROM pg_stat_activity;
