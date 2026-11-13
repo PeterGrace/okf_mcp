@@ -200,6 +200,19 @@ fn expired() -> OkfError {
     }
 }
 
+/// Logs why webauthn-rs refused a registration, and answers 422 with one
+/// message, as a bad passkey name is answered. A registration that fails is
+/// bad input about the credential, not a failed sign-in: from a console
+/// session a 401 would read as "signed out", and the session is still live
+/// (issue #325).
+fn registration_refused(error: &WebauthnError) -> OkfError {
+    tracing::debug!(%error, "WebAuthn refused a registration");
+    OkfError::LimitExceeded {
+        limit: "passkey",
+        reason: REGISTRATION_FAILED.to_string(),
+    }
+}
+
 /// Logs why webauthn-rs refused, and answers with one message.
 fn refused(error: &WebauthnError, message: &str) -> OkfError {
     tracing::debug!(%error, "WebAuthn refused");
@@ -419,7 +432,7 @@ async fn begin_registration(
             &user.name,
             (!existing.is_empty()).then_some(existing),
         )
-        .map_err(|error| refused(&error, REGISTRATION_FAILED))?;
+        .map_err(|error| registration_refused(&error))?;
     // webauthn-rs asks for `residentKey: "discouraged"`; discoverable
     // sign-in needs the credential kept on the authenticator.
     if let Some(selection) = challenge.public_key.authenticator_selection.as_mut() {
@@ -448,7 +461,7 @@ struct Registered {
 ///
 /// # Errors
 /// [`OkfError::Gone`] without a live registration ceremony;
-/// [`OkfError::Unauthenticated`] for a credential that does not verify.
+/// [`OkfError::LimitExceeded`] (422) for a credential that does not verify.
 fn finish_registration(
     app: &App,
     passkeys: &Passkeys,
@@ -468,7 +481,7 @@ fn finish_registration(
     let passkey = passkeys
         .webauthn
         .finish_passkey_registration(credential, &state)
-        .map_err(|error| refused(&error, REGISTRATION_FAILED))?;
+        .map_err(|error| registration_refused(&error))?;
     Ok(Registered {
         passkey,
         pending,
@@ -519,7 +532,7 @@ async fn setup_start(
 /// `{"redirect": <return_to>}`.
 ///
 /// # Errors
-/// 403 from another site; 410 for an expired ceremony or a used link; 401
+/// 403 from another site; 410 for an expired ceremony or a used link; 422
 /// for a credential that does not verify; 409 for a passkey already
 /// registered.
 async fn setup_finish(
@@ -831,8 +844,8 @@ async fn register_start(
 ///
 /// # Errors
 /// 403 for a key, a grant or another session's ceremony; 410 for an expired
-/// ceremony; 401 for a credential that does not verify or a session that
-/// ended meanwhile; 409 for a passkey already registered.
+/// ceremony; 422 for a credential that does not verify; 401 only for a
+/// session that ended meanwhile; 409 for a passkey already registered.
 async fn register_finish(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
@@ -1983,6 +1996,54 @@ mod tests {
         assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
         assert_eq!(key.status, StatusCode::FORBIDDEN);
         assert_ne!(key_finish.status, StatusCode::CREATED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_credential_that_does_not_verify_is_422_and_the_session_lives_on() {
+        let test = login_app().await;
+        let alice = user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
+        let mut browser = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
+        let mut soft = SoftPasskey::new(true);
+        let mut credential =
+            registration_from_session(&test, &mut browser, &mut soft, json!({ "name": "Phone" }))
+                .await;
+        // The client data claims a sign-in (`webauthn.get`), not a
+        // registration, so webauthn-rs refuses it.
+        let field = &mut credential["response"]["clientDataJSON"];
+        let client_data = URL_SAFE_NO_PAD
+            .decode(field.as_str().expect("client data"))
+            .expect("base64url");
+        let forged = String::from_utf8(client_data)
+            .expect("client data is JSON text")
+            .replace("webauthn.create", "webauthn.get");
+        *field = json!(URL_SAFE_NO_PAD.encode(forged));
+
+        let reply = browser
+            .send(
+                &test,
+                "POST",
+                "/api/v1/me/passkeys/register/finish",
+                Payload::Json(credential),
+            )
+            .await;
+
+        // A bad credential, never a 401: the console reads 401 as "signed
+        // out", and this session is still live.
+        assert_eq!(
+            reply.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            reply.text()
+        );
+        assert_eq!(reply.json()["message"], REGISTRATION_FAILED);
+        let still = browser
+            .send(&test, "GET", "/api/v1/session", Payload::Empty)
+            .await;
+        assert_eq!(still.status, StatusCode::OK);
+        let stored = passkey_rows::list(test.app.pool(), &alice.id)
+            .await
+            .expect("list");
+        assert!(stored.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
