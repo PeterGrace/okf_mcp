@@ -52,11 +52,12 @@ fn catalog_names(listed: &str) -> Vec<String> {
 ///
 /// Unlike the MCP tool, whose default is the connection's catalogs (else
 /// the key's default catalog), the console has no connection: without
-/// `catalogs` it searches every loaded catalog the key reaches.
+/// `catalogs` it searches every loaded catalog the key reaches, leaving out
+/// those whose owner team is suspended (unless the key is admin).
 ///
 /// # Errors
 /// As `search`: 404 for a named catalog the key does not reach or that does
-/// not exist.
+/// not exist; 403 `Suspended` for a named catalog whose team is suspended.
 async fn search(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
@@ -69,11 +70,13 @@ async fn search(
         .unwrap_or_default();
     let catalogs = if named.is_empty() {
         // `Catalogs` is a BTreeMap, so the names come out sorted. An empty
-        // list (a key that reaches nothing) falls back to the key's default
-        // inside the selection, which then refuses as the tool would.
+        // list (a key that reaches nothing active) falls back to the key's
+        // default inside the selection, which then refuses as the tool would.
+        // A suspended team's catalogs are not searched (M13), and reach is
+        // checked first; naming one explicitly is refused by the selection.
         app.catalogs()
             .keys()
-            .filter(|name| principal.reaches(name))
+            .filter(|name| principal.reaches(name) && principal.check_not_suspended(name).is_ok())
             .cloned()
             .collect()
     } else {
@@ -171,5 +174,87 @@ mod tests {
             serde_json::json!([]),
             "other has no concepts"
         );
+    }
+
+    /// M13 Task 4: searching every reached catalog leaves a suspended
+    /// team's catalogs out (an admin's search keeps them); naming one is a
+    /// 403 `Suspended`, and a key that does not reach it gets 404 still.
+    #[tokio::test]
+    async fn search_leaves_out_or_refuses_a_suspended_catalog() {
+        use crate::config::Config;
+        use crate::http::api::testing::{assert_answers, Expect};
+        use crate::mcp::testing::{app_with, stored_secret, suspend_catalogs};
+        use crate::store::keys::Access;
+        const ALPHA: &str = "---\ntype: system\ntitle: Alpha\n---\n# Alpha\n";
+        let test = app_with(
+            &[
+                ("main", &[("alpha.md", ALPHA)]),
+                ("other", &[("alpha.md", ALPHA)]),
+            ],
+            Config::default(),
+        )
+        .await;
+        let member = stored_secret(&test, "member", Access::Read, &["main", "other"], false).await;
+        let only_main = stored_secret(&test, "only-main", Access::Read, &["main"], false).await;
+        let stranger = stored_secret(&test, "stranger", Access::Read, &["other"], false).await;
+        let root = stored_secret(&test, "root", Access::Admin, &[], false).await;
+        suspend_catalogs(&test, &["main"]).await;
+        let searched = |listed: &serde_json::Value| -> Vec<String> {
+            let mut catalogs: Vec<String> = listed["hits"]
+                .as_array()
+                .expect("hits")
+                .iter()
+                .filter_map(|hit| hit["catalog"].as_str().map(str::to_string))
+                .collect();
+            catalogs.dedup();
+            catalogs
+        };
+
+        let (status, members) =
+            send(&test, "GET", "/api/v1/search?q=alpha", Some(&member), None).await;
+        let (_, admins) = send(&test, "GET", "/api/v1/search?q=alpha", Some(&root), None).await;
+        let named = "/api/v1/search?q=alpha&catalogs=main";
+        let mixed = "/api/v1/search?q=alpha&catalogs=other,main";
+        let every = "/api/v1/search?q=alpha";
+        let expect = |uri, key, who, status, error| Expect {
+            method: "GET",
+            uri,
+            body: None,
+            key,
+            who,
+            status,
+            error,
+        };
+
+        assert_eq!(status.as_u16(), 200, "{members}");
+        assert_eq!(
+            searched(&members),
+            ["other"],
+            "the suspended catalog is left out"
+        );
+        assert_eq!(
+            searched(&admins),
+            ["main", "other"],
+            "an admin searches both"
+        );
+        assert_answers(
+            &test,
+            &[
+                expect(named, &member, "member", 403, Some("Suspended")),
+                expect(mixed, &member, "member", 403, Some("Suspended")),
+                expect(
+                    named,
+                    &stranger,
+                    "stranger",
+                    404,
+                    Some("CatalogNotSelected"),
+                ),
+                expect(named, &root, "root", 200, None),
+                // Every catalog it reaches is suspended: its default (`main`)
+                // is then the selection, and is refused as named.
+                expect(every, &only_main, "only-main", 403, Some("Suspended")),
+            ],
+        )
+        .await;
     }
 }

@@ -10,6 +10,28 @@ use serde::Serialize;
 use crate::clock::format_timestamp;
 use crate::mcp::context::ToolContext;
 use crate::mcp::OkfServer;
+use crate::store::teams::SuspendedCatalog;
+
+/// Why a listed catalog is unavailable: its owner team is suspended (M13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct SuspensionInfo {
+    /// The owner team.
+    pub team: String,
+    /// The operator's notice, if any.
+    pub notice: Option<String>,
+}
+
+// `From` is Rust's conversion trait (like a Python `from_x` classmethod);
+// implementing it also gives `.into()` and lets `.map(SuspensionInfo::from)`
+// convert a borrowed cache entry into an owned listing field.
+impl From<&SuspendedCatalog> for SuspensionInfo {
+    fn from(suspended: &SuspendedCatalog) -> Self {
+        Self {
+            team: suspended.team.clone(),
+            notice: suspended.notice.clone(),
+        }
+    }
+}
 
 /// One reachable catalog.
 // `JsonSchema` gives the tool its output schema; doc comments become the
@@ -24,6 +46,9 @@ pub struct CatalogInfo {
     pub files: usize,
     /// Its newest change (`2026-11-02T21:00:00Z`), or null when empty.
     pub last_change: Option<String>,
+    /// Set when its owner team is suspended: then only export works (for a
+    /// credential below admin). Null for an active catalog.
+    pub suspended: Option<SuspensionInfo>,
 }
 
 /// `list_catalogs`' result.
@@ -49,6 +74,8 @@ pub struct CatalogList {
 /// # Returns
 /// The list; a selection that fails is reported in `selection_error`
 /// rather than failing the call, since this is the tool to diagnose it with.
+/// A suspended catalog is listed with `suspended` set, and the selection
+/// leaves it out of a connection's list ([`crate::selection::resolve`]).
 pub(crate) fn list(ctx: &ToolContext) -> CatalogList {
     let catalogs = ctx
         .catalogs()
@@ -61,6 +88,9 @@ pub(crate) fn list(ctx: &ToolContext) -> CatalogList {
                 description: state.description().to_string(),
                 files: loaded.files(),
                 last_change: loaded.last_change().map(format_timestamp),
+                // Listed only after `offers` (reach), so a credential that does
+                // not reach a catalog never learns it is suspended.
+                suspended: ctx.principal().suspension(name).map(SuspensionInfo::from),
             }
         })
         .collect();
@@ -94,9 +124,10 @@ impl OkfServer {
         title = "List Catalogs",
         description = "List the catalogs this connection offers (name, description, file \
                        count, last change): those the API key can reach, limited to the \
-                       connection's X-OKF-Catalogs list when it has one. Also this \
-                       connection's selection: the catalogs a call without a `catalog` \
-                       argument reads, and the default write target.",
+                       connection's X-OKF-Catalogs list when it has one. A catalog whose \
+                       team is suspended is listed with `suspended` set, and only export \
+                       works on it. Also this connection's selection: the catalogs a call \
+                       without a `catalog` argument reads, and the default write target.",
         annotations(
             title = "List Catalogs",
             read_only_hint = true,
@@ -185,6 +216,73 @@ mod tests {
             .selection_error
             .unwrap()
             .contains("no catalog selected"));
+    }
+
+    /// M13 Task 4: listing marks a suspended catalog instead of hiding it,
+    /// and the connection's selection keeps the other team's catalog.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_suspended_catalog_is_listed_marked_and_the_others_still_select() {
+        use crate::mcp::testing::{
+            cached_principal, stored_secret, suspend_catalogs, SUSPENDED_TEAM, SUSPENSION_NOTICE,
+        };
+        use crate::store::keys::Access;
+        let test = app_with(
+            &[
+                ("main", &[("index.md", "# Main\n")]),
+                ("other", &[("index.md", "# Other\n")]),
+            ],
+            Config::default(),
+        )
+        .await;
+        let reader = stored_secret(&test, "reader", Access::Read, &[], false).await;
+        let stranger = stored_secret(&test, "stranger", Access::Read, &["other"], false).await;
+        let root = stored_secret(&test, "root", Access::Admin, &[], false).await;
+        suspend_catalogs(&test, &["main"]).await;
+        let on = |secret: &str, connection: &[&str]| {
+            context(&test, cached_principal(&test, secret), Some(connection))
+        };
+
+        let listed = list(&on(&reader, &["main", "other"]));
+        let only_suspended = list(&on(&reader, &["main"]));
+        let strangers = list(&on(&stranger, &["other"]));
+        let admins = list(&on(&root, &["main", "other"]));
+
+        let main = listed.catalogs.iter().find(|c| c.name == "main").unwrap();
+        assert_eq!(
+            main.suspended,
+            Some(SuspensionInfo {
+                team: SUSPENDED_TEAM.to_string(),
+                notice: Some(SUSPENSION_NOTICE.to_string()),
+            })
+        );
+        let other = listed.catalogs.iter().find(|c| c.name == "other").unwrap();
+        assert_eq!(other.suspended, None, "the other team's catalog is active");
+        assert_eq!(
+            listed.selection,
+            ["other"],
+            "the connection keeps the active catalog"
+        );
+        assert_eq!(listed.write_target.as_deref(), Some("other"));
+        assert!(only_suspended.selection.is_empty());
+        assert!(
+            only_suspended
+                .selection_error
+                .as_deref()
+                .is_some_and(|error| error.contains("suspended")),
+            "{:?}",
+            only_suspended.selection_error
+        );
+        let names: Vec<&str> = strangers.catalogs.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["other"],
+            "a key that does not reach main never sees it"
+        );
+        assert!(
+            admins.catalogs[0].suspended.is_some(),
+            "an admin sees the mark"
+        );
+        assert_eq!(admins.selection, ["main", "other"], "and selects both");
     }
 
     #[test]

@@ -538,8 +538,11 @@ mod tests {
                 });
             }
         }
+        // The tool selects its catalog before checking `write`, so since M13
+        // Task 4 the selection refuses the read key as suspended first (it
+        // reaches `main`, so it learns nothing it could not list).
         for (who, key, status, error) in [
-            ("read", &keys.read, 403, Some("Forbidden")),
+            ("read", &keys.read, 403, Some("Suspended")),
             ("write", &keys.write, 403, Some("Suspended")),
             ("stranger", &keys.stranger, 404, Some("CatalogNotSelected")),
             ("admin", &keys.admin, 200, None),
