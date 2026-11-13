@@ -70,6 +70,10 @@ async fn an_admin_visits_every_page_without_a_console_error() {
 
         ui.click("a[data-nav=keys]");
         ui.wait_visible("[data-test=key-console-smoke]");
+
+        ui.click("a[data-nav=settings]");
+        ui.wait_visible("#settings-table");
+        ui.wait_visible("#mail-queue-table");
     })
     .await;
 }

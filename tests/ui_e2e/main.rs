@@ -15,6 +15,7 @@ mod keys;
 mod login;
 mod maintenance;
 mod self_service;
+mod settings;
 mod signin;
 mod smoke;
 mod teams;

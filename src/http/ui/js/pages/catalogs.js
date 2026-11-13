@@ -123,13 +123,16 @@ export async function render(main) {
             toast(`Deleted catalog ${row.name}.`, 'ok');
             await settled(ticket);
         });
+        const members = memberAccess(row, creator, ticket);
         ticket.open(row.name, `generation ${row.generation} - ${count(row.concepts, 'concept')}, ${count(row.files, 'file')}`,
             edit,
             owner,
+            members.section,
             h('section', { class: 'danger-zone' },
                 h('h3', {}, 'Delete'),
                 h('label', {}, force, ' Also discard unpublished changes (force)'),
                 remove));
+        await members.refresh();
     }
 
     // fill(), not native append: the note may be null (issue #302).
@@ -143,4 +146,64 @@ export async function render(main) {
             ? h('p', { class: 'muted small' }, 'Creating a catalog needs an admin key that reaches every catalog.')
             : null);
     await load();
+}
+
+// The drawer's "Team member access": what members of the catalog's owner
+// team reach through their accounts (the ceiling's level for it; keys and
+// grants they create are capped at it). It is read from GET
+// /catalogs/{catalog}/member-access when the drawer opens and again after
+// every save, refused or not, so it always shows the server's value. A
+// refusal's reason stays in the section until the next save. Changing it
+// needs `allowed` (an admin that reaches every catalog: the server's one
+// check is `may_set_member_access`). `ticket` is the drawer's claim: an
+// answer that arrives after the drawer was replaced or dismissed is
+// dropped. Returns the section and `refresh()`, which the caller runs once
+// the drawer is open.
+function memberAccess(row, allowed, ticket) {
+    const path = `/catalogs/${enc(row.name)}/member-access`;
+    const select = h('select', { id: 'catalog-member-access-select', 'aria-label': 'Team member access', disabled: true },
+        ['none', 'read', 'write'].map(value => h('option', { value }, value)));
+    const current = h('span', { id: 'catalog-member-access-current', class: 'mono' }, '...');
+    const save = h('button', { type: 'button', id: 'catalog-member-access-save', disabled: true }, 'Save');
+    const refusal = h('p', { id: 'catalog-member-access-error', class: 'error small', role: 'alert', hidden: true });
+    // The server's value, once read; null until then and after a failed read.
+    let value = null;
+    const sync = () => { save.disabled = !allowed || value === null || select.value === value; };
+    select.addEventListener('change', sync);
+
+    async function refresh() {
+        let answer = null;
+        try { answer = await api.get(path); } catch { /* toasted */ }
+        if (!ticket.current()) return;
+        value = answer?.member_access ?? null;
+        current.textContent = value ?? 'unknown';
+        if (value !== null) select.value = value;
+        select.disabled = !allowed || value === null;
+        sync();
+    }
+
+    save.addEventListener('click', async () => {
+        save.disabled = true;
+        select.disabled = true;
+        try {
+            const answer = await api.put(path, { access: select.value });
+            toast(`Members of ${row.owner_team ?? 'the owner team'} now reach ${answer.name} at ${answer.member_access}.`, 'ok');
+            refusal.hidden = true;
+        } catch (error) {
+            refusal.textContent = error.message;   // already toasted
+            refusal.hidden = false;
+        }
+        await refresh();
+    });
+
+    const section = h('section', { id: 'catalog-member-access' },
+        h('h3', {}, 'Team member access'),
+        h('p', { class: 'muted small' },
+            `What members of ${row.owner_team ?? 'its owner team'} reach through their accounts: `
+            + 'none, read or write. Their own keys and grants are capped at it.'),
+        h('p', { class: 'small' }, 'Now: ', current),
+        h('div', { class: 'inline-form' }, select, save),
+        refusal,
+        allowed ? null : h('p', { class: 'muted small' }, 'Changing it needs an admin key that reaches every catalog.'));
+    return { section, refresh };
 }
