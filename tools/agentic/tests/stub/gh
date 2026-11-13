@@ -5,7 +5,7 @@
 #   pr merge              fails if --match-head-commit differs from merge-head
 #                         (the head at merge time; default: pr-view.json's);
 #                         on success writes the merged SHA to merged
-#   pr comment            logged only
+#   pr comment            logged; the fake clock's time goes to comment-times
 #   api repos/O/R/<path>  api/<path with / as _>.<page>.json; every page with
 #                         --paginate, only page 1 without; fails if
 #                         api/<name>.fail exists; [] when there are no pages
@@ -52,7 +52,10 @@ case "$1 ${2:-}" in
         fi
         printf '%s\n' "$actual" >"$fixtures/merged"
         ;;
-    "pr comment") ;;
+    "pr comment")
+        # Record the fake clock's time, if any, so tests can see when it posted.
+        [ -e "$fixtures/clock" ] && cat "$fixtures/clock" >>"$fixtures/comment-times"
+        ;;
     "api "*)
         path=${2#repos/*/*/}
         name=${path//\//_}

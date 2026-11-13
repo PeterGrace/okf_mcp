@@ -16,8 +16,9 @@ work=$(cd "$work" && pwd -P)
 trap 'rm -rf "$work"' EXIT
 
 export PATH="$tests_dir/stub:$PATH"
-export AGENTIC_REPO=owner/repo AGENTIC_REVIEWER=brooke AGENTIC_RETRIGGER=/prrb
-unset AGENTIC_NOW_CMD AGENTIC_SLEEP_CMD
+export AGENTIC_REPO=owner/repo AGENTIC_RETRIGGER=/prrb
+# The scripts' defaults are under test, so none of these come from the caller.
+unset AGENTIC_REVIEWER AGENTIC_MAX_REVIEW_ROUNDS AGENTIC_NOW_CMD AGENTIC_SLEEP_CMD
 
 bot='brooke-reviews[bot]'
 head_a=aaaaaaa1111111111111111111111111111111111
@@ -47,6 +48,9 @@ new_fixtures() {
     : >"$fx/calls.log"
     export GH_FIXTURES=$fx
 }
+
+# A user whose login shares the bot's prefix but is not the bot.
+impostor='brooke-example'
 
 # old_reviews <n>: n bot reviews, all of an earlier head than the PR's.
 old_reviews() {
@@ -108,7 +112,7 @@ test_merge_refuses_unreviewed_head() {
     printf '[{"user":{"login":"%s"},"commit_id":"%s"}]\n' "$bot" "$head_b" \
         >"$fx/api/pulls_7_reviews.1.json"
     run_merge
-    want_rc 1; want_out "REFUSE: no brooke review"; want_not_merged
+    want_rc 1; want_out "REFUSE: no brooke-reviews[bot] review"; want_not_merged
 }
 
 test_merge_refuses_unreplied_thread() {
@@ -133,6 +137,43 @@ test_merge_refuses_on_api_error() {
     want_rc 1; want_out "REFUSE: could not read the reviews"; want_not_merged
 }
 
+test_merge_refuses_on_pr_view_error() {
+    new_fixtures; good_pr "$head_a"; touch "$fx/pr-view.fail"
+    run_merge
+    want_rc 1; want_out "REFUSE: could not read PR 7"; want_not_merged
+}
+
+test_merge_refuses_on_comments_api_error() {
+    new_fixtures; good_pr "$head_a"; touch "$fx/api/pulls_7_comments.fail"
+    run_merge
+    want_rc 1; want_out "REFUSE: could not read the inline comments"; want_not_merged
+}
+
+test_merge_ignores_prefix_sharing_reviewer() {
+    new_fixtures; good_pr "$head_a"
+    # Three reviews of the current head by someone who is not the bot: they
+    # must neither count as the head's review nor use up rounds.
+    jq -n --arg who "$impostor" --arg head "$head_a" \
+        '[range(3) | {user: {login: $who}, commit_id: $head}]' >"$fx/api/pulls_7_reviews.1.json"
+    run_merge
+    want_rc 1; want_out "(0 of 3 rounds used)"; want_not_merged
+}
+
+test_merge_ignores_prefix_sharing_thread() {
+    new_fixtures; good_pr "$head_a"
+    printf '[{"id":5,"in_reply_to_id":null,"user":{"login":"%s"}}]\n' "$impostor" \
+        >"$fx/api/pulls_7_comments.1.json"
+    run_merge
+    want_rc 0; want_out "MERGED PR 7"
+}
+
+test_merge_matches_bot_login_without_suffix() {
+    new_fixtures; good_pr "$head_a"
+    out=$(cd "$repo" && AGENTIC_REVIEWER=brooke-reviews "$tools/merge-reviewed.sh" 7 2>&1)
+    rc=$?
+    want_rc 0; want_out "MERGED PR 7"
+}
+
 test_merge_refuses_head_changed_before_merge() {
     new_fixtures; good_pr "$head_a"
     echo "$head_b" >"$fx/merge-head"
@@ -149,7 +190,7 @@ test_merge_finds_review_on_page_two() {
 test_merge_below_cap_requires_current_head_review() {
     new_fixtures; good_pr "$head_a"; old_reviews 2
     run_merge
-    want_rc 1; want_out "REFUSE: no brooke review on head aaaaaaa (2 of 3 rounds used)"
+    want_rc 1; want_out "REFUSE: no brooke-reviews[bot] review on head aaaaaaa (2 of 3 rounds used)"
     want_not_merged
 }
 
@@ -225,6 +266,45 @@ test_watch_retrigger_keeps_overall_deadline() {
 }
 
 # --- watchdog.sh ---
+
+test_watch_reviews_api_error_never_retriggers() {
+    new_fixtures; good_pr "$head_a"; touch "$fx/api/pulls_7_reviews.fail"
+    run_watch
+    want_rc 2; want_out "TIMEOUT"; want_out "could not read the reviews"
+    ! grep -q '^pr comment' "$fx/calls.log" || die "re-triggered with the round count unknown"
+    [ "$clock" -ge 2800 ] && [ "$clock" -le 2830 ] || die "gave up at $clock, want 2800..2830"
+}
+
+test_watch_reactions_api_error_never_retriggers() {
+    new_fixtures; good_pr "$head_a"
+    echo '[]' >"$fx/api/pulls_7_reviews.1.json"
+    touch "$fx/api/issues_7_reactions.fail"
+    run_watch
+    want_rc 2
+    ! grep -q '^pr comment' "$fx/calls.log" || die "re-triggered with the reactions unknown"
+}
+
+test_watch_ignores_prefix_sharing_reaction() {
+    new_fixtures; good_pr "$head_a"
+    echo '[]' >"$fx/api/pulls_7_reviews.1.json"
+    printf '[{"user":{"login":"%s"},"content":"eyes"}]\n' "$impostor" \
+        >"$fx/api/issues_7_reactions.1.json"
+    run_watch
+    # The bot hasn't reacted, so the re-trigger is due after ~90 s (the first
+    # poll past 90 s is at 1120), not the ~6 min it waits after a bot reaction.
+    [ "$(cat "$fx/comment-times" 2>/dev/null)" = 1120 ] \
+        || die "re-triggered at $(cat "$fx/comment-times" 2>/dev/null), want 1120"
+}
+
+test_watch_bot_reaction_delays_retrigger() {
+    new_fixtures; good_pr "$head_a"
+    echo '[]' >"$fx/api/pulls_7_reviews.1.json"
+    printf '[{"user":{"login":"%s"},"content":"eyes"}]\n' "$bot" \
+        >"$fx/api/issues_7_reactions.1.json"
+    run_watch
+    [ "$(cat "$fx/comment-times" 2>/dev/null)" = 1390 ] \
+        || die "re-triggered at $(cat "$fx/comment-times" 2>/dev/null), want 1390"
+}
 
 test_watchdog_covers_worktrees_outside_main_checkout() {
     new_fixtures

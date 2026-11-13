@@ -11,10 +11,18 @@ agentic_repo() {
     fi
 }
 
-# The login prefix of the review bot (matched with startswith, so the "[bot]"
-# suffix GitHub adds does not matter). Override with $AGENTIC_REVIEWER.
+# The review bot's full login. Override with $AGENTIC_REVIEWER.
 agentic_reviewer() {
-    printf '%s\n' "${AGENTIC_REVIEWER:-brooke}"
+    printf '%s\n' "${AGENTIC_REVIEWER:-brooke-reviews[bot]}"
+}
+
+# agentic_jq_bot <bot> <filter> [jq options...]: runs jq with `is_bot`
+# defined, true when the input login IS the bot: an exact comparison after
+# dropping an optional trailing "[bot]" from both sides, so "brooke-reviews"
+# and "brooke-reviews[bot]" match but "brooke-example" never does.
+agentic_jq_bot() {
+    jq "${@:3}" --arg bot "$1" \
+        "def is_bot: rtrimstr(\"[bot]\") == (\$bot | rtrimstr(\"[bot]\")); $2"
 }
 
 # The directory shared by every worktree of this repository (git's common dir),
@@ -55,9 +63,11 @@ agentic_max_rounds() {
 agentic_review_counts() {
     local reviews
     reviews=$(agentic_api_list "repos/$1/pulls/$2/reviews") || return 1
-    jq -r --arg bot "$3" --arg head "$4" '
-        map(select(.user.login | startswith($bot)))
-        | "\(map(select(.commit_id == $head)) | length) \(length)"' <<<"$reviews"
+    # shellcheck disable=SC2016 # a jq program: $vars are jq's, not the shell's
+    agentic_jq_bot "$3" '
+        map(select(.user.login | is_bot))
+        | "\(map(select(.commit_id == $head)) | length) \(length)"' -r --arg head "$4" \
+        <<<"$reviews"
 }
 
 # The clock and sleep the watchers use, in seconds. The tests swap in a fake

@@ -38,12 +38,13 @@ fi
 
 comments=$(agentic_api_list "repos/$repo/pulls/$pr/comments") \
     || { echo "REFUSE: could not read the inline comments of PR $pr"; exit 1; }
-unreplied=$(jq -c --arg bot "$bot" '
+# shellcheck disable=SC2016 # a jq program: $vars are jq's, not the shell's
+unreplied=$(agentic_jq_bot "$bot" '
     (map(select(.in_reply_to_id != null) | .in_reply_to_id) | unique) as $replied
-    | map(select((.user.login | startswith($bot))
+    | map(select((.user.login | is_bot)
                  and .in_reply_to_id == null
                  and ((.id as $i | $replied | index($i)) == null)))
-    | map(.id)' <<<"$comments")
+    | map(.id)' -c <<<"$comments")
 if [ "$unreplied" != "[]" ]; then
     echo "REFUSE: $bot threads without a reply: $unreplied"
     exit 1

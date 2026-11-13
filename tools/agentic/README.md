@@ -46,7 +46,7 @@ A PR gets at most `AGENTIC_MAX_REVIEW_ROUNDS` (default 3) reviews from the bot, 
 | Variable | Default | Meaning |
 |---|---|---|
 | `AGENTIC_REPO` | from `gh repo view` | `owner/name` of the GitHub repository |
-| `AGENTIC_REVIEWER` | `brooke` | Login prefix of the review bot (matched with `startswith`) |
+| `AGENTIC_REVIEWER` | `brooke-reviews[bot]` | Full login of the review bot, compared exactly (a trailing `[bot]` is optional on either side) |
 | `AGENTIC_RETRIGGER` | `/prrb` | Comment that re-triggers the bot |
 | `AGENTIC_MAX_REVIEW_ROUNDS` | 3 | Most bot reviews a PR gets before it merges without another |
 | `AGENTIC_TIMEOUT_<GATE>` | 5m / 30m / 75m / 60m / 15m | Per-gate limits for `gate.sh`: fmt, lint, test, test-ui, narrow |
