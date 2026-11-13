@@ -25,5 +25,6 @@ If a tool is missing a feature you need, extend it in `tools/agentic/` in a PR, 
 
 - **One PR per sub-issue.** Each sub-issue gets its own git worktree (`.worktrees/okf-mcp-<N>`) and its own PR. The milestone's plan under `docs/superpowers/plans/` is authoritative. Where the code has to differ, correct the plan in the same PR.
 - **Merging.** Every PR is reviewed by the review bot (`brooke-reviews`), and every inline comment gets a reply in its thread before the PR merges.
+- **Review rounds.** A PR gets at most 3 review rounds (`AGENTIC_MAX_REVIEW_ROUNDS`). In rounds 1 and 2, address all comments. In the final round (round 3), fix only correctness, security and data-loss findings; file everything else (style, extra tests, wording, refactors) as a follow-up issue labelled `review-followup`, and reply in each thread with the issue link. Then the coordinator merges with `merge-reviewed.sh`, with no further review request.
 - **Keeping branches current.** When `main` moves, merge `origin/main` into the branch. Never rebase or force-push.
 - **No real infrastructure details** in files, tests, commits or issues. Use placeholders such as `example.com`.

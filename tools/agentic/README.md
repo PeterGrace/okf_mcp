@@ -8,12 +8,13 @@ bot before it merges.
 | File | Used by | What it does |
 |---|---|---|
 | `gate.sh` | implementation agents | Runs `fmt`, `lint`, `test`, `test-ui` or a narrow `cargo test`. Every gate has a hard timeout; the heavy gates also take a lock shared by all worktrees. Exit 124 means a test hung. |
-| `watch-review.sh <pr>` | coordinator | Waits until the bot has reviewed the PR's current head. Re-triggers the bot once if it is silent, and gives up after 30 min, printing why. |
-| `merge-reviewed.sh <pr>` | coordinator | Merges only if the bot reviewed the current head, every bot thread has a reply, and the PR is `CLEAN`. |
-| `watchdog.sh` | coordinator | Runs in the background for the whole epic. Exits when any test or gate process in this repository runs past its limit, which catches agents stuck before they open a PR. |
+| `watch-review.sh <pr>` | coordinator | Waits until the bot has reviewed the PR's current head (exit 0). Re-triggers the bot once if it is silent, and gives up 30 min after it started, printing why (exit 2). Exits 4 at once when the round cap is reached instead of asking again. |
+| `merge-reviewed.sh <pr>` | coordinator | Merges only if the bot reviewed the current head (or the round cap is reached), every bot thread has a reply, and the PR is `CLEAN`. The merge is pinned to the inspected head with `--match-head-commit`. |
+| `watchdog.sh [--once]` | coordinator | Runs in the background for the whole epic. Exits 3 when any test or gate process in the main checkout or any registered worktree (wherever it lives) runs past its limit, which catches agents stuck before they open a PR. `--once` checks a single time. |
 | `brief-common.md` | implementation agents | The shared rules every implementation agent follows. |
 | `lessons.md` | implementation agents | Rules learned from real review findings. Extend it whenever a review finds a new class of bug. |
-| `lib.sh` | the scripts | Repository, reviewer and shared-state helpers. |
+| `lib.sh` | the scripts | Repository, reviewer, review-round, paginated-API, clock and shared-state helpers. |
+| `tests/run.sh` | anyone changing these tools | Shell tests: a stub `gh` driven by fixture files, a fake clock and throwaway repositories. Run `just test-agentic`. |
 
 ## Coordinator loop
 
@@ -24,9 +25,21 @@ bot before it merges.
    ```
 3. **Start an agent with a short brief:** the issue, its worktree and branch, the plan task, and what runs in parallel. Point it at `tools/agentic/brief-common.md` and `tools/agentic/lessons.md`.
 4. **When the agent reports a PR,** run `tools/agentic/watch-review.sh <pr>` in the background.
-5. **When the review lands,** send the same agent back with the comments. Repeat until a review leaves no new comments.
+5. **When the review lands,** send the same agent back with the comments. Repeat until a review leaves no new comments, or until the round cap (below) is reached.
 6. **Merge** with `tools/agentic/merge-reviewed.sh <pr>`. Then remove the worktree and branch, and tell agents with open PRs to `git merge origin/main`.
 7. **If an agent goes quiet** for longer than its gates should take, check it directly. Use `ps` for its processes, and query `pg_stat_activity` in its test container. Don't wait for its report.
+
+## Review rounds
+
+A PR gets at most `AGENTIC_MAX_REVIEW_ROUNDS` (default 3) reviews from the bot, counted across every head. Asking again past that mostly produces nitpicks.
+
+- In rounds 1 and 2, address every comment.
+- In the final round, fix only correctness, security and data-loss findings. File everything else (style, extra tests, wording, refactors) as a follow-up issue labelled `review-followup`, and reply in each thread with the issue link.
+- Then merge with `merge-reviewed.sh`, with no further review request. At the cap, `watch-review.sh` exits 4 instead of re-triggering, and `merge-reviewed.sh` accepts the latest review even if it is of an earlier head, still requiring a reply in every bot thread and a `CLEAN` PR.
+
+## Testing these tools
+
+`just test-agentic` runs `tests/run.sh` under a 2-minute timeout. It takes a few seconds, needs no network or Docker, and never touches GitHub or this checkout. Add a case there for every change to the scripts.
 
 ## Configuration
 
@@ -35,7 +48,9 @@ bot before it merges.
 | `AGENTIC_REPO` | from `gh repo view` | `owner/name` of the GitHub repository |
 | `AGENTIC_REVIEWER` | `brooke` | Login prefix of the review bot (matched with `startswith`) |
 | `AGENTIC_RETRIGGER` | `/prrb` | Comment that re-triggers the bot |
+| `AGENTIC_MAX_REVIEW_ROUNDS` | 3 | Most bot reviews a PR gets before it merges without another |
 | `AGENTIC_TIMEOUT_<GATE>` | 5m / 30m / 75m / 60m / 15m | Per-gate limits for `gate.sh`: fmt, lint, test, test-ui, narrow |
 | `AGENTIC_WATCHDOG_TEST`, `_GATE`, `_INTERVAL` | 1200, 4800, 300 (seconds) | Watchdog limits and check interval |
+| `AGENTIC_NOW_CMD`, `AGENTIC_SLEEP_CMD` | `date +%s`, `sleep` | Clock and sleep for `watch-review.sh`; the tests replace them with a fake clock |
 
 The gate lock is `.git/agentic/gates.lock` in the shared git directory, so every worktree uses the same one.

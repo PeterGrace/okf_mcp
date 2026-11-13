@@ -6,8 +6,12 @@
 #
 # - Posts the bot's re-trigger command ($AGENTIC_RETRIGGER, default "/prrb")
 #   once if the bot has not reacted after ~90 s, or reacted but not reviewed
-#   after ~6 min.
-# - Exits 2 after 30 min without a review and prints the bot's latest PR
+#   after ~6 min. Never re-triggers once the bot has given the maximum number
+#   of review rounds (agentic_max_rounds).
+# - Exits 4 at once when the current head has no review and the round cap is
+#   reached: merge with merge-reviewed.sh instead of asking again.
+# - Exits 2 once 30 min have passed since it started, whatever happened in
+#   between (re-trigger, API failures), and prints the bot's latest PR
 #   comments: the usual cause is a skip notice such as "out of date with main"
 #   (merge origin/main into the branch and push again).
 set -u
@@ -19,30 +23,45 @@ pr=${1:?usage: watch-review.sh <pr>}
 repo=$(agentic_repo)
 bot=$(agentic_reviewer)
 retrigger=${AGENTIC_RETRIGGER:-/prrb}
-start=$(date +%s)
+poll=30
+started=$(agentic_now)           # for re-trigger timing
+readonly deadline=$((started + 1800)) # overall limit; never moves
+max_rounds=$(agentic_max_rounds)
 retriggered=0
+head=""
 
 while :; do
-    head=$(gh pr view "$pr" -R "$repo" --json headRefOid --jq .headRefOid) || { sleep 30; continue; }
-    reviews=$(gh api "repos/$repo/pulls/$pr/reviews" \
-        --jq "[.[] | select((.user.login | startswith(\"$bot\")) and .commit_id == \"$head\")] | length" \
-        2>/dev/null || echo 0)
-    if [ "$reviews" != 0 ]; then
-        echo "reviewed PR $pr at ${head:0:7}"
-        exit 0
+    if head=$(gh pr view "$pr" -R "$repo" --json headRefOid --jq .headRefOid); then
+        counts=$(agentic_review_counts "$repo" "$pr" "$bot" "$head" 2>/dev/null) || counts="0 0"
+        read -r on_head rounds <<<"$counts"
+        if [ "$on_head" != 0 ]; then
+            echo "reviewed PR $pr at ${head:0:7}"
+            exit 0
+        fi
+        if [ "$rounds" -ge "$max_rounds" ]; then
+            echo "review round limit reached ($max_rounds); merge with merge-reviewed.sh" \
+                "once the gates pass and every thread has a reply"
+            exit 4
+        fi
+        if [ "$retriggered" = 0 ]; then
+            waited=$(($(agentic_now) - started))
+            reacted=$(agentic_api_list "repos/$repo/issues/$pr/reactions" 2>/dev/null \
+                | jq --arg bot "$bot" '[.[] | select(.user.login | startswith($bot))] | length') \
+                || reacted=0
+            if { [ "$reacted" = 0 ] && [ "$waited" -gt 90 ]; } || [ "$waited" -gt 360 ]; then
+                gh pr comment "$pr" -R "$repo" --body "$retrigger" >/dev/null \
+                    && retriggered=1 && echo "posted $retrigger on PR $pr"
+            fi
+        fi
+    else
+        echo "watch-review.sh: could not read PR $pr; retrying" >&2
     fi
-    elapsed=$(( $(date +%s) - start ))
-    reacted=$(gh api "repos/$repo/issues/$pr/reactions" \
-        --jq "[.[] | select(.user.login | startswith(\"$bot\"))] | length" 2>/dev/null || echo 0)
-    if [ "$retriggered" = 0 ] && { { [ "$reacted" = 0 ] && [ "$elapsed" -gt 90 ]; } || [ "$elapsed" -gt 360 ]; }; then
-        gh pr comment "$pr" -R "$repo" --body "$retrigger" >/dev/null && retriggered=1 && start=$(date +%s) \
-            && echo "posted $retrigger on PR $pr"
-    fi
-    if [ "$elapsed" -gt 1800 ]; then
-        echo "TIMEOUT waiting for a review of PR $pr at ${head:0:7}"
-        gh api "repos/$repo/issues/$pr/comments" \
-            --jq ".[] | select(.user.login | startswith(\"$bot\")) | .body" | tail -5
+    if [ "$(agentic_now)" -ge "$deadline" ]; then
+        echo "TIMEOUT waiting for a review of PR $pr at ${head:-unknown head}"
+        agentic_api_list "repos/$repo/issues/$pr/comments" 2>/dev/null \
+            | jq -r --arg bot "$bot" '.[] | select(.user.login | startswith($bot)) | .body' \
+            | tail -5
         exit 2
     fi
-    sleep 30
+    agentic_sleep "$poll"
 done

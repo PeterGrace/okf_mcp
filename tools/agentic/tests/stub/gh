@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Stub `gh` for tools/agentic/tests. Answers from files in $GH_FIXTURES and logs
+# every call to $GH_FIXTURES/calls.log.
+#   pr view               pr-view.json (fails if pr-view.fail exists)
+#   pr merge              fails if --match-head-commit differs from merge-head
+#                         (the head at merge time; default: pr-view.json's);
+#                         on success writes the merged SHA to merged
+#   pr comment            logged only
+#   api repos/O/R/<path>  api/<path with / as _>.<page>.json; every page with
+#                         --paginate, only page 1 without; fails if
+#                         api/<name>.fail exists; [] when there are no pages
+# --jq is applied to each page, as real gh does.
+set -u
+fixtures=${GH_FIXTURES:?GH_FIXTURES is not set}
+printf '%s\n' "$*" >>"$fixtures/calls.log"
+
+jq_expr=""
+paginate=0
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --jq) jq_expr=$2; shift 2 ;;
+        --paginate) paginate=1; shift ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+set -- "${args[@]}"
+
+emit() {
+    if [ -n "$jq_expr" ]; then jq -r "$jq_expr" "$1"; else cat "$1"; fi
+}
+
+case "$1 ${2:-}" in
+    "pr view")
+        [ -e "$fixtures/pr-view.fail" ] && { echo "stub gh: pr view failed" >&2; exit 1; }
+        emit "$fixtures/pr-view.json"
+        ;;
+    "pr merge")
+        want=""
+        while [ $# -gt 0 ]; do
+            [ "$1" = --match-head-commit ] && want=$2
+            shift
+        done
+        if [ -e "$fixtures/merge-head" ]; then
+            actual=$(cat "$fixtures/merge-head")
+        else
+            actual=$(jq -r .headRefOid "$fixtures/pr-view.json")
+        fi
+        if [ -n "$want" ] && [ "$want" != "$actual" ]; then
+            echo "stub gh: head is $actual, not $want" >&2
+            exit 1
+        fi
+        printf '%s\n' "$actual" >"$fixtures/merged"
+        ;;
+    "pr comment") ;;
+    "api "*)
+        path=${2#repos/*/*/}
+        name=${path//\//_}
+        [ -e "$fixtures/api/$name.fail" ] && { echo "stub gh: HTTP 502 on $2" >&2; exit 1; }
+        shopt -s nullglob
+        pages=("$fixtures/api/$name".*.json)
+        if [ "${#pages[@]}" = 0 ]; then
+            echo '[]' >"$fixtures/empty.json"
+            pages=("$fixtures/empty.json")
+        fi
+        [ "$paginate" = 1 ] || pages=("${pages[0]}")
+        for page in "${pages[@]}"; do emit "$page"; done
+        ;;
+    *) echo "stub gh: unhandled: ${args[*]}" >&2; exit 1 ;;
+esac

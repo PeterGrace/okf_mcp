@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fake clock for the tests: prints the seconds stored in $GH_FIXTURES/clock.
+cat "${GH_FIXTURES:?}/clock"

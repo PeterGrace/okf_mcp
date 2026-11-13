@@ -45,6 +45,12 @@ Run `git merge origin/main`. Never rebase or force-push. Keep both sides of a co
 ## Review replies
 When you address a review, reply in each inline thread (as a reply to that comment), not only in a top-level comment. `merge-reviewed.sh` refuses to merge while any reviewer thread has no reply. Keep the PR description and its claims in step with the final code after every round.
 
+## Review rounds
+A PR gets at most 3 review rounds from the bot (`AGENTIC_MAX_REVIEW_ROUNDS`).
+- In rounds 1 and 2, address all comments.
+- In the final round (round 3), fix only correctness, security and data-loss findings. File everything else (style, extra tests, wording, refactors) as a follow-up issue labelled `review-followup`, and reply in each thread with the issue link.
+- Then the coordinator merges with no further review request.
+
 ## When done
 - Don't merge.
 - End commit messages with the attribution line the coordinator gives you, and use `Closes #<N>` in the PR body.
