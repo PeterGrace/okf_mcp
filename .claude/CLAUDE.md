@@ -1,5 +1,13 @@
 # Agent Guidelines for Rust Code Quality
 
+> **Agentic and multi-agent work: read [`AGENTS.md`](../AGENTS.md) first.** If you are coordinating subagents, implementing a sub-issue, running gates, or waiting on or answering a review, follow `AGENTS.md` and use the shared tools in [`tools/agentic/`](../tools/agentic/README.md):
+> - `gate.sh` for every gate (hard timeouts and the shared lock);
+> - `watch-review.sh` and `merge-reviewed.sh` for reviews;
+> - `watchdog.sh` while coordinating;
+> - `brief-common.md` and `lessons.md` for the rules.
+>
+> Don't write your own replacements. These rules apply even if your brief doesn't mention them.
+
 This document provides guidelines for maintaining high-quality Rust code. These rules MUST be followed by all AI coding agents and contributors.
 
 ## Your Core Principles

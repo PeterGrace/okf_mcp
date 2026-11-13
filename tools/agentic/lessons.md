@@ -35,5 +35,5 @@ Each rule below records a real bug the review bot found in an earlier PR, mostly
 
 ## Process
 - **Find the whole class.** When you fix one path, grep for every sibling path with the same pattern and fix those too.
-- **Tests must fail without the fix.** Verify that by temporarily reverting the code, and say so in your report.
+- **Tests must fail without the fix.** Verify that by temporarily reverting the code, and say so in your report. After restoring a reverted file, `touch` it (or restore with `git checkout`, which sets a new modification time). Otherwise cargo can reuse the test binary built from the reverted copy and report stale results.
 - **The PR description and claims must match the final code** exactly. Update them after every review round.
