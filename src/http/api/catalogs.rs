@@ -900,8 +900,8 @@ mod tests {
         assert_eq!(listed["catalogs"][0]["files"], 1);
     }
 
-    /// M13 Task 3: the per-catalog admin routes check `require(Admin, ..)`
-    /// themselves. Below admin they still answer `Forbidden` (the level
+    /// M13 Task 3: the per-catalog admin routes (update, member access,
+    /// delete) check `require(Admin, ..)` themselves. Below admin they still answer `Forbidden` (the level
     /// check comes before suspension), and an admin, who is exempt, still
     /// manages a suspended catalog.
     #[tokio::test]
@@ -914,6 +914,7 @@ mod tests {
         let described = || Some(json!({"description": "Paused."}));
         let catalog = "/api/v1/catalogs/main";
         let member_access = "/api/v1/catalogs/main/member-access";
+        let delete = "/api/v1/catalogs/main?force=true";
 
         assert_answers(
             &test,
@@ -948,6 +949,25 @@ mod tests {
                 Expect {
                     method: "GET",
                     uri: member_access,
+                    body: None,
+                    key: &keys.admin,
+                    who: "admin",
+                    status: 200,
+                    error: None,
+                },
+                // Last: the admin's delete removes `main`.
+                Expect {
+                    method: "DELETE",
+                    uri: delete,
+                    body: None,
+                    key: &keys.write,
+                    who: "write",
+                    status: 403,
+                    error: Some("Forbidden"),
+                },
+                Expect {
+                    method: "DELETE",
+                    uri: delete,
                     body: None,
                     key: &keys.admin,
                     who: "admin",
