@@ -24615,6 +24615,17 @@ Task 12 documented the admin routes in the API reference and Task 13 added the c
 
 The route names below are the ones Tasks 7a to 12 shipped. If a task's PR changed one (its `Corrected` note says so), write the shipped name, and keep `tests/admin_parity.rs` passing: it checks every parity row's route against the API reference tables.
 
+> **Corrected (issue #327, 2026-11-13).** What shipped in the docs differs from the text below where the code on `main` does; `docs/operations.md` is authoritative:
+> - **Config rows.** `mail.from` defaults to `"okf <okf@localhost>"` (always checked as one mailbox), not "none"; `mail.worker` (default `true`, its own pool of up to 4 connections) has a row; `max_keys_per_user` takes `0` to `1000` (zero is allowed; over 1000 is refused); `[[auth.oidc]]` refuses unknown keys, needs `public_url`, and checks `id` (1 to 32 of `a-z0-9-`), `label`, `client_id`, `client_secret_env` and `issuer` (https, or http on loopback). Durations are capped at ten years. A missing secret variable stops only `serve`; the other subcommands never read it.
+> - **Section 4 and Upgrades** were also changed: the three trusted extensions, the `apalis` schema and the worker's extra connections, and an upgrade bullet for migration `0010`.
+> - **Postmark retry** is 401, 429 and 5xx (not only 429 and 5xx); every other Postmark error is permanent. The queue's statuses are `pending`, `sending`, `retrying` and `failed`; retry takes `retrying` and `failed`, delete anything but `sending`. `mail queue` prints id, status, attempts, to, template, run_at, error.
+> - **"Method added" mail** also follows a password reset. A reset signs nobody in. A passkey registration that does not verify is 422 (issue #325), and a wrong current password on `PUT /me/password` is 403.
+> - **`POST /api/v1/me/keys`** is 400 (not 422) for no catalogs, a repeated catalog or an unknown level; `admin` is a 422 `ceiling`.
+> - **The Your account API** says a bearer key or token gets 403 from every route but `GET /me`; the account routes are not claimed to be tested against a member's session in every area.
+> - **Logging.** The request line names the matched route, never the literal path or query (`MatchedPath`, issue #322).
+> - **Rollout** sets `public_url` and `[mail]` before inviting anyone, and checks `mail queue`.
+> - **Follow-up issues** are #352 (team owners), #353 (OIDC providers in the database), #354 (multi-factor), #355 (self-service deletion), #356 (cleanup loops on apalis) and #357 (rate limits across replicas).
+
 - [ ] **Step 1: The configuration table (section 3).** Add these rows to the table under "The configuration file", after the `oauth.*` rows:
 
 ```markdown

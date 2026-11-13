@@ -82,12 +82,26 @@ unknown keys are ignored, so one file serves every version.
 | `concept_outline_chars` | `20000` | `get_concept` returns an outline of the headings, not the body, for a body longer than this many characters, unless the call passes `full` or `section` |
 | `database_max_connections` | `16` | The most database connections one process opens (`serve` and every subcommand). Writers queued on one changeset wait without one; the writer whose turn it is, a publish, and a read that builds an overlay each hold one |
 | `overlay_cache_size` | `64` | The most changeset overlays (an open changeset's view of its catalog) kept in memory; past it, the least recently used is dropped and rebuilt on its next read |
-| `public_url` | none | The server's public origin, such as `"https://okf-mcp.example.com"` (no path, query or user info; a trailing `/` is dropped). Setting it turns on OAuth ("OAuth connectors"); without it the OAuth routes are 404. It must be `https`, except on a loopback host (such as `localhost`, `127.0.0.1` or `::1`) for local testing, and its host must be in `allowed_hosts` |
+| `public_url` | none | The server's public origin, such as `"https://okf-mcp.example.com"` (no path, query or user info; a trailing `/` is dropped). Setting it turns on OAuth ("OAuth connectors") and console sign-in by account ("Signing in and self-service"); without it the OAuth and sign-in routes are 404. It must be `https`, except on a loopback host (such as `localhost`, `127.0.0.1` or `::1`) for local testing, and its host must be in `allowed_hosts` |
 | `oauth.access_token_ttl` | `"1h"` | How long an OAuth access token works |
 | `oauth.refresh_token_ttl` | `"30d"` | How long a refresh token works. Each refresh issues a new one with a fresh lifetime, so a connection used within this stays signed in |
 | `oauth.code_max_expiry` | `"7d"` | The longest expiry a sign-in code may be given (`oauth code create --expires`, the console's expiry) |
 | `oauth.dcr_enabled` | `true` | Accept dynamic client registration (RFC 7591) at `/oauth/register`. Clients that publish a Client ID Metadata Document work either way |
 | `oauth.cimd_allow_private` | `false` | Fetch Client ID Metadata Documents from loopback and private addresses. For test rigs only: it opens the fetcher to the internal network |
+| `auth.password_sign_in` | `true` | Offer email and password sign-in on `/signin`. The default for the `password_sign_in` setting ([Signing in and self-service](#signing-in-and-self-service)) |
+| `auth.max_keys_per_user` | `20` | The most live self-issued keys a user may hold, `0` to `1000` (`max_keys_per_user` setting) |
+| `auth.max_key_lifetime` | none | The longest expiry a self-issued key may have, such as `"90d"`; unset means no limit (`max_key_lifetime` setting) |
+| `auth.console_session_idle` | `"12h"` | A console session unused this long ends (`console_session_idle` setting). Not `session_idle_timeout`, which is MCP's |
+| `auth.console_session_absolute` | `"7d"` | A console session ends this long after sign-in, used or not (`console_session_absolute` setting) |
+| `auth.setup_link_ttl` | `"24h"` | How long a setup link works (`setup_link_ttl` setting) |
+| `auth.reset_link_ttl` | `"1h"` | How long a password reset link works (`reset_link_ttl` setting) |
+| `auth.trusted_proxy_header` | none | The header whose last address is the client's, such as `"x-forwarded-for"`, behind an ingress that appends it. Unset: the TCP peer's address, and no header is read. The sign-in limits and the sign-in history use it. Config only, not a setting |
+| `[[auth.oidc]]` | none | One table per OIDC provider: `id` (1 to 32 of `a-z`, `0-9` and `-`; stable, since each linked identity stores it), `label` (the button text), `issuer`, `client_id`, `client_secret_env` (the environment variable holding the secret) and `scopes` (default `["openid", "email", "profile"]`). Needs `public_url` |
+| `mail.provider` | `"log"` | `"smtp"`, `"postmark"` or `"log"`. **`log` is for development only:** it writes each whole message, setup and reset links included, to the log at `info`, and delivers nothing |
+| `mail.from` | `"okf <okf@localhost>"` | The From address, such as `"okf <okf@example.com>"`; it must parse as one mailbox. Set it for `smtp` and `postmark` |
+| `mail.worker` | `true` | Run the mail worker in `serve`. Its own pool opens up to 4 connections, on top of `database_max_connections` |
+| `mail.smtp.host`, `mail.smtp.port`, `mail.smtp.starttls`, `mail.smtp.username`, `mail.smtp.password_env` | none, `587`, `true`, none, none | The SMTP relay. `starttls = true` requires STARTTLS; `false` is TLS from the first byte (port 465); there is no plain-text mode. `username` and `password_env` (the environment variable holding the password) go together |
+| `mail.postmark.token_env`, `mail.postmark.message_stream` | none, `"outbound"` | Postmark's server token (by environment variable) and message stream |
 
 The server refuses to start (and every subcommand refuses to run) with a zero
 `poll_interval`, `session_idle_timeout`, `database_max_connections` or
@@ -100,6 +114,23 @@ lifetime, and a `public_url` that is not a URL, has a path, query or user
 info, is `http` on a host other than a loopback one, or whose host no
 `allowed_hosts` entry admits (an entry with a port must match the URL's
 port).
+
+For `[auth]` it refuses a zero duration or one over ten years,
+`max_keys_per_user` over 1000, and a `trusted_proxy_header` that is not a
+header name. An `[[auth.oidc]]` table needs `public_url`, and each needs
+every key but `scopes`. Unlike the rest of the file, it refuses a key it does
+not know, so a misspelt key or an inline `client_secret` is an error. It
+also refuses an `id` that is malformed or listed twice, an empty `label`,
+`client_id` or `client_secret_env`, and an `issuer` that is not `https`
+(`http` only on a loopback host) or has a query or fragment. For `[mail]`
+it refuses a `from` that is not one address, an `smtp` provider without a
+`[mail.smtp]` table, with a blank host, port 0, or `username` without
+`password_env` (or the reverse), and a `postmark` provider without a
+`[mail.postmark]` table or with a blank `token_env` or `message_stream`.
+`serve` also refuses to start when a variable named by `client_secret_env`,
+`password_env` or `token_env` is unset or empty, naming the variable (never
+a value). The other subcommands never read those variables: `user invite`
+and `mail test` only queue mail, which a running server sends.
 
 ```toml
 listen = "[::]:8080"
@@ -121,10 +152,36 @@ refresh_token_ttl = "30d"
 code_max_expiry = "7d"
 dcr_enabled = true
 cimd_allow_private = false
+
+[auth]
+password_sign_in = true
+max_keys_per_user = 20
+max_key_lifetime = "90d"
+console_session_idle = "12h"
+console_session_absolute = "7d"
+trusted_proxy_header = "x-forwarded-for"   # behind an ingress only
+
+[[auth.oidc]]
+id = "example"
+label = "Example ID"
+issuer = "https://id.example.com"
+client_id = "okf-console"
+client_secret_env = "OKF_OIDC_EXAMPLE_SECRET"
+
+[mail]
+provider = "smtp"
+from = "okf <okf@example.com>"
+
+[mail.smtp]
+host = "smtp.example.com"
+port = 587
+starttls = true
+username = "okf"
+password_env = "OKF_SMTP_PASSWORD"
 ```
 
-`[oauth]` is a TOML table, so it comes after every top-level key: a
-top-level key written below it would land inside the table.
+`[oauth]`, `[auth]` and `[mail]` are TOML tables, so they come after every
+top-level key: a top-level key written below one would land inside it.
 
 - **IPv6:** on an IPv6 or dual-stack cluster, listen on `[::]:8080`. Linux
   binds it dual-stack, so IPv4 still works. With the default `0.0.0.0:8080`,
@@ -143,9 +200,17 @@ top-level key written below it would land inside the table.
 | `PGSSLMODE` | TLS to Postgres; `verify-full` in production (section 4) |
 | `PGSSLROOTCERT` | The CA certificate file that `verify-full` checks the database's certificate against |
 | `RUST_LOG` | The log filter. **Leave it unset:** the default is `warn,okf_mcp=info,tower_http=info`, which logs the server's own events and one line per request. Setting `info` everywhere adds noise from every dependency |
+| `OKF_OIDC_EXAMPLE_SECRET` (any name) | An OIDC client secret, named by its provider's `client_secret_env` |
+| `OKF_SMTP_PASSWORD` (any name) | The SMTP password, named by `mail.smtp.password_env` |
+| `OKF_POSTMARK_TOKEN` (any name) | The Postmark server token, named by `mail.postmark.token_env` |
 
 Logs go to stderr. They never carry the database URL, an API key or a
-document's text.
+document's text, nor a password, session id, CSRF token, setup or reset
+link, or client secret. Each request's line names the method and the matched
+route (`/api/v1/users/{name}/sessions/{id_prefix}`), never the literal path
+or the query, so neither an id in a path nor an emailed link's token reaches
+the log. The `log` mail provider is the one exception: it logs whole
+messages, links included, which is why it is for development only.
 
 Set `OKF_MCP_CONFIG` in the container's environment rather than passing
 `--config` as an argument: then `kubectl exec ... -- okf-mcp <subcommand>`
@@ -154,9 +219,16 @@ reads the same file as the server, with no extra flags.
 ## 4. Postgres
 
 - **One database and its owner role**, for example `okf_mcp` owned by
-  `okf_mcp`. The server needs no superuser and no extension. The pool opens up
-  to `database_max_connections` (16 by default) connections; keep the
-  database's `max_connections` above that times the number of replicas.
+  `okf_mcp`. The server needs no superuser. The migrations create three
+  extensions, `citext` (okf's) and `pgcrypto` and `hstore` (apalis', for the
+  mail queue). All three are trusted extensions, so the database's owner can
+  create them (Postgres 13 or later). The pool opens up to
+  `database_max_connections` (16 by default) connections, and the mail
+  worker's own pool up to 4 more; keep the database's `max_connections`
+  above that sum times the number of replicas.
+- **Two schemas.** okf's tables are in `public`; the mail queue is apalis'
+  `apalis` schema, which `migrate` sets up after okf's migrations, with its
+  own migration table (`apalis._sqlx_migrations`).
 - **Migrations** are embedded in the binary and run on every start, by `serve`
   and by every subcommand. `okf-mcp migrate` applies them and exits, for a
   separate deploy step if you want one. They are forward-only: a binary older
@@ -788,6 +860,359 @@ reading users and teams needs any admin key, so a scoped admin can pick the
 user of a key it creates. For any other admin the console shows these
 controls disabled, or the Unassigned view a note, saying why.
 
+## Signing in and self-service
+
+People sign in to the console as themselves, with any of three methods: a
+password, a passkey, or a linked account at an OIDC provider. Signed in,
+they manage their own API keys and OAuth grants within a **ceiling** an admin
+sets, and approve OAuth consent as themselves. Pasting an API key into the
+console still works, for automation and for admins without a user.
+
+Signing in needs `public_url` (section 3). It gives the cookies' origin, the
+passkey relying party (its host) and the OIDC redirect URIs. Without it,
+`GET /signin` offers only "Use an API key instead", and every other sign-in
+route answers 404 (`POST /signin` included).
+
+### Signing in
+
+`GET /signin` offers:
+
+- **Email and password**, while the `password_sign_in` setting is on (when
+  it is off, the form is gone and `POST /signin` answers 404);
+- **Sign in with a passkey**, while passkeys are on (below): the browser
+  offers the passkeys it holds for this server, so no email is typed first;
+- **one button per `[[auth.oidc]]` provider**;
+- **Use an API key instead**: the console's pasted-key card.
+
+It takes `return_to`, a same-origin path starting `/ui/` or
+`/oauth/authorize?`; anything else becomes `/ui/`. The console's card links
+to it with "Sign in with your account", carrying the page you were on.
+
+- **One refusal for everything.** Every refused password sign-in (a wrong
+  password, an unknown email, a locked account, a malformed form) answers
+  401 "Email or password is incorrect", and costs the same: an unknown
+  email is checked against a dummy hash.
+- **Lockout.** After 10 consecutive failures an account locks for 15
+  minutes. The lock is stored, so a restart does not lift it.
+- **Per-address limit.** Each client address may try 30 times per 15
+  minutes (a token bucket: a burst of 30, refilled over 15 minutes), shared
+  by password sign-in, passkey sign-in and OIDC starts; past it, 429. IPv6
+  addresses count by their `/64`. The limit is in memory, per process
+  (sharing it across replicas is #357).
+  Behind an ingress, set `auth.trusted_proxy_header`, or every request seems
+  to come from the ingress and all of them share one limit.
+- **Other sites' forms are refused.** Every sign-in, forgot, setup and reset
+  form POST, and every open passkey route, answers 403 when the browser's
+  `Sec-Fetch-Site` header is neither `same-origin` nor `none` (login CSRF).
+  A request without the header, such as curl's, is let through.
+
+Passwords are hashed with argon2id (19 MiB, 2 passes, 1 lane). A password
+has 12 to 1024 characters and is not in the bundled list of common
+passwords; there are no composition rules.
+
+Every attempt writes a sign-in event (method `password`, `passkey`, `oidc`
+or `setup`; outcome `ok`, `failed` or `locked`; the client address), which
+the user sees on their Account page and an admin in the user's drawer or
+with `okf-mcp user sign-ins NAME`, and the same facts as an `info` log line
+with the user id. Events older than 90 days are pruned.
+
+### Sessions
+
+A sign-in starts a **console session**. The `okf_session` cookie holds 256
+random bits (`HttpOnly; SameSite=Lax; Path=/`, and `Secure` when
+`public_url` is `https`); the server stores only its SHA-256, and a CSRF
+token derived from it, stored hashed too.
+
+- **Lifetime.** A session ends after `console_session_idle` unused (default
+  12 hours) or `console_session_absolute` after sign-in (default 7 days),
+  whichever comes first. Use is recorded at most once per
+  `min(1 minute, idle / 4)`, so an idle session ends between `idle` and
+  `idle` plus that interval after its last use.
+- **CSRF.** Every write the cookie authenticates must carry `X-OKF-CSRF`
+  with the session's token (`GET /api/v1/session` gives it); otherwise it
+  gets 403. The console does this itself.
+- **One credential per request.** A request with a bearer key or token is
+  that credential's, whatever cookie it carries. `/mcp` and
+  `/catalogs/{name}/export|import` take only bearer credentials. The
+  `/api/v1` copies of export and import take a session, at its levels.
+- **What a session reaches.** An admin user's session is an admin that
+  reaches every catalog, as an every-catalog admin key is. A member's
+  session reaches exactly its ceiling, at the ceiling's levels. The admin
+  flag and the ceiling are read from the key cache on every request.
+- **No changesets.** A session never owns a changeset, so MCP writes still
+  need a key or a grant.
+- **Ending sessions.**
+  - Sign-out (the console's Sign out, `DELETE /api/v1/session`) deletes the
+    session.
+  - Changing a user's admin flag signs them out of every session, and they
+    sign in again with the new flag.
+  - Changing your password, adding a passkey or linking an account from the
+    Account page signs your other sessions out, unless "Keep me signed in
+    elsewhere" is ticked.
+  - A password reset signs every session of the user out.
+  - The Account page signs out one session at a time, this browser's
+    included.
+  - An admin signs a user out everywhere with
+    `okf-mcp user revoke-sessions NAME` or the user drawer's "Sign out
+    everywhere", or ends one session from the drawer.
+
+### Setting up an account, and resetting a password
+
+No admin ever sees a password. An admin gives the user an email and sends a
+setup link:
+
+```sh
+okf-mcp user set-email alice alice@example.com
+okf-mcp user invite alice
+```
+
+The link (`{public_url}/account/setup?token=...`) opens a page where the
+person chooses a password, registers a passkey, or both, and is signed in.
+It works once, for `setup_link_ttl` (24 hours by default), and a newer setup
+link replaces it. Changing the user's email ends every link they have not
+used yet.
+
+On `/signin/forgot` anyone may ask for a reset link. The answer is always
+"If an account exists, we sent a link.", except a 403 for another site's
+form and a 429 past the per-address limit (20 requests per hour). Each email
+gets at most 3 links per hour; past that the answer is the same and nothing
+is sent. A reset link works once, for
+`reset_link_ttl` (1 hour by default), and opens a set-password page. The
+reset signs every session of the user out, mails a "sign-in method added"
+notice, signs nobody in, and sends the browser to `/signin`. An expired,
+used or unknown link answers 410 "This link has expired. Ask for a new
+one."
+
+### Passkeys
+
+Passkeys are on when `public_url`'s host is a domain name (a relying party
+id cannot be an address, so a `public_url` such as `https://192.0.2.10` turns
+them off, and `/auth/passkey/*` answers 404). They are registered on the
+setup page or the Account page, and always need user verification (a PIN or
+a biometric). The relying party is `public_url`'s host, so a passkey works
+only at that host: changing it strands every registered passkey (people then
+sign in another way and add a new one). Sign-in uses discoverable
+credentials. The server stores public keys only, and checks and advances each
+passkey's signature counter: a counter that did not move is logged at `warn`
+and refused as a failed sign-in. A ceremony waits at most 5 minutes, in
+memory, keyed by the `okf_passkey` cookie (`SameSite=Strict`), so a restart
+ends the ones in progress.
+
+### OIDC providers
+
+A provider is an `[[auth.oidc]]` table in the config file, with its client
+secret in an environment variable. This example uses a placeholder provider
+at `https://id.example.com`:
+
+```toml
+[[auth.oidc]]
+id = "example"                          # stable: stored with each linked identity
+label = "Example ID"                    # the button text
+issuer = "https://id.example.com"
+client_id = "okf-console"
+client_secret_env = "OKF_OIDC_EXAMPLE_SECRET"
+scopes = ["openid", "email", "profile"]
+```
+
+1. Register a confidential web client at the provider, with the redirect
+   URI `{public_url}/auth/oidc/<id>/callback` (here
+   `https://okf-mcp.example.com/auth/oidc/example/callback`). Note its
+   client id and secret.
+2. Add the table above, and put the secret in the server's environment as
+   `OKF_OIDC_EXAMPLE_SECRET` (a Kubernetes secret, as for `DATABASE_URL`).
+3. Restart the server. `/signin` shows "Example ID", and the pod needs
+   outbound HTTPS to the issuer.
+
+The flow is the authorization code flow with PKCE (S256), `state` and
+`nonce`, bound to the browser by a 10-minute, single-use `okf_oidc` cookie.
+The provider's discovery document (`<issuer>/.well-known/openid-configuration`)
+is cached for an hour; a failed refresh keeps the cached one and is tried
+again after a minute, and with nothing cached the sign-in answers 503. The
+`/auth/oidc/*` routes exist only while a provider is configured; an unknown
+provider is 404.
+
+After the ID token checks out (issuer, audience, nonce, expiry):
+
+1. an identity already linked (by provider and subject) signs its user in;
+2. otherwise, if the token's email is verified and matches a user's email
+   (in any letter case), the identity is linked, the user signs in, and they
+   get a "sign-in method added" email;
+3. otherwise sign-in is refused (403) with "No account for this email. Ask
+   an admin to invite you." There is no self-signup.
+
+A bad `state`, nonce or token is 400 "Sign-in failed; try again". A
+signed-in person can also link a provider from the Account page, whatever
+the provider's email says: the callback links it only for the browser still
+holding the session that started the link, and returns to `/ui/#/account`.
+Each user may start 10 links in a burst, then one a minute. A user links
+at most one account per provider, and an account linked to another user
+cannot be linked (409). Unlinking is refused for the last sign-in method
+(409). The Settings page lists the providers (id, label, issuer), never a
+secret. Changing a provider's `id` orphans its linked identities.
+
+### Mail
+
+Mail goes through `[mail]`'s provider:
+
+- `smtp`: any relay, over STARTTLS or TLS from the first byte;
+- `postmark`: Postmark's HTTP API;
+- `log`: **for development only.** It logs each whole message at `info`,
+  recipient, subject and body, setup and reset links included, and
+  delivers nothing. Anyone who can read the log can use those links. Never
+  run it in production; it is the default only so that a server without
+  `[mail]` starts.
+
+The templates are a setup link, a reset link, "a sign-in method was added
+to your account" (after a password change or reset, a new passkey or a
+linked identity) and the Settings page's test email.
+
+A request never sends mail itself. It queues a `SendMail` job in the
+server's own Postgres database (the `apalis` schema, section 4); a setup
+link and a "method added" notice are queued in the same transaction as the
+change they report. A worker in every `serve` process
+sends it, on a pool of its own (`mail.worker`); `user invite` and `mail test`
+on the command line only queue. Two workers never send the same mail.
+
+- A provider error that may pass is retried: a network error, Postmark 401,
+  429 or 5xx, an SMTP 4xx. The first retry is 30 seconds later, doubling up
+  to an hour, for 24 hours from when the mail was queued.
+- A refusal fails the mail at once: an SMTP 5xx, or any other Postmark
+  error (422 among them).
+- Failed mail keeps its last error. Sent mail is deleted after 7 days and
+  failed mail after 30, by the server's hourly prune.
+- A job holds the rendered message, link included, until it is pruned: the
+  queue listings never show a body.
+
+```sh
+okf-mcp mail test alice@example.com    # queues the test email
+okf-mcp mail queue                     # id, status, attempts, to, template, run_at, error
+okf-mcp mail retry ID                  # failed mail: send again now, with a new 24-hour window
+okf-mcp mail delete ID
+```
+
+The queue lists every mail not yet sent, as `pending` (waiting for a
+worker), `sending` (a worker holds it), `retrying` (failed, with tries
+left) or `failed` (refused, or out of time). Retry takes `retrying` and
+`failed` mail; Delete takes anything but `sending`. The Settings page shows
+the same queue with Retry and Delete. A setup or reset link in a deleted
+mail stays valid until it expires; send a new one to replace it.
+
+### Settings
+
+Policy settings live in the database, so the Settings page changes them
+without a restart; the config file's `[auth]` table gives each one's
+default.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `password_sign_in` | `true` | Offer email and password sign-in |
+| `max_keys_per_user` | `20` | Live self-issued keys per user, `0` to `1000` |
+| `max_key_lifetime` | `none` | Longest self-issued key expiry; `none` means no limit |
+| `console_session_idle` | `12h` | Console session idle timeout |
+| `console_session_absolute` | `7d` | Console session absolute timeout |
+| `setup_link_ttl` | `24h` | Setup link lifetime |
+| `reset_link_ttl` | `1h` | Password reset link lifetime |
+
+```sh
+okf-mcp settings list                      # key, value, then "default" or "set by WHO at T"
+okf-mcp settings set max_key_lifetime 90d
+okf-mcp settings reset max_key_lifetime    # back to the config file's default
+```
+
+A value is checked as its config key is: `true`/`false` (or `on`/`off`), a
+whole number, or a duration like `12h` above zero and at most ten years
+(`none` for `max_key_lifetime`). A bad one is refused, naming the key: 422
+over REST, a non-zero exit on the command line, and an unknown key is clap's
+list of the keys. Each change records who made it (`cli` for the command
+line, the admin's actor over REST and in the console) and reaches every
+server within `poll_interval`. A stored value this server cannot read (from
+a newer version, or a hand edit) is logged at `warn` and the default used.
+
+### Self-service keys and grants
+
+A signed-in person's **My keys** page (`/ui/#/my-keys`) lists, creates,
+renames and revokes the keys they made themselves. A self-issued key:
+
+- names its catalogs, each `read` or `write`, all within the ceiling; never
+  "all catalogs", never `admin`, never a maintenance reporter;
+- counts against `max_keys_per_user` while it is live;
+- expires no later than `max_key_lifetime` allows (and at that limit when
+  no expiry is given), or never if that is `none`;
+- belongs to the signed-in user, with its name as the default actor.
+
+Creating one above the ceiling, past the key limit or beyond the lifetime
+limit answers 422 naming the limit (`ceiling`, `max_keys_per_user` or
+`max_key_lifetime`). An expired key stops working at once. **My grants**
+(`/ui/#/my-grants`) lists and revokes the user's OAuth grants. My keys also
+lists the keys an admin made for the user: those are admin-issued, so not
+capped by the ceiling, and an admin manages them on the API keys page.
+**Account** (`/ui/#/account`) changes the password, adds, renames and
+removes passkeys, links and unlinks providers, lists and ends sessions, and
+shows recent sign-ins, teams and the ceiling. It refuses to remove the last
+sign-in method (409).
+
+### The ceiling and member access
+
+A user's **ceiling** is what their self-issued keys and grants may reach:
+
+- the catalogs owned by every team the user belongs to, at each catalog's
+  **member access** (`none`, `read` or `write`; `write` by default);
+- plus the user's **entitlements**, catalogs an admin adds one at a time,
+  each `read` or `write`;
+- where both give a catalog, the higher level.
+
+A self-issued key or grant reaches, on each catalog, the lower of its own
+level and the ceiling's; a catalog outside the ceiling is unreachable. Every
+change that can move a ceiling (team membership, a catalog's owner or member
+access, entitlements, the admin flag) reaches running servers within
+`poll_interval`, at once on the server that made it, so lowering a ceiling
+lowers live keys and grants. An admin user's session is uncapped, but their
+self-issued keys and grants are capped like anyone's: the ceiling comes from
+teams and entitlements, never from the admin flag. Admin-issued keys and
+grants from sign-in codes are never capped.
+
+```sh
+okf-mcp catalog set-member-access recipes --access read   # members read only
+okf-mcp user entitle bob notes --access read             # one more catalog for bob
+okf-mcp user unentitle bob notes
+```
+
+Only admins change member access and entitlements, and changing them needs
+an admin that reaches every catalog. Team owners may later (#352): the
+server's one check is `store::ceiling::may_set_member_access`.
+
+### Rollout
+
+Migration `0010` only adds. Until an admin acts nothing changes: every key,
+grant, sign-in code and catalog works as before, every existing key is
+admin-issued (uncapped), every catalog's member access is `write`, and
+pasting a key into the console still works. After deploying:
+
+1. Set `public_url` (section 3) if it is not set yet; it turns on OAuth too
+   ("OAuth connectors").
+2. Configure `[mail]` (until then the `log` provider writes each setup link
+   to the server log, which is acceptable on a test server only) and, if
+   wanted, `[[auth.oidc]]`. Put their secrets in the environment, and
+   restart.
+3. Give yourself an email, the admin flag and a setup link (inside the pod,
+   with `kubectl exec` as in [First run](#6-first-run)):
+
+   ```sh
+   okf-mcp user set-email alice alice@example.com
+   okf-mcp user set-admin alice --on
+   okf-mcp user invite alice
+   okf-mcp mail queue          # the setup mail, until the worker sends it
+   ```
+
+4. Open the link, choose a password or register a passkey, and you are
+   signed in. Settings (`/ui/#/settings`) shows the policy, the providers
+   and the mail queue; send yourself a test email from it.
+5. Team catalogs start at `member_access = write`: before members start
+   creating their own keys, review shared catalogs and set `read` (or
+   `none`) where intended.
+6. Invite the others (`user set-email`, then `user invite`, or the user
+   drawer's Email and "Send setup email").
+
 ## Report-only maintenance
 
 ### Permissions and lifecycle
@@ -1314,7 +1739,14 @@ the same port as `/mcp`:
 | `GET /ui`, `GET /ui/` | none | `/ui` redirects (308) to `/ui/`, which serves the console's shell |
 | `GET /ui/*` | none | The console's static files, embedded in the binary at build time; an unknown file is 404 |
 | `GET /ui/manifest.json` | none | `{"pages": [...]}`: the console pages this build has |
-| `/api/v1/*` | bearer key | The JSON API; each endpoint checks the level it needs |
+| `/api/v1/*` | bearer key or console session | The JSON API; each endpoint checks the level it needs |
+| `GET /signin`, `POST /signin` | none | The sign-in page and its password form ([Signing in and self-service](#signing-in-and-self-service)). Without `public_url` the page offers only the pasted key and the POST is 404; with `password_sign_in` off the POST is 404 |
+| `GET /signin/forgot`, `POST /signin/forgot` | none | Ask for a reset link; only with `public_url` set |
+| `GET /account/setup`, `POST /account/setup` | setup link (`?token=`) | Choose a password (or, with the page's script, register a passkey); signs in |
+| `GET /account/reset`, `POST /account/reset` | reset link (`?token=`) | Set a new password; signs every session out |
+| `POST /auth/passkey/signin/start`, `POST /auth/passkey/signin/finish` | none | Passkey sign-in (discoverable credentials); only while passkeys are on. The finish answers `{redirect}` with the session cookie, or 401 |
+| `POST /auth/passkey/setup/start`, `POST /auth/passkey/setup/finish` | setup link (in the body) | Register a passkey from the setup page, use the link and sign in; 422 for a credential that does not verify |
+| `GET /auth/oidc/{provider}/start`, `GET /auth/oidc/{provider}/callback` | none | OIDC sign-in, and the end of linking an account; only while a provider is configured |
 
 The console's files hold no catalog data, so they need no key. Every
 `/ui/` response carries:
@@ -1336,28 +1768,48 @@ same errors as the other routes: 401 without a valid key (plain text, with
 with the statuses in the README's "Routes". An unknown `/api/v1` path is 404,
 key or not.
 
-You sign in to the console by pasting an API key. The console keeps it in
-that browser's `localStorage` (in memory only, where storage is blocked) until
-you sign out, so sign out on a shared machine; anyone who can run script in
-that browser profile can read it. A refused key (revoked, say) signs the
-browser out at its next request.
+The sign-in pages use the console's CSP (their scripts are static files
+under `/ui/js/signin/`), with `Cache-Control: no-store`. Sign-out is
+`DELETE /api/v1/session`, in the identity table below; there is no sign-out
+page.
+
+You sign in to the console with your account ("Sign in with your account";
+see [Signing in and self-service](#signing-in-and-self-service)), or by
+pasting an API key. A pasted key is kept in that browser's `localStorage` (in
+memory only, where storage is blocked) until you sign out, so sign out on a
+shared machine; anyone who can run script in that browser profile can read
+it. An account session lives in an `HttpOnly` cookie no script can read. At
+start the console asks for a session first: a live session wins over a
+stored key, which is then dropped, so the console uses one credential at a
+time. A refused key (revoked, say) or an ended session signs the browser out
+at its next request. Signed in with an account, the console shows "Your
+account" (My keys, My grants, Account), and Administer only to an admin
+user; hiding it is a convenience, since the API refuses a member's session on
+admin routes (403).
 
 ### API reference
 
-The API has 66 endpoints. The identity endpoint is below, and each area's
-endpoints are in its own subsection: [API keys](#api-keys) (7),
+The API has 87 endpoints (a method and path each). The identity endpoints
+are below (3), and each area's endpoints are in its own subsection:
+[API keys](#api-keys) (7),
 [OAuth sign-in codes](#oauth-sign-in-codes) (4),
 [Users and teams](#users-and-teams-api) (20),
+[Your account](#your-account-api) (19),
 [Settings and mail](#settings-and-mail-api) (7),
 [Health](#health) (2), [Browse and search](#browse-and-search) (7),
 [Catalogs and import/export](#catalogs-and-importexport) (9),
 [Findings and runs](#findings-and-runs) (6) and [Changesets](#changesets) (3).
-Each area's tests check every endpoint against the access matrix (no key,
-read, write, admin, and an admin key that does not reach the catalog).
+Each area's tests but Your account's check every endpoint against the
+access matrix (no key, read, write, admin, and an admin key that does not
+reach the catalog); Your account's check that every route refuses a bearer
+key and acts only on the signed-in user's own rows. Every endpoint also takes a console session, at the signed-in user's levels
+([Sessions](#sessions)), with `X-OKF-CSRF` on writes.
 
 | Method and path | Key | Does |
 |---|---|---|
-| `GET /api/v1/whoami` | any | The calling key: `key_id`, `name`, `actor`, `access`, `maintenance_report`, `all_catalogs`, `catalogs` (the loaded catalogs it reaches, sorted), `default_catalog`, `user` (the user it belongs to, `null` when unassigned) and `teams` (that user's teams, sorted). Never the key or its hash |
+| `GET /api/v1/whoami` | any | The calling credential: `key_id`, `name`, `actor`, `access`, `maintenance_report`, `all_catalogs`, `catalogs` (the loaded catalogs it reaches, sorted), `default_catalog`, `kind` (`key`, `oauth` or `session`), `client_name` (a grant's client), `user` (the user it belongs to, `null` when unassigned) and `teams` (that user's teams, sorted). A session's `key_id` is `session:<user>`, its `name` `null` and its `actor` the user's name. Never a key, token or hash |
+| `GET /api/v1/session` | console session | `{user, email, admin, csrf, ceiling, expires_at}`: the signed-in user's name, email and admin flag, the CSRF token writes must send as `X-OKF-CSRF`, the ceiling (`{catalog: "read"\|"write"}`) and when the session ends at the latest. 401 without a usable session (a dead cookie is cleared); a bearer credential gets 403 |
+| `DELETE /api/v1/session` | console session | Signs out: deletes the session and clears the cookie; 204. Needs `X-OKF-CSRF` (403 without); a bearer credential gets 403 |
 
 ```sh
 curl -s -H "Authorization: Bearer $OKF_MCP_KEY" https://okf-mcp.example.com/api/v1/whoami
@@ -1389,7 +1841,7 @@ ones included, has Assign (unassigned) or Change user.
 
 | Method and path | Key | Does |
 |---|---|---|
-| `GET /api/v1/keys` | admin | The keys the caller manages, revoked ones included: `id`, `name`, `actor`, `access`, `maintenance_report`, `all_catalogs`, `catalogs`, `default_catalog`, `created_at`, `revoked_at`, `user` (`null` when unassigned). Never a secret or hash |
+| `GET /api/v1/keys` | admin | The keys the caller manages, revoked ones included: `id`, `name`, `actor`, `access`, `kind` (`key` or `oauth`), `client_name`, `maintenance_report`, `all_catalogs`, `catalogs`, `catalog_access` (each catalog's level), `default_catalog`, `created_at`, `revoked_at`, `expires_at` (`null`: never), `self_issued`, `user` (`null` when unassigned). Never a secret or hash |
 | `POST /api/v1/keys` | admin | Body `{name, user, access: "read"\|"write"\|"admin", all, catalogs, default_catalog, actor, maintenance_report}` (`user` required; `actor` defaults to `name`). Answers `{key, secret}`. 400 for a bad `access`, 403 for `all` from a scoped caller, 404 for an unreached catalog or an unknown user, 409 for a bad or taken name, no catalogs, or `all` with `catalogs`, 422 for an unknown field or a missing `user` |
 | `PATCH /api/v1/keys/{id}` | admin | Body `{maintenance_report: bool}`. 409 for a revoked key, or for enabling reporting on an OAuth grant |
 | `PUT /api/v1/keys/{id}/user` | admin | Body `{user}`. Gives the key or OAuth grant (live or revoked) that user, or changes it; access is unchanged. Answers its view, and its next request runs as that user. 404 for an unmanaged key or an unknown user, 422 without `user` |
@@ -1477,6 +1929,37 @@ curl -fsS -H "Authorization: Bearer $OKF_MCP_KEY" -H 'Content-Type: application/
     -d '{"name":"family","owner":"alice"}' \
     https://okf-mcp.example.com/api/v1/teams
 ```
+
+### Your account API
+
+The routes behind My keys, My grants and Account, for a person signed in
+with an account (a console session). A bearer key or OAuth token gets 403
+from every one but `GET /api/v1/me`, since a key must not mint keys for
+itself. Each acts only on the signed-in user's own keys, grants, passkeys,
+identities and sessions: anyone else's id answers 404, as an unknown one
+does. Limits are in [Signing in and self-service](#signing-in-and-self-service).
+
+| Method and path | Key | Does |
+|---|---|---|
+| `GET /api/v1/me` | console session, or a key that belongs to a user | `{user, display_name, email, admin, has_password, teams, ceiling, session, password_sign_in, limits}`: `ceiling` is `[{catalog, access}]`, `session` says whether a console session asked, and `limits` is `{max_keys_per_user, max_key_lifetime_secs}` (`null` for no lifetime limit). 404 for a key without a user |
+| `GET /api/v1/me/keys` | console session | `{keys}`: the user's keys, revoked and expired ones included, as `GET /api/v1/keys` shows them (with `catalog_access`, `expires_at`, `self_issued`) |
+| `POST /api/v1/me/keys` | console session | Body `{name, catalogs: [{catalog, access}], default_catalog, actor, expires_at}` (`actor` defaults to `name`; `expires_at` RFC 3339, and absent means the lifetime limit, or none). Answers `{key, secret}`, the secret once. 400 for no catalogs, a repeated catalog, an unknown level, or a malformed or past expiry; 409 for a bad or taken name or a default that is not one of `catalogs`; 422 above the ceiling (`admin` included), past the key limit or the lifetime limit (`limit` is `ceiling`, `max_keys_per_user` or `max_key_lifetime`), or for an unknown field such as `all`, `user` or `maintenance_report` |
+| `PATCH /api/v1/me/keys/{id}` | console session | Body `{name}`. Renames a live key; answers its view. 409 for a bad or taken name or a revoked key |
+| `DELETE /api/v1/me/keys/{id}` | console session | Revokes it (the row stays, revoked); answers its view. 409 if already revoked |
+| `GET /api/v1/me/grants` | console session | `{grants}`: the user's OAuth grants, revoked ones included, as key views (`client_name`, `catalog_access`, `self_issued`, `revoked_at`, ...) |
+| `DELETE /api/v1/me/grants/{id}` | console session | Revokes the grant and every token it holds; its client is refused from its next request. Answers its view; 409 if already revoked |
+| `PUT /api/v1/me/password` | console session | Body `{current_password, new_password, keep_sessions}` (`current_password` required while the user has a password). 204. 403 for a wrong current password, a locked account or a password changed meanwhile (never 401, which the console would read as signed out); 401 once this session has ended; 422 for the policy (`limit: "password"`). Signs the other sessions out unless `keep_sessions`, and queues the notice, in the same transaction |
+| `GET /api/v1/me/passkeys` | console session | `{passkeys}`, oldest first: `id` (unpadded base64url), `name`, `created_at`, `last_used_at` |
+| `POST /api/v1/me/passkeys/register/start` | console session | Body `{name, keep_sessions}`. The WebAuthn creation options; the ceremony is bound to a 5-minute `okf_passkey` cookie and to this session. 404 while passkeys are off, 422 for a bad name |
+| `POST /api/v1/me/passkeys/register/finish` | console session | Body: the browser's credential. Stores the passkey; 201 `{id, name}`. Signs the other sessions out unless the start said `keep_sessions`. 403 for another session's ceremony, 409 for a passkey already registered, 410 for an expired ceremony, 422 for a credential that does not verify (`limit: "passkey"`), 401 only once the session has ended |
+| `PATCH /api/v1/me/passkeys/{id}` | console session | Body `{name}`. Renames it; 204. 422 for an empty, over-64-character or control-character name (`limit: "passkey_name"`) |
+| `DELETE /api/v1/me/passkeys/{id}` | console session | Removes it; 204. 409 for the last sign-in method |
+| `GET /api/v1/me/identities` | console session | `{identities, providers}`: the linked identities (`provider`, `email_at_link`, `created_at`, `last_used_at`; never the subject) and the configured providers (`id`, `label`) |
+| `POST /api/v1/me/identities/{provider}/link` | console session | Body `{keep_sessions}`. Starts linking: answers `{url}`, the provider's sign-in URL (the flow cookie is set); the callback links the identity and returns to `/ui/#/account`. 404 for an unknown provider or with no providers, 429 past the per-user allowance, 503 when the provider cannot be reached |
+| `DELETE /api/v1/me/identities/{provider}` | console session | Unlinks it; 204. 404 when none is linked there, 409 for the last sign-in method |
+| `GET /api/v1/me/sessions` | console session | `{sessions}`, most recently used first: `id_prefix` (12 hex characters, never the id), `created_at`, `last_seen_at`, `ip`, `user_agent`, `current` (this browser's) |
+| `DELETE /api/v1/me/sessions/{id_prefix}` | console session | Signs one session out, this browser's included; 204. 404 for a malformed prefix or one none of the user's sessions has; 409 for one several share (none is ended) |
+| `GET /api/v1/me/sign-ins` | console session | `{sign_ins}`, newest first (at most 50): `method`, `outcome`, `ip`, `at` |
 
 ### Settings and mail API
 
@@ -1681,13 +2164,25 @@ following the MCP authorization specification (2026-07-28). Clients that send
 an API key (`Authorization: Bearer okf_...`) are not affected: keys and OAuth
 work side by side on the same `/mcp` URL.
 
-There are no user accounts. An admin mints a **sign-in code** that says what
-the connection may do: its catalogs, `read` or `write` access, the default
-catalog, and the actor its writes are recorded as. The person connecting
-types the code into the server's consent page. Redeeming a code creates an
-**OAuth grant**, which works like an API key with exactly the code's access:
-it is listed with the keys and revoked like one. A code works once, and
-expires unused after 24 hours unless it was minted with another expiry.
+A person connecting a client signs in on the consent page with their
+account: `/oauth/authorize` sends them to `/signin` first, after checking the
+client and its redirect URI. They tick catalogs, choose `read` or `write` for
+each within their ceiling, pick a default and approve. The grant is
+**self-issued**: it belongs to them, its actor is the client's name, and it
+is capped at their ceiling and lowered when the ceiling is
+([Signing in and self-service](#signing-in-and-self-service)). The approval
+re-reads the ceiling, so a level lowered while the page was open is
+refused, and each page approves at most once.
+
+Alternatively ("Use a sign-in code instead" on the consent page) an admin
+mints a **sign-in code** that says what the connection may do: its
+catalogs, `read` or `write` access, the default catalog, and the actor its
+writes are recorded as. The person connecting types the code into the
+server's consent page. Redeeming a code creates an **OAuth grant**, which
+works like an API key with exactly the code's access: it is listed with the
+keys and revoked like one. A grant from a sign-in code is admin-issued: it
+keeps the code's access, uncapped, as before. A code works once, and expires
+unused after 24 hours unless it was minted with another expiry.
 
 OAuth grants are never `admin` and never submit maintenance reports (the
 database refuses both). The console and the maintenance runner keep using API
@@ -1744,6 +2239,11 @@ Approve). Grants, tokens, codes and clients are in the database.
 The steps are the same for ChatGPT, Claude.ai and any other client that
 supports remote MCP servers with OAuth. The client's own screens differ and
 change over time, so they are described generically here.
+
+A person with an account skips step 1: in step 3 they sign in (if their
+browser has no console session yet), choose catalogs and levels within their
+ceiling, and approve. The steps below are the sign-in code path, for anyone
+without an account.
 
 1. **Mint a sign-in code** for the connection, on the server:
 
@@ -1850,6 +2350,15 @@ The API keys page (`/ui/#/keys`):
   changes its catalogs. It has no maintenance-reporting switch: a grant never
   reports.
 
+The Users page's user drawer (`/ui/#/users`) has the sign-in controls: the
+Admin switch, Email (Save, Clear), "Send setup email", Entitlements, the
+console sessions with Sign out and "Sign out everywhere", and Recent
+sign-ins. A catalog's drawer (`/ui/#/catalogs`) has Team member access. The
+Settings page (`/ui/#/settings`) edits the policy settings, lists the OIDC
+providers and the mail provider read-only, sends a test email and shows the
+mail queue with Retry and Delete. A scoped admin sees these controls
+disabled, with the reason.
+
 `GET /api/v1/whoami` and the key list carry each credential's `kind` (`key`
 or `oauth`) and `client_name`. The console's codes JSON API is under "Web
 console" ([OAuth sign-in codes](#oauth-sign-in-codes)).
@@ -1914,7 +2423,7 @@ find them. The server stores only their SHA-256 and never logs them.
 | `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-protected-resource/mcp` | none | Protected Resource Metadata (RFC 9728) |
 | `GET /.well-known/oauth-authorization-server` | none | Authorization server metadata (RFC 8414). `registration_endpoint` is absent when `dcr_enabled = false` |
 | `POST /oauth/register` | none | Dynamic client registration (RFC 7591), public clients only: 201 with the client's metadata and `client_id`. 404 when `dcr_enabled = false` |
-| `GET /oauth/authorize`, `POST /oauth/authorize` | none (a sign-in code on the form) | The consent page. Approve and Deny redirect (303) to the client |
+| `GET /oauth/authorize`, `POST /oauth/authorize` | none (a console session, or a sign-in code on the form) | The consent page; without a session it redirects to `/signin` first (`signin=code` takes the sign-in code path instead). Approve and Deny redirect (303) to the client |
 | `POST /oauth/token` | none (PKCE, or a refresh token) | `grant_type=authorization_code` or `refresh_token`: answers `access_token`, `token_type: Bearer`, `expires_in` and `refresh_token` |
 | `POST /oauth/revoke` | none | Revokes a token (RFC 7009): 200 for any token, an unknown one included; 400 `invalid_request` without `token` |
 
@@ -1995,6 +2504,27 @@ take the server out of service. Alert on the `error` log line, not on
   metadata documents). Every tool now carries a title and behaviour hints
   (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`),
   which clients may show; no tool's arguments or results changed.
+- **User login (the first release after 0.14.0)** adds migration
+  `0010_user_login.sql` and apalis' `apalis` schema, and an older binary
+  refuses the migrated database. Before upgrading:
+  - check that the database owner can create the trusted extensions
+    `citext`, `pgcrypto` and `hstore` (Postgres 13 or later), and that the
+    database's `max_connections` leaves room for the mail worker's 4 extra
+    connections per server process (section 4);
+  - decide on `[mail]`: without it the `log` provider logs every message,
+    links included, so set `smtp` or `postmark` (and its secret) before you
+    send anyone a setup link on a shared server;
+  - add the `[auth]` and `[[auth.oidc]]` tables if wanted (section 3). A
+    secret variable a table names must be set, or `serve` refuses to start.
+
+  The migration only adds: existing keys, grants, codes and catalogs work as
+  before, every existing key is admin-issued (uncapped), every catalog's
+  member access is `write`, and the pasted-key console sign-in is unchanged.
+  `/api/v1` now also takes a console session cookie, and `whoami` may answer
+  `kind: "session"`. The new routes are `/signin`, `/account/*`,
+  `/auth/passkey/*` and `/auth/oidc/*`; a proxy that routes only some paths
+  must pass them. Then follow
+  [Rollout](#rollout) to give the first admin a sign-in.
 
 ### Preparing and shipping a release
 
