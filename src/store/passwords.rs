@@ -557,6 +557,99 @@ pub async fn reset_in(
     crate::store::user_sessions::revoke_all(&mut *conn, user_id, None).await
 }
 
+/// A password change asked for by a signed-in console session (`PUT
+/// /api/v1/me/password`). `Debug` is redacted where it holds a secret.
+pub struct SessionChange<'a> {
+    /// Whose password.
+    pub user_id: &'a str,
+    /// The raw id of the session asking (the cookie's value).
+    pub session_id: &'a str,
+    /// The password this change replaces, as the current password the
+    /// caller typed proved it; `None` when the user had none.
+    pub replaces: Option<&'a PasswordStamp>,
+    /// The new password, from [`NewPassword::hash`].
+    pub password: &'a NewPassword,
+    /// Keep the user's other sessions (otherwise they end).
+    pub keep_sessions: bool,
+    /// When (server clock).
+    pub now: DateTime<Utc>,
+}
+
+// Hand-written (Python's `__repr__`): the session id is a credential.
+impl std::fmt::Debug for SessionChange<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionChange")
+            .field("user_id", &self.user_id)
+            .field("session_id", &"<redacted>")
+            .field("replaces", &self.replaces)
+            .field("password", &self.password)
+            .field("keep_sessions", &self.keep_sessions)
+            .field("now", &self.now)
+            .finish()
+    }
+}
+
+/// Changes a signed-in user's password and, unless kept, ends their other
+/// sessions, inside the caller's transaction (which also queues the
+/// notice, then commits).
+///
+/// The user's row is locked first (`FOR NO KEY UPDATE`, the lock order of
+/// `email_tokens`' module docs), then, under that lock:
+/// - the asking session must still be in force (held `FOR SHARE`), so a
+///   reset or an admin change that ended it refuses the change;
+/// - the stored password must still be the one [`SessionChange::replaces`]
+///   names, so a change made meanwhile from another session (or a reset)
+///   is never overwritten by someone who only knew the old password.
+///
+/// # Arguments
+/// * `conn` - the caller's transaction (`&mut *tx`).
+/// * `change` - what to store and for whom.
+///
+/// # Returns
+/// How many other sessions ended.
+///
+/// # Errors
+/// [`OkfError::Unauthenticated`] once the session or the user is gone;
+/// [`OkfError::Forbidden`] when the password changed since it was checked;
+/// [`OkfError::Database`].
+pub async fn change_from_session_in(
+    conn: &mut PgConnection,
+    change: &SessionChange<'_>,
+) -> Result<u64, OkfError> {
+    // `Option<Option<String>>`: the outer `None` is "no such user", the
+    // inner one "no password".
+    let stored: Option<Option<String>> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(change.user_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let live = stored.is_some()
+        && crate::store::user_sessions::hold_live(
+            &mut *conn,
+            change.session_id,
+            change.user_id,
+            change.now,
+        )
+        .await?;
+    let Some(stored) = stored.filter(|_| live) else {
+        return Err(OkfError::Unauthenticated {
+            reason: "this session has ended; sign in again".to_string(),
+        });
+    };
+    if stored.as_deref() != change.replaces.map(PasswordStamp::as_str) {
+        return Err(OkfError::Forbidden {
+            reason: "the password changed meanwhile; give the current one again".to_string(),
+        });
+    }
+    set_in(&mut *conn, change.user_id, change.password, change.now).await?;
+    if change.keep_sessions {
+        return Ok(0);
+    }
+    crate::store::user_sessions::revoke_all(&mut *conn, change.user_id, Some(change.session_id))
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,5 +1008,278 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(outcome, SignInOutcome::Ok(ref verified) if verified.user == alice));
+    }
+
+    /// Two console sessions for `user_id`: (the one asking, another).
+    async fn two_sessions(pool: &PgPool, user_id: &str) -> (String, String) {
+        let start = || {
+            crate::store::user_sessions::create(
+                pool,
+                user_id,
+                None,
+                "",
+                std::time::Duration::from_secs(3600),
+                now(),
+            )
+        };
+        (start().await.unwrap().id, start().await.unwrap().id)
+    }
+
+    /// How many console sessions `user_id` has.
+    async fn sessions_of(pool: &PgPool, user_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM user_sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The stamp of alice's current password (`GOOD`).
+    async fn alices_stamp(pool: &PgPool) -> PasswordStamp {
+        match verify(pool, "alice@example.com", GOOD, now())
+            .await
+            .unwrap()
+        {
+            SignInOutcome::Ok(verified) => verified.stamp,
+            other => panic!("alice's password was refused: {other:?}"),
+        }
+    }
+
+    /// Runs [`change_from_session_in`] in its own transaction and commits.
+    async fn change(pool: &PgPool, change: &SessionChange<'_>) -> Result<u64, OkfError> {
+        let mut tx = pool.begin().await?;
+        let ended = change_from_session_in(&mut tx, change).await?;
+        tx.commit().await?;
+        Ok(ended)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_change_keeps_its_session_and_ends_the_others_unless_kept() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", Some("alice@example.com")).await;
+        let (asking, _) = two_sessions(&db.pool, &alice.id).await;
+        let first = NewPassword::hash("amber quarry signal").await.unwrap();
+        let second = NewPassword::hash("copper meadow lantern").await.unwrap();
+
+        let ended = change(
+            &db.pool,
+            &SessionChange {
+                user_id: &alice.id,
+                session_id: &asking,
+                replaces: None,
+                password: &first,
+                keep_sessions: true,
+                now: now(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((ended, sessions_of(&db.pool, &alice.id).await), (0, 2));
+
+        let stamp = first.stamp();
+        let ended = change(
+            &db.pool,
+            &SessionChange {
+                user_id: &alice.id,
+                session_id: &asking,
+                replaces: Some(&stamp),
+                password: &second,
+                keep_sessions: false,
+                now: now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((ended, sessions_of(&db.pool, &alice.id).await), (1, 1));
+        let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM user_sessions WHERE id_hash = $1")
+            .bind(crate::keys::hash(&asking).as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 1, "the asking session stays");
+        let outcome = verify(
+            &db.pool,
+            "alice@example.com",
+            "copper meadow lantern",
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, SignInOutcome::Ok(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_change_refuses_a_password_that_changed_since_it_was_checked() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", Some("alice@example.com")).await;
+        set(&db.pool, &alice.id, GOOD, now()).await.unwrap();
+        let (asking, _) = two_sessions(&db.pool, &alice.id).await;
+        let stale = alices_stamp(&db.pool).await;
+        // Another change, from elsewhere and keeping the sessions, lands
+        // between the check and this change.
+        set(&db.pool, &alice.id, "copper meadow lantern", now())
+            .await
+            .unwrap();
+        let mine = NewPassword::hash("amber quarry signal").await.unwrap();
+        let first_ever = NewPassword::hash("violet harbor quill").await.unwrap();
+
+        let refused = change(
+            &db.pool,
+            &SessionChange {
+                user_id: &alice.id,
+                session_id: &asking,
+                replaces: Some(&stale),
+                password: &mine,
+                keep_sessions: false,
+                now: now(),
+            },
+        )
+        .await;
+        // A "first password" when one has been set meanwhile is refused too.
+        let also_refused = change(
+            &db.pool,
+            &SessionChange {
+                user_id: &alice.id,
+                session_id: &asking,
+                replaces: None,
+                password: &first_ever,
+                keep_sessions: false,
+                now: now(),
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(refused, Err(OkfError::Forbidden { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            matches!(also_refused, Err(OkfError::Forbidden { .. })),
+            "{also_refused:?}"
+        );
+        assert_eq!(sessions_of(&db.pool, &alice.id).await, 2, "nothing ended");
+        let outcome = verify(
+            &db.pool,
+            "alice@example.com",
+            "copper meadow lantern",
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, SignInOutcome::Ok(_)),
+            "the other change stands"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_change_queued_behind_a_reset_is_refused_and_the_reset_stands() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", Some("alice@example.com")).await;
+        set(&db.pool, &alice.id, GOOD, now()).await.unwrap();
+        let (asking, _) = two_sessions(&db.pool, &alice.id).await;
+        let stamp = alices_stamp(&db.pool).await;
+        let mine = NewPassword::hash("amber quarry signal").await.unwrap();
+        let pool = db.pool.clone();
+        // Hold alice's row, so the reset and then the change queue on it in
+        // that order.
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(&alice.id)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        // `tokio::spawn` runs each on its own task, like
+        // `asyncio.create_task`; `move` hands each owned copies.
+        let reset_task = tokio::spawn({
+            let pool = pool.clone();
+            let user_id = alice.id.clone();
+            async move { reset(&pool, &user_id, "copper meadow lantern", now()).await }
+        });
+        let first_queued = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::http::api::testing::wait_for_lock_waiters(&pool, 1),
+        )
+        .await;
+        if first_queued.is_err() {
+            holder.rollback().await.unwrap();
+            panic!("the reset never queued on alice's row within 30 s");
+        }
+        let change_task = tokio::spawn({
+            let pool = pool.clone();
+            let user_id = alice.id.clone();
+            async move {
+                change(
+                    &pool,
+                    &SessionChange {
+                        user_id: &user_id,
+                        session_id: &asking,
+                        replaces: Some(&stamp),
+                        password: &mine,
+                        keep_sessions: true,
+                        now: now(),
+                    },
+                )
+                .await
+            }
+        });
+        // Bounded, and the holder is released before any failure is
+        // reported, so a broken lock order fails fast instead of hanging.
+        let bound = std::time::Duration::from_secs(30);
+        let queued = tokio::time::timeout(
+            bound,
+            crate::http::api::testing::wait_for_lock_waiters(&pool, 2),
+        )
+        .await;
+        holder.commit().await.unwrap();
+        queued.expect("the reset and the change to queue on alice's row within 30 s");
+        let ended = tokio::time::timeout(bound, reset_task)
+            .await
+            .expect("the reset to finish within 30 s")
+            .unwrap()
+            .unwrap();
+        let refused = tokio::time::timeout(bound, change_task)
+            .await
+            .expect("the change to finish within 30 s")
+            .unwrap();
+
+        assert_eq!(ended, 2, "the reset ended both sessions");
+        assert!(
+            matches!(refused, Err(OkfError::Unauthenticated { .. })),
+            "{refused:?}"
+        );
+        let outcome = verify(
+            &db.pool,
+            "alice@example.com",
+            "copper meadow lantern",
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, SignInOutcome::Ok(_)), "the reset stands");
+        assert_eq!(sessions_of(&db.pool, &alice.id).await, 0);
+    }
+
+    #[test]
+    fn a_session_change_debug_shows_no_secret() {
+        let password =
+            NewPassword("$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2g".to_string());
+        let stamp = PasswordStamp("$argon2id$old-hash".to_string());
+        let change = SessionChange {
+            user_id: "user-1",
+            session_id: "raw-session-id-value",
+            replaces: Some(&stamp),
+            password: &password,
+            keep_sessions: false,
+            now: now(),
+        };
+
+        let shown = format!("{change:?}");
+
+        assert!(shown.contains("user-1"), "{shown}");
+        for secret in ["raw-session-id-value", "argon2id", "old-hash"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
     }
 }

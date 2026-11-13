@@ -162,6 +162,23 @@ pub struct OidcProviderConfig {
     pub scopes: Vec<String>,
 }
 
+/// Whether `id` is a well-formed `[[auth.oidc]]` id: 1 to 32 of `a-z`,
+/// `0-9` and `-`. Config validation requires it, and unlinking uses it to
+/// answer a malformed provider (a NUL, which Postgres refuses, included)
+/// as unknown before any query.
+///
+/// # Arguments
+/// * `id` - the candidate id.
+///
+/// # Returns
+/// `true` when it is well formed.
+pub(crate) fn is_provider_id(id: &str) -> bool {
+    (1..=32).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 /// `["openid", "email", "profile"]`.
 fn default_oidc_scopes() -> Vec<String> {
     Vec::from(["openid", "email", "profile"].map(String::from))
@@ -654,11 +671,7 @@ impl Config {
         let mut seen = std::collections::HashSet::new();
         for provider in &self.auth.oidc {
             let id = provider.id.as_str();
-            let valid_id = (1..=32).contains(&id.len())
-                && id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-            if !valid_id {
+            if !is_provider_id(id) {
                 return Err(format!(
                     "auth.oidc id {id:?} must be 1 to 32 of a-z, 0-9 and -"
                 ));
