@@ -605,6 +605,89 @@ mod tests {
         .await;
     }
 
+    /// M13 Task 3: the key routes that name a catalog check
+    /// `require(Admin, ..)` on it (create with `catalogs` and
+    /// `default_catalog`, grant, ungrant). Below admin `require_admin`
+    /// refuses first, with `Forbidden`; an admin, who is exempt, still
+    /// manages keys of a suspended catalog.
+    #[tokio::test]
+    async fn key_routes_on_a_suspended_catalog_stay_open_to_an_admin() {
+        use crate::http::api::testing::{assert_answers, Expect};
+        use crate::mcp::testing::suspend_catalogs;
+        let test = app().await;
+        let keys = keys(&test).await;
+        let main = main_only();
+        let first = stored(&test, "target-one", Access::Read, Grants::Catalogs(&main))
+            .await
+            .id;
+        let second = stored(&test, "target-two", Access::Read, Grants::Catalogs(&main))
+            .await
+            .id;
+        suspend_catalogs(&test, &["main"]).await;
+        let create = || {
+            Some(
+                json!({"user": crate::db::TEST_USER, "name": "made", "access": "read",
+                        "catalogs": ["main"], "default_catalog": "main"}),
+            )
+        };
+        let grant = format!("/api/v1/keys/{first}/catalogs/main");
+        let ungrant = format!("/api/v1/keys/{second}/catalogs/main");
+        let expect = |method, uri, body, who, key, status, error| Expect {
+            method,
+            uri,
+            body,
+            key,
+            who,
+            status,
+            error,
+        };
+
+        assert_answers(
+            &test,
+            &[
+                expect(
+                    "POST",
+                    "/api/v1/keys",
+                    create(),
+                    "write",
+                    &keys.write,
+                    403,
+                    Some("Forbidden"),
+                ),
+                expect(
+                    "POST",
+                    "/api/v1/keys",
+                    create(),
+                    "admin",
+                    &keys.admin,
+                    200,
+                    None,
+                ),
+                expect(
+                    "PUT",
+                    &grant,
+                    None,
+                    "write",
+                    &keys.write,
+                    403,
+                    Some("Forbidden"),
+                ),
+                expect("PUT", &grant, None, "admin", &keys.admin, 200, None),
+                expect(
+                    "DELETE",
+                    &ungrant,
+                    None,
+                    "write",
+                    &keys.write,
+                    403,
+                    Some("Forbidden"),
+                ),
+                expect("DELETE", &ungrant, None, "admin", &keys.admin, 200, None),
+            ],
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn create_returns_the_secret_once_and_the_new_key_works() {
         let test = app().await;

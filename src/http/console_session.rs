@@ -267,6 +267,7 @@ async fn session_principal(app: &App, user_id: &str) -> Result<Option<Principal>
         return Ok(Some(Principal::for_session(
             &user,
             app.keys().ceiling_of(user_id),
+            app.keys().suspensions(),
         )));
     }
     // Not in the cache yet: two queries, until the next reload.
@@ -274,7 +275,13 @@ async fn session_principal(app: &App, user_id: &str) -> Result<Option<Principal>
         return Ok(None);
     };
     match ceiling::ceiling_of(app.pool(), &user.name).await {
-        Ok(ceiling) => Ok(Some(Principal::for_session(&user, ceiling))),
+        // The current cache's suspensions are right for a user it does not
+        // know yet: suspension is per catalog, not per user.
+        Ok(ceiling) => Ok(Some(Principal::for_session(
+            &user,
+            ceiling,
+            app.keys().suspensions(),
+        ))),
         // Deleted between the two reads.
         Err(OkfError::UnknownName { .. }) => Ok(None),
         Err(other) => Err(other),

@@ -144,6 +144,7 @@ pub(crate) fn principal_with_reporting(
         actor: key_id.to_string(),
         kind: CredentialKind::ApiKey,
         user: None,
+        suspended: Default::default(),
     })
 }
 
@@ -338,4 +339,110 @@ pub(crate) fn context(
 ) -> ToolContext {
     let connection = connection.map(|names| names.iter().map(|name| name.to_string()).collect());
     ToolContext::new(Arc::clone(&test.app), principal, connection)
+}
+
+/// The team [`suspend_catalogs`] moves catalogs to and suspends.
+pub(crate) const SUSPENDED_TEAM: &str = "family";
+
+/// The notice [`suspend_catalogs`] gives the suspension.
+pub(crate) const SUSPENSION_NOTICE: &str = "Paused for billing.";
+
+/// Moves `catalogs` to a new team, [`SUSPENDED_TEAM`] (owned by
+/// [`crate::db::TEST_USER`]), suspends it with [`SUSPENSION_NOTICE`], and
+/// polls, so the key cache sees the suspension. Every other catalog stays
+/// with [`crate::db::TEST_TEAM`], active.
+///
+/// # Arguments
+/// * `test` - the app.
+/// * `catalogs` - the catalogs to suspend (call once per test).
+///
+/// # Panics
+/// If the team exists already or a store call fails.
+pub(crate) async fn suspend_catalogs(test: &TestApp, catalogs: &[&str]) {
+    let pool = test.app.pool();
+    let now = Utc::now();
+    let team = crate::store::teams::NewTeam {
+        name: SUSPENDED_TEAM,
+        display_name: "Family",
+        owner: crate::db::TEST_USER,
+    };
+    crate::store::teams::create(pool, &team, now)
+        .await
+        .expect("create the team to suspend");
+    for catalog in catalogs {
+        catalogs::set_owner(pool, catalog, SUSPENDED_TEAM)
+            .await
+            .expect("move the catalog to the team");
+    }
+    crate::store::teams::suspend(pool, SUSPENDED_TEAM, Some(SUSPENSION_NOTICE), now)
+        .await
+        .expect("suspend the team");
+    test.app.poll().await.expect("poll the suspension in");
+}
+
+/// Lifts [`suspend_catalogs`]'s suspension and polls it in.
+///
+/// # Panics
+/// If the store or the poll fails.
+pub(crate) async fn lift_suspension(test: &TestApp) {
+    crate::store::teams::unsuspend(test.app.pool(), SUSPENDED_TEAM)
+        .await
+        .expect("lift the suspension");
+    test.app.poll().await.expect("poll the lift in");
+}
+
+/// Stores a live, admin-issued key and polls it in.
+///
+/// # Arguments
+/// * `test` - the app.
+/// * `name` - its name, also its actor (once per test).
+/// * `access` - its level.
+/// * `reach` - its catalogs; empty for every catalog.
+/// * `maintenance_report` - whether it may submit maintenance reports.
+///
+/// # Returns
+/// Its secret: look its principal up with [`cached_principal`] after each
+/// poll, as a request would.
+///
+/// # Panics
+/// If the store refuses the key or the poll fails.
+pub(crate) async fn stored_secret(
+    test: &TestApp,
+    name: &str,
+    access: Access,
+    reach: &[&str],
+    maintenance_report: bool,
+) -> String {
+    let names: Vec<String> = reach.iter().map(|catalog| catalog.to_string()).collect();
+    let new = crate::store::keys::NewKey {
+        name,
+        access,
+        maintenance_report,
+        grants: if names.is_empty() {
+            crate::store::keys::Grants::All
+        } else {
+            crate::store::keys::Grants::Catalogs(&names)
+        },
+        default_catalog: reach.first().copied(),
+        actor: name,
+        user: crate::db::TEST_USER,
+        self_issued: false,
+        expires_at: None,
+        levels: &[],
+    };
+    let secret = crate::store::keys::create_with_id(test.app.pool(), &new, Utc::now())
+        .await
+        .expect("create the key")
+        .key;
+    test.app.poll().await.expect("poll the key in");
+    secret
+}
+
+/// The principal the key cache holds now for `secret`, as the auth layer
+/// would put it in a request.
+///
+/// # Panics
+/// If the cache does not know the key.
+pub(crate) fn cached_principal(test: &TestApp, secret: &str) -> Arc<Principal> {
+    test.app.keys().find(secret).expect("the key is cached")
 }
