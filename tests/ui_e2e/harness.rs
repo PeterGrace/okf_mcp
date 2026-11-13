@@ -9,6 +9,65 @@ use rustwright::{chromium, ActionOptions, Browser, GotoOptions, LaunchOptions, P
 /// How long `wait_*` polls before failing.
 const WAIT: Duration = Duration::from_secs(10);
 
+/// Holds the page's next request with method `arg.method` to a path ending
+/// in `arg.suffix` until `window.releaseHeld()`; `window.heldDone` turns
+/// true once that held answer has been handed back to the page, and
+/// `window.heldMatches` counts the matching requests the page made while it
+/// was held (the held one included). With `arg.early`, the request is sent
+/// at once and only its answer is held (`window.heldFetched` turns true
+/// when the server has answered): a read that finishes late with what it
+/// read early. Runs through `ui.eval`, so it wraps `fetch` without touching
+/// the page's code.
+const HOLD_NEXT: &str = "(arg) => {
+    const original = window.fetch;
+    let release = null;
+    window.heldDone = false;
+    window.heldFetched = false;
+    window.heldMatches = 0;
+    window.releaseHeld = () => release();
+    window.fetch = (input, init) => {
+        const method = (init && init.method) || 'GET';
+        const matches = method === arg.method && String(input).endsWith(arg.suffix);
+        if (matches) window.heldMatches += 1;
+        if (release === null && matches) {
+            const held = new Promise(resolve => { release = resolve; });
+            if (arg.early) {
+                const answer = original(input, init);
+                const fetched = () => { window.heldFetched = true; };
+                answer.then(fetched, fetched);
+                return held.then(() => answer)
+                    .finally(() => { window.heldDone = true; window.fetch = original; });
+            }
+            return held.then(() => original(input, init))
+                .finally(() => { window.heldDone = true; window.fetch = original; });
+        }
+        return original(input, init);
+    };
+    return true;
+}";
+
+/// Answers the page's next request with method `arg.method` to a path
+/// ending in `arg.suffix` with status `arg.status` and the error body
+/// `{error, message: arg.message}`, without reaching the server (a refusal
+/// or an outage the console must survive). Later requests go through. The
+/// wrapper stays installed after it has answered (passing everything on),
+/// so several of them nest: each answers its own request once.
+const FAIL_NEXT: &str = "(arg) => {
+    const original = window.fetch;
+    let used = false;
+    window.fetch = (input, init) => {
+        const method = (init && init.method) || 'GET';
+        if (!used && method === arg.method && String(input).endsWith(arg.suffix)) {
+            used = true;
+            return Promise.resolve(new Response(
+                JSON.stringify({ error: 'test', message: arg.message }),
+                { status: arg.status, headers: { 'Content-Type': 'application/json' } }));
+        }
+        return original(input, init);
+    };
+    return true;
+}";
+
 /// One browser page on the console.
 pub struct Ui {
     /// The server, `http://127.0.0.1:<port>`.
@@ -178,6 +237,128 @@ impl Ui {
         self.page
             .evaluate(function, Some(&arg), ActionOptions::default())
             .expect("evaluate")
+    }
+
+    /// Holds the page's next `method` request to a path ending in `suffix`
+    /// until [`Ui::release_held`] (see [`HOLD_NEXT`]).
+    ///
+    /// # Arguments
+    /// * `method` - the HTTP method, upper case.
+    /// * `suffix` - the end of the request's URL.
+    pub fn hold_next(&self, method: &str, suffix: &str) {
+        self.eval(
+            HOLD_NEXT,
+            serde_json::json!({ "method": method, "suffix": suffix, "early": false }),
+        );
+    }
+
+    /// Sends the page's next `method` request to a path ending in `suffix`
+    /// at once but holds its answer until [`Ui::release_held`], then waits
+    /// until the server has answered it (see [`HOLD_NEXT`]): the page gets,
+    /// late, what the server said early.
+    ///
+    /// # Arguments
+    /// * `method` - the HTTP method, upper case.
+    /// * `suffix` - the end of the request's URL.
+    /// * `trigger` - what makes the page send it, run after the hold is set.
+    ///
+    /// # Panics
+    /// When the server has not answered within [`WAIT`].
+    pub fn hold_answer(&self, method: &str, suffix: &str, trigger: impl FnOnce()) {
+        self.eval(
+            HOLD_NEXT,
+            serde_json::json!({ "method": method, "suffix": suffix, "early": true }),
+        );
+        trigger();
+        self.poll(&format!("the server's answer to {method} {suffix}"), || {
+            self.eval("() => window.heldFetched", serde_json::json!(null))
+                == serde_json::json!(true)
+        });
+    }
+
+    /// How many matching requests the page made since [`Ui::hold_next`],
+    /// the held one included.
+    pub fn held_matches(&self) -> u64 {
+        self.eval("() => window.heldMatches", serde_json::json!(null))
+            .as_u64()
+            .unwrap_or(0)
+    }
+
+    /// Releases the held answer, waits until the page has it, then gives
+    /// the page a moment to act on it (a stale drawer would be drawn by
+    /// then).
+    ///
+    /// # Panics
+    /// When the held answer has not arrived within [`WAIT`].
+    pub fn release_held(&self) {
+        self.eval("() => window.releaseHeld()", serde_json::json!(null));
+        let deadline = Instant::now() + WAIT;
+        while self.eval("() => window.heldDone", serde_json::json!(null)) != serde_json::json!(true)
+        {
+            assert!(Instant::now() < deadline, "the held answer never arrived");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    /// Makes the page's next `method` request to a path ending in `suffix`
+    /// answer `status` with `message`, without reaching the server (see
+    /// [`FAIL_NEXT`]).
+    ///
+    /// # Arguments
+    /// * `method` - the HTTP method, upper case.
+    /// * `suffix` - the end of the request's URL.
+    /// * `status` - the status to answer, such as 409 or 503.
+    /// * `message` - the error body's `message`.
+    pub fn fail_next(&self, method: &str, suffix: &str, status: u16, message: &str) {
+        self.eval(
+            FAIL_NEXT,
+            serde_json::json!({
+                "method": method, "suffix": suffix, "status": status, "message": message,
+            }),
+        );
+    }
+
+    /// Clicks the element `selector` names twice in a row, in the page
+    /// (a disabled button ignores both clicks).
+    ///
+    /// # Returns
+    /// Whether the element is disabled afterwards.
+    pub fn click_twice(&self, selector: &str) -> bool {
+        self.eval(
+            "(selector) => { const element = document.querySelector(selector); \
+             element.click(); element.click(); return element.disabled; }",
+            serde_json::json!(selector),
+        ) == serde_json::json!(true)
+    }
+
+    /// Marks the element `selector` names now, so [`Ui::is_marked`] can tell
+    /// whether the page has drawn a new one in its place since.
+    pub fn mark(&self, selector: &str) {
+        self.eval(
+            "(selector) => { document.querySelector(selector).dataset.uiMarked = 'yes'; }",
+            serde_json::json!(selector),
+        );
+    }
+
+    /// Whether the element `selector` names now is the one [`Ui::mark`]
+    /// marked (false once the page has drawn a new one).
+    pub fn is_marked(&self, selector: &str) -> bool {
+        self.eval(
+            "(selector) => document.querySelector(selector)?.dataset.uiMarked === 'yes'",
+            serde_json::json!(selector),
+        ) == serde_json::json!(true)
+    }
+
+    /// Waits until the page has drawn a new element for `selector` in place
+    /// of the one [`Ui::mark`] marked.
+    ///
+    /// # Panics
+    /// When the marked one is still there after [`WAIT`].
+    pub fn wait_redrawn(&self, selector: &str) {
+        self.poll(&format!("{selector} drawn again"), || {
+            !self.is_marked(selector)
+        });
     }
 
     /// Gives the page a virtual WebAuthn authenticator (Chromium DevTools'

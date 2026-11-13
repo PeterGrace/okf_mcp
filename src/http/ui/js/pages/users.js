@@ -13,7 +13,8 @@ import { ago, when } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
 import { assignControl, namesOf } from '../components/picker.js';
-import { canAdministerPeople, keyUserChanged, refreshUnassigned } from '../core/shell.js';
+import { accountSections, loadAccount } from '../components/user-account.js';
+import { canAdministerPeople, keyUserChanged, refreshIdentity, refreshUnassigned } from '../core/shell.js';
 
 const NEEDS_EVERY_CATALOG = 'Changing users needs an admin key that reaches every catalog.';
 
@@ -31,9 +32,12 @@ export async function render(main, rest) {
     const columns = [
         { key: 'name', label: 'Name', sort: user => user.name,
           render: user => h('code', { dataset: { test: `user-${user.name}` } }, user.name,
-              user.name === store.whoami.user ? [' ', pill('you', 'info')] : null) },
+              user.name === store.whoami.user ? [' ', pill('you', 'info')] : null,
+              user.is_admin ? [' ', pill('admin', 'warn')] : null) },
         { key: 'display_name', label: 'Display name',
           render: user => user.display_name || h('span', { class: 'muted' }, '-') },
+        { key: 'email', label: 'Email', sort: user => user.email ?? '',
+          render: user => (user.email ? h('span', { class: 'mono small' }, user.email) : h('span', { class: 'muted' }, '-')) },
         { key: 'credentials', label: 'Credentials', sort: user => user.credentials, class: 'num' },
         { key: 'teams', label: 'Teams', render: user => user.teams.join(', ') },
         { key: 'created_at', label: 'Created', sort: user => user.created_at, render: user => ago(user.created_at) },
@@ -52,6 +56,11 @@ export async function render(main, rest) {
         table,
         manager ? null : h('p', { class: 'muted small' }, NEEDS_EVERY_CATALOG));
     await load();
+
+    // The user drawer shown or loading ({name, ticket, last}), and the count
+    // of its reads (see openDetail).
+    let shown = null;
+    let reads = 0;
 
     async function load() {
         try {
@@ -82,19 +91,51 @@ export async function render(main, rest) {
         ticket.open('New user', 'Creates its personal team of the same name.', form);
     }
 
-    // The drawer: the user's teams and the credentials this key manages, and
+    // The drawer: the user's teams, the credentials this key manages, the
+    // account sections (sign-in, entitlements, sessions, sign-ins), and
     // Delete, disabled with the reason while anything still names the user.
-    async function openDetail(name) {
-        const ticket = drawerTicket(main);
-        let detail;
-        let personal;
+    // `ticket` is the drawer's claim: a re-render after an action passes
+    // the one the drawer was opened with, so once the drawer is replaced or
+    // dismissed the late answer is dropped. `refusal` is the reason that
+    // action was refused (shown until the next action), and `last` the
+    // answers the drawer showed before it: when reading the user again
+    // fails, the drawer is drawn from them, marked stale, so the refusal
+    // still shows and every control can be used again.
+    //
+    // `shown` is the drawer being shown (or loaded) and whose it is. A write
+    // re-renders the drawer that shows its user when it settles, through
+    // that drawer's own ticket, even when it is not the drawer the write
+    // started in (the user's drawer was closed and opened again meanwhile);
+    // a drawer of another user is left alone. Every read takes the next
+    // number in `reads`, and only the newest one draws, so a read that
+    // started before the write never draws over the one after it.
+    async function openDetail(name, ticket = drawerTicket(main), { refusal = null, last = null } = {}) {
+        const read = ++reads;
+        shown = { name, ticket, last };
+        let loaded;
         try {
-            [detail, personal] = await Promise.all([
-                api.get(`/users/${enc(name)}`), api.get(`/teams/${enc(name)}`)]);
-        } catch { return; }
-        if (!ticket.current()) return;
+            const [detail, personal, account] = await Promise.all([
+                api.get(`/users/${enc(name)}`), api.get(`/teams/${enc(name)}`), loadAccount(name)]);
+            loaded = { detail, personal, account, stale: false };
+        } catch {
+            if (!last) return;   // the first load: no drawer to keep (toasted)
+            loaded = { ...last, stale: true };
+        }
+        if (read !== reads || !ticket.current()) return;
+        const { detail, personal, account, stale } = loaded;
+        shown.last = { detail, personal, account };
         const { user, keys, codes } = detail;
         const reason = deleteReason(user, personal);
+        const changed = async refused => {
+            // An admin flag or session change of the signed-in user is
+            // shell state (the Administer group, the session itself).
+            if (name === store.session?.user) await refreshIdentity().catch(() => {});
+            if (main.isConnected) await load();
+            const view = shown;
+            if (view?.name === name && view.ticket.current()) {
+                await openDetail(name, view.ticket, { refusal: refused, last: view.last });
+            }
+        };
         const remove = h('button', {
             type: 'button', id: 'user-delete', class: 'danger', disabled: !manager || !!reason,
             onclick: async () => {
@@ -112,10 +153,13 @@ export async function render(main, rest) {
         }, 'Delete user');
         ticket.open(name, user.display_name || 'User',
             h('div', { id: 'user-detail' },
+                stale ? h('p', { id: 'user-stale', class: 'error small', role: 'status' },
+                    'Could not read this user again, so what is shown may be out of date.') : null,
                 h('p', {}, 'Personal team: ', h('code', {}, personal.name)),
                 h('dl', { class: 'facts' },
                     h('dt', {}, 'Teams'), h('dd', {}, user.teams.join(', ')),
                     h('dt', {}, 'Created'), h('dd', {}, when(user.created_at))),
+                accountSections({ detail, account, manager, refusal, changed }),
                 h('h3', {}, 'Keys and grants'),
                 h('ul', { class: 'grant-list', id: 'user-keys' }, keys.length
                     ? keys.map(key => h('li', {}, h('code', {}, key.name), ` ${key.kind}, ${key.access}`,

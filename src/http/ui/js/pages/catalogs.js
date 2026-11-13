@@ -11,6 +11,7 @@ import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
 import { namesOf, picker, assignControl } from '../components/picker.js';
 import { refreshIdentity, refreshUnassigned } from '../core/shell.js';
+import { guard, once, recheck } from '../core/pending.js';
 
 export async function render(main) {
     const admin = store.can('admin');
@@ -123,13 +124,16 @@ export async function render(main) {
             toast(`Deleted catalog ${row.name}.`, 'ok');
             await settled(ticket);
         });
+        const members = memberAccess(row, creator, ticket);
         ticket.open(row.name, `generation ${row.generation} - ${count(row.concepts, 'concept')}, ${count(row.files, 'file')}`,
             edit,
             owner,
+            members.section,
             h('section', { class: 'danger-zone' },
                 h('h3', {}, 'Delete'),
                 h('label', {}, force, ' Also discard unpublished changes (force)'),
                 remove));
+        await members.refresh();
     }
 
     // fill(), not native append: the note may be null (issue #302).
@@ -143,4 +147,99 @@ export async function render(main) {
             ? h('p', { class: 'muted small' }, 'Creating a catalog needs an admin key that reaches every catalog.')
             : null);
     await load();
+}
+
+// The member-access section the catalog drawer shows (or last showed):
+// {catalog, ticket, refresh, report}. See memberAccess.
+let shownMemberAccess = null;
+
+// The drawer's "Team member access": what members of the catalog's owner
+// team reach through their accounts (the ceiling's level for it; keys and
+// grants they create are capped at it). It is read from GET
+// /catalogs/{catalog}/member-access when the drawer opens and again after
+// every save, refused or not, so it always shows the server's value. A
+// refusal's reason stays in the section until the next save. A read that
+// fails keeps the last value, marked as possibly out of date, and leaves
+// the controls usable, so the save can be tried again. Changing it
+// needs `allowed` (an admin that reaches every catalog: the server's one
+// check is `may_set_member_access`). `ticket` is the drawer's claim: an
+// answer that arrives after the drawer was replaced or dismissed is
+// dropped. Returns the section and `refresh()`, which the caller runs once
+// the drawer is open.
+//
+// A save that settles updates the section the drawer shows now if it is
+// this catalog's, through that section's own ticket, even when the drawer
+// was closed and opened again while the save ran (`shownMemberAccess`); a
+// drawer of another catalog is left alone. Each section draws only its
+// newest read, so a read that started before the save never draws over
+// the one after it.
+function memberAccess(row, allowed, ticket) {
+    const path = `/catalogs/${enc(row.name)}/member-access`;
+    // The pending-write key (core/pending.js): a save in flight keeps these
+    // controls disabled, and those of a drawer reopened meanwhile too.
+    const key = `catalog:${row.name}:member-access`;
+    // Whether a read has finished, the server's value as last read (null
+    // until a read succeeds), and whether the latest read failed.
+    let loaded = false;
+    let value = null;
+    let stale = false;
+    const select = guard(h('select', { id: 'catalog-member-access-select', 'aria-label': 'Team member access' },
+        ['none', 'read', 'write'].map(option => h('option', { value: option }, option))), key, () => allowed && loaded);
+    const current = h('span', { id: 'catalog-member-access-current', class: 'mono' }, '...');
+    // Save is offered when the choice differs from the server's value, or
+    // always while that value is not known to be current.
+    const save = guard(h('button', { type: 'button', id: 'catalog-member-access-save' }, 'Save'), key,
+        () => allowed && loaded && (stale || select.value !== value));
+    const refusal = h('p', { id: 'catalog-member-access-error', class: 'error small', role: 'alert', hidden: true });
+    const sync = () => { recheck(select); recheck(save); };
+    select.addEventListener('change', sync);
+
+    let reads = 0;
+    async function refresh() {
+        const mine = ++reads;
+        let answer = null;
+        try { answer = await api.get(path); } catch { /* toasted */ }
+        if (mine !== reads || !ticket.current()) return;
+        loaded = true;
+        stale = answer === null;
+        if (!stale) {
+            value = answer.member_access;
+            select.value = value;
+        }
+        current.textContent = `${value ?? 'unknown'}${stale ? ' (could not be read again, may be out of date)' : ''}`;
+        sync();
+    }
+
+    // Shows the reason a save was refused, or clears it (null).
+    const report = reason => {
+        refusal.textContent = reason ?? '';
+        refusal.hidden = reason === null;
+    };
+    const self = { catalog: row.name, ticket, refresh, report };
+    shownMemberAccess = self;
+
+    save.addEventListener('click', () => once(key, async () => {
+        let refused = null;
+        try {
+            const answer = await api.put(path, { access: select.value });
+            toast(`Members of ${row.owner_team ?? 'the owner team'} now reach ${answer.name} at ${answer.member_access}.`, 'ok');
+        } catch (error) {
+            refused = error.message;   // already toasted
+        }
+        const shown = shownMemberAccess;
+        const view = shown?.catalog === row.name && shown.ticket.current() ? shown : self;
+        view.report(refused);
+        await view.refresh();
+    }));
+
+    const section = h('section', { id: 'catalog-member-access' },
+        h('h3', {}, 'Team member access'),
+        h('p', { class: 'muted small' },
+            `What members of ${row.owner_team ?? 'its owner team'} reach through their accounts: `
+            + 'none, read or write. Their own keys and grants are capped at it.'),
+        h('p', { class: 'small' }, 'Now: ', current),
+        h('div', { class: 'inline-form' }, select, save),
+        refusal,
+        allowed ? null : h('p', { class: 'muted small' }, 'Changing it needs an admin key that reaches every catalog.'));
+    return { section, refresh };
 }

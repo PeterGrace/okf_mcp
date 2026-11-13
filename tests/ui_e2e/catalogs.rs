@@ -1,15 +1,18 @@
-//! Catalog administration and import/export in the console (M9 task 5).
+//! Catalog administration and import/export in the console (M9 task 5),
+//! and a catalog's team member access (M12 Task 15).
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use chrono::Utc;
 use okf_mcp::archive::{write_tarball, ExportFile};
 use okf_mcp::config::Config;
+use okf_mcp::store::ceiling::{self, MemberAccess};
 use okf_mcp::store::keys::Access;
-use okf_mcp::store::teams::{self, NewTeam};
+use okf_mcp::store::teams::{self, NewTeam, Role};
 use serde_json::json;
 
 use crate::harness::{drive, Ui};
+use crate::self_service::{console_base, login_server, EMAIL, PASSWORD};
 use crate::support::server::{files, TestServer, OWNER};
 
 const ALPHA: &str = "---\ntype: system\ntitle: Alpha\n---\n# Alpha\n\nAlpha.\n";
@@ -443,4 +446,127 @@ async fn an_admin_signed_in_with_a_password_imports_an_archive() {
     }
     let current = server.app.catalog("main").expect("main").current();
     assert_eq!(current.generation(), generation + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn member_access_read_makes_a_team_catalog_read_only_for_its_members() {
+    let server = login_server().await;
+    server.user_with_password("alice", EMAIL, PASSWORD).await;
+    let pool = &server.db.pool;
+    let family = NewTeam {
+        name: "family",
+        display_name: "",
+        owner: OWNER,
+    };
+    teams::create(pool, &family, Utc::now())
+        .await
+        .expect("create a team");
+    teams::set_member(pool, "family", "alice", Role::Member, Utc::now())
+        .await
+        .expect("add alice");
+    okf_mcp::store::catalogs::create(pool, "shared", "", "family", Utc::now())
+        .await
+        .expect("create the team's catalog");
+    server.app.poll().await.expect("poll");
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let ran = drive(console_base(&server), move |ui| {
+        ui.login(&admin);
+        ui.open("/catalogs");
+        ui.click("[data-catalog=shared]");
+        ui.wait_text("#catalog-member-access-current", "write");
+        // Nothing to save until the choice differs from the server's value.
+        ui.wait_visible("#catalog-member-access-save[disabled]");
+        // A refused save: its reason stays in the drawer, the value is read
+        // again (still write), and the drawer stays usable.
+        // The console has no control a full admin can get refused through,
+        // so the page's fetch answers this one.
+        ui.fail_next("PUT", "/member-access", 409, "refused by the test");
+        ui.select("#catalog-member-access-select", "read");
+        ui.click("#catalog-member-access-save");
+        ui.wait_visible("#catalog-member-access-error");
+        ui.wait_text("#catalog-member-access-error", "refused by the test");
+        ui.wait_text("#catalog-member-access-current", "write");
+        ui.wait_visible("#catalog-member-access-select:not([disabled])");
+        // Refused again, and the read after it fails too: the reason stays,
+        // the last value is marked out of date, and Save can be tried again.
+        ui.fail_next("PUT", "/member-access", 409, "refused again");
+        ui.fail_next("GET", "/member-access", 503, "the server is unavailable");
+        ui.select("#catalog-member-access-select", "read");
+        ui.click("#catalog-member-access-save");
+        ui.wait_text("#catalog-member-access-error", "refused again");
+        ui.wait_text("#catalog-member-access-current", "may be out of date");
+        ui.wait_visible("#catalog-member-access-select:not([disabled])");
+        ui.wait_visible("#catalog-member-access-save:not([disabled])");
+        // Then a real one.
+        ui.select("#catalog-member-access-select", "read");
+        ui.click("#catalog-member-access-save");
+        ui.wait_text("#toasts", "now reach shared at read");
+        ui.wait_hidden("#catalog-member-access-error");
+        ui.wait_text_gone("#catalog-member-access-current", "out of date");
+        // A save that settles after the drawer was closed and opened again
+        // shows in the new drawer.
+        ui.hold_next("PUT", "/member-access");
+        ui.select("#catalog-member-access-select", "write");
+        ui.click("#catalog-member-access-save");
+        ui.click("#drawer-close");
+        ui.click("[data-catalog=shared]");
+        ui.wait_text("#catalog-member-access-current", "read");
+        ui.wait_visible("#catalog-member-access-select[disabled]");
+        ui.release_held();
+        ui.wait_text("#catalog-member-access-current", "write");
+        ui.wait_visible("#catalog-member-access-select:not([disabled])");
+        // Back to read for alice, below.
+        ui.select("#catalog-member-access-select", "read");
+        ui.click("#catalog-member-access-save");
+        ui.wait_text_gone("#catalog-member-access-current", "write");
+        ui.wait_text("#catalog-member-access-current", "read");
+        // The drawer stays open and shows the value read again.
+        ui.wait_text("#catalog-member-access-current", "read");
+        ui.wait_visible("#catalog-member-access-save[disabled]");
+        ui.click("#drawer-close");
+        ui.click("#signout");
+        ui.wait_visible("#login");
+        // alice reaches the team's catalog read-only.
+        ui.sign_in_password(EMAIL, PASSWORD);
+        ui.open("/my-keys");
+        ui.click("#my-key-new");
+        ui.wait_visible("#my-key-form");
+        assert_eq!(
+            ui.eval(
+                "() => [...document.querySelectorAll('#my-key-form select[name=level-shared] option')] \
+                 .map(option => option.value)",
+                json!(null)
+            ),
+            json!(["read"])
+        );
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let access = ceiling::member_access(&server.db.pool, "shared")
+        .await
+        .expect("read member access");
+    assert_eq!(access, MemberAccess::Read);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scoped_admin_cannot_change_member_access() {
+    let server = server().await;
+    let scoped = server
+        .key("console-scoped", Access::Admin, &["main"], Some("main"))
+        .await;
+    drive(server.base.clone(), move |ui| {
+        ui.login(&scoped);
+        ui.open("/catalogs");
+        ui.click("[data-catalog=main]");
+        // Read, but not changeable.
+        ui.wait_text("#catalog-member-access-current", "write");
+        ui.wait_visible("#catalog-member-access-select[disabled]");
+        ui.wait_visible("#catalog-member-access-save[disabled]");
+        ui.wait_text("#catalog-member-access", "every catalog");
+        // The page itself carries no stray "null" under the table.
+        assert!(!ui.text("#main").contains("null"));
+    })
+    .await;
 }

@@ -164,7 +164,7 @@ The research notes with crate file:line citations are in the session scratchpad.
   - `db.rs:76` lists every public table.
   - `src/http/api/testing.rs::send` sends only a bearer header.
   - `tests/ui_e2e/harness.rs` has `Ui::{open, login, wait_visible, wait_text, click, fill, select, eval}`.
-  - The `hold_next` fetch wrapper is local to `tests/ui_e2e/keys.rs`.
+  - The `hold_next` fetch wrapper is local to `tests/ui_e2e/keys.rs`. **Corrected (issue #326, 2026-11-13):** it moved to `tests/ui_e2e/harness.rs` as `Ui::hold_next`, `Ui::held_matches` and `Ui::release_held`, beside `Ui::fail_next`.
 
 ## Conventions for every task
 
@@ -23583,6 +23583,8 @@ Routes this task calls (all defined in Task 12, with the shapes Task 12 document
 
 - [ ] **Step 1: Write the failing user-drawer journeys.** Add to `tests/ui_e2e/users.rs` (new imports first):
 
+> **Corrected (issue #326, 2026-11-13).** What shipped in `tests/ui_e2e/users.rs` differs in four places. (1) A mail job's recipient is at `job -> 'mail' ->> 'to'` (Task 6's payload), not `job ->> 'to'`; the count is the `mail_jobs_to` helper. (2) A scoped admin's `/catalogs` lists only `main`, which alice already holds, so the drawer has no `#entitlement-form` at all; `a_scoped_admin_sees_the_sign_in_controls_disabled` checks `[data-test=entitlement-level-main][disabled]`, the email form's submit and `#user-account-readonly` instead. (3) A fifth journey, `clearing_the_last_admin_is_refused_with_the_reason_and_the_drawer_stays_usable`, covers the 409: the reason in a toast and in `#user-refusal`, the switch back on, and a following email change that succeeds and clears the refusal. (4) The sign-out journey uses three sessions and checks that the "Sign out everywhere" confirmation counts the two left (read again after the first sign-out). Toasts quote the server's answers (`Queued a setup email to <email>`, `<name> now has write on other.`, `Signed alice out of 2 console sessions.`).
+
 ```rust
 use std::time::Duration;
 
@@ -23875,6 +23877,8 @@ async fn a_scoped_admin_cannot_change_member_access() {
 
 - [ ] **Step 3: Write the failing Settings journeys.** Create `tests/ui_e2e/settings.rs`:
 
+> **Corrected (issue #326, 2026-11-13).** `failed_mail`'s `UPDATE` matches `job -> 'mail' ->> 'to'`, as above. The override journey also checks the inline reason (`[data-test=setting-error-max_keys_per_user]`) and reads the setting back through `GET /api/v1/settings` after each save; the mail journey checks that the new test mail is listed and, after the journey, that the retried mail is `pending` and the test mail is queued; the scoped-admin journey also checks a failed mail's Retry and Delete are disabled. Read `tests/ui_e2e/settings.rs`.
+
 ```rust
 //! The Settings page (M12 Task 15): a policy override and its reset, a
 //! refused value, the read-only mail provider, Send test email, and the
@@ -24056,6 +24060,8 @@ Expected: FAIL: the new user journeys time out on `#user-invite`, the member-acc
 
 - [ ] **Step 5: Create `js/components/user-account.js`.**
 
+> **Superseded (issue #326, 2026-11-13).** Read `src/http/ui/js/components/user-account.js`. What changed: `accountSections` also takes `refusal` (the previous action's refused reason, drawn as `#user-refusal` until the next action) and shows `#user-account-readonly` for a scoped admin; `act(control, request, message)` disables the control while the request runs, toasts `message(answer)` built from the server's answer, and calls `changed(refusedReason)`; the sessions table is its own `sessionSection`. After review (PR #349): every write is a pending write in the new `core/pending.js` (`guard(el, key, allowed)`, `once(key, write)`), keyed `user:<name>:<what>`, so its controls are drawn disabled while it runs, even when drawn again; `sessionTable` (Task 14a's `components/activity.js`) keys each Sign out `<scope>:<id_prefix>` (new `scope` option); and `openDetail` takes `{ refusal, last }`, drawing a re-render whose read failed from `last`, marked `#user-stale`. A settled write re-renders the drawer that shows its user now (`shown`), and only the newest read draws (`reads`); member access does the same through `shownMemberAccess`, and Settings numbers its list and queue loads.
+
 ```js
 // The account parts of a user's drawer (M12): sign-in (email, admin flag,
 // Send setup email), entitlements (catalogs beyond the user's teams'), the
@@ -24224,6 +24230,8 @@ In `render`, give the Name column the admin pill and add an Email column after D
 
 Replace `openDetail` with:
 
+> **Corrected (issue #326, 2026-11-13).** Shipped as `openDetail(name, ticket = drawerTicket(main), { refusal = null, last = null } = {})`: `changed(refused)` re-renders with `{ refusal: refused, last: { detail, personal, account } }`, and a re-render that cannot read the user again draws `last`, marked stale (`#user-stale`), so the refusal still shows and the controls work.
+
 ```js
     // The drawer: the user's teams, the credentials this key manages, the
     // account sections (sign-in, entitlements, sessions, sign-ins), and
@@ -24293,6 +24301,8 @@ and extend the shell import to `import { canAdministerPeople, keyUserChanged, re
 
 - [ ] **Step 7: Team member access in `pages/catalogs.js`.** `GET /api/v1/catalogs` does not carry member access; the drawer reads it from Task 12's `GET /api/v1/catalogs/{catalog}/member-access`. In `openEdit`, build the section after `owner` and pass it to `ticket.open` between `owner` and the danger zone:
 
+> **Superseded (issue #326, 2026-11-13).** The section is a module function, `memberAccess(row, allowed, ticket)` in `src/http/ui/js/pages/catalogs.js`, returning `{ section, refresh }`; `openEdit` runs `refresh()` after `ticket.open`. A save no longer closes the drawer: refused or not, the value is read again from `GET /catalogs/{catalog}/member-access` (dropped once the ticket is stale), and a refusal's reason stays in `#catalog-member-access-error`. The read is not `quiet`, so a failure is toasted. The journey checks the new value in the open drawer and `ceiling::member_access` afterwards.
+
 ```js
         // What members of the owner team reach through their accounts: the
         // ceiling's level for this catalog (keys and grants they create are
@@ -24348,6 +24358,8 @@ and extend the shell import to `import { canAdministerPeople, keyUserChanged, re
 > **Corrected (issue #324, 2026-11-13).** Task 14a already fixed this page's stray `null` (issue #302): `render` ends with `fill(main, ...)`, which drops the conditional note. Leave it as it is.
 
 - [ ] **Step 8: Create `js/pages/settings.js`.**
+
+> **Superseded (issue #326, 2026-11-13).** Read `src/http/ui/js/pages/settings.js`. What changed: the page renders with `fill`; a refusal's reason stays beside its control (`[data-test=setting-error-<key>]`, `[data-test=mail-test-error]`, `[data-test=mail-refusal-<id>]`) until that control's next success; the queue's statuses are Task 12's `pending|sending|retrying|failed`, Retry shows for `retrying` and `failed` (what `queue::retry` takes), Delete is disabled while `sending` (`queue::delete` refuses it), and "Next try" shows for `pending` and `retrying`; `mail.from` is always a string; toasts quote the server's answers.
 
 ```js
 // Settings (admin): the policy settings (each its effective value, and
