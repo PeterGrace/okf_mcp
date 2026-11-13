@@ -247,4 +247,65 @@ mod tests {
         let (status, _) = send(&test, "DELETE", &uri, Some(&keys.write), None).await;
         assert_eq!(status.as_u16(), 409);
     }
+
+    /// M13 Task 3: the changeset routes resolve a handle through the
+    /// tools' `ToolContext::changeset`, so a suspended catalog's changeset
+    /// is refused to its non-admin owner with `Suspended`, stays unknown to
+    /// a key that does not reach it, and still answers an admin.
+    #[tokio::test]
+    async fn changeset_routes_refuse_a_suspended_catalog_but_to_an_admin() {
+        use crate::http::api::testing::{assert_answers, Expect};
+        use crate::mcp::testing::suspend_catalogs;
+        let test = app().await;
+        let keys = keys(&test).await;
+        let writers = open_as(&test, &keys.write, "systems/gamma.md").await;
+        let admins = open_as(&test, &keys.admin, "systems/delta.md").await;
+        suspend_catalogs(&test, &["main"]).await;
+        let diff = format!("/api/v1/changesets/{writers}/diff");
+        let mine = format!("/api/v1/changesets/{writers}");
+        let theirs = format!("/api/v1/changesets/{admins}");
+        let expect = |method, uri, who, key, status, error| Expect {
+            method,
+            uri,
+            body: None,
+            key,
+            who,
+            status,
+            error,
+        };
+
+        assert_answers(
+            &test,
+            &[
+                expect("GET", &diff, "write", &keys.write, 403, Some("Suspended")),
+                expect(
+                    "GET",
+                    &diff,
+                    "stranger",
+                    &keys.stranger,
+                    404,
+                    Some("UnknownChangeset"),
+                ),
+                expect("GET", &diff, "admin", &keys.admin, 200, None),
+                expect(
+                    "DELETE",
+                    &mine,
+                    "write",
+                    &keys.write,
+                    403,
+                    Some("Suspended"),
+                ),
+                expect(
+                    "DELETE",
+                    &theirs,
+                    "stranger",
+                    &keys.stranger,
+                    404,
+                    Some("UnknownChangeset"),
+                ),
+                expect("DELETE", &theirs, "admin", &keys.admin, 200, None),
+            ],
+        )
+        .await;
+    }
 }

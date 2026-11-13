@@ -208,3 +208,150 @@ pub(crate) async fn maintenance_close(
     .map_err(missing_record)?;
     Ok(MaintenanceResult::new(state.name(), result))
 }
+
+/// M13 Task 3: every maintenance work tool checks access through
+/// `Principal::require` before it reads its ids, so a suspended catalog is
+/// refused to a non-admin reporter with `Suspended`, stays unknown to a
+/// reporter that does not reach it, and still answers an admin.
+#[cfg(test)]
+mod suspension_tests {
+    use super::*;
+
+    use crate::config::Config;
+    use crate::maintenance::types::{Assessment, WorkOutcome};
+    use crate::mcp::testing::{
+        app_with, cached_principal, context, stored_secret, suspend_catalogs, TestApp,
+    };
+
+    /// Each work tool on `catalog` as the key behind `secret`, as `(tool,
+    /// error kind or "ok")`. The ids are made up: access is checked first.
+    async fn every_tool(
+        test: &TestApp,
+        secret: &str,
+        catalog: &str,
+    ) -> Vec<(&'static str, String)> {
+        fn outcome<T>(result: Result<T, OkfError>) -> String {
+            result.map_or_else(|error| error.kind().to_string(), |_| "ok".to_string())
+        }
+        let ctx = context(test, cached_principal(test, secret), None);
+        let catalog = catalog.to_string();
+        let submission = Submission {
+            outcome: WorkOutcome::Completed,
+            assessment: Assessment::NotAssessed,
+            summary: "Nothing to report.".to_string(),
+            evidence: Vec::new(),
+            findings: Vec::new(),
+            reported_tokens: None,
+        };
+        vec![
+            (
+                "maintenance_claim",
+                outcome(
+                    maintenance_claim(
+                        &ctx,
+                        MaintenanceClaimParams {
+                            catalog: catalog.clone(),
+                            idempotency_key: "claim".to_string(),
+                            batch_size: Some(1),
+                        },
+                    )
+                    .await,
+                ),
+            ),
+            (
+                "maintenance_renew",
+                outcome(
+                    maintenance_renew(
+                        &ctx,
+                        MaintenanceRenewParams {
+                            catalog: catalog.clone(),
+                            work_id: "no-such-work".to_string(),
+                            token: "no-such-token".to_string(),
+                            idempotency_key: "renew".to_string(),
+                        },
+                    )
+                    .await,
+                ),
+            ),
+            (
+                "maintenance_read_revision",
+                outcome(
+                    maintenance_read_revision(
+                        &ctx,
+                        MaintenanceReadRevisionParams {
+                            catalog: catalog.clone(),
+                            path: "a.md".to_string(),
+                            revision: 1,
+                        },
+                    )
+                    .await,
+                ),
+            ),
+            (
+                "maintenance_submit",
+                outcome(
+                    maintenance_submit(
+                        &ctx,
+                        MaintenanceSubmitParams {
+                            catalog: catalog.clone(),
+                            work_id: "no-such-work".to_string(),
+                            token: "no-such-token".to_string(),
+                            idempotency_key: "submit".to_string(),
+                            submission,
+                        },
+                    )
+                    .await,
+                ),
+            ),
+            (
+                "maintenance_close",
+                outcome(
+                    maintenance_close(
+                        &ctx,
+                        MaintenanceCloseParams {
+                            catalog,
+                            run_id: "no-such-run".to_string(),
+                            state: RunState::Cancelled,
+                            rationale: "Stop.".to_string(),
+                            idempotency_key: "close".to_string(),
+                        },
+                    )
+                    .await,
+                ),
+            ),
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_work_tool_refuses_a_suspended_catalog_but_to_an_admin() {
+        let note = "---\ntype: Note\ntitle: A\ndescription: A note.\n---\n# A\n";
+        let test = app_with(
+            &[("pg", &[("a.md", note)]), ("other", &[])],
+            Config::default(),
+        )
+        .await;
+        let reporter = stored_secret(&test, "reporter", Access::Write, &["pg"], true).await;
+        let stranger = stored_secret(&test, "stranger", Access::Write, &["other"], true).await;
+        let root = stored_secret(&test, "root", Access::Admin, &[], true).await;
+        suspend_catalogs(&test, &["pg"]).await;
+
+        let suspended = every_tool(&test, &reporter, "pg").await;
+        let strangers = every_tool(&test, &stranger, "pg").await;
+        let admins = every_tool(&test, &root, "pg").await;
+
+        for (tool, kind) in &suspended {
+            assert_eq!(kind, "Suspended", "{tool} as the catalog's reporter");
+        }
+        for (tool, kind) in &strangers {
+            assert_eq!(
+                kind, "CatalogNotSelected",
+                "{tool}: an unreached catalog never reads as suspended"
+            );
+        }
+        for (tool, kind) in &admins {
+            assert_ne!(kind, "Suspended", "{tool} as an admin");
+        }
+        assert_eq!(admins[0].1, "ok", "an admin still claims");
+        assert_eq!(admins[2].1, "ok", "an admin still reads a revision");
+    }
+}

@@ -497,4 +497,64 @@ mod tests {
             .as_str()
             .is_some_and(|path| path.starts_with('/')));
     }
+
+    /// M13 Task 3: every maintenance route refuses a suspended catalog to a
+    /// non-admin key with `Suspended` (after the level check), answers an
+    /// admin as before, and still answers 404 to a key that does not reach it.
+    #[tokio::test]
+    async fn maintenance_routes_refuse_a_suspended_catalog_but_to_an_admin() {
+        use crate::http::api::testing::{assert_answers, Expect};
+        use crate::mcp::testing::suspend_catalogs;
+        let test = app().await;
+        let keys = keys(&test).await;
+        let (run, finding) = seed(&test).await;
+        suspend_catalogs(&test, &["main"]).await;
+        let reads = [
+            format!("{BASE}/runs"),
+            format!("{BASE}/runs/{run}"),
+            format!("{BASE}/findings"),
+            format!("{BASE}/findings?disposition=open"),
+            format!("{BASE}/findings/{finding}"),
+            format!("{BASE}/counts"),
+        ];
+        let dispose = format!("{BASE}/findings/{finding}/disposition");
+        let body = || Some(dispose_body("needs_input", "Ask the owner.", "suspended"));
+        let mut expected = Vec::new();
+        for uri in &reads {
+            for (who, key, status, error) in [
+                ("read", &keys.read, 403, Some("Suspended")),
+                ("write", &keys.write, 403, Some("Suspended")),
+                ("stranger", &keys.stranger, 404, Some("CatalogNotSelected")),
+                ("admin", &keys.admin, 200, None),
+            ] {
+                expected.push(Expect {
+                    method: "GET",
+                    uri,
+                    body: None,
+                    key,
+                    who,
+                    status,
+                    error,
+                });
+            }
+        }
+        for (who, key, status, error) in [
+            ("read", &keys.read, 403, Some("Forbidden")),
+            ("write", &keys.write, 403, Some("Suspended")),
+            ("stranger", &keys.stranger, 404, Some("CatalogNotSelected")),
+            ("admin", &keys.admin, 200, None),
+        ] {
+            expected.push(Expect {
+                method: "POST",
+                uri: &dispose,
+                body: body(),
+                key,
+                who,
+                status,
+                error,
+            });
+        }
+
+        assert_answers(&test, &expected).await;
+    }
 }

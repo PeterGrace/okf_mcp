@@ -246,6 +246,7 @@ mod tests {
             actor: "a".to_string(),
             kind: CredentialKind::ApiKey,
             user: None,
+            suspended: Default::default(),
         }
     }
 
