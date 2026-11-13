@@ -20,7 +20,7 @@
 
 - Branch per task from `main`, one PR per task, linked to its sub-issue. Follow `AGENTS.md` (review rounds, keeping branches current, `tools/agentic/`).
 - TDD: write the failing test, run it, implement, run it, commit.
-- Gates only through `tools/agentic/gate.sh`: `fmt`, `lint` and `test` before every commit, plus `test-ui` for Task 7. Use `gate.sh narrow <cargo test args>` while iterating.
+- Gates only through `tools/agentic/gate.sh`: `fmt`, `lint` and `test` before every commit, plus `test-ui` for Task 7. Use `gate.sh narrow <cargo test args>` while iterating; it passes its arguments straight to `cargo test`, which takes **one** test-name filter per run, so run several filters as several commands.
 - Comments for a Python-expert, Rust-novice reader on Rust-specific constructs, as in the existing code. Every public item gets a doc comment with `# Arguments`, `# Returns` and `# Errors`. No `.unwrap()` outside tests.
 - One changelog entry per task, `changelog/<UTC ts>-m13-task-<NN>-<slug>.md` (timestamp from `date -u +%Y-%m-%dT%H-%M-%SZ`), with `## Added`, `## Changed` and `## Notes`. Task 8 also writes the milestone changelog.
 - The code in this plan has not been compiled. If an implementation has to differ, fix this plan in the same PR (inline, or with a dated `> **Corrected (issue #N).**` note), then grep later tasks for the changed symbol.
@@ -35,6 +35,7 @@ Checked against `origin/main` at `9a84af6` (v0.15.0) on 2026-11-13.
 - MCP reads never call `require`: they pick catalogs with `selection::resolve`, whose `available` closure is `exists(name) && principal.reaches(name)` (`src/selection.rs:182-188`). `ToolContext::select` and `states` wrap it (`src/mcp/context.rs`), and REST browse, health and report routes run tools through a `ToolContext`.
 - Changeset writes and publish go through `ToolContext::pinned`, which calls `principal.require(access, ..)` (`src/mcp/context.rs:384`); `open_changeset` calls `require(Access::Write, ..)` (`src/mcp/changesets.rs:235`).
 - Export checks `principal.require(Access::Read, &name)` (`src/http/archives.rs:110`); `/api/v1/catalogs/{c}/export` uses the same handler.
+- `list_changesets` without a `catalog` enumerates catalogs with `ctx.offers` (reach and connection scope only) after `ctx.check_connection()` (`src/mcp/changesets.rs:114-125`, `src/mcp/context.rs:144-145`); `GET /api/v1/changesets` runs the same function (`src/http/api/changesets.rs:52-60`). `ctx.one(Some(name))` resolves through `resolve`.
 - The REST search over every reached catalog filters with `principal.reaches` and passes the names as the argument (`src/http/api/search.rs:72-79`), so without Task 4's filter one suspended catalog would refuse the whole search.
 - The key cache is rebuilt whole by `KeyCache::read`, a `tokio::try_join!` of three loads (`src/auth.rs:415-427`), when `admin_generation` moves (`src/app.rs:428`). Team writes bump it with `bump_admin_generation(&mut tx)` (`src/store/catalogs.rs:346`), and the REST team handlers then call `settle(&app)`, which polls at once (`src/http/api/mod.rs:159`).
 - Console session principals are built per request by `Principal::for_session(&user, ceiling)` (`src/http/console_session.rs:267-277`).
@@ -102,6 +103,7 @@ Checked against `origin/main` at `9a84af6` (v0.15.0) on 2026-11-13.
 | `src/http/api/search.rs` | Leave suspended catalogs out of "every catalog" | 4 |
 | `src/mcp/catalogs.rs` | `SuspensionInfo`, `CatalogInfo.suspended` | 4 |
 | `src/http/api/catalogs.rs` | `CatalogSummary.suspended` | 4 |
+| `src/mcp/changesets.rs` | `list_changesets` leaves suspended catalogs out | 4 |
 | `src/http/api/people.rs` | The suspension route; `TeamView` fields | 1 (pattern), 5 |
 | `src/cli.rs`, `src/cli/people.rs` | `team suspend`, `team unsuspend`; list column | 6 |
 | `tests/admin_parity.rs` | Two covered subcommands | 6 |
@@ -506,7 +508,7 @@ And in `src/http/mod.rs`'s tests, next to the existing status checks:
 
 - [ ] **Step 2: Run and see them fail**
 
-Run: `tools/agentic/gate.sh narrow --lib error::tests http::tests`
+Run: `tools/agentic/gate.sh narrow --lib error::tests`, then `tools/agentic/gate.sh narrow --lib http::tests` (`cargo test` takes one filter per run)
 Expected: compile error, no variant `Suspended`.
 
 - [ ] **Step 3: Implement**
@@ -566,7 +568,7 @@ Check the MCP tool-error mapping (`src/mcp/mod.rs`, which turns `OkfError` into 
 
 - [ ] **Step 4: Run the tests**
 
-Run: `tools/agentic/gate.sh narrow --lib error::tests http::tests`
+Run: `tools/agentic/gate.sh narrow --lib error::tests`, then `tools/agentic/gate.sh narrow --lib http::tests`
 Expected: PASS.
 
 - [ ] **Step 5: Gates and commit**
@@ -824,7 +826,7 @@ git commit -m "feat(auth): suspended teams' catalogs refuse non-admin credential
 ### Task 4: Selection, REST search and listing
 
 **Files:**
-- Modify: `src/selection.rs`, `src/http/api/search.rs`, `src/mcp/catalogs.rs`, `src/http/api/catalogs.rs`
+- Modify: `src/selection.rs`, `src/http/api/search.rs`, `src/mcp/catalogs.rs`, `src/http/api/catalogs.rs`, `src/mcp/changesets.rs`
 
 - [ ] **Step 1: Write the failing selection tests** (in `src/selection.rs`'s `mod tests`; the module's `principal` helper gains `suspended`)
 
@@ -1076,6 +1078,56 @@ Mention suspension in the tool's `description` (one clause: "a catalog whose tea
 
 If the conversion appears twice, add `impl From<&SuspendedCatalog> for SuspensionInfo` in `src/mcp/catalogs.rs` and use `.map(SuspensionInfo::from)` in both places.
 
+- [ ] **Step 5b: Changeset listing** (`src/mcp/changesets.rs` `list_changesets`, which `GET /api/v1/changesets` also runs)
+
+Without a `catalog` argument it enumerates every catalog `ctx.offers`, which checks only reach and the connection list, so it would bypass both choke points (review of PR #360). Leave suspended catalogs out there too; with `catalog` named, `ctx.one` already goes through `resolve` and refuses it:
+
+```rust
+        None => {
+            // A list naming a bad catalog fails here as it does elsewhere.
+            ctx.check_connection()?;
+            ctx.catalogs()
+                .values()
+                // A suspended team's catalog shows no changesets (M13): its
+                // handles and paths are part of what suspension withholds.
+                .filter(|state| {
+                    ctx.offers(state.name())
+                        && principal.check_not_suspended(state.name()).is_ok()
+                })
+                .map(|state| state.id())
+                .collect()
+        }
+```
+
+Tests, in `src/mcp/changesets.rs`'s tests (built like Step 6's: `main` owned by the suspended `TEST_TEAM`, `other` moved to an active team `family`, and a `write` principal given the cache's map). Open one changeset in each catalog before suspending, then:
+
+```rust
+        // No connection list: only the active catalog's changeset is listed.
+        let listed = list_changesets(&context(&test, Arc::clone(&writer), None), ListParams { catalog: None })
+            .await
+            .unwrap();
+        assert_eq!(catalogs_of(&listed), ["other"]);
+
+        // A mixed connection list: the same.
+        let mixed = list_changesets(
+            &context(&test, Arc::clone(&writer), Some(&["main", "other"])),
+            ListParams { catalog: None },
+        )
+        .await
+        .unwrap();
+        assert_eq!(catalogs_of(&mixed), ["other"]);
+
+        // Naming the suspended catalog is refused.
+        let named = list_changesets(
+            &context(&test, Arc::clone(&writer), None),
+            ListParams { catalog: Some("main".to_string()) },
+        )
+        .await;
+        assert!(matches!(named, Err(OkfError::Suspended { .. })));
+```
+
+where `catalogs_of` collects each listed changeset's catalog name (use the field `Listed`'s rows carry; see the existing `list_changesets` tests). Task 5's member test adds the REST case: with the `write` key from `keys()`, open a changeset on `main` before suspending (as the existing REST changeset tests do), then `GET /api/v1/changesets` lists none and `GET /api/v1/changesets?catalog=main` is 403 `Suspended`.
+
 - [ ] **Step 6: A tool-level test** (in `src/mcp/catalogs.rs`'s tests, or create a `mod tests` there following `src/mcp/search.rs`'s):
 
 ```rust
@@ -1125,10 +1177,10 @@ If the conversion appears twice, add `impl From<&SuspendedCatalog> for Suspensio
 
 - [ ] **Step 7: Run, gate, commit**
 
-Run: `tools/agentic/gate.sh narrow --lib selection::tests mcp::catalogs`, then `tools/agentic/gate.sh test`.
+Run: `tools/agentic/gate.sh narrow --lib selection::tests`, `tools/agentic/gate.sh narrow --lib mcp::catalogs` and `tools/agentic/gate.sh narrow --lib mcp::changesets` (one filter per run), then `tools/agentic/gate.sh test`.
 
 ```bash
-git add src/selection.rs src/http/api/search.rs src/mcp/catalogs.rs src/http/api/catalogs.rs changelog/
+git add src/selection.rs src/http/api/search.rs src/mcp/catalogs.rs src/http/api/catalogs.rs src/mcp/changesets.rs changelog/
 git commit -m "feat(selection): refuse named suspended catalogs, drop them from a connection's list; mark them in listings (M13 task 4)"
 ```
 
@@ -1225,7 +1277,7 @@ Import `TEST_TEAM` from `crate::db` and `keys` from `crate::http::api::testing` 
 
 - [ ] **Step 2: Run and see them fail**
 
-Run: `tools/agentic/gate.sh narrow --lib http::api::people::tests::suspension http::api::people::tests::a_member_of_a_suspended`
+Run: `tools/agentic/gate.sh narrow --lib http::api::people::tests::suspension`, then `tools/agentic/gate.sh narrow --lib http::api::people::tests::a_member_of_a_suspended` (one filter per run)
 Expected: 404/405 for the new route.
 
 - [ ] **Step 3: Implement**
@@ -1472,6 +1524,13 @@ async fn a_team_is_suspended_with_a_notice_shown_on_its_catalogs_then_lifted() {
         ui.click("#team-unsuspend");
         ui.wait_text("#toasts", &format!("Lifted the suspension of team {OWNER}."));
         ui.wait_hidden(&format!("[data-test=team-suspended-{OWNER}]"));
+        // Suspended without a notice: no notice paragraph, and never the
+        // text "null" (core/dom.js, issue #302).
+        ui.click("#team-suspend");
+        ui.click("#confirm-ok");
+        ui.wait_text("#team-suspension", "Suspended");
+        ui.wait_hidden("#team-suspension-notice");
+        ui.wait_text_gone("#team-suspension", "null");
     })
     .await;
 }
@@ -1529,11 +1588,16 @@ In `openDetail`, before `const reason = ...`, build the section:
 ```js
         // Suspension: its catalogs refuse every non-admin credential except
         // export until it is lifted. Same rule as the other team writes.
-        const suspension = h('section', { id: 'team-suspension' }, h('h3', {}, 'Suspension'));
+        // Every conditional child goes through h(), never the DOM's own
+        // append, which prints null as "null" (core/dom.js, issue #302).
+        const heading = h('h3', {}, 'Suspension');
+        let suspension;
         if (team.suspended_at) {
-            suspension.append(
+            suspension = h('section', { id: 'team-suspension' }, heading,
                 h('p', {}, `Suspended ${when(team.suspended_at)}.`),
-                team.suspension_notice ? h('p', { class: 'muted' }, team.suspension_notice) : null,
+                team.suspension_notice
+                    ? h('p', { class: 'muted', id: 'team-suspension-notice' }, team.suspension_notice)
+                    : null,
                 h('button', {
                     type: 'button', id: 'team-unsuspend', disabled: !manager,
                     onclick: async () => {
@@ -1560,11 +1624,11 @@ In `openDetail`, before `const reason = ...`, build the section:
                 try { updated = await api.put(`/teams/${enc(team.name)}/suspension`, { suspended: true, notice }); } catch { return; }
                 await changed(updated, `Suspended team ${team.name}.`, ticket);
             });
-            suspension.append(form);
+            suspension = h('section', { id: 'team-suspension' }, heading, form);
         }
 ```
 
-`fill` skips `null` children; `append` does not, so the notice paragraph uses `append` only when present. If `h` already drops `null` children (check `core/dom.js`), keep the code as written; otherwise build the list with `filter(Boolean)` first.
+`h()` drops `null` children (`core/dom.js:6-10`); the native `append` would print them as `"null"`, so the section is built with `h()` in both branches.
 
 Add `suspension` to `ticket.open(...)` after the Members section and before the `manager ? null : ...` note.
 
