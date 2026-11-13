@@ -99,10 +99,13 @@ fn idle_cutoff(now: DateTime<Utc>, idle: Duration) -> DateTime<Utc> {
 /// # Returns
 /// Open changesets, empty ones included, in the catalogs the connection
 /// offers ([`ToolContext::offers`]) or the one named: the key's own, and
-/// with `admin` every key's.
+/// with `admin` every key's. Without `catalog`, a catalog whose owner team
+/// is suspended is left out for a key below `admin` (M13).
 ///
 /// # Errors
-/// A selection error for `catalog`; [`OkfError::Database`].
+/// A selection error for `catalog` (including [`OkfError::Suspended`]), or
+/// for a connection list ([`ToolContext::check_connection`]: one whose
+/// every catalog is suspended is refused); [`OkfError::Database`].
 pub(crate) async fn list_changesets(
     ctx: &ToolContext,
     params: ListParams,
@@ -119,7 +122,12 @@ pub(crate) async fn list_changesets(
             ctx.check_connection()?;
             ctx.catalogs()
                 .values()
-                .filter(|state| ctx.offers(state.name()))
+                // A suspended team's catalog shows no changesets (M13): its
+                // handles and paths are part of what suspension withholds.
+                // `offers` (reach) is checked first.
+                .filter(|state| {
+                    ctx.offers(state.name()) && principal.check_not_suspended(state.name()).is_ok()
+                })
                 .map(|state| state.id())
                 .collect()
         }
@@ -3093,5 +3101,83 @@ mod suspension_tests {
         )
         .await;
         assert!(lifted.is_ok(), "lifting restores the key: {lifted:?}");
+    }
+
+    /// The catalogs of `listed`'s changesets, sorted, without repeats.
+    fn catalogs_of(listed: &Listed) -> Vec<&str> {
+        let mut names: Vec<&str> = listed
+            .changesets
+            .iter()
+            .map(|row| row.catalog.as_str())
+            .collect();
+        // Rows are ordered by key and age, not catalog; `dedup` drops only
+        // consecutive repeats, so sort first.
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// `list_changesets` without `catalog` enumerates catalogs itself
+    /// (`ctx.offers`), so it bypasses `resolve`: M13 Task 4 leaves suspended
+    /// catalogs out there, and naming one is refused through `resolve`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_changesets_leaves_a_suspended_catalog_out_but_to_an_admin() {
+        let test = app_with(
+            &[("pg", &[("a.md", NOTE)]), ("work", &[("a.md", NOTE)])],
+            Config::default(),
+        )
+        .await;
+        let writer = stored_secret(&test, "writer", Access::Write, &["pg", "work"], false).await;
+        let stranger = stored_secret(&test, "stranger", Access::Write, &["work"], false).await;
+        let root = stored_secret(&test, "root", Access::Admin, &[], false).await;
+        open_with_edit(&connect(&test, &writer), "pg").await;
+        open_with_edit(&connect(&test, &writer), "work").await;
+        let all = || ListParams { catalog: None };
+        let named = |catalog: &str| ListParams {
+            catalog: Some(catalog.to_string()),
+        };
+        let on = |secret: &str, connection: &[&str]| {
+            context(&test, cached_principal(&test, secret), Some(connection))
+        };
+
+        suspend_catalogs(&test, &["pg"]).await;
+        let plain = list_changesets(&connect(&test, &writer), all())
+            .await
+            .unwrap();
+        let mixed = list_changesets(&on(&writer, &["pg", "work"]), all())
+            .await
+            .unwrap();
+        let only_suspended = list_changesets(&on(&writer, &["pg"]), all()).await;
+        let refused = list_changesets(&connect(&test, &writer), named("pg")).await;
+        let unreached = list_changesets(&connect(&test, &stranger), named("pg")).await;
+        let admin = list_changesets(&connect(&test, &root), all())
+            .await
+            .unwrap();
+
+        assert_eq!(catalogs_of(&plain), ["work"], "no connection list");
+        assert_eq!(catalogs_of(&mixed), ["work"], "a mixed connection list");
+        assert!(
+            matches!(only_suspended, Err(OkfError::Suspended { ref catalog, .. }) if catalog == "pg"),
+            "a list of only suspended catalogs is refused: {only_suspended:?}"
+        );
+        assert!(
+            matches!(refused, Err(OkfError::Suspended { ref catalog, .. }) if catalog == "pg"),
+            "naming the suspended catalog: {refused:?}"
+        );
+        assert!(
+            matches!(unreached, Err(OkfError::CatalogNotSelected { .. })),
+            "a key that does not reach pg never learns: {unreached:?}"
+        );
+        assert_eq!(catalogs_of(&admin), ["pg", "work"], "an admin is exempt");
+
+        lift_suspension(&test).await;
+        let lifted = list_changesets(&connect(&test, &writer), all())
+            .await
+            .unwrap();
+        assert_eq!(
+            catalogs_of(&lifted),
+            ["pg", "work"],
+            "lifting restores them"
+        );
     }
 }

@@ -151,6 +151,46 @@ mod tests {
         }
     }
 
+    /// M13 Task 4: `GET /changesets` runs `list_changesets`, so a
+    /// suspended catalog's changesets are left out for a member key and
+    /// naming the catalog is a 403; an admin still lists them.
+    #[tokio::test]
+    async fn the_changeset_list_leaves_out_a_suspended_catalog_but_to_an_admin() {
+        use crate::http::api::testing::{assert_answers, Expect};
+        use crate::mcp::testing::suspend_catalogs;
+        let test = app().await;
+        let keys = keys(&test).await;
+        let writers = open_as(&test, &keys.write, "systems/gamma.md").await;
+        suspend_catalogs(&test, &["main"]).await;
+
+        let (status, members) =
+            send(&test, "GET", "/api/v1/changesets", Some(&keys.write), None).await;
+        let (_, admins) = send(&test, "GET", "/api/v1/changesets", Some(&keys.admin), None).await;
+
+        assert_eq!(status.as_u16(), 200, "{members}");
+        assert!(handles(&members).is_empty(), "{members}");
+        assert_eq!(handles(&admins), [writers]);
+        let named = "/api/v1/changesets?catalog=main";
+        let expect = |who, key, status, error| Expect {
+            method: "GET",
+            uri: named,
+            body: None,
+            key,
+            who,
+            status,
+            error,
+        };
+        assert_answers(
+            &test,
+            &[
+                expect("write", &keys.write, 403, Some("Suspended")),
+                expect("stranger", &keys.stranger, 404, Some("CatalogNotSelected")),
+                expect("admin", &keys.admin, 200, None),
+            ],
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn changeset_routes_follow_the_tools_access_rules() {
         let test = app().await;

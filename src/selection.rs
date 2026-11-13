@@ -8,6 +8,9 @@
 //! Without a connection list, the argument, else the key's default
 //! catalog, else the server's `default_catalog`, is the selection. Every
 //! name must exist and be reachable by the key: a list never grants.
+//!
+//! A suspended team's catalogs are refused when named and left out of a
+//! connection's list (milestone 13); admins are exempt.
 
 use axum::http::request::Parts;
 
@@ -157,6 +160,61 @@ fn checked<'a>(
     Ok(Selection { catalogs })
 }
 
+/// `selection` refused whole if any of its catalogs is suspended: for a
+/// call that named them (its argument, or the key's or server's default).
+///
+/// Every name in `selection` already passed the reach check, so a
+/// credential that does not reach a catalog never learns it is suspended.
+///
+/// # Arguments
+/// * `principal` - the calling key (an admin is never refused).
+/// * `selection` - the checked selection.
+///
+/// # Returns
+/// `selection`, unchanged.
+///
+/// # Errors
+/// [`OkfError::Suspended`] for the first suspended catalog.
+fn refuse_suspended(principal: &Principal, selection: Selection) -> Result<Selection, OkfError> {
+    for name in &selection.catalogs {
+        principal.check_not_suspended(name)?;
+    }
+    Ok(selection)
+}
+
+/// `selection` without its suspended catalogs: for a call that falls back
+/// to the connection's list, so one suspended team does not stop the rest.
+///
+/// # Arguments
+/// * `principal` - the calling key (an admin keeps every catalog).
+/// * `selection` - the checked connection list.
+///
+/// # Returns
+/// The catalogs that are not suspended, in order; never empty.
+///
+/// # Errors
+/// [`OkfError::Suspended`] for the first catalog, when every one is
+/// suspended (a selection is never empty).
+fn without_suspended(principal: &Principal, selection: Selection) -> Result<Selection, OkfError> {
+    let mut kept = Vec::with_capacity(selection.catalogs.len());
+    let mut first_refusal = None;
+    // `selection.catalogs` is moved out (no `&`), so each kept name is reused
+    // rather than copied.
+    for name in selection.catalogs {
+        match principal.check_not_suspended(&name) {
+            Ok(()) => kept.push(name),
+            // `get_or_insert` keeps the first refusal only.
+            Err(error) => {
+                first_refusal.get_or_insert(error);
+            }
+        }
+    }
+    match first_refusal {
+        Some(error) if kept.is_empty() => Err(error),
+        _ => Ok(Selection { catalogs: kept }),
+    }
+}
+
 /// Resolves a call's catalogs.
 ///
 /// A connection list is checked whole, even when the argument names a
@@ -176,7 +234,11 @@ fn checked<'a>(
 /// [`OkfError::CatalogNotSelected`] naming the first catalog that does not
 /// exist, that the key does not reach, or (in the argument) that the
 /// connection's list leaves out; [`OkfError::Refused`] if no source names a
-/// catalog.
+/// catalog; then [`OkfError::Suspended`] (for a credential below admin) for
+/// a named or default catalog whose owner team is suspended. A selection
+/// that falls back to the connection's list leaves suspended catalogs out
+/// instead, and is refused only when every listed catalog is suspended.
+/// Reach is always checked first.
 // `impl Fn(&str) -> bool`: any function or closure taking a name, like a
 // Python callable argument.
 pub fn resolve(
@@ -194,15 +256,18 @@ pub fn resolve(
     if let Some(connection) = set(sources.connection) {
         let scope = checked(connection.iter().map(String::as_str), available)?;
         return match argument {
-            None => Ok(scope),
+            None => without_suspended(principal, scope),
             // Every scope name is available, so membership is the whole check.
+            // `and_then` runs the suspension check only on an `Ok` selection.
             Some(list) => checked(list.iter().map(String::as_str), |name| {
                 scope.catalogs.iter().any(|listed| listed == name)
-            }),
+            })
+            .and_then(|selection| refuse_suspended(principal, selection)),
         };
     }
     if let Some(list) = argument {
-        return checked(list.iter().map(String::as_str), available);
+        return checked(list.iter().map(String::as_str), available)
+            .and_then(|selection| refuse_suspended(principal, selection));
     }
     // `as_deref`: `Option<String>` to `Option<&str>`, borrowing the name.
     match principal
@@ -210,7 +275,9 @@ pub fn resolve(
         .as_deref()
         .or(sources.server_default)
     {
-        Some(name) => checked([name], available),
+        Some(name) => {
+            checked([name], available).and_then(|selection| refuse_suspended(principal, selection))
+        }
         None => Err(OkfError::Refused {
             reason: "no catalog selected: pass `catalog`, set the X-OKF-Catalogs header \
                      or `?catalogs=` on the MCP URL, or give the key a default catalog"
@@ -227,7 +294,9 @@ mod tests {
     use crate::auth::{CredentialKind, Reach};
     use crate::store::keys::Access;
 
-    fn principal(reach: &[&str], default: Option<&str>) -> Principal {
+    /// A `read` key reaching `reach` (every catalog when empty), seeing each
+    /// of `suspended` as suspended, as the key cache would build it.
+    fn principal_with(reach: &[&str], default: Option<&str>, suspended: &[&str]) -> Principal {
         Principal {
             key_id: "k".to_string(),
             access: Access::Read,
@@ -246,7 +315,32 @@ mod tests {
             actor: "a".to_string(),
             kind: CredentialKind::ApiKey,
             user: None,
-            suspended: Default::default(),
+            suspended: std::sync::Arc::new(
+                suspended
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.to_string(),
+                            crate::store::teams::SuspendedCatalog {
+                                team: "family".to_string(),
+                                notice: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn principal(reach: &[&str], default: Option<&str>) -> Principal {
+        principal_with(reach, default, &[])
+    }
+
+    /// The name of the catalog a `Suspended` refusal names, or a panic.
+    fn suspended_name(refused: Result<Selection, OkfError>) -> String {
+        match refused {
+            Err(OkfError::Suspended { catalog, .. }) => catalog,
+            other => panic!("expected Suspended, got {other:?}"),
         }
     }
 
@@ -497,6 +591,160 @@ mod tests {
         assert_eq!(
             connection_catalogs(&garbled),
             Some(names(&["pg", "w\u{fffd}rk"]))
+        );
+    }
+
+    #[test]
+    fn a_named_suspended_catalog_is_refused() {
+        let key = principal_with(&[], Some("pg"), &["work"]);
+        let list = names(&["pg", "work"]);
+        let connection = names(&["pg", "work"]);
+        let named = Sources {
+            argument: Some(&list),
+            connection: None,
+            server_default: None,
+        };
+        let narrowed = Sources {
+            connection: Some(&connection),
+            ..named
+        };
+
+        assert_eq!(suspended_name(resolve(&key, named, exists)), "work");
+        assert_eq!(
+            suspended_name(resolve(&key, narrowed, exists)),
+            "work",
+            "an argument naming a suspended catalog on a connection is refused too"
+        );
+    }
+
+    #[test]
+    fn a_suspended_default_is_refused() {
+        let key = principal_with(&[], Some("work"), &["work"]);
+        let server = principal_with(&[], None, &["home"]);
+        let sources = Sources {
+            argument: None,
+            connection: None,
+            server_default: None,
+        };
+
+        assert_eq!(suspended_name(resolve(&key, sources, exists)), "work");
+        assert_eq!(
+            suspended_name(resolve(
+                &server,
+                Sources {
+                    server_default: Some("home"),
+                    ..sources
+                },
+                exists
+            )),
+            "home",
+            "the server's default is a named catalog too"
+        );
+    }
+
+    #[test]
+    fn the_connection_list_drops_suspended_catalogs() {
+        let key = principal_with(&[], None, &["pg"]);
+        let connection = names(&["pg", "work"]);
+        let sources = Sources {
+            argument: None,
+            connection: Some(&connection),
+            server_default: None,
+        };
+
+        let selection = resolve(&key, sources, exists).unwrap();
+
+        assert_eq!(selection.catalogs(), ["work"]);
+        assert_eq!(selection.write_target(), "work");
+    }
+
+    #[test]
+    fn a_connection_list_of_only_suspended_catalogs_is_refused() {
+        let key = principal_with(&[], None, &["pg", "work"]);
+        let connection = names(&["pg", "work"]);
+        let sources = Sources {
+            argument: None,
+            connection: Some(&connection),
+            server_default: None,
+        };
+
+        assert_eq!(suspended_name(resolve(&key, sources, exists)), "pg");
+    }
+
+    #[test]
+    fn an_unreached_suspended_catalog_is_not_selected_rather_than_suspended() {
+        // `work` is suspended, but this key reaches only `pg`.
+        let key = principal_with(&["pg"], Some("work"), &["work"]);
+        let list = names(&["work"]);
+        let connection = names(&["pg", "work"]);
+        let base = Sources {
+            argument: None,
+            connection: None,
+            server_default: None,
+        };
+        let cases = [
+            (
+                "argument",
+                Sources {
+                    argument: Some(&list),
+                    ..base
+                },
+            ),
+            ("default", base),
+            (
+                "connection",
+                Sources {
+                    connection: Some(&connection),
+                    ..base
+                },
+            ),
+        ];
+
+        for (source, sources) in cases {
+            let refused = resolve(&key, sources, exists);
+            assert!(
+                matches!(refused, Err(OkfError::CatalogNotSelected { ref catalog }) if catalog == "work"),
+                "{source}: an unreached catalog never reads as suspended: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_admin_selects_suspended_catalogs() {
+        let admin = Principal {
+            access: Access::Admin,
+            ..principal_with(&[], Some("pg"), &["pg", "work"])
+        };
+        let list = names(&["work"]);
+        let connection = names(&["pg", "work"]);
+        let base = Sources {
+            argument: None,
+            connection: None,
+            server_default: None,
+        };
+
+        assert_eq!(select(&admin, base).unwrap(), ["pg"]);
+        assert_eq!(
+            select(
+                &admin,
+                Sources {
+                    argument: Some(&list),
+                    ..base
+                }
+            )
+            .unwrap(),
+            ["work"]
+        );
+        assert_eq!(
+            select(
+                &admin,
+                Sources {
+                    connection: Some(&connection),
+                    ..base
+                }
+            )
+            .unwrap(),
+            ["pg", "work"]
         );
     }
 }
