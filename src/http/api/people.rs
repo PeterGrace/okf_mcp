@@ -11,7 +11,16 @@
 //!   admin can pick the user of a key it creates;
 //! - a user's detail shows only the keys, grants and codes the caller
 //!   manages (`api::keys`' rule), so it reveals no credential outside a
-//!   scoped admin's reach.
+//!   scoped admin's reach;
+//! - a user's sign-in controls (M12: admin flag, email, setup email,
+//!   entitlements, ending sessions) are writes like the rest; listing a
+//!   user's sessions and sign-ins is a read. The API never clears the last
+//!   admin user (plan Decision 16): only the CLI, with operator access, may.
+//!
+//! An admin console session reaches every catalog, so it passes the same
+//! checks as an every-catalog admin key; a non-admin session is below
+//! admin. No answer or log line holds a session id, token or hash: a
+//! session is shown by its id prefix only.
 //!
 //! Every write bumps the administrative generation; the handlers poll after
 //! it, so the next request sees the change.
@@ -20,22 +29,27 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::app::App;
 use crate::auth::Principal;
 use crate::clock::format_timestamp;
-use crate::http::api::keys::{manages, manages_grants, KeyView};
+use crate::error::OkfError;
+use crate::http::api::keys::{manages, manages_grants, parse_access, KeyView};
+use crate::http::api::me::{SessionList, SessionView, SignInList, SignInView, RECENT_SIGN_INS};
 use crate::http::api::oauth::SignInCodeView;
 use crate::http::api::{require_admin, require_every_catalog, settle};
 use crate::http::AppError;
-use crate::store::keys as key_rows;
+use crate::mail::invite;
+use crate::store::ceiling::{self, Entitlement};
+use crate::store::keys::{self as key_rows, Access};
 use crate::store::oauth::codes;
 use crate::store::teams::{self, MemberChange, NewTeam, Role, TeamRecord};
 use crate::store::unassigned;
 use crate::store::users::{self, NewUser, UserRecord};
+use crate::store::{sign_in_events, user_sessions};
 
 /// One user as the API shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -102,6 +116,72 @@ pub(crate) struct UserDetail {
     pub keys: Vec<KeyView>,
     /// Its sign-in codes that the caller manages, in every state.
     pub codes: Vec<SignInCodeView>,
+    /// The catalogs it may reach beyond its teams', by catalog.
+    pub entitlements: Vec<EntitlementView>,
+}
+
+/// One entitlement: a catalog given to a user beyond its teams' catalogs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct EntitlementView {
+    /// The catalog.
+    pub catalog: String,
+    /// `read` or `write`.
+    pub access: &'static str,
+    /// When it was first given.
+    pub created_at: String,
+}
+
+impl From<Entitlement> for EntitlementView {
+    fn from(entitlement: Entitlement) -> Self {
+        let Entitlement {
+            catalog,
+            access,
+            created_at,
+        } = entitlement;
+        Self {
+            catalog,
+            access: access.as_str(),
+            created_at: format_timestamp(created_at),
+        }
+    }
+}
+
+/// The entitlement routes' answer: the user's entitlements as they now are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Entitlements {
+    /// The user.
+    pub name: String,
+    /// Its entitlements, by catalog.
+    pub entitlements: Vec<EntitlementView>,
+}
+
+/// `PUT /users/{name}/admin`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct AdminChanged {
+    /// The user.
+    pub name: String,
+    /// The flag before.
+    pub previous: bool,
+    /// The flag now.
+    pub admin: bool,
+}
+
+/// `POST /users/{name}/invite`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Invited {
+    /// The user.
+    pub name: String,
+    /// Where the setup email goes.
+    pub email: String,
+}
+
+/// `DELETE /users/{name}/sessions`' answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionsRevoked {
+    /// The user.
+    pub name: String,
+    /// How many sessions ended.
+    pub revoked: u64,
 }
 
 /// One member of a team.
@@ -218,11 +298,53 @@ struct MemberBody {
     role: Role,
 }
 
+/// `PUT /users/{name}/admin`'s body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminBody {
+    /// The flag to set.
+    admin: bool,
+}
+
+/// `PUT /users/{name}/email`'s body. `null` clears the email; the field
+/// itself is required, so an empty body is a 422, not a silent clear.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmailBody {
+    /// The address, or `null`.
+    // serde treats an `Option` field as optional unless told otherwise;
+    // `deserialize_with` a plain `Option` deserializer makes the key
+    // required while still taking `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    email: Option<String>,
+}
+
+/// `PUT /users/{name}/entitlements/{catalog}`'s body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntitlementBody {
+    /// `read` or `write`.
+    access: String,
+}
+
 /// This area's routes.
 pub(crate) fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/users", get(list_users).post(create_user))
         .route("/users/{name}", get(user_detail).delete(delete_user))
+        .route("/users/{name}/admin", put(set_admin))
+        .route("/users/{name}/email", put(set_email))
+        .route("/users/{name}/invite", post(invite_user))
+        .route(
+            "/users/{name}/entitlements/{catalog}",
+            put(entitle).delete(unentitle),
+        )
+        .route(
+            "/users/{name}/sessions",
+            get(list_sessions).delete(revoke_sessions),
+        )
+        .route("/users/{name}/sessions/{id_prefix}", delete(revoke_session))
+        .route("/users/{name}/sign-ins", get(list_sign_ins))
         .route("/teams", get(list_teams).post(create_team))
         .route("/teams/{name}", get(team_detail).delete(delete_team))
         .route(
@@ -316,7 +438,218 @@ async fn user_detail(
         user: user.into(),
         keys,
         codes,
+        entitlements: entitlement_views(&app, &name).await?,
     }))
+}
+
+/// The user's entitlements as the API shows them.
+///
+/// # Errors
+/// [`OkfError::UnknownName`]; [`OkfError::Database`].
+async fn entitlement_views(app: &App, name: &str) -> Result<Vec<EntitlementView>, OkfError> {
+    Ok(ceiling::entitlements(app.pool(), name)
+        .await?
+        .into_iter()
+        .map(EntitlementView::from)
+        .collect())
+}
+
+/// `PUT /users/{name}/admin`: turns the user's admin flag on or off. A
+/// change ends the user's console sessions (Decision 20). The API never
+/// clears the last admin user (Decision 16): `users::set_admin` counts the
+/// admins under their row locks, so two concurrent clears of the last two
+/// cannot both pass.
+///
+/// # Errors
+/// 403 unless the caller is an admin reaching every catalog; 404 for an
+/// unknown user; 409 for clearing the last admin; 422 without `admin`.
+async fn set_admin(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(name): Path<String>,
+    Json(body): Json<AdminBody>,
+) -> Result<Json<AdminChanged>, AppError> {
+    require_every_catalog(&principal)?;
+    let previous = users::set_admin(app.pool(), &name, body.admin, false).await?;
+    tracing::info!(user = %name, previous, admin = body.admin, key = %principal.key_id,
+                   actor = %principal.actor, "admin flag set");
+    settle(&app).await;
+    Ok(Json(AdminChanged {
+        name,
+        previous,
+        admin: body.admin,
+    }))
+}
+
+/// `PUT /users/{name}/email`: sets or (with `null`) clears the email.
+///
+/// # Errors
+/// 403 unless the caller is an admin reaching every catalog; 404 for an
+/// unknown user; 409 for an email another user has; 422 for an address
+/// that is not one, or without `email`.
+async fn set_email(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(name): Path<String>,
+    Json(body): Json<EmailBody>,
+) -> Result<Json<UserView>, AppError> {
+    require_every_catalog(&principal)?;
+    users::set_email(app.pool(), &name, body.email.as_deref()).await?;
+    // The address itself is not logged.
+    tracing::info!(user = %name, cleared = body.email.is_none(), key = %principal.key_id,
+                   actor = %principal.actor, "email set");
+    settle(&app).await;
+    Ok(Json(users::find(app.pool(), &name).await?.into()))
+}
+
+/// `POST /users/{name}/invite`: queues a setup email with a single-use link.
+///
+/// # Returns
+/// 202 with the address: the mail is queued, not yet sent.
+///
+/// # Errors
+/// 403 unless the caller is an admin reaching every catalog; 404 for an
+/// unknown user; 409 without an email or without `public_url`.
+async fn invite_user(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<Invited>), AppError> {
+    require_every_catalog(&principal)?;
+    let email = invite::send_setup(app.pool(), app.config(), &name, app.clock().now()).await?;
+    tracing::info!(user = %name, key = %principal.key_id, actor = %principal.actor,
+                   "setup email requested");
+    Ok((StatusCode::ACCEPTED, Json(Invited { name, email })))
+}
+
+/// `PUT /users/{name}/entitlements/{catalog}`: lets the user reach the
+/// catalog at `access`, beyond its teams' catalogs.
+///
+/// # Errors
+/// 403 unless the caller is an admin reaching every catalog; 400 for an
+/// access other than `read` or `write`; 404 for an unknown user or catalog;
+/// 422 without `access`.
+async fn entitle(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path((name, catalog)): Path<(String, String)>,
+    Json(body): Json<EntitlementBody>,
+) -> Result<Json<Entitlements>, AppError> {
+    require_every_catalog(&principal)?;
+    let access = parse_access(&body.access)?;
+    if access == Access::Admin {
+        return Err(OkfError::InvalidPath {
+            path: "access".to_string(),
+            reason: "an entitlement is read or write".to_string(),
+        }
+        .into());
+    }
+    ceiling::entitle(app.pool(), &name, &catalog, access, app.clock().now()).await?;
+    tracing::info!(user = %name, %catalog, access = access.as_str(), key = %principal.key_id,
+                   actor = %principal.actor, "entitlement set");
+    settle(&app).await;
+    let entitlements = entitlement_views(&app, &name).await?;
+    Ok(Json(Entitlements { name, entitlements }))
+}
+
+/// `DELETE /users/{name}/entitlements/{catalog}`: removes an entitlement
+/// (none given: no change).
+///
+/// # Errors
+/// 403 unless the caller is an admin reaching every catalog; 404 for an
+/// unknown user or catalog.
+async fn unentitle(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path((name, catalog)): Path<(String, String)>,
+) -> Result<Json<Entitlements>, AppError> {
+    require_every_catalog(&principal)?;
+    ceiling::unentitle(app.pool(), &name, &catalog).await?;
+    tracing::info!(user = %name, %catalog, key = %principal.key_id, actor = %principal.actor,
+                   "entitlement removed");
+    settle(&app).await;
+    let entitlements = entitlement_views(&app, &name).await?;
+    Ok(Json(Entitlements { name, entitlements }))
+}
+
+/// `GET /users/{name}/sessions`: the user's console sessions, by id prefix
+/// (none is marked current: the caller is not that browser).
+///
+/// # Errors
+/// 403 below admin; 404 for an unknown user.
+async fn list_sessions(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(name): Path<String>,
+) -> Result<Json<SessionList>, AppError> {
+    require_admin(&principal)?;
+    let id = users::id_by_name(app.pool(), &name).await?;
+    let sessions = user_sessions::list(app.pool(), &id, None)
+        .await?
+        .into_iter()
+        .map(SessionView::from)
+        .collect();
+    Ok(Json(SessionList { sessions }))
+}
+
+/// `DELETE /users/{name}/sessions`: signs the user out of every console
+/// session. Keys and OAuth grants are untouched.
+///
+/// # Errors
+/// 403 unless the caller is an admin reaching every catalog; 404 for an
+/// unknown user.
+async fn revoke_sessions(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(name): Path<String>,
+) -> Result<Json<SessionsRevoked>, AppError> {
+    require_every_catalog(&principal)?;
+    let revoked = users::end_sessions(app.pool(), &name).await?;
+    tracing::info!(user = %name, revoked, key = %principal.key_id, actor = %principal.actor,
+                   "sessions ended by an admin");
+    Ok(Json(SessionsRevoked { name, revoked }))
+}
+
+/// `DELETE /users/{name}/sessions/{id_prefix}`: ends one of the user's
+/// sessions (the console's per-row revoke).
+///
+/// # Returns
+/// 204.
+///
+/// # Errors
+/// 403 unless the caller is an admin reaching every catalog; 404 for an
+/// unknown user, or a malformed prefix or one that matches none of the
+/// user's sessions; 409 for a prefix that matches several (none is ended).
+async fn revoke_session(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path((name, id_prefix)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    require_every_catalog(&principal)?;
+    let id = users::id_by_name(app.pool(), &name).await?;
+    user_sessions::revoke_by_prefix(app.pool(), &id, &id_prefix).await?;
+    tracing::info!(user = %name, key = %principal.key_id, actor = %principal.actor,
+                   "session ended by an admin");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /users/{name}/sign-ins`: the user's recent sign-in attempts,
+/// newest first.
+///
+/// # Errors
+/// 403 below admin; 404 for an unknown user.
+async fn list_sign_ins(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(name): Path<String>,
+) -> Result<Json<SignInList>, AppError> {
+    require_admin(&principal)?;
+    let sign_ins = sign_in_events::recent(app.pool(), &name, RECENT_SIGN_INS)
+        .await?
+        .into_iter()
+        .map(SignInView::from)
+        .collect();
+    Ok(Json(SignInList { sign_ins }))
 }
 
 /// `DELETE /users/{name}`: deletes a user that nothing names, with its
@@ -487,13 +820,48 @@ mod tests {
     use chrono::{TimeDelta, Utc};
     use serde_json::json;
 
+    use std::time::Duration;
+
     use crate::db::{TEST_TEAM, TEST_USER};
     use crate::http::api::testing::{
-        app, assert_matrix_with, every_catalog_admin, keys, send, Row,
+        app, assert_matrix_with, every_catalog_admin, keys, login_app, send, wait_for_lock_waiters,
+        Browser, Payload, Row,
     };
     use crate::mcp::testing::TestApp;
+    use crate::store::ceiling;
     use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
     use crate::store::oauth::codes::{self, NewSignInCode};
+    use crate::store::sign_in_events::{self, Method, Outcome};
+    use crate::store::user_sessions::{self, SessionStart};
+    use crate::store::users as user_rows;
+
+    /// The longest a race test waits for a request or a lock waiter.
+    const RACE_WAIT: Duration = Duration::from_secs(30);
+
+    /// The admin user routes, as `(method, uri, body)`, for user `name`:
+    /// reads first (the first two), then writes.
+    fn admin_user_routes(name: &str) -> Vec<(&'static str, String, Option<serde_json::Value>)> {
+        let base = format!("/api/v1/users/{name}");
+        vec![
+            ("GET", format!("{base}/sessions"), None),
+            ("GET", format!("{base}/sign-ins"), None),
+            ("PUT", format!("{base}/admin"), Some(json!({"admin": true}))),
+            (
+                "PUT",
+                format!("{base}/email"),
+                Some(json!({"email": "someone@example.com"})),
+            ),
+            ("POST", format!("{base}/invite"), None),
+            (
+                "PUT",
+                format!("{base}/entitlements/main"),
+                Some(json!({"access": "read"})),
+            ),
+            ("DELETE", format!("{base}/entitlements/main"), None),
+            ("DELETE", format!("{base}/sessions"), None),
+            ("DELETE", format!("{base}/sessions/abcdef012345"), None),
+        ]
+    }
 
     /// Creates user `name` through the API as `root`, asserting the 201.
     async fn user(test: &TestApp, root: &str, name: &str) {
@@ -506,6 +874,668 @@ mod tests {
         )
         .await;
         assert_eq!(status.as_u16(), 201, "create user {name}: {body}");
+    }
+
+    #[tokio::test]
+    async fn the_new_user_routes_need_an_admin_and_writes_one_reaching_every_catalog() {
+        let test = app().await;
+        let keys = keys(&test).await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        let rows: Vec<Row> = admin_user_routes("alice")
+            .into_iter()
+            .enumerate()
+            .map(|(index, (method, uri, body))| {
+                // Reads: any admin. Writes: no key in the matrix reaches
+                // every catalog, so all 403.
+                let admin = if index < 2 { 200 } else { 403 };
+                Row {
+                    method,
+                    uri,
+                    body,
+                    read: 403,
+                    write: 403,
+                    admin,
+                    stranger: admin,
+                }
+            })
+            .collect();
+
+        assert_matrix_with(&test, &keys, &rows).await;
+        let (_, alice) = send(&test, "GET", "/api/v1/users/alice", Some(&root), None).await;
+        assert_eq!(alice["user"]["is_admin"], false, "no refused write landed");
+        assert_eq!(alice["user"]["email"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_non_admin_session_is_refused_and_an_admin_session_may_act() {
+        let test = login_app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        user(&test, &root, "bob").await;
+        let mut plain = Browser::session_for(&test, "bob").await;
+        let mut refused = Vec::new();
+        for (method, uri, body) in admin_user_routes("alice") {
+            let payload = body.map_or(Payload::Empty, Payload::Json);
+            let (status, _) = plain.send(&test, method, &uri, payload).await.parts();
+            refused.push((method, uri, status.as_u16()));
+        }
+        let (flag, _) = send(
+            &test,
+            "PUT",
+            "/api/v1/users/alice/admin",
+            Some(&root),
+            Some(json!({"admin": true})),
+        )
+        .await;
+        let mut admin = Browser::session_for(&test, "alice").await;
+
+        let (listed, _) = admin
+            .send(&test, "GET", "/api/v1/users/bob/sessions", Payload::Empty)
+            .await
+            .parts();
+        let (wrote, body) = admin
+            .send(
+                &test,
+                "PUT",
+                "/api/v1/users/bob/email",
+                Payload::Json(json!({"email": "bob@example.com"})),
+            )
+            .await
+            .parts();
+        admin.csrf = None;
+        let (no_csrf, _) = admin
+            .send(
+                &test,
+                "PUT",
+                "/api/v1/users/bob/email",
+                Payload::Json(json!({"email": null})),
+            )
+            .await
+            .parts();
+
+        for (method, uri, status) in refused {
+            assert_eq!(status, 403, "{method} {uri} as a non-admin session");
+        }
+        assert_eq!(flag.as_u16(), 200);
+        assert_eq!(listed.as_u16(), 200);
+        assert_eq!(
+            wrote.as_u16(),
+            200,
+            "an admin session reaches every catalog: {body}"
+        );
+        assert_eq!(body["email"], "bob@example.com");
+        assert_eq!(no_csrf.as_u16(), 403, "a cookie write needs X-OKF-CSRF");
+    }
+
+    #[tokio::test]
+    async fn the_admin_flag_round_trips_and_the_last_admin_is_refused() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        let flag = |on: bool| Some(json!({"admin": on}));
+        let mut session = Browser::session_for(&test, "alice").await;
+
+        let (on, body) = send(
+            &test,
+            "PUT",
+            "/api/v1/users/alice/admin",
+            Some(&root),
+            flag(true),
+        )
+        .await;
+        let (signed_out, _) = session
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+        let (last, refused) = send(
+            &test,
+            "PUT",
+            "/api/v1/users/alice/admin",
+            Some(&root),
+            flag(false),
+        )
+        .await;
+        let (_, still) = send(&test, "GET", "/api/v1/users/alice", Some(&root), None).await;
+        send(
+            &test,
+            "PUT",
+            &format!("/api/v1/users/{TEST_USER}/admin"),
+            Some(&root),
+            flag(true),
+        )
+        .await;
+        let (off, after) = send(
+            &test,
+            "PUT",
+            "/api/v1/users/alice/admin",
+            Some(&root),
+            flag(false),
+        )
+        .await;
+        let (_, listed) = send(&test, "GET", "/api/v1/users", Some(&root), None).await;
+        let (unknown, _) = send(
+            &test,
+            "PUT",
+            "/api/v1/users/nobody/admin",
+            Some(&root),
+            flag(true),
+        )
+        .await;
+        let (missing, _) = send(
+            &test,
+            "PUT",
+            "/api/v1/users/alice/admin",
+            Some(&root),
+            Some(json!({})),
+        )
+        .await;
+
+        assert_eq!(on.as_u16(), 200, "{body}");
+        assert_eq!(
+            body,
+            json!({"name": "alice", "previous": false, "admin": true})
+        );
+        assert_eq!(signed_out.as_u16(), 401, "a flag change signs the user out");
+        assert_eq!(
+            last.as_u16(),
+            409,
+            "the API never clears the last admin: {refused}"
+        );
+        assert_eq!(still["user"]["is_admin"], true);
+        assert_eq!(off.as_u16(), 200);
+        assert_eq!(
+            after,
+            json!({"name": "alice", "previous": true, "admin": false})
+        );
+        let alice = listed["users"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .find(|row| row["name"] == "alice")
+            .expect("alice")
+            .clone();
+        assert_eq!(alice["is_admin"], false);
+        assert_eq!(alice["has_password"], false);
+        assert_eq!(unknown.as_u16(), 404);
+        assert_eq!(missing.as_u16(), 422);
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_clears_of_the_last_two_admins_leave_one() {
+        // Both requests queue behind a held lock on the admin rows, so they
+        // run their checks one after the other: the second must see only one
+        // admin left and refuse.
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        for name in ["alice", TEST_USER] {
+            user_rows::set_admin(test.app.pool(), name, true, false)
+                .await
+                .expect("make an admin");
+        }
+        let mut holder = test.app.pool().begin().await.expect("begin");
+        sqlx::query("SELECT id FROM users WHERE is_admin FOR UPDATE")
+            .execute(&mut *holder)
+            .await
+            .expect("hold the admin rows");
+        let clear = |name: &str| {
+            let uri = format!("/api/v1/users/{name}/admin");
+            let (test, root) = (&test, root.as_str());
+            async move { send(test, "PUT", &uri, Some(root), Some(json!({"admin": false}))).await }
+        };
+        let release = async {
+            tokio::time::timeout(RACE_WAIT, wait_for_lock_waiters(test.app.pool(), 2))
+                .await
+                .expect("both clears wait on the admin rows");
+            holder.rollback().await.expect("release the admin rows");
+        };
+
+        // `join!` polls all three on this task; the two requests make
+        // progress while their queries wait on the database.
+        let joined = tokio::time::timeout(RACE_WAIT, async {
+            tokio::join!(clear("alice"), clear(TEST_USER), release)
+        })
+        .await
+        .expect("the two clears never finished");
+        let ((first, _), (second, _), ()) = joined;
+        let mut statuses = [first.as_u16(), second.as_u16()];
+        statuses.sort_unstable();
+        let admins: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE is_admin")
+            .fetch_one(test.app.pool())
+            .await
+            .expect("count the admins");
+
+        assert_eq!(statuses, [200, 409]);
+        assert_eq!(admins, 1);
+    }
+
+    #[tokio::test]
+    async fn email_is_set_cleared_and_unique() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        user(&test, &root, "bob").await;
+        let put = |name: &str, body: serde_json::Value| {
+            let uri = format!("/api/v1/users/{name}/email");
+            let (test, root) = (&test, root.as_str());
+            async move { send(test, "PUT", &uri, Some(root), Some(body)).await }
+        };
+
+        let (set, view) = put("alice", json!({"email": "alice@example.com"})).await;
+        let (duplicate, _) = put("bob", json!({"email": "Alice@Example.com"})).await;
+        let (malformed, _) = put("bob", json!({"email": "bob@example.com, x@example.com"})).await;
+        let (missing, _) = put("bob", json!({})).await;
+        let (unknown, _) = put("nobody", json!({"email": "n@example.com"})).await;
+        let (_, bob) = send(&test, "GET", "/api/v1/users/bob", Some(&root), None).await;
+        let (cleared, after) = put("alice", json!({"email": null})).await;
+
+        assert_eq!(set.as_u16(), 200, "{view}");
+        assert_eq!(view["name"], "alice");
+        assert_eq!(view["email"], "alice@example.com");
+        assert_eq!(duplicate.as_u16(), 409);
+        assert_eq!(malformed.as_u16(), 422);
+        assert_eq!(missing.as_u16(), 422, "an absent email is not a clear");
+        assert_eq!(unknown.as_u16(), 404);
+        assert_eq!(bob["user"]["email"], serde_json::Value::Null);
+        assert_eq!(cleared.as_u16(), 200);
+        assert_eq!(after["email"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn invite_queues_a_setup_mail_once_there_is_an_email_and_a_public_url() {
+        let test = login_app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        let (no_email, _) = send(
+            &test,
+            "POST",
+            "/api/v1/users/alice/invite",
+            Some(&root),
+            None,
+        )
+        .await;
+        send(
+            &test,
+            "PUT",
+            "/api/v1/users/alice/email",
+            Some(&root),
+            Some(json!({"email": "alice@example.com"})),
+        )
+        .await;
+
+        let (status, body) = send(
+            &test,
+            "POST",
+            "/api/v1/users/alice/invite",
+            Some(&root),
+            None,
+        )
+        .await;
+
+        assert_eq!(no_email.as_u16(), 409);
+        assert_eq!(status.as_u16(), 202, "{body}");
+        assert_eq!(body, json!({"name": "alice", "email": "alice@example.com"}));
+        let queued = crate::mail::queue::list(test.app.pool())
+            .await
+            .expect("the queue");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].to, "alice@example.com");
+        assert_eq!(queued[0].template, "setup");
+
+        let plain = app().await;
+        let plain_root = every_catalog_admin(&plain).await;
+        user_rows::set_email(plain.app.pool(), TEST_USER, Some("tester@example.com"))
+            .await
+            .expect("email");
+        let (no_url, _) = send(
+            &plain,
+            "POST",
+            &format!("/api/v1/users/{TEST_USER}/invite"),
+            Some(&plain_root),
+            None,
+        )
+        .await;
+        assert_eq!(no_url.as_u16(), 409, "login needs public_url (Decision 18)");
+    }
+
+    #[tokio::test]
+    async fn entitlements_change_the_ceiling_and_show_in_the_detail() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        let put = |catalog: &str, access: &str| {
+            let uri = format!("/api/v1/users/alice/entitlements/{catalog}");
+            let body = json!({ "access": access });
+            let (test, root) = (&test, root.as_str());
+            async move { send(test, "PUT", &uri, Some(root), Some(body)).await }
+        };
+
+        let (entitled, body) = put("main", "read").await;
+        let (_, detail) = send(&test, "GET", "/api/v1/users/alice", Some(&root), None).await;
+        let ceiling_now = ceiling::ceiling_of(test.app.pool(), "alice")
+            .await
+            .expect("ceiling");
+        let cached = test.app.keys().ceiling_of(&detail_id(&test, "alice").await);
+        let (admin, _) = put("main", "admin").await;
+        let (bogus, _) = put("main", "owner").await;
+        let (unknown_catalog, _) = put("nowhere", "read").await;
+        let (removed, after) = send(
+            &test,
+            "DELETE",
+            "/api/v1/users/alice/entitlements/main",
+            Some(&root),
+            None,
+        )
+        .await;
+
+        assert_eq!(entitled.as_u16(), 200, "{body}");
+        assert_eq!(body["name"], "alice");
+        assert_eq!(body["entitlements"][0]["catalog"], "main");
+        assert_eq!(body["entitlements"][0]["access"], "read");
+        assert!(body["entitlements"][0]["created_at"].is_string());
+        assert_eq!(detail["entitlements"], body["entitlements"]);
+        assert_eq!(ceiling_now.get("main"), Some(&Access::Read));
+        assert_eq!(cached.get("main"), Some(&Access::Read), "the route polls");
+        assert_eq!(admin.as_u16(), 400, "an entitlement is read or write");
+        assert_eq!(bogus.as_u16(), 400);
+        assert_eq!(unknown_catalog.as_u16(), 404);
+        assert_eq!(removed.as_u16(), 200);
+        assert_eq!(after, json!({"name": "alice", "entitlements": []}));
+    }
+
+    /// The id of user `name`.
+    async fn detail_id(test: &TestApp, name: &str) -> String {
+        user_rows::id_by_name(test.app.pool(), name)
+            .await
+            .expect("the user's id")
+    }
+
+    #[tokio::test]
+    async fn an_admin_lists_and_revokes_a_users_sessions_and_reads_its_sign_ins() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        let mut first = Browser::session_for(&test, "alice").await;
+        let mut second = Browser::session_for(&test, "alice").await;
+        let id = detail_id(&test, "alice").await;
+        sign_in_events::record(
+            test.app.pool(),
+            Some(&id),
+            Method::Password,
+            Outcome::Ok,
+            None,
+            Utc::now(),
+        )
+        .await
+        .expect("record");
+
+        let (_, listed) = send(
+            &test,
+            "GET",
+            "/api/v1/users/alice/sessions",
+            Some(&root),
+            None,
+        )
+        .await;
+        let (_, sign_ins) = send(
+            &test,
+            "GET",
+            "/api/v1/users/alice/sign-ins",
+            Some(&root),
+            None,
+        )
+        .await;
+        let prefix = listed["sessions"][0]["id_prefix"]
+            .as_str()
+            .expect("a prefix")
+            .to_string();
+        let (one, _) = send(
+            &test,
+            "DELETE",
+            &format!("/api/v1/users/alice/sessions/{prefix}"),
+            Some(&root),
+            None,
+        )
+        .await;
+        let (again, _) = send(
+            &test,
+            "DELETE",
+            &format!("/api/v1/users/alice/sessions/{prefix}"),
+            Some(&root),
+            None,
+        )
+        .await;
+        let (_, left) = send(
+            &test,
+            "GET",
+            "/api/v1/users/alice/sessions",
+            Some(&root),
+            None,
+        )
+        .await;
+        let (all, revoked) = send(
+            &test,
+            "DELETE",
+            "/api/v1/users/alice/sessions",
+            Some(&root),
+            None,
+        )
+        .await;
+        let (first_out, _) = first
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+        let (second_out, _) = second
+            .send(&test, "GET", "/api/v1/me", Payload::Empty)
+            .await
+            .parts();
+        let (unknown, _) = send(
+            &test,
+            "GET",
+            "/api/v1/users/nobody/sessions",
+            Some(&root),
+            None,
+        )
+        .await;
+        let (unknown_sign_ins, _) = send(
+            &test,
+            "GET",
+            "/api/v1/users/nobody/sign-ins",
+            Some(&root),
+            None,
+        )
+        .await;
+
+        let sessions = listed["sessions"].as_array().expect("a list");
+        assert_eq!(sessions.len(), 2);
+        let mut fields: Vec<&str> = sessions[0]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "created_at",
+                "current",
+                "id_prefix",
+                "ip",
+                "last_seen_at",
+                "user_agent"
+            ],
+            "a prefix only: never a session id, token or hash"
+        );
+        assert_eq!(prefix.len(), 12);
+        assert!(
+            sessions.iter().all(|row| row["current"] == false),
+            "an admin's view has no current"
+        );
+        assert_eq!(sign_ins["sign_ins"][0]["method"], "password");
+        assert_eq!(sign_ins["sign_ins"][0]["outcome"], "ok");
+        assert_eq!(one.as_u16(), 204);
+        assert_eq!(again.as_u16(), 404);
+        assert_eq!(left["sessions"].as_array().map(Vec::len), Some(1));
+        assert_eq!(all.as_u16(), 200);
+        assert_eq!(revoked, json!({"name": "alice", "revoked": 1}));
+        assert_eq!(first_out.as_u16(), 401);
+        assert_eq!(second_out.as_u16(), 401);
+        assert_eq!(unknown.as_u16(), 404);
+        assert_eq!(unknown_sign_ins.as_u16(), 404);
+    }
+
+    #[tokio::test]
+    async fn a_prefix_several_sessions_share_is_a_409_and_ends_none() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        let id = detail_id(&test, "alice").await;
+        // Two stored hashes with the same first six bytes, as two random ids
+        // could have (no real id is needed to list or revoke).
+        for last in [1_u8, 2] {
+            let mut hash = vec![0xab_u8; 32];
+            hash[31] = last;
+            sqlx::query(
+                "INSERT INTO user_sessions \
+                     (id_hash, user_id, csrf_token, created_at, last_seen_at, expires_at) \
+                 VALUES ($1, $2, '', now(), now(), now() + interval '1 day')",
+            )
+            .bind(hash)
+            .bind(&id)
+            .execute(test.app.pool())
+            .await
+            .expect("seed a session");
+        }
+
+        let (status, _) = send(
+            &test,
+            "DELETE",
+            "/api/v1/users/alice/sessions/abababababab",
+            Some(&root),
+            None,
+        )
+        .await;
+        let (_, listed) = send(
+            &test,
+            "GET",
+            "/api/v1/users/alice/sessions",
+            Some(&root),
+            None,
+        )
+        .await;
+
+        assert_eq!(status.as_u16(), 409);
+        assert_eq!(listed["sessions"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[tokio::test]
+    async fn signing_out_everywhere_ends_a_session_whose_start_was_still_uncommitted() {
+        // A sign-in holds the user's row `FOR SHARE` while its session insert
+        // is uncommitted. The admin's sign-out must wait for it and end that
+        // session too, not report success and leave it signed in.
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        let id = detail_id(&test, "alice").await;
+        let mut signing_in = test.app.pool().begin().await.expect("begin");
+        user_sessions::start(
+            &mut *signing_in,
+            &SessionStart {
+                user_id: &id,
+                ip: None,
+                user_agent: "okf-test",
+                absolute: Duration::from_secs(3_600),
+                now: Utc::now(),
+                password: None,
+            },
+        )
+        .await
+        .expect("start a session in the open transaction");
+        let commit = async {
+            tokio::time::timeout(RACE_WAIT, wait_for_lock_waiters(test.app.pool(), 1))
+                .await
+                .expect("the sign-out waits on the user's row");
+            signing_in.commit().await.expect("commit the sign-in");
+        };
+
+        let ((status, body), ()) = tokio::time::timeout(RACE_WAIT, async {
+            tokio::join!(
+                send(
+                    &test,
+                    "DELETE",
+                    "/api/v1/users/alice/sessions",
+                    Some(&root),
+                    None
+                ),
+                commit
+            )
+        })
+        .await
+        .expect("the sign-out never finished");
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM user_sessions WHERE user_id = $1")
+            .bind(&id)
+            .fetch_one(test.app.pool())
+            .await
+            .expect("count the sessions");
+
+        assert_eq!(status.as_u16(), 200, "{body}");
+        assert_eq!(body, json!({"name": "alice", "revoked": 1}));
+        assert_eq!(left, 0);
+    }
+
+    #[tokio::test]
+    async fn a_nul_or_malformed_name_in_a_path_is_a_404_never_a_500() {
+        // Postgres refuses a NUL in text, so each name must be checked
+        // before it reaches SQL (issue #339). `login_app` has `public_url`,
+        // so the invite gets as far as the name.
+        let test = login_app().await;
+        let root = every_catalog_admin(&test).await;
+        let mut routes = admin_user_routes("a%00b");
+        routes.extend(admin_user_routes("UPPER"));
+        routes.extend([
+            ("GET", "/api/v1/users/a%00b".to_string(), None),
+            (
+                "PUT",
+                "/api/v1/users/alice/entitlements/a%00b".to_string(),
+                Some(json!({"access": "read"})),
+            ),
+            (
+                "DELETE",
+                "/api/v1/users/alice/entitlements/a%00b".to_string(),
+                None,
+            ),
+            (
+                "DELETE",
+                format!("/api/v1/users/{TEST_USER}/sessions/a%00b"),
+                None,
+            ),
+            (
+                "GET",
+                "/api/v1/catalogs/a%00b/member-access".to_string(),
+                None,
+            ),
+            (
+                "PUT",
+                "/api/v1/catalogs/a%00b/member-access".to_string(),
+                Some(json!({"access": "read"})),
+            ),
+            (
+                "PUT",
+                "/api/v1/settings/a%00b".to_string(),
+                Some(json!({"value": "1"})),
+            ),
+            ("DELETE", "/api/v1/settings/a%00b".to_string(), None),
+            ("POST", "/api/v1/mail/queue/a%00b/retry".to_string(), None),
+            ("DELETE", "/api/v1/mail/queue/a%00b".to_string(), None),
+        ]);
+        user(&test, &root, "alice").await;
+
+        for (method, uri, body) in routes {
+            let (status, answer) = send(&test, method, &uri, Some(&root), body).await;
+            assert_eq!(status.as_u16(), 404, "{method} {uri}: {answer}");
+        }
     }
 
     #[tokio::test]

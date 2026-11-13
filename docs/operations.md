@@ -1313,12 +1313,13 @@ browser out at its next request.
 
 ### API reference
 
-The API has 48 endpoints. The identity endpoint is below, and each area's
+The API has 66 endpoints. The identity endpoint is below, and each area's
 endpoints are in its own subsection: [API keys](#api-keys) (7),
 [OAuth sign-in codes](#oauth-sign-in-codes) (4),
-[Users and teams](#users-and-teams-api) (11),
+[Users and teams](#users-and-teams-api) (20),
+[Settings and mail](#settings-and-mail-api) (7),
 [Health](#health) (2), [Browse and search](#browse-and-search) (7),
-[Catalogs and import/export](#catalogs-and-importexport) (7),
+[Catalogs and import/export](#catalogs-and-importexport) (9),
 [Findings and runs](#findings-and-runs) (6) and [Changesets](#changesets) (3).
 Each area's tests check every endpoint against the access matrix (no key,
 read, write, admin, and an admin key that does not reach the catalog).
@@ -1419,10 +1420,19 @@ admin). Every change takes effect at once. A refusal under the
 
 | Method and path | Key | Does |
 |---|---|---|
-| `GET /api/v1/users` | admin | `{users}`, by name: `name`, `display_name`, `created_at`, `credentials` (keys, grants and codes naming it, whoever manages them), `teams` |
+| `GET /api/v1/users` | admin | `{users}`, by name: `name`, `display_name`, `created_at`, `credentials` (keys, grants and codes naming it, whoever manages them), `teams`, `email` (`null` when unset), `is_admin`, `has_password` (never the password or its hash) |
 | `POST /api/v1/users` | admin, every catalog | Body `{name, display_name}` (`display_name` optional). Creates the user and its personal team; 201 with the user. 409 for an invalid or taken name, 422 without `name` |
-| `GET /api/v1/users/{name}` | admin | `{user, keys, codes}`: the user, and the keys, grants and codes naming it that the caller manages |
+| `GET /api/v1/users/{name}` | admin | `{user, keys, codes, entitlements}`: the user, the keys, grants and codes naming it that the caller manages, and its entitlements (`[{catalog, access, created_at}]`, by catalog) |
 | `DELETE /api/v1/users/{name}` | admin, every catalog | Deletes the user with its personal team; 204. 409 while something refers to it |
+| `PUT /api/v1/users/{name}/admin` | admin, every catalog | Body `{admin: bool}`. Answers `{name, previous, admin}`. A change signs the user out of every console session (they sign in again with the new flag). 409 for clearing the last admin user (only the CLI may), 422 without `admin` |
+| `PUT /api/v1/users/{name}/email` | admin, every catalog | Body `{email}` (`null` clears; the field is required). Answers the user. A change ends the user's outstanding emailed links. 409 "Another user has this email" (in any letter case), 422 for an address that is not one or without `email` |
+| `POST /api/v1/users/{name}/invite` | admin, every catalog | Queues a setup email with a single-use link (replacing any older one) to the user's email; 202 `{name, email}`. 409 without an email or without `public_url` |
+| `PUT /api/v1/users/{name}/entitlements/{catalog}` | admin, every catalog | Body `{access: "read"\|"write"}`. Adds the entitlement or changes its level; answers `{name, entitlements}`. 400 for another level, 404 for an unknown user or catalog |
+| `DELETE /api/v1/users/{name}/entitlements/{catalog}` | admin, every catalog | Removes it (none given: no change); answers `{name, entitlements}` |
+| `GET /api/v1/users/{name}/sessions` | admin | `{sessions}`, most recently used first: `id_prefix`, `created_at`, `last_seen_at`, `ip`, `user_agent`, `current` (always `false` here). Never a session id, token or hash |
+| `DELETE /api/v1/users/{name}/sessions` | admin, every catalog | Signs the user out of every console session (keys and grants keep working); answers `{name, revoked}` |
+| `DELETE /api/v1/users/{name}/sessions/{id_prefix}` | admin, every catalog | Signs one session out; 204. 404 for a malformed prefix or one that matches none of the user's sessions, 409 for one that matches several (none is ended) |
+| `GET /api/v1/users/{name}/sign-ins` | admin | `{sign_ins}`, newest first (at most 50): `method`, `outcome`, `ip`, `at` |
 | `GET /api/v1/teams` | admin | `{teams}`, by name: `name`, `display_name`, `personal_of` (the user whose personal team it is, or `null`), `created_at`, `members` (`[{user, role}]`, by user), `catalogs` (the names it owns) |
 | `POST /api/v1/teams` | admin, every catalog | Body `{name, display_name, owner}` (`owner` required: the first owner's user name). 201 with the team. 404 for an unknown owner, 409 for an invalid or taken name, 422 without `owner` |
 | `GET /api/v1/teams/{name}` | admin | The team, as in the list |
@@ -1436,6 +1446,23 @@ curl -fsS -H "Authorization: Bearer $OKF_MCP_KEY" -H 'Content-Type: application/
     -d '{"name":"family","owner":"alice"}' \
     https://okf-mcp.example.com/api/v1/teams
 ```
+
+### Settings and mail API
+
+The routes behind `okf-mcp settings ...` and `okf-mcp mail ...`. Reads need
+any admin key; changes need an admin key that reaches every catalog (403 for
+any other key). An admin user's console session counts as an admin that
+reaches every catalog.
+
+| Method and path | Key | Does |
+|---|---|---|
+| `GET /api/v1/settings` | admin | `{settings, oidc, mail}`: each setting's `key`, `value` (the effective value, as text), `overridden`, `updated_at`, `updated_by`; the OIDC providers' `id`, `label`, `issuer`; the mail `provider` and `from`. Never a secret |
+| `PUT /api/v1/settings/{key}` | admin, every catalog | Body `{value}` (a string, as on the command line). Answers the setting. 404 for an unknown key, 422 for a value the setting refuses or without `value` |
+| `DELETE /api/v1/settings/{key}` | admin, every catalog | Drops the override; answers the setting at its default. 404 for an unknown key |
+| `POST /api/v1/mail/test` | admin, every catalog | Body `{to}`. Queues the test email; 202 `{to}`. 422 for an address that is not one |
+| `GET /api/v1/mail/queue` | admin | `{mail}`: every mail not yet sent, oldest due first: `id`, `to`, `template`, `status` (`pending`, `sending`, `retrying` or `failed`), `attempts`, `last_error`, `run_at`. Never a body |
+| `POST /api/v1/mail/queue/{id}/retry` | admin, every catalog | Sends failed mail again now, with a new 24-hour retry window; 204. 404 for an unknown id, 409 for mail that has not failed |
+| `DELETE /api/v1/mail/queue/{id}` | admin, every catalog | Deletes mail that is not being sent right now; 204. 404 for an unknown id, 409 while a worker is sending it |
 
 ### Health
 
@@ -1511,13 +1538,15 @@ curl -s -H "Authorization: Bearer $OKF_MCP_KEY" \
 | `POST /api/v1/catalogs` | admin, every catalog | `{name, description, owner}` (`description` optional; `owner` required, a team's name). 201 with the new catalog's summary; 403 for a key granted named catalogs, since it would not reach the new one; 404 for an unknown owner; 409 for an invalid or taken name; 422 without `owner` |
 | `PATCH /api/v1/catalogs/{catalog}` | admin | `{description}`. Answers `{name, previous, description}` |
 | `PUT /api/v1/catalogs/{catalog}/owner` | admin, every catalog | `{team}`. Makes the team the owner; answers `{name, previous, owner_team}` (`previous` is `null` for a legacy catalog). 404 for an unknown catalog or team, 422 without `team`. Ownership grants no access |
+| `GET /api/v1/catalogs/{catalog}/member-access` | admin | `{name, member_access}` (`none`, `read` or `write`): what members of the owner team reach through their own keys and grants |
+| `PUT /api/v1/catalogs/{catalog}/member-access` | admin, every catalog | Body `{access: "none"\|"read"\|"write"}`. Sets it, and every member's own keys and grants are capped again at once; answers `{name, previous, member_access}`. 400 for another value, 404 for an unknown catalog, 422 without `access` |
 | `DELETE /api/v1/catalogs/{catalog}[?force=true]` | admin | Deletes the catalog with its documents, history, changesets and grants; answers `{name}`. 409 while an open changeset holds unpublished changes, unless `force=true` |
 | `GET /api/v1/catalogs/{catalog}/export` | read | The same handler and 120 s timeout as `/catalogs/{name}/export` |
 | `POST /api/v1/catalogs/{catalog}/import[?replace=true&only_machinery=true&expect_generation=N]` | admin | The same handler, body cap and upload deadline as `/catalogs/{name}/import` |
 
 A catalog the key does not reach, or that does not exist, is 404 on every
-route but the list, the create and the owner change (which reaches every
-catalog).
+route but the list, the create, the owner change and the member-access
+change (which reach every catalog).
 
 - Catalog changes take effect at once: the handler polls after each one, so
   the next request (and the console's catalog switcher) sees it.

@@ -228,6 +228,21 @@ pub async fn list(pool: &PgPool) -> Result<Vec<QueuedMail>, OkfError> {
     .await?)
 }
 
+/// Whether `id` can be a job id (a ULID: ASCII letters and digits). Text
+/// that cannot (a NUL, which Postgres refuses as a database error, among
+/// others) names no job and never reaches SQL.
+fn is_job_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// The error for a job id that names no mail job.
+fn unknown_job(id: &str) -> OkfError {
+    OkfError::UnknownName {
+        noun: "mail job",
+        name: id.to_string(),
+    }
+}
+
 /// Explains why a job-id write matched no row: the job is unknown, or in a
 /// state the operation does not take.
 async fn refusal(pool: &PgPool, id: &str, why: &str) -> Result<OkfError, OkfError> {
@@ -238,10 +253,7 @@ async fn refusal(pool: &PgPool, id: &str, why: &str) -> Result<OkfError, OkfErro
             .fetch_optional(pool)
             .await?;
     Ok(match exists {
-        None => OkfError::UnknownName {
-            noun: "mail job",
-            name: id.to_string(),
-        },
+        None => unknown_job(id),
         Some(_) => OkfError::Refused {
             reason: format!("mail job {id} {why}"),
         },
@@ -260,6 +272,9 @@ async fn refusal(pool: &PgPool, id: &str, why: &str) -> Result<OkfError, OkfErro
 /// [`OkfError::UnknownName`] (`noun: "mail job"`); [`OkfError::Refused`]
 /// for a job that has not failed; [`OkfError::Database`].
 pub async fn retry(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), OkfError> {
+    if !is_job_id(id) {
+        return Err(unknown_job(id));
+    }
     // `jsonb_set` rewrites `queued_at` inside the stored payload. No NOTIFY
     // fires for an UPDATE; the worker's interval poll finds the job. A row
     // a worker holds is no longer `Failed`, so it is never taken back.
@@ -293,6 +308,9 @@ pub async fn retry(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), Ok
 /// [`OkfError::UnknownName`] (`noun: "mail job"`); [`OkfError::Refused`]
 /// while a worker holds it; [`OkfError::Database`].
 pub async fn delete(pool: &PgPool, id: &str) -> Result<(), OkfError> {
+    if !is_job_id(id) {
+        return Err(unknown_job(id));
+    }
     let deleted = sqlx::query(
         "DELETE FROM apalis.jobs \
          WHERE id = $1 AND job_type = $2 AND status NOT IN ('Queued', 'Running')",

@@ -23,11 +23,13 @@ mod changesets;
 mod health;
 mod identity;
 mod keys;
+mod mail;
 mod maintenance;
 mod me;
 mod oauth;
 mod people;
 mod search;
+mod settings;
 #[cfg(test)]
 pub(crate) mod testing;
 
@@ -53,6 +55,8 @@ pub(crate) fn routes(app: &Arc<App>) -> Router<Arc<App>> {
         .merge(oauth::routes())
         .merge(changesets::routes())
         .merge(people::routes())
+        .merge(settings::routes())
+        .merge(mail::routes())
         .merge(me::routes())
         .merge(crate::http::passkeys::api_routes())
         // `POST /me/identities/{provider}/link` (Task 9); it answers 404

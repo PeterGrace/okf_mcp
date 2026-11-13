@@ -208,14 +208,7 @@ pub async fn record_in(conn: &mut PgConnection, attempt: &Attempt<'_>) -> Result
 /// # Errors
 /// [`OkfError::UnknownName`]; [`OkfError::Database`].
 pub async fn recent(pool: &PgPool, user: &str, limit: i64) -> Result<Vec<SignInEvent>, OkfError> {
-    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
-        .bind(user)
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| OkfError::UnknownName {
-            noun: "user",
-            name: user.to_string(),
-        })?;
+    let user_id = crate::store::users::id_by_name(pool, user).await?;
     // `host(ip)` is the address as text without a prefix length.
     let rows: Vec<(String, String, Option<String>, DateTime<Utc>)> = sqlx::query_as(
         "SELECT method, outcome, host(ip), at FROM sign_in_events \
