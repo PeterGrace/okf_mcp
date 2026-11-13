@@ -17,6 +17,7 @@ Each rule below records a real bug the review bot found in an earlier PR, mostly
 - **Every refused sign-in looks identical:** the same 401 text, one argon2 check, and no hint whether the account exists.
 - **Genuine database errors stay 500.** Don't turn them into 4xx.
 - **Bounded state per actor.** When any client, signed in or not, can add entries to a shared in-memory map (flows, ceremonies, pending authorizations), limit each actor: by address for anonymous starts, by user or session for signed-in ones. A new entry from the same browser or session must replace its previous one instead of stranding it. Test that one actor's repeated starts never grow the map and that others can still start.
+- **A test that a JSON field is `null` checks the key is there:** `assert_eq!(body.get("notice"), Some(&serde_json::Value::Null))`, never `body["notice"] == Null`. serde_json's `[]` answers `Null` for a missing key, so the weaker form passes when the field is dropped (found while revert-checking issue #364).
 
 ## Browser-facing pages and routes
 - **Every state-changing form POST on a server-rendered page** must call the cross-site check in `src/http/signin.rs` (`Sec-Fetch-Site` must be `same-origin` or `none`). This blocks login CSRF. Don't use `Origin`: with `Referrer-Policy: no-referrer`, browsers send `Origin: null`.

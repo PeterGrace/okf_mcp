@@ -485,7 +485,9 @@ git commit -m "feat(store): suspend and lift teams; the suspended-catalogs map (
 
         let body = error.to_json();
 
-        assert_eq!(body["notice"], serde_json::Value::Null);
+        // `get`, not `body["notice"]`: indexing a missing key also yields
+        // `Null`, so only `get` proves the field is present.
+        assert_eq!(body.get("notice"), Some(&serde_json::Value::Null));
         assert_eq!(
             body["message"],
             "catalog \"shared\" is unavailable: its team \"family\" is suspended"
@@ -519,8 +521,9 @@ In `OkfError`, after `Forbidden`:
 ```rust
     /// The key reaches the catalog, but its owner team is suspended: only
     /// export works until the operator lifts it.
-    // `.catalog` etc. name the variant's fields inside `#[error]`.
-    #[error("{}", suspended_message(.catalog, .team, .notice))]
+    // `.catalog`, `.team` and `.notice` name the variant's fields inside
+    // `#[error]`; `.as_deref()` turns `&Option<String>` into `Option<&str>`.
+    #[error("{}", suspended_message(.catalog, .team, .notice.as_deref()))]
     Suspended {
         /// The catalog asked for.
         catalog: String,
@@ -536,7 +539,7 @@ Add the helper below the `impl OkfError` block:
 ```rust
 /// The text of [`OkfError::Suspended`]: the catalog, the team, then the
 /// notice as its own sentence.
-fn suspended_message(catalog: &str, team: &str, notice: &Option<String>) -> String {
+fn suspended_message(catalog: &str, team: &str, notice: Option<&str>) -> String {
     let mut message = format!("catalog {catalog:?} is unavailable: its team {team:?} is suspended");
     if let Some(notice) = notice {
         message.push_str(". ");
@@ -567,6 +570,8 @@ In `src/http/mod.rs` `status()`: `OkfError::Forbidden { .. } | OkfError::Suspend
 
 Check the MCP tool-error mapping (`src/mcp/mod.rs`, which turns `OkfError` into a tool error with `structured_content`) needs no arm; if it matches variants exhaustively, add `Suspended` beside `Forbidden`.
 
+> **Corrected (issue #364, 2026-11-13).** Shipped as above, with two inline fixes: `suspended_message` takes `Option<&str>` (the `#[error]` passes `.notice.as_deref()`) rather than `&Option<String>`, and the no-notice test checks `body.get("notice")`, because `body["notice"]` is `Null` for a missing key too, so the plan's assertion passed with the field dropped (found by reverting it). The MCP mapping (`tool_error` in `src/mcp/mod.rs`) calls `to_json` and matches no variants, so it needs no arm and is not changed. Read `src/error.rs` for the shipped code.
+
 - [ ] **Step 4: Run the tests**
 
 Run: `tools/agentic/gate.sh narrow --lib error::tests`, then `tools/agentic/gate.sh narrow --lib http::tests`
@@ -575,7 +580,7 @@ Expected: PASS.
 - [ ] **Step 5: Gates and commit**
 
 ```bash
-git add src/error.rs src/http/mod.rs src/mcp/mod.rs changelog/
+git add src/error.rs src/http/mod.rs changelog/
 git commit -m "feat(error): a Suspended error kind, 403 (M13 task 2)"
 ```
 
@@ -1240,7 +1245,9 @@ git commit -m "feat(selection): refuse named suspended catalogs, drop them from 
         assert!(team["suspended_at"].is_string());
         assert_eq!(missing, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(lifted, StatusCode::OK);
-        assert_eq!(after["suspended_at"], serde_json::Value::Null);
+        // `get`: `after["suspended_at"]` is `Null` for a missing key too.
+        // (Corrected, issue #364, 2026-11-13.)
+        assert_eq!(after.get("suspended_at"), Some(&serde_json::Value::Null));
     }
 
     #[tokio::test(flavor = "multi_thread")]
