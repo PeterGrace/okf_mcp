@@ -19029,7 +19029,7 @@ Every write logs at `info` with `key = principal.key_id` and `actor = principal.
 > - `EmailBody.email` needs `#[serde(deserialize_with = "Option::deserialize")]`: serde fills a missing `Option` field with `None`, so without it `{}` would clear the email.
 > - `set_email` polls after the change (`settle`): the key cache holds each user's email for console sessions.
 > - `list_sign_ins` needs no `id_by_name` first (`sign_in_events::recent` already answers an unknown user with 404); `RECENT_SIGN_INS` is `me.rs`'s, made `pub(crate)`. The views in `me` need no `pub(crate) mod me;`: a private module's `pub(crate)` items are visible to its sibling modules.
-> - `MailProvider::as_str` is new in `src/config.rs` (the settings listing needs it). The queue's `status` is `pending`, `sending`, `retrying` or `failed` (Task 6). An invalid setting value and a malformed test-mail address are 422 (`LimitExceeded`). The invite handler is `invite_user`, since `invite` names the imported module. No line logs an email address.
+> - `MailProvider::as_str` is new in `src/config.rs` (the settings listing needs it). The queue's `status` is `pending`, `sending`, `retrying` or `failed` (Task 6). An invalid setting value and a malformed test-mail address are 422 (`LimitExceeded`). The invite handler is `invite_user`, since `invite` names the imported module. No admin handler's log line, and no request span, holds an email address. The development `log` mail provider is the exception: by design it logs each message's recipient and full text, including a setup link, so it is for development and tests only and must not be used in production.
 
 - [ ] **Step 1: Write the failing store tests.** In `src/store/users.rs`'s test module:
 
