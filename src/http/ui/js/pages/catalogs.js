@@ -153,7 +153,9 @@ export async function render(main) {
 // grants they create are capped at it). It is read from GET
 // /catalogs/{catalog}/member-access when the drawer opens and again after
 // every save, refused or not, so it always shows the server's value. A
-// refusal's reason stays in the section until the next save. Changing it
+// refusal's reason stays in the section until the next save. A read that
+// fails keeps the last value, marked as possibly out of date, and leaves
+// the controls usable, so the save can be tried again. Changing it
 // needs `allowed` (an admin that reaches every catalog: the server's one
 // check is `may_set_member_access`). `ticket` is the drawer's claim: an
 // answer that arrives after the drawer was replaced or dismissed is
@@ -166,19 +168,26 @@ function memberAccess(row, allowed, ticket) {
     const current = h('span', { id: 'catalog-member-access-current', class: 'mono' }, '...');
     const save = h('button', { type: 'button', id: 'catalog-member-access-save', disabled: true }, 'Save');
     const refusal = h('p', { id: 'catalog-member-access-error', class: 'error small', role: 'alert', hidden: true });
-    // The server's value, once read; null until then and after a failed read.
+    // The server's value as last read (null until a read succeeds), and
+    // whether the latest read failed.
     let value = null;
-    const sync = () => { save.disabled = !allowed || value === null || select.value === value; };
+    let stale = false;
+    // Save is offered when the choice differs from the server's value, or
+    // always while that value is not known to be current.
+    const sync = () => { save.disabled = !allowed || (!stale && select.value === value); };
     select.addEventListener('change', sync);
 
     async function refresh() {
         let answer = null;
         try { answer = await api.get(path); } catch { /* toasted */ }
         if (!ticket.current()) return;
-        value = answer?.member_access ?? null;
-        current.textContent = value ?? 'unknown';
-        if (value !== null) select.value = value;
-        select.disabled = !allowed || value === null;
+        stale = answer === null;
+        if (!stale) {
+            value = answer.member_access;
+            select.value = value;
+        }
+        current.textContent = `${value ?? 'unknown'}${stale ? ' (could not be read again, may be out of date)' : ''}`;
+        select.disabled = !allowed;
         sync();
     }
 

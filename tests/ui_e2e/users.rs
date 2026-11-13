@@ -446,3 +446,104 @@ async fn a_scoped_admin_sees_the_sign_in_controls_disabled() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_sign_out_clicked_twice_sends_one_request() {
+    let server = login_server().await;
+    member(&server, Access::Write).await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let pool = &server.db.pool;
+    let alice = users::find_by_email(pool, EMAIL)
+        .await
+        .expect("find")
+        .expect("alice");
+    for agent in ["phone browser", "tablet browser"] {
+        user_sessions::create(
+            pool,
+            &alice.id,
+            None,
+            agent,
+            Duration::from_secs(7 * 86_400),
+            Utc::now(),
+        )
+        .await
+        .expect("a session of alice's");
+    }
+    let ran = drive(console_base(&server), move |ui| {
+        ui.login(&admin);
+        ui.open("/users");
+        ui.click("[data-test=user-alice]");
+        ui.wait_text("#user-session-table", "phone browser");
+        let phone = ui.eval(
+            "() => [...document.querySelectorAll('#user-session-table tbody tr')] \
+             .find(row => row.textContent.includes('phone browser')) \
+             ?.querySelector('button')?.dataset.test ?? null",
+            serde_json::json!(null),
+        );
+        let phone = phone.as_str().expect("a revoke button").to_string();
+        let prefix = phone
+            .strip_prefix("user-session-revoke-")
+            .expect("the button's data-test names the session");
+        // Hold the DELETE, then click twice: the button is disabled while
+        // the first request runs, so the second click sends nothing.
+        ui.hold_next("DELETE", &format!("/sessions/{prefix}"));
+        let disabled = ui.eval(
+            "(selector) => { const button = document.querySelector(selector); \
+             button.click(); button.click(); return button.disabled; }",
+            serde_json::json!(format!("[data-test={phone}]")),
+        );
+        assert_eq!(ui.held_matches(), 1, "a second DELETE was sent");
+        assert_eq!(disabled, serde_json::json!(true));
+        ui.release_held();
+        ui.wait_text_gone("#user-session-table", "phone browser");
+        ui.wait_text("#user-session-table", "tablet browser");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let left = user_sessions::list(pool, &alice.id, None)
+        .await
+        .expect("list");
+    assert_eq!(left.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_whose_reread_fails_keeps_its_reason_and_working_controls() {
+    let server = login_server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    server.user_with_password("alice", EMAIL, PASSWORD).await;
+    users::set_admin(&server.db.pool, "alice", true, false)
+        .await
+        .expect("make alice the one admin user");
+    server.app.poll().await.expect("poll");
+    let ran = drive(console_base(&server), move |ui| {
+        ui.login(&admin);
+        ui.open("/users");
+        ui.click("[data-test=user-alice]");
+        ui.wait_visible("#user-admin-toggle:checked");
+        // The server refuses the change (the last admin), and reading the
+        // user again then fails.
+        ui.fail_next("GET", "/users/alice", 503, "the server is unavailable");
+        ui.click("#user-admin-toggle");
+        ui.wait_visible("#user-stale");
+        ui.wait_text("#user-refusal", "last admin user");
+        ui.wait_visible("#user-admin-toggle:checked:not([disabled])");
+        ui.wait_visible("#user-email-form button[type=submit]:not([disabled])");
+        // The drawer still works, and the next read clears both notes.
+        ui.fill("#user-email-form input[name=email]", "alice@example.org");
+        ui.click("#user-email-form button[type=submit]");
+        ui.wait_text("[data-test=user-alice-email]", "alice@example.org");
+        ui.wait_hidden("#user-stale");
+        ui.wait_hidden("#user-refusal");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let alice = users::find_by_email(&server.db.pool, "alice@example.org")
+        .await
+        .expect("find")
+        .expect("alice has the new email");
+    assert!(alice.is_admin);
+}

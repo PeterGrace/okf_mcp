@@ -109,6 +109,15 @@ async fn an_admin_overrides_a_setting_then_resets_it_to_the_default() {
             ui.eval(MAX_KEYS_SETTING, json!(null))["overridden"],
             json!(false)
         );
+        // Another refusal, and reading the settings after it fails: its
+        // reason still shows (drawn from the last answer), the table is
+        // marked out of date, and Save works.
+        ui.fail_next("GET", "/api/v1/settings", 503, "the server is unavailable");
+        ui.fill("[data-test=setting-input-setup_link_ttl]", "soon");
+        ui.click("[data-test=setting-save-setup_link_ttl]");
+        ui.wait_visible("#settings-stale");
+        ui.wait_text("[data-test=setting-error-setup_link_ttl]", "not a duration");
+        ui.wait_visible("[data-test=setting-save-setup_link_ttl]:not([disabled])");
         // A valid one becomes an override, and the refusal goes.
         ui.fill("[data-test=setting-input-max_keys_per_user]", "5");
         ui.click("[data-test=setting-save-max_keys_per_user]");
@@ -118,6 +127,7 @@ async fn an_admin_overrides_a_setting_then_resets_it_to_the_default() {
             "console-admin",
         );
         ui.wait_hidden("[data-test=setting-error-max_keys_per_user]");
+        ui.wait_hidden("#settings-stale");
         let saved = ui.eval(MAX_KEYS_SETTING, json!(null));
         assert_eq!(saved["value"], json!("5"));
         assert_eq!(saved["overridden"], json!(true));

@@ -9,6 +9,54 @@ use rustwright::{chromium, ActionOptions, Browser, GotoOptions, LaunchOptions, P
 /// How long `wait_*` polls before failing.
 const WAIT: Duration = Duration::from_secs(10);
 
+/// Holds the page's next request with method `arg.method` to a path ending
+/// in `arg.suffix` until `window.releaseHeld()`; `window.heldDone` turns
+/// true once that held answer has been handed back to the page, and
+/// `window.heldMatches` counts the matching requests the page made while it
+/// was held (the held one included). Runs through `ui.eval`, so it wraps
+/// `fetch` without touching the page's code.
+const HOLD_NEXT: &str = "(arg) => {
+    const original = window.fetch;
+    let release = null;
+    window.heldDone = false;
+    window.heldMatches = 0;
+    window.releaseHeld = () => release();
+    window.fetch = (input, init) => {
+        const method = (init && init.method) || 'GET';
+        const matches = method === arg.method && String(input).endsWith(arg.suffix);
+        if (matches) window.heldMatches += 1;
+        if (release === null && matches) {
+            const held = new Promise(resolve => { release = resolve; });
+            return held.then(() => original(input, init))
+                .finally(() => { window.heldDone = true; window.fetch = original; });
+        }
+        return original(input, init);
+    };
+    return true;
+}";
+
+/// Answers the page's next request with method `arg.method` to a path
+/// ending in `arg.suffix` with status `arg.status` and the error body
+/// `{error, message: arg.message}`, without reaching the server (a refusal
+/// or an outage the console must survive). Later requests go through. The
+/// wrapper stays installed after it has answered (passing everything on),
+/// so several of them nest: each answers its own request once.
+const FAIL_NEXT: &str = "(arg) => {
+    const original = window.fetch;
+    let used = false;
+    window.fetch = (input, init) => {
+        const method = (init && init.method) || 'GET';
+        if (!used && method === arg.method && String(input).endsWith(arg.suffix)) {
+            used = true;
+            return Promise.resolve(new Response(
+                JSON.stringify({ error: 'test', message: arg.message }),
+                { status: arg.status, headers: { 'Content-Type': 'application/json' } }));
+        }
+        return original(input, init);
+    };
+    return true;
+}";
+
 /// One browser page on the console.
 pub struct Ui {
     /// The server, `http://127.0.0.1:<port>`.
@@ -178,6 +226,62 @@ impl Ui {
         self.page
             .evaluate(function, Some(&arg), ActionOptions::default())
             .expect("evaluate")
+    }
+
+    /// Holds the page's next `method` request to a path ending in `suffix`
+    /// until [`Ui::release_held`] (see [`HOLD_NEXT`]).
+    ///
+    /// # Arguments
+    /// * `method` - the HTTP method, upper case.
+    /// * `suffix` - the end of the request's URL.
+    pub fn hold_next(&self, method: &str, suffix: &str) {
+        self.eval(
+            HOLD_NEXT,
+            serde_json::json!({ "method": method, "suffix": suffix }),
+        );
+    }
+
+    /// How many matching requests the page made since [`Ui::hold_next`],
+    /// the held one included.
+    pub fn held_matches(&self) -> u64 {
+        self.eval("() => window.heldMatches", serde_json::json!(null))
+            .as_u64()
+            .unwrap_or(0)
+    }
+
+    /// Releases the held answer, waits until the page has it, then gives
+    /// the page a moment to act on it (a stale drawer would be drawn by
+    /// then).
+    ///
+    /// # Panics
+    /// When the held answer has not arrived within [`WAIT`].
+    pub fn release_held(&self) {
+        self.eval("() => window.releaseHeld()", serde_json::json!(null));
+        let deadline = Instant::now() + WAIT;
+        while self.eval("() => window.heldDone", serde_json::json!(null)) != serde_json::json!(true)
+        {
+            assert!(Instant::now() < deadline, "the held answer never arrived");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    /// Makes the page's next `method` request to a path ending in `suffix`
+    /// answer `status` with `message`, without reaching the server (see
+    /// [`FAIL_NEXT`]).
+    ///
+    /// # Arguments
+    /// * `method` - the HTTP method, upper case.
+    /// * `suffix` - the end of the request's URL.
+    /// * `status` - the status to answer, such as 409 or 503.
+    /// * `message` - the error body's `message`.
+    pub fn fail_next(&self, method: &str, suffix: &str, status: u16, message: &str) {
+        self.eval(
+            FAIL_NEXT,
+            serde_json::json!({
+                "method": method, "suffix": suffix, "status": status, "message": message,
+            }),
+        );
     }
 
     /// Gives the page a virtual WebAuthn authenticator (Chromium DevTools'

@@ -164,7 +164,7 @@ The research notes with crate file:line citations are in the session scratchpad.
   - `db.rs:76` lists every public table.
   - `src/http/api/testing.rs::send` sends only a bearer header.
   - `tests/ui_e2e/harness.rs` has `Ui::{open, login, wait_visible, wait_text, click, fill, select, eval}`.
-  - The `hold_next` fetch wrapper is local to `tests/ui_e2e/keys.rs`.
+  - The `hold_next` fetch wrapper is local to `tests/ui_e2e/keys.rs`. **Corrected (issue #326, 2026-11-13):** it moved to `tests/ui_e2e/harness.rs` as `Ui::hold_next`, `Ui::held_matches` and `Ui::release_held`, beside `Ui::fail_next`.
 
 ## Conventions for every task
 
@@ -24060,7 +24060,7 @@ Expected: FAIL: the new user journeys time out on `#user-invite`, the member-acc
 
 - [ ] **Step 5: Create `js/components/user-account.js`.**
 
-> **Superseded (issue #326, 2026-11-13).** Read `src/http/ui/js/components/user-account.js`. What changed: `accountSections` also takes `refusal` (the previous action's refused reason, drawn as `#user-refusal` until the next action) and shows `#user-account-readonly` for a scoped admin; `act(control, request, message)` disables the control while the request runs, toasts `message(answer)` built from the server's answer, and calls `changed(refusedReason)`; the sessions table is its own `sessionSection`.
+> **Superseded (issue #326, 2026-11-13).** Read `src/http/ui/js/components/user-account.js`. What changed: `accountSections` also takes `refusal` (the previous action's refused reason, drawn as `#user-refusal` until the next action) and shows `#user-account-readonly` for a scoped admin; `act(control, request, message)` disables the control while the request runs, toasts `message(answer)` built from the server's answer, and calls `changed(refusedReason)`; the sessions table is its own `sessionSection`. After review (PR #349): `act` restores its control in a `finally`; `sessionTable` (Task 14a's `components/activity.js`) disables a row's Sign out button until `revoke`'s promise settles; and `openDetail` takes `{ refusal, last }`, drawing a re-render whose read failed from `last`, marked `#user-stale`.
 
 ```js
 // The account parts of a user's drawer (M12): sign-in (email, admin flag,
@@ -24230,7 +24230,7 @@ In `render`, give the Name column the admin pill and add an Email column after D
 
 Replace `openDetail` with:
 
-> **Corrected (issue #326, 2026-11-13).** Shipped as `openDetail(name, ticket = drawerTicket(main), { again = false, refusal = null } = {})`: `changed(refused)` re-renders with `{ again: true, refusal: refused }`, and a re-render that cannot read the user again closes the drawer (through its ticket) rather than leave the old state showing.
+> **Corrected (issue #326, 2026-11-13).** Shipped as `openDetail(name, ticket = drawerTicket(main), { refusal = null, last = null } = {})`: `changed(refused)` re-renders with `{ refusal: refused, last: { detail, personal, account } }`, and a re-render that cannot read the user again draws `last`, marked stale (`#user-stale`), so the refusal still shows and the controls work.
 
 ```js
     // The drawer: the user's teams, the credentials this key manages, the

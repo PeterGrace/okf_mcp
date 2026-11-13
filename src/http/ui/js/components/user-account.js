@@ -8,7 +8,9 @@
 // which reads the user again and re-renders the drawer while its ticket is
 // current. Every control therefore shows the server's state after the
 // action (a refused admin toggle springs back), and a refusal's reason
-// stays in the drawer (`#user-refusal`) until the next action.
+// stays in the drawer (`#user-refusal`) until the next action. When that
+// read fails, the drawer is re-rendered from the last answer, marked stale
+// (`#user-stale`), so the reason still shows and every control works.
 import { h, fact } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { toast } from '../core/toast.js';
@@ -34,17 +36,24 @@ export async function loadAccount(name) {
 // `account` loadAccount's, `refusal` the reason the previous action was
 // refused (or null).
 export function accountSections({ detail, account, manager, refusal, changed }) {
-    // `control` is disabled while the request runs; the re-render that
-    // follows draws it again from the server's answer.
+    // `control` is disabled while the request runs (a session's Sign out
+    // button is disabled by sessionTable itself); the re-render that follows
+    // draws every control again, and the `finally` restores a control it did
+    // not replace.
     const act = async (control, request, message) => {
+        const was = control?.disabled ?? false;
         if (control) control.disabled = true;
-        let refused = null;
         try {
-            toast(message(await request()), 'ok');
-        } catch (error) {
-            refused = error.message;   // already toasted by api.js
+            let refused = null;
+            try {
+                toast(message(await request()), 'ok');
+            } catch (error) {
+                refused = error.message;   // already toasted by api.js
+            }
+            await changed(refused);
+        } finally {
+            if (control) control.disabled = was;
         }
-        await changed(refused);
     };
     const { user, entitlements } = detail;
     return [

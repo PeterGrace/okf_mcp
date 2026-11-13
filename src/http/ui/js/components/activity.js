@@ -9,9 +9,10 @@ const OUTCOME_KIND = { ok: 'ok', failed: 'warn', locked: 'error' };
 // sessions: [{id_prefix, created_at, last_seen_at, ip, user_agent, current?}].
 // Each row but the current one has a Sign out button calling revoke(row);
 // with `revokeCurrent`, the current one has one too (the Account page signs
-// this browser out with it). `prefix` starts its data-test
-// (`<prefix>-<id_prefix>`, `<prefix>-revoke-<id_prefix>`), and `allowed`
-// false disables it.
+// this browser out with it). The button stays disabled until the promise
+// revoke returns settles, so a second click never sends a second request.
+// `prefix` starts its data-test (`<prefix>-<id_prefix>`,
+// `<prefix>-revoke-<id_prefix>`), and `allowed` false disables it.
 export function sessionTable({ id, sessions, prefix, revoke, allowed = true, revokeCurrent = false }) {
     const table = listTable([
         { key: 'user_agent', label: 'Browser',
@@ -23,7 +24,12 @@ export function sessionTable({ id, sessions, prefix, revoke, allowed = true, rev
         { key: 'actions', label: '',
           render: row => row.current && !revokeCurrent ? '-' : h('button', {
               type: 'button', class: 'text-btn', disabled: !allowed,
-              dataset: { test: `${prefix}-revoke-${row.id_prefix}` }, onclick: () => revoke(row),
+              dataset: { test: `${prefix}-revoke-${row.id_prefix}` },
+              onclick: async event => {
+                  const button = event.currentTarget;
+                  button.disabled = true;
+                  try { await revoke(row); } finally { button.disabled = !allowed; }
+              },
           }, 'Sign out') },
     ], sessions, { empty: 'No console sessions.' });
     table.id = id;

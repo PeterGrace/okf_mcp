@@ -91,23 +91,23 @@ export async function render(main, rest) {
     // Delete, disabled with the reason while anything still names the user.
     // `ticket` is the drawer's claim: a re-render after an action passes
     // the one the drawer was opened with, so once the drawer is replaced or
-    // dismissed the late answer is dropped. `again` marks such a re-render,
-    // and `refusal` is the reason its action was refused (shown until the
-    // next action).
-    async function openDetail(name, ticket = drawerTicket(main), { again = false, refusal = null } = {}) {
-        let detail;
-        let personal;
-        let account;
+    // dismissed the late answer is dropped. `refusal` is the reason that
+    // action was refused (shown until the next action), and `last` the
+    // answers the drawer showed before it: when reading the user again
+    // fails, the drawer is drawn from them, marked stale, so the refusal
+    // still shows and every control can be used again.
+    async function openDetail(name, ticket = drawerTicket(main), { refusal = null, last = null } = {}) {
+        let loaded;
         try {
-            [detail, personal, account] = await Promise.all([
+            const [detail, personal, account] = await Promise.all([
                 api.get(`/users/${enc(name)}`), api.get(`/teams/${enc(name)}`), loadAccount(name)]);
+            loaded = { detail, personal, account, stale: false };
         } catch {
-            // A re-render that cannot read the user again closes the drawer
-            // rather than leave the old state showing as if current.
-            if (again) ticket.close();
-            return;
+            if (!last) return;   // the first load: no drawer to keep (toasted)
+            loaded = { ...last, stale: true };
         }
         if (!ticket.current()) return;
+        const { detail, personal, account, stale } = loaded;
         const { user, keys, codes } = detail;
         const reason = deleteReason(user, personal);
         const changed = async refused => {
@@ -115,7 +115,9 @@ export async function render(main, rest) {
             // shell state (the Administer group, the session itself).
             if (name === store.session?.user) await refreshIdentity().catch(() => {});
             if (main.isConnected) await load();
-            if (ticket.current()) await openDetail(name, ticket, { again: true, refusal: refused });
+            if (ticket.current()) {
+                await openDetail(name, ticket, { refusal: refused, last: { detail, personal, account } });
+            }
         };
         const remove = h('button', {
             type: 'button', id: 'user-delete', class: 'danger', disabled: !manager || !!reason,
@@ -134,6 +136,8 @@ export async function render(main, rest) {
         }, 'Delete user');
         ticket.open(name, user.display_name || 'User',
             h('div', { id: 'user-detail' },
+                stale ? h('p', { id: 'user-stale', class: 'error small', role: 'status' },
+                    'Could not read this user again, so what is shown may be out of date.') : null,
                 h('p', {}, 'Personal team: ', h('code', {}, personal.name)),
                 h('dl', { class: 'facts' },
                     h('dt', {}, 'Teams'), h('dd', {}, user.teams.join(', ')),

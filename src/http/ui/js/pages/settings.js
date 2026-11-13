@@ -9,7 +9,11 @@
 // Every value shown comes from the server's latest answer: each action is
 // followed by a fresh GET of what it changed. A refusal's reason (a value
 // the setting refuses, 422 with `limit: "setting"`) stays beside what it
-// refused until that control's next action succeeds.
+// refused until that control's next action succeeds. A control is disabled
+// while its request runs and restored when it settles. When the GET that
+// follows fails, the table is drawn again from the last answer and marked
+// as possibly out of date, so the reason still shows and every control can
+// be tried again.
 import { h, pill, fact, fill } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
@@ -54,17 +58,25 @@ export async function render(main) {
         ? h('p', { class: 'error small', role: 'alert', dataset: { test } }, refusals.get(control))
         : null);
 
-    // Runs `request`; on success toasts `message(answer)` and forgets the
-    // control's refusal, on failure (already toasted) keeps its reason.
-    // Then `reload()` reads the server's state again.
-    const act = async (control, request, message, reload) => {
+    // Runs `request` with `button` disabled; on success toasts
+    // `message(answer)` and forgets the refusal for `control`, on failure
+    // (already toasted) keeps its reason. Then `reload()` reads the server's
+    // state again and redraws, from the last answer if that read fails. The
+    // `finally` restores a button the redraw did not replace.
+    const act = async ({ control, button }, request, message, reload) => {
+        const was = button.disabled;
+        button.disabled = true;
         try {
-            toast(message(await request()), 'ok');
-            refusals.delete(control);
-        } catch (error) {
-            refusals.set(control, error.message);
+            try {
+                toast(message(await request()), 'ok');
+                refusals.delete(control);
+            } catch (error) {
+                refusals.set(control, error.message);
+            }
+            await reload();
+        } finally {
+            button.disabled = was;
         }
-        await reload();
     };
 
     const valueControl = row => {
@@ -75,21 +87,15 @@ export async function render(main) {
             : h('input', { ...attrs, value: row.value, autocomplete: 'off' });
         const save = h('button', {
             type: 'button', class: 'secondary', disabled: !manager, dataset: { test: `setting-save-${row.key}` },
-            onclick: () => {
-                save.disabled = true;
-                const value = input.value.trim();
-                act(row.key, () => api.put(`/settings/${enc(row.key)}`, { value }),
-                    answer => `${answer.key} is now ${answer.value}.`, loadSettings);
-            },
+            onclick: () => act({ control: row.key, button: save },
+                () => api.put(`/settings/${enc(row.key)}`, { value: input.value.trim() }),
+                answer => `${answer.key} is now ${answer.value}.`, loadSettings),
         }, 'Save');
         const reset = h('button', {
             type: 'button', class: 'text-btn', disabled: !manager || !row.overridden,
             dataset: { test: `setting-reset-${row.key}` },
-            onclick: () => {
-                reset.disabled = true;
-                act(row.key, () => api.del(`/settings/${enc(row.key)}`),
-                    answer => `${answer.key} is back to its default, ${answer.value}.`, loadSettings);
-            },
+            onclick: () => act({ control: row.key, button: reset }, () => api.del(`/settings/${enc(row.key)}`),
+                answer => `${answer.key} is back to its default, ${answer.value}.`, loadSettings),
         }, 'Reset');
         return [h('div', { class: 'inline-form' }, input, save, reset),
             refusalNote(row.key, `setting-error-${row.key}`)];
@@ -117,16 +123,15 @@ export async function render(main) {
     const testRefusal = h('div', { id: 'mail-test-error' });
     testForm.addEventListener('submit', async event => {
         event.preventDefault();
-        send.disabled = true;
         const address = to.value.trim();
-        await act('mail-test', () => api.post('/mail/test', { to: address }),
+        await act({ control: 'mail-test', button: send }, () => api.post('/mail/test', { to: address }),
             answer => `Queued a test email to ${answer.to}.`, loadQueue);
         if (!refusals.has('mail-test')) testForm.reset();
         fill(testRefusal, refusalNote('mail-test', 'mail-test-error'));
-        send.disabled = !manager;
     });
 
-    const queueAction = (row, request, message) => act(`queue-${row.id}`, request, message, loadQueue);
+    const queueAction = (row, button, request, message) =>
+        act({ control: `queue-${row.id}`, button }, request, message, loadQueue);
     const queue = listTable([
         { key: 'to', label: 'To', class: 'mono', sort: row => row.to },
         { key: 'template', label: 'Template', sort: row => row.template },
@@ -140,21 +145,22 @@ export async function render(main) {
         { key: 'actions', label: '', render: row => [h('div', { class: 'inline-form' },
             RETRYABLE.has(row.status) ? h('button', {
                 type: 'button', class: 'secondary', disabled: !manager, dataset: { test: `mail-retry-${row.id}` },
-                onclick: () => queueAction(row, () => api.post(`/mail/queue/${enc(row.id)}/retry`),
+                onclick: event => queueAction(row, event.currentTarget, () => api.post(`/mail/queue/${enc(row.id)}/retry`),
                     () => `Sending the mail to ${row.to} again.`),
             }, 'Retry') : null,
             h('button', {
                 type: 'button', class: 'text-btn', disabled: !manager || row.status === SENDING,
                 title: row.status === SENDING ? 'It is being sent right now.' : null,
                 dataset: { test: `mail-delete-${row.id}` },
-                onclick: async () => {
+                onclick: async event => {
+                    const button = event.currentTarget;
                     const ok = await confirmDialog({
                         title: `Delete the mail to ${row.to}?`,
                         message: 'It is not sent. A setup or reset link in it stays valid until it expires.',
                         action: 'Delete',
                     });
                     if (ok) {
-                        await queueAction(row, () => api.del(`/mail/queue/${enc(row.id)}`),
+                        await queueAction(row, button, () => api.del(`/mail/queue/${enc(row.id)}`),
                             () => `Deleted the mail to ${row.to}.`);
                     }
                 },
@@ -163,12 +169,22 @@ export async function render(main) {
     ], [], { empty: 'No mail waiting or failed.' });
     queue.id = 'mail-queue-table';
 
+    // The last answers drawn, kept for a redraw after a failed read, and the
+    // notes saying the shown values may be out of date.
+    let settingRows = [];
+    let queueRows = [];
+    const staleNote = (id, what) => h('p', { id, class: 'error small', role: 'status', hidden: true },
+        `Could not read ${what} again, so what is shown may be out of date.`);
+    const settingsStale = staleNote('settings-stale', 'the settings');
+    const queueStale = staleNote('mail-queue-stale', 'the mail queue');
+
     fill(main,
         head,
         manager ? null : h('p', { class: 'muted small', id: 'settings-readonly' },
             'Changing settings or the mail queue needs an admin key that reaches every catalog.'),
         h('section', { class: 'account-section', id: 'settings-policy' }, h('h2', {}, 'Policy'),
             h('p', { class: 'muted small' }, 'The config file\'s [auth] table gives the defaults; a value saved here overrides it until Reset.'),
+            settingsStale,
             settings),
         h('section', { class: 'account-section' }, h('h2', {}, 'Sign-in providers'), providers),
         h('section', { class: 'account-section' }, h('h2', {}, 'Mail'), mail, testForm, testRefusal),
@@ -178,13 +194,22 @@ export async function render(main) {
                 h('div', { class: 'actions' },
                     h('button', { type: 'button', id: 'mail-queue-refresh', class: 'secondary', onclick: () => loadQueue() }, 'Refresh'))),
             h('p', { class: 'muted small' }, 'Mail waiting to be sent, and mail that failed after its retries (24 hours) or at once.'),
+            queueStale,
             queue));
 
+    // Reads the settings and redraws them; after a failed read (toasted),
+    // redraws the last ones, marked stale, with the current refusals.
     async function loadSettings() {
-        let answer;
-        try { answer = await api.get('/settings'); } catch { return; /* toasted */ }
+        let answer = null;
+        try { answer = await api.get('/settings'); } catch { /* toasted */ }
         if (!main.isConnected) return;
-        settings.redraw(answer.settings);
+        settingsStale.hidden = answer !== null;
+        if (answer === null) {
+            settings.redraw(settingRows);
+            return;
+        }
+        settingRows = answer.settings;
+        settings.redraw(settingRows);
         fill(providers, answer.oidc.length
             ? h('ul', { class: 'grant-list' }, answer.oidc.map(provider =>
                 h('li', { dataset: { test: `oidc-${provider.id}` } },
@@ -196,16 +221,21 @@ export async function render(main) {
             fact('From', answer.mail.from)));
     }
 
+    // Reads the queue and redraws it, as loadSettings does the settings.
     async function loadQueue() {
-        let answer;
-        try { answer = await api.get('/mail/queue'); } catch { return; /* toasted */ }
+        let answer = null;
+        try { answer = await api.get('/mail/queue'); } catch { /* toasted */ }
         if (!main.isConnected) return;
-        // A refusal for a mail no longer listed has nothing to stand beside.
-        const listed = new Set(answer.mail.map(row => `queue-${row.id}`));
-        for (const control of refusals.keys()) {
-            if (control.startsWith('queue-') && !listed.has(control)) refusals.delete(control);
+        queueStale.hidden = answer !== null;
+        if (answer !== null) {
+            queueRows = answer.mail;
+            // A refusal for a mail no longer listed has nothing to stand beside.
+            const listed = new Set(queueRows.map(row => `queue-${row.id}`));
+            for (const control of refusals.keys()) {
+                if (control.startsWith('queue-') && !listed.has(control)) refusals.delete(control);
+            }
         }
-        queue.redraw(answer.mail);
+        queue.redraw(queueRows);
     }
 
     await Promise.all([loadSettings(), loadQueue()]);
