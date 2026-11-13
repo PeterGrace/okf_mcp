@@ -336,13 +336,63 @@ test_watchdog_covers_worktrees_outside_main_checkout() {
 # --- gate.sh ---
 
 test_gate_timeout_returns_124() {
-    new_fixtures
-    mkdir "$fx/bin"
-    printf '#!/usr/bin/env bash\nexec sleep 30\n' >"$fx/bin/just"
-    chmod +x "$fx/bin/just"
+    new_fixtures; fake_just 'exec sleep 30'
     out=$(cd "$repo" && PATH="$fx/bin:$PATH" AGENTIC_TIMEOUT_FMT=1s \
         "$tools/gate.sh" fmt 2>&1)
     rc=$?
+    want_rc 124; want_out "Treat this as a HANG"
+}
+
+# fake_just <body>: puts a `just` running <body> first on PATH for this test.
+fake_just() {
+    mkdir -p "$fx/bin"
+    printf '#!/usr/bin/env bash\n%s\n' "$1" >"$fx/bin/just"
+    chmod +x "$fx/bin/just"
+}
+
+test_gate_returns_the_gate_exit_status() {
+    new_fixtures; fake_just 'exit 3'
+    out=$(cd "$repo" && PATH="$fx/bin:$PATH" "$tools/gate.sh" lint 2>&1)
+    rc=$?
+    want_rc 3; want_no_out "HANG"
+}
+
+test_gate_timeout_stops_term_ignoring_child_and_frees_lock() {
+    new_fixtures
+    # The gate starts a child that ignores TERM and inherits the lock's fd.
+    # Its output goes to /dev/null so it can't hold the test's pipe open.
+    fake_just "$(cat <<'EOF'
+bash -c 'trap "" TERM; exec sleep 30' >/dev/null 2>&1 &
+echo $! >"$GH_FIXTURES/child.pid"
+wait
+EOF
+)"
+    trap '[ -s "$fx/child.pid" ] && kill -KILL "$(cat "$fx/child.pid")" 2>/dev/null' EXIT
+    local started=$SECONDS
+    (cd "$repo" && PATH="$fx/bin:$PATH" AGENTIC_TIMEOUT_LINT=1s AGENTIC_GATE_KILL_AFTER=1 \
+        "$tools/gate.sh" lint) >"$fx/out" 2>&1
+    rc=$?
+    out=$(cat "$fx/out")
+    want_rc 124; want_out "Treat this as a HANG"
+    [ $((SECONDS - started)) -le 6 ] || die "took $((SECONDS - started)) s"
+    ! kill -0 "$(cat "$fx/child.pid")" 2>/dev/null || die "the TERM-ignoring child outlived the gate"
+    flock -n "$repo/.git/agentic/gates.lock" true || die "gates.lock is still held"
+}
+
+test_gate_lock_wait_is_bounded() {
+    new_fixtures; fake_just 'exit 0'
+    mkdir -p "$repo/.git/agentic"
+    # One process takes the lock and becomes the sleep, so killing $holder
+    # releases the lock.
+    # shellcheck disable=SC2016 # $1 is expanded by the inner bash
+    bash -c 'exec 9>"$1"; flock 9; exec sleep 30' _ "$repo/.git/agentic/gates.lock" \
+        >/dev/null 2>&1 &
+    lock_holder=$! # not local: the EXIT trap runs after the function returns
+    trap 'kill "$lock_holder" 2>/dev/null' EXIT
+    sleep 0.2
+    out=$(cd "$repo" && PATH="$fx/bin:$PATH" AGENTIC_TIMEOUT_LINT=1s "$tools/gate.sh" lint 2>&1)
+    rc=$?
+    kill "$lock_holder"; wait "$lock_holder" 2>/dev/null
     want_rc 124; want_out "Treat this as a HANG"
 }
 

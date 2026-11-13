@@ -7,7 +7,7 @@ bot before it merges.
 
 | File | Used by | What it does |
 |---|---|---|
-| `gate.sh` | implementation agents | Runs `fmt`, `lint`, `test`, `test-ui` or a narrow `cargo test`. Every gate has a hard timeout; the heavy gates also take a lock shared by all worktrees. Exit 124 means a test hung. |
+| `gate.sh` | implementation agents | Runs `fmt`, `lint`, `test`, `test-ui` or a narrow `cargo test`. Every gate has a hard timeout; the heavy gates also take a lock shared by all worktrees. Exit 124 means a test hung; by then every process the gate started is gone and the lock is free. |
 | `watch-review.sh <pr>` | coordinator | Waits until the bot has reviewed the PR's current head (exit 0). Re-triggers the bot once if it is silent, and gives up 30 min after it started, printing why (exit 2). Exits 4 at once when the round cap is reached instead of asking again. |
 | `merge-reviewed.sh <pr>` | coordinator | Merges only if the bot reviewed the current head (or the round cap is reached), every bot thread has a reply, and the PR is `CLEAN`. The merge is pinned to the inspected head with `--match-head-commit`. |
 | `watchdog.sh [--once]` | coordinator | Runs in the background for the whole epic. Exits 3 when any test or gate process in the main checkout or any registered worktree (wherever it lives) runs past its limit, which catches agents stuck before they open a PR. `--once` checks a single time. |
@@ -50,6 +50,7 @@ A PR gets at most `AGENTIC_MAX_REVIEW_ROUNDS` (default 3) reviews from the bot, 
 | `AGENTIC_RETRIGGER` | `/prrb` | Comment that re-triggers the bot |
 | `AGENTIC_MAX_REVIEW_ROUNDS` | 3 | Most bot reviews a PR gets before it merges without another |
 | `AGENTIC_TIMEOUT_<GATE>` | 5m / 30m / 75m / 60m / 15m | Per-gate limits for `gate.sh`: fmt, lint, test, test-ui, narrow |
+| `AGENTIC_GATE_KILL_AFTER` | 60 (seconds) | After a gate times out, how long its process group gets between TERM and KILL. `gate.sh` returns 124 only once the whole group is gone, so the lock is free |
 | `AGENTIC_WATCHDOG_TEST`, `_GATE`, `_INTERVAL` | 1200, 4800, 300 (seconds) | Watchdog limits and check interval |
 | `AGENTIC_NOW_CMD`, `AGENTIC_SLEEP_CMD` | `date +%s`, `sleep` | Clock and sleep for `watch-review.sh`; the tests replace them with a fake clock |
 
