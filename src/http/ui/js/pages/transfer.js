@@ -1,7 +1,7 @@
 // Import & export: download a catalog's .tar.gz, or upload one with the
 // CLI's options. An <a href> cannot carry the bearer header, so the export
 // is fetched and handed to the browser as a blob: object URL.
-import { h, clear } from '../core/dom.js';
+import { h, clear, fill } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
@@ -165,7 +165,9 @@ export async function render(main, rest) {
     });
     showGeneration();
 
-    main.append(
+    // fill(), not native append: the import panel is null without admin
+    // (issue #302).
+    fill(main,
         h('div', { class: 'page-head' },
             h('div', {}, h('h1', {}, 'Import & export'),
                 h('p', { class: 'muted' }, 'Move a catalog in and out as a .tar.gz, as okf-mcp import and export do.'))),
