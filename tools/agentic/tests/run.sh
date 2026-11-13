@@ -467,6 +467,23 @@ test_gate_lock_wait_is_bounded() {
     want_rc 124; want_out "Treat this as a HANG"
 }
 
+test_gate_narrow_builds_offline() {
+    new_fixtures
+    mkdir -p "$fx/bin"
+    # A fake cargo that records the SQLX_OFFLINE it was given.
+    cat >"$fx/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${SQLX_OFFLINE-unset}" >"$GH_FIXTURES/sqlx_offline"
+EOF
+    chmod +x "$fx/bin/cargo"
+    out=$(cd "$repo" && env -u SQLX_OFFLINE DATABASE_URL=postgres://db.example.invalid/x \
+        PATH="$fx/bin:$PATH" "$tools/gate.sh" narrow --lib 2>&1)
+    rc=$?
+    want_rc 0
+    [ "$(cat "$fx/sqlx_offline")" = true ] \
+        || die "cargo got SQLX_OFFLINE=$(cat "$fx/sqlx_offline"), want true"
+}
+
 # --- runner ---
 
 passed=0

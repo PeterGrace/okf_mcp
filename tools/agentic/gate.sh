@@ -39,6 +39,12 @@ source "$here/lib.sh"
 gate=${1:?usage: gate.sh fmt|lint|test|test-ui|narrow [args...]}
 shift
 
+# Build against the committed sqlx query data, as the justfile does, so a
+# DATABASE_URL in the caller's environment never steers a gate (the narrow
+# gate runs cargo directly and would otherwise miss the justfile's setting).
+# A value the caller set explicitly is kept.
+export SQLX_OFFLINE="${SQLX_OFFLINE-true}"
+
 lock="$(agentic_state_dir)/gates.lock"
 kill_after=${AGENTIC_GATE_KILL_AFTER:-60}
 
