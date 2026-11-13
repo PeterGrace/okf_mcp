@@ -11,7 +11,15 @@ API at `/api/v1` ("Web console" below; design:
 `docs/superpowers/specs/2026-11-09-okf-webui-design.md`). Milestone 10 added
 OAuth 2.1 for connectors that cannot send an API key, and a title and
 behaviour hints on every tool (`docs/operations.md`, "OAuth connectors";
-design: `docs/superpowers/specs/2026-11-11-okf-oauth-design.md`).
+design: `docs/superpowers/specs/2026-11-11-okf-oauth-design.md`). Milestone
+11 gave every credential a user and every catalog an owner team
+(`docs/operations.md`, "Users and teams"; design:
+`docs/superpowers/specs/2026-11-11-okf-users-teams-design.md`). Milestone 12
+added sign-in to the console (password, passkey or OIDC), self-service keys
+and grants within a ceiling admins set through team member access and
+entitlements, OAuth consent as the signed-in user, and mail through a job
+queue in Postgres (`docs/operations.md`, "Signing in and self-service";
+design: `docs/superpowers/specs/2026-11-12-okf-user-login-design.md`).
 
 Deployed: `https://okf-mcp.k.vsix.me` (every route but `/healthz` needs a
 bearer key), from the image `ghcr.io/hypotheosis/okf-mcp`, with its database
@@ -76,6 +84,11 @@ creates its personal team of the same name. Ownership grants no access.
 `catalog set-owner`, `key assign` and `oauth code assign` manage them, and
 `okf-mcp unassigned` lists what predates users and teams and has neither
 (`docs/operations.md`, "Users and teams").
+`okf-mcp user set-admin|set-email|invite|entitle|unentitle|sessions|revoke-sessions|sign-ins`,
+`catalog set-member-access`, `settings list|set|reset` and
+`mail test|queue|retry|delete` manage sign-in, the ceiling, policy and mail
+(`docs/operations.md`, "Signing in and self-service"). `user invite` and
+`mail test` only queue the mail; a running server's worker sends it.
 
 `import` takes a `.tar.gz` file, `-` for one on stdin, or a directory. A
 `git archive` tarball imports exactly the checkout's tracked files, and a
@@ -166,6 +179,10 @@ overlay_cache_size = 64            # open changesets' views kept in memory
 maintenance_review_intervals = { pg = "30d" } # per-catalog; default 30d, minimum 1d
 time_server = "time.example.com"   # NTP server for the clock check (default: none)
 ```
+
+`public_url` (OAuth and console sign-in), `[oauth]`, `[auth]` (sign-in
+policy and OIDC providers) and `[mail]` are described, with every other key,
+in `docs/operations.md`, section 3.
 
 A zero `poll_interval` or `session_idle_timeout`, an empty `allowed_hosts`
 or a blank entry in it, or a blank or padded `time_server`, is refused at
@@ -287,7 +304,8 @@ only).
 | `POST /catalogs/{name}/import[?replace=true&only_machinery=true&expect_generation=N]` | `admin` on the catalog | Imports the uploaded `.tar.gz` and answers with the import report |
 | `GET /` | none | Redirects (303) to the web console, `/ui/` |
 | `GET /ui/*` | none | The web console's static files ("Web console" below) |
-| `/api/v1/*` | any (each endpoint checks its level) | The console's JSON API (`docs/operations.md`, "Web console") |
+| `/api/v1/*` | a key, or a console session (each endpoint checks its level) | The console's JSON API (`docs/operations.md`, "Web console") |
+| `GET/POST /signin`, `GET/POST /signin/forgot`, `GET/POST /account/setup`, `GET/POST /account/reset`, `POST /auth/passkey/*`, `GET /auth/oidc/{provider}/*` | none (setup and reset take their link) | Console sign-in; only with `public_url` set (`docs/operations.md`, "Signing in and self-service"). Sign-out is `DELETE /api/v1/session` |
 | `GET /.well-known/oauth-protected-resource[/mcp]`, `GET /.well-known/oauth-authorization-server` | none | OAuth discovery; only with `public_url` set (`docs/operations.md`, "OAuth connectors") |
 | `GET/POST /oauth/authorize`, `POST /oauth/register`, `POST /oauth/token`, `POST /oauth/revoke` | none | The OAuth authorization server; only with `public_url` set |
 
@@ -330,10 +348,12 @@ long-lived event stream.
 ## Web console
 
 `/ui/` is a browser console for the server, and `/` redirects there. Sign in
-by pasting an API key: the console acts with exactly that key's access and
-hides what the key cannot do. The key stays in that browser's `localStorage`
-until you sign out (or only in memory for the page's lifetime, where storage
-is blocked), so sign out on a shared machine.
+with your account (password, passkey or a linked OIDC provider), or paste an
+API key: the console acts with exactly that identity's access and hides what
+it cannot do. A pasted key stays in that browser's `localStorage` until you
+sign out (or only in memory for the page's lifetime, where storage is
+blocked), so sign out on a shared machine; an account session is an
+`HttpOnly` cookie.
 
 The Health page shows lint, sprawl, link, staleness and open-question counts,
 with each report one click away.
@@ -345,7 +365,8 @@ server.
 Maintenance findings can be triaged (accepted, dismissed, needs input,
 reopened) and runs inspected from the browser.
 
-Every console action is an `/api/v1` call with the same bearer key, so
+Every console action is an `/api/v1` call with the same credential (the
+bearer key, or the session cookie with its `X-OKF-CSRF` header on writes), so
 anything the console does can be scripted:
 
     curl -s -H "Authorization: Bearer $OKF_MCP_KEY" http://127.0.0.1:8080/api/v1/whoami
@@ -355,7 +376,10 @@ on the server: list, create (the secret is shown once), revoke, grant and
 ungrant catalogs, the maintenance-report flag, and the user each key
 belongs to. Users and Teams (`/ui/#/users`, `/ui/#/teams`) manage users,
 teams and membership, and `/ui/#/users/unassigned` assigns what predates
-them.
+them. Signed in with an account, My keys, My grants and Account
+(`/ui/#/my-keys`, `/ui/#/my-grants`, `/ui/#/account`) manage the person's
+own keys, grants, sign-in methods and sessions; admins also get Settings
+(`/ui/#/settings`) and the mail queue.
 
 Browse shows a catalog's tree, each concept rendered (raw HTML in a concept
 is shown as text, never run), its links, history and revision diffs, and

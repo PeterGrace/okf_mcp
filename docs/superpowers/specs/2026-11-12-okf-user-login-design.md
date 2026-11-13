@@ -1,6 +1,6 @@
 # okf-mcp user login: design
 
-Status: approved in brainstorming, 2026-11-12. This is milestone 12, and it closes issues #298 (login) and #299 (access through team membership).
+Status: delivered in milestone 12 (epic #308; sub-issues #309-#327; PRs #328-#334, #336-#338 and #340-#349, and the PR for #327), 2026-11-13 (plan `docs/superpowers/plans/2026-11-12-okf-mcp-m12-user-login.md`). It closes #298 and #299. What differs from this design is under "What shipped differently" at the end; the operator's view is `docs/operations.md`, "Signing in and self-service".
 
 ## Goal
 
@@ -443,3 +443,177 @@ Every admin action has a CLI command, a REST route and a console control under *
 3. **Multi-factor authentication** for password sign-in (TOTP or passkey as a second factor).
 4. **Self-service account deletion**, once credential history no longer blocks deletion (#297).
 5. **Move the existing background loops onto apalis**: token, code and session cleanup, and sign-in event pruning.
+
+## What shipped differently
+
+Read the plan's "Decisions taken while planning" and its `Corrected (issue
+#N)` and `Superseded (issue #N)` notes for the detail; the per-task
+changelogs (`changelog/*-m12-task-*`) give the reasons.
+
+### From the plan's decisions
+
+- **Per-catalog levels on keys** (plan Decision 1). `key_catalogs` gained a
+  nullable `access` (NULL: the key's own level), and `Principal`'s reach
+  became a level per catalog, so a self-issued key holds read on one catalog
+  and write on another, and capping lowers each catalog separately.
+- **`user_catalogs.catalog_id` is `bigint`** (Decision 2), as `catalogs.id`
+  is; the data model above wrote `text`.
+- **Self-issued keys name their catalogs** (Decision 3): "all catalogs" is
+  refused (422), and a CHECK keeps self-issued keys from `admin`,
+  maintenance reporting and all catalogs.
+- **Key expiry is a column** (Decision 4): `api_keys.expires_at`, checked at
+  lookup as well as on cache load. Only self-issued keys get one.
+- **A console session is a principal** (Decision 5):
+  `CredentialKind::Session` with `key_id = "session:<user>"`, which can
+  never be a key id. A session owns no changesets (`open_changeset` refuses
+  it). `whoami` answers for it with `kind: "session"`.
+- **Three error variants** (Decision 6): `Unauthenticated` (401), `Gone`
+  (410) and `LimitExceeded` (422, naming the limit).
+- **Client addresses behind a proxy** (Decision 7): a new
+  `[auth] trusted_proxy_header`; without it the peer address is used and no
+  header is read.
+- **Limits** (Decision 8): per-address and per-email limits are in memory,
+  per process, as M10's are; account lockout is durable
+  (`users.failed_sign_ins`, `users.locked_until`).
+- **Setting names** (Decision 9): `console_session_idle` and
+  `console_session_absolute`, not `session_idle` and `session_absolute`,
+  which would read as MCP's `session_idle_timeout`.
+- **Mail retry** (Decision 11): 30 s doubling to 1 h for 24 hours from when
+  the mail was queued; a permanent refusal fails at once; the worker polls
+  every 30 s as well as listening, so manual retries are picked up.
+- **OIDC over the existing HTTP client** (Decision 12): `openidconnect`
+  without default features, through an adapter over the crate's `reqwest`
+  0.13, so no second `reqwest` is linked.
+- **Passkey ceremony state and OIDC flow state are in memory** (Decision
+  13), each keyed by a cookie (5 minutes and 10 minutes, single use), not a
+  database row. Passkeys are off when `public_url`'s host is an address.
+- **Sign-in pages may run script** (Decision 14): they share `http::pages`
+  with consent, but use the console's CSP (`script-src 'self'`), since the
+  passkey button needs WebAuthn; consent keeps its no-script CSP.
+- **The `Secure` cookie flag follows `public_url`'s scheme** (Decision 15),
+  so a loopback `http` test server works; the design said `Secure` always.
+- **The last admin user** (Decision 16): the API refuses clearing it for any
+  principal, admin keys included; the CLI may, as operator access. The
+  design let an admin key do it.
+- **One route per admin action** (Decision 17): entitle and unentitle,
+  retry and delete, set and reset each have their own route, so the parity
+  test keeps one route per row.
+- **An admin flag change signs the user out everywhere** (Decision 20,
+  `users::set_admin`): instead of rotating the session id, every session of
+  the user is deleted, so the next request signs in again with the new flag.
+- **Linking an account from the console** goes through
+  `POST /api/v1/me/identities/{provider}/link`, which answers the
+  provider's URL, so the start of the link flow carries the CSRF token.
+- **The console reads `GET /api/v1/session` beside `whoami`** (Decision
+  22): the session gives the CSRF token, admin flag and ceiling
+  (`{catalog: level}`), `whoami` the catalogs, as for keys. Sign-out is
+  `DELETE /api/v1/session`, behind the CSRF check, not a separate sign-out
+  page.
+- **Passkey registration from the Account page** is
+  `POST /api/v1/me/passkeys/register/start` and `/finish` (Decision 23),
+  beside the setup page's `POST /auth/passkey/setup/start` and `/finish`.
+- **No "sign out everywhere else" for oneself**: the Account page signs
+  sessions out one at a time (`DELETE /api/v1/me/sessions/{id_prefix}`),
+  this browser's included; admins still sign a user out everywhere.
+- **Mail is queued inside the transaction it reports**, not after it
+  commits: a setup link, and the "method added" notice, are queued in the
+  same transaction as the change, so nothing that can block or fail runs
+  after a sign-in or change commits.
+
+### From the plan's corrections, by issue
+
+- **#309 (schema).** apalis resolved to 1.1.1 and apalis-postgres to 1.1.0
+  (API unchanged). Test databases get apalis' schema from the per-server
+  template in `tests/support/pg.rs`, not from `db::migrate`. `apalis_error`
+  maps every variant, with no catch-all.
+- **#310 (key levels).** The self-issued rules hold after creation too:
+  turning maintenance reporting on for a self-issued key is refused (422,
+  `limit: "maintenance_report"`).
+- **#311 (ceiling).** Every existing write to a ceiling's inputs already
+  bumped `admin_generation`; one test walks each of them, and later writes
+  to those tables must join it.
+- **#312 (passwords and links).** The dummy hash is a constant PHC string,
+  so the first unknown email costs no more than the rest. The success and
+  failure updates re-check the stored hash and the lock under the row, so
+  concurrent failures all count and a lock is never lost. Issuing a link
+  locks the user `FOR NO KEY UPDATE`, so two issues leave one live link.
+- **#313 (settings and sessions).** The CSRF token is derived from the
+  session id and only its hash is stored, so `user_sessions` holds no
+  secret. `touch` cannot revive an ended or revoked session, and writes at
+  most once per `min(1 minute, idle / 4)`, not once a minute, so a short
+  idle limit still works (an idle session ends between `idle` and `idle`
+  plus that interval). Every `[auth]` and `[oauth]` lifetime is capped at
+  ten years. `User-Agent` is kept to 256 characters.
+- **#314 (mail).** The worker runs on its own pool (at most 4 connections,
+  `application_name` `okf-mail-worker`) beside `database_max_connections`,
+  and restarts after a backend error under a new worker name. `[mail]`
+  gained `worker` (default `true`), and `from` defaults to a valid
+  placeholder (`okf <okf@localhost>`) so a server without `[mail]` starts.
+- **#315 (console sessions).** A session's admin level and ceiling come
+  from the key cache on every request, never from the sign-in. The limiter
+  is a token bucket whose find-or-create is one step, and IPv6 addresses
+  share a bucket per `/64`. `users::set_email` bumps the generation, since
+  the cache holds every user's email. The `/api/v1` copies of export and
+  import take a session; `/mcp` and the archive routes stay bearer-only.
+- **#316 (sign-in pages).** A malformed `POST /signin` is the same 401 as a
+  wrong password. Every form POST refuses another site (`Sec-Fetch-Site`,
+  403), because `Origin` is `null` under `no-referrer`. A password sign-in
+  carries the hash it matched into the session insert, so no session
+  outlives a reset; a reset, a setup and its session commit in one
+  transaction, user row first. Email text Postgres would refuse is treated
+  as an unknown email. The request span records no query (later, no literal
+  path: see #322). Without `public_url`, `POST /signin` is 404.
+- **#317 (passkeys).** Passkey sign-in verifies and starts the session in
+  one transaction holding the user and the passkey rows, so the counter
+  never goes back and no removal or reset slips between. Every sign-in path
+  starts its session through one function in its own transaction, and
+  records the success event and queues the notice there too. Ceremonies are
+  bounded per browser and per session, and the open routes refuse other
+  sites and take the per-address limit.
+- **#318 (OIDC).** An OIDC sign-in is one transaction: find or link, end
+  the old session, start the new one, stamp, record. A link callback needs
+  the live session that started it. Each browser holds one flow and each
+  session one link flow, and link starts are limited per user (a burst of
+  10, one a minute). A user links at most one account per provider. A
+  malformed `sub` is a bad token (400).
+- **#319 (self-service keys).** `create_self_issued` gets every check
+  `create_with_id` has, and counts live keys under the user's row, so
+  concurrent creates never pass the limit.
+- **#320 (self-service account).** A password change checks, sets, signs
+  other sessions out and queues the notice in one transaction, and a wrong
+  current password is 403, not 401. An ambiguous session prefix is 409
+  (nothing ended). A passkey rename refuses a bad name with 422
+  (`limit: "passkey_name"`), not 400.
+- **#321 (consent).** The grant insert locks the user and the approving
+  session and re-reads the ceiling. The POST is checked against the
+  ceiling the page offered, each page approves once, and another site's
+  POST is refused. A changed ceiling shows "Your access changed while this
+  page was open".
+- **#322 (admin REST).** The user view keeps `is_admin` (not `admin`). The
+  setup link is issued and queued in one transaction under the user's row.
+  "Sign out everywhere" locks the user first, so an uncommitted session is
+  ended too. A malformed name or id in a path is 404, not 500, on the new
+  routes and the user lookups they share (#339 tracks the older team,
+  catalog and key routes). An invalid setting or test address is
+  422. The request span records the matched route template, never the
+  literal path (`MatchedPath`).
+- **#323 (admin CLI).** `settings set|reset` take the key as a clap value
+  list (an unknown key lists the valid ones). `settings` and `mail` stay
+  out of the users-and-teams command table; the parity table covers them.
+  `user invite` and `mail test` only queue, so they need no mail secret.
+- **#324 (console, My keys).** `authHeaders` was already shared from Task
+  7b, so the console has one place that picks a request's credentials. The
+  stray `null` on four pages (#302) was fixed here.
+- **#325 (console, My grants and Account).** The ceiling is read from
+  `GET /api/v1/me` on every load, never from the sign-in snapshot. A
+  passkey credential that does not verify at registration is **422**
+  (`limit: "passkey"`), not 401, so the console does not read it as signed
+  out; passkey sign-in keeps its 401. Refusals show the server's reason.
+- **#326 (console, admin side).** Every write control is disabled while its
+  write runs, tracked by a stable key (`core/pending.js`), so a redrawn
+  control cannot send it twice. A refusal's reason stays beside its control,
+  even when the follow-up read fails. Overlapping reads draw only the
+  newest answer, and a settled write redraws the drawer showing its object
+  now. The mail queue's statuses are `pending`, `sending`, `retrying` and
+  `failed`. Issue #351 tracks the same overlapping-read fix for the users,
+  teams and catalogs tables.
