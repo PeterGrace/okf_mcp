@@ -29,7 +29,7 @@ Each rule below records a real bug the review bot found in an earlier PR, mostly
 - **The console uses one credential at a time:** a live cookie session wins over a stored key.
 - **Sign-out counts as done only on a 2xx, or a 401** meaning the session was already over. Any other failure keeps the session and shows a retryable error.
 - **A browser journey for a write path** must actually perform the write and check the persisted result. It must fail if the header or feature it covers is removed; check that by temporarily reverting the code.
-- **Every console control that starts a request is disabled until the request settles**, and restored in a `finally` (a shared table's buttons included), so a double click never sends a second request. Test it by holding the request (`Ui::hold_next`), clicking twice and checking `Ui::held_matches` is 1.
+- **Every console control that starts a write is disabled until the request settles**, and restored in a `finally` (a shared table's buttons included), so a double click never sends a second request. Test it by holding the request (`Ui::hold_next`), clicking twice and checking `Ui::held_matches` is 1.
 - **A refusal's reason must show even when the read after it fails.** Redraw from the last answer, marked as possibly out of date, and leave every control usable; never let the refresh's success decide whether the reason or the controls come back. Test it with `Ui::fail_next` on the follow-up GET.
 - **A journey that checks a message the page shows by toggling `hidden`** waits for it to be visible (`ui.wait_visible`), not only for its text: `ui.wait_text` reads `textContent`, which a hidden element still has, so the check passes even when the message never shows (found while revert-checking issue #326).
 
