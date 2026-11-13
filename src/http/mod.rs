@@ -86,11 +86,11 @@ impl AppError {
     /// # Returns
     /// 404 for a path, catalog or changeset that is not there (or not reachable), 401
     /// for a request that proves no identity, 403 for an access level that is
-    /// not enough or a suspended team's catalog, 409 for a refused request or a publish conflict, 410 for a
-    /// used or expired link, 422 for a publish whose result fails lint or a
-    /// self-service request past a limit, 400 for a bad input, 500 for the
-    /// server's own failures, 503 for a request the database aborted (retry
-    /// it).
+    /// not enough or a suspended team's catalog, 409 for a refused request or a
+    /// publish conflict, 410 for a used or expired link, 422 for a publish
+    /// whose result fails lint or a self-service request past a limit, 400 for
+    /// a bad input, 500 for the server's own failures, 503 for a request the
+    /// database aborted (retry it).
     pub fn status(&self) -> StatusCode {
         // No `_` arm: a new variant fails to compile here until it has a status.
         match &self.0 {
