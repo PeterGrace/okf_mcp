@@ -266,6 +266,10 @@ pub async fn list(pool: &PgPool) -> Result<Vec<UserRecord>, OkfError> {
 /// # Errors
 /// [`OkfError::UnknownName`] if there is none; [`OkfError::Database`].
 pub async fn find(pool: &PgPool, name: &str) -> Result<UserRecord, OkfError> {
+    // A malformed name (a NUL, which Postgres refuses) names nobody.
+    if !is_valid_name(name) {
+        return Err(unknown(name));
+    }
     sqlx::query_as::<_, UserRecord>(concat!(select_users!(), " WHERE u.name = $1"))
         .bind(name)
         .fetch_optional(pool)
@@ -303,8 +307,75 @@ pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String,
         .ok_or_else(|| unknown(name))
 }
 
+/// The id of the user called `name`, without a lock: for callers that
+/// pass it to functions keyed by user id (sessions, sign-in events,
+/// ceilings) and need no consistency with a later write.
+///
+/// A name that is not `[a-z0-9-]+` (a NUL among others, which Postgres
+/// refuses as a database error) names nobody and never reaches SQL.
+///
+/// # Arguments
+/// * `executor` - a `&PgPool`, or `&mut *tx` to read inside a transaction.
+/// * `name` - the user's name.
+///
+/// # Returns
+/// Its `users.id`.
+///
+/// # Errors
+/// [`OkfError::UnknownName`]; [`OkfError::Database`].
+// `impl PgExecutor<'e>` accepts `&PgPool` or `&mut PgConnection`, so one
+// function serves both, like `catalogs::find`.
+pub async fn id_by_name<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    name: &str,
+) -> Result<String, OkfError> {
+    if !is_valid_name(name) {
+        return Err(unknown(name));
+    }
+    sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
+        .bind(name)
+        .fetch_optional(executor)
+        .await?
+        .ok_or_else(|| unknown(name))
+}
+
+/// Ends every console session of the user called `name` (an admin's "sign
+/// out everywhere"), under the user's row lock.
+///
+/// The lock (`FOR NO KEY UPDATE`) conflicts with the `FOR SHARE` that
+/// `user_sessions::start` takes on the same row, so a session whose insert
+/// is still uncommitted when this starts is waited for and then ended too;
+/// one that starts later is a sign-in after the sign-out. Lock order: the
+/// user's row, then its sessions (`email_tokens`' module docs).
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `name` - the user's name.
+///
+/// # Returns
+/// How many sessions ended.
+///
+/// # Errors
+/// [`OkfError::UnknownName`]; [`OkfError::Database`].
+pub async fn end_sessions(pool: &PgPool, name: &str) -> Result<u64, OkfError> {
+    if !is_valid_name(name) {
+        return Err(unknown(name));
+    }
+    let mut tx = pool.begin().await?;
+    let user_id: String =
+        sqlx::query_scalar("SELECT id FROM users WHERE name = $1 FOR NO KEY UPDATE")
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| unknown(name))?;
+    // The session store owns its SQL; `&mut *tx` runs it in this transaction.
+    let ended = user_sessions::revoke_all(&mut *tx, &user_id, None).await?;
+    tx.commit().await?;
+    Ok(ended)
+}
+
 /// The error for a user name that names no user.
-fn unknown(name: &str) -> OkfError {
+pub(crate) fn unknown(name: &str) -> OkfError {
     OkfError::UnknownName {
         noun: "user",
         name: name.to_string(),
@@ -394,6 +465,10 @@ pub async fn set_email(pool: &PgPool, name: &str, email: Option<&str>) -> Result
     // `Option::map(check_email)` runs the check only for `Some`;
     // `transpose` turns `Option<Result<..>>` into `Result<Option<..>>` for `?`.
     email.map(check_email).transpose()?;
+    // A malformed name (a NUL, which Postgres refuses) names nobody.
+    if !is_valid_name(name) {
+        return Err(unknown(name));
+    }
     let mut tx = pool.begin().await?;
     // The subquery reads (and locks) the old value, so `changed` compares it
     // with the new one in the same statement. Both sides are `citext`, so
@@ -464,6 +539,10 @@ pub async fn set_admin(
     on: bool,
     allow_last: bool,
 ) -> Result<bool, OkfError> {
+    // A malformed name (a NUL, which Postgres refuses) names nobody.
+    if !is_valid_name(name) {
+        return Err(unknown(name));
+    }
     let mut tx = pool.begin().await?;
     // A waiter re-reads a row another transaction changed before taking its
     // lock (Postgres' read-committed rule), so an admin cleared concurrently
@@ -987,6 +1066,61 @@ pub(crate) mod tests {
 
         assert_eq!(after_no_change, 1, "no change keeps the session");
         assert_eq!(session_count(&db.pool).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn id_by_name_finds_a_user_and_names_an_unknown_one() {
+        let db = test_db().await;
+
+        let id = id_by_name(&db.pool, crate::db::TEST_USER).await;
+        let unknown = id_by_name(&db.pool, "nobody").await;
+        let malformed = id_by_name(&db.pool, "a\0b").await;
+
+        assert!(id.is_ok_and(|id| !id.is_empty()));
+        assert!(
+            matches!(unknown, Err(OkfError::UnknownName { noun: "user", .. })),
+            "{unknown:?}"
+        );
+        assert!(
+            matches!(malformed, Err(OkfError::UnknownName { noun: "user", .. })),
+            "a NUL never reaches SQL: {malformed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_malformed_name_is_an_unknown_user_for_every_write() {
+        let db = test_db().await;
+
+        let admin = set_admin(&db.pool, "a\0b", true, false).await;
+        let email = set_email(&db.pool, "a\0b", Some("a@example.com")).await;
+        let sessions = end_sessions(&db.pool, "a\0b").await;
+
+        for outcome in [admin.map(|_| ()), email, sessions.map(|_| ())] {
+            assert!(
+                matches!(outcome, Err(OkfError::UnknownName { noun: "user", .. })),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_sessions_ends_every_session_of_one_user() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        let bob = seed_user(&db.pool, "bob", None).await;
+        seed_session(&db.pool, &alice.id).await;
+        seed_session(&db.pool, &alice.id).await;
+        seed_session(&db.pool, &bob.id).await;
+
+        let ended = end_sessions(&db.pool, "alice").await.unwrap();
+        let unknown = end_sessions(&db.pool, "nobody").await;
+
+        assert_eq!(ended, 2);
+        assert_eq!(session_count(&db.pool).await, 1, "bob's session stays");
+        assert!(
+            matches!(unknown, Err(OkfError::UnknownName { .. })),
+            "{unknown:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -13,6 +13,7 @@ use crate::error::OkfError;
 
 // `log` is the provider that writes to the log. A local module shadows the
 // `log` crate's name inside this module, and this module never uses the crate.
+pub mod invite;
 mod log;
 mod postmark;
 pub mod queue;
