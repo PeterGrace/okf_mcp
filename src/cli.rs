@@ -26,12 +26,16 @@ use crate::config::Config;
 use crate::db;
 use crate::http;
 use crate::store::catalogs;
+use crate::store::ceiling::MemberAccess;
 use crate::store::export;
 use crate::store::import::{self, ImportOptions, ImportScope};
 use crate::store::keys::{self, Access, Grants, KeyKind, NewKey};
 use crate::store::oauth::codes::{self, NewSignInCode, SignInCodeRecord};
+use crate::store::settings::SettingKey;
 use crate::store::teams::Role;
 
+// `src/cli/admin.rs`: the `settings` and `mail` handlers.
+mod admin;
 // `src/cli/people.rs`: the user, team, assignment and `unassigned` handlers.
 mod people;
 
@@ -80,6 +84,13 @@ pub enum Command {
     /// Create, list or delete teams, and manage their members.
     #[command(subcommand)]
     Team(TeamCommand),
+    /// List, set or reset the policy settings (password sign-in, key
+    /// limits, session and link lifetimes).
+    #[command(subcommand)]
+    Settings(SettingsCommand),
+    /// Send a test email, and list, retry or delete queued mail.
+    #[command(subcommand)]
+    Mail(MailCommand),
     /// List keys, grants, sign-in codes and catalogs with no user or owner.
     Unassigned,
     /// Import a directory or a .tar.gz into an existing catalog.
@@ -157,6 +168,15 @@ pub enum CatalogCommand {
         /// user's personal team).
         #[arg(long)]
         team: String,
+    },
+    /// Set what the owning team's members may reach in a catalog through
+    /// their self-issued keys and grants.
+    SetMemberAccess {
+        /// The catalog.
+        name: String,
+        /// `none`, `read` or `write`.
+        #[arg(long, value_enum)]
+        access: MemberAccess,
     },
     /// Delete a catalog with its documents, history, pending changes and grants.
     Delete {
@@ -238,12 +258,76 @@ pub enum UserCommand {
         #[arg(long, default_value = "")]
         display_name: String,
     },
-    /// List users with their credential counts and teams.
+    /// List users with their credential counts, emails, admin flags and
+    /// teams.
     List,
     /// Delete a user nothing references, with its personal team.
     Delete {
         /// Its name.
         name: String,
+    },
+    /// Turn a user's admin flag on or off. The CLI may clear the last admin.
+    SetAdmin {
+        /// The user.
+        name: String,
+        /// Make the user an admin.
+        // Exactly one of `--on` and `--off`: clap refuses both or neither.
+        #[arg(long, conflicts_with = "off", required_unless_present = "off")]
+        on: bool,
+        /// Make the user a non-admin.
+        #[arg(long)]
+        off: bool,
+    },
+    /// Set or clear a user's email (unique, case-insensitive).
+    SetEmail {
+        /// The user.
+        name: String,
+        /// The address.
+        #[arg(conflicts_with = "clear", required_unless_present = "clear")]
+        email: Option<String>,
+        /// Remove the email instead.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Email a user a single-use setup link (a running server sends it).
+    Invite {
+        /// The user; it must have an email.
+        name: String,
+    },
+    /// Let a user reach a catalog beyond its teams' catalogs.
+    Entitle {
+        /// The user.
+        name: String,
+        /// The catalog.
+        catalog: String,
+        /// `read` or `write`.
+        #[arg(long, value_enum)]
+        access: Access,
+    },
+    /// Remove a user's entitlement to a catalog.
+    Unentitle {
+        /// The user.
+        name: String,
+        /// The catalog.
+        catalog: String,
+    },
+    /// List a user's console sessions (by id prefix, never the id).
+    Sessions {
+        /// The user.
+        name: String,
+    },
+    /// Sign a user out of every console session.
+    RevokeSessions {
+        /// The user.
+        name: String,
+    },
+    /// List a user's recent sign-in attempts, newest first.
+    SignIns {
+        /// The user.
+        name: String,
+        /// How many to show.
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
     },
 }
 
@@ -297,6 +381,54 @@ pub enum TeamCommand {
     Delete {
         /// Its name.
         name: String,
+    },
+}
+
+/// `okf-mcp settings ...`.
+#[derive(Debug, Subcommand)]
+pub enum SettingsCommand {
+    /// List every setting with its value and where it comes from.
+    List,
+    /// Override a setting (validated; a running server applies it within
+    /// one poll interval).
+    Set {
+        /// The setting, by its snake_case name.
+        // `SettingKey` spells its clap values as stored (`max_keys_per_user`),
+        // and an unknown one is refused with the list of possible values.
+        #[arg(value_enum)]
+        key: SettingKey,
+        /// Its value (`true`, `20`, `12h`, `7d`, ...).
+        value: String,
+    },
+    /// Remove an override, back to the config file's default.
+    Reset {
+        /// The setting, by its snake_case name.
+        // `SettingKey` spells its clap values as stored (`max_keys_per_user`),
+        // and an unknown one is refused with the list of possible values.
+        #[arg(value_enum)]
+        key: SettingKey,
+    },
+}
+
+/// `okf-mcp mail ...`.
+#[derive(Debug, Subcommand)]
+pub enum MailCommand {
+    /// Queue the test email to an address (a running server sends it).
+    Test {
+        /// The recipient.
+        address: String,
+    },
+    /// List pending and failed mail (never the bodies).
+    Queue,
+    /// Send a failed mail again, with a new 24-hour retry window.
+    Retry {
+        /// Its id, from `mail queue`.
+        id: String,
+    },
+    /// Delete a queued mail.
+    Delete {
+        /// Its id, from `mail queue`.
+        id: String,
     },
 }
 
@@ -483,11 +615,27 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
         }
         Command::User(command) => {
             let pool = connect(cli.database_url.as_deref(), &config).await?;
-            print!("{}", people::user(&pool, command, clock.now()).await?);
+            print!(
+                "{}",
+                people::user(&pool, &config, command, clock.now()).await?
+            );
         }
         Command::Team(command) => {
             let pool = connect(cli.database_url.as_deref(), &config).await?;
             print!("{}", people::team(&pool, command, clock.now()).await?);
+        }
+        Command::Settings(command) => {
+            let pool = connect(cli.database_url.as_deref(), &config).await?;
+            print!(
+                "{}",
+                admin::settings(&pool, &config.auth, command, clock.now()).await?
+            );
+        }
+        Command::Mail(command) => {
+            // Only queues and lists: no mailer is built, so no mail secret
+            // is needed here.
+            let pool = connect(cli.database_url.as_deref(), &config).await?;
+            print!("{}", admin::mail(&pool, command, clock.now()).await?);
         }
         Command::Unassigned => {
             let pool = connect(cli.database_url.as_deref(), &config).await?;
@@ -688,6 +836,9 @@ async fn run_catalog(
         }
         CatalogCommand::SetOwner { name, team } => {
             print!("{}", people::set_owner(pool, &name, &team).await?);
+        }
+        CatalogCommand::SetMemberAccess { name, access } => {
+            print!("{}", people::set_member_access(pool, &name, access).await?);
         }
         CatalogCommand::Delete { name, force } => {
             catalogs::delete(pool, &name, force).await?;

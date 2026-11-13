@@ -21100,7 +21100,7 @@ pub enum SettingsCommand {
     /// one poll interval).
     Set {
         /// The setting, by its snake_case name.
-        #[arg(value_parser = parse_setting_key)]
+        #[arg(value_enum)]
         key: SettingKey,
         /// Its value (`true`, `20`, `12h`, `7d`, ...).
         value: String,
@@ -21108,7 +21108,7 @@ pub enum SettingsCommand {
     /// Remove an override, back to the config file's default.
     Reset {
         /// The setting.
-        #[arg(value_parser = parse_setting_key)]
+        #[arg(value_enum)]
         key: SettingKey,
     },
 }
@@ -21134,31 +21134,11 @@ pub enum MailCommand {
         id: String,
     },
 }
-
-/// Parses a setting key by its snake_case name, listing every key when the
-/// name is unknown.
-///
-/// # Arguments
-/// * `text` - the argument.
-///
-/// # Returns
-/// The key.
-///
-/// # Errors
-/// A message naming the valid keys.
-fn parse_setting_key(text: &str) -> Result<SettingKey, String> {
-    SettingKey::parse(text).ok_or_else(|| {
-        // `value_variants` is the ValueEnum list of every variant.
-        let known: Vec<&str> = SettingKey::value_variants()
-            .iter()
-            .map(|key| key.as_str())
-            .collect();
-        format!("unknown setting {text:?}; one of {}", known.join(", "))
-    })
-}
 ```
 
-Import `clap::ValueEnum`, `crate::store::ceiling::MemberAccess` and `crate::store::settings::SettingKey` in `cli.rs`, and add `mod admin;` beside `mod people;`.
+> **Corrected (issue #323, 2026-11-13).** `SettingKey` already derives `clap::ValueEnum` with each value named as stored (`#[value(name = "max_keys_per_user")]`, Task 5), so `key` takes `#[arg(value_enum)]` and the plan's `parse_setting_key` helper was not written: clap refuses an unknown key (or the kebab-case spelling) with its "possible values" list, which names every key.
+
+Import `crate::store::ceiling::MemberAccess` and `crate::store::settings::SettingKey` in `cli.rs`, and add `mod admin;` beside `mod people;`.
 
 The dispatcher in `run`:
 
@@ -21609,7 +21589,7 @@ Change the parity section's first paragraph to: "Every admin command for users, 
 | `okf-mcp user entitle` | `PUT /api/v1/users/{name}/entitlements/{catalog}` | Users → user → Entitlements → Entitle, or a level |
 | `okf-mcp user unentitle` | `DELETE /api/v1/users/{name}/entitlements/{catalog}` | Users → user → Entitlements → Remove |
 | `okf-mcp user sessions` | `GET /api/v1/users/{name}/sessions` | Users → user → Console sessions |
-| `okf-mcp user revoke-sessions` | `DELETE /api/v1/users/{name}/sessions` | Users → user → Sign out everywhere (or one session's Sign out) |
+| `okf-mcp user revoke-sessions` | `DELETE /api/v1/users/{name}/sessions` | Users → user → Sign out everywhere |
 | `okf-mcp user sign-ins` | `GET /api/v1/users/{name}/sign-ins` | Users → user → Recent sign-ins |
 | `okf-mcp catalog set-member-access` | `PUT /api/v1/catalogs/{catalog}/member-access` | Catalogs → catalog → Team member access |
 | `okf-mcp settings list` | `GET /api/v1/settings` | Settings → Policy |
@@ -21622,6 +21602,8 @@ Change the parity section's first paragraph to: "Every admin command for users, 
 ```
 
 Below the table, add: "`DELETE /api/v1/users/{name}/sessions/{id_prefix}` (one session's Sign out in the drawer) has no command of its own: `user revoke-sessions` ends them all. The self-service routes under `/api/v1/me` are not admin actions and have no command."
+
+> **Corrected (issue #323, 2026-11-13).** The `revoke-sessions` row's console cell names only "Sign out everywhere": one session's Sign out is a different route (`.../sessions/{id_prefix}`), listed below the table. The sentence also names `GET /api/v1/catalogs/{catalog}/member-access`, which has no command either. The command table's new rows were written against the shipped behaviour (the admin change signs the user out, `set-email` ends outstanding links, `invite` needs `public_url` and no mail secret, `sign-ins --limit`). `settings` and `mail` stay out of that table: Task 16 documents them in their own sections. Task 13 also added `invite_and_mail_test_queue_without_any_mail_secret` (`src/cli/people.rs`): `user invite` and `mail test` through `cli::run` with a Postmark config whose token variable is unset, proving the CLI only queues.
 
 - [ ] **Step 10: Run the parity test.**
 
