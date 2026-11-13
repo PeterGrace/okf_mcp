@@ -335,10 +335,31 @@ actions that don't read contents (deleting a catalog, suspending its team,
 managing users and keys); those are audited as usual. A provisioner never
 reads contents, so it never needs one.
 
-*My call:* the maintenance runner's keys are not exempt. On a server with
-`require_unlock` on, the runner reaches a customer catalog only through a
-key whose user is a member of the owner team, or through an unlock. Hosted
-maintenance of customers' catalogs is left for a later design.
+**The maintenance runner is exempt, per catalog (founder, 2026-11-13):**
+it works on the customer's behalf, so it needs no unlock, but each catalog
+can opt out.
+- A new per-catalog flag, `maintenance` (`on` or `off`), **default `on`**
+  (*my call:* the product promises catalogs that check themselves for
+  stale, bloated and broken notes).
+- A **maintenance credential** is a non-admin key with the existing
+  `maintenance_report` flag. On a catalog with `maintenance` on, it reaches
+  the catalog without an unlock (reads and maintenance reports only, as
+  its access level already limits). On a catalog with `maintenance` off,
+  it is refused (`Forbidden`) whatever its grants, and the runner skips
+  that catalog.
+- An admin key with the flag gets no exemption: the exemption is for the
+  runner, not for staff.
+- Who sets it: an admin, **or an owner of the catalog's owner team**
+  (signed-in console session): `okf-mcp catalog set-maintenance C on|off`,
+  `PUT /api/v1/catalogs/{catalog}/maintenance` with `{"maintenance":
+  "on"|"off"}`, and a switch on the catalog in the console. This is the
+  one owner-managed control in this milestone (the rest is milestone 15).
+- Recorded: `catalog.maintenance_changed` (who, old and new value), and one
+  `catalog.maintenance_run` entry per runner pass over a catalog (when,
+  findings reported), visible to the team's owners as "maintenance ran".
+  The runner's individual reads aren't recorded.
+- The flag applies whether or not `require_unlock` is on: an owner who
+  opts out keeps the runner out on any server.
 
 ### An unlock
 
@@ -395,7 +416,8 @@ Every new CLI subcommand has a REST route and a console control, and goes
 in `docs/operations.md`'s parity table (`tests/admin_parity.rs` enforces it):
 `settings set product_name|support_contact|audit_retention_days|require_unlock|unlock_max_hours|unlock_notify_owners`,
 `user list --email`, `key create --provisioner`, `audit list`,
-`audit export`, `unlock create`, `unlock list`, `unlock end`.
+`audit export`, `unlock create`, `unlock list`, `unlock end`,
+`catalog set-maintenance`.
 
 ## Testing
 
@@ -409,6 +431,10 @@ in `docs/operations.md`'s parity table (`tests/admin_parity.rs` enforces it):
 - Provisioner: every allowed route works; every other admin route and every
   catalog read, write and export is refused; `key create --provisioner`
   can't be combined with grants.
+- Maintenance: with the flag on, the runner's key reads a customer catalog
+  without an unlock; with it off, the runner is refused and skips it; an
+  owner can switch it, a plain member can't; an admin key with the report
+  flag still needs an unlock; each pass writes one `maintenance_run` entry.
 - Unlock: with `require_unlock` off nothing changes; with it on, an admin,
   an all-catalogs read key, a self-entitled admin and a user-less key are
   each refused with `UnlockRequired`, and a member and an entitled
@@ -469,6 +495,7 @@ migrations start at `0012`, the provisioner's allow-list includes
   maximum unlock; the six reason categories.
 - Who counts as a customer (member of the owner team, or entitled
   non-admin); everything else needs an unlock.
-- The maintenance runner gets no exemption.
+- The maintenance runner's per-catalog flag defaults to on; owners may
+  switch it; admin keys with the report flag are not exempt.
 - Owners see the category but not the free-text reason; owners are
   emailed when an unlock starts.
