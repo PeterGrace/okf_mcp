@@ -973,8 +973,10 @@ link replaces it. Changing the user's email ends every link they have not
 used yet.
 
 On `/signin/forgot` anyone may ask for a reset link. The answer is always
-"If an account exists, we sent a link."; each email gets at most 3 requests
-per hour, and each address 20. A reset link works once, for
+"If an account exists, we sent a link.", except a 403 for another site's
+form and a 429 past the per-address limit (20 requests per hour). Each email
+gets at most 3 links per hour; past that the answer is the same and nothing
+is sent. A reset link works once, for
 `reset_link_ttl` (1 hour by default), and opens a set-password page. The
 reset signs every session of the user out, mails a "sign-in method added"
 notice, signs nobody in, and sends the browser to `/signin`. An expired,
@@ -1797,9 +1799,10 @@ are below (3), and each area's endpoints are in its own subsection:
 [Health](#health) (2), [Browse and search](#browse-and-search) (7),
 [Catalogs and import/export](#catalogs-and-importexport) (9),
 [Findings and runs](#findings-and-runs) (6) and [Changesets](#changesets) (3).
-Each area's tests check every endpoint against the access matrix (no key,
-read, write, admin, and an admin key that does not reach the catalog).
-Every endpoint also takes a console session, at the signed-in user's levels
+Each area's tests but Your account's check every endpoint against the
+access matrix (no key, read, write, admin, and an admin key that does not
+reach the catalog); Your account's check that every route refuses a bearer
+key and acts only on the signed-in user's own rows. Every endpoint also takes a console session, at the signed-in user's levels
 ([Sessions](#sessions)), with `X-OKF-CSRF` on writes.
 
 | Method and path | Key | Does |
