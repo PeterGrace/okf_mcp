@@ -209,8 +209,18 @@ fn refused(error: &WebauthnError, message: &str) -> OkfError {
 }
 
 /// A passkey name: trimmed, 1 to 64 characters, no control characters
-/// (a NUL, which Postgres refuses, included).
-fn passkey_name(raw: &str) -> Result<String, OkfError> {
+/// (a NUL, which Postgres refuses, included). Registration and the
+/// account page's rename (`PATCH /me/passkeys/{id}`) both check it.
+///
+/// # Arguments
+/// * `raw` - the name as sent.
+///
+/// # Returns
+/// The trimmed name.
+///
+/// # Errors
+/// [`OkfError::LimitExceeded`] with `limit: "passkey_name"`.
+pub(crate) fn passkey_name(raw: &str) -> Result<String, OkfError> {
     let name = raw.trim();
     let length = name.chars().count();
     if length == 0 || length > MAX_NAME_CHARS || name.chars().any(char::is_control) {

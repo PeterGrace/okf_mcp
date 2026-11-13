@@ -290,6 +290,8 @@ pub async fn reset(pool: &PgPool, user_id: &str, password: &str, now: DateTime<U
 pub struct NewPassword(/* hashed; Debug redacted */); impl NewPassword { pub async fn hash(password: &str) -> Result<Self, OkfError>; } // Task 7b
 pub async fn set_in(conn: &mut PgConnection, user_id: &str, password: &NewPassword, now: DateTime<Utc>) -> Result<(), OkfError>; // Task 7b
 pub async fn reset_in(conn: &mut PgConnection, user_id: &str, password: &NewPassword, now: DateTime<Utc>) -> Result<u64, OkfError>; // Task 7b
+pub struct SessionChange<'a> { pub user_id: &'a str, pub session_id: &'a str, pub replaces: Option<&'a PasswordStamp>, pub password: &'a NewPassword, pub keep_sessions: bool, pub now: DateTime<Utc> } // Task 10b; Debug redacted
+pub async fn change_from_session_in(conn: &mut PgConnection, change: &SessionChange<'_>) -> Result<u64 /*ended*/, OkfError>; // Task 10b: user FOR NO KEY UPDATE, session held, stamp checked (403), set_in, revoke_all except the session
 pub async fn set(pool: &PgPool, user_id: &str, password: &str, now: DateTime<Utc>) -> Result<(), OkfError>;
 
 // ---- src/store/email_tokens.rs (Task 4) ----
@@ -366,7 +368,7 @@ pub async fn start(executor: impl PgExecutor<'_>, request: &SessionStart<'_>) ->
 pub async fn hold_live(executor: impl PgExecutor<'_>, id: &str, user_id: &str, now: DateTime<Utc>) -> Result<bool, OkfError>; // Task 8: the session still in force, its row held FOR SHARE (after the user's row)
 pub struct SessionInfo { pub id_prefix: String, pub created_at: DateTime<Utc>, pub last_seen_at: DateTime<Utc>, pub ip: Option<IpAddr>, pub user_agent: String, pub current: bool }
 pub async fn list(pool: &PgPool, user_id: &str, current: Option<&str>) -> Result<Vec<SessionInfo>, OkfError>; // `current` is the raw cookie id
-pub async fn revoke_by_prefix(pool: &PgPool, user_id: &str, id_prefix: &str) -> Result<(), OkfError>; // id_prefix = first 12 hex chars of the stored hash
+pub async fn revoke_by_prefix(pool: &PgPool, user_id: &str, id_prefix: &str) -> Result<(), OkfError>; // id_prefix = first 12 hex chars of the stored hash; corrected (issue #320): Refused (409) when it matches several, ending none
 pub async fn prune(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, OkfError>;
 
 // ---- src/mail/mod.rs (Task 6; invite Task 12) ----
@@ -482,7 +484,7 @@ pub async fn link_for_session_in(conn: &mut PgConnection, request: &SessionLink<
 pub async fn touch(pool: &PgPool, provider: &str, subject: &str, now: DateTime<Utc>) -> Result<(), OkfError>;
 pub struct IdentityInfo { pub provider: String, pub email_at_link: String, pub created_at: DateTime<Utc>, pub last_used_at: Option<DateTime<Utc>> }
 pub async fn list(pool: &PgPool, user_id: &str) -> Result<Vec<IdentityInfo>, OkfError>;
-pub async fn unlink(pool: &PgPool, user_id: &str, provider: &str) -> Result<(), OkfError>; // 409 if last sign-in method
+pub async fn unlink(pool: &PgPool, user_id: &str, provider: &str) -> Result<(), OkfError>; // 409 if last sign-in method; corrected (issue #320): 404 before any query unless config::is_provider_id(provider)
 // src/oidc.rs: OidcProviders::new(config, secret_of) -> Result<Option<Self>, OkfError>; labels() -> (id, label)
 // src/http/oidc.rs: GET /auth/oidc/{provider}/{start,callback}; POST /api/v1/me/identities/{provider}/link {keep_sessions} -> {url}
 
@@ -16961,6 +16963,16 @@ git commit -m "feat(api): self-service keys and grants under /api/v1/me" \
 
 The rules of Task 10a hold here too: session principals only (403 for a key), and a route acts only on the session user's own rows (another user's passkey, identity or session is a 404). Removing or unlinking the last sign-in method is a 409. A password change ends the user's other sessions unless `keep_sessions`, and a wrong current password is a 403, never a 401 (the console signs out on any 401). It checks the current password with Task 4's `passwords::verify_user`, and mails the notice through Task 7b's `signin::notify_method_added`.
 
+> **Corrected (issue #320, 2026-11-13).** What shipped differs from the code below in these ways; `src/http/api/me.rs` and the store modules named are authoritative.
+> - **Password change in one transaction.** The handler checks the policy (`check_policy`, before any argon2 work), verifies the current password (`verify_user`, keeping its `Verified::stamp`), hashes the new one (`NewPassword::hash`) before the transaction, then runs the new `passwords::change_from_session_in(&mut tx, &SessionChange { user_id, session_id, replaces, password, keep_sessions, now })` and `notify_method_added(app, &mut tx, ..)` in one transaction (`store_password_change`). `change_from_session_in` locks the user's row `FOR NO KEY UPDATE`, holds the asking session `FOR SHARE` (`hold_live`; an ended session is a 401), refuses with 403 a stored password that is no longer the one `replaces` names (a change or reset since the check; `None` means "no password yet"), then `set_in` and `revoke_all(.., Some(session_id))` unless `keep_sessions`. `SessionChange` has a redacted `Debug`. A locked account is a 403 too, with its own message.
+> - **The current session** comes from the request's `ConsoleSession` extension (`session_and_user` in `me.rs`), not from parsing the cookie, for both the password change and `GET /me/sessions`' `current` mark.
+> - **`user_sessions::revoke_by_prefix`** now locks the matching rows and refuses (`OkfError::Refused`, 409) a prefix that matches more than one of the user's sessions, ending none. A short, uppercase or non-hex prefix is still a 404 (`UnknownName`). Task 12's admin route inherits this.
+> - **`identities::unlink`** answers 404 before any query for a provider that is not a well-formed id (new `config::is_provider_id`, which `validate_oidc` now uses too), so a NUL is a 404, not a 500; an unknown user is the identity's 404, not `count`'s `users/<id>`.
+> - **`PATCH /me/passkeys/{id}`** checks the name with Task 8's `http::passkeys::passkey_name` (now `pub(crate)`): 422 `limit: "passkey_name"` for an empty, over-64-character or control-character name, not the 400 `InvalidPath` below.
+> - **The notice's address** is read with `users::find_auth` (the database), not `console_session::session_user`: the key cache can lag an email change by a poll interval.
+> - The views implement `From` for `PasskeyInfo` and `IdentityInfo` too, destructuring every field. `RECENT_SIGN_INS` sits with the imports.
+> - Tests beyond the six below: the ambiguous prefix (store and HTTP), another user's passkey, identity and session as 404s, rename/remove with the field list, a failed revocation rolling the new password back (`fail_on`), the two-removals race under a held user row, a change queued behind a reset (store), a stale stamp (store), and the `Debug` of `PasswordBody` and `SessionChange`.
+
 - [ ] **Step 1: Write the failing tests.** In `src/http/api/me.rs`'s test module, add the imports
 
 ```rust
@@ -20094,7 +20106,8 @@ async fn revoke_sessions(
 ///
 /// # Errors
 /// 403 unless the caller is an admin reaching every catalog; 404 for an
-/// unknown user or prefix.
+/// unknown user or prefix; 409 for a prefix that matches several sessions
+/// (corrected, issue #320: `revoke_by_prefix` refuses it).
 async fn revoke_session(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
@@ -24974,17 +24987,17 @@ in "Signing in and self-service".
 | `DELETE /api/v1/me/keys/{id}` | console session | Revokes it (the row stays, revoked); answers its view |
 | `GET /api/v1/me/grants` | console session | `{grants}`: the user's OAuth grants, as key views (`client_name`, `catalog_access`, `self_issued`, `revoked_at`, ...) |
 | `DELETE /api/v1/me/grants/{id}` | console session | Revokes the grant; its client is refused from its next request. Answers its view |
-| `PUT /api/v1/me/password` | console session | Body `{current_password, new_password, keep_sessions}` (`current_password` is required while the user has a password). 204. 403 for a wrong current password (never 401); 422 for the policy (`limit: "password"`). Signs the other sessions out unless `keep_sessions` |
+| `PUT /api/v1/me/password` | console session | Body `{current_password, new_password, keep_sessions}` (`current_password` is required while the user has a password). 204. 403 for a wrong current password, a locked account or a password changed meanwhile (never 401); 422 for the policy (`limit: "password"`). Signs the other sessions out unless `keep_sessions`, in the same transaction |
 | `GET /api/v1/me/passkeys` | console session | `{passkeys}`: `id` (base64url), `name`, `created_at`, `last_used_at` |
 | `POST /api/v1/me/passkeys/register/start` | console session | Body `{name, keep_sessions}`. Starts registering a passkey: the WebAuthn creation options, with the ceremony bound to a 5-minute cookie. 404 while passkeys are off |
 | `POST /api/v1/me/passkeys/register/finish` | console session | Body: the browser's credential. Stores the passkey; 201 `{id, name}`. Signs the other sessions out unless the start said `keep_sessions`. 401 for a credential that does not verify, 410 for an expired ceremony |
-| `PATCH /api/v1/me/passkeys/{id}` | console session | Body `{name}`. Renames it; 204 |
+| `PATCH /api/v1/me/passkeys/{id}` | console session | Body `{name}`. Renames it; 204. 422 for an empty, over-64-character or control-character name (`limit: "passkey_name"`) |
 | `DELETE /api/v1/me/passkeys/{id}` | console session | Removes it; 204. 409 for the last sign-in method |
 | `GET /api/v1/me/identities` | console session | `{identities, providers}`: the linked identities (`provider`, `email_at_link`, `created_at`, `last_used_at`) and the configured providers (`id`, `label`) |
 | `POST /api/v1/me/identities/{provider}/link` | console session | Body `{keep_sessions}`. Starts linking: answers `{url}`, the provider's sign-in URL (the flow cookie is set); the callback links the identity and returns to `/ui/#/account`. 404 for an unknown provider |
 | `DELETE /api/v1/me/identities/{provider}` | console session | Unlinks it; 204. 409 for the last sign-in method |
 | `GET /api/v1/me/sessions` | console session | `{sessions}`: `id_prefix`, `created_at`, `last_seen_at`, `ip`, `user_agent`, `current` (this browser's) |
-| `DELETE /api/v1/me/sessions/{id_prefix}` | console session | Signs one session out; 204 |
+| `DELETE /api/v1/me/sessions/{id_prefix}` | console session | Signs one session out; 204. 404 for a prefix none of the user's sessions has; 409 for one several share |
 | `GET /api/v1/me/sign-ins` | console session | `{sign_ins}`, newest first (at most 50): `method`, `outcome`, `ip`, `at` |
 ```
 
