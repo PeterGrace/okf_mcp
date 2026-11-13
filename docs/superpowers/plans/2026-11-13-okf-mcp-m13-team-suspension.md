@@ -14,7 +14,50 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-13-okf-team-suspension-design.md`.
 
-**Rules for every task:** follow `AGENTS.md` and `.claude/CLAUDE.md` (doc comments on everything public, comments for Rust idioms a Python developer may not know, no `unwrap` outside tests). Run gates only through `tools/agentic/gate.sh`. Add a dated `changelog/` entry with each PR. No real infrastructure details in code, tests, docs, commits or issues: use placeholders such as `example.com`.
+---
+
+## Conventions for every task
+
+- Branch per task from `main`, one PR per task, linked to its sub-issue. Follow `AGENTS.md` (review rounds, keeping branches current, `tools/agentic/`).
+- TDD: write the failing test, run it, implement, run it, commit.
+- Gates only through `tools/agentic/gate.sh`: `fmt`, `lint` and `test` before every commit, plus `test-ui` for Task 7. Use `gate.sh narrow <cargo test args>` while iterating.
+- Comments for a Python-expert, Rust-novice reader on Rust-specific constructs, as in the existing code. Every public item gets a doc comment with `# Arguments`, `# Returns` and `# Errors`. No `.unwrap()` outside tests.
+- One changelog entry per task, `changelog/<UTC ts>-m13-task-<NN>-<slug>.md` (timestamp from `date -u +%Y-%m-%dT%H-%M-%SZ`), with `## Added`, `## Changed` and `## Notes`. Task 8 also writes the milestone changelog.
+- The code in this plan has not been compiled. If an implementation has to differ, fix this plan in the same PR (inline, or with a dated `> **Corrected (issue #N).**` note), then grep later tasks for the changed symbol.
+- Placeholders only in tests and docs: `alice`, `family`, `example.com`. No real hostnames, domains or names.
+- Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+
+## Verified facts the code relies on
+
+Checked against `origin/main` at `9a84af6` (v0.15.0) on 2026-11-13.
+
+- `Principal::require(&self, access, catalog)` is the single level check: unreached is `CatalogNotSelected`, too low is `Forbidden` (`src/auth.rs:140`). Callers: 39, all through `require` or the two below.
+- MCP reads never call `require`: they pick catalogs with `selection::resolve`, whose `available` closure is `exists(name) && principal.reaches(name)` (`src/selection.rs:182-188`). `ToolContext::select` and `states` wrap it (`src/mcp/context.rs`), and REST browse, health and report routes run tools through a `ToolContext`.
+- Changeset writes and publish go through `ToolContext::pinned`, which calls `principal.require(access, ..)` (`src/mcp/context.rs:384`); `open_changeset` calls `require(Access::Write, ..)` (`src/mcp/changesets.rs:235`).
+- Export checks `principal.require(Access::Read, &name)` (`src/http/archives.rs:110`); `/api/v1/catalogs/{c}/export` uses the same handler.
+- The REST search over every reached catalog filters with `principal.reaches` and passes the names as the argument (`src/http/api/search.rs:72-79`), so without Task 4's filter one suspended catalog would refuse the whole search.
+- The key cache is rebuilt whole by `KeyCache::read`, a `tokio::try_join!` of three loads (`src/auth.rs:415-427`), when `admin_generation` moves (`src/app.rs:428`). Team writes bump it with `bump_admin_generation(&mut tx)` (`src/store/catalogs.rs:346`), and the REST team handlers then call `settle(&app)`, which polls at once (`src/http/api/mod.rs:159`).
+- Console session principals are built per request by `Principal::for_session(&user, ceiling)` (`src/http/console_session.rs:267-277`).
+- `OkfError::kind`, `to_json` and `AppError::status` match every variant with no `_` arm (`src/error.rs:286`, `:337-403`; `src/http/mod.rs:96`), so the compiler lists each place a new variant needs.
+- thiserror 2.0.6 accepts field references in extra format arguments: the crate already uses `#[error("import refused: {}", .problems.join("; "))]` (`src/error.rs:94`).
+- `catalogs::create(pool, name, description, owner_team, now)` and `catalogs::set_owner(pool, name, team)` (`src/store/catalogs.rs:76`, `:138`). Test apps create every catalog owned by `db::TEST_TEAM`, the personal team of `db::TEST_USER` (`src/mcp/testing.rs:77`, `src/db.rs:100-103`).
+- The console's API client toasts a generic "cannot do this" for every 403 (`src/http/ui/js/core/api.js:53-54`); its `ApiError` keeps the JSON body as `error.body` (`:9-14`).
+- Hash routes load `js/pages/<page>.js` (`src/http/ui/js/core/router.js:1`), so Import & export for a catalog is `#/transfer/<catalog>`. The confirm dialog's button is `#confirm-ok` (`src/http/ui/js/components/confirm.js:10`).
+- `TestServer` exposes `app: Arc<App>` (`tests/support/server.rs:90`): journeys reach the pool with `server.app.pool()` and poll with `server.app.poll()`.
+- `tests/admin_parity.rs` fails until every `team` subcommand is in `COVERED` and has a parity row whose REST cell is a route documented in `docs/operations.md`.
+
+## Task dependencies
+
+```
+1 -> 2 -> 3 -> 4
+          3 -> 5 -> 6
+               5 -> 7
+     4, 6, 7 -> 8
+```
+
+- Task 2 needs Task 1 only for order (both are small); Task 3 needs both (`SuspendedCatalog`, `OkfError::Suspended`).
+- Tasks 4 and 5 can run in parallel after Task 3. They share no files except `changelog/`.
+- Tasks 6 and 7 can run in parallel after Task 5. Task 6 edits `docs/operations.md` (parity and API rows); Task 8 edits other sections of it, so it goes last.
 
 ---
 
@@ -31,30 +74,42 @@
 | 7 | Console: team controls, pills, Browse notice, the 403 message |
 | 8 | Documentation, README status line, close-out |
 
-Tasks 1 to 3 are sequential. Task 4 and Task 5 need Task 3. Task 6 needs Task 1 and Task 5 (the parity table names the REST route). Task 7 needs Task 5. Task 8 is last.
+### Deliberately deferred
+
+| Item | Where it goes |
+|---|---|
+| Suspending one user or one catalog | Not planned; suspend the owner team (spec, Non-goals) |
+| Scheduled or automatic suspension | Not planned; an operator or an outside system calls the route |
+| A narrower "provisioner" admin scope for automation | A later milestone (file as an issue at close-out) |
+| Deleting a user whose credentials still name them (#297) | Its own issue, unchanged by this milestone |
+| Multiple replicas | Unchanged: single replica (`docs/operations.md`) |
 
 ## File map
 
-| File | Change |
-|---|---|
-| `migrations/0011_team_suspension.sql` | Create |
-| `src/store/teams.rs` | `Suspension`, `SuspendedCatalog`, `suspend`, `unsuspend`, `suspended_catalogs`, `TeamRecord.suspension` |
-| `src/error.rs` | `OkfError::Suspended`, its kind and JSON |
-| `src/http/mod.rs` | 403 for `Suspended` |
-| `src/auth.rs` | `Suspensions`, `Principal.suspended`, `suspension`, `check_not_suspended`, `require_export`, cache wiring, `for_session` |
-| `src/http/console_session.rs` | Pass the cache's suspensions to `for_session` |
-| `src/http/archives.rs` | Export uses `require_export` |
-| `src/selection.rs` | Suspension rules in `resolve` |
-| `src/http/api/search.rs` | Leave suspended catalogs out of "every catalog" |
-| `src/mcp/catalogs.rs` | `CatalogInfo.suspended` |
-| `src/http/api/catalogs.rs` | `CatalogSummary.suspended` |
-| `src/http/api/people.rs` | The suspension route; `TeamView` fields |
-| `src/cli.rs`, `src/cli/people.rs` | `team suspend`, `team unsuspend`; list column |
-| `tests/admin_parity.rs` | Two covered subcommands |
-| `src/http/ui/js/core/api.js`, `pages/teams.js`, `pages/catalogs.js`, `pages/browse.js` | Console |
-| `tests/ui_e2e/teams.rs` | Journey |
-| Every `Principal { ... }` literal (`src/auth.rs`, `src/selection.rs`, `src/http/archives.rs`, `src/mcp/testing.rs`, and any other `grep -rn "Principal {" src tests` finds) | Add `suspended: Default::default(),` |
-| `docs/operations.md`, `README.md`, `changelog/` | Docs |
+| File | Change | Tasks |
+|---|---|---|
+| `migrations/0011_team_suspension.sql` | Create | 1 |
+| `src/store/teams.rs` | `Suspension`, `SuspendedCatalog`, `suspend`, `unsuspend`, `suspended_catalogs`, `TeamRecord.suspension` | 1 |
+| `src/error.rs` | `OkfError::Suspended`, its kind and JSON | 2 |
+| `src/http/mod.rs` | 403 for `Suspended` | 2 |
+| `src/mcp/mod.rs` | Tool-error mapping, only if it matches variants | 2 |
+| `src/auth.rs` | `Suspensions`, `Principal.suspended`, `suspension`, `check_not_suspended`, `require_export`, cache wiring, `for_session` | 3 |
+| `src/http/console_session.rs` | Pass the cache's suspensions to `for_session` | 3 |
+| `src/http/archives.rs` | Export uses `require_export` | 3 |
+| `src/store/keys.rs`, `src/mcp/changesets.rs` (tests) | New `from_records` / `for_session` argument | 3 |
+| Every `Principal { ... }` literal (`grep -rn "Principal {" src tests`) | `suspended: Default::default(),` | 3 |
+| `src/selection.rs` | Suspension rules in `resolve` | 4 |
+| `src/http/api/search.rs` | Leave suspended catalogs out of "every catalog" | 4 |
+| `src/mcp/catalogs.rs` | `SuspensionInfo`, `CatalogInfo.suspended` | 4 |
+| `src/http/api/catalogs.rs` | `CatalogSummary.suspended` | 4 |
+| `src/http/api/people.rs` | The suspension route; `TeamView` fields | 1 (pattern), 5 |
+| `src/cli.rs`, `src/cli/people.rs` | `team suspend`, `team unsuspend`; list column | 6 |
+| `tests/admin_parity.rs` | Two covered subcommands | 6 |
+| `docs/operations.md` | Parity and API rows, team list format (6); everything else (8) | 6, 8 |
+| `src/http/ui/js/core/api.js`, `pages/teams.js`, `pages/catalogs.js`, `pages/browse.js` | Console | 7 |
+| `tests/ui_e2e/teams.rs` | Journeys | 7 |
+| `README.md`, the spec, the milestone changelog | Close-out | 8 |
+| `changelog/` | One entry per task | all |
 
 ---
 
@@ -1422,17 +1477,17 @@ async fn a_team_is_suspended_with_a_notice_shown_on_its_catalogs_then_lifted() {
 }
 ```
 
-Check the confirm dialog's OK button id in `src/http/ui/js/components/confirm.js` and use it in place of `#confirm-ok` if it differs. The admin is exempt, so the admin's own Browse still works; the Browse notice is covered by the member case below.
+The admin is exempt, so the admin's own Browse still works; the Browse notice is covered by the member case below.
 
 ```rust
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_member_sees_the_notice_on_browse_with_a_link_to_export() {
     let server = server().await;
     let reader = server.key("member-reader", Access::Read, &["main"], Some("main")).await;
-    teams::suspend(server.pool(), OWNER, Some("Paused for review."), Utc::now())
+    teams::suspend(server.app.pool(), OWNER, Some("Paused for review."), Utc::now())
         .await
         .unwrap();
-    server.poll().await;
+    server.app.poll().await.unwrap();
     drive(server.base.clone(), move |ui| {
         ui.login(&reader);
         ui.open("/browse/main");
@@ -1443,7 +1498,6 @@ async fn a_member_sees_the_notice_on_browse_with_a_link_to_export() {
 }
 ```
 
-Use the `TestServer` accessors the other journeys use for the pool and for polling (`grep -n "pub fn\|pub async fn" tests/support/server.rs`); if there is no poll helper, the server's poll interval in tests is short: wait with `ui.wait_text` as written, which retries.
 
 - [ ] **Step 2: Run and see them fail**
 
@@ -1549,7 +1603,6 @@ function showSuspended(view, catalog, body) {
 }
 ```
 
-Check `core/router.js` for the Import & export route's exact hash (`#/transfer/<catalog>` is assumed) and use it.
 
 - [ ] **Step 7: Run, gate, commit**
 
@@ -1587,7 +1640,7 @@ git commit -m "docs: team suspension operations, API reference and close-out (M1
 
 ---
 
-## Decisions taken while planning
+## Decisions taken while planning (2026-11-13)
 
 1. **Admins are exempt** (`Principal.access == Admin`), including admin console sessions: the operator must still be able to inspect, export and repair a suspended team's catalogs.
 2. **Order of checks:** reach, then level, then suspension. A credential that doesn't reach a catalog never learns it is suspended.
