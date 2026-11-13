@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{MatchedPath, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
@@ -268,9 +268,12 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
         .nest("/api/v1", api::routes(&app))
         .merge(keyed)
         // One `info` line per response (status, latency) in a span naming the
-        // method and path. The span records no headers, so a bearer key never
-        // reaches the log, and no query, so neither does an emailed link's
-        // token (`/account/setup?token=...`) or an OAuth code.
+        // method and the matched route. The span records no headers, so a
+        // bearer key never reaches the log; no query, so neither does an
+        // emailed link's token (`/account/setup?token=...`) or an OAuth code;
+        // and no literal path, so neither does an id in a path segment (a
+        // session's id prefix, a mail job id). `Router::layer` wraps the
+        // routes, so it runs after routing and sees `MatchedPath`.
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(request_span)
@@ -280,19 +283,32 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
         .with_state(app)
 }
 
-/// The request span: method, path and HTTP version, without the query
-/// (which can carry a single-use token) and without any header.
+/// What the request span records as the path of a request no route
+/// matched: never the client's text.
+const UNMATCHED_ROUTE: &str = "<unmatched>";
+
+/// The request span: method, matched route template and HTTP version. It
+/// records the route (`/api/v1/users/{name}/sessions/{id_prefix}`), never
+/// the literal path (which can carry an id or a token), the query (which
+/// can carry a single-use token) or any header.
 ///
 /// # Arguments
-/// * `request` - the incoming request.
+/// * `request` - the incoming request, after routing.
 ///
 /// # Returns
-/// An `info` span named `request`.
+/// An `info` span named `request`; its `path` is the route template, or
+/// [`UNMATCHED_ROUTE`] when no route matched.
 fn request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
+    // `MatchedPath` is the template axum's router put in the request's
+    // extensions (a typed per-request map) when a route matched.
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or(UNMATCHED_ROUTE, MatchedPath::as_str);
     tracing::info_span!(
         "request",
         method = %request.method(),
-        path = %request.uri().path(),
+        path = %route,
         version = ?request.version(),
     )
 }
@@ -358,6 +374,138 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log sink for one test: everything the `fmt` subscriber writes.
+    // `Arc<Mutex<..>>` so every writer the subscriber makes appends to one
+    // buffer the test reads afterwards.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the log buffer")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // `MakeWriter` is how `fmt` asks for a writer per line.
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        /// Everything logged so far, as text.
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("the log buffer")).into_owned()
+        }
+
+        /// Forgets everything logged so far.
+        fn clear(&self) {
+            self.0.lock().expect("the log buffer").clear();
+        }
+    }
+
+    // A current-thread runtime (the `tokio::test` default), so the
+    // thread-local subscriber below sees every span the requests open.
+    #[tokio::test]
+    async fn the_request_span_logs_the_route_template_never_the_literal_path() {
+        use crate::http::api::testing::{app, every_catalog_admin, send, Browser};
+
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        let (created, _) = send(
+            &test,
+            "POST",
+            "/api/v1/users",
+            Some(&root),
+            Some(serde_json::json!({"name": "alice"})),
+        )
+        .await;
+        assert_eq!(created.as_u16(), 201);
+        let _session = Browser::session_for(&test, "alice").await;
+        let (_, listed) = send(
+            &test,
+            "GET",
+            "/api/v1/users/alice/sessions",
+            Some(&root),
+            None,
+        )
+        .await;
+        let prefix = listed["sessions"][0]["id_prefix"]
+            .as_str()
+            .expect("a session prefix")
+            .to_string();
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(Level::INFO)
+            // Each span's creation is written as a line of its own, so the
+            // check does not depend on an event firing inside the span.
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+            .finish();
+        // `set_default` installs it for this thread until the guard drops.
+        let guard = tracing::subscriber::set_default(subscriber);
+        // tracing caches whether each log callsite is enabled. Tests on
+        // other threads, with no subscriber, can cache "disabled" for the
+        // callsites these requests use while this one starts. So run the
+        // same two kinds of request once (registering every callsite they
+        // touch), recompute every cached answer against this subscriber,
+        // and only then capture.
+        send(
+            &test,
+            "DELETE",
+            "/api/v1/users/alice/sessions/000000000000",
+            Some(&root),
+            None,
+        )
+        .await;
+        send(&test, "GET", "/warm-up", None, None).await;
+        tracing::callsite::rebuild_interest_cache();
+        captured.clear();
+
+        let (revoked, _) = send(
+            &test,
+            "DELETE",
+            &format!("/api/v1/users/alice/sessions/{prefix}"),
+            Some(&root),
+            None,
+        )
+        .await;
+        let (unmatched, _) = send(&test, "GET", "/no-such-route-marker", None, None).await;
+        drop(guard);
+        let logged = captured.text();
+
+        assert_eq!(revoked.as_u16(), 204);
+        assert_eq!(unmatched.as_u16(), 404);
+        assert!(
+            logged.contains("path=/api/v1/users/{name}/sessions/{id_prefix}"),
+            "the route template is logged: {logged}"
+        );
+        assert!(
+            logged.contains("path=<unmatched>"),
+            "an unmatched request logs a placeholder: {logged}"
+        );
+        assert!(
+            !logged.contains(&prefix),
+            "the session prefix leaked: {logged}"
+        );
+        assert!(
+            !logged.contains("no-such-route-marker"),
+            "a client path leaked: {logged}"
+        );
+    }
     use axum::body::Body;
     use axum::http::Request;
     // `oneshot` sends one request through a router without a socket.
