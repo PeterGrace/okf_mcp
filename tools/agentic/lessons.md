@@ -29,6 +29,7 @@ Each rule below records a real bug the review bot found in an earlier PR, mostly
 - **The console uses one credential at a time:** a live cookie session wins over a stored key.
 - **Sign-out counts as done only on a 2xx, or a 401** meaning the session was already over. Any other failure keeps the session and shows a retryable error.
 - **A browser journey for a write path** must actually perform the write and check the persisted result. It must fail if the header or feature it covers is removed; check that by temporarily reverting the code.
+- **A journey that checks a message the page shows by toggling `hidden`** waits for it to be visible (`ui.wait_visible`), not only for its text: `ui.wait_text` reads `textContent`, which a hidden element still has, so the check passes even when the message never shows (found while revert-checking issue #326).
 
 ## Process
 - **Find the whole class.** When you fix one path, grep for every sibling path with the same pattern and fix those too.
