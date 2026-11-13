@@ -899,4 +899,63 @@ mod tests {
         assert_eq!(listed["catalogs"][0]["generation"], generation + 1);
         assert_eq!(listed["catalogs"][0]["files"], 1);
     }
+
+    /// M13 Task 3: the per-catalog admin routes check `require(Admin, ..)`
+    /// themselves. Below admin they still answer `Forbidden` (the level
+    /// check comes before suspension), and an admin, who is exempt, still
+    /// manages a suspended catalog.
+    #[tokio::test]
+    async fn catalog_admin_routes_stay_open_to_an_admin_while_suspended() {
+        use crate::http::api::testing::{assert_answers, Expect};
+        use crate::mcp::testing::suspend_catalogs;
+        let test = app().await;
+        let keys = keys(&test).await;
+        suspend_catalogs(&test, &["main"]).await;
+        let described = || Some(json!({"description": "Paused."}));
+        let catalog = "/api/v1/catalogs/main";
+        let member_access = "/api/v1/catalogs/main/member-access";
+
+        assert_answers(
+            &test,
+            &[
+                Expect {
+                    method: "PATCH",
+                    uri: catalog,
+                    body: described(),
+                    key: &keys.write,
+                    who: "write",
+                    status: 403,
+                    error: Some("Forbidden"),
+                },
+                Expect {
+                    method: "PATCH",
+                    uri: catalog,
+                    body: described(),
+                    key: &keys.admin,
+                    who: "admin",
+                    status: 200,
+                    error: None,
+                },
+                Expect {
+                    method: "GET",
+                    uri: member_access,
+                    body: None,
+                    key: &keys.read,
+                    who: "read",
+                    status: 403,
+                    error: Some("Forbidden"),
+                },
+                Expect {
+                    method: "GET",
+                    uri: member_access,
+                    body: None,
+                    key: &keys.admin,
+                    who: "admin",
+                    status: 200,
+                    error: None,
+                },
+            ],
+        )
+        .await;
+    }
 }

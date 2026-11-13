@@ -33,6 +33,7 @@ use crate::keys;
 use crate::oauth::access::OAuthVerifier;
 use crate::store::ceiling::{self, cap, Ceiling};
 use crate::store::keys::{self as key_rows, Access, KeyKind, KeyRecord};
+use crate::store::teams::{self, SuspendedCatalog};
 use crate::store::users::{self, UserAuth};
 
 /// The `key_id` prefix of a console session's principal. Key ids match
@@ -70,6 +71,10 @@ pub enum CredentialKind {
     },
 }
 
+/// Every catalog whose owner team is suspended, by catalog name. One map per
+/// key-cache load, shared (through an `Arc`) by every principal built from it.
+pub type Suspensions = HashMap<String, SuspendedCatalog>;
+
 /// Who a request acts as: one live API key, OAuth grant or console session
 /// (never the secret itself).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +101,11 @@ pub struct Principal {
     /// assigned. Display only: it grants nothing, so `reaches` and
     /// `require` never read it.
     pub user: Option<String>,
+    /// The catalogs suspended when the key cache was loaded, shared by every
+    /// principal of that load. Read by [`Principal::require`] (and, from
+    /// Task 4 of M13, selection); an admin credential ignores it. Empty for a
+    /// principal built outside the cache (`From<KeyRecord>`, tests).
+    pub suspended: Arc<Suspensions>,
 }
 
 impl Principal {
@@ -126,7 +136,8 @@ impl Principal {
         self.level(catalog).is_some()
     }
 
-    /// Checks that the key may do something needing `access` to `catalog`.
+    /// Checks that the key reaches `catalog` at `access` or higher, ignoring
+    /// suspension: the first two of [`Self::require`]'s three checks.
     ///
     /// # Arguments
     /// * `access` - the level the operation needs.
@@ -137,7 +148,7 @@ impl Principal {
     /// catalog (worded like an unknown catalog, so a key cannot probe which
     /// catalogs exist); [`OkfError::Forbidden`] if it does but its level
     /// there is lower than `access`.
-    pub fn require(&self, access: Access, catalog: &str) -> Result<(), OkfError> {
+    fn require_level(&self, access: Access, catalog: &str) -> Result<(), OkfError> {
         // `let ... else`: bind the level, or leave early when there is none.
         let Some(level) = self.level(catalog) else {
             return Err(OkfError::CatalogNotSelected {
@@ -158,6 +169,75 @@ impl Principal {
         Ok(())
     }
 
+    /// The suspension of `catalog`, if its owner team is suspended: a fact
+    /// shown to anyone who reaches the catalog (listing), whatever their
+    /// level. Callers check reach first, so a credential that does not reach
+    /// a catalog never learns it is suspended.
+    ///
+    /// # Arguments
+    /// * `catalog` - a catalog name.
+    ///
+    /// # Returns
+    /// The owner team and its notice, or `None` for an active catalog.
+    pub fn suspension(&self, catalog: &str) -> Option<&SuspendedCatalog> {
+        self.suspended.get(catalog)
+    }
+
+    /// Refuses a suspended catalog for every credential but an admin (M13
+    /// Decision 1: the operator must still inspect, export and repair it).
+    ///
+    /// # Arguments
+    /// * `catalog` - a catalog the principal reaches (check reach first).
+    ///
+    /// # Errors
+    /// [`OkfError::Suspended`] when the catalog's owner team is suspended and
+    /// the principal is not an admin.
+    pub fn check_not_suspended(&self, catalog: &str) -> Result<(), OkfError> {
+        if self.access == Access::Admin {
+            return Ok(());
+        }
+        match self.suspension(catalog) {
+            None => Ok(()),
+            Some(suspended) => Err(OkfError::Suspended {
+                catalog: catalog.to_string(),
+                team: suspended.team.clone(),
+                notice: suspended.notice.clone(),
+            }),
+        }
+    }
+
+    /// Checks that the key may do something needing `access` to `catalog`:
+    /// reach, then level, then suspension (M13 Decision 2), so a credential
+    /// that does not reach the catalog never learns it is suspended.
+    ///
+    /// # Arguments
+    /// * `access` - the level the operation needs.
+    /// * `catalog` - the catalog it acts on.
+    ///
+    /// # Errors
+    /// [`OkfError::CatalogNotSelected`] if the key does not reach the
+    /// catalog (worded like an unknown catalog, so a key cannot probe which
+    /// catalogs exist); [`OkfError::Forbidden`] if it does but its level
+    /// there is lower than `access`; then [`OkfError::Suspended`] (see
+    /// [`Self::check_not_suspended`]).
+    pub fn require(&self, access: Access, catalog: &str) -> Result<(), OkfError> {
+        self.require_level(access, catalog)?;
+        self.check_not_suspended(catalog)
+    }
+
+    /// Checks that the key may export `catalog`: read access, suspended or
+    /// not (M13 spec: export stays open so members can take their data).
+    ///
+    /// # Arguments
+    /// * `catalog` - the catalog to export.
+    ///
+    /// # Errors
+    /// As [`Self::require`] with [`Access::Read`], but never
+    /// [`OkfError::Suspended`].
+    pub fn require_export(&self, catalog: &str) -> Result<(), OkfError> {
+        self.require_level(Access::Read, catalog)
+    }
+
     /// The principal of a console session (plan Decision 5): an admin
     /// user acts as an admin on every catalog; anyone else reaches exactly
     /// their ceiling, at the ceiling's level for each catalog.
@@ -169,11 +249,13 @@ impl Principal {
     /// # Arguments
     /// * `user` - the signed-in user, from the key cache.
     /// * `ceiling` - the user's ceiling (unused for an admin).
+    /// * `suspended` - the suspended catalogs, from the key cache
+    ///   ([`Keys::suspensions`]); an admin ignores them.
     ///
     /// # Returns
     /// The principal; its `access` is the highest level it holds, for
     /// display and the admin checks (which a non-admin never passes).
-    pub fn for_session(user: &UserAuth, ceiling: Ceiling) -> Self {
+    pub fn for_session(user: &UserAuth, ceiling: Ceiling, suspended: Arc<Suspensions>) -> Self {
         let (access, reach) = if user.is_admin {
             (Access::Admin, Reach::All)
         } else {
@@ -193,6 +275,7 @@ impl Principal {
                 user_id: user.id.clone(),
             },
             user: Some(user.name.clone()),
+            suspended,
         }
     }
 
@@ -238,6 +321,9 @@ impl From<KeyRecord> for Principal {
             actor: record.actor,
             kind,
             user: record.user,
+            // Filled in by the key cache (`principal_of`); a principal
+            // built outside it sees nothing suspended.
+            suspended: Arc::default(),
         }
     }
 }
@@ -284,6 +370,8 @@ pub struct KeyCache {
     // Every user, by id: what a session principal is built from without a
     // query (admin flag, name, email).
     users: HashMap<String, UserAuth>,
+    // The suspended catalogs this cache's principals share.
+    suspended: Arc<Suspensions>,
 }
 
 /// The ceiling of a self-issued credential whose user has none.
@@ -296,10 +384,15 @@ static NO_CEILING: Ceiling = BTreeMap::new();
 /// # Arguments
 /// * `record` - the row.
 /// * `ceilings` - every user's ceiling, by user id.
+/// * `suspended` - the cache's suspended catalogs, shared with the principal.
 ///
 /// # Returns
 /// The principal.
-fn principal_of(record: KeyRecord, ceilings: &HashMap<String, Ceiling>) -> Principal {
+fn principal_of(
+    record: KeyRecord,
+    ceilings: &HashMap<String, Ceiling>,
+    suspended: &Arc<Suspensions>,
+) -> Principal {
     // Looked up before `record` moves into the principal. `get` borrows
     // only `ceilings`, so the reference outlives the borrow of `record`.
     let ceiling = record.self_issued.then(|| {
@@ -310,6 +403,8 @@ fn principal_of(record: KeyRecord, ceilings: &HashMap<String, Ceiling>) -> Princ
             .unwrap_or(&NO_CEILING)
     });
     let mut principal = Principal::from(record);
+    // `Arc::clone` copies the pointer, not the map: one map per load.
+    principal.suspended = Arc::clone(suspended);
     if let Some(ceiling) = ceiling {
         let levels = match &principal.reach {
             Reach::Catalogs(levels) => cap(levels, ceiling),
@@ -333,6 +428,9 @@ impl KeyCache {
     /// * `records` - the rows, as [`key_rows::list`] returns them.
     /// * `ceilings` - every user's ceiling by user id, as
     ///   [`ceiling::ceilings`] returns them (kept in the cache).
+    /// * `suspended` - the suspended catalogs, as
+    ///   [`teams::suspended_catalogs`] returns them (kept in the cache and
+    ///   shared by every principal it builds).
     /// * `now` - the server clock.
     ///
     /// # Returns
@@ -340,10 +438,12 @@ impl KeyCache {
     pub fn from_records(
         records: Vec<KeyRecord>,
         ceilings: HashMap<String, Ceiling>,
+        suspended: Arc<Suspensions>,
         now: DateTime<Utc>,
     ) -> Self {
         let mut cache = Self {
             by_user: ceilings,
+            suspended,
             ..Self::default()
         };
         for record in records
@@ -363,7 +463,8 @@ impl KeyCache {
                     else {
                         continue;
                     };
-                    let principal = Arc::new(principal_of(record, &cache.by_user));
+                    let principal =
+                        Arc::new(principal_of(record, &cache.by_user, &cache.suspended));
                     cache.by_hash.insert(
                         hash,
                         Cached {
@@ -374,7 +475,8 @@ impl KeyCache {
                 }
                 KeyKind::OAuth => {
                     let id = record.id.clone();
-                    let principal = Arc::new(principal_of(record, &cache.by_user));
+                    let principal =
+                        Arc::new(principal_of(record, &cache.by_user, &cache.suspended));
                     cache.by_id.insert(
                         id,
                         Cached {
@@ -411,21 +513,23 @@ impl KeyCache {
         self.users.get(user_id)
     }
 
-    /// Reads every key, every ceiling and every user, and builds the cache.
+    /// Reads every key, every ceiling, every user and every suspended
+    /// catalog, and builds the cache.
     ///
     /// # Errors
     /// [`OkfError::Database`].
     async fn read(pool: &PgPool, now: DateTime<Utc>) -> Result<Self, OkfError> {
-        // All three at once, on three pooled connections (`try_join!` is
+        // All four at once, on four pooled connections (`try_join!` is
         // `asyncio.gather` that stops at the first error). A change committed
         // between the reads also moved `admin_generation`, which every
         // caller reads first, so the next poll reloads again.
-        let (records, ceilings, users) = tokio::try_join!(
+        let (records, ceilings, users, suspended) = tokio::try_join!(
             key_rows::list(pool),
             ceiling::ceilings(pool),
-            users::auth_by_id(pool)
+            users::auth_by_id(pool),
+            teams::suspended_catalogs(pool)
         )?;
-        Ok(Self::from_records(records, ceilings, now).with_users(users))
+        Ok(Self::from_records(records, ceilings, Arc::new(suspended), now).with_users(users))
     }
 
     /// The principal of a presented key.
@@ -553,6 +657,21 @@ impl Keys {
             .expect("key cache lock poisoned")
             .user(user_id)
             .cloned()
+    }
+
+    /// The suspended catalogs, from the current cache: what a console
+    /// session principal is built with.
+    ///
+    /// # Returns
+    /// The shared map (a pointer copy, not a copy of the map).
+    pub fn suspensions(&self) -> Arc<Suspensions> {
+        Arc::clone(
+            &self
+                .cache
+                .read()
+                .expect("key cache lock poisoned")
+                .suspended,
+        )
     }
 
     /// The principal of a presented key, from the current cache.
@@ -804,6 +923,7 @@ mod tests {
                 },
             ],
             HashMap::new(),
+            Arc::default(),
             now,
         );
 
@@ -941,6 +1061,7 @@ mod tests {
                 record("forever", "forever-key", false),
             ],
             HashMap::new(),
+            Arc::default(),
             now,
         );
 
@@ -965,11 +1086,11 @@ mod tests {
             ..record("soon", "soon-key", false)
         };
         let fresh = Keys::new(
-            KeyCache::from_records(vec![soon.clone()], HashMap::new(), now),
+            KeyCache::from_records(vec![soon.clone()], HashMap::new(), Arc::default(), now),
             Arc::new(FixedClock(now)),
         );
         let stale = Keys::new(
-            KeyCache::from_records(vec![soon], HashMap::new(), now),
+            KeyCache::from_records(vec![soon], HashMap::new(), Arc::default(), now),
             Arc::new(FixedClock(now + hour * 2)),
         );
 
@@ -1120,6 +1241,7 @@ mod tests {
                 grant_record("grant-old", true),
             ],
             HashMap::new(),
+            Arc::default(),
             now,
         );
 
@@ -1291,6 +1413,7 @@ mod tests {
                 stranger,
             ],
             HashMap::from([("alice-id".to_string(), alice.clone())]),
+            Arc::default(),
             now,
         );
 
@@ -1486,7 +1609,7 @@ mod tests {
             ("other".to_string(), Access::Read),
         ]);
 
-        let principal = Principal::for_session(&user(false), ceiling);
+        let principal = Principal::for_session(&user(false), ceiling, Arc::default());
 
         assert_eq!(principal.key_id, "session:alice");
         assert_eq!(principal.actor, "alice");
@@ -1518,7 +1641,7 @@ mod tests {
 
     #[test]
     fn an_admin_users_session_is_an_admin_on_every_catalog() {
-        let principal = Principal::for_session(&user(true), Ceiling::new());
+        let principal = Principal::for_session(&user(true), Ceiling::new(), Arc::default());
 
         assert_eq!(principal.access, Access::Admin);
         assert_eq!(principal.reach, Reach::All);
@@ -1527,10 +1650,172 @@ mod tests {
 
     #[test]
     fn a_session_with_an_empty_ceiling_reaches_nothing() {
-        let principal = Principal::for_session(&user(false), Ceiling::new());
+        let principal = Principal::for_session(&user(false), Ceiling::new(), Arc::default());
 
         assert_eq!(principal.access, Access::Read);
         assert!(!principal.reaches("main"));
+    }
+
+    /// A suspension map holding each of `catalogs`, owned by `family`.
+    fn suspended_on(catalogs: &[&str]) -> Arc<Suspensions> {
+        Arc::new(
+            catalogs
+                .iter()
+                .map(|catalog| {
+                    (
+                        catalog.to_string(),
+                        SuspendedCatalog {
+                            team: "family".to_string(),
+                            notice: Some("Paused.".to_string()),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// An API key reaching `catalogs`, each at `access`, seeing `suspended`.
+    fn key_on(catalogs: &[&str], access: Access, suspended: Arc<Suspensions>) -> Principal {
+        Principal {
+            key_id: "k".to_string(),
+            access,
+            maintenance_report: true,
+            reach: Reach::Catalogs(levels(catalogs, access)),
+            default_catalog: None,
+            actor: "a".to_string(),
+            kind: CredentialKind::ApiKey,
+            user: None,
+            suspended,
+        }
+    }
+
+    #[test]
+    fn require_refuses_a_suspended_catalog_after_reach_and_level() {
+        // `theirs` is suspended too, but this key does not reach it.
+        let principal = key_on(
+            &["shared", "mine"],
+            Access::Write,
+            suspended_on(&["shared", "theirs"]),
+        );
+
+        let suspended = principal.require(Access::Read, "shared");
+        let unreached = principal.require(Access::Read, "theirs");
+        let too_low = principal.require(Access::Admin, "shared");
+        let fine = principal.require(Access::Write, "mine");
+        let reporting = principal.require_maintenance_report("shared");
+
+        assert!(matches!(
+            suspended,
+            Err(OkfError::Suspended { ref catalog, ref team, ref notice })
+                if catalog == "shared" && team == "family" && notice.as_deref() == Some("Paused.")
+        ));
+        assert!(
+            matches!(unreached, Err(OkfError::CatalogNotSelected { .. })),
+            "an unreached catalog never reads as suspended: {unreached:?}"
+        );
+        assert!(
+            matches!(too_low, Err(OkfError::Forbidden { .. })),
+            "level is checked before suspension: {too_low:?}"
+        );
+        assert!(fine.is_ok());
+        assert!(matches!(reporting, Err(OkfError::Suspended { .. })));
+    }
+
+    #[test]
+    fn an_admin_is_not_suspended_and_export_ignores_suspension() {
+        let admin = key_on(&["shared"], Access::Admin, suspended_on(&["shared"]));
+        let reader = key_on(
+            &["shared"],
+            Access::Read,
+            suspended_on(&["shared", "other"]),
+        );
+
+        assert!(admin.require(Access::Admin, "shared").is_ok());
+        assert!(admin.require(Access::Write, "shared").is_ok());
+        assert!(reader.require_export("shared").is_ok());
+        assert!(matches!(
+            reader.require_export("other"),
+            Err(OkfError::CatalogNotSelected { .. })
+        ));
+        assert_eq!(
+            reader.suspension("shared").map(|s| s.team.as_str()),
+            Some("family"),
+            "the fact is visible to anyone who reaches it"
+        );
+        assert_eq!(reader.suspension("mine"), None);
+    }
+
+    #[test]
+    fn a_member_session_is_suspended_and_an_admin_session_is_not() {
+        let ceiling = Ceiling::from([("shared".to_string(), Access::Write)]);
+
+        let member = Principal::for_session(&user(false), ceiling, suspended_on(&["shared"]));
+        let admin = Principal::for_session(&user(true), Ceiling::new(), suspended_on(&["shared"]));
+
+        assert!(matches!(
+            member.require(Access::Read, "shared"),
+            Err(OkfError::Suspended { .. })
+        ));
+        assert!(member.require_export("shared").is_ok());
+        assert!(admin.require(Access::Write, "shared").is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cache_gives_every_principal_the_suspended_catalogs() {
+        use crate::store::{catalogs, keys as key_rows};
+        let db = crate::db::test_db().await;
+        for name in ["main", "other"] {
+            catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, Utc::now())
+                .await
+                .unwrap();
+        }
+        let names = ["main".to_string()];
+        let new = key_rows::NewKey {
+            name: "writer",
+            access: Access::Write,
+            maintenance_report: false,
+            grants: key_rows::Grants::Catalogs(&names),
+            default_catalog: Some("main"),
+            actor: "writer",
+            user: crate::db::TEST_USER,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
+        };
+        let secret = key_rows::create_with_id(&db.pool, &new, Utc::now())
+            .await
+            .unwrap()
+            .key;
+        teams::suspend(&db.pool, crate::db::TEST_TEAM, Some("Paused."), Utc::now())
+            .await
+            .unwrap();
+
+        let keys = Keys::load(&db.pool, Arc::new(crate::clock::SystemClock))
+            .await
+            .unwrap();
+        let writer = keys.find(&secret).expect("the key is live");
+
+        assert_eq!(keys.suspensions().len(), 2, "both of the team's catalogs");
+        assert!(
+            Arc::ptr_eq(&writer.suspended, &keys.suspensions()),
+            "one shared map per load"
+        );
+        assert!(matches!(
+            writer.require(Access::Read, "main"),
+            Err(OkfError::Suspended { ref notice, .. }) if notice.as_deref() == Some("Paused.")
+        ));
+
+        teams::unsuspend(&db.pool, crate::db::TEST_TEAM)
+            .await
+            .unwrap();
+        keys.reload(&db.pool).await.unwrap();
+        let writer = keys.find(&secret).expect("the key is live");
+
+        assert!(keys.suspensions().is_empty());
+        assert!(
+            writer.require(Access::Write, "main").is_ok(),
+            "lifting restores the key exactly as it was"
+        );
     }
 
     #[test]

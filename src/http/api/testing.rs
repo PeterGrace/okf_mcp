@@ -215,6 +215,47 @@ pub(crate) async fn assert_matrix_with(test: &TestApp, keys: &Keys, rows: &[Row]
     }
 }
 
+/// One request's expected answer: a status and, for a refusal, the error
+/// kind in its JSON body (`None` for a success).
+pub(crate) struct Expect<'a> {
+    /// HTTP method.
+    pub method: &'static str,
+    /// Full URI, `/api/v1/...`.
+    pub uri: &'a str,
+    /// JSON body, if the endpoint takes one.
+    pub body: Option<serde_json::Value>,
+    /// The caller's secret.
+    pub key: &'a str,
+    /// Who the caller is, for the failure message.
+    pub who: &'static str,
+    /// The expected status.
+    pub status: u16,
+    /// The expected `error` kind, or `None` to leave the body unchecked.
+    pub error: Option<&'static str>,
+}
+
+/// Sends each request and asserts its status and error kind.
+///
+/// # Panics
+/// On the first answer that differs, naming the request and the caller.
+pub(crate) async fn assert_answers(test: &TestApp, expected: &[Expect<'_>]) {
+    for want in expected {
+        let (status, body) = send(
+            test,
+            want.method,
+            want.uri,
+            Some(want.key),
+            want.body.clone(),
+        )
+        .await;
+        let context = format!("{} {} as {}: {body}", want.method, want.uri, want.who);
+        assert_eq!(status.as_u16(), want.status, "{context}");
+        if let Some(error) = want.error {
+            assert_eq!(body["error"], error, "{context}");
+        }
+    }
+}
+
 /// A password every test user can be given: long enough and not common.
 pub(crate) const PASSWORD: &str = "violet-lantern-orbit-42";
 

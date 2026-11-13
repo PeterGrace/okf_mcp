@@ -871,7 +871,8 @@ mod open_tests {
             is_admin: true,
         };
         // An admin session: it passes every level check.
-        let session = crate::auth::Principal::for_session(&user, Default::default());
+        let session =
+            crate::auth::Principal::for_session(&user, Default::default(), Default::default());
         let ctx = crate::mcp::testing::context(&test, std::sync::Arc::new(session), None);
 
         let refused = open_changeset(
@@ -2885,5 +2886,212 @@ mod restructure_publish_tests {
         );
         let row = changeset_row(&test, &report.changeset).await;
         assert_eq!(row.state, ChangesetState::Open);
+    }
+}
+
+/// M13 Task 3: every changeset path (open, pinned writes and reads,
+/// publish, discard, revert, pending changes) refuses a suspended catalog to
+/// a non-admin key, through `Principal::require`; a key that does not reach
+/// the catalog never learns it is suspended; an admin is exempt.
+#[cfg(test)]
+mod suspension_tests {
+    use super::*;
+
+    use crate::config::Config;
+    use crate::mcp::testing::{
+        app_with, cached_principal, context, lift_suspension, stored_secret, suspend_catalogs,
+        TestApp, SUSPENDED_TEAM,
+    };
+    use crate::mcp::writes::{replace_body, ReplaceBodyParams};
+
+    const NOTE: &str = "---\ntype: Note\ntitle: A\ndescription: A note.\n---\n# A\n";
+
+    /// A connection of the key behind `secret`, as the cache holds it now.
+    fn connect(test: &TestApp, secret: &str) -> ToolContext {
+        context(test, cached_principal(test, secret), None)
+    }
+
+    /// Opens a changeset in `catalog` and edits `a.md` in it.
+    async fn open_with_edit(ctx: &ToolContext, catalog: &str) -> String {
+        let handle = open_changeset(
+            ctx,
+            OpenParams {
+                catalog: Some(catalog.to_string()),
+            },
+        )
+        .await
+        .expect("open a changeset")
+        .changeset;
+        let edit = ReplaceBodyParams {
+            path: "a.md".to_string(),
+            body: "# A\n\nEdited.\n".to_string(),
+            changeset: handle.clone(),
+        };
+        replace_body(ctx, edit).await.expect("edit a.md");
+        handle
+    }
+
+    /// Every changeset tool on `handle` (and `open_changeset` on its
+    /// catalog), as `(tool, error kind or "ok")`.
+    async fn every_path(
+        ctx: &ToolContext,
+        catalog: &str,
+        handle: &str,
+    ) -> Vec<(&'static str, String)> {
+        // `map_or_else` turns each result into its error's kind, or "ok".
+        fn outcome<T>(result: Result<T, OkfError>) -> String {
+            result.map_or_else(|error| error.kind().to_string(), |_| "ok".to_string())
+        }
+        let changeset = handle.to_string();
+        vec![
+            (
+                "open_changeset",
+                outcome(
+                    open_changeset(
+                        ctx,
+                        OpenParams {
+                            catalog: Some(catalog.to_string()),
+                        },
+                    )
+                    .await,
+                ),
+            ),
+            (
+                "pin (a read through the changeset)",
+                outcome(ctx.pin(Some(handle)).await),
+            ),
+            (
+                "replace_body",
+                outcome(
+                    replace_body(
+                        ctx,
+                        ReplaceBodyParams {
+                            path: "a.md".to_string(),
+                            body: "# A\n\nAgain.\n".to_string(),
+                            changeset: changeset.clone(),
+                        },
+                    )
+                    .await,
+                ),
+            ),
+            (
+                "revert",
+                outcome(
+                    revert(
+                        ctx,
+                        RevertParams {
+                            path: "a.md".to_string(),
+                            revision: 1,
+                            changeset: changeset.clone(),
+                        },
+                    )
+                    .await,
+                ),
+            ),
+            (
+                "pending_changes",
+                outcome(
+                    pending_changes(
+                        ctx,
+                        PendingParams {
+                            changeset: changeset.clone(),
+                        },
+                    )
+                    .await,
+                ),
+            ),
+            (
+                "discard",
+                outcome(
+                    discard(
+                        ctx,
+                        DiscardParams {
+                            paths: Some(vec!["/nothing.md".to_string()]),
+                            changeset: changeset.clone(),
+                        },
+                    )
+                    .await,
+                ),
+            ),
+            (
+                "publish",
+                outcome(
+                    publish(
+                        ctx,
+                        PublishParams {
+                            message: "Edit a.md.".to_string(),
+                            changeset,
+                        },
+                    )
+                    .await,
+                ),
+            ),
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_changeset_path_refuses_a_suspended_catalog_but_to_an_admin() {
+        let test = app_with(
+            &[("pg", &[("a.md", NOTE)]), ("work", &[("a.md", NOTE)])],
+            Config::default(),
+        )
+        .await;
+        let writer = stored_secret(&test, "writer", Access::Write, &["pg", "work"], false).await;
+        let stranger = stored_secret(&test, "stranger", Access::Write, &["work"], false).await;
+        let root = stored_secret(&test, "root", Access::Admin, &[], false).await;
+        let handle = open_with_edit(&connect(&test, &writer), "pg").await;
+        let in_work = open_with_edit(&connect(&test, &writer), "work").await;
+        let roots = open_with_edit(&connect(&test, &root), "pg").await;
+
+        suspend_catalogs(&test, &["pg"]).await;
+        let suspended = every_path(&connect(&test, &writer), "pg", &handle).await;
+        let refused = open_changeset(
+            &connect(&test, &writer),
+            OpenParams {
+                catalog: Some("pg".to_string()),
+            },
+        )
+        .await
+        .unwrap_err();
+        let elsewhere = every_path(&connect(&test, &writer), "work", &in_work).await;
+        let strangers = every_path(&connect(&test, &stranger), "pg", &handle).await;
+        let admins = every_path(&connect(&test, &root), "pg", &roots).await;
+
+        for (tool, kind) in &suspended {
+            assert_eq!(kind, "Suspended", "{tool} on the suspended catalog");
+        }
+        assert!(matches!(
+            refused,
+            OkfError::Suspended { ref catalog, ref team, .. } if catalog == "pg" && team == SUSPENDED_TEAM
+        ));
+        for (tool, kind) in &elsewhere {
+            assert_eq!(kind, "ok", "{tool} on the other team's catalog");
+        }
+        for (tool, kind) in &strangers {
+            assert_ne!(
+                kind, "Suspended",
+                "{tool}: a key that does not reach pg never learns"
+            );
+        }
+        assert_eq!(strangers[0].1, "CatalogNotSelected", "open_changeset");
+        assert!(
+            strangers[1..]
+                .iter()
+                .all(|(_, kind)| kind == "UnknownChangeset"),
+            "{strangers:?}"
+        );
+        for (tool, kind) in &admins {
+            assert_eq!(kind, "ok", "{tool} as an admin");
+        }
+
+        lift_suspension(&test).await;
+        let lifted = pending_changes(
+            &connect(&test, &writer),
+            PendingParams {
+                changeset: handle.clone(),
+            },
+        )
+        .await;
+        assert!(lifted.is_ok(), "lifting restores the key: {lifted:?}");
     }
 }

@@ -728,4 +728,78 @@ mod tests {
         assert_eq!(concept.as_u16(), 400);
         assert_eq!(unknown.as_u16(), 404);
     }
+
+    /// M13 Task 3: the revision route reads the store directly and checks
+    /// access itself, so it refuses a suspended catalog through
+    /// `Principal::require`: to member keys and member sessions, not to an
+    /// admin key or an admin session, and never to a key that does not reach
+    /// it (404). Export stays open to the member session.
+    #[tokio::test]
+    async fn a_revision_of_a_suspended_catalog_is_refused_to_members_only() {
+        use crate::http::api::testing::{assert_answers, Browser, Expect, Payload};
+        use crate::mcp::testing::suspend_catalogs;
+        let test = app().await;
+        let keys = keys(&test).await;
+        suspend_catalogs(&test, &["main"]).await;
+        let uri = "/api/v1/catalogs/main/revisions/1/index.md";
+        let expect = |who, key, status, error| Expect {
+            method: "GET",
+            uri,
+            body: None,
+            key,
+            who,
+            status,
+            error,
+        };
+
+        assert_answers(
+            &test,
+            &[
+                expect("read", &keys.read, 403, Some("Suspended")),
+                expect("write", &keys.write, 403, Some("Suspended")),
+                expect("stranger", &keys.stranger, 404, Some("CatalogNotSelected")),
+                expect("admin", &keys.admin, 200, None),
+            ],
+        )
+        .await;
+
+        // The fixture user owns the suspended team, so its session reaches
+        // `main` (write) and `other` (its personal team, still active).
+        let user = crate::db::TEST_USER;
+        let mut member = Browser::session_for(&test, user).await;
+        let (refused, why) = member.send(&test, "GET", uri, Payload::Empty).await.parts();
+        let (active, _) = member
+            .send(
+                &test,
+                "GET",
+                "/api/v1/catalogs/other/revisions/1/index.md",
+                Payload::Empty,
+            )
+            .await
+            .parts();
+        let (exported, _) = member
+            .send(&test, "GET", "/api/v1/catalogs/main/export", Payload::Empty)
+            .await
+            .parts();
+        crate::store::users::set_admin(test.app.pool(), user, true, false)
+            .await
+            .expect("make the user an admin");
+        let mut admin = Browser::session_for(&test, user).await;
+        let (as_admin, answer) = admin.send(&test, "GET", uri, Payload::Empty).await.parts();
+
+        assert_eq!(refused.as_u16(), 403, "{why}");
+        assert_eq!(why["error"], "Suspended");
+        assert_eq!(why["team"], "family");
+        assert_eq!(
+            active.as_u16(),
+            200,
+            "the other team's catalog is untouched"
+        );
+        assert_eq!(exported.as_u16(), 200, "export stays open to the member");
+        assert_eq!(
+            as_admin.as_u16(),
+            200,
+            "an admin session is exempt: {answer}"
+        );
+    }
 }

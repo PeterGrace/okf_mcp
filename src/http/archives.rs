@@ -107,7 +107,9 @@ async fn export_catalog(
     Path(name): Path<String>,
 ) -> Result<Response, AppError> {
     // `?` returns early with the error, converted to `AppError` by `From`.
-    principal.require(Access::Read, &name)?;
+    // Export stays open while the owner team is suspended (M13 spec), so
+    // members can take their data; reach and read access still apply.
+    principal.require_export(&name)?;
     // M3's export builds the whole tarball in memory (a `Vec<u8>`).
     // The generation is for the command line's `import --expect-generation`.
     let (bytes, _generation) = export(app.pool(), &name, Vec::new()).await?;
@@ -576,6 +578,64 @@ mod tests {
         assert_eq!(after_refusal, before);
         assert_eq!(current_status, StatusCode::OK);
         assert_eq!(report["updated"], serde_json::json!(["index.md"]));
+    }
+
+    /// M13 Task 3: export stays open to every credential that reaches a
+    /// suspended catalog, and import into it stays behind `admin` (which is
+    /// exempt from suspension); a key that does not reach it gets 404.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn export_stays_open_and_only_an_admin_imports_while_suspended() {
+        use crate::mcp::testing::{cached_principal, stored_secret, suspend_catalogs};
+        let test = app_with(
+            &[("pg", &[("index.md", "# Index\n")]), ("other", &[])],
+            Config::default(),
+        )
+        .await;
+        let reader = stored_secret(&test, "reader", Access::Read, &["pg"], false).await;
+        let writer = stored_secret(&test, "writer", Access::Write, &["pg"], false).await;
+        let stranger = stored_secret(&test, "stranger", Access::Read, &["other"], false).await;
+        let root = stored_secret(&test, "root", Access::Admin, &[], false).await;
+        suspend_catalogs(&test, &["pg"]).await;
+        // Each request goes through the routes with the principal the key
+        // cache holds now, as the auth layer would add it.
+        let call = |secret: &str, request: Request<Body>| {
+            let caller = cached_principal(&test, secret);
+            router(&test, caller).oneshot(request)
+        };
+        let export = || {
+            Request::get("/catalogs/pg/export")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let import = || {
+            Request::post("/catalogs/pg/import?replace=true")
+                .body(Body::from(tarball_of(&[("index.md", "# Imported\n")])))
+                .unwrap()
+        };
+
+        let exported = call(&reader, export()).await.unwrap();
+        let hidden = status_and_json(call(&stranger, export()).await.unwrap()).await;
+        let refused = status_and_json(call(&writer, import()).await.unwrap()).await;
+        let imported = status_and_json(call(&root, import()).await.unwrap()).await;
+
+        assert_eq!(
+            exported.status(),
+            StatusCode::OK,
+            "a suspended catalog still exports"
+        );
+        assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{}", hidden.1);
+        assert_eq!(hidden.1["error"], "CatalogNotSelected");
+        assert_eq!(refused.0, StatusCode::FORBIDDEN, "{}", refused.1);
+        assert_eq!(
+            refused.1["error"], "Forbidden",
+            "the level check comes first"
+        );
+        assert_eq!(
+            imported.0,
+            StatusCode::OK,
+            "an admin is exempt: {}",
+            imported.1
+        );
     }
 
     #[test]

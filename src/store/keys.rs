@@ -1724,8 +1724,12 @@ mod tests {
                 .expect("a key row has a hash"),
             &replacement.key
         ));
-        let cache =
-            crate::auth::KeyCache::from_records(records, std::collections::HashMap::new(), now());
+        let cache = crate::auth::KeyCache::from_records(
+            records,
+            std::collections::HashMap::new(),
+            Default::default(),
+            now(),
+        );
         assert!(
             cache.find(&first.key, now()).is_none(),
             "the revoked key is refused"
