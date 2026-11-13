@@ -1,5 +1,12 @@
-//! `okf-mcp user ...`, `team ...`, `unassigned`, and the assignment
-//! subcommands (`catalog set-owner`, `key assign`, `oauth code assign`).
+//! `okf-mcp user ...` (accounts, the admin flag, email, setup invites,
+//! entitlements, console sessions and sign-ins), `team ...`, `unassigned`,
+//! the assignment subcommands (`catalog set-owner`, `key assign`, `oauth
+//! code assign`) and `catalog set-member-access`.
+//!
+//! Each subcommand calls the same store function as its REST route
+//! (`src/http/api/people.rs`, `catalogs.rs`), so the two cannot disagree.
+//! The CLI has operator access: `user set-admin --off` may clear the last
+//! admin user, which the API refuses (plan Decision 16).
 //!
 //! Each handler returns the text to print (one `\n`-terminated line per
 //! row) instead of printing it, so the tests can compare it exactly. A
@@ -10,28 +17,40 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use super::{labelled, tab_row, TeamCommand, UserCommand};
+use crate::clock::format_timestamp;
+use crate::config::Config;
+use crate::mail::invite;
 use crate::store::catalogs;
+use crate::store::ceiling::{self, MemberAccess};
 use crate::store::keys::{self, KeyKind};
 use crate::store::oauth::codes;
+use crate::store::sign_in_events::{self, SignInEvent};
 use crate::store::teams::{self, MemberChange, NewTeam, Role, TeamRecord};
 use crate::store::unassigned;
+use crate::store::user_sessions::{self, SessionInfo};
 use crate::store::users::{self, NewUser, UserRecord};
 
 /// Runs `okf-mcp user ...`.
 ///
 /// # Arguments
 /// * `pool` - the migrated database.
+/// * `config` - for `user invite`: `public_url` (the link's origin) and the
+///   `[auth]` defaults under the stored settings (`setup_link_ttl`).
 /// * `command` - which user subcommand.
-/// * `now` - the creation time for `create` (server clock).
+/// * `now` - the server clock: `create`'s creation time, an entitlement's
+///   and a setup link's start.
 ///
 /// # Returns
-/// The text to print.
+/// The text to print. `user invite` names the address, never the link.
 ///
 /// # Errors
 /// The store's refusal (an invalid or taken name, a user something still
-/// names), an unknown user, or a database error.
+/// names, an email another user has or that is not one, an `admin`
+/// entitlement, an invite without an email or `public_url`), an unknown
+/// user or catalog, or a database error.
 pub(super) async fn user(
     pool: &PgPool,
+    config: &Config,
     command: UserCommand,
     now: DateTime<Utc>,
 ) -> anyhow::Result<String> {
@@ -52,6 +71,66 @@ pub(super) async fn user(
         UserCommand::Delete { name } => {
             users::delete(pool, &name).await?;
             format!("deleted user {name}\n")
+        }
+        // `off: _` ignores the field: clap made `--on` and `--off` exclusive
+        // and required one, so `on` alone decides.
+        UserCommand::SetAdmin { name, on, off: _ } => {
+            // `allow_last: true`: operator access may clear the last admin
+            // (Decision 16).
+            let previous = users::set_admin(pool, &name, on, true).await?;
+            describe_admin_change(&name, previous, on)
+        }
+        UserCommand::SetEmail {
+            name,
+            email,
+            clear: _,
+        } => {
+            users::set_email(pool, &name, email.as_deref()).await?;
+            match email {
+                Some(email) => format!("{name}: email {email}\n"),
+                None => format!("{name}: email cleared\n"),
+            }
+        }
+        UserCommand::Invite { name } => {
+            // Only queues the mail (no mailer, so no mail secret, is needed);
+            // a running server's worker sends it.
+            let email = invite::send_setup(pool, config, &name, now).await?;
+            format!("queued a setup email for {name} to {email}\n")
+        }
+        UserCommand::Entitle {
+            name,
+            catalog,
+            access,
+        } => {
+            ceiling::entitle(pool, &name, &catalog, access, now).await?;
+            format!("{name} may now use {catalog} ({})\n", access.as_str())
+        }
+        UserCommand::Unentitle { name, catalog } => {
+            ceiling::unentitle(pool, &name, &catalog).await?;
+            format!("{name} may no longer use {catalog} through an entitlement\n")
+        }
+        UserCommand::Sessions { name } => {
+            let id = users::id_by_name(pool, &name).await?;
+            let sessions = user_sessions::list(pool, &id, None).await?;
+            if sessions.is_empty() {
+                format!("{name} has no sessions\n")
+            } else {
+                lines(sessions.iter().map(format_session))
+            }
+        }
+        UserCommand::RevokeSessions { name } => {
+            // `end_sessions` locks the user's row first, so a sign-in still
+            // committing is ended too (corrected, issue #322).
+            let revoked = users::end_sessions(pool, &name).await?;
+            format!("revoked {revoked} sessions of {name}\n")
+        }
+        UserCommand::SignIns { name, limit } => {
+            let events = sign_in_events::recent(pool, &name, limit).await?;
+            if events.is_empty() {
+                format!("{name} has no sign-ins\n")
+            } else {
+                lines(events.iter().map(format_sign_in))
+            }
         }
     })
 }
@@ -161,6 +240,31 @@ pub(super) async fn set_owner(pool: &PgPool, catalog: &str, team: &str) -> anyho
     ))
 }
 
+/// Runs `okf-mcp catalog set-member-access`.
+///
+/// # Arguments
+/// * `pool` - the migrated database.
+/// * `catalog` - the catalog's name.
+/// * `access` - what the owning team's members may reach from now on.
+///
+/// # Returns
+/// `catalog C: member access OLD -> NEW`.
+///
+/// # Errors
+/// An unknown catalog, or a database error.
+pub(super) async fn set_member_access(
+    pool: &PgPool,
+    catalog: &str,
+    access: MemberAccess,
+) -> anyhow::Result<String> {
+    let previous = ceiling::set_member_access(pool, catalog, access).await?;
+    Ok(format!(
+        "catalog {catalog}: member access {} -> {}\n",
+        previous.as_str(),
+        access.as_str()
+    ))
+}
+
 /// Runs `okf-mcp key assign`: gives a key or OAuth grant a user.
 ///
 /// # Arguments
@@ -219,8 +323,27 @@ fn describe_member_change(change: MemberChange, team: &str, user: &str, role: Ro
     }
 }
 
-/// One `user list` line, tab-separated: name, `credentials N`, `teams
-/// T1,T2`, then the free-text display name last.
+/// What `user set-admin` did, as one line.
+///
+/// # Arguments
+/// * `name` - the user.
+/// * `previous` - the flag before.
+/// * `on` - the flag asked for.
+///
+/// # Returns
+/// The line, with its newline.
+fn describe_admin_change(name: &str, previous: bool, on: bool) -> String {
+    match (previous, on) {
+        (false, true) => format!("{name} is now an admin\n"),
+        (true, false) => format!("{name} is no longer an admin\n"),
+        (true, true) => format!("{name} is already an admin\n"),
+        (false, false) => format!("{name} is already not an admin\n"),
+    }
+}
+
+/// One `user list` line, tab-separated: name, `credentials N`, `email E`
+/// (`-` when unset), `admin yes|no`, `teams T1,T2`, then the free-text
+/// display name last.
 ///
 /// # Arguments
 /// * `user` - the user.
@@ -231,8 +354,52 @@ fn format_user(user: &UserRecord) -> String {
     tab_row(&[
         &user.name,
         &format!("credentials {}", user.credentials),
+        &labelled("email", user.email.as_deref()),
+        if user.is_admin {
+            "admin yes"
+        } else {
+            "admin no"
+        },
         &labelled("teams", comma_list(&user.teams).as_deref()),
         &user.display_name,
+    ])
+}
+
+/// One `user sessions` line, tab-separated: the id prefix (never the id),
+/// `created T`, `seen T`, `ip A` (`-` when unknown), then the free-text
+/// user agent last.
+///
+/// # Arguments
+/// * `session` - the session.
+///
+/// # Returns
+/// The line, without a newline.
+fn format_session(session: &SessionInfo) -> String {
+    let ip = session.ip.map(|address| address.to_string());
+    tab_row(&[
+        &session.id_prefix,
+        &format!("created {}", format_timestamp(session.created_at)),
+        &format!("seen {}", format_timestamp(session.last_seen_at)),
+        &labelled("ip", ip.as_deref()),
+        &session.user_agent,
+    ])
+}
+
+/// One `user sign-ins` line, tab-separated: time, method, outcome, `ip A`
+/// (`-` when unknown).
+///
+/// # Arguments
+/// * `event` - the attempt.
+///
+/// # Returns
+/// The line, without a newline.
+fn format_sign_in(event: &SignInEvent) -> String {
+    let ip = event.ip.map(|address| address.to_string());
+    tab_row(&[
+        &format_timestamp(event.at),
+        event.method.as_str(),
+        event.outcome.as_str(),
+        &labelled("ip", ip.as_deref()),
     ])
 }
 
@@ -293,19 +460,37 @@ mod tests {
     use clap::Parser;
     use std::sync::Arc;
 
+    /// The config the tests run commands with: `public_url` set, so
+    /// `user invite` can build its link.
+    fn test_config() -> Config {
+        Config {
+            public_url: Some("https://okf.example.com".to_string()),
+            ..Config::default()
+        }
+    }
+
     /// Runs `okf-mcp <args>` against `db` and returns what it prints. The
-    /// commands this module handles return their text; any other runs
-    /// through `cli::run` (printing to the real stdout) and returns `""`.
+    /// commands this module and `admin` handle return their text; any other
+    /// runs through `cli::run` (printing to the real stdout) and returns
+    /// `""`.
     async fn okf(db: &TestDb, args: &[&str]) -> anyhow::Result<String> {
         let parsed = Cli::try_parse_from(std::iter::once(&"okf-mcp").chain(args))?;
         let now = Utc::now();
         let pool = &db.pool;
+        let config = test_config();
         match parsed.command.expect("a subcommand") {
-            Command::User(command) => user(pool, command, now).await,
+            Command::User(command) => user(pool, &config, command, now).await,
             Command::Team(command) => team(pool, command, now).await,
             Command::Unassigned => unassigned(pool).await,
+            Command::Settings(command) => {
+                crate::cli::admin::settings(pool, &config.auth, command, now).await
+            }
+            Command::Mail(command) => crate::cli::admin::mail(pool, command, now).await,
             Command::Catalog(CatalogCommand::SetOwner { name, team }) => {
                 set_owner(pool, &name, &team).await
+            }
+            Command::Catalog(CatalogCommand::SetMemberAccess { name, access }) => {
+                set_member_access(pool, &name, access).await
             }
             Command::Key(KeyCommand::Assign { id, actor, user }) => {
                 assign_key(pool, &id, actor.as_deref(), &user).await
@@ -343,8 +528,8 @@ mod tests {
         // The fixture user sorts after alice.
         assert_eq!(
             listed,
-            "alice\tcredentials 0\tteams alice\tAlice Example\n\
-             test-user\tcredentials 0\tteams test-user\t\n"
+            "alice\tcredentials 0\temail -\tadmin no\tteams alice\tAlice Example\n\
+             test-user\tcredentials 0\temail -\tadmin no\tteams test-user\t\n"
         );
         assert_eq!(deleted, "deleted user alice\n");
         assert!(!after.contains("alice"), "{after}");
@@ -584,6 +769,320 @@ mod tests {
 
         let message = refused.unwrap_err().to_string();
         assert!(message.contains("name it"), "{message}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_admin_turns_the_flag_on_and_off_and_may_clear_the_last_admin() {
+        let db = test_db().await;
+        okf(&db, &["user", "create", "alice"]).await.unwrap();
+
+        let on = okf(&db, &["user", "set-admin", "alice", "--on"])
+            .await
+            .unwrap();
+        let again = okf(&db, &["user", "set-admin", "alice", "--on"])
+            .await
+            .unwrap();
+        let listed = okf(&db, &["user", "list"]).await.unwrap();
+        let admins_before = users::list(&db.pool)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|user| user.is_admin)
+            .count();
+        // alice is the only admin: the CLI may still clear it (Decision 16),
+        // which the API refuses (`users::set_admin` with `allow_last: false`).
+        let off = okf(&db, &["user", "set-admin", "alice", "--off"])
+            .await
+            .unwrap();
+        let admins_after = users::list(&db.pool)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|user| user.is_admin)
+            .count();
+        let already_off = okf(&db, &["user", "set-admin", "alice", "--off"])
+            .await
+            .unwrap();
+        let neither = okf(&db, &["user", "set-admin", "alice"]).await;
+        let both = okf(&db, &["user", "set-admin", "alice", "--on", "--off"]).await;
+        let unknown = okf(&db, &["user", "set-admin", "nobody", "--on"]).await;
+
+        assert_eq!(on, "alice is now an admin\n");
+        assert_eq!(again, "alice is already an admin\n");
+        assert!(
+            listed.starts_with("alice\tcredentials 0\temail -\tadmin yes\t"),
+            "{listed}"
+        );
+        assert_eq!(admins_before, 1, "alice was the last admin");
+        assert_eq!(off, "alice is no longer an admin\n");
+        assert_eq!(admins_after, 0, "the CLI cleared the last admin");
+        assert_eq!(already_off, "alice is already not an admin\n");
+        assert!(neither.is_err(), "clap requires --on or --off");
+        assert!(both.is_err(), "clap refuses both");
+        assert!(unknown.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_email_sets_clears_and_refuses_a_duplicate() {
+        let db = test_db().await;
+        okf(&db, &["user", "create", "alice"]).await.unwrap();
+
+        let set = okf(&db, &["user", "set-email", "alice", "alice@example.com"])
+            .await
+            .unwrap();
+        let duplicate = okf(&db, &["user", "set-email", TEST_USER, "ALICE@example.com"]).await;
+        let malformed = okf(&db, &["user", "set-email", TEST_USER, "not an address"]).await;
+        let listed = okf(&db, &["user", "list"]).await.unwrap();
+        let cleared = okf(&db, &["user", "set-email", "alice", "--clear"])
+            .await
+            .unwrap();
+        let neither = okf(&db, &["user", "set-email", "alice"]).await;
+        let both = okf(
+            &db,
+            &["user", "set-email", "alice", "alice@example.com", "--clear"],
+        )
+        .await;
+        let after = okf(&db, &["user", "list"]).await.unwrap();
+
+        assert_eq!(set, "alice: email alice@example.com\n");
+        assert!(duplicate.is_err(), "emails are unique, case-insensitively");
+        assert!(malformed.is_err(), "not an address");
+        assert!(
+            listed.contains("alice\tcredentials 0\temail alice@example.com\t"),
+            "{listed}"
+        );
+        assert_eq!(cleared, "alice: email cleared\n");
+        assert!(neither.is_err(), "clap requires EMAIL or --clear");
+        assert!(both.is_err(), "clap refuses both");
+        assert!(
+            after.starts_with("alice\tcredentials 0\temail -\t"),
+            "{after}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invite_queues_a_setup_mail_and_never_prints_the_link() {
+        let db = test_db().await;
+        okf(&db, &["user", "create", "alice"]).await.unwrap();
+        let without = okf(&db, &["user", "invite", "alice"]).await;
+        okf(&db, &["user", "set-email", "alice", "alice@example.com"])
+            .await
+            .unwrap();
+
+        let invited = okf(&db, &["user", "invite", "alice"]).await.unwrap();
+
+        assert!(without.is_err(), "no email yet");
+        assert_eq!(
+            invited,
+            "queued a setup email for alice to alice@example.com\n"
+        );
+        assert!(!invited.contains("token") && !invited.contains("https://"));
+        let queued = crate::mail::queue::list(&db.pool).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].template, "setup");
+        assert_eq!(queued[0].to, "alice@example.com");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn entitle_and_unentitle_change_the_ceiling() {
+        let db = test_db().await;
+        okf(&db, &["user", "create", "alice"]).await.unwrap();
+        okf(&db, &["catalog", "create", "notes", "--owner", TEST_USER])
+            .await
+            .unwrap();
+
+        let entitled = okf(
+            &db,
+            &["user", "entitle", "alice", "notes", "--access", "read"],
+        )
+        .await
+        .unwrap();
+        let ceiling = ceiling::ceiling_of(&db.pool, "alice").await.unwrap();
+        let admin = okf(
+            &db,
+            &["user", "entitle", "alice", "notes", "--access", "admin"],
+        )
+        .await;
+        let unknown = okf(
+            &db,
+            &["user", "entitle", "alice", "nowhere", "--access", "read"],
+        )
+        .await;
+        let removed = okf(&db, &["user", "unentitle", "alice", "notes"])
+            .await
+            .unwrap();
+        let after = ceiling::ceiling_of(&db.pool, "alice").await.unwrap();
+
+        assert_eq!(entitled, "alice may now use notes (read)\n");
+        assert_eq!(ceiling.get("notes"), Some(&keys::Access::Read));
+        assert!(admin.is_err(), "entitlements are read or write");
+        assert!(unknown.is_err(), "an unknown catalog");
+        assert_eq!(
+            removed,
+            "alice may no longer use notes through an entitlement\n"
+        );
+        assert!(!after.contains_key("notes"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sessions_revoke_sessions_and_sign_ins_list_a_users_activity() {
+        use crate::store::sign_in_events::{Method, Outcome};
+
+        let db = test_db().await;
+        okf(&db, &["user", "create", "alice"]).await.unwrap();
+        let id = users::id_by_name(&db.pool, "alice").await.unwrap();
+        let day = std::time::Duration::from_secs(24 * 3600);
+        let mut raw_ids = Vec::new();
+        for agent in ["Browser One", "Browser Two"] {
+            let started = user_sessions::create(&db.pool, &id, None, agent, day, Utc::now())
+                .await
+                .unwrap();
+            raw_ids.push(started.id);
+        }
+        sign_in_events::record(
+            &db.pool,
+            Some(&id),
+            Method::Password,
+            Outcome::Failed,
+            None,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let sessions = okf(&db, &["user", "sessions", "alice"]).await.unwrap();
+        let sign_ins = okf(&db, &["user", "sign-ins", "alice"]).await.unwrap();
+        let revoked = okf(&db, &["user", "revoke-sessions", "alice"])
+            .await
+            .unwrap();
+        let none = okf(&db, &["user", "sessions", "alice"]).await.unwrap();
+        let unknown = okf(&db, &["user", "sessions", "nobody"]).await;
+
+        assert_eq!(sessions.lines().count(), 2, "{sessions}");
+        assert!(sessions.contains("\tip -\tBrowser One\n"), "{sessions}");
+        for line in sessions.lines() {
+            // The first cell is the 12-character prefix of the stored hash.
+            let prefix = line.split('\t').next().unwrap_or_default();
+            assert_eq!(prefix.len(), user_sessions::ID_PREFIX_LENGTH, "{line}");
+        }
+        for raw in &raw_ids {
+            assert!(!sessions.contains(raw.as_str()), "a session id is printed");
+        }
+        assert_eq!(sign_ins.lines().count(), 1, "{sign_ins}");
+        assert!(
+            sign_ins.ends_with("\tpassword\tfailed\tip -\n"),
+            "{sign_ins}"
+        );
+        assert_eq!(revoked, "revoked 2 sessions of alice\n");
+        assert_eq!(none, "alice has no sessions\n");
+        assert!(unknown.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_member_access_reports_the_previous_level() {
+        let db = test_db().await;
+        okf(&db, &["catalog", "create", "notes", "--owner", TEST_USER])
+            .await
+            .unwrap();
+
+        let read = okf(
+            &db,
+            &["catalog", "set-member-access", "notes", "--access", "read"],
+        )
+        .await
+        .unwrap();
+        let none = okf(
+            &db,
+            &["catalog", "set-member-access", "notes", "--access", "none"],
+        )
+        .await
+        .unwrap();
+        let unknown = okf(
+            &db,
+            &[
+                "catalog",
+                "set-member-access",
+                "nowhere",
+                "--access",
+                "read",
+            ],
+        )
+        .await;
+        let stored = ceiling::member_access(&db.pool, "notes").await.unwrap();
+
+        assert_eq!(read, "catalog notes: member access write -> read\n");
+        assert_eq!(none, "catalog notes: member access read -> none\n");
+        assert!(unknown.is_err());
+        assert_eq!(stored, MemberAccess::None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invite_and_mail_test_queue_without_any_mail_secret() {
+        // A Postmark config whose token variable is unset: building a mailer
+        // would fail, so success proves the CLI only queues.
+        const UNSET: &str = "OKF_CLI_TEST_POSTMARK_TOKEN_UNSET";
+        assert!(std::env::var(UNSET).is_err(), "{UNSET} must be unset");
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("okf.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "public_url = \"https://okf.example.com\"\n\
+                 allowed_hosts = [\"okf.example.com\"]\n\
+                 [mail]\nprovider = \"postmark\"\n\
+                 [mail.postmark]\ntoken_env = \"{UNSET}\"\n"
+            ),
+        )
+        .unwrap();
+        okf(&db, &["user", "create", "alice"]).await.unwrap();
+        okf(&db, &["user", "set-email", "alice", "alice@example.com"])
+            .await
+            .unwrap();
+        // Through `cli::run`, as the binary runs them, with that config file.
+        let through_run = |args: &[&str]| {
+            let parsed =
+                Cli::try_parse_from(std::iter::once(&"okf-mcp").chain(args)).expect("parses");
+            Cli {
+                database_url: Some(db.url.clone()),
+                config: Some(config_path.clone()),
+                command: parsed.command,
+            }
+        };
+
+        run(
+            through_run(&["user", "invite", "alice"]),
+            Arc::new(FixedClock(Utc::now())),
+        )
+        .await
+        .unwrap();
+        run(
+            through_run(&["mail", "test", "ops@example.com"]),
+            Arc::new(FixedClock(Utc::now())),
+        )
+        .await
+        .unwrap();
+
+        let mut templates: Vec<String> = crate::mail::queue::list(&db.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|mail| mail.template)
+            .collect();
+        templates.sort();
+        assert_eq!(templates, ["setup", "test"]);
+    }
+
+    #[test]
+    fn admin_changes_are_described() {
+        assert_eq!(
+            describe_admin_change("alice", false, false),
+            "alice is already not an admin\n"
+        );
+        assert_eq!(
+            describe_admin_change("alice", true, false),
+            "alice is no longer an admin\n"
+        );
     }
 
     #[test]

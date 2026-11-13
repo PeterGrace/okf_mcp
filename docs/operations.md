@@ -626,8 +626,16 @@ takes effect at once.
 | Command | Does |
 |---|---|
 | `okf-mcp user create NAME [--display-name TEXT]` | Creates the user and its personal team `NAME` |
-| `okf-mcp user list` | One tab-separated line per user: name, `credentials N` (keys, grants and codes naming it, revoked ones included), `teams a,b`, then the display name |
+| `okf-mcp user list` | One tab-separated line per user: name, `credentials N` (keys, grants and codes naming it, revoked ones included), `email E` (`-` when unset), `admin yes\|no`, `teams a,b`, then the display name |
 | `okf-mcp user delete NAME` | Deletes a user nothing references, with its personal team (see below) |
+| `okf-mcp user set-admin NAME --on\|--off` | Gives or takes the admin flag: an admin user's console session acts as an admin that reaches every catalog. A change signs the user out of every console session. `--off` for the last admin user is allowed here (operator access), refused over REST |
+| `okf-mcp user set-email NAME EMAIL` (`--clear`) | Sets the email a user signs in and gets mail with (unique, case-insensitive), or clears it. A change ends the user's outstanding emailed links |
+| `okf-mcp user invite NAME` | Queues a setup email with a single-use link (valid `setup_link_ttl`) to the user's email; an older setup link stops working. Needs `public_url`; prints the address, never the link. It only queues: a running server's mail worker sends it, so the command needs no mail secret |
+| `okf-mcp user entitle NAME CATALOG --access read\|write` | Adds a catalog to the user's ceiling, or changes its level |
+| `okf-mcp user unentitle NAME CATALOG` | Removes an entitlement |
+| `okf-mcp user sessions NAME` | The user's console sessions, most recently used first, one per line: id prefix (never the id), `created T`, `seen T`, `ip A`, then the browser |
+| `okf-mcp user revoke-sessions NAME` | Signs the user out of every console session; keys and grants keep working. Prints `revoked N sessions of NAME` |
+| `okf-mcp user sign-ins NAME [--limit N]` | The user's recent sign-in attempts (20 by default), newest first: time, method, outcome, `ip A` |
 | `okf-mcp team create NAME [--display-name TEXT] --owner USER` | Creates a shared team with `USER` as its first owner |
 | `okf-mcp team list` | One line per team: name, `personal U` (`-` for a shared team), `members u(role),...`, `catalogs c,...` (`-` for none), then the display name |
 | `okf-mcp team add-member TEAM USER [--role owner\|member]` | Adds a member (`member` by default), or gives a member that role |
@@ -636,6 +644,7 @@ takes effect at once.
 | `okf-mcp team delete NAME` | Deletes a shared team that owns no catalog; its memberships go with it |
 | `okf-mcp catalog create NAME --owner TEAM [--description TEXT]` | `--owner` is required |
 | `okf-mcp catalog set-owner NAME --team TEAM` | Moves a catalog to another team, or gives a legacy catalog its first owner. Prints `catalog C: owner OLD -> NEW` (`(none)` for a legacy catalog) |
+| `okf-mcp catalog set-member-access NAME --access none\|read\|write` | What members of the owner team reach through their own keys and grants (default `write`). Prints `catalog C: member access OLD -> NEW` |
 | `okf-mcp key create NAME --user USER ...` | `--user` is required; `--actor` still defaults to `NAME` |
 | `okf-mcp key assign ID --user USER [--actor ACTOR]` | Gives a key or an OAuth grant a user, or changes it; access is unchanged. `ID` is an id, or an unambiguous live name (`--actor` narrows it). The only `key` subcommand that also acts on grants. Prints `key ID now belongs to USER` |
 | `okf-mcp oauth code create NAME --user USER ...` | `--user` is required; `--actor` defaults to `NAME` |
@@ -728,10 +737,11 @@ Disabling a user or team instead of deleting it is future work (#297).
 
 ### CLI, API and console parity
 
-Every admin command for users, teams and assignment has a REST route and a
-console control. `tests/admin_parity.rs` fails when a `user` or `team`
-subcommand, or one of the assignment commands below, has no row here or its
-row names a route the API reference does not document.
+Every admin command for users, teams, assignment, sign-in, settings and
+mail has a REST route and a console control. `tests/admin_parity.rs` fails
+when a `user`, `team`, `settings` or `mail` subcommand, or one of the other
+commands below, has no row here or its row names a route the API reference
+does not document.
 
 | CLI | REST | Console |
 |---|---|---|
@@ -748,10 +758,31 @@ row names a route the API reference does not document.
 | `okf-mcp key assign` | `PUT /api/v1/keys/{id}/user` | API keys → key or grant → Assign / Change user; Users → What is unassigned |
 | `okf-mcp oauth code assign` | `PUT /api/v1/oauth/codes/{id}/user` | API keys → sign-in code → Assign / Change user; Users → What is unassigned |
 | `okf-mcp unassigned` | `GET /api/v1/unassigned` | Users → What is unassigned (`/ui/#/users/unassigned`), and the count on the Users link |
+| `okf-mcp user set-admin` | `PUT /api/v1/users/{name}/admin` | Users → user → Admin switch |
+| `okf-mcp user set-email` | `PUT /api/v1/users/{name}/email` | Users → user → Email (Save, Clear) |
+| `okf-mcp user invite` | `POST /api/v1/users/{name}/invite` | Users → user → Send setup email |
+| `okf-mcp user entitle` | `PUT /api/v1/users/{name}/entitlements/{catalog}` | Users → user → Entitlements → Entitle, or a level |
+| `okf-mcp user unentitle` | `DELETE /api/v1/users/{name}/entitlements/{catalog}` | Users → user → Entitlements → Remove |
+| `okf-mcp user sessions` | `GET /api/v1/users/{name}/sessions` | Users → user → Console sessions |
+| `okf-mcp user revoke-sessions` | `DELETE /api/v1/users/{name}/sessions` | Users → user → Sign out everywhere |
+| `okf-mcp user sign-ins` | `GET /api/v1/users/{name}/sign-ins` | Users → user → Recent sign-ins |
+| `okf-mcp catalog set-member-access` | `PUT /api/v1/catalogs/{catalog}/member-access` | Catalogs → catalog → Team member access |
+| `okf-mcp settings list` | `GET /api/v1/settings` | Settings → Policy |
+| `okf-mcp settings set` | `PUT /api/v1/settings/{key}` | Settings → Policy → a value's Save |
+| `okf-mcp settings reset` | `DELETE /api/v1/settings/{key}` | Settings → Policy → Reset |
+| `okf-mcp mail test` | `POST /api/v1/mail/test` | Settings → Mail → Send test email |
+| `okf-mcp mail queue` | `GET /api/v1/mail/queue` | Settings → Mail queue |
+| `okf-mcp mail retry` | `POST /api/v1/mail/queue/{id}/retry` | Settings → Mail queue → Retry |
+| `okf-mcp mail delete` | `DELETE /api/v1/mail/queue/{id}` | Settings → Mail queue → Delete |
 
 `GET /api/v1/users/{name}` and `GET /api/v1/teams/{name}` (a user's or a
 team's drawer in the console) have no command of their own: `user list` and
-`team list` show the same facts. The users, teams and unassigned writes need
+`team list` show the same facts. Nor do `DELETE
+/api/v1/users/{name}/sessions/{id_prefix}` (one session's Sign out in the
+drawer; `user revoke-sessions` ends them all) and `GET
+/api/v1/catalogs/{catalog}/member-access` (`catalog set-member-access`
+prints the previous level). The self-service routes under `/api/v1/me` are
+not admin actions and have no command. The users, teams and unassigned writes need
 an admin key that reaches every catalog, as `POST /api/v1/catalogs` does;
 reading users and teams needs any admin key, so a scoped admin can pick the
 user of a key it creates. For any other admin the console shows these
