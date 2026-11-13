@@ -1,12 +1,13 @@
-//! Every admin subcommand for users, teams and assignment has a documented
-//! REST route and console control (users and teams design, "Web console"):
-//! the parity table in `docs/operations.md` lists each one, so the CLI, the
-//! API and the console cannot drift apart unnoticed.
+//! Every admin subcommand for users, teams, assignment, sign-in, settings
+//! and mail has a documented REST route and console control (users and
+//! teams design, "Web console"; user login design, "Admin surface"): the
+//! parity table in `docs/operations.md` lists each one, so the CLI, the API
+//! and the console cannot drift apart unnoticed.
 //!
 //! The checks, all without a database or a server:
 //! - every covered subcommand exists in the clap tree;
-//! - every user and team subcommand is covered, so a new one fails until it
-//!   is added to the table;
+//! - every `user`, `team`, `settings` and `mail` subcommand is covered, so
+//!   a new one fails until it is added to the table;
 //! - each covered subcommand has a parity row whose REST cell names a route
 //!   that `docs/operations.md`'s API reference documents, and whose console
 //!   cell is not empty.
@@ -29,6 +30,14 @@ const COVERED: &[&str] = &[
     "user create",
     "user list",
     "user delete",
+    "user set-admin",
+    "user set-email",
+    "user invite",
+    "user entitle",
+    "user unentitle",
+    "user sessions",
+    "user revoke-sessions",
+    "user sign-ins",
     "team create",
     "team list",
     "team add-member",
@@ -36,10 +45,21 @@ const COVERED: &[&str] = &[
     "team remove-member",
     "team delete",
     "catalog set-owner",
+    "catalog set-member-access",
     "key assign",
     "oauth code assign",
     "unassigned",
+    "settings list",
+    "settings set",
+    "settings reset",
+    "mail test",
+    "mail queue",
+    "mail retry",
+    "mail delete",
 ];
+
+/// The command groups whose every subcommand must be covered.
+const SCANNED_GROUPS: &[&str] = &["user", "team", "settings", "mail"];
 
 /// The parity section: from its heading to the next heading of any level.
 ///
@@ -114,9 +134,9 @@ fn every_covered_subcommand_exists_and_is_in_the_parity_table() {
 }
 
 #[test]
-fn every_user_and_team_subcommand_is_covered() {
+fn every_subcommand_of_the_scanned_groups_is_covered() {
     let cli = Cli::command();
-    for group in ["user", "team"] {
+    for group in SCANNED_GROUPS {
         let subcommands = cli
             .find_subcommand(group)
             .unwrap_or_else(|| panic!("`okf-mcp {group}` is not a subcommand"))
