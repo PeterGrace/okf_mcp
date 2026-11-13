@@ -420,11 +420,21 @@ CREATE FUNCTION audit_team_ref(p_team_id text) RETURNS bigint LANGUAGE sql AS $$
 $$;
 
 -- The audit_credentials row of a credential id, created or refreshed; a
--- NULL label or person keeps the stored one. NULL for a NULL id.
+-- NULL label keeps the stored one. NULL for a NULL id. The owning person
+-- comes from the credential tables while the credential exists (a key or
+-- grant's api_keys.user_id, a code's sign_in_codes.user_id), whatever the
+-- caller passes, so a credential from before this migration that is only
+-- ever a target (revoked, granted) still has its person, and
+-- forget_person clears it with its user.
 CREATE FUNCTION audit_credential(p_credential_id text, p_person_id bigint, p_label text)
 RETURNS bigint LANGUAGE sql AS $$
     INSERT INTO audit_credentials (credential_id, person_id, label)
-    SELECT p_credential_id, p_person_id, p_label WHERE p_credential_id IS NOT NULL
+    SELECT p_credential_id,
+           COALESCE(audit_person((SELECT user_id FROM api_keys WHERE id = p_credential_id)),
+                    audit_person((SELECT user_id FROM sign_in_codes WHERE id = p_credential_id)),
+                    p_person_id),
+           p_label
+    WHERE p_credential_id IS NOT NULL
     ON CONFLICT (credential_id) DO UPDATE
         SET label = COALESCE(EXCLUDED.label, audit_credentials.label),
             person_id = COALESCE(EXCLUDED.person_id, audit_credentials.person_id)
@@ -457,6 +467,8 @@ CREATE TRIGGER audit_entries_append_only BEFORE UPDATE OR DELETE ON audit_entrie
 CREATE TRIGGER audit_entries_no_truncate BEFORE TRUNCATE ON audit_entries
     FOR EACH STATEMENT EXECUTE FUNCTION audit_entries_append_only();
 ```
+
+> **Corrected (PR #375 review, 2026-11-13).** `audit_credential` resolves a credential's owner from `api_keys.user_id` / `sign_in_codes.user_id` instead of trusting the caller's person, and `forget_person` also finds a user's credentials through those tables (Decision 19). No backfill is needed: `audit_credentials` starts empty, and every row is created through this function while its credential still exists.
 
 (The trigger compares against the database clock: it only decides whether a delete is allowed, it writes no timestamp. The prune in Task 6d leaves a one-hour margin so a small skew never trips it.)
 
@@ -1242,14 +1254,20 @@ pub async fn key_teams(conn: &mut PgConnection, key_id: &str) -> Result<Vec<i64>
 /// the user's credentials lose their id (a legacy key's id was its name)
 /// and their label (a self-issued key's defaults to a name the user chose),
 /// showing as `credential #<id>`. Entries themselves hold no name to clear.
+/// Call it before deleting the user row (its credentials are still there).
 ///
 /// # Errors
 /// [`OkfError::Database`].
 pub async fn forget_person(conn: &mut PgConnection, user_id: &str) -> Result<(), OkfError> {
-    // Credentials first: they find the person through its `user_id`.
+    // Credentials first, found two ways: linked to the person, or (a row
+    // whose person was never resolved) still named by the user's keys,
+    // grants and codes. So it must run before the user row is deleted,
+    // which cascades those. *(Corrected, PR #375 review, 2026-11-13.)*
     sqlx::query(
         "UPDATE audit_credentials SET credential_id = NULL, label = NULL \
-         WHERE person_id = (SELECT id FROM audit_people WHERE user_id = $1)",
+         WHERE person_id = (SELECT id FROM audit_people WHERE user_id = $1) \
+            OR credential_id IN (SELECT id FROM api_keys WHERE user_id = $1 \
+                                 UNION ALL SELECT id FROM sign_in_codes WHERE user_id = $1)",
     )
     .bind(user_id)
     .execute(&mut *conn)
@@ -2397,10 +2415,13 @@ pub async fn delete(
     if let Some(team_id) = &team_id {
         sqlx::query("DELETE FROM teams WHERE id = $1").bind(team_id).execute(&mut *tx).await?;
     }
+    // Before the delete: it finds the user's credentials through api_keys
+    // and sign_in_codes, which the delete cascades. *(Corrected, PR #375
+    // review, 2026-11-13: this ran after the delete.)*
+    audit::forget_person(&mut tx, &user_id).await?;
     // Cascades: keys (and their grants and tokens), codes, memberships,
     // sessions, passkeys, identities, emailed links, entitlements, events.
     sqlx::query("DELETE FROM users WHERE id = $1").bind(&user_id).execute(&mut *tx).await?;
-    audit::forget_person(&mut tx, &user_id).await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(DeletedUser { keys, codes, discarded })
@@ -3206,6 +3227,50 @@ git commit -m "feat(audit): record team, membership, suspension, catalog and imp
 | `codes::redeem(pool, code_id, client, now)` (signature unchanged) | `oauth.grant_created` | `Grant`, person = the code's user | `key_teams` of the new grant | `{"code": id, "client": client_host(client)}`, actor `AuditActor::system("oauth")` |
 | `grants::create_self_issued(pool, new, audit, now)` (consent) | `oauth.grant_created` | `Grant`, person = user | `key_teams` | `{"client": client_host(client)}` |
 
+> **Corrected (PR #375 review, 2026-11-13).** The rows above that pass no person (revoke, grant, report flag) rely on `audit_credential` resolving the owner from `api_keys` (Decision 19). Regression test, in `src/store/keys.rs`'s tests:
+
+```rust
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pre_m14_key_that_only_ever_is_a_target_is_forgotten_with_its_user() {
+        let db = test_db().await;
+        crate::store::users::tests::seed_user(&db.pool, "alice", None).await;
+        // A key from before migration 0012: its id is its name (0005's
+        // legacy ids), it belongs to alice, and it never acted since the
+        // upgrade, so no audit row knows it yet.
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, sha256, access, all_catalogs, actor, created_at, user_id) \
+             SELECT 'alice-legacy', 'alice-legacy', sha256('alice-legacy'::bytea), 'read', true, \
+                    'alice-legacy', $1, id FROM users WHERE name = 'alice'",
+        )
+        .bind(now())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Revoked: an entry whose target is the key, with no person passed.
+        revoke_by_id(&db.pool, "alice-legacy", &AuditActor::cli(), now()).await.unwrap();
+        crate::store::users::delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await.unwrap();
+
+        // Every stored column of every entry, and every row they refer to.
+        let stored: String = sqlx::query_scalar(
+            "SELECT string_agg(row_to_json(e)::text || coalesce(row_to_json(tc)::text, '') \
+                               || coalesce(row_to_json(tp)::text, ''), '') \
+             FROM audit_entries e \
+             LEFT JOIN audit_credentials tc ON tc.id = e.target_credential_ref \
+             LEFT JOIN audit_people tp ON tp.id = e.target_person_id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let credentials: String = sqlx::query_scalar("SELECT string_agg(row_to_json(c)::text, '') FROM audit_credentials c")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(stored.contains("key.revoked"), "{stored}");
+        assert!(!stored.contains("alice") && !credentials.contains("alice"), "{stored}\n{credentials}");
+    }
+```
+
 Never the key, code, token or its hash in `details`. The provisioner's `key.created` is already recorded by `create_provisioner` (Task 5). Self-service routes in `me.rs` (creating and revoking one's own keys and grants) record with the session's actor: they are credential changes.
 
 Commit:
@@ -3600,6 +3665,44 @@ git commit -m "feat(audit): record publishes, reverts and admins' discards (M14 
         .unwrap();
         assert_eq!(counts, [10, 1]);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catalog_moved_or_created_again_within_the_hour_starts_a_new_admin_read_entry() {
+        let db = test_db().await;
+        let actor = admin_actor(&user_id(&db.pool, TEST_USER).await);
+        crate::store::teams::create(
+            &db.pool,
+            &crate::store::teams::NewTeam { name: "family", display_name: "", owner: TEST_USER },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let main = |owner_team| crate::store::catalogs::NewCatalog { name: "main", description: "", owner_team };
+        crate::store::catalogs::create(&db.pool, &main(TEST_TEAM), &AuditActor::cli(), now()).await.unwrap();
+
+        record_admin_read(&db.pool, &actor, "main", now()).await.unwrap();
+        crate::store::catalogs::set_owner(&db.pool, "main", "family", &AuditActor::cli(), now()).await.unwrap();
+        record_admin_read(&db.pool, &actor, "main", now() + TimeDelta::minutes(1)).await.unwrap();
+        record_admin_read(&db.pool, &actor, "main", now() + TimeDelta::minutes(2)).await.unwrap();
+        crate::store::catalogs::delete(&db.pool, "main", true, &AuditActor::cli(), now()).await.unwrap();
+        crate::store::catalogs::create(&db.pool, &main(TEST_TEAM), &AuditActor::cli(), now()).await.unwrap();
+        record_admin_read(&db.pool, &actor, "main", now() + TimeDelta::minutes(3)).await.unwrap();
+
+        let reads: Vec<(Vec<i64>, i64)> = sqlx::query_as(
+            "SELECT e.teams, c.requests FROM audit_entries e \
+             JOIN audit_access_counts c ON c.entry_id = e.id \
+             WHERE e.action = 'catalog.admin_read' ORDER BY e.id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        let mut conn = db.pool.acquire().await.unwrap();
+        let personal = team_ref(&mut conn, TEST_TEAM).await.unwrap();
+        let family = team_ref(&mut conn, "family").await.unwrap();
+        // Same hour throughout: one entry per (catalog identity, owner team).
+        assert_eq!(reads, [(vec![personal], 1), (vec![family], 2), (vec![personal], 1)]);
+    }
 ```
 
 `src/http/api/browse.rs` (or `catalogs.rs`) tests:
@@ -3666,7 +3769,7 @@ git commit -m "feat(audit): record publishes, reverts and admins' discards (M14 
 
 - [ ] **Step 2: Run them and see them fail**
 
-Run: `tools/agentic/gate.sh narrow --lib auth::tests`, `tools/agentic/gate.sh narrow --lib store::audit::tests::admin_reads`, `tools/agentic/gate.sh narrow --lib http::api::browse::tests::an_operator_read`, `tools/agentic/gate.sh narrow --lib http::api::browse::tests::every_export`, `tools/agentic/gate.sh narrow --lib store::export::tests`
+Run: `tools/agentic/gate.sh narrow --lib auth::tests`, `tools/agentic/gate.sh narrow --lib store::audit::tests::admin_reads`, `tools/agentic/gate.sh narrow --lib store::audit::tests::a_catalog_moved`, `tools/agentic/gate.sh narrow --lib http::api::browse::tests::an_operator_read`, `tools/agentic/gate.sh narrow --lib http::api::browse::tests::every_export`, `tools/agentic/gate.sh narrow --lib store::export::tests`
 Expected: compile errors.
 
 - [ ] **Step 3: Implement the gates** (`src/auth.rs`, `src/store/gates.rs`)
@@ -3772,6 +3875,8 @@ pub async fn load(pool: &PgPool) -> Result<AccessGates, OkfError> {
 }
 ```
 
+> **Corrected (PR #375 review, 2026-11-13).** An hourly `catalog.admin_read` bucket is keyed by (credential or person audit id, `catalogs.id`, owner `audit_teams` id, hour), not by catalog name: reads before and after a transfer to another team, or of a catalog deleted and created again under the same name, go to separate entries, each scoped to the team that owned the catalog (Decision 20). The catalog and its owner are read when the background write runs, a few milliseconds after the request.
+
 - [ ] **Step 4: Noting admissions** (`src/store/audit.rs`, `src/mcp/context.rs`, `src/app.rs`)
 
 ```rust
@@ -3786,10 +3891,11 @@ pub enum AccessKind {
     Export,
 }
 
-/// Counts one admin read in its hour's `catalog.admin_read` entry, creating
-/// the entry on the hour's first read. Exact under concurrency: the counter
-/// row is upserted, so a second first read waits for the first to commit
-/// and then increments.
+/// Counts one admin read in its `catalog.admin_read` entry, one per
+/// credential, catalog identity (`catalogs.id`), owning team and clock
+/// hour, creating the entry on the bucket's first read. Exact under
+/// concurrency: the counter row is upserted, so a second first read waits
+/// for the first to commit and then increments.
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -3822,8 +3928,23 @@ pub async fn record_admin_read(
     .bind(actor.stored_label())
     .fetch_one(&mut *tx)
     .await?;
-    // U+001F (unit separator) cannot occur in an id or a catalog name.
-    let bucket = format!("{who}\u{1f}{catalog}\u{1f}{}", hour.timestamp());
+    // The catalog by its immutable id and its owner team by audit id, read
+    // now: a catalog moved to another team, or deleted and created again
+    // under the same name, starts a new bucket and a new entry, scoped to
+    // the team that owns it. A catalog gone meanwhile has nothing to record.
+    // *(Corrected, PR #375 review, 2026-11-13: the bucket was keyed by name.)*
+    let Some(catalog_id) = sqlx::query_scalar::<_, i64>("SELECT id FROM catalogs WHERE name = $1")
+        .bind(catalog)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        return Ok(());
+    };
+    let teams = catalog_teams(&mut tx, catalog_id).await?;
+    // `0` stands for "no owner team" (audit ids start at 1).
+    let team = teams.first().copied().unwrap_or(0);
+    // U+001F (unit separator) cannot occur in the parts.
+    let bucket = format!("{who}\u{1f}{catalog_id}\u{1f}{team}\u{1f}{}", hour.timestamp());
     let entry_id: Option<i64> = sqlx::query_scalar(
         "INSERT INTO audit_access_counts (bucket, requests) VALUES ($1, 1) \
          ON CONFLICT (bucket) DO UPDATE SET requests = audit_access_counts.requests + 1 \
@@ -3833,14 +3954,6 @@ pub async fn record_admin_read(
     .fetch_one(&mut *tx)
     .await?;
     if entry_id.is_none() {
-        let catalog_id: Option<i64> = sqlx::query_scalar("SELECT id FROM catalogs WHERE name = $1")
-            .bind(catalog)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let teams = match catalog_id {
-            Some(id) => catalog_teams(&mut tx, id).await?,
-            None => Vec::new(),
-        };
         let id = record(
             &mut tx,
             actor,
@@ -5579,7 +5692,7 @@ Expected: compile errors (`entitled`, `require_unlock`, `Admission::Unlocked`), 
 - `http/api/search.rs` and `mcp/changesets.rs` (`list_changesets`): M13's `check_not_suspended(name).is_ok()` filter becomes `check_open(name, Access::Read, now).is_ok()`.
 - `ToolContext::changeset`: `self.principal.require_contents(access, state.name(), self.app.clock().now())?` replaces `require`; `open_changeset` (`mcp/changesets.rs:235`) likewise; the revision route (`browse.rs:328`); `maintenance_close`'s operator override (`work.rs:172`) uses `require_contents(Access::Write, ..).is_ok()`.
 - `http/archives.rs`: export keeps M13's `require_export` (reach and read level, suspension ignored), then `principal.admission(&name, Access::Read, now)?`; with `Admission::Unlocked`, `app.note_access(.., AccessKind::Export, ..)`. Import: `require(Access::Admin, ..)` then `admission(&name, Access::Write, now)?`, noted as a write.
-- `App::note_access`: `Admission::Unlocked { unlock_id } => unlocks::tally(&pool, unlock_id, kind).await`, with, in `src/store/unlocks.rs`:
+- `App::note_access`: `Admission::Unlocked { unlock_id } => unlocks::tally(&pool, unlock_id, kind).await`. Tallies are keyed by the unlock's id, and an unlock belongs to one `catalogs.id` (`ON DELETE CASCADE`), so a catalog deleted and created again under the same name never inherits an unlock or its counts; deleting a catalog bumps `admin_generation`, so the cache drops the unlock at once. *(Corrected, PR #375 review, 2026-11-13: checked for the same name-keying defect; none.)* In `src/store/unlocks.rs`:
 
 ```rust
 /// Counts one request under an unlock.
@@ -6265,3 +6378,5 @@ git commit -m "docs: operator API operations, API reference and close-out (M14 t
 16. **Owners' scope is an immutable team identity.** *(PR #375 review, 2026-11-13.)* A shared team's name can be reused: delete `family`, create a new `family` for another customer, and a scope by name (`e.teams @> ARRAY[name]`) would show the new owners the old team's retained entries. Entries now store `audit_teams` ids; an `audit_teams` row follows one `teams.id`, a UUID that is never reused, and keeps the name only as a display snapshot. An owner's view is scoped by the one id of the team it owns now; an admin's `team` filter by name may span every team that had it. Tests: Task 1 (`a_team_created_again_under_its_old_name_gets_a_new_audit_id`) and Task 8a (`a_new_team_under_an_old_name_cannot_read_the_old_teams_entries`). The spec's "teams" rule says so too.
 17. **No person's name in an immutable column.** *(PR #375 review, 2026-11-13.)* `Principal::for_session` sets a session's `actor` to the user's name (`src/auth.rs:191`), a self-issued key's actor label defaults to the key name its user chose, and a legacy key's id is its name (`migrations/0005_key_names.sql`). So `actor_label` holds only a kind (`console session`, `api key`, `oauth grant`), `cli:<os user>`, `system:<what>` or the label of a key with no user (`AuditActor::stored_label`); credential ids and labels live in `audit_credentials`, which `forget_person` clears for the deleted user's credentials (shown as `credential #N`); the admin-read bucket key uses audit ids. Grant names (`grants::grant_name`, which starts with the user's name) are never written into entries. The CLI's operating-system user stays in `actor_label` as the spec decides: it is operator staff, not an okf-mcp user. Tests: Task 1 (`a_session_actor_leaves_no_name_in_the_entry_once_its_user_is_forgotten`) and Task 8a (`a_deleted_session_user_is_named_nowhere_in_the_admin_or_owner_view`, the complete admin and owner records).
 18. **Operator staff as a target are hidden from owners too.** *(PR #375 review, 2026-11-13.)* An unlock's entries name the unlocked admin as their person; owners saw it although the actor read "an operator". `record` sets `target_operator` when the target person is an admin user, and the owner view drops that person (and a credential naming them); for owners the target filter never matches a hidden person or credential and the actor filter never matches an operator's entry, so neither is an identity oracle. Tests: Task 8a (`owners_never_see_an_operators_identity_ip_unlock_reason_or_unlocked_staff`, the whole serialized record and both filters) and Task 9d (the owner's full `GET /api/v1/audit` response, its export and its filters contain no staff name).
+19. **A credential's owner comes from the credential tables.** *(PR #375 review, round 2, 2026-11-13.)* Entries that target a credential without naming a person (`key.revoked`, `key.catalog_granted`, `key.report_flag_changed`) could create an `audit_credentials` row with no person, so `forget_person` would miss it, and a legacy key whose id is its user's name would stay visible after the user is deleted. `audit_credential` now takes the owner from `api_keys.user_id` or `sign_in_codes.user_id` while the credential exists, and `forget_person` also clears every row still named by the user's keys, grants and codes; Task 4 calls it before deleting the user row, while those exist. No backfill: the table starts empty and every row is made through that function. Test: Task 6c `a_pre_m14_key_that_only_ever_is_a_target_is_forgotten_with_its_user`.
+20. **Admin-read buckets follow the catalog's identity and owner.** *(PR #375 review, round 2, 2026-11-13.)* The bucket was (credential, catalog name, hour), so reads after a transfer to another team, or of a catalog deleted and created again under the same name, counted in the first entry and showed in the wrong team's log. It is now (credential or person audit id, `catalogs.id`, owner `audit_teams` id, hour): one entry per credential, catalog identity, owning team and clock hour. Unlock tallies were checked: they are keyed by unlock id, and an unlock belongs to one `catalogs.id`. Test: Task 7b `a_catalog_moved_or_created_again_within_the_hour_starts_a_new_admin_read_entry`.

@@ -235,8 +235,12 @@ owner `NOT NULL`) is unaffected.
   credential (key, grant or admin console session) that reads a catalog
   whose owner team the credential's user is not a member of (a legacy key
   with no user always counts). Recorded as at most **one entry per
-  credential, per catalog, per clock hour**, carrying a request count, so
-  the count is exact and the log stays readable.
+  credential, per catalog identity and owning team, per clock hour**,
+  carrying a request count, so the count is exact and the log stays
+  readable. A catalog moved to another team, or deleted and created again
+  under the same name, starts a new entry within the hour, scoped to the
+  team that owns it then. *(Corrected, PR #375 review, 2026-11-13: the
+  bucket was per catalog name.)*
 - **Not recorded:** reads by anyone else; sign-ins (already in
   `sign_in_events`, which the audit view links to); maintenance runner
   reports (already in their own tables).
@@ -261,6 +265,12 @@ identifying the person. Email addresses are never written into entries or
 > and label are cleared when their user is deleted (a legacy key's id was
 > its name); and teams through an `audit_teams` table keyed by the team's
 > immutable id (below). See the M14 plan's Decisions 16 to 18.
+>
+> **Corrected (PR #375 review, 2026-11-13).** A credential's person is
+> taken from the credential tables (its key's or code's user) while it
+> exists, never only from the change that names it, so a credential from
+> before the audit log that is only ever a target is still cleared when
+> its user is deleted (plan Decision 19).
 
 ### An entry
 
