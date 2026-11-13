@@ -149,19 +149,27 @@ fn one_ceiling(rows: Vec<CeilingRow>) -> Ceiling {
         .collect()
 }
 
-/// The id of the user called `name`, without locking it (a read).
+/// The refusal for a catalog name that names no catalog.
+fn unknown_catalog(catalog: &str) -> OkfError {
+    OkfError::CatalogNotSelected {
+        catalog: catalog.to_string(),
+    }
+}
+
+/// Refuses, before any query, a user or catalog name that cannot name
+/// one (not `[a-z0-9-]+`: a NUL, which Postgres refuses as a database
+/// error, among others), as the unknown name it is.
 ///
 /// # Errors
-/// [`OkfError::UnknownName`]; [`OkfError::Database`].
-async fn user_id(pool: &PgPool, name: &str) -> Result<String, OkfError> {
-    sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
-        .bind(name)
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| OkfError::UnknownName {
-            noun: "user",
-            name: name.to_string(),
-        })
+/// [`OkfError::UnknownName`] or [`OkfError::CatalogNotSelected`].
+fn check_names(user: Option<&str>, catalog: &str) -> Result<(), OkfError> {
+    if let Some(user) = user.filter(|user| !catalogs::is_valid_name(user)) {
+        return Err(users::unknown(user));
+    }
+    if !catalogs::is_valid_name(catalog) {
+        return Err(unknown_catalog(catalog));
+    }
+    Ok(())
 }
 
 /// Every user's ceiling, for the key cache.
@@ -198,7 +206,7 @@ pub async fn ceilings(pool: &PgPool) -> Result<HashMap<String, Ceiling>, OkfErro
 /// # Errors
 /// [`OkfError::UnknownName`] for an unknown user; [`OkfError::Database`].
 pub async fn ceiling_of(pool: &PgPool, user: &str) -> Result<Ceiling, OkfError> {
-    let user_id = user_id(pool, user).await?;
+    let user_id = users::id_by_name(pool, user).await?;
     Ok(one_ceiling(ceiling_rows(pool, Some(&user_id)).await?))
 }
 
@@ -241,6 +249,7 @@ pub async fn set_member_access(
     catalog: &str,
     access: MemberAccess,
 ) -> Result<MemberAccess, OkfError> {
+    check_names(None, catalog)?;
     let mut tx = pool.begin().await?;
     // As in `catalogs::set_owner`: the subquery reads the row as it was,
     // under its row lock, so this returns the value it replaced.
@@ -253,9 +262,7 @@ pub async fn set_member_access(
     .bind(access.as_str())
     .fetch_optional(&mut *tx)
     .await?;
-    let previous = previous.ok_or_else(|| OkfError::CatalogNotSelected {
-        catalog: catalog.to_string(),
-    })?;
+    let previous = previous.ok_or_else(|| unknown_catalog(catalog))?;
     let previous =
         MemberAccess::parse(&previous).expect("the schema checks catalogs.member_access");
     if previous != access {
@@ -263,6 +270,29 @@ pub async fn set_member_access(
     }
     tx.commit().await?;
     Ok(previous)
+}
+
+/// A catalog's member access, for the console's catalog drawer.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `catalog` - the catalog's name.
+///
+/// # Returns
+/// Its `member_access`.
+///
+/// # Errors
+/// [`OkfError::CatalogNotSelected`] for an unknown or malformed catalog
+/// name; [`OkfError::Database`].
+pub async fn member_access(pool: &PgPool, catalog: &str) -> Result<MemberAccess, OkfError> {
+    check_names(None, catalog)?;
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT member_access FROM catalogs WHERE name = $1")
+            .bind(catalog)
+            .fetch_optional(pool)
+            .await?;
+    let stored = stored.ok_or_else(|| unknown_catalog(catalog))?;
+    Ok(MemberAccess::parse(&stored).expect("the schema checks catalogs.member_access"))
 }
 
 /// Gives a user a catalog at `access`, or changes the level of one already
@@ -292,6 +322,7 @@ pub async fn entitle(
                 .to_string(),
         });
     }
+    check_names(Some(user), catalog)?;
     let mut tx = pool.begin().await?;
     // `FOR KEY SHARE` until commit: a concurrent `users::delete` waits.
     let user_id = users::id_of(&mut tx, user).await?;
@@ -330,6 +361,7 @@ pub async fn entitle(
 /// [`OkfError::CatalogNotSelected`] for an unknown catalog;
 /// [`OkfError::Database`].
 pub async fn unentitle(pool: &PgPool, user: &str, catalog: &str) -> Result<(), OkfError> {
+    check_names(Some(user), catalog)?;
     let mut tx = pool.begin().await?;
     let user_id = users::id_of(&mut tx, user).await?;
     let catalog_id = catalogs::find(&mut *tx, catalog).await?.id;
@@ -357,7 +389,7 @@ pub async fn unentitle(pool: &PgPool, user: &str, catalog: &str) -> Result<(), O
 /// # Errors
 /// [`OkfError::UnknownName`] for an unknown user; [`OkfError::Database`].
 pub async fn entitlements(pool: &PgPool, user: &str) -> Result<Vec<Entitlement>, OkfError> {
-    let user_id = user_id(pool, user).await?;
+    let user_id = users::id_by_name(pool, user).await?;
     let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
         "SELECT c.name, e.access, e.created_at FROM user_catalogs e \
          JOIN catalogs c ON c.id = e.catalog_id WHERE e.user_id = $1 ORDER BY c.name",

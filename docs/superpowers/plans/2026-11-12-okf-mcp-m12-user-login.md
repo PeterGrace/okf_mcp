@@ -274,7 +274,8 @@ pub async fn set_admin(pool: &PgPool, name: &str, on: bool, allow_last: bool) ->
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<UserAuth>, OkfError>;
 pub async fn find_auth(pool: &PgPool, user_id: &str) -> Result<Option<UserAuth>, OkfError>;
 pub async fn auth_by_id(pool: &PgPool) -> Result<HashMap<String, UserAuth>, OkfError>;    // Task 7a, for the key cache
-pub async fn id_by_name<'e>(executor: impl sqlx::PgExecutor<'e>, name: &str) -> Result<String, OkfError>; // Task 12
+pub async fn id_by_name<'e>(executor: impl sqlx::PgExecutor<'e>, name: &str) -> Result<String, OkfError>; // Task 12; a name that is not [a-z0-9-]+ is UnknownName before any query
+pub async fn end_sessions(pool: &PgPool, name: &str) -> Result<u64, OkfError>; // Task 12 (corrected, issue #322): the user FOR NO KEY UPDATE, then revoke_all; the admin's sign-out everywhere
 pub(crate) fn check_email(email: &str) -> Result<(), OkfError>;                           // LimitExceeded{limit:"email"}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserAuth { pub id: String, pub name: String, pub email: Option<String>, pub is_admin: bool }
@@ -300,6 +301,7 @@ pub async fn issue(pool: &PgPool, user_id: &str, purpose: Purpose, ttl: std::tim
 pub async fn redeem(pool: &PgPool, token: &str, purpose: Purpose, now: DateTime<Utc>) -> Result<UserAuth, OkfError>; // Gone on expired/used/unknown
 pub async fn redeem_in(conn: &mut PgConnection, token: &str, purpose: Purpose, now: DateTime<Utc>) -> Result<UserAuth, OkfError>; // Task 7b: inside the caller's transaction
 pub async fn issue_for_email(pool: &PgPool, email: &str, purpose: Purpose, ttl: std::time::Duration, now: DateTime<Utc>) -> Result<Option<IssuedLink>, OkfError>; // Task 7b: lookup + issue under the row lock
+pub async fn issue_for_user_in(conn: &mut PgConnection, name: &str, purpose: Purpose, ttl: std::time::Duration, now: DateTime<Utc>) -> Result<Option<IssuedLink>, OkfError>; // Task 12 (issue #322): by name, the user FOR NO KEY UPDATE, then its email; None (nothing written) without an email
 pub async fn peek(pool: &PgPool, token: &str, purpose: Purpose, now: DateTime<Utc>) -> Result<UserAuth, OkfError>;   // validate without using
 pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError>;
 
@@ -385,14 +387,14 @@ pub fn link(public_url: &str, path: &str, token: &str) -> String; // {public_url
 // src/mail/queue.rs
 pub async fn enqueue(pool: &PgPool, to: &str, template: &Template, now: DateTime<Utc>) -> Result<(), OkfError>; // pushes SendMail; now = queued_at
 pub async fn enqueue_in(conn: &mut PgConnection, to: &str, template: &Template, now: DateTime<Utc>) -> Result<(), OkfError>; // Task 8: inside the caller's transaction (apalis' push_tasks takes the connection)
-pub struct QueuedMail { pub id: String, pub to: String, pub template: String /*setup|reset|method_added|test*/, pub status: String /*pending|failed*/, pub attempts: i32, pub last_error: Option<String>, pub run_at: DateTime<Utc> }
+pub struct QueuedMail { pub id: String, pub to: String, pub template: String /*setup|reset|method_added|test*/, pub status: String /*pending|sending|retrying|failed*/, pub attempts: i32, pub last_error: Option<String>, pub run_at: DateTime<Utc> }
 pub async fn list(pool: &PgPool) -> Result<Vec<QueuedMail>, OkfError>;   // pending + failed, never the body
 pub async fn retry(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), OkfError>; // a new 24-hour window
 pub async fn delete(pool: &PgPool, id: &str) -> Result<(), OkfError>;
 pub async fn prune(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, OkfError>; // done > 7d, failed > 30d
 pub fn spawn_worker(app: Arc<App>, shutdown: CancellationToken) -> JoinHandle<()>;  // called by http::serve when mail.worker
 // src/mail/invite.rs (Task 12; used by Task 13's `user invite`)
-pub async fn send_setup(pool: &PgPool, config: &Config, user: &str, now: DateTime<Utc>) -> Result<String /*to*/, OkfError>;
+pub async fn send_setup(pool: &PgPool, config: &Config, user: &str, now: DateTime<Utc>) -> Result<String /*to*/, OkfError>; // corrected (issue #322): issue_for_user_in + enqueue_in in one transaction
 
 // ---- src/http/console_session.rs (Task 7a) ----
 pub const COOKIE: &str = "okf_session";
@@ -19018,6 +19020,17 @@ The API refuses to clear the last admin user for every principal (Decision 16), 
 
 Every write logs at `info` with `key = principal.key_id` and `actor = principal.actor`, as `catalogs.rs` does (spec "Logging and audit"), then calls `settle`.
 
+> **Corrected (issue #322, 2026-11-13).** What shipped differs from the code below in these ways; the files on `main` are authoritative:
+> - The user view keeps Task 4's `is_admin` field (not `admin`) in `GET /users` and `/users/{name}`; the tests, Step 9's `UserView` and the reference rows below are corrected inline, and Task 15's `user.admin` is now `user.is_admin`. `PUT /users/{name}/admin` still answers `{name, previous, admin}`.
+> - Tests use Task 7a's `login_app()` (an app with `public_url`) where this said `oauth_app()`.
+> - `mail::invite::send_setup` issues the token and queues the mail in one transaction under the user's row lock, through a new `email_tokens::issue_for_user_in(conn, name, purpose, ttl, now)`, so a link is never mailed to an address the user no longer has and never exists without its mail (`a_setup_link_goes_to_the_address_the_user_has_when_it_commits`). Read `src/mail/invite.rs`.
+> - `DELETE /users/{name}/sessions` calls a new `users::end_sessions(pool, name)`, which locks the user's row (`FOR NO KEY UPDATE`) before `revoke_all`, so a session whose insert was still uncommitted is ended too (`signing_out_everywhere_ends_a_session_whose_start_was_still_uncommitted`). Task 13's `user revoke-sessions` uses it.
+> - Names from a path never reach SQL unless they can name something (issue #339's 500 for a NUL): `users::{id_by_name, find, set_email, set_admin, end_sessions}`, `email_tokens::issue_for_user_in`, `ceiling::{member_access, set_member_access, entitle, unentitle, entitlements, ceiling_of}` and `mail::queue::{retry, delete}` answer an unknown name or id first (`a_nul_or_malformed_name_in_a_path_is_a_404_never_a_500`). `ceiling`'s private `user_id` and `sign_in_events::recent`'s lookup now call `users::id_by_name`.
+> - `EmailBody.email` needs `#[serde(deserialize_with = "Option::deserialize")]`: serde fills a missing `Option` field with `None`, so without it `{}` would clear the email.
+> - `set_email` polls after the change (`settle`): the key cache holds each user's email for console sessions.
+> - `list_sign_ins` needs no `id_by_name` first (`sign_in_events::recent` already answers an unknown user with 404); `RECENT_SIGN_INS` is `me.rs`'s, made `pub(crate)`. The views in `me` need no `pub(crate) mod me;`: a private module's `pub(crate)` items are visible to its sibling modules.
+> - `MailProvider::as_str` is new in `src/config.rs` (the settings listing needs it). The queue's `status` is `pending`, `sending`, `retrying` or `failed` (Task 6). An invalid setting value and a malformed test-mail address are 422 (`LimitExceeded`). The invite handler is `invite_user`, since `invite` names the imported module. No line logs an email address.
+
 - [ ] **Step 1: Write the failing store tests.** In `src/store/users.rs`'s test module:
 
 ```rust
@@ -19203,14 +19216,14 @@ Expected: PASS.
 
 - [ ] **Step 6: Write the failing route tests.** In `src/http/api/people.rs`'s test module, add these imports:
   - `crate::http::api::testing::{Browser, Payload}` (Task 7a's cookie-aware test browser);
-  - `crate::oauth::testing::oauth_app` (an app with `public_url`, for invite);
+  - `crate::http::api::testing::login_app` (an app with `public_url`, for invite);
   - `crate::store::{ceiling, users as user_rows}`;
   - `crate::store::sign_in_events::{self, Method, Outcome}`.
 
 ```rust
     #[tokio::test]
     async fn the_new_user_routes_need_an_admin_and_writes_one_reaching_every_catalog() {
-        let test = oauth_app().await;
+        let test = login_app().await;
         let keys = keys(&test).await;
         let root = every_catalog_admin(&test).await;
         user(&test, &root, "alice").await;
@@ -19274,7 +19287,7 @@ Expected: PASS.
             .find(|row| row["name"] == "alice")
             .expect("alice")
             .clone();
-        assert_eq!(alice["admin"], false);
+        assert_eq!(alice["is_admin"], false);
         assert_eq!(alice["has_password"], false);
         assert_eq!(unknown.as_u16(), 404);
     }
@@ -19320,7 +19333,7 @@ Expected: PASS.
 
     #[tokio::test]
     async fn invite_queues_a_setup_mail_once_there_is_an_email_and_a_public_url() {
-        let test = oauth_app().await;
+        let test = login_app().await;
         let root = every_catalog_admin(&test).await;
         user(&test, &root, "alice").await;
         let (no_email, _) = send(&test, "POST", "/api/v1/users/alice/invite", Some(&root), None).await;
@@ -19788,7 +19801,7 @@ pub(crate) struct UserView {
     /// Where setup, reset and notice mail goes.
     pub email: Option<String>,
     /// An admin user: its console session acts as an admin.
-    pub admin: bool,
+    pub is_admin: bool,
     /// Whether a password is set (never the password or its hash).
     pub has_password: bool,
 }
@@ -19814,7 +19827,7 @@ impl From<UserRecord> for UserView {
             credentials,
             teams,
             email,
-            admin: is_admin,
+            is_admin,
             has_password,
         }
     }
@@ -19898,8 +19911,9 @@ struct AdminBody {
 #[serde(deny_unknown_fields)]
 struct EmailBody {
     /// The address, or `null`.
-    // `Option` with no `#[serde(default)]`: the key must be present, but
-    // its value may be `null`.
+    // serde fills a missing `Option` field with `None`; a plain `Option`
+    // deserializer makes the key required while still taking `null`.
+    #[serde(deserialize_with = "Option::deserialize")]
     email: Option<String>,
 }
 
@@ -20091,8 +20105,7 @@ async fn revoke_sessions(
     Path(name): Path<String>,
 ) -> Result<Json<SessionsRevoked>, AppError> {
     require_every_catalog(&principal)?;
-    let id = users::id_by_name(app.pool(), &name).await?;
-    let revoked = user_sessions::revoke_all(app.pool(), &id, None).await?;
+    let revoked = users::end_sessions(app.pool(), &name).await?;
     tracing::info!(user = %name, revoked, key = %principal.key_id, actor = %principal.actor,
                    "sessions revoked by an admin");
     Ok(Json(SessionsRevoked { name, revoked }))
@@ -20131,9 +20144,6 @@ async fn list_sign_ins(
     Path(name): Path<String>,
 ) -> Result<Json<SignInList>, AppError> {
     require_admin(&principal)?;
-    // Resolving the id first turns an unknown name into a 404, not an
-    // empty list.
-    users::id_by_name(app.pool(), &name).await?;
     let sign_ins = sign_in_events::recent(app.pool(), &name, RECENT_SIGN_INS)
         .await?
         .into_iter()
@@ -20638,7 +20648,7 @@ Expected: PASS. Then `SQLX_OFFLINE=true cargo test --test admin_parity`: still P
 | `GET /api/v1/users/{name}/sign-ins` | admin | `{sign_ins}`, newest first (at most 50): `method`, `outcome`, `ip`, `at` |
 ```
 
-and change the `GET /api/v1/users` and `GET /api/v1/users/{name}` rows to name the new fields: the list's users gain `email`, `admin` and `has_password`, and the detail gains `entitlements` (`[{catalog, access, created_at}]`). Add to the catalogs table:
+and change the `GET /api/v1/users` and `GET /api/v1/users/{name}` rows to name the new fields: the list's users gain `email`, `is_admin` and `has_password`, and the detail gains `entitlements` (`[{catalog, access, created_at}]`). Add to the catalogs table:
 
 ```markdown
 | `GET /api/v1/catalogs/{catalog}/member-access` | admin on the catalog | `{name, member_access}` (`none`, `read` or `write`) |
@@ -20681,7 +20691,7 @@ Add the subsection to the API reference's opening list of areas, and raise the e
 - The API reference rows for every new route in `docs/operations.md`.
 
 ## Changed
-- `GET /api/v1/users` and `GET /users/{name}` show `email`, `admin` and `has_password`; the detail also lists `entitlements`.
+- `GET /api/v1/users/{name}` lists `entitlements`; the reference rows name `email`, `is_admin` and `has_password` (Task 4's fields).
 
 ## Notes
 - One route per CLI action (Decision 17). Writes need an admin reaching every catalog, reads any admin; member access goes through `may_set_member_access`.
@@ -21213,8 +21223,9 @@ The dispatcher in `run`:
             }
         }
         UserCommand::RevokeSessions { name } => {
-            let id = users::id_by_name(pool, &name).await?;
-            let revoked = user_sessions::revoke_all(pool, &id, None).await?;
+            // Corrected (issue #322): `users::end_sessions` locks the user's
+            // row first, so a sign-in still committing is ended too.
+            let revoked = users::end_sessions(pool, &name).await?;
             format!("revoked {revoked} sessions of {name}\n")
         }
         UserCommand::SignIns { name, limit } => {
@@ -23548,7 +23559,7 @@ Routes this task calls (all defined in Task 12, with the shapes Task 12 document
 
 | Route | Control |
 |---|---|
-| `GET /api/v1/users`, `GET /api/v1/users/{name}` (users gain `email`, `admin`, `has_password`; the detail gains `entitlements: [{catalog, access, created_at}]`) | Users list and drawer |
+| `GET /api/v1/users`, `GET /api/v1/users/{name}` (users gain `email`, `is_admin`, `has_password`; the detail gains `entitlements: [{catalog, access, created_at}]`) | Users list and drawer |
 | `PUT /api/v1/users/{name}/admin` (`{admin}` -> `{name, previous, admin}`) | Admin toggle |
 | `PUT /api/v1/users/{name}/email` | Email field, Clear |
 | `POST /api/v1/users/{name}/invite` (202 `{name, email}`) | Send setup email |
@@ -24129,7 +24140,7 @@ function signInSection(user, manager, act) {
             next ? `${user.name}'s email is now ${next}.` : `Cleared ${user.name}'s email.`);
     });
     const admin = h('input', { type: 'checkbox', role: 'switch', id: 'user-admin-toggle',
-                               checked: user.admin, disabled: !manager });
+                               checked: user.is_admin, disabled: !manager });
     admin.addEventListener('change', () => act(() => api.put(`${base}/admin`, { admin: admin.checked }),
         admin.checked ? `${user.name} is now an admin.` : `${user.name} is no longer an admin.`));
     const invite = h('button', {
@@ -24201,7 +24212,7 @@ In `render`, give the Name column the admin pill and add an Email column after D
         { key: 'name', label: 'Name', sort: user => user.name,
           render: user => h('code', { dataset: { test: `user-${user.name}` } }, user.name,
               user.name === store.whoami.user ? [' ', pill('you', 'info')] : null,
-              user.admin ? [' ', pill('admin', 'warn')] : null) },
+              user.is_admin ? [' ', pill('admin', 'warn')] : null) },
         { key: 'display_name', label: 'Display name',
           render: user => user.display_name || h('span', { class: 'muted' }, '-') },
         { key: 'email', label: 'Email', sort: user => user.email ?? '',
