@@ -88,6 +88,8 @@ pub struct TeamRecord {
     pub members: Vec<Member>,
     /// Names of the catalogs it owns, sorted.
     pub catalogs: Vec<String>,
+    /// Its suspension; `None` while it is active.
+    pub suspension: Option<Suspension>,
 }
 
 /// What [`set_member`] did.
@@ -101,6 +103,27 @@ pub enum MemberChange {
     Unchanged,
 }
 
+/// The longest suspension notice, in characters (the schema checks it too).
+pub const MAX_NOTICE_CHARS: usize = 2000;
+
+/// A team's suspension: since when, and what members are told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suspension {
+    /// When it was first suspended (server clock); a second suspend keeps it.
+    pub since: DateTime<Utc>,
+    /// The notice members see, if the operator gave one.
+    pub notice: Option<String>,
+}
+
+/// One catalog whose owner team is suspended, as the key cache holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspendedCatalog {
+    /// The owner team's name.
+    pub team: String,
+    /// Its notice, if any.
+    pub notice: Option<String>,
+}
+
 /// A team row without its members (they come from a second query).
 #[derive(sqlx::FromRow)]
 struct TeamRow {
@@ -108,6 +131,8 @@ struct TeamRow {
     display_name: String,
     personal_of: Option<String>,
     created_at: DateTime<Utc>,
+    suspended_at: Option<DateTime<Utc>>,
+    suspension_notice: Option<String>,
     catalogs: Vec<String>,
 }
 
@@ -124,6 +149,7 @@ struct MemberRow {
 macro_rules! select_teams {
     () => {
         "SELECT t.name, t.display_name, p.name AS personal_of, t.created_at, \
+                t.suspended_at, t.suspension_notice, \
                 COALESCE((SELECT array_agg(c.name ORDER BY c.name) FROM catalogs c \
                           WHERE c.owner_team_id = t.id), '{}'::text[]) AS catalogs \
          FROM teams t LEFT JOIN users p ON p.id = t.personal_of"
@@ -152,6 +178,14 @@ fn assemble(rows: Vec<TeamRow>, member_rows: Vec<MemberRow>) -> Vec<TeamRecord> 
     rows.into_iter()
         .map(|row| TeamRecord {
             members: members.remove(&row.name).unwrap_or_default(),
+            // `map` runs only for `Some`: a team with a time is suspended.
+            // Struct-literal fields are evaluated in the order written, so
+            // this moves `suspension_notice` out of `row` before the
+            // fields below move the rest.
+            suspension: row.suspended_at.map(|since| Suspension {
+                since,
+                notice: row.suspension_notice,
+            }),
             name: row.name,
             display_name: row.display_name,
             personal_of: row.personal_of,
@@ -207,6 +241,7 @@ pub async fn create(
             role: Role::Owner,
         }],
         catalogs: Vec::new(),
+        suspension: None,
     })
 }
 
@@ -388,6 +423,135 @@ pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError> {
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// A notice as stored: trimmed, `None` when blank.
+///
+/// # Arguments
+/// * `notice` - the notice as given.
+///
+/// # Returns
+/// The trimmed notice, or `None` for a missing or blank one.
+///
+/// # Errors
+/// [`OkfError::Refused`] for one longer than [`MAX_NOTICE_CHARS`], or one
+/// holding a NUL character (Postgres text cannot store it, so it would
+/// otherwise be a database error, a 500).
+fn clean_notice(notice: Option<&str>) -> Result<Option<&str>, OkfError> {
+    // `filter` turns a blank (after trimming) notice into `None`.
+    let notice = notice.map(str::trim).filter(|text| !text.is_empty());
+    if let Some(text) = notice {
+        if text.contains('\0') {
+            return Err(OkfError::Refused {
+                reason: "a suspension notice cannot contain a NUL character".to_string(),
+            });
+        }
+        // `chars().count()`: characters, as the schema's `char_length`
+        // counts, not bytes.
+        if text.chars().count() > MAX_NOTICE_CHARS {
+            return Err(OkfError::Refused {
+                reason: format!("a suspension notice is at most {MAX_NOTICE_CHARS} characters"),
+            });
+        }
+    }
+    Ok(notice)
+}
+
+/// Suspends a team, or replaces the notice of one already suspended
+/// (keeping its first `suspended_at`), and bumps the administrative
+/// generation.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `name` - the team's name.
+/// * `notice` - what members are told; blank or `None` for no notice.
+/// * `now` - the suspension time, if it was not suspended (server clock).
+///
+/// # Returns
+/// The team as it now is.
+///
+/// # Errors
+/// [`OkfError::UnknownName`]; [`OkfError::Refused`] for a notice over
+/// [`MAX_NOTICE_CHARS`]; [`OkfError::Database`].
+pub async fn suspend(
+    pool: &PgPool,
+    name: &str,
+    notice: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<TeamRecord, OkfError> {
+    let notice = clean_notice(notice)?;
+    let mut tx = pool.begin().await?;
+    let locked = lock_team(&mut tx, name).await?;
+    // `COALESCE` keeps the first suspension time on a repeat.
+    sqlx::query(
+        "UPDATE teams SET suspended_at = COALESCE(suspended_at, $2), suspension_notice = $3 \
+         WHERE id = $1",
+    )
+    .bind(&locked.id)
+    .bind(now)
+    .bind(notice)
+    .execute(&mut *tx)
+    .await?;
+    bump_admin_generation(&mut tx).await?;
+    tx.commit().await?;
+    find(pool, name).await
+}
+
+/// Lifts a team's suspension, and bumps the administrative generation when
+/// there was one.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `name` - the team's name.
+///
+/// # Returns
+/// The team as it now is.
+///
+/// # Errors
+/// [`OkfError::UnknownName`]; [`OkfError::Database`].
+pub async fn unsuspend(pool: &PgPool, name: &str) -> Result<TeamRecord, OkfError> {
+    let mut tx = pool.begin().await?;
+    let locked = lock_team(&mut tx, name).await?;
+    let lifted = sqlx::query(
+        "UPDATE teams SET suspended_at = NULL, suspension_notice = NULL \
+         WHERE id = $1 AND suspended_at IS NOT NULL",
+    )
+    .bind(&locked.id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if lifted > 0 {
+        bump_admin_generation(&mut tx).await?;
+    }
+    tx.commit().await?;
+    find(pool, name).await
+}
+
+/// Every catalog whose owner team is suspended, by catalog name: what the
+/// key cache gives every principal.
+///
+/// # Arguments
+/// * `pool` - the database.
+///
+/// # Returns
+/// The map; empty when no team is suspended.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn suspended_catalogs(
+    pool: &PgPool,
+) -> Result<HashMap<String, SuspendedCatalog>, OkfError> {
+    let rows = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT c.name, t.name, t.suspension_notice \
+         FROM catalogs c JOIN teams t ON t.id = c.owner_team_id \
+         WHERE t.suspended_at IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(catalog, team, notice)| (catalog, SuspendedCatalog { team, notice }))
+        .collect())
 }
 
 /// A team row held `FOR UPDATE` by the caller's transaction.
@@ -871,5 +1035,155 @@ mod tests {
                 "{change:?}: {outcome:?}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suspend_keeps_the_first_time_and_replaces_the_notice() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let later = now() + chrono::TimeDelta::hours(1);
+        let before = crate::store::catalogs::admin_generation(&db.pool)
+            .await
+            .unwrap();
+
+        let first = suspend(&db.pool, "family", Some("Contact the operator."), now())
+            .await
+            .unwrap();
+        let after_first = crate::store::catalogs::admin_generation(&db.pool)
+            .await
+            .unwrap();
+        let again = suspend(&db.pool, "family", Some("Still paused."), later)
+            .await
+            .unwrap();
+
+        assert!(after_first > before, "suspending bumps the generation");
+
+        assert_eq!(
+            first.suspension,
+            Some(Suspension {
+                since: now(),
+                notice: Some("Contact the operator.".to_string()),
+            })
+        );
+        let again = again.suspension.unwrap();
+        assert_eq!(again.since, now(), "a second suspend keeps the first time");
+        assert_eq!(again.notice.as_deref(), Some("Still paused."));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blank_notice_is_none_and_a_long_one_is_refused() {
+        let db = test_db().await;
+        family(&db.pool).await;
+
+        let blank = suspend(&db.pool, "family", Some("   "), now())
+            .await
+            .unwrap();
+        let long = "x".repeat(MAX_NOTICE_CHARS + 1);
+        let refused = suspend(&db.pool, "family", Some(&long), now()).await;
+
+        let nul = suspend(&db.pool, "family", Some("a\0b"), now()).await;
+        let at_limit = "\u{e9}".repeat(MAX_NOTICE_CHARS);
+        let multibyte = suspend(&db.pool, "family", Some(&at_limit), now()).await;
+
+        assert_eq!(blank.suspension.unwrap().notice, None);
+        assert!(
+            matches!(refused, Err(OkfError::Refused { .. })),
+            "{refused:?}"
+        );
+        assert!(matches!(nul, Err(OkfError::Refused { .. })), "{nul:?}");
+        // 2000 two-byte characters: the limit counts characters, not bytes.
+        let multibyte = multibyte.unwrap().suspension.unwrap().notice.unwrap();
+        assert_eq!(multibyte.chars().count(), MAX_NOTICE_CHARS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_schema_refuses_a_notice_without_a_suspension_or_over_the_limit() {
+        // The store never writes either; the constraints guard hand edits.
+        let db = test_db().await;
+        family(&db.pool).await;
+        let long = "x".repeat(MAX_NOTICE_CHARS + 1);
+
+        let orphan = sqlx::query("UPDATE teams SET suspension_notice = 'x' WHERE name = 'family'")
+            .execute(&db.pool)
+            .await;
+        let too_long = sqlx::query(
+            "UPDATE teams SET suspended_at = now(), suspension_notice = $1 WHERE name = 'family'",
+        )
+        .bind(&long)
+        .execute(&db.pool)
+        .await;
+
+        assert!(orphan.is_err(), "a notice needs a suspension");
+        assert!(
+            too_long.is_err(),
+            "a notice is at most {MAX_NOTICE_CHARS} characters"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsuspend_lifts_and_is_a_no_op_when_active() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        suspend(&db.pool, "family", None, now()).await.unwrap();
+        let before = crate::store::catalogs::admin_generation(&db.pool)
+            .await
+            .unwrap();
+
+        let lifted = unsuspend(&db.pool, "family").await.unwrap();
+        let after_lift = crate::store::catalogs::admin_generation(&db.pool)
+            .await
+            .unwrap();
+        let unchanged = unsuspend(&db.pool, "family").await.unwrap();
+        let after_noop = crate::store::catalogs::admin_generation(&db.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(lifted.suspension, None);
+        assert_eq!(unchanged.suspension, None);
+        assert!(after_lift > before, "lifting bumps the generation");
+        assert_eq!(after_noop, after_lift, "lifting nothing does not");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suspending_an_unknown_team_is_unknown_name() {
+        let db = test_db().await;
+
+        let suspended = suspend(&db.pool, "nobody", None, now()).await;
+        let lifted = unsuspend(&db.pool, "nobody").await;
+
+        assert!(matches!(
+            suspended,
+            Err(OkfError::UnknownName { noun: "team", .. })
+        ));
+        assert!(matches!(
+            lifted,
+            Err(OkfError::UnknownName { noun: "team", .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suspended_catalogs_names_each_catalog_of_a_suspended_team() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        crate::store::catalogs::create(&db.pool, "shared", "", "family", now())
+            .await
+            .unwrap();
+        crate::store::catalogs::create(&db.pool, "mine", "", TEST_USER, now())
+            .await
+            .unwrap();
+        suspend(&db.pool, "family", Some("Paused."), now())
+            .await
+            .unwrap();
+
+        let map = suspended_catalogs(&db.pool).await.unwrap();
+
+        assert_eq!(map.len(), 1, "only the suspended team's catalog: {map:?}");
+        assert_eq!(
+            map.get("shared"),
+            Some(&SuspendedCatalog {
+                team: "family".to_string(),
+                notice: Some("Paused.".to_string()),
+            })
+        );
     }
 }

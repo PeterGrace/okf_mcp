@@ -219,6 +219,10 @@ impl From<TeamRecord> for TeamView {
             created_at,
             members,
             catalogs,
+            // Not shown yet: Task 5 of milestone 13 adds it to the view.
+            // `_` ignores the field; naming it keeps this pattern exhaustive,
+            // so a new `TeamRecord` field is still a compile error here.
+            suspension: _,
         } = record;
         Self {
             name,
