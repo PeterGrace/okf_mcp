@@ -427,6 +427,8 @@ pub async fn suspended_catalogs(
 
 Fix every other `TeamRecord { ... }` literal the compiler reports (tests, `src/http/api/people.rs` conversions use destructuring: add `suspension` to the pattern; Task 5 uses it).
 
+> **Corrected (issue #363, 2026-11-13).** The only other `TeamRecord` pattern is `From<TeamRecord> for TeamView` in `src/http/api/people.rs`; Task 1 adds `suspension: _` there (the field is ignored until Task 5 shows it). The store tests also check that `suspend` bumps the generation (the spec's test list asks for it) and add `the_schema_refuses_a_notice_without_a_suspension_or_over_the_limit`, which checks the migration's two constraints directly. `clean_notice` also refuses a notice holding a NUL character (`Refused`), since Postgres text cannot store one and it would otherwise be a database error (a 500) when Task 5's route passes a REST body through; `a_blank_notice_is_none_and_a_long_one_is_refused` covers that and a notice of 2000 two-byte characters. Read `src/store/teams.rs` for the shipped `clean_notice`.
+
 - [ ] **Step 5: Run the tests**
 
 Run: `tools/agentic/gate.sh narrow --lib store::teams::tests`
@@ -1290,7 +1292,7 @@ Expected: 404/405 for the new route.
     pub suspension_notice: Option<String>,
 ```
 
-In `From<TeamRecord>`, destructure `suspension` too and set:
+In `From<TeamRecord>`, bind `suspension` (Task 1 left the pattern ignoring it as `suspension: _`; change that to `suspension`) and set:
 
 ```rust
             // `as_ref` borrows inside the `Option`, so both fields can read it.
