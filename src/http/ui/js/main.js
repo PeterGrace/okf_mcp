@@ -26,6 +26,9 @@ function applyTheme(theme) {
 function showLogin(message) {
     $('#app').hidden = true;
     $('#login').hidden = false;
+    // Signing in with an account comes back to this console page; /signin
+    // keeps only a same-origin path such as this one (`safe_return_to`).
+    $('#login-signin').href = `/signin?return_to=${encodeURIComponent(`/ui/${location.hash}`)}`;
     const error = $('#login-error');
     error.textContent = message ?? '';
     error.hidden = !message;
@@ -58,6 +61,7 @@ setUnauthorizedHandler(() => {
     store.key = null;
     store.whoami = null;
     store.csrf = null;
+    store.session = null;
     showLogin(hadKey ? 'The key was refused. Sign in again.' : 'Your session ended. Sign in again.');
 });
 
@@ -71,6 +75,9 @@ $('#login-form').addEventListener('submit', async event => {
         return;
     }
     store.key = key;
+    // The key wins over any cookie, in this browser as on the server.
+    store.session = null;
+    store.csrf = null;
     event.target.reset();
     await enterOrRecover();
 });
@@ -106,6 +113,7 @@ $('#signout').addEventListener('click', async () => {
     store.key = null;
     store.whoami = null;
     store.csrf = null;
+    store.session = null;
     history.replaceState(null, '', '/ui/');
     showLogin();
 });
@@ -135,7 +143,8 @@ async function boot() {
         response = await fetch('/api/v1/session', { headers: authHeaders('GET', { key: null }) });
     } catch { /* the server is down */ }
     if (response?.ok) {
-        store.csrf = (await response.json()).csrf;
+        store.session = await response.json();
+        store.csrf = store.session.csrf;
         store.key = null;
         await enterOrRecover();
     } else if (store.key) {

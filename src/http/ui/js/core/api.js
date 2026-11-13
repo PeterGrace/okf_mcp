@@ -17,6 +17,9 @@ export class ApiError extends Error {
 let unauthorized = () => {};
 export function setUnauthorizedHandler(handler) { unauthorized = handler; }
 
+// The header carrying a console session's CSRF token on writes.
+export const CSRF_HEADER = 'X-OKF-CSRF';
+
 // The headers that authenticate one request to /api/v1, the one place
 // that chooses them: a key as a bearer, or else nothing for the session
 // cookie (the browser sends it by itself, same origin) plus the session's
@@ -24,7 +27,7 @@ export function setUnauthorizedHandler(handler) { unauthorized = handler; }
 // ones; pass `key: null` for a request that must speak for the cookie alone.
 export function authHeaders(method, { key = store.key, csrf = store.csrf } = {}) {
     if (key) return { Authorization: `Bearer ${key}` };
-    if (method !== 'GET' && csrf) return { 'X-OKF-CSRF': csrf };
+    if (method !== 'GET' && csrf) return { [CSRF_HEADER]: csrf };
     return {};
 }
 

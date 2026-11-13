@@ -7,19 +7,46 @@ import { store } from './store.js';
 import { api } from './api.js';
 
 export async function refreshIdentity() {
-    store.whoami = await api.get('/whoami');
-    const me = store.whoami;
+    // Signed in with an account, the session (admin flag, ceiling, CSRF
+    // token) is read again beside whoami: an admin may have changed it.
+    const [session, me] = await Promise.all([
+        store.session ? api.get('/session') : null,
+        api.get('/whoami'),
+    ]);
+    if (session) {
+        store.session = session;
+        store.csrf = session.csrf;
+    }
+    store.whoami = me;
     // A console session is its user; a key shows its user and its name.
     $('#whoami').textContent = me.kind === 'session'
         ? `${me.user} - ${me.access}`
         : `${me.user ? `${me.user} / ` : ''}${me.name ?? me.key_id} - ${me.access}`;
-    document.querySelectorAll('[data-need]').forEach(el => { el.hidden = !store.can(el.dataset.need); });
     if (!me.catalogs.includes(store.catalog)) {
         store.catalog = me.catalogs.includes(me.default_catalog) ? me.default_catalog : (me.catalogs[0] ?? null);
     }
+    // After the catalog is settled: a member's level depends on it.
+    document.querySelectorAll('[data-need]').forEach(el => { el.hidden = !shows(el.dataset.need); });
     const select = $('#catalog-select');
     select.replaceChildren(...me.catalogs.map(name => h('option', { value: name }, name)));
     select.value = store.catalog ?? '';
+}
+
+// Whether an element marked data-need="<need>" shows: "session" for the
+// account pages (signed in with an account, not a key), else an access
+// level.
+function shows(need) {
+    return need === 'session' ? !!store.session : store.can(need);
+}
+
+// The account pages (My keys, My grants, Account) are for a person signed
+// in with their account. Signed in by key, the page says so in a muted
+// paragraph with this `id`. Returns whether the page may render.
+export function requireSession(main, id) {
+    if (store.session) return true;
+    main.append(h('p', { class: 'muted', id },
+        'This page is for people signed in with their account. Sign out, then sign in with your account to use it.'));
+    return false;
 }
 
 // After a key's user changed: when it is the signed-in key, its user is
