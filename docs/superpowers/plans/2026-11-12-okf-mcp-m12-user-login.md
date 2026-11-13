@@ -23572,7 +23572,7 @@ Routes this task calls (all defined in Task 12, with the shapes Task 12 document
 - Create: `src/http/ui/js/components/user-account.js` (the drawer's account sections)
 - Create: `src/http/ui/js/pages/settings.js`
 - Modify: `src/http/ui/js/pages/users.js` (list columns; the drawer loads and shows the account sections, and re-renders through its ticket)
-- Modify: `src/http/ui/js/pages/catalogs.js` ("Team member access" in the drawer, read from `GET /catalogs/{catalog}/member-access`; the stray-`null` append fixed)
+- Modify: `src/http/ui/js/pages/catalogs.js` ("Team member access" in the drawer, read from `GET /catalogs/{catalog}/member-access`)
 - Modify: `src/http/ui/index.html` (Settings link under Administer), `src/http/ui/styles.css` (`.settings-input`)
 - Modify: `tests/ui_e2e/users.rs`, `tests/ui_e2e/catalogs.rs`, `tests/ui_e2e/smoke.rs`, `tests/ui_e2e/main.rs` (`mod settings;`)
 - Test: `tests/ui_e2e/settings.rs`
@@ -24216,14 +24216,9 @@ In `render`, give the Name column the admin pill and add an Email column after D
           render: user => user.email ? h('span', { class: 'mono small' }, user.email) : h('span', { class: 'muted' }, '-') },
 ```
 
-Fix the stray-`null` append (issue #302) while here: replace `table, manager ? null : h('p', ...)` at the end of the `main.append(...)` call with
+> **Corrected (issue #324, 2026-11-13).** Task 14a fixed #302: `users.js`, `teams.js`, `catalogs.js` and `transfer.js` end `render` with `fill(main, ...)` (from `core/dom.js`), which drops the conditional `null`. Keep that call as it is; there is no stray-`null` step here any more.
 
-```js
-        table);
-    if (!manager) main.append(h('p', { class: 'muted small' }, NEEDS_EVERY_CATALOG));
-```
-
-(skip this line change if #302's fix has already landed on `main`). Replace `openDetail` with:
+Replace `openDetail` with:
 
 ```js
     // The drawer: the user's teams, the credentials this key manages, the
@@ -24346,20 +24341,7 @@ and extend the shell import to `import { canAdministerPeople, keyUserChanged, re
                 remove));
 ```
 
-Fix the stray-`null` append at the end of `render` (issue #302's pattern; the page's own `main.append` is native):
-
-```js
-    main.append(
-        h('div', { class: 'page-head' },
-            h('div', {}, h('h1', {}, 'Catalogs'), h('p', { class: 'muted' }, 'The catalogs this key reaches.')),
-            h('div', { class: 'actions' },
-                creator ? h('button', { type: 'button', id: 'catalog-create', onclick: openCreate }, 'New catalog') : null)),
-        table);
-    if (admin && !creator) {
-        main.append(h('p', { class: 'muted small' }, 'Creating a catalog needs an admin key that reaches every catalog.'));
-    }
-    await load();
-```
+> **Corrected (issue #324, 2026-11-13).** Task 14a already fixed this page's stray `null` (issue #302): `render` ends with `fill(main, ...)`, which drops the conditional note. Leave it as it is.
 
 - [ ] **Step 8: Create `js/pages/settings.js`.**
 
