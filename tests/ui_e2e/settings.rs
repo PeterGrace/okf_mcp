@@ -22,6 +22,11 @@ const MAX_KEYS_SETTING: &str = "async () => { \
     const { settings } = await (await fetch('/api/v1/settings', { headers })).json(); \
     return settings.find(row => row.key === 'max_keys_per_user'); }";
 
+/// Retries the mail `id` through the API with the console's stored key, as
+/// another admin would; answers the status.
+const RETRY_ELSEWHERE: &str = "async (id) => (await fetch(`/api/v1/mail/queue/${id}/retry`, { \
+    method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('okf.key')}` } })).status";
+
 /// Queues a test mail to `to`, then marks it failed for good (apalis's
 /// `Killed`, which no worker fetches again) with an SMTP error, as a
 /// permanent provider refusal would.
@@ -153,9 +158,16 @@ async fn an_admin_sends_a_test_email_and_retries_and_deletes_failed_mail() {
             ),
             json!(0)
         );
+        // An address the browser's own check accepts and the server refuses
+        // (over 254 characters): the reason stays under the form.
+        let long = format!("{}@example.com", "a".repeat(250));
+        ui.fill("#mail-test-form input[name=to]", &long);
+        ui.click("#mail-test-form button[type=submit]");
+        ui.wait_text("[data-test=mail-test-error]", "longer than 254");
         ui.fill("#mail-test-form input[name=to]", "carol@example.com");
         ui.click("#mail-test-form button[type=submit]");
         ui.wait_text("#toasts", "Queued a test email to carol@example.com");
+        ui.wait_hidden("[data-test=mail-test-error]");
         // The queue is read again: the new mail is listed.
         ui.wait_text("#mail-queue-table", "carol@example.com");
         ui.wait_text(&format!("[data-test=mail-status-{retried}]"), "failed");
@@ -163,6 +175,13 @@ async fn an_admin_sends_a_test_email_and_retries_and_deletes_failed_mail() {
         ui.click(&format!("[data-test=mail-retry-{retried}]"));
         ui.wait_text("#toasts", "bob@example.com");
         wait_not_failed(ui, &retried);
+        // A Retry the server refuses: dave's mail was retried elsewhere
+        // since the page drew it, so it has not failed any more (409). The
+        // reason stays beside the mail, which is listed as pending again.
+        assert_eq!(ui.eval(RETRY_ELSEWHERE, json!(deleted)), json!(204));
+        ui.click(&format!("[data-test=mail-retry-{deleted}]"));
+        ui.wait_text(&format!("[data-test=mail-refusal-{deleted}]"), "has not failed");
+        ui.wait_text(&format!("[data-test=mail-status-{deleted}]"), "pending");
         ui.click(&format!("[data-test=mail-delete-{deleted}]"));
         ui.click("#confirm-ok");
         ui.wait_hidden(&format!("[data-test=mail-status-{deleted}]"));

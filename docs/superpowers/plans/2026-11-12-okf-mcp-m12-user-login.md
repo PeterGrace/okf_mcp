@@ -24299,10 +24299,9 @@ Replace `openDetail` with:
 
 and extend the shell import to `import { canAdministerPeople, keyUserChanged, refreshIdentity, refreshUnassigned } from '../core/shell.js';`. The `onRow: user => openDetail(user.name)` call is unchanged (the default ticket).
 
-- [ ] **Step 7: Team member access in `pages/catalogs.js`.**
+- [ ] **Step 7: Team member access in `pages/catalogs.js`.** `GET /api/v1/catalogs` does not carry member access; the drawer reads it from Task 12's `GET /api/v1/catalogs/{catalog}/member-access`. In `openEdit`, build the section after `owner` and pass it to `ticket.open` between `owner` and the danger zone:
 
 > **Superseded (issue #326, 2026-11-13).** The section is a module function, `memberAccess(row, allowed, ticket)` in `src/http/ui/js/pages/catalogs.js`, returning `{ section, refresh }`; `openEdit` runs `refresh()` after `ticket.open`. A save no longer closes the drawer: refused or not, the value is read again from `GET /catalogs/{catalog}/member-access` (dropped once the ticket is stale), and a refusal's reason stays in `#catalog-member-access-error`. The read is not `quiet`, so a failure is toasted. The journey checks the new value in the open drawer and `ceiling::member_access` afterwards.
- `GET /api/v1/catalogs` does not carry member access; the drawer reads it from Task 12's `GET /api/v1/catalogs/{catalog}/member-access`. In `openEdit`, build the section after `owner` and pass it to `ticket.open` between `owner` and the danger zone:
 
 ```js
         // What members of the owner team reach through their accounts: the

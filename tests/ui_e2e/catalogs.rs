@@ -448,6 +448,22 @@ async fn an_admin_signed_in_with_a_password_imports_an_archive() {
     assert_eq!(current.generation(), generation + 1);
 }
 
+/// Makes the page's next `PUT .../member-access` answer 409 with a reason,
+/// without reaching the server, as a refusal would (the console has no
+/// control a full admin can get refused through).
+const REFUSE_NEXT_MEMBER_ACCESS_PUT: &str = "() => { \
+    const real = window.fetch; \
+    window.fetch = (url, init) => { \
+        if (init?.method === 'PUT' && String(url).endsWith('/member-access')) { \
+            window.fetch = real; \
+            return Promise.resolve(new Response( \
+                JSON.stringify({ error: 'refused', message: 'refused by the test' }), \
+                { status: 409, headers: { 'Content-Type': 'application/json' } })); \
+        } \
+        return real(url, init); \
+    }; \
+    return true; }";
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn member_access_read_makes_a_team_catalog_read_only_for_its_members() {
     let server = login_server().await;
@@ -476,9 +492,20 @@ async fn member_access_read_makes_a_team_catalog_read_only_for_its_members() {
         ui.wait_text("#catalog-member-access-current", "write");
         // Nothing to save until the choice differs from the server's value.
         ui.wait_visible("#catalog-member-access-save[disabled]");
+        // A refused save: its reason stays in the drawer, the value is read
+        // again (still write), and the drawer stays usable.
+        ui.eval(REFUSE_NEXT_MEMBER_ACCESS_PUT, json!(null));
+        ui.select("#catalog-member-access-select", "read");
+        ui.click("#catalog-member-access-save");
+        ui.wait_visible("#catalog-member-access-error");
+        ui.wait_text("#catalog-member-access-error", "refused by the test");
+        ui.wait_text("#catalog-member-access-current", "write");
+        ui.wait_visible("#catalog-member-access-select:not([disabled])");
+        // Then a real one.
         ui.select("#catalog-member-access-select", "read");
         ui.click("#catalog-member-access-save");
         ui.wait_text("#toasts", "now reach shared at read");
+        ui.wait_hidden("#catalog-member-access-error");
         // The drawer stays open and shows the value read again.
         ui.wait_text("#catalog-member-access-current", "read");
         ui.wait_visible("#catalog-member-access-save[disabled]");
