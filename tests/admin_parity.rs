@@ -5,7 +5,9 @@
 //! and the console cannot drift apart unnoticed.
 //!
 //! The checks, all without a database or a server:
-//! - every covered subcommand exists in the clap tree;
+//! - every covered subcommand exists in the clap tree, and every covered
+//!   flag (an entry such as `user list --email`) is an option of its
+//!   subcommand;
 //! - every `user`, `team`, `settings` and `mail` subcommand is covered, so
 //!   a new one fails until it is added to the table;
 //! - each covered subcommand has a parity row whose REST cell names a route
@@ -25,10 +27,13 @@ const OPERATIONS: &str = include_str!("../docs/operations.md");
 /// The heading the parity table sits under.
 const PARITY_HEADING: &str = "### CLI, API and console parity";
 
-/// The subcommands under parity, as `okf-mcp <path>`.
+/// The subcommands under parity, as `okf-mcp <path>`. An entry may end
+/// in one ` --<flag>`, for a flag with its own parity row (milestone 14
+/// Decision 15).
 const COVERED: &[&str] = &[
     "user create",
     "user list",
+    "user list --email",
     "user delete",
     "user set-admin",
     "user set-email",
@@ -117,20 +122,74 @@ fn documented_routes() -> Vec<&'static str> {
         .collect()
 }
 
+/// Splits a [`COVERED`] entry into its subcommand path and its flag.
+///
+/// # Arguments
+/// * `entry` - such as `user list` or `user list --email`.
+///
+/// # Returns
+/// The subcommand path and the flag's long name without `--` (`None` for
+/// a plain subcommand entry).
+fn split_flag(entry: &str) -> (&str, Option<&str>) {
+    // `split_once` is Python's `str.partition`, answering `None` when the
+    // separator is absent.
+    match entry.split_once(" --") {
+        Some((path, flag)) => (path, Some(flag)),
+        None => (entry, None),
+    }
+}
+
+/// Walks the clap tree from `cli` to the subcommand at `path`.
+///
+/// # Arguments
+/// * `cli` - the root command.
+/// * `path` - space-separated subcommand names, such as `user list`.
+///
+/// # Returns
+/// The subcommand.
+///
+/// # Panics
+/// When a part of `path` is not a subcommand.
+fn subcommand<'a>(cli: &'a clap::Command, path: &str) -> &'a clap::Command {
+    path.split(' ').fold(cli, |command, part| {
+        command
+            .find_subcommand(part)
+            .unwrap_or_else(|| panic!("`okf-mcp {path}` is not a subcommand"))
+    })
+}
+
 #[test]
 fn every_covered_subcommand_exists_and_is_in_the_parity_table() {
     let cli = Cli::command();
-    for path in COVERED {
-        // Walk the clap tree to prove the subcommand exists.
-        let mut command = &cli;
-        for part in path.split(' ') {
-            command = command
-                .find_subcommand(part)
-                .unwrap_or_else(|| panic!("`okf-mcp {path}` is not a subcommand"));
-        }
+    for entry in COVERED {
+        // Walk the clap tree to prove the subcommand exists; the row is
+        // still required for the whole entry, flag included.
+        subcommand(&cli, split_flag(entry).0);
         assert!(
-            parity_row(path).is_some(),
-            "parity table lacks `okf-mcp {path}`"
+            parity_row(entry).is_some(),
+            "parity table lacks `okf-mcp {entry}`"
+        );
+    }
+}
+
+#[test]
+fn a_covered_flag_is_an_option_of_its_subcommand() {
+    let cli = Cli::command();
+    // `filter_map` keeps only the entries that name a flag.
+    let flags: Vec<(&str, &str)> = COVERED
+        .iter()
+        .filter_map(|entry| match split_flag(entry) {
+            (path, Some(flag)) => Some((path, flag)),
+            (_, None) => None,
+        })
+        .collect();
+    assert!(!flags.is_empty(), "COVERED names no flag");
+    for (path, flag) in flags {
+        assert!(
+            subcommand(&cli, path)
+                .get_arguments()
+                .any(|argument| argument.get_long() == Some(flag)),
+            "`okf-mcp {path}` has no --{flag}"
         );
     }
 }

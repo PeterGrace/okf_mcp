@@ -2060,6 +2060,13 @@ placed in the `actions` div before New user.
 
 and the API reference's `GET /api/v1/users` row documents `?email=` (0 or 1 users, the same view). Add to the parity section's lead: "A row may name a subcommand's flag (`user list --email`); the test checks the flag exists."
 
+> **Corrected (issue #393, 2026-11-14).** What shipped differs in these details; read the code, not the sketches above:
+> - The CLI test runs `okf(&db, &["user", "list", "--email", ..])` (the module's clap-parsing helper) and checks the whole line; the sketch's `user(.., now())` call and `seed_user` path do not fit `src/cli/people.rs`' tests. The flag is `#[arg(long, value_name = "ADDRESS")]`.
+> - `tests/admin_parity.rs` gained two helpers, `split_flag(entry) -> (path, Option<flag>)` and `subcommand(cli, path)`, which both tests use; Task 5 only adds `"key create --provisioner"` to `COVERED`.
+> - `list_users` builds `records: Vec<UserRecord>` (the lookup's `Option` collected, or `users::list`) and then maps to `UserView`; Task 5's provisioner filter goes on `records` (`UserRecord.is_admin`).
+> - The REST test also checks that a scoped admin key may look up (the list's rule), that malformed text finds none, and that an unknown parameter (`?mail=`) is 400.
+> - `listTable`'s `empty` may be a function, so the filtered Users table says "No user matches the filter."; `styles.css` sizes `.page-head input[type=search]`. The journey also holds a list answer across a filter change and checks it is drawn through the newest filter.
+
 - [ ] **Step 4: Run, gate, commit**
 
 Run the four tests, `tools/agentic/gate.sh test`, `tools/agentic/gate.sh test-ui`, `fmt`, `lint`.
@@ -3038,7 +3045,7 @@ In `routes`, add the gate inside the principal layer (a later `route_layer` wrap
 - [ ] **Step 6: The allowed handlers**
 
 `src/http/api/people.rs`:
-- `list_users`: `require_reader`; a provisioner must give `email` (else 403 "a provisioner looks users up by email"); its result leaves out admin users (`filter(|user| !(principal.provisioner && user.is_admin))`).
+- `list_users`: `require_reader`; a provisioner must give `email` (else 403 "a provisioner looks users up by email"); its result leaves out admin users (`filter(|user| !(principal.provisioner && user.is_admin))`, on Task 3's `records` before they become `UserView`s; *corrected, issue #393*).
 - `user_detail`, `team_detail`: `require_reader`; a provisioner gets 403 for an admin user's detail, and no keys or codes in it (`manages` is vacuously true for a credential with no catalogs).
 - `create_user`, `set_email`, `invite_user`, `delete_user`, `create_team`, `set_member`, `remove_member`, `delete_team`, `set_suspension` (M13): `require_every_catalog` becomes `require_manager`. Their store functions already refuse a provisioner on an admin user through `audit::refuse_admin_target` (Tasks 4, 6a, 6b); the `AuditActor` extractor now carries `provisioner`.
 - Update the module doc's access list.

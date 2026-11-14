@@ -260,7 +260,12 @@ pub enum UserCommand {
     },
     /// List users with their credential counts, emails, admin flags and
     /// teams.
-    List,
+    List {
+        /// Only the user with this email address (any letter case); prints
+        /// nothing when no user has it.
+        #[arg(long, value_name = "ADDRESS")]
+        email: Option<String>,
+    },
     /// Delete a user nothing references, with its personal team.
     Delete {
         /// Its name.

@@ -2,6 +2,8 @@ import { h } from '../core/dom.js';
 
 // A table over rows already in memory, sortable by any column with a sort().
 // columns: [{ key, label, render?(row) -> Node|string, sort?(row) -> value, class? }]
+// empty: the text for no rows, or a function answering it at each draw (a
+// filtered table can say that nothing matches rather than that nothing exists).
 export function listTable(columns, rows, { onRow, empty = 'Nothing here.' } = {}) {
     let sortKey = null;
     let direction = 1;
@@ -28,7 +30,8 @@ export function listTable(columns, rows, { onRow, empty = 'Nothing here.' } = {}
             ? view.map(row => h('tr', { class: onRow ? 'clickable' : null, onclick: onRow ? () => onRow(row) : null },
                 columns.map(column => h('td', { class: column.class ?? null },
                     column.render ? column.render(row) : (row[column.key] ?? '-')))))
-            : [h('tr', {}, h('td', { colspan: columns.length, class: 'muted empty' }, empty))]));
+            : [h('tr', {}, h('td', { colspan: columns.length, class: 'muted empty' },
+                typeof empty === 'function' ? empty() : empty))]));
     }
 
     table.redraw = newRows => { if (newRows) rows = newRows; draw(); };

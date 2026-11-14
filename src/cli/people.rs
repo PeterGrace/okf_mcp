@@ -67,7 +67,17 @@ pub(super) async fn user(
                 created.name, created.name
             )
         }
-        UserCommand::List => lines(users::list(pool).await?.iter().map(format_user)),
+        // `--email`: zero or one user; `Option::iter` yields it or nothing,
+        // so both arms print through the same `lines(.. format_user)`.
+        UserCommand::List { email: Some(email) } => lines(
+            users::find_record_by_email(pool, &email)
+                .await?
+                .iter()
+                .map(format_user),
+        ),
+        UserCommand::List { email: None } => {
+            lines(users::list(pool).await?.iter().map(format_user))
+        }
         UserCommand::Delete { name } => {
             users::delete(pool, &name).await?;
             format!("deleted user {name}\n")
@@ -554,6 +564,29 @@ mod tests {
         );
         assert_eq!(deleted, "deleted user alice\n");
         assert!(!after.contains("alice"), "{after}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn user_list_with_an_email_prints_only_that_user() {
+        let db = test_db().await;
+        okf(&db, &["user", "create", "alice"]).await.unwrap();
+        okf(&db, &["user", "create", "bob"]).await.unwrap();
+        okf(&db, &["user", "set-email", "alice", "alice@example.com"])
+            .await
+            .unwrap();
+
+        let listed = okf(&db, &["user", "list", "--email", "ALICE@example.com"])
+            .await
+            .unwrap();
+        let none = okf(&db, &["user", "list", "--email", "x@example.com"])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            listed,
+            "alice\tcredentials 0\temail alice@example.com\tadmin no\tteams alice\t\n"
+        );
+        assert_eq!(none, "");
     }
 
     #[tokio::test(flavor = "multi_thread")]
