@@ -23,6 +23,10 @@
 //! [`set`] and [`reset`] record each change in the audit log
 //! (`setting.changed`, `setting.cleared`) in their own transaction.
 //!
+//! Lock order: every settings write bumps `admin_generation` (locking the
+//! `server_state` row) before it reads or writes any `server_settings` row,
+//! so concurrent writes queue on that one row and never deadlock.
+//!
 //! One function, `apply`, checks a value both when it is set (a bad one
 //! is refused with 422) and when it is loaded (a row this server cannot
 //! read, from a newer version or a hand edit, is logged at `warn` and the
@@ -648,17 +652,21 @@ pub async fn reset(
     now: DateTime<Utc>,
 ) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
+    // The generation row first, as in `set`: every settings write locks it
+    // before any `server_settings` row, so a concurrent set and reset queue
+    // there instead of each holding the row the other waits on (a deadlock).
+    bump_admin_generation(&mut tx).await?;
     // `RETURNING value`: the deleted override, for the entry.
     let deleted: Option<Value> =
         sqlx::query_scalar("DELETE FROM server_settings WHERE key = $1 RETURNING value")
             .bind(key.as_str())
             .fetch_optional(&mut *tx)
             .await?;
-    // `let ... else`: no override, nothing to record or bump.
+    // `let ... else`: no override, nothing to record; dropping `tx` rolls
+    // the generation bump back.
     let Some(from) = deleted else {
         return Ok(());
     };
-    bump_admin_generation(&mut tx).await?;
     let details = match audited_value(key, &from) {
         Some(from) => serde_json::json!({ "from": from }),
         None => serde_json::json!({}),
@@ -1461,5 +1469,109 @@ mod tests {
             (changed[0].source.as_str(), changed[0].actor_label.as_str()),
             ("cli", expected.as_str())
         );
+    }
+
+    /// Runs `set` to 4 and `reset` of `max_keys_per_user` at once, with an
+    /// override of 3 stored, and answers both results. The lock order is
+    /// forced: a held `server_state` row queues `set` on it first, then
+    /// `reset`; the hold is released only once both wait. Taken in the old
+    /// order (`reset` deleting before it bumps), `set` would win the
+    /// generation row and wait on the row `reset` deleted, while `reset`
+    /// waited on the generation row: a deadlock Postgres aborts.
+    async fn set_and_reset_queued_on_the_generation_row(
+        pool: &sqlx::PgPool,
+    ) -> (Result<(), OkfError>, Result<(), OkfError>) {
+        use crate::http::api::testing::wait_for_lock_waiters;
+        use std::time::Duration;
+        set(pool, SettingKey::MaxKeysPerUser, "3", &by("alice"), now())
+            .await
+            .unwrap();
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("UPDATE server_state SET admin_generation = admin_generation")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        // `tokio::spawn` runs each call on its own task (and connection).
+        let setter = tokio::spawn({
+            let pool = pool.clone();
+            async move { set(&pool, SettingKey::MaxKeysPerUser, "4", &by("alice"), now()).await }
+        });
+        wait_for_lock_waiters(pool, 1).await;
+        let resetter = tokio::spawn({
+            let pool = pool.clone();
+            async move { reset(&pool, SettingKey::MaxKeysPerUser, &by("bob"), now()).await }
+        });
+        wait_for_lock_waiters(pool, 2).await;
+        holder.commit().await.unwrap();
+        let wait = Duration::from_secs(30);
+        let set_result = tokio::time::timeout(wait, setter)
+            .await
+            .expect("set finished within 30 s")
+            .expect("the set task did not panic");
+        let reset_result = tokio::time::timeout(wait, resetter)
+            .await
+            .expect("reset finished within 30 s")
+            .expect("the reset task did not panic");
+        (set_result, reset_result)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_concurrent_set_and_reset_of_one_key_both_succeed_in_order() {
+        let db = test_db().await;
+
+        let (set_result, reset_result) = set_and_reset_queued_on_the_generation_row(&db.pool).await;
+
+        assert!(set_result.is_ok(), "{set_result:?}");
+        assert!(reset_result.is_ok(), "{reset_result:?}");
+        let changed = audit::testing::entries(&db.pool, "setting.changed").await;
+        let cleared = audit::testing::entries(&db.pool, "setting.cleared").await;
+        assert_eq!(changed[1].details, serde_json::json!({"from": 3, "to": 4}));
+        assert_eq!(
+            cleared
+                .iter()
+                .map(|e| e.details.clone())
+                .collect::<Vec<_>>(),
+            [serde_json::json!({"from": 4})],
+            "reset ran after set, and cleared what set stored"
+        );
+        assert!(list(&db.pool, &defaults())
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| !row.overridden));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn many_racing_sets_and_resets_of_one_key_all_succeed() {
+        let db = test_db().await;
+
+        let (alice, bob) = (by("alice"), by("bob"));
+        for round in 0..20 {
+            let value = format!("{}", round + 1);
+            let wait = std::time::Duration::from_secs(30);
+            let (set_result, reset_result) = tokio::time::timeout(wait, async {
+                tokio::join!(
+                    set(&db.pool, SettingKey::MaxKeysPerUser, &value, &alice, now()),
+                    reset(&db.pool, SettingKey::MaxKeysPerUser, &bob, now()),
+                )
+            })
+            .await
+            .expect("both finished within 30 s");
+
+            assert!(set_result.is_ok(), "round {round}: {set_result:?}");
+            assert!(reset_result.is_ok(), "round {round}: {reset_result:?}");
+        }
+        let changed = audit::testing::entries(&db.pool, "setting.changed").await;
+        let cleared = audit::testing::entries(&db.pool, "setting.cleared").await;
+        // Each clear removed exactly the value a set stored just before it.
+        for entry in &cleared {
+            assert!(
+                changed
+                    .iter()
+                    .any(|c| c.details["to"] == entry.details["from"]),
+                "{entry:?}"
+            );
+        }
+        assert_eq!(changed.len(), 20, "every round's set changed the value");
     }
 }

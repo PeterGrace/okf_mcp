@@ -43,9 +43,12 @@
 
 ## Notes
 
-- `set` bumps the administrative generation before it reads the previous
-  value: `FOR UPDATE` cannot lock a row that does not exist yet, and the
-  generation row serializes every settings write, so `from` is exact even
-  for two concurrent first overrides.
+- Lock order: `set` and `reset` both bump the administrative generation
+  (locking the `server_state` row) before touching any `server_settings`
+  row. `FOR UPDATE` cannot lock a row that does not exist yet, so this one
+  row serializes every settings write and makes `from` exact. `reset` first
+  deleted before bumping, which deadlocked against a concurrent `set` (PR
+  #416 review); two concurrency tests now cover a set and a reset of one
+  key, one with the interleaving forced.
 - The plan (Task 6d, and Task 9a's settings) carries dated
   `Corrected (issue #399)` notes for these differences.
