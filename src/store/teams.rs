@@ -1883,6 +1883,13 @@ mod tests {
             .await;
         let actor = AuditActor::cli();
 
+        let ops = NewTeam {
+            name: "ops",
+            display_name: "",
+            owner: "alice",
+        };
+
+        let created = create(&db.pool, &ops, &actor, now()).await;
         let added = set_member(
             &db.pool,
             &membership("family", TEST_USER, Role::Member),
@@ -1893,7 +1900,11 @@ mod tests {
         let suspended = suspend(&db.pool, "family", None, &actor, now()).await;
         let deleted = delete(&db.pool, "family", &actor, now()).await;
 
-        assert!(added.is_err() && suspended.is_err() && deleted.is_err());
+        assert!(created.is_err() && added.is_err() && suspended.is_err() && deleted.is_err());
+        assert!(matches!(
+            find(&db.pool, "ops").await,
+            Err(OkfError::UnknownName { .. })
+        ));
         let team = find(&db.pool, "family").await.unwrap();
         assert_eq!(team.members.len(), 1, "the addition rolled back");
         assert_eq!(team.suspension, None, "the suspension rolled back");
@@ -2152,5 +2163,85 @@ mod tests {
             .expect("the change finishes")
             .unwrap();
         assert!(changed.is_ok(), "{changed:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_audit_write_fails_a_removal_and_a_lift() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let actor = AuditActor::cli();
+        set_member(
+            &db.pool,
+            &membership("family", TEST_USER, Role::Member),
+            &actor,
+            now(),
+        )
+        .await
+        .unwrap();
+        suspend(&db.pool, "family", None, &actor, now())
+            .await
+            .unwrap();
+        crate::http::api::testing::fail_on(&db.pool, "BEFORE INSERT ON audit_entries FOR EACH ROW")
+            .await;
+
+        let removed = remove_member(&db.pool, "family", TEST_USER, &actor, now()).await;
+        let lifted = unsuspend(&db.pool, "family", &actor, now()).await;
+
+        assert!(removed.is_err() && lifted.is_err());
+        let team = find(&db.pool, "family").await.unwrap();
+        assert_eq!(team.members.len(), 2, "the removal rolled back");
+        assert!(team.suspension.is_some(), "the lift rolled back");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_malformed_team_or_user_name_is_unknown_and_records_nothing() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let actor = AuditActor::cli();
+        let bad = "fam\0ily";
+        let owned_by_bad = NewTeam {
+            name: "ops",
+            display_name: "",
+            owner: bad,
+        };
+
+        let outcomes = [
+            create(&db.pool, &owned_by_bad, &actor, now())
+                .await
+                .map(|_| ()),
+            set_member(
+                &db.pool,
+                &membership(bad, TEST_USER, Role::Member),
+                &actor,
+                now(),
+            )
+            .await
+            .map(|_| ()),
+            set_member(
+                &db.pool,
+                &membership("family", bad, Role::Member),
+                &actor,
+                now(),
+            )
+            .await
+            .map(|_| ()),
+            remove_member(&db.pool, bad, TEST_USER, &actor, now()).await,
+            remove_member(&db.pool, "family", bad, &actor, now()).await,
+            delete(&db.pool, bad, &actor, now()).await,
+            unsuspend(&db.pool, bad, &actor, now()).await.map(|_| ()),
+        ];
+
+        // A NUL would be a database error (a 500) if it were bound.
+        for outcome in outcomes {
+            assert!(
+                matches!(outcome, Err(OkfError::UnknownName { .. })),
+                "{outcome:?}"
+            );
+        }
+        let entries: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_entries")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(entries, 1, "family's team.created only");
     }
 }

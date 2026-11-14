@@ -1879,6 +1879,8 @@ pub(crate) mod tests {
         seed_catalog_owned_by(&db.pool, "alice").await;
         code_for(&db.pool, "alice").await;
         let generation = catalogs::admin_generation(&db.pool).await.unwrap();
+        // The catalog's own `catalog.created` entry.
+        let entries = count(&db.pool, "SELECT count(*) FROM audit_entries").await;
 
         let refused = delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await;
 
@@ -1888,7 +1890,8 @@ pub(crate) mod tests {
         assert_eq!(team.catalogs, ["shared"]);
         assert_eq!(
             count(&db.pool, "SELECT count(*) FROM audit_entries").await,
-            0
+            entries,
+            "the refusal recorded nothing"
         );
     }
 

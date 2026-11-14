@@ -185,7 +185,10 @@ pub async fn set_owner(
 ) -> Result<Option<String>, OkfError> {
     check_name(name)?;
     let mut tx = pool.begin().await?;
-    // The new owner's person, and the old one's (through the catalog).
+    // The new owner's person, and the old one's (through the catalog). A
+    // concurrent `set_owner` committing between this and the `UPDATE` below
+    // leaves the old person to `audit_team_ref`, locked late; at worst
+    // Postgres then aborts one of the two as a deadlock (`Busy`, retryable).
     audit::lock_people(
         &mut tx,
         actor,

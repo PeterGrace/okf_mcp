@@ -1009,9 +1009,14 @@ mod tests {
             .await
             .unwrap();
         let refused = import(&db.pool, "pg", files(&[]), &options(false, at(4))).await;
+        let malformed = import(&db.pool, "p\0g", files(&[]), &options(true, at(5))).await;
 
         assert_eq!(same.unchanged, 1);
         assert!(matches!(refused, Err(OkfError::Refused { .. })));
+        assert!(matches!(
+            malformed,
+            Err(OkfError::CatalogNotSelected { .. })
+        ));
         let imported = crate::store::audit::testing::entries(&db.pool, "catalog.imported").await;
         assert_eq!(imported.len(), 2, "nothing for no change: {imported:?}");
         assert_eq!(imported[0].target.as_deref(), Some("pg"));
