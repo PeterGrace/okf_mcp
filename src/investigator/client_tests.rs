@@ -640,6 +640,7 @@ async fn investigator_client_real_slice1_http_nine_tools() {
             expires_at: None,
             levels: &[],
         },
+        &crate::store::audit::AuditActor::cli(),
         chrono::Utc::now(),
     )
     .await
@@ -704,9 +705,14 @@ async fn investigator_client_real_slice1_http_nine_tools() {
         .unwrap();
     assert_eq!(report["run"]["state"], "completed");
     assert_eq!(report["work"][0]["assessment"], "unverifiable");
-    keys::revoke(app.app.pool(), "reporter", chrono::Utc::now())
-        .await
-        .unwrap();
+    keys::revoke(
+        app.app.pool(),
+        "reporter",
+        &crate::store::audit::AuditActor::cli(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
     app.app.poll().await.unwrap();
     assert_eq!(client.call(search()).await, Err(RunnerError::Permission));
     assert_eq!(client.call(search()).await, Err(RunnerError::Permission));

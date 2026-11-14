@@ -685,6 +685,7 @@ async fn list_keys(
 /// or the lifetime limit, or for an unknown body field such as `all`.
 async fn create_key(
     State(app): State<Arc<App>>,
+    audit: crate::store::audit::AuditActor,
     Extension(principal): Extension<Arc<Principal>>,
     Json(body): Json<CreateKeyBody>,
 ) -> Result<Json<CreatedKeyView>, AppError> {
@@ -730,7 +731,8 @@ async fn create_key(
         levels: &grants,
     };
     let created =
-        key_rows::create_self_issued(app.pool(), &new, policy.max_keys_per_user, now).await?;
+        key_rows::create_self_issued(app.pool(), &new, policy.max_keys_per_user, &audit, now)
+            .await?;
     tracing::info!(user = %user.name, key = %created.id, "self-issued key created");
     settle(&app).await;
     let key = own(&app, user, KeyKind::Key, &created.id).await?;
@@ -770,10 +772,11 @@ async fn rename_key(
 /// 409 if it is already revoked.
 async fn revoke_key(
     State(app): State<Arc<App>>,
+    audit: crate::store::audit::AuditActor,
     Extension(principal): Extension<Arc<Principal>>,
     Path(id): Path<String>,
 ) -> Result<Json<KeyView>, AppError> {
-    revoke_own(&app, &principal, KeyKind::Key, &id).await
+    revoke_own(&app, &principal, KeyKind::Key, &id, &audit).await
 }
 
 /// `GET /me/grants`: the user's OAuth grants.
@@ -797,10 +800,11 @@ async fn list_grants(
 /// As [`revoke_key`].
 async fn revoke_grant(
     State(app): State<Arc<App>>,
+    audit: crate::store::audit::AuditActor,
     Extension(principal): Extension<Arc<Principal>>,
     Path(id): Path<String>,
 ) -> Result<Json<KeyView>, AppError> {
-    revoke_own(&app, &principal, KeyKind::OAuth, &id).await
+    revoke_own(&app, &principal, KeyKind::OAuth, &id, &audit).await
 }
 
 /// The body of [`revoke_key`] and [`revoke_grant`]: revokes the session
@@ -824,10 +828,11 @@ async fn revoke_own(
     principal: &Principal,
     kind: KeyKind,
     id: &str,
+    audit: &crate::store::audit::AuditActor,
 ) -> Result<Json<KeyView>, AppError> {
     let user = session_user(principal)?;
     let target = own(app, user, kind, id).await?;
-    key_rows::revoke_by_id(app.pool(), &target.id, app.clock().now()).await?;
+    key_rows::revoke_by_id(app.pool(), &target.id, audit, app.clock().now()).await?;
     tracing::info!(user = %user.name, credential = %target.id, "self-service revoke");
     settle(app).await;
     Ok(Json(own(app, user, kind, &target.id).await?.into()))
@@ -1688,6 +1693,7 @@ mod tests {
                     expires_at: Utc::now() + TimeDelta::hours(1),
                     user,
                 },
+                &crate::store::audit::AuditActor::cli(),
                 Utc::now(),
             )
             .await

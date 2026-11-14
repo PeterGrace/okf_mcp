@@ -13,6 +13,7 @@ use sqlx::PgPool;
 
 use crate::error::OkfError;
 use crate::keys::{self, SIGN_IN_CODE_PREFIX};
+use crate::store::audit::{self, Action, AuditActor, Entry, Target};
 use crate::store::catalogs::bump_admin_generation;
 use crate::store::keys::{is_valid_name, resolve_grants, Access, Grants};
 use crate::store::oauth::clients::{ClientKind, ClientRecord};
@@ -245,6 +246,7 @@ pub fn expiry(
 /// # Arguments
 /// * `pool` - the database.
 /// * `new` - the code's template and expiry.
+/// * `audit` - the caller recorded with this change.
 /// * `now` - the creation time (server clock).
 ///
 /// # Returns
@@ -259,6 +261,7 @@ pub fn expiry(
 pub async fn create(
     pool: &PgPool,
     new: &NewSignInCode<'_>,
+    audit: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<CreatedSignInCode, OkfError> {
     let refuse = |reason: String| Err(OkfError::Refused { reason });
@@ -283,6 +286,20 @@ pub async fn create(
         ));
     }
     let mut tx = pool.begin().await?;
+    let catalogs: Vec<&str> = match new.grants {
+        Grants::All => Vec::new(),
+        Grants::Catalogs(names) => names.iter().map(String::as_str).collect(),
+    };
+    audit::lock_people(
+        &mut tx,
+        audit,
+        &audit::People {
+            target: Some((new.user, audit::RowLock::KeyShare)),
+            catalogs: &catalogs,
+            ..Default::default()
+        },
+    )
+    .await?;
     let (granted, default_catalog_id) = resolve_grants(
         &mut tx,
         "sign-in code",
@@ -321,6 +338,9 @@ pub async fn create(
     .bind(&granted)
     .execute(&mut *tx)
     .await?;
+    let teams = audit::code_teams(&mut tx, &id).await?;
+    audit::record(&mut tx, audit, &Entry { action: Action::OauthCodeCreated, target: Target::Code(&id), person: Some(&user_id), teams: &teams,
+        details: serde_json::json!({"access": new.access.as_str(), "all_catalogs": matches!(new.grants, Grants::All), "catalogs": granted.len()}) }, now).await?;
     tx.commit().await?;
     Ok(CreatedSignInCode { id, code })
 }
@@ -389,25 +409,48 @@ pub async fn find_live(
 /// # Arguments
 /// * `pool` - the database.
 /// * `id` - the code's id.
+/// * `audit` - the caller recorded with this change.
 /// * `now` - the revocation time.
 ///
 /// # Errors
 /// [`OkfError::Refused`] for an unknown, redeemed or already revoked code;
 /// [`OkfError::Database`].
-pub async fn revoke(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), OkfError> {
+pub async fn revoke(
+    pool: &PgPool,
+    id: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
+    let mut tx = pool.begin().await?;
+    audit::lock_credential_people(&mut tx, audit, id, true, &audit::People::default()).await?;
     let revoked = sqlx::query(
         "UPDATE sign_in_codes SET revoked_at = $2 \
          WHERE id = $1 AND revoked_at IS NULL AND redeemed_at IS NULL",
     )
     .bind(id)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     if revoked.rows_affected() == 0 {
         return Err(OkfError::Refused {
             reason: format!("no unredeemed, unrevoked sign-in code {id:?}"),
         });
     }
+    let teams = audit::code_teams(&mut tx, id).await?;
+    audit::record(
+        &mut tx,
+        audit,
+        &Entry {
+            action: Action::OauthCodeRevoked,
+            target: Target::Code(id),
+            person: None,
+            teams: &teams,
+            details: serde_json::json!({}),
+        },
+        now,
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -424,20 +467,55 @@ pub async fn revoke(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<(), O
 /// # Errors
 /// [`OkfError::UnknownName`] for an unknown user; [`OkfError::NotFound`]
 /// (`oauth/codes/<id>`) for an unknown code; [`OkfError::Database`].
-pub async fn assign_user(pool: &PgPool, id: &str, user: &str) -> Result<(), OkfError> {
+pub async fn assign_user(
+    pool: &PgPool,
+    id: &str,
+    user: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
-    // `FOR KEY SHARE` until commit: see `users::id_of`.
+    audit::lock_credential_people(
+        &mut tx,
+        audit,
+        id,
+        true,
+        &audit::People {
+            target: Some((user, audit::RowLock::KeyShare)),
+            ..Default::default()
+        },
+    )
+    .await?;
     let user_id = users::id_of(&mut tx, user).await?;
-    let updated = sqlx::query("UPDATE sign_in_codes SET user_id = $2 WHERE id = $1")
+    let previous: Option<Option<String>> =
+        sqlx::query_scalar("SELECT user_id FROM sign_in_codes WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let previous = previous.ok_or_else(|| OkfError::NotFound {
+        path: format!("oauth/codes/{id}"),
+    })?;
+    if previous.as_deref() == Some(&user_id) {
+        return Ok(());
+    }
+    sqlx::query("UPDATE sign_in_codes SET user_id = $2 WHERE id = $1")
         .bind(id)
         .bind(&user_id)
         .execute(&mut *tx)
         .await?;
-    if updated.rows_affected() == 0 {
-        return Err(OkfError::NotFound {
-            path: format!("oauth/codes/{id}"),
-        });
-    }
+    audit::record(
+        &mut tx,
+        audit,
+        &Entry {
+            action: Action::KeyUserAssigned,
+            target: Target::Code(id),
+            person: Some(&user_id),
+            teams: &[],
+            details: serde_json::json!({}),
+        },
+        now,
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -485,6 +563,9 @@ pub async fn redeem(
     };
     // Dropping `tx` without `commit` (every early return below) rolls back.
     let mut tx = pool.begin().await?;
+    let audit = AuditActor::system("oauth");
+    audit::lock_credential_people(&mut tx, &audit, code_id, true, &audit::People::default())
+        .await?;
     // `FOR UPDATE` holds the row until commit: a racing redeem of the same
     // code waits here, then reads the committed `redeemed_at` and is refused.
     let code: Option<LockedCode> = sqlx::query_as(
@@ -539,6 +620,20 @@ pub async fn redeem(
         .bind(&grant_id)
         .execute(&mut *tx)
         .await?;
+    let teams = audit::key_teams(&mut tx, &grant_id).await?;
+    audit::record(
+        &mut tx,
+        &audit,
+        &Entry {
+            action: Action::OauthGrantCreated,
+            target: Target::Grant(&grant_id),
+            person: code.user_id.as_deref(),
+            teams: &teams,
+            details: serde_json::json!({"code": code_id, "client": client_host(client)}),
+        },
+        now,
+    )
+    .await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(grant_id)
@@ -668,6 +763,10 @@ pub(crate) async fn insert_test_client(
 }
 
 #[cfg(test)]
+#[path = "credential_audit_tests.rs"]
+mod credential_audit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
@@ -747,6 +846,7 @@ mod tests {
         let created = create(
             &db.pool,
             &new_code("laptop", Grants::Catalogs(&names), Some("main")),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -799,23 +899,47 @@ mod tests {
             ..new_code("p", Grants::Catalogs(&main), None)
         };
 
-        assert!(refused(create(&db.pool, &admin, now()).await));
-        assert!(refused(create(&db.pool, &past, now()).await));
         assert!(refused(
             create(
                 &db.pool,
-                &new_code("bad name", Grants::Catalogs(&main), None),
+                &admin,
+                &crate::store::audit::AuditActor::cli(),
                 now()
             )
             .await
         ));
         assert!(refused(
-            create(&db.pool, &new_code("x", Grants::Catalogs(&[]), None), now()).await
+            create(
+                &db.pool,
+                &past,
+                &crate::store::audit::AuditActor::cli(),
+                now()
+            )
+            .await
+        ));
+        assert!(refused(
+            create(
+                &db.pool,
+                &new_code("bad name", Grants::Catalogs(&main), None),
+                &crate::store::audit::AuditActor::cli(),
+                now()
+            )
+            .await
+        ));
+        assert!(refused(
+            create(
+                &db.pool,
+                &new_code("x", Grants::Catalogs(&[]), None),
+                &crate::store::audit::AuditActor::cli(),
+                now()
+            )
+            .await
         ));
         assert!(refused(
             create(
                 &db.pool,
                 &new_code("x", Grants::Catalogs(&main), Some("other")),
+                &crate::store::audit::AuditActor::cli(),
                 now()
             )
             .await
@@ -824,6 +948,7 @@ mod tests {
             create(
                 &db.pool,
                 &new_code("x", Grants::Catalogs(&nope), None),
+                &crate::store::audit::AuditActor::cli(),
                 now()
             )
             .await,
@@ -841,15 +966,27 @@ mod tests {
             let pool = db.pool.clone();
             let main = main.clone();
             async move {
-                create(&pool, &new_code(name, Grants::Catalogs(&main), None), now())
-                    .await
-                    .unwrap()
+                create(
+                    &pool,
+                    &new_code(name, Grants::Catalogs(&main), None),
+                    &crate::store::audit::AuditActor::cli(),
+                    now(),
+                )
+                .await
+                .unwrap()
             }
         };
         let live = mint("live").await;
         let revoked = mint("gone").await;
         let redeemed = mint("used").await;
-        revoke(&db.pool, &revoked.id, now()).await.unwrap();
+        revoke(
+            &db.pool,
+            &revoked.id,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         redeem(&db.pool, &redeemed.id, &client, now())
             .await
             .unwrap();
@@ -895,6 +1032,7 @@ mod tests {
         let code = create(
             &db.pool,
             &new_code("c", Grants::Catalogs(&main), None),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -902,17 +1040,25 @@ mod tests {
         let used = create(
             &db.pool,
             &new_code("u", Grants::Catalogs(&main), None),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
         .unwrap();
         redeem(&db.pool, &used.id, &client, now()).await.unwrap();
 
-        revoke(&db.pool, &code.id, now()).await.unwrap();
+        revoke(
+            &db.pool,
+            &code.id,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         for id in [code.id.as_str(), used.id.as_str(), "no-such-code"] {
             assert!(matches!(
-                revoke(&db.pool, id, now()).await,
+                revoke(&db.pool, id, &crate::store::audit::AuditActor::cli(), now()).await,
                 Err(OkfError::Refused { .. })
             ));
         }
@@ -932,6 +1078,7 @@ mod tests {
         let code = create(
             &db.pool,
             &new_code("laptop", Grants::Catalogs(&names), Some("other")),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -983,9 +1130,30 @@ mod tests {
             ..new_code("all", Grants::All, None)
         };
         let client = dcr_client(&db.pool).await;
-        let expired = create(&db.pool, &all, now()).await.unwrap();
-        let revoked = create(&db.pool, &all, now()).await.unwrap();
-        revoke(&db.pool, &revoked.id, now()).await.unwrap();
+        let expired = create(
+            &db.pool,
+            &all,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let revoked = create(
+            &db.pool,
+            &all,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        revoke(
+            &db.pool,
+            &revoked.id,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let generation = catalogs::admin_generation(&db.pool).await.unwrap();
         let after_expiry = now() + TimeDelta::hours(24);
 
@@ -1022,6 +1190,7 @@ mod tests {
         let code = create(
             &db.pool,
             &new_code("race", Grants::Catalogs(&main), None),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -1096,6 +1265,7 @@ mod tests {
         let first = create(
             &db.pool,
             &new_code("phone", Grants::Catalogs(&main), None),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -1103,6 +1273,7 @@ mod tests {
         let second = create(
             &db.pool,
             &new_code("phone", Grants::Catalogs(&main), None),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -1132,6 +1303,7 @@ mod tests {
         let code = create(
             &db.pool,
             &new_code("c", Grants::Catalogs(&main), Some("main")),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -1169,14 +1341,29 @@ mod tests {
         let code = create(
             &db.pool,
             &new_code("c", Grants::Catalogs(&main), None),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
         .unwrap();
         let grant = redeem(&db.pool, &code.id, &client, now()).await.unwrap();
 
-        let enabled = key_rows::set_maintenance_report_by_id(&db.pool, &grant, true).await;
-        let disabled = key_rows::set_maintenance_report_by_id(&db.pool, &grant, false).await;
+        let enabled = key_rows::set_maintenance_report_by_id(
+            &db.pool,
+            &grant,
+            true,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
+        let disabled = key_rows::set_maintenance_report_by_id(
+            &db.pool,
+            &grant,
+            false,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
 
         assert!(
             matches!(&enabled, Err(OkfError::Refused { reason }) if reason.contains("OAuth grant")),
@@ -1344,10 +1531,21 @@ mod tests {
             ..new_code("other", Grants::All, None)
         };
 
-        let code = create(&db.pool, &new_code("laptop", Grants::All, None), now())
-            .await
-            .unwrap();
-        let refused = create(&db.pool, &unknown, now()).await;
+        let code = create(
+            &db.pool,
+            &new_code("laptop", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let refused = create(
+            &db.pool,
+            &unknown,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         assert_eq!(
             code_record(&db.pool, &code.id).await.user.as_deref(),
@@ -1364,9 +1562,14 @@ mod tests {
     async fn a_redeemed_grant_inherits_its_codes_user() {
         let db = test_db().await;
         let client = dcr_client(&db.pool).await;
-        let code = create(&db.pool, &new_code("laptop", Grants::All, None), now())
-            .await
-            .unwrap();
+        let code = create(
+            &db.pool,
+            &new_code("laptop", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let grant = redeem(&db.pool, &code.id, &client, now()).await.unwrap();
 
@@ -1382,9 +1585,14 @@ mod tests {
     async fn a_legacy_codes_grant_stays_unassigned() {
         let db = test_db().await;
         let client = dcr_client(&db.pool).await;
-        let code = create(&db.pool, &new_code("laptop", Grants::All, None), now())
-            .await
-            .unwrap();
+        let code = create(
+            &db.pool,
+            &new_code("laptop", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         make_legacy(&db.pool, &code.id).await;
 
         let grant = redeem(&db.pool, &code.id, &client, now()).await.unwrap();
@@ -1405,7 +1613,14 @@ mod tests {
             ..new_code("laptop", Grants::All, None)
         };
 
-        let code = create(&db.pool, &blank, now()).await.unwrap();
+        let code = create(
+            &db.pool,
+            &blank,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(code_record(&db.pool, &code.id).await.actor, "laptop");
     }
@@ -1413,15 +1628,26 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn assign_user_sets_a_codes_user_without_bumping_the_generation() {
         let db = test_db().await;
-        let code = create(&db.pool, &new_code("laptop", Grants::All, None), now())
-            .await
-            .unwrap();
+        let code = create(
+            &db.pool,
+            &new_code("laptop", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         make_legacy(&db.pool, &code.id).await;
         let generation = catalogs::admin_generation(&db.pool).await.unwrap();
 
-        assign_user(&db.pool, &code.id, crate::db::TEST_USER)
-            .await
-            .unwrap();
+        assign_user(
+            &db.pool,
+            &code.id,
+            crate::db::TEST_USER,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             code_record(&db.pool, &code.id).await.user.as_deref(),
@@ -1437,12 +1663,31 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn assign_user_refuses_an_unknown_code_or_user() {
         let db = test_db().await;
-        let code = create(&db.pool, &new_code("laptop", Grants::All, None), now())
-            .await
-            .unwrap();
+        let code = create(
+            &db.pool,
+            &new_code("laptop", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
-        let no_code = assign_user(&db.pool, "no-such-id", crate::db::TEST_USER).await;
-        let no_user = assign_user(&db.pool, &code.id, "nobody").await;
+        let no_code = assign_user(
+            &db.pool,
+            "no-such-id",
+            crate::db::TEST_USER,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
+        let no_user = assign_user(
+            &db.pool,
+            &code.id,
+            "nobody",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
 
         assert!(
             matches!(&no_code, Err(OkfError::NotFound { path }) if path == "oauth/codes/no-such-id"),
@@ -1466,9 +1711,14 @@ mod tests {
         users::create(&db.pool, &alice, &AuditActor::cli(), now())
             .await
             .unwrap();
-        let legacy = create(&db.pool, &new_code("old", Grants::All, None), now())
-            .await
-            .unwrap();
+        let legacy = create(
+            &db.pool,
+            &new_code("old", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         make_legacy(&db.pool, &legacy.id).await;
         let mut deleting = db.pool.begin().await.unwrap();
         sqlx::query(
@@ -1489,11 +1739,20 @@ mod tests {
                 user: "alice",
                 ..new_code("laptop", Grants::All, None)
             };
-            create(&pool, &new, now()).await
+            create(&pool, &new, &crate::store::audit::AuditActor::cli(), now()).await
         });
         let pool = db.pool.clone();
         let id = legacy.id.clone();
-        let assigning = tokio::spawn(async move { assign_user(&pool, &id, "alice").await });
+        let assigning = tokio::spawn(async move {
+            assign_user(
+                &pool,
+                &id,
+                "alice",
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now(),
+            )
+            .await
+        });
         crate::store::catalogs::tests::until_locks_are_awaited(&db.pool, 2).await;
 
         deleting.commit().await.unwrap();

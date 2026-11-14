@@ -86,9 +86,14 @@ async fn a_revoked_key_stops_working_after_a_poll() {
     let client = server.client(&key, None).await.unwrap();
     structured(&call(&client, "list_catalogs", serde_json::json!({})).await);
 
-    keys::revoke(&server.db.pool, "reader", chrono::Utc::now())
-        .await
-        .unwrap();
+    keys::revoke(
+        &server.db.pool,
+        "reader",
+        &okf_mcp::store::audit::AuditActor::cli(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
     server.app.poll().await.unwrap();
 
     let arguments = serde_json::json!({}).as_object().unwrap().clone();

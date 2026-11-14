@@ -107,9 +107,16 @@ async fn maintenance_http_lease_uses_credential_identity() {
             .await
             .unwrap();
     assert_eq!(stored, id);
-    keys::set_maintenance_report_target(&server.db.pool, &id, None, false)
-        .await
-        .unwrap();
+    keys::set_maintenance_report_target(
+        &server.db.pool,
+        &id,
+        None,
+        false,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
     server.app.poll().await.unwrap();
     for (tool, args) in [
         ("maintenance_renew", renew_args(lease, "renew")),
@@ -128,13 +135,25 @@ async fn maintenance_http_lease_uses_credential_identity() {
             "Forbidden"
         );
     }
-    keys::set_maintenance_report_target(&server.db.pool, &id, None, true)
-        .await
-        .unwrap();
+    keys::set_maintenance_report_target(
+        &server.db.pool,
+        &id,
+        None,
+        true,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
     server.app.poll().await.unwrap();
-    keys::revoke(&server.db.pool, &id, server.app.clock().now())
-        .await
-        .unwrap();
+    keys::revoke(
+        &server.db.pool,
+        &id,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        server.app.clock().now(),
+    )
+    .await
+    .unwrap();
     server.app.poll().await.unwrap();
     for (tool, args) in [
         ("maintenance_renew", renew_args(lease, "renew")),
@@ -685,9 +704,16 @@ async fn maintenance_http_reauthorizes_successful_replays_and_allows_plain_reads
     let args = submit_args(lease, "submitted");
     let receipt = structured(&call(&client, "maintenance_submit", args.clone()).await).clone();
     let id = server.app.keys().find(&key).unwrap().key_id.clone();
-    keys::set_maintenance_report_target(&server.db.pool, &id, None, false)
-        .await
-        .unwrap();
+    keys::set_maintenance_report_target(
+        &server.db.pool,
+        &id,
+        None,
+        false,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
     server.app.poll().await.unwrap();
     assert_eq!(
         error(&call(&client, "maintenance_submit", args.clone()).await)["error"],
@@ -748,9 +774,16 @@ async fn maintenance_http_reauthorizes_successful_replays_and_allows_plain_reads
     .unwrap();
     assert!(!stored_paths.is_empty());
     assert!(stored_paths.iter().all(|path| !path.starts_with('/')));
-    keys::set_maintenance_report_target(&server.db.pool, &id, None, true)
-        .await
-        .unwrap();
+    keys::set_maintenance_report_target(
+        &server.db.pool,
+        &id,
+        None,
+        true,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
     server.app.poll().await.unwrap();
     assert_eq!(
         receipt,
@@ -765,15 +798,29 @@ async fn maintenance_close_requires_reporting_for_own_run_even_with_write() {
         .key("writer-owner", Access::Write, &["pg"], None)
         .await;
     let id = server.app.keys().find(&key).unwrap().key_id.clone();
-    keys::set_maintenance_report_target(&server.db.pool, &id, None, true)
-        .await
-        .unwrap();
+    keys::set_maintenance_report_target(
+        &server.db.pool,
+        &id,
+        None,
+        true,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
     server.app.poll().await.unwrap();
     let client = server.client(&key, None).await.unwrap();
     let run = claim(&client, "claim", 1).await;
-    keys::set_maintenance_report_target(&server.db.pool, &id, None, false)
-        .await
-        .unwrap();
+    keys::set_maintenance_report_target(
+        &server.db.pool,
+        &id,
+        None,
+        false,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
     server.app.poll().await.unwrap();
     assert_eq!(error(&call(&client,"maintenance_close",json!({"catalog":"pg","run_id":run["run_id"],"state":"cancelled","rationale":"Own run needs reporting.","idempotency_key":"close"})).await)["error"],"Forbidden");
 }
@@ -792,12 +839,26 @@ async fn maintenance_close_owner_replay_is_stable_after_access_upgrade() {
         .execute(&server.db.pool)
         .await
         .unwrap();
-    keys::set_maintenance_report_target(&server.db.pool, &id, None, false)
-        .await
-        .unwrap();
-    keys::set_maintenance_report_target(&server.db.pool, &id, None, true)
-        .await
-        .unwrap();
+    keys::set_maintenance_report_target(
+        &server.db.pool,
+        &id,
+        None,
+        false,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    keys::set_maintenance_report_target(
+        &server.db.pool,
+        &id,
+        None,
+        true,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
     server.app.poll().await.unwrap();
     assert_eq!(server.app.keys().find(&key).unwrap().access, Access::Write);
     assert_eq!(

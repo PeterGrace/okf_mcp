@@ -74,14 +74,20 @@ async fn key_of(server: &TestServer, user: &str, name: &str, revoked: bool) {
             expires_at: None,
             levels: &[],
         },
+        &okf_mcp::store::audit::AuditActor::cli(),
         Utc::now(),
     )
     .await
     .expect("create a key");
     if revoked {
-        keys::revoke_by_id(&server.db.pool, &created.id, Utc::now())
-            .await
-            .expect("revoke the key");
+        keys::revoke_by_id(
+            &server.db.pool,
+            &created.id,
+            &okf_mcp::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("revoke the key");
     }
 }
 

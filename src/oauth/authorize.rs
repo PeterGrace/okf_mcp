@@ -645,7 +645,7 @@ async fn authorize(
 /// `POST /oauth/authorize`: the consent form (spec "Consent flow").
 async fn consent_post(
     State(app): State<Arc<App>>,
-    headers: HeaderMap,
+    parts: axum::http::request::Parts,
     form: Result<Form<ConsentForm>, FormRejection>,
 ) -> Response {
     // OAuth off: the routes are not mounted then, so this is only a guard.
@@ -655,7 +655,7 @@ async fn consent_post(
     let brand = app.settings().brand();
     // Another site's page posting this form into the person's browser
     // (with its own pending id and token) is refused before anything else.
-    if cross_site(&headers) {
+    if cross_site(&parts.headers) {
         return consent::error_page(StatusCode::FORBIDDEN, CROSS_SITE, &brand);
     }
     let now = Instant::now();
@@ -729,7 +729,7 @@ async fn consent_post(
             }
         },
         // `claimed`: on the user path, with this page's current nonce.
-        "consent" if claimed => consent_as_user(&app, oauth, &form, &pending, &headers).await,
+        "consent" if claimed => consent_as_user(&app, oauth, &form, &pending, &parts).await,
         _ => consent::error_page(StatusCode::BAD_REQUEST, EXPIRED, &brand),
     }
 }
@@ -906,8 +906,9 @@ async fn consent_as_user(
     oauth: &OAuth,
     form: &ConsentForm,
     pending: &PendingAuthorization,
-    headers: &HeaderMap,
+    parts: &axum::http::request::Parts,
 ) -> Response {
+    let headers = &parts.headers;
     let brand = app.settings().brand();
     let Some(consent) = pending.consent.as_ref() else {
         return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED, &brand);
@@ -965,16 +966,27 @@ async fn consent_as_user(
         levels: &chosen,
         default_catalog,
     };
-    let grant_id = match grant_rows::create_self_issued(app.pool(), &new, app.clock().now()).await {
-        Ok(grant_id) => grant_id,
-        // Signed out, reset or deleted since the check above.
-        Err(OkfError::Unauthenticated { .. }) => return refuse(SIGNED_OUT),
-        // The ceiling shrank, or a chosen catalog was deleted, meanwhile.
-        Err(OkfError::Refused { .. } | OkfError::CatalogNotSelected { .. }) => {
-            return refuse(CHANGED)
-        }
-        Err(error) => return server_error(&error, &brand),
+    let audit = crate::store::audit::AuditActor {
+        source: crate::store::audit::Source::Console,
+        credential: None,
+        user_id: Some(user.id.clone()),
+        label: user.name.clone(),
+        via: crate::store::audit::Via::Session,
+        operator: user.is_admin,
+        provisioner: false,
+        ip: crate::http::console_session::client_ip(parts, &app.config().auth),
     };
+    let grant_id =
+        match grant_rows::create_self_issued(app.pool(), &new, &audit, app.clock().now()).await {
+            Ok(grant_id) => grant_id,
+            // Signed out, reset or deleted since the check above.
+            Err(OkfError::Unauthenticated { .. }) => return refuse(SIGNED_OUT),
+            // The ceiling shrank, or a chosen catalog was deleted, meanwhile.
+            Err(OkfError::Refused { .. } | OkfError::CatalogNotSelected { .. }) => {
+                return refuse(CHANGED)
+            }
+            Err(error) => return server_error(&error, &brand),
+        };
     tracing::info!(
         user = %user.name,
         client = %pending.client.client_id,

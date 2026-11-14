@@ -149,6 +149,7 @@ async fn a_person_enters_a_code_approves_and_lands_back_at_the_client() {
             expires_at: Utc::now() + TimeDelta::hours(1),
             user: crate::support::server::OWNER,
         },
+        &okf_mcp::store::audit::AuditActor::cli(),
         Utc::now(),
     )
     .await

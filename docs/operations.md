@@ -1034,8 +1034,25 @@ the setting and belongs to no team.
 | `catalog.member_access_changed` | A catalog's member access changes (`catalog set-member-access`, `PUT /api/v1/catalogs/{catalog}/member-access`). The same value again records nothing | `from`, `to` (`none`, `read` or `write`) |
 | `catalog.deleted` | A catalog is deleted (`catalog delete`, `DELETE /api/v1/catalogs/{catalog}`), recorded before the row goes. A refused deletion records nothing | `forced` (unpublished changes were deleted with it), `generation` |
 | `catalog.imported` | An import writes or deletes at least one file (`okf-mcp import`, `POST /catalogs/{name}/import` and its `/api/v1` twin, the console). An import that changes nothing, or is refused, records nothing | `replace`, `scope` (`everything` or `machinery`), `written` (files added or changed), `deleted`, `generation` (after the import) |
+| `key.created` | An admin or signed-in user creates a key (CLI, API, console, self-service); provisioner creation also records this action | `access`, `all_catalogs`, `catalogs` (count), `maintenance_report`, `self_issued`, `expires` (boolean); a provisioner records only `provisioner: true` |
+| `key.revoked`, `oauth.grant_revoked` | An API key or OAuth grant is revoked, including self-service. An already revoked or unknown target records nothing | none |
+| `key.catalog_granted`, `key.catalog_ungranted` | A catalog grant is added or removed; unchanged grants record nothing. Scoped to that catalog's owner team | `catalog` |
+| `key.user_assigned` | A key, grant or sign-in code gets a different user (including revoked credentials); the entry's person is the new user. Assigning the existing user records nothing | none |
+| `key.report_flag_changed` | A key's reporting flag changes; an unchanged or refused flag records nothing | `from`, `to` |
+| `oauth.code_created`, `oauth.code_revoked` | A sign-in code is created or revoked; refused operations record nothing | Creation: `access`, `all_catalogs`, `catalogs` (count); revocation: none |
+| `oauth.grant_created` | A sign-in code is redeemed (system actor `oauth`), or a signed-in user approves consent (their console-session actor) | `client` (host only), plus `code` (the immutable code id, not its secret) for redemption |
 | `setting.changed` | `settings set` or `PUT /api/v1/settings/{key}` changes a setting ([Settings](#settings)). Setting the value already stored records nothing | `from` (the stored value before, `null` without an override) and `to`; for `support_contact` only `set` (whether a contact is set now), never the address |
 | `setting.cleared` | `settings reset` or `DELETE /api/v1/settings/{key}` removes an override (with none, nothing is recorded) | `from`; nothing for `support_contact` |
+
+Credential events belong to the owner teams of their granted catalogs
+(all-catalogs credentials belong to no team); a code assignment belongs to
+no team. Web changes retain the request's actor, source and client address;
+the CLI records its operating-system actor. Secrets and hashes never enter
+entry details. New credentials get their audit reference in the creation
+transaction. An older credential's first reference resolution can wait on
+another first resolver; existing-reference refreshes skip locked rows.
+These credential-change entries do not claim to record every provisioner
+request (the separate every-use design work remains outstanding).
 
 The log is append-only: the database refuses any change to an entry, and
 any delete of one younger than `audit_retention_days` (at least 30 days,

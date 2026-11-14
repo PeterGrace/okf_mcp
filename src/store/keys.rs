@@ -431,6 +431,7 @@ pub async fn create_provisioner(
 /// * `pool` - the database.
 /// * `new` - the key's name, access, grants (with any per-catalog levels),
 ///   default catalog, actor, user, expiry and whether it is self-issued.
+/// * `audit` - the caller recorded with this change.
 /// * `now` - the creation time (server clock).
 ///
 /// # Returns
@@ -449,15 +450,16 @@ pub async fn create_provisioner(
 pub async fn create(
     pool: &PgPool,
     new: &NewKey<'_>,
+    audit: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
-    Ok(create_with_id(pool, new, now).await?.key)
+    Ok(create_with_id(pool, new, audit, now).await?.key)
 }
 
 /// Creates a key and also returns its immutable generated id.
 ///
 /// # Arguments
-/// As [`create`].
+/// As [`create`], including the caller and server clock.
 ///
 /// # Returns
 /// The key's id and the key itself (shown once).
@@ -467,13 +469,62 @@ pub async fn create(
 pub async fn create_with_id(
     pool: &PgPool,
     new: &NewKey<'_>,
+    audit: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<CreatedKey, OkfError> {
     let mut tx = pool.begin().await?;
+    lock_new_key(&mut tx, new, audit, audit::RowLock::KeyShare).await?;
     let created = insert_key(&mut tx, new, now).await?;
+    record_created(&mut tx, &created.id, new, audit, now).await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(created)
+}
+
+/// Locks a new key's user and all people its audit entry will resolve.
+async fn lock_new_key(
+    conn: &mut PgConnection,
+    new: &NewKey<'_>,
+    actor: &AuditActor,
+    mode: audit::RowLock,
+) -> Result<String, OkfError> {
+    let catalogs: Vec<&str> = match new.grants {
+        Grants::All => Vec::new(),
+        Grants::Catalogs(names) => names.iter().map(String::as_str).collect(),
+    };
+    Ok(audit::lock_people(
+        conn,
+        actor,
+        &audit::People {
+            target: Some((new.user, mode)),
+            catalogs: &catalogs,
+            ..Default::default()
+        },
+    )
+    .await?
+    .expect("a named target is returned")
+    .0)
+}
+
+/// Records creation after inserting the key and its grants, before commit.
+async fn record_created(
+    conn: &mut PgConnection,
+    id: &str,
+    new: &NewKey<'_>,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
+    let teams = audit::key_teams(conn, id).await?;
+    let (user_id, count): (Option<String>, i64) = sqlx::query_as(
+        "SELECT user_id, (SELECT count(*) FROM key_catalogs WHERE key_id = $1) FROM api_keys WHERE id = $1"
+    ).bind(id).fetch_one(&mut *conn).await?;
+    audit::record(conn, actor, &Entry {
+        action: Action::KeyCreated, target: Target::Key(id), person: user_id.as_deref(), teams: &teams,
+        details: serde_json::json!({"access": new.access.as_str(), "all_catalogs": matches!(new.grants, Grants::All),
+            "catalogs": count, "maintenance_report": new.maintenance_report,
+            "self_issued": new.self_issued, "expires": new.expires_at.is_some()}),
+    }, now).await?;
+    Ok(())
 }
 
 /// Checks a key and inserts it with its grants inside the caller's
@@ -571,6 +622,7 @@ async fn insert_key(
 /// * `new` - the key; the caller sets `self_issued: true` and has checked
 ///   its levels against the ceiling.
 /// * `max_live` - the `max_keys_per_user` setting.
+/// * `audit` - the caller recorded with this change.
 /// * `now` - the creation time, also the expiry cut-off for the count.
 ///
 /// # Returns
@@ -585,6 +637,7 @@ pub async fn create_self_issued(
     pool: &PgPool,
     new: &NewKey<'_>,
     max_live: u32,
+    audit: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<CreatedKey, OkfError> {
     // The count below only covers self-issued keys, so an unmarked key
@@ -595,14 +648,7 @@ pub async fn create_self_issued(
         });
     }
     let mut tx = pool.begin().await?;
-    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE name = $1 FOR UPDATE")
-        .bind(new.user)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| OkfError::UnknownName {
-            noun: "user",
-            name: new.user.to_string(),
-        })?;
+    let user_id = lock_new_key(&mut tx, new, audit, audit::RowLock::Update).await?;
     let live: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM api_keys \
          WHERE user_id = $1 AND kind = 'key' AND self_issued AND revoked_at IS NULL \
@@ -623,6 +669,7 @@ pub async fn create_self_issued(
         });
     }
     let created = insert_key(&mut tx, new, now).await?;
+    record_created(&mut tx, &created.id, new, audit, now).await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(created)
@@ -879,8 +926,17 @@ pub async fn set_maintenance_report_target(
     target: &str,
     actor: Option<&str>,
     enabled: bool,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
-    set_maintenance_report_with(pool, Selector::Resolve { target, actor }, enabled).await
+    set_maintenance_report_with(
+        pool,
+        Selector::Resolve { target, actor },
+        enabled,
+        audit,
+        now,
+    )
+    .await
 }
 
 /// As [`set_maintenance_report_target`], but for exactly the key with this immutable id, never a
@@ -894,8 +950,10 @@ pub async fn set_maintenance_report_by_id(
     pool: &PgPool,
     id: &str,
     enabled: bool,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
-    set_maintenance_report_with(pool, Selector::Exact(id), enabled).await
+    set_maintenance_report_with(pool, Selector::Exact(id), enabled, audit, now).await
 }
 
 /// Maps only the live-name constraint to a user-facing duplicate refusal.
@@ -929,9 +987,12 @@ async fn set_maintenance_report_with(
     pool: &PgPool,
     selector: Selector<'_>,
     enabled: bool,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
     let id = select(&mut tx, selector).await?;
+    audit::lock_credential_people(&mut tx, audit, &id, false, &audit::People::default()).await?;
     if enabled {
         // An OAuth grant and a self-issued key never report (the schema's
         // `api_keys_oauth_caps` and `api_keys_self_issued_caps`): refuse them
@@ -970,6 +1031,15 @@ async fn set_maintenance_report_with(
     .execute(&mut *tx)
     .await?;
     if updated.rows_affected() != 0 {
+        record_change(
+            &mut tx,
+            &id,
+            Action::KeyReportFlagChanged,
+            audit,
+            serde_json::json!({"from": !enabled, "to": enabled}),
+            now,
+        )
+        .await?;
         bump_admin_generation(&mut tx).await?;
     } else {
         // `resolve_active` accepts an exact generated id even if revoked.
@@ -1004,9 +1074,10 @@ pub async fn revoke_target(
     pool: &PgPool,
     target: &str,
     actor: Option<&str>,
+    audit: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
-    revoke_with(pool, Selector::Resolve { target, actor }, now).await
+    revoke_with(pool, Selector::Resolve { target, actor }, audit, now).await
 }
 
 /// As [`revoke_target`], but for exactly the key with this immutable id, never a
@@ -1016,18 +1087,25 @@ pub async fn revoke_target(
 ///
 /// # Errors
 /// As [`revoke_target`]; [`OkfError::Refused`] if there is no key with this id.
-pub async fn revoke_by_id(pool: &PgPool, id: &str, now: DateTime<Utc>) -> Result<String, OkfError> {
-    revoke_with(pool, Selector::Exact(id), now).await
+pub async fn revoke_by_id(
+    pool: &PgPool,
+    id: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<String, OkfError> {
+    revoke_with(pool, Selector::Exact(id), audit, now).await
 }
 
 /// The body of [`revoke_target`] and [`revoke_by_id`].
 async fn revoke_with(
     pool: &PgPool,
     selector: Selector<'_>,
+    audit: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
     let id = select(&mut tx, selector).await?;
+    audit::lock_credential_people(&mut tx, audit, &id, false, &audit::People::default()).await?;
     let revoked =
         sqlx::query("UPDATE api_keys SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL")
             .bind(&id)
@@ -1039,14 +1117,31 @@ async fn revoke_with(
             reason: format!("no active key {id:?}"),
         });
     }
+    let kind: String = sqlx::query_scalar("SELECT kind FROM api_keys WHERE id = $1")
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let action = if kind == "oauth" {
+        Action::OauthGrantRevoked
+    } else {
+        Action::KeyRevoked
+    };
+    record_change(&mut tx, &id, action, audit, serde_json::json!({}), now).await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(id)
 }
 
 /// Revokes a key selected by immutable id or an unambiguous live name.
-pub async fn revoke(pool: &PgPool, target: &str, now: DateTime<Utc>) -> Result<(), OkfError> {
-    revoke_target(pool, target, None, now).await.map(|_| ())
+pub async fn revoke(
+    pool: &PgPool,
+    target: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
+    revoke_target(pool, target, None, audit, now)
+        .await
+        .map(|_| ())
 }
 
 /// Grants a key a catalog, and bumps the administrative generation. Already
@@ -1067,8 +1162,17 @@ pub async fn grant_target(
     target: &str,
     actor: Option<&str>,
     catalog: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
-    grant_with(pool, Selector::Resolve { target, actor }, catalog).await
+    grant_with(
+        pool,
+        Selector::Resolve { target, actor },
+        catalog,
+        audit,
+        now,
+    )
+    .await
 }
 
 /// As [`grant_target`], but for exactly the key with this immutable id, never a
@@ -1078,8 +1182,14 @@ pub async fn grant_target(
 ///
 /// # Errors
 /// As [`grant_target`]; [`OkfError::Refused`] if there is no key with this id.
-pub async fn grant_by_id(pool: &PgPool, id: &str, catalog: &str) -> Result<String, OkfError> {
-    grant_with(pool, Selector::Exact(id), catalog).await
+pub async fn grant_by_id(
+    pool: &PgPool,
+    id: &str,
+    catalog: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<String, OkfError> {
+    grant_with(pool, Selector::Exact(id), catalog, audit, now).await
 }
 
 /// The body of [`grant_target`] and [`grant_by_id`].
@@ -1087,10 +1197,25 @@ async fn grant_with(
     pool: &PgPool,
     selector: Selector<'_>,
     catalog: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
-    let catalog = catalogs::find(&mut *tx, catalog).await?;
+    // Keep the existing unknown-catalog precedence without taking a row lock.
+    catalogs::find(&mut *tx, catalog).await?;
     let id = select(&mut tx, selector).await?;
+    audit::lock_credential_people(
+        &mut tx,
+        audit,
+        &id,
+        false,
+        &audit::People {
+            catalogs: &[catalog],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let catalog = catalogs::find(&mut *tx, catalog).await?;
     require_named_grants(&mut tx, &id).await?;
     let inserted = sqlx::query(
         "INSERT INTO key_catalogs (key_id, catalog_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -1102,14 +1227,36 @@ async fn grant_with(
     if inserted.rows_affected() == 0 {
         return Ok(id);
     }
+    let teams = audit::catalog_teams(&mut tx, catalog.id).await?;
+    audit::record(
+        &mut tx,
+        audit,
+        &Entry {
+            action: Action::KeyCatalogGranted,
+            target: Target::Key(&id),
+            person: None,
+            teams: &teams,
+            details: serde_json::json!({"catalog": catalog.name}),
+        },
+        now,
+    )
+    .await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(id)
 }
 
 /// Grants a catalog to a key selected by immutable id or unambiguous name.
-pub async fn grant(pool: &PgPool, target: &str, catalog: &str) -> Result<(), OkfError> {
-    grant_target(pool, target, None, catalog).await.map(|_| ())
+pub async fn grant(
+    pool: &PgPool,
+    target: &str,
+    catalog: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
+    grant_target(pool, target, None, catalog, audit, now)
+        .await
+        .map(|_| ())
 }
 
 /// Removes a key's grant of a catalog; if it was the key's default catalog,
@@ -1126,8 +1273,17 @@ pub async fn ungrant_target(
     target: &str,
     actor: Option<&str>,
     catalog: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
-    ungrant_with(pool, Selector::Resolve { target, actor }, catalog).await
+    ungrant_with(
+        pool,
+        Selector::Resolve { target, actor },
+        catalog,
+        audit,
+        now,
+    )
+    .await
 }
 
 /// As [`ungrant_target`], but for exactly the key with this immutable id, never a
@@ -1137,8 +1293,14 @@ pub async fn ungrant_target(
 ///
 /// # Errors
 /// As [`ungrant_target`]; [`OkfError::Refused`] if there is no key with this id.
-pub async fn ungrant_by_id(pool: &PgPool, id: &str, catalog: &str) -> Result<String, OkfError> {
-    ungrant_with(pool, Selector::Exact(id), catalog).await
+pub async fn ungrant_by_id(
+    pool: &PgPool,
+    id: &str,
+    catalog: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<String, OkfError> {
+    ungrant_with(pool, Selector::Exact(id), catalog, audit, now).await
 }
 
 /// The body of [`ungrant_target`] and [`ungrant_by_id`].
@@ -1146,10 +1308,25 @@ async fn ungrant_with(
     pool: &PgPool,
     selector: Selector<'_>,
     catalog: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
-    let catalog = catalogs::find(&mut *tx, catalog).await?;
+    // Keep the existing unknown-catalog precedence without taking a row lock.
+    catalogs::find(&mut *tx, catalog).await?;
     let id = select(&mut tx, selector).await?;
+    audit::lock_credential_people(
+        &mut tx,
+        audit,
+        &id,
+        false,
+        &audit::People {
+            catalogs: &[catalog],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let catalog = catalogs::find(&mut *tx, catalog).await?;
     require_named_grants(&mut tx, &id).await?;
     let deleted = sqlx::query("DELETE FROM key_catalogs WHERE key_id = $1 AND catalog_id = $2")
         .bind(&id)
@@ -1166,14 +1343,34 @@ async fn ungrant_with(
     if deleted.rows_affected() + cleared.rows_affected() == 0 {
         return Ok(id);
     }
+    let teams = audit::catalog_teams(&mut tx, catalog.id).await?;
+    audit::record(
+        &mut tx,
+        audit,
+        &Entry {
+            action: Action::KeyCatalogUngranted,
+            target: Target::Key(&id),
+            person: None,
+            teams: &teams,
+            details: serde_json::json!({"catalog": catalog.name}),
+        },
+        now,
+    )
+    .await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(id)
 }
 
 /// Removes a catalog grant from a key selected by id or unambiguous name.
-pub async fn ungrant(pool: &PgPool, target: &str, catalog: &str) -> Result<(), OkfError> {
-    ungrant_target(pool, target, None, catalog)
+pub async fn ungrant(
+    pool: &PgPool,
+    target: &str,
+    catalog: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
+    ungrant_target(pool, target, None, catalog, audit, now)
         .await
         .map(|_| ())
 }
@@ -1193,14 +1390,19 @@ pub async fn ungrant(pool: &PgPool, target: &str, catalog: &str) -> Result<(), O
 /// # Errors
 /// [`OkfError::UnknownName`] for an unknown user; [`OkfError::NotFound`]
 /// (`keys/<id>`) when no row has this id; [`OkfError::Database`].
-pub async fn assign_user_by_id(pool: &PgPool, id: &str, user: &str) -> Result<String, OkfError> {
+pub async fn assign_user_by_id(
+    pool: &PgPool,
+    id: &str,
+    user: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
-    let name = set_user(&mut tx, id, user)
+    let name = set_user(&mut tx, id, user, audit, now)
         .await?
         .ok_or_else(|| OkfError::NotFound {
             path: format!("keys/{id}"),
         })?;
-    bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(name)
 }
@@ -1227,17 +1429,18 @@ pub async fn assign_user_target(
     target: &str,
     actor: Option<&str>,
     user: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
     let mut tx = pool.begin().await?;
     let id = select(&mut tx, Selector::ResolveAnyKind { target, actor }).await?;
     // `select` found the row in this transaction, but without a lock it can
     // be gone by the update; that is the same "no such key" answer.
-    set_user(&mut tx, &id, user)
+    set_user(&mut tx, &id, user, audit, now)
         .await?
         .ok_or_else(|| OkfError::Refused {
             reason: format!("no key {id:?}"),
         })?;
-    bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(id)
 }
@@ -1253,18 +1456,96 @@ async fn set_user(
     conn: &mut PgConnection,
     id: &str,
     user: &str,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
 ) -> Result<Option<String>, OkfError> {
-    // The user is read `FOR KEY SHARE` (held until commit) before the update,
-    // so a concurrent `users::delete` either waits and then counts this row,
-    // or wins first and this is `UnknownName` rather than a foreign-key error.
-    let user_id = users::id_of(conn, user).await?;
-    Ok(
-        sqlx::query_scalar("UPDATE api_keys SET user_id = $2 WHERE id = $1 RETURNING name")
-            .bind(id)
-            .bind(&user_id)
-            .fetch_optional(&mut *conn)
-            .await?,
+    audit::lock_credential_people(
+        conn,
+        audit,
+        id,
+        false,
+        &audit::People {
+            target: Some((user, audit::RowLock::KeyShare)),
+            ..Default::default()
+        },
     )
+    .await?;
+    let user_id = users::id_of(conn, user).await?;
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT name, user_id FROM api_keys WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((name, previous)) = row else {
+        return Ok(None);
+    };
+    if previous.as_deref() == Some(&user_id) {
+        return Ok(Some(name));
+    }
+    sqlx::query("UPDATE api_keys SET user_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(&user_id)
+        .execute(&mut *conn)
+        .await?;
+    let teams = audit::key_teams(conn, id).await?;
+    let kind: String = sqlx::query_scalar("SELECT kind FROM api_keys WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+    audit::record(
+        conn,
+        audit,
+        &Entry {
+            action: Action::KeyUserAssigned,
+            target: if kind == "oauth" {
+                Target::Grant(id)
+            } else {
+                Target::Key(id)
+            },
+            person: Some(&user_id),
+            teams: &teams,
+            details: serde_json::json!({}),
+        },
+        now,
+    )
+    .await?;
+    bump_admin_generation(conn).await?;
+    Ok(Some(name))
+}
+
+/// Records a key or grant change with its current grant scope.
+async fn record_change(
+    conn: &mut PgConnection,
+    id: &str,
+    action: Action,
+    actor: &AuditActor,
+    details: serde_json::Value,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
+    let teams = audit::key_teams(conn, id).await?;
+    let kind: String = sqlx::query_scalar("SELECT kind FROM api_keys WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+    let target = if kind == "oauth" {
+        Target::Grant(id)
+    } else {
+        Target::Key(id)
+    };
+    audit::record(
+        conn,
+        actor,
+        &Entry {
+            action,
+            target,
+            person: None,
+            teams: &teams,
+            details,
+        },
+        now,
+    )
+    .await?;
+    Ok(())
 }
 
 /// How a key change names its key.
@@ -1297,13 +1578,12 @@ async fn select(conn: &mut PgConnection, selector: Selector<'_>) -> Result<Strin
             resolve_active(conn, target, actor, true).await
         }
         Selector::Exact(id) => {
-            // `FOR UPDATE` locks the row until the transaction ends, so a
-            // concurrent revoke or grant of it waits for this change.
-            let found: Option<String> =
-                sqlx::query_scalar("SELECT id FROM api_keys WHERE id = $1 FOR UPDATE")
-                    .bind(id)
-                    .fetch_optional(&mut *conn)
-                    .await?;
+            // Resolve without a lock: lock_credential_people takes users
+            // first, then locks and rechecks this credential.
+            let found: Option<String> = sqlx::query_scalar("SELECT id FROM api_keys WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?;
             found.ok_or_else(|| OkfError::Refused {
                 reason: format!("no key {id:?}"),
             })
@@ -1423,6 +1703,10 @@ async fn require_named_grants(conn: &mut PgConnection, id: &str) -> Result<(), O
 }
 
 #[cfg(test)]
+#[path = "keys/audit_tests.rs"]
+mod audit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::test_db;
@@ -1489,6 +1773,7 @@ mod tests {
         let key = create(
             &db.pool,
             &new_key("laptop", Grants::Catalogs(&names), None),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -1565,6 +1850,7 @@ mod tests {
         let key = create(
             &db.pool,
             &new_key("laptop", Grants::Catalogs(&names), Some("pg")),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -1611,22 +1897,47 @@ mod tests {
         .unwrap();
         let pg = ["pg".to_string()];
         let missing = ["pg".to_string(), "nope".to_string()];
-        create(&db.pool, &new_key("a", Grants::All, None), now())
-            .await
-            .unwrap();
+        create(
+            &db.pool,
+            &new_key("a", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let unknown = create(
             &db.pool,
             &new_key("b", Grants::Catalogs(&missing), None),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await;
-        let duplicate = create(&db.pool, &new_key("a", Grants::All, None), now()).await;
-        let bad_id = create(&db.pool, &new_key("has space", Grants::All, None), now()).await;
-        let no_catalogs = create(&db.pool, &new_key("d", Grants::Catalogs(&[]), None), now()).await;
+        let duplicate = create(
+            &db.pool,
+            &new_key("a", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await;
+        let bad_id = create(
+            &db.pool,
+            &new_key("has space", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await;
+        let no_catalogs = create(
+            &db.pool,
+            &new_key("d", Grants::Catalogs(&[]), None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await;
         let bad_default = create(
             &db.pool,
             &new_key("c", Grants::Catalogs(&pg), Some("work")),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await;
@@ -1683,19 +1994,64 @@ mod tests {
         create(
             &db.pool,
             &new_key("k", Grants::Catalogs(&pg), Some("pg")),
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
         .unwrap();
-        create(&db.pool, &new_key("all", Grants::All, None), now())
-            .await
-            .unwrap();
+        create(
+            &db.pool,
+            &new_key("all", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
-        grant(&db.pool, "k", "work").await.unwrap();
-        grant(&db.pool, "k", "work").await.unwrap(); // already granted: a no-op
-        ungrant(&db.pool, "k", "pg").await.unwrap();
-        ungrant(&db.pool, "k", "pg").await.unwrap(); // not granted: a no-op
-        revoke(&db.pool, "k", now()).await.unwrap();
+        grant(
+            &db.pool,
+            "k",
+            "work",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        grant(
+            &db.pool,
+            "k",
+            "work",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap(); // already granted: a no-op
+        ungrant(
+            &db.pool,
+            "k",
+            "pg",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        ungrant(
+            &db.pool,
+            "k",
+            "pg",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap(); // not granted: a no-op
+        revoke(
+            &db.pool,
+            "k",
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let record = &list(&db.pool).await.unwrap()[1];
         assert_eq!(record.name, "k");
@@ -1710,31 +2066,65 @@ mod tests {
             start + 7
         );
         assert!(matches!(
-            revoke(&db.pool, "k", now()).await,
+            revoke(
+                &db.pool,
+                "k",
+                &crate::store::audit::AuditActor::cli(),
+                now()
+            )
+            .await,
             Err(OkfError::Refused { .. })
         ));
         assert!(matches!(
-            grant(&db.pool, "k", "pg").await,
+            grant(&db.pool, "k", "pg", &crate::store::audit::AuditActor::cli(), chrono::Utc::now()).await,
             Err(OkfError::Refused { reason }) if reason.contains("is revoked")
         ));
         assert!(matches!(
-            ungrant(&db.pool, "k", "work").await,
+            ungrant(
+                &db.pool,
+                "k",
+                "work",
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now()
+            )
+            .await,
             Err(OkfError::Refused { .. })
         ));
         assert!(matches!(
-            grant(&db.pool, "nope", "pg").await,
+            grant(
+                &db.pool,
+                "nope",
+                "pg",
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now()
+            )
+            .await,
             Err(OkfError::Refused { .. })
         ));
         assert!(matches!(
-            grant(&db.pool, "k", "nope").await,
+            grant(
+                &db.pool,
+                "k",
+                "nope",
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now()
+            )
+            .await,
             Err(OkfError::CatalogNotSelected { .. })
         ));
         assert!(matches!(
-            grant(&db.pool, "all", "pg").await,
+            grant(&db.pool, "all", "pg", &crate::store::audit::AuditActor::cli(), chrono::Utc::now()).await,
             Err(OkfError::Refused { reason }) if reason.contains("every catalog")
         ));
         assert!(matches!(
-            ungrant(&db.pool, "all", "pg").await,
+            ungrant(
+                &db.pool,
+                "all",
+                "pg",
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now()
+            )
+            .await,
             Err(OkfError::Refused { .. })
         ));
     }
@@ -1754,11 +2144,21 @@ mod tests {
         )
         .await
         .unwrap();
-        create(&db.pool, &new_key("k", Grants::All, Some("pg")), now())
-            .await
-            .unwrap();
-        let unknown_default =
-            create(&db.pool, &new_key("j", Grants::All, Some("nope")), now()).await;
+        create(
+            &db.pool,
+            &new_key("k", Grants::All, Some("pg")),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let unknown_default = create(
+            &db.pool,
+            &new_key("j", Grants::All, Some("nope")),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         catalogs::delete(
             &db.pool,
@@ -1822,8 +2222,22 @@ mod tests {
             ..terminal
         };
 
-        let first = create_with_id(&db.pool, &terminal, now()).await.unwrap();
-        let second = create_with_id(&db.pool, &web, now()).await.unwrap();
+        let first = create_with_id(
+            &db.pool,
+            &terminal,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let second = create_with_id(
+            &db.pool,
+            &web,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let mut tx = db.pool.begin().await.unwrap();
         let old_changeset = crate::store::changesets::open(
             &mut tx,
@@ -1852,27 +2266,40 @@ mod tests {
         assert_ne!(first.id, "claude");
         assert_ne!(second.id, first.id);
         assert!(matches!(
-            create(&db.pool, &terminal, now()).await,
+            create(&db.pool, &terminal, &crate::store::audit::AuditActor::cli(), now()).await,
             Err(OkfError::Refused { reason }) if reason.contains("already exists")
         ));
         assert!(matches!(
-            revoke_target(&db.pool, "claude", None, now()).await,
+            revoke_target(&db.pool, "claude", None, &crate::store::audit::AuditActor::cli(), now()).await,
             Err(OkfError::Refused { reason }) if reason.contains("ambiguous")
         ));
         assert!(matches!(
-            grant_target(&db.pool, "claude", None, "work").await,
+            grant_target(&db.pool, "claude", None, "work", &crate::store::audit::AuditActor::cli(), chrono::Utc::now()).await,
             Err(OkfError::Refused { reason }) if reason.contains("ambiguous")
         ));
         assert!(matches!(
-            ungrant_target(&db.pool, "claude", None, "work").await,
+            ungrant_target(&db.pool, "claude", None, "work", &crate::store::audit::AuditActor::cli(), chrono::Utc::now()).await,
             Err(OkfError::Refused { reason }) if reason.contains("ambiguous")
         ));
 
-        let revoked_id = revoke_target(&db.pool, "claude", Some("claude-code-tui"), now())
-            .await
-            .unwrap();
+        let revoked_id = revoke_target(
+            &db.pool,
+            "claude",
+            Some("claude-code-tui"),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(revoked_id, first.id);
-        let replacement = create_with_id(&db.pool, &terminal, now()).await.unwrap();
+        let replacement = create_with_id(
+            &db.pool,
+            &terminal,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         assert_ne!(replacement.id, first.id);
         let historical = crate::store::changesets::list_open(&db.pool, &[work_catalog.id], None)
             .await
@@ -1964,6 +2391,7 @@ mod tests {
                 expires_at: None,
                 levels: &[],
             },
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -1980,22 +2408,49 @@ mod tests {
             expires_at: None,
             levels: &[],
         };
-        create(&db.pool, &collision, now()).await.unwrap();
+        create(
+            &db.pool,
+            &collision,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
-            grant_target(&db.pool, &by_id.id, Some("first"), "work").await,
+            grant_target(&db.pool, &by_id.id, Some("first"), "work", &crate::store::audit::AuditActor::cli(), chrono::Utc::now()).await,
             Err(OkfError::Refused { reason }) if reason.contains("cannot be used with key id")
         ));
 
-        grant_target(&db.pool, &by_id.id, None, "work")
-            .await
-            .unwrap();
-        ungrant_target(&db.pool, &by_id.id, None, "work")
-            .await
-            .unwrap();
-        let revoked = revoke_target(&db.pool, &by_id.id, None, now())
-            .await
-            .unwrap();
+        grant_target(
+            &db.pool,
+            &by_id.id,
+            None,
+            "work",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        ungrant_target(
+            &db.pool,
+            &by_id.id,
+            None,
+            "work",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let revoked = revoke_target(
+            &db.pool,
+            &by_id.id,
+            None,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(revoked, by_id.id);
         assert!(list(&db.pool)
             .await
@@ -2033,7 +2488,14 @@ mod tests {
             .find(|record| record.id == "legacy")
             .expect("the legacy key");
 
-        revoke_by_id(&db.pool, &snapshot.id, now()).await.unwrap();
+        revoke_by_id(
+            &db.pool,
+            &snapshot.id,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let work = ["work".to_string()];
         let replacement = create_with_id(
             &db.pool,
@@ -2041,6 +2503,7 @@ mod tests {
                 actor: "terminal",
                 ..new_key("legacy", Grants::Catalogs(&work), None)
             },
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -2052,11 +2515,54 @@ mod tests {
                 "{result:?}"
             );
         };
-        refused(revoke_by_id(&db.pool, &snapshot.id, now()).await);
-        refused(set_maintenance_report_by_id(&db.pool, &snapshot.id, true).await);
-        refused(grant_by_id(&db.pool, &snapshot.id, "extra").await);
-        refused(ungrant_by_id(&db.pool, &snapshot.id, "work").await);
-        refused(revoke_by_id(&db.pool, "no-such-id", now()).await);
+        refused(
+            revoke_by_id(
+                &db.pool,
+                &snapshot.id,
+                &crate::store::audit::AuditActor::cli(),
+                now(),
+            )
+            .await,
+        );
+        refused(
+            set_maintenance_report_by_id(
+                &db.pool,
+                &snapshot.id,
+                true,
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now(),
+            )
+            .await,
+        );
+        refused(
+            grant_by_id(
+                &db.pool,
+                &snapshot.id,
+                "extra",
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now(),
+            )
+            .await,
+        );
+        refused(
+            ungrant_by_id(
+                &db.pool,
+                &snapshot.id,
+                "work",
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now(),
+            )
+            .await,
+        );
+        refused(
+            revoke_by_id(
+                &db.pool,
+                "no-such-id",
+                &crate::store::audit::AuditActor::cli(),
+                now(),
+            )
+            .await,
+        );
 
         let after = list(&db.pool)
             .await
@@ -2101,27 +2607,42 @@ mod tests {
                 expires_at: None,
                 levels: &[],
             },
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
         .unwrap();
         assert!(matches!(
-            revoke_target(&db.pool, "legacy", None, now()).await,
+            revoke_target(&db.pool, "legacy", None, &crate::store::audit::AuditActor::cli(), now()).await,
             Err(OkfError::Refused { reason }) if reason.contains("ambiguous")
         ));
 
-        revoke_target(&db.pool, &web.id, None, now()).await.unwrap();
-        revoke_target(&db.pool, "legacy", Some("terminal"), now())
-            .await
-            .unwrap();
+        revoke_target(
+            &db.pool,
+            &web.id,
+            None,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        revoke_target(
+            &db.pool,
+            "legacy",
+            Some("terminal"),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         for actor in [None, Some("terminal")] {
             assert!(matches!(
-                revoke_target(&db.pool, "legacy", actor, now()).await,
+                revoke_target(&db.pool, "legacy", actor, &crate::store::audit::AuditActor::cli(), now()).await,
                 Err(OkfError::Refused { reason }) if reason.contains("is revoked")
             ));
         }
         assert!(matches!(
-            revoke_target(&db.pool, "legacy", Some("unknown"), now()).await,
+            revoke_target(&db.pool, "legacy", Some("unknown"), &crate::store::audit::AuditActor::cli(), now()).await,
             Err(OkfError::Refused { reason }) if reason.contains("no active key")
         ));
         let replacement = create_with_id(
@@ -2138,27 +2659,48 @@ mod tests {
                 expires_at: None,
                 levels: &[],
             },
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
         .unwrap();
 
         assert_eq!(
-            ungrant_target(&db.pool, "legacy", None, "work")
-                .await
-                .unwrap(),
+            ungrant_target(
+                &db.pool,
+                "legacy",
+                None,
+                "work",
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now()
+            )
+            .await
+            .unwrap(),
             replacement.id
         );
         assert_eq!(
-            grant_target(&db.pool, "legacy", None, "work")
-                .await
-                .unwrap(),
+            grant_target(
+                &db.pool,
+                "legacy",
+                None,
+                "work",
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now()
+            )
+            .await
+            .unwrap(),
             replacement.id
         );
         assert_eq!(
-            revoke_target(&db.pool, "legacy", None, now())
-                .await
-                .unwrap(),
+            revoke_target(
+                &db.pool,
+                "legacy",
+                None,
+                &crate::store::audit::AuditActor::cli(),
+                now()
+            )
+            .await
+            .unwrap(),
             replacement.id
         );
     }
@@ -2212,10 +2754,15 @@ mod tests {
             ..new_key("laptop", Grants::Catalogs(&main), None)
         };
         // The live name/actor rule covers keys only: the grant does not collide.
-        let key = create_with_id(&db.pool, &same_name, now())
-            .await
-            .unwrap()
-            .id;
+        let key = create_with_id(
+            &db.pool,
+            &same_name,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap()
+        .id;
         let row = |id: String| {
             let pool = db.pool.clone();
             async move {
@@ -2229,10 +2776,41 @@ mod tests {
         };
 
         // Each by-name command finds exactly one candidate (not "ambiguous").
-        let reporting = set_maintenance_report_target(&db.pool, "laptop", None, true).await;
-        let granted = grant_target(&db.pool, "laptop", Some("example-actor"), "other").await;
-        let ungranted = ungrant_target(&db.pool, "laptop", None, "main").await;
-        let revoked = revoke_target(&db.pool, "laptop", None, now()).await;
+        let reporting = set_maintenance_report_target(
+            &db.pool,
+            "laptop",
+            None,
+            true,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
+        let granted = grant_target(
+            &db.pool,
+            "laptop",
+            Some("example-actor"),
+            "other",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
+        let ungranted = ungrant_target(
+            &db.pool,
+            "laptop",
+            None,
+            "main",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
+        let revoked = revoke_target(
+            &db.pool,
+            "laptop",
+            None,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         assert_eq!(reporting.unwrap(), key);
         assert_eq!(granted.unwrap(), key);
@@ -2248,14 +2826,37 @@ mod tests {
         assert_eq!(grant_row.revoked_at, None, "the grant is untouched");
         // With the key revoked, the name reports the key, not the live grant.
         assert!(matches!(
-            revoke_target(&db.pool, "laptop", None, now()).await,
+            revoke_target(&db.pool, "laptop", None, &crate::store::audit::AuditActor::cli(), now()).await,
             Err(OkfError::Refused { reason }) if reason.contains("is revoked")
         ));
         // A grant's id is no key id to `okf-mcp key ...`.
         for result in [
-            revoke_target(&db.pool, &grant, None, now()).await,
-            grant_target(&db.pool, &grant, None, "other").await,
-            set_maintenance_report_target(&db.pool, &grant, None, false).await,
+            revoke_target(
+                &db.pool,
+                &grant,
+                None,
+                &crate::store::audit::AuditActor::cli(),
+                now(),
+            )
+            .await,
+            grant_target(
+                &db.pool,
+                &grant,
+                None,
+                "other",
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now(),
+            )
+            .await,
+            set_maintenance_report_target(
+                &db.pool,
+                &grant,
+                None,
+                false,
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now(),
+            )
+            .await,
         ] {
             assert!(
                 matches!(&result, Err(OkfError::Refused { reason }) if reason.contains("no active key")),
@@ -2306,9 +2907,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_key_belongs_to_its_user() {
         let db = test_db().await;
-        let created = create_with_id(&db.pool, &new_key("k", Grants::All, None), now())
-            .await
-            .unwrap();
+        let created = create_with_id(
+            &db.pool,
+            &new_key("k", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let found = record(&db.pool, &created.id).await;
 
@@ -2324,7 +2930,13 @@ mod tests {
         };
         let generation = catalogs::admin_generation(&db.pool).await.unwrap();
 
-        let made = create_with_id(&db.pool, &new, now()).await;
+        let made = create_with_id(
+            &db.pool,
+            &new,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         assert!(
             matches!(&made, Err(OkfError::UnknownName { noun: "user", name }) if name == "nobody"),
@@ -2344,9 +2956,15 @@ mod tests {
         assert_eq!(record(&db.pool, "legacy").await.user, None);
         let before = catalogs::admin_generation(&db.pool).await.unwrap();
 
-        let name = assign_user_by_id(&db.pool, "legacy", crate::db::TEST_USER)
-            .await
-            .unwrap();
+        let name = assign_user_by_id(
+            &db.pool,
+            "legacy",
+            crate::db::TEST_USER,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(name, "legacy");
         let found = record(&db.pool, "legacy").await;
@@ -2359,14 +2977,47 @@ mod tests {
         // Arrange: a revoked key belonging to the fixture user, and alice.
         let db = test_db().await;
         alice(&db.pool).await;
-        let created = create_with_id(&db.pool, &new_key("k", Grants::All, None), now())
-            .await
-            .unwrap();
-        revoke_by_id(&db.pool, &created.id, now()).await.unwrap();
+        let created = create_with_id(
+            &db.pool,
+            &new_key("k", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        revoke_by_id(
+            &db.pool,
+            &created.id,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
-        let moved = assign_user_by_id(&db.pool, &created.id, "alice").await;
-        let unknown_user = assign_user_by_id(&db.pool, &created.id, "nobody").await;
-        let unknown_key = assign_user_by_id(&db.pool, "no-such-id", "alice").await;
+        let moved = assign_user_by_id(
+            &db.pool,
+            &created.id,
+            "alice",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
+        let unknown_user = assign_user_by_id(
+            &db.pool,
+            &created.id,
+            "nobody",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
+        let unknown_key = assign_user_by_id(
+            &db.pool,
+            "no-such-id",
+            "alice",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
 
         assert_eq!(moved.unwrap(), "k", "revoked rows are attributed too");
         assert!(
@@ -2418,22 +3069,45 @@ mod tests {
         )
         .await;
 
-        let by_name = assign_user_target(&db.pool, "laptop", None, crate::db::TEST_USER).await;
+        let by_name = assign_user_target(
+            &db.pool,
+            "laptop",
+            None,
+            crate::db::TEST_USER,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
         assert_eq!(by_name.unwrap(), grant);
         assert_eq!(
             record(&db.pool, &grant).await.user.as_deref(),
             Some(crate::db::TEST_USER)
         );
-        let key = create_with_id(&db.pool, &new_key("laptop", Grants::All, None), now())
-            .await
-            .unwrap()
-            .id;
-        let ambiguous = assign_user_target(&db.pool, "laptop", None, crate::db::TEST_USER).await;
+        let key = create_with_id(
+            &db.pool,
+            &new_key("laptop", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap()
+        .id;
+        let ambiguous = assign_user_target(
+            &db.pool,
+            "laptop",
+            None,
+            crate::db::TEST_USER,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
         let by_actor = assign_user_target(
             &db.pool,
             "laptop",
             Some("claude-code/test"),
             crate::db::TEST_USER,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
         )
         .await;
 
@@ -2459,7 +3133,7 @@ mod tests {
                 user: "alice",
                 ..new_key("k", Grants::All, None)
             };
-            create_with_id(&pool, &new, now()).await
+            create_with_id(&pool, &new, &crate::store::audit::AuditActor::cli(), now()).await
         });
         crate::store::catalogs::tests::until_a_lock_is_awaited(&db.pool).await;
 
@@ -2481,8 +3155,16 @@ mod tests {
         insert_legacy_test_key(&db.pool, "legacy", Access::Read, "legacy", now()).await;
         let deleting = deleting_alice(&db.pool).await;
         let pool = db.pool.clone();
-        let assigning =
-            tokio::spawn(async move { assign_user_by_id(&pool, "legacy", "alice").await });
+        let assigning = tokio::spawn(async move {
+            assign_user_by_id(
+                &pool,
+                "legacy",
+                "alice",
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now(),
+            )
+            .await
+        });
         crate::store::catalogs::tests::until_a_lock_is_awaited(&db.pool).await;
 
         deleting.commit().await.unwrap();
@@ -2534,8 +3216,23 @@ mod tests {
             ..new_key("mixed", Grants::Catalogs(&names), None)
         };
 
-        let created = create_with_id(&db.pool, &new, now()).await.unwrap();
-        grant_by_id(&db.pool, &created.id, "docs").await.unwrap();
+        let created = create_with_id(
+            &db.pool,
+            &new,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        grant_by_id(
+            &db.pool,
+            &created.id,
+            "docs",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             stored_levels(&db.pool, &created.id).await,
@@ -2610,7 +3307,13 @@ mod tests {
         ];
 
         for new in cases {
-            let refused = create_with_id(&db.pool, &new, now()).await;
+            let refused = create_with_id(
+                &db.pool,
+                &new,
+                &crate::store::audit::AuditActor::cli(),
+                now(),
+            )
+            .await;
             assert!(
                 matches!(refused, Err(OkfError::Refused { .. })),
                 "{}: {refused:?}",
@@ -2672,14 +3375,27 @@ mod tests {
         ];
 
         for (limit, new) in refusals {
-            let refused = create_with_id(&db.pool, &new, now()).await;
+            let refused = create_with_id(
+                &db.pool,
+                &new,
+                &crate::store::audit::AuditActor::cli(),
+                now(),
+            )
+            .await;
             // `&refused`: match by reference, so `refused` is still there to print.
             assert!(
                 matches!(&refused, Err(OkfError::LimitExceeded { limit: named, .. }) if *named == limit),
                 "{limit}: {refused:?}"
             );
         }
-        let created = create_with_id(&db.pool, &mine, now()).await.unwrap();
+        let created = create_with_id(
+            &db.pool,
+            &mine,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let listed = record(&db.pool, &created.id).await;
         let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
@@ -2700,7 +3416,13 @@ mod tests {
             ..new_key("late", Grants::All, None)
         };
 
-        let refused = create_with_id(&db.pool, &new, now()).await;
+        let refused = create_with_id(
+            &db.pool,
+            &new,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         assert!(
             matches!(refused, Err(OkfError::Refused { .. })),
@@ -2730,19 +3452,62 @@ mod tests {
             self_issued: true,
             ..new_key("mine", Grants::Catalogs(&names), None)
         };
-        let created = create_with_id(&db.pool, &mine, now()).await.unwrap();
+        let created = create_with_id(
+            &db.pool,
+            &mine,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let generation = catalogs::admin_generation(&db.pool).await.unwrap();
 
         // Reporting is refused by id (the web API) and by name (the CLI) as
         // the rule it breaks, never as the schema's CHECK failing.
-        let by_id = set_maintenance_report_by_id(&db.pool, &created.id, true).await;
-        let by_name = set_maintenance_report_target(&db.pool, "mine", None, true).await;
+        let by_id = set_maintenance_report_by_id(
+            &db.pool,
+            &created.id,
+            true,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
+        let by_name = set_maintenance_report_target(
+            &db.pool,
+            "mine",
+            None,
+            true,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
         // Turning it off is allowed (and a no-op).
-        let off = set_maintenance_report_by_id(&db.pool, &created.id, false).await;
+        let off = set_maintenance_report_by_id(
+            &db.pool,
+            &created.id,
+            false,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
         // Granting and removing a catalog keep it within the rules: a new
         // grant takes the key's own level (write, never admin).
-        let granted = grant_by_id(&db.pool, &created.id, "work").await;
-        let ungranted = ungrant_by_id(&db.pool, &created.id, "pg").await;
+        let granted = grant_by_id(
+            &db.pool,
+            &created.id,
+            "work",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
+        let ungranted = ungrant_by_id(
+            &db.pool,
+            &created.id,
+            "pg",
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await;
 
         for refused in [&by_id, &by_name] {
             assert!(
@@ -2817,10 +3582,22 @@ mod tests {
         let db = test_db().await;
         let (names, levels) = main_read(&db.pool).await;
 
-        let first =
-            create_self_issued(&db.pool, &self_issued("a", &names, &levels, None), 1, now()).await;
-        let second =
-            create_self_issued(&db.pool, &self_issued("b", &names, &levels, None), 1, now()).await;
+        let first = create_self_issued(
+            &db.pool,
+            &self_issued("a", &names, &levels, None),
+            1,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await;
+        let second = create_self_issued(
+            &db.pool,
+            &self_issued("b", &names, &levels, None),
+            1,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         assert!(first.is_ok(), "{first:?}");
         assert!(
@@ -2844,6 +3621,7 @@ mod tests {
             &db.pool,
             &new_key("plain", Grants::Catalogs(&names), None),
             5,
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await;
@@ -2862,18 +3640,25 @@ mod tests {
             &db.pool,
             &self_issued("gone", &names, &levels, None),
             1,
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
         .expect("first key");
-        revoke_by_id(&db.pool, &revoked.id, now())
-            .await
-            .expect("revoke");
+        revoke_by_id(
+            &db.pool,
+            &revoked.id,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .expect("revoke");
         let in_an_hour = Some(now() + chrono::TimeDelta::hours(1));
         let expired = create_self_issued(
             &db.pool,
             &self_issued("old", &names, &levels, in_an_hour),
             1,
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
@@ -2885,14 +3670,20 @@ mod tests {
             .execute(&db.pool)
             .await
             .expect("expire");
-        create_with_id(&db.pool, &new_key("admin-made", Grants::All, None), now())
-            .await
-            .expect("an admin-issued key");
+        create_with_id(
+            &db.pool,
+            &new_key("admin-made", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .expect("an admin-issued key");
 
         let made = create_self_issued(
             &db.pool,
             &self_issued("new", &names, &levels, None),
             1,
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await;
@@ -2917,8 +3708,14 @@ mod tests {
                         catalog: "main".to_string(),
                         access: Some(Access::Read),
                     }];
-                    create_self_issued(&pool, &self_issued(&name, &names, &levels, None), 2, now())
-                        .await
+                    create_self_issued(
+                        &pool,
+                        &self_issued(&name, &names, &levels, None),
+                        2,
+                        &crate::store::audit::AuditActor::cli(),
+                        now(),
+                    )
+                    .await
                 })
             })
             .collect();
@@ -2957,7 +3754,14 @@ mod tests {
                 catalog: "main".to_string(),
                 access: Some(Access::Read),
             }];
-            create_self_issued(&pool, &self_issued("late", &names, &levels, None), 1, now()).await
+            create_self_issued(
+                &pool,
+                &self_issued("late", &names, &levels, None),
+                1,
+                &crate::store::audit::AuditActor::cli(),
+                now(),
+            )
+            .await
         });
         catalogs::tests::until_a_lock_is_awaited(&db.pool).await;
 
@@ -2986,12 +3790,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn rename_keeps_the_id_and_refuses_a_taken_name() {
         let db = test_db().await;
-        let first = create_with_id(&db.pool, &new_key("first", Grants::All, None), now())
-            .await
-            .expect("first");
-        create_with_id(&db.pool, &new_key("second", Grants::All, None), now())
-            .await
-            .expect("second");
+        let first = create_with_id(
+            &db.pool,
+            &new_key("first", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .expect("first");
+        create_with_id(
+            &db.pool,
+            &new_key("second", Grants::All, None),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .expect("second");
         let before = catalogs::admin_generation(&db.pool)
             .await
             .expect("generation");
@@ -3001,9 +3815,14 @@ mod tests {
             .expect("rename");
         let taken = rename_by_id(&db.pool, &first.id, "second").await;
         let invalid = rename_by_id(&db.pool, &first.id, "no spaces").await;
-        revoke_by_id(&db.pool, &first.id, now())
-            .await
-            .expect("revoke");
+        revoke_by_id(
+            &db.pool,
+            &first.id,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .expect("revoke");
         let revoked = rename_by_id(&db.pool, &first.id, "again").await;
 
         let record = list(&db.pool)

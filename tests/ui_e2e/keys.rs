@@ -217,6 +217,7 @@ async fn an_oauth_grant_is_marked_and_cannot_be_given_reporting() {
             expires_at: Utc::now() + TimeDelta::hours(1),
             user: OWNER,
         },
+        &okf_mcp::store::audit::AuditActor::cli(),
         Utc::now(),
     )
     .await
@@ -315,6 +316,7 @@ async fn an_admin_changes_a_sign_in_codes_user() {
             expires_at: Utc::now() + TimeDelta::hours(1),
             user: OWNER,
         },
+        &okf_mcp::store::audit::AuditActor::cli(),
         Utc::now(),
     )
     .await

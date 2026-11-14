@@ -941,7 +941,13 @@ async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyho
                     expires_at: None,
                     levels: &[],
                 };
-                keys::create_with_id(pool, &new, clock.now()).await?
+                keys::create_with_id(
+                    pool,
+                    &new,
+                    &crate::store::audit::AuditActor::cli(),
+                    clock.now(),
+                )
+                .await?
             };
             println!("{}", created.key);
             eprintln!(
@@ -955,26 +961,56 @@ async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyho
             }
         }
         KeyCommand::MaintenanceReport { id, enabled, actor } => {
-            let resolved =
-                keys::set_maintenance_report_target(pool, &id, actor.as_deref(), enabled).await?;
+            let resolved = keys::set_maintenance_report_target(
+                pool,
+                &id,
+                actor.as_deref(),
+                enabled,
+                &crate::store::audit::AuditActor::cli(),
+                clock.now(),
+            )
+            .await?;
             println!("key {resolved} maintenance_report {enabled}");
         }
         KeyCommand::Revoke { id, actor } => {
-            let resolved = keys::revoke_target(pool, &id, actor.as_deref(), clock.now()).await?;
+            let resolved = keys::revoke_target(
+                pool,
+                &id,
+                actor.as_deref(),
+                &crate::store::audit::AuditActor::cli(),
+                clock.now(),
+            )
+            .await?;
             println!("revoked key {resolved}");
         }
         KeyCommand::Grant { id, actor, catalog } => {
-            let resolved = keys::grant_target(pool, &id, actor.as_deref(), &catalog).await?;
+            let resolved = keys::grant_target(
+                pool,
+                &id,
+                actor.as_deref(),
+                &catalog,
+                &crate::store::audit::AuditActor::cli(),
+                clock.now(),
+            )
+            .await?;
             println!("granted {catalog} to key {resolved}");
         }
         KeyCommand::Ungrant { id, actor, catalog } => {
-            let resolved = keys::ungrant_target(pool, &id, actor.as_deref(), &catalog).await?;
+            let resolved = keys::ungrant_target(
+                pool,
+                &id,
+                actor.as_deref(),
+                &catalog,
+                &crate::store::audit::AuditActor::cli(),
+                clock.now(),
+            )
+            .await?;
             println!("removed {catalog} from key {resolved}");
         }
         KeyCommand::Assign { id, actor, user } => {
             print!(
                 "{}",
-                people::assign_key(pool, &id, actor.as_deref(), &user).await?
+                people::assign_key(pool, &id, actor.as_deref(), &user, clock.now()).await?
             );
         }
     }
@@ -1094,7 +1130,8 @@ async fn run_oauth(
                 expires_at,
                 user: &args.user,
             };
-            let created = codes::create(pool, &new, now).await?;
+            let created =
+                codes::create(pool, &new, &crate::store::audit::AuditActor::cli(), now).await?;
             println!("{}", created.code);
             eprintln!(
                 "code id: {}\nexpires: {}\nhand this code over now: it is not shown again",
@@ -1108,11 +1145,11 @@ async fn run_oauth(
             }
         }
         OauthCommand::Code(CodeCommand::Revoke { id }) => {
-            codes::revoke(pool, &id, now).await?;
+            codes::revoke(pool, &id, &crate::store::audit::AuditActor::cli(), now).await?;
             println!("revoked sign-in code {id}");
         }
         OauthCommand::Code(CodeCommand::Assign { id, user }) => {
-            print!("{}", people::assign_code(pool, &id, &user).await?);
+            print!("{}", people::assign_code(pool, &id, &user, now).await?);
         }
         OauthCommand::Grant(GrantCommand::List) => {
             for grant in keys::list(pool).await? {
@@ -1135,7 +1172,7 @@ async fn run_oauth(
             if !is_grant {
                 anyhow::bail!("no OAuth grant {id:?} (a plain key is revoked with `key revoke`)");
             }
-            keys::revoke_by_id(pool, &id, now).await?;
+            keys::revoke_by_id(pool, &id, &crate::store::audit::AuditActor::cli(), now).await?;
             println!("revoked OAuth grant {id}");
         }
     }
@@ -1898,6 +1935,7 @@ mod tests {
                 expires_at: clock.now() + chrono::TimeDelta::hours(1),
                 user: crate::db::TEST_USER,
             },
+            &crate::store::audit::AuditActor::cli(),
             clock.now(),
         )
         .await
@@ -1935,6 +1973,7 @@ mod tests {
                 expires_at: None,
                 levels: &[],
             },
+            &crate::store::audit::AuditActor::cli(),
             clock.now(),
         )
         .await

@@ -256,9 +256,14 @@ impl TestServer {
             expires_at: None,
             levels: &[],
         };
-        let key = keys::create(&self.db.pool, &new, Utc::now())
-            .await
-            .expect("create key");
+        let key = keys::create(
+            &self.db.pool,
+            &new,
+            &okf_mcp::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("create key");
         self.app.poll().await.expect("poll");
         key
     }
@@ -347,9 +352,16 @@ impl TestServer {
             .expect("created principal")
             .key_id
             .clone();
-        keys::set_maintenance_report_target(&self.db.pool, &id, None, true)
-            .await
-            .expect("enable reporting");
+        keys::set_maintenance_report_target(
+            &self.db.pool,
+            &id,
+            None,
+            true,
+            &okf_mcp::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("enable reporting");
         self.app.poll().await.expect("poll");
         key
     }

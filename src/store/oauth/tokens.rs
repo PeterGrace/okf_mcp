@@ -599,9 +599,14 @@ mod tests {
             .await
             .unwrap();
         drop(tx);
-        crate::store::keys::revoke_by_id(&db.pool, &grant, now())
-            .await
-            .unwrap();
+        crate::store::keys::revoke_by_id(
+            &db.pool,
+            &grant,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(expired, RefreshUse::Unknown, "expired");
         for (hash, what) in [

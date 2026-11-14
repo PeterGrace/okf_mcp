@@ -449,7 +449,7 @@ async fn create_key(
         expires_at: None,
         levels: &[],
     };
-    let created = key_rows::create_with_id(app.pool(), &new, app.clock().now()).await?;
+    let created = key_rows::create_with_id(app.pool(), &new, &audit, app.clock().now()).await?;
     let Json(key) = changed(&app, &principal, &created.id).await?;
     Ok(Json(CreatedKeyView {
         key,
@@ -464,12 +464,20 @@ async fn create_key(
 /// revoked key, or for enabling reporting on an OAuth grant.
 async fn update_key(
     State(app): State<Arc<App>>,
+    audit: crate::store::audit::AuditActor,
     Extension(principal): Extension<Arc<Principal>>,
     Path(id): Path<String>,
     Json(body): Json<UpdateKeyBody>,
 ) -> Result<Json<KeyView>, AppError> {
     let target = managed(&app, &principal, &id).await?;
-    key_rows::set_maintenance_report_by_id(app.pool(), &target.id, body.maintenance_report).await?;
+    key_rows::set_maintenance_report_by_id(
+        app.pool(),
+        &target.id,
+        body.maintenance_report,
+        &audit,
+        app.clock().now(),
+    )
+    .await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -482,12 +490,20 @@ async fn update_key(
 /// user; 422 for a body without `user`.
 async fn assign_user(
     State(app): State<Arc<App>>,
+    audit: crate::store::audit::AuditActor,
     Extension(principal): Extension<Arc<Principal>>,
     Path(id): Path<String>,
     Json(body): Json<AssignUserBody>,
 ) -> Result<Json<KeyView>, AppError> {
     let target = managed(&app, &principal, &id).await?;
-    key_rows::assign_user_by_id(app.pool(), &target.id, &body.user).await?;
+    key_rows::assign_user_by_id(
+        app.pool(),
+        &target.id,
+        &body.user,
+        &audit,
+        app.clock().now(),
+    )
+    .await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -499,11 +515,12 @@ async fn assign_user(
 /// already revoked.
 async fn revoke_key(
     State(app): State<Arc<App>>,
+    audit: crate::store::audit::AuditActor,
     Extension(principal): Extension<Arc<Principal>>,
     Path(id): Path<String>,
 ) -> Result<Json<KeyView>, AppError> {
     let target = managed(&app, &principal, &id).await?;
-    key_rows::revoke_by_id(app.pool(), &target.id, app.clock().now()).await?;
+    key_rows::revoke_by_id(app.pool(), &target.id, &audit, app.clock().now()).await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -515,6 +532,7 @@ async fn revoke_key(
 /// does not manage; 409 for a revoked or all-catalogs key.
 async fn grant_catalog(
     State(app): State<Arc<App>>,
+    audit: crate::store::audit::AuditActor,
     Extension(principal): Extension<Arc<Principal>>,
     // Two path parameters arrive as a tuple, in the order of the pattern.
     Path((id, catalog)): Path<(String, String)>,
@@ -522,7 +540,7 @@ async fn grant_catalog(
     require_admin(&principal)?;
     principal.require(Access::Admin, &catalog)?;
     let target = managed(&app, &principal, &id).await?;
-    key_rows::grant_by_id(app.pool(), &target.id, &catalog).await?;
+    key_rows::grant_by_id(app.pool(), &target.id, &catalog, &audit, app.clock().now()).await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -533,13 +551,14 @@ async fn grant_catalog(
 /// As [`grant_catalog`].
 async fn ungrant_catalog(
     State(app): State<Arc<App>>,
+    audit: crate::store::audit::AuditActor,
     Extension(principal): Extension<Arc<Principal>>,
     Path((id, catalog)): Path<(String, String)>,
 ) -> Result<Json<KeyView>, AppError> {
     require_admin(&principal)?;
     principal.require(Access::Admin, &catalog)?;
     let target = managed(&app, &principal, &id).await?;
-    key_rows::ungrant_by_id(app.pool(), &target.id, &catalog).await?;
+    key_rows::ungrant_by_id(app.pool(), &target.id, &catalog, &audit, app.clock().now()).await?;
     changed(&app, &principal, &target.id).await
 }
 
@@ -567,9 +586,14 @@ mod tests {
             expires_at: None,
             levels: &[],
         };
-        let created = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
-            .await
-            .expect("create a key");
+        let created = key_rows::create_with_id(
+            test.app.pool(),
+            &new,
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("create a key");
         test.app.poll().await.expect("poll the key in");
         created
     }
@@ -1010,9 +1034,14 @@ mod tests {
             expires_at: None,
             levels: &[],
         };
-        let web = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
-            .await
-            .expect("create the newer key");
+        let web = key_rows::create_with_id(
+            test.app.pool(),
+            &new,
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("create the newer key");
         test.app.poll().await.expect("poll the keys in");
         let state = |listed: &serde_json::Value, id: &str| -> serde_json::Value {
             listed["keys"]
@@ -1046,9 +1075,14 @@ mod tests {
             actor: "terminal",
             ..new
         };
-        let replacement = key_rows::create_with_id(test.app.pool(), &replacement, Utc::now())
-            .await
-            .expect("create the replacement");
+        let replacement = key_rows::create_with_id(
+            test.app.pool(),
+            &replacement,
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("create the replacement");
         test.app.poll().await.expect("poll the keys in");
         let (status, _) = send(
             &test,
@@ -1154,9 +1188,14 @@ mod tests {
             expires_at: None,
             levels: &[],
         };
-        let mine = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
-            .await
-            .expect("create a self-issued key");
+        let mine = key_rows::create_with_id(
+            test.app.pool(),
+            &new,
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("create a self-issued key");
         test.app.poll().await.expect("poll the key in");
 
         let (status, refused) = send(

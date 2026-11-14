@@ -18,6 +18,7 @@ use sqlx::{PgConnection, PgPool};
 use crate::error::OkfError;
 use crate::keys;
 use crate::maintenance::types::new_id;
+use crate::store::audit::{self, Action, AuditActor, Entry, Target};
 use crate::store::catalogs::bump_admin_generation;
 use crate::store::ceiling;
 use crate::store::keys::{resolve_grants, Access, Grants};
@@ -179,6 +180,7 @@ async fn lock_signed_in(
 /// # Arguments
 /// * `pool` - the database.
 /// * `new` - the user, session, client, levels and default catalog.
+/// * `audit` - the caller recorded with this change.
 /// * `now` - the creation time (server clock).
 ///
 /// # Returns
@@ -193,6 +195,7 @@ async fn lock_signed_in(
 pub async fn create_self_issued(
     pool: &PgPool,
     new: &NewSelfIssuedGrant<'_>,
+    audit: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
     let access = grant_access(new.levels)?;
@@ -201,6 +204,30 @@ pub async fn create_self_issued(
     let levels: Vec<&'static str> = new.levels.values().map(|access| access.as_str()).collect();
     // Dropping `tx` without `commit` (every early return below) rolls back.
     let mut tx = pool.begin().await?;
+    let user_name: String = sqlx::query_scalar("SELECT name FROM users WHERE id = $1")
+        .bind(new.user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| OkfError::Unauthenticated {
+            reason: "the approving user is gone".to_string(),
+        })?;
+    let catalogs: Vec<&str> = names.iter().map(String::as_str).collect();
+    audit::lock_people(
+        &mut tx,
+        audit,
+        &audit::People {
+            target: Some((&user_name, audit::RowLock::Share)),
+            catalogs: &catalogs,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|error| match error {
+        OkfError::UnknownName { .. } => OkfError::Unauthenticated {
+            reason: "the approving user is gone".to_string(),
+        },
+        other => other,
+    })?;
     let user = lock_signed_in(&mut tx, new, now).await?;
     let ceiling = ceiling::ceiling_in(&mut tx, new.user_id).await?;
     // `is_none_or`: absent from the ceiling, or allowed below the choice.
@@ -249,6 +276,20 @@ pub async fn create_self_issued(
     .bind(&catalog_ids)
     .bind(&levels)
     .execute(&mut *tx)
+    .await?;
+    let teams = audit::key_teams(&mut tx, &grant_id).await?;
+    audit::record(
+        &mut tx,
+        audit,
+        &Entry {
+            action: Action::OauthGrantCreated,
+            target: Target::Grant(&grant_id),
+            person: Some(new.user_id),
+            teams: &teams,
+            details: serde_json::json!({"client": client_host(new.client)}),
+        },
+        now,
+    )
     .await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
@@ -404,6 +445,10 @@ mod tests {
             .await
             .expect("generation");
 
+        let mut audit = AuditActor::system("consent-test");
+        audit.source = crate::store::audit::Source::Console;
+        audit.via = crate::store::audit::Via::Session;
+        audit.user_id = Some(user_id.clone());
         let grant_id = create_self_issued(
             &db.pool,
             &NewSelfIssuedGrant {
@@ -413,6 +458,7 @@ mod tests {
                 levels: &chosen,
                 default_catalog: Some("main"),
             },
+            &audit,
             now(),
         )
         .await
@@ -424,6 +470,16 @@ mod tests {
             .into_iter()
             .find(|record| record.id == grant_id)
             .expect("the grant row");
+        let entries = crate::store::audit::testing::entries(&db.pool, "oauth.grant_created").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "console");
+        assert_eq!(entries[0].actor_label, "console session");
+        assert_eq!(entries[0].actor_person.as_deref(), Some("alice"));
+        assert_eq!(entries[0].person.as_deref(), Some("alice"));
+        assert_eq!(
+            entries[0].details,
+            serde_json::json!({"client":"client.example.com"})
+        );
         assert_eq!(record.kind, KeyKind::OAuth);
         assert!(record.self_issued);
         assert!(!record.all_catalogs);
@@ -447,6 +503,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn consent_rolls_back_when_audit_fails() {
+        let db = test_db().await;
+        let (client, user_id, session_id) = alice_with(&db.pool, &[("main", Access::Write)]).await;
+        let chosen = levels(&[("main", Access::Read)]);
+        let before = catalogs::admin_generation(&db.pool).await.unwrap();
+        sqlx::query("ALTER TABLE audit_entries ADD CONSTRAINT reject_consent CHECK (action <> 'oauth.grant_created') NOT VALID")
+            .execute(&db.pool).await.unwrap();
+        assert!(create_self_issued(
+            &db.pool,
+            &NewSelfIssuedGrant {
+                user_id: &user_id,
+                session_id: &session_id,
+                client: &client,
+                levels: &chosen,
+                default_catalog: None,
+            },
+            &AuditActor::cli(),
+            now()
+        )
+        .await
+        .is_err());
+        assert!(key_rows::list(&db.pool).await.unwrap().is_empty());
+        assert_eq!(catalogs::admin_generation(&db.pool).await.unwrap(), before);
+        assert!(
+            crate::store::audit::testing::entries(&db.pool, "oauth.grant_created")
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_grant_with_no_catalog_or_an_admin_level_is_refused() {
         let db = test_db().await;
         let (client, user_id, session_id) = alice_with(&db.pool, &[("main", Access::Write)]).await;
@@ -463,6 +550,7 @@ mod tests {
                     levels: chosen,
                     default_catalog: None,
                 },
+                &crate::store::audit::AuditActor::cli(),
                 now(),
             )
             .await;
@@ -487,6 +575,7 @@ mod tests {
                         levels: &chosen,
                         default_catalog: None,
                     },
+                    &crate::store::audit::AuditActor::cli(),
                     now(),
                 )
                 .await
@@ -533,6 +622,7 @@ mod tests {
                         levels: chosen,
                         default_catalog: None,
                     },
+                    &crate::store::audit::AuditActor::cli(),
                     now(),
                 )
                 .await
@@ -582,6 +672,7 @@ mod tests {
                     levels: &chosen,
                     default_catalog: None,
                 },
+                &crate::store::audit::AuditActor::cli(),
                 now(),
             )
             .await

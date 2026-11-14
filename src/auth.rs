@@ -1183,6 +1183,7 @@ mod tests {
                 expires_at: None,
                 levels: &[],
             },
+            &crate::store::audit::AuditActor::cli(),
             Utc::now(),
         )
         .await
@@ -1196,9 +1197,14 @@ mod tests {
         let test = crate::mcp::testing::app_with(&[("main", &[])], Config::default()).await;
         let (id, key) = stored_key(&test.app, "reader").await;
         let (old_id, old_key) = stored_key(&test.app, "old").await;
-        key_rows::revoke_by_id(test.app.pool(), &old_id, Utc::now())
-            .await
-            .unwrap();
+        key_rows::revoke_by_id(
+            test.app.pool(),
+            &old_id,
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         test.app.poll().await.unwrap();
         let router = || echo(&test.app);
 
@@ -1312,9 +1318,14 @@ mod tests {
             expires_at: None,
             levels: &[],
         };
-        let created = key_rows::create_with_id(&db.pool, &new, Utc::now())
-            .await
-            .unwrap();
+        let created = key_rows::create_with_id(
+            &db.pool,
+            &new,
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         let app = crate::app::App::load(
             db.pool.clone(),
             crate::config::Config::default(),
@@ -1325,9 +1336,16 @@ mod tests {
         assert!(app.keys().find(&created.key).unwrap().maintenance_report);
         let before = catalogs::admin_generation(&db.pool).await.unwrap();
         assert_eq!(
-            key_rows::set_maintenance_report_target(&db.pool, &created.id, None, false)
-                .await
-                .unwrap(),
+            key_rows::set_maintenance_report_target(
+                &db.pool,
+                &created.id,
+                None,
+                false,
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now()
+            )
+            .await
+            .unwrap(),
             created.id
         );
         assert_eq!(
@@ -1341,9 +1359,16 @@ mod tests {
         assert!(principal_after_poll
             .require_maintenance_report("pg")
             .is_err());
-        key_rows::set_maintenance_report_target(&db.pool, &created.id, None, false)
-            .await
-            .unwrap();
+        key_rows::set_maintenance_report_target(
+            &db.pool,
+            &created.id,
+            None,
+            false,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             catalogs::admin_generation(&db.pool).await.unwrap(),
             before + 1
@@ -1379,18 +1404,28 @@ mod tests {
             expires_at: None,
             levels: &[],
         };
-        let created = key_rows::create_with_id(&db.pool, &new, Utc::now())
-            .await
-            .unwrap();
+        let created = key_rows::create_with_id(
+            &db.pool,
+            &new,
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         let key = created.key;
 
         let loaded = Keys::load(&db.pool, Arc::new(crate::clock::SystemClock))
             .await
             .unwrap();
         assert_eq!(loaded.find(&key).unwrap().key_id, created.id);
-        key_rows::revoke(&db.pool, "reader", Utc::now())
-            .await
-            .unwrap();
+        key_rows::revoke(
+            &db.pool,
+            "reader",
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         // The cache keeps the key until it is reloaded (the poll loop does that).
         assert!(loaded.find(&key).is_some());
         loaded.reload(&db.pool).await.unwrap();
@@ -1403,6 +1438,7 @@ mod tests {
                 name: "other",
                 ..new
             },
+            &crate::store::audit::AuditActor::cli(),
             Utc::now(),
         )
         .await
@@ -1546,12 +1582,22 @@ mod tests {
             expires_at: None,
             levels: &[],
         };
-        let mine = key_rows::create_with_id(&db.pool, &new("mine", true), now)
-            .await
-            .unwrap();
-        let issued = key_rows::create_with_id(&db.pool, &new("issued", false), now)
-            .await
-            .unwrap();
+        let mine = key_rows::create_with_id(
+            &db.pool,
+            &new("mine", true),
+            &crate::store::audit::AuditActor::cli(),
+            now,
+        )
+        .await
+        .unwrap();
+        let issued = key_rows::create_with_id(
+            &db.pool,
+            &new("issued", false),
+            &crate::store::audit::AuditActor::cli(),
+            now,
+        )
+        .await
+        .unwrap();
         // A self-issued OAuth grant, as consent signed in as alice will make
         // one (Task 11).
         let client = crate::store::oauth::testing::insert_client(
@@ -1877,10 +1923,15 @@ mod tests {
             expires_at: None,
             levels: &[],
         };
-        let secret = key_rows::create_with_id(&db.pool, &new, Utc::now())
-            .await
-            .unwrap()
-            .key;
+        let secret = key_rows::create_with_id(
+            &db.pool,
+            &new,
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .key;
         teams::suspend(
             &db.pool,
             crate::db::TEST_TEAM,

@@ -147,9 +147,14 @@ async fn alices_key(server: &TestServer, name: &str) {
         expires_at: None,
         levels: &levels,
     };
-    key_rows::create(&server.db.pool, &new, Utc::now())
-        .await
-        .expect("create alice's key");
+    key_rows::create(
+        &server.db.pool,
+        &new,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("create alice's key");
     server.app.poll().await.expect("poll");
 }
 
@@ -525,9 +530,14 @@ async fn an_admin_issued_key_for_every_catalog_shows_its_level() {
         expires_at: None,
         levels: &[],
     };
-    key_rows::create(&server.db.pool, &new, Utc::now())
-        .await
-        .expect("an admin issues alice a key for every catalog");
+    key_rows::create(
+        &server.db.pool,
+        &new,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("an admin issues alice a key for every catalog");
     server.app.poll().await.expect("poll");
     drive(console_base(&server), |ui| {
         ui.sign_in_password(EMAIL, PASSWORD);

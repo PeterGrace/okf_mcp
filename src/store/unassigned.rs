@@ -108,14 +108,35 @@ mod tests {
             expires_at: None,
             levels: &[],
         };
-        keys::create(&db.pool, &owned, now()).await.unwrap();
-        let legacy_code = codes::create(&db.pool, &code("old"), now()).await.unwrap();
+        keys::create(
+            &db.pool,
+            &owned,
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let legacy_code = codes::create(
+            &db.pool,
+            &code("old"),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         sqlx::query("UPDATE sign_in_codes SET user_id = NULL WHERE id = $1")
             .bind(&legacy_code.id)
             .execute(&db.pool)
             .await
             .unwrap();
-        codes::create(&db.pool, &code("new"), now()).await.unwrap();
+        codes::create(
+            &db.pool,
+            &code("new"),
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO catalogs (name, created_at) VALUES ('orphan', now())")
             .execute(&db.pool)
             .await

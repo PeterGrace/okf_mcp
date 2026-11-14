@@ -2273,6 +2273,7 @@ mod tests {
                     expires_at: None,
                     levels: &[],
                 },
+                &crate::store::audit::AuditActor::cli(),
                 Utc::now(),
             )
             .await
@@ -2291,6 +2292,7 @@ mod tests {
                     expires_at: Utc::now() + TimeDelta::hours(1),
                     user: "alice",
                 },
+                &crate::store::audit::AuditActor::cli(),
                 Utc::now(),
             )
             .await
