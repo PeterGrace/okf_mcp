@@ -827,8 +827,9 @@ okf-mcp team unsuspend family
 Over REST it is `PUT /api/v1/teams/{name}/suspension` with
 `{"suspended": true, "notice": "..."}` or `{"suspended": false}` (the
 [API reference](#users-and-teams-api) has the details); in the console,
-Teams → a team → Suspension → Suspend, or Lift suspension. All three need an
-admin that reaches every catalog, as the other team writes do.
+Teams → a team → Suspension → Suspend, or Lift suspension. The route and the
+console need an admin that reaches every catalog, as the other team writes
+do; the command line needs only the database, as every subcommand does.
 
 - **What it refuses.** Every read and write of the team's catalogs by a
   non-admin credential (API keys, OAuth grants and console sessions, whoever
