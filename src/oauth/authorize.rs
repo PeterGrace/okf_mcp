@@ -1017,6 +1017,7 @@ mod tests {
         oauth_app, send, send_as, sign_in_code, user_authorize_query, CLIENT_ID,
         LOOPBACK_CLIENT_ID, LOOPBACK_ON_PORT, PUBLIC_URL, REDIRECT_URI, VERIFIER,
     };
+    use crate::store::audit::AuditActor;
     use crate::store::ceiling::{self, Ceiling};
     use crate::store::keys::{self as key_rows, Access, KeyKind};
     use crate::store::oauth::codes as code_rows;
@@ -1625,7 +1626,7 @@ mod tests {
             (SettingKey::ProductName, "Acme Notes"),
             (SettingKey::SupportContact, "help@example.com"),
         ] {
-            settings::set(test.app.pool(), key, value, "cli", Utc::now())
+            settings::set(test.app.pool(), key, value, &AuditActor::cli(), Utc::now())
                 .await
                 .unwrap();
         }

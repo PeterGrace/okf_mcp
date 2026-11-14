@@ -53,6 +53,10 @@ Issue #397, epic #390. Plan:
 - Suspending a team already suspended with the same notice, giving a catalog
   to its current owner, and setting a description to its current text no
   longer write or bump the administrative generation.
+- Task 6d's `audit::lock_actor` is folded into `lock_people` and deleted:
+  `settings::set` and `reset` call `lock_people` (the actor and its
+  credential's owner, now admins first rather than in plain id order), and
+  `tools/agentic/lessons.md` has one lock-order rule.
 - `catalogs::find` (so `delete` and `import`), `set_owner` and
   `update_description` refuse a malformed catalog name as unknown before it
   reaches SQL (part of #339).

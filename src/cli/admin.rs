@@ -16,10 +16,8 @@ use crate::clock::format_timestamp;
 use crate::config::AuthConfig;
 use crate::mail::queue::{self, QueuedMail};
 use crate::mail::Template;
+use crate::store::audit::AuditActor;
 use crate::store::settings::{self, SettingRow};
-
-/// Who the CLI records as having changed a setting: it has no principal.
-const CLI_ACTOR: &str = "cli";
 
 /// Runs `okf-mcp settings ...`.
 ///
@@ -27,7 +25,7 @@ const CLI_ACTOR: &str = "cli";
 /// * `pool` - the migrated database.
 /// * `defaults` - the config file's `[auth]` table.
 /// * `command` - which settings subcommand.
-/// * `now` - the time a `set` is recorded at.
+/// * `now` - the time a `set` or `reset` is recorded at.
 ///
 /// # Returns
 /// The text to print.
@@ -47,11 +45,13 @@ pub(super) async fn settings(
             .map(|row| format_setting(row) + "\n")
             .collect(),
         SettingsCommand::Set { key, value } => {
-            settings::set(pool, key, &value, CLI_ACTOR, now).await?;
+            // The command line has no principal: the operating-system user
+            // is the actor (`AuditActor::cli`).
+            settings::set(pool, key, &value, &AuditActor::cli(), now).await?;
             format!("set {} to {value}\n", key.as_str())
         }
         SettingsCommand::Reset { key } => {
-            settings::reset(pool, key).await?;
+            settings::reset(pool, key, &AuditActor::cli(), now).await?;
             format!("reset {} to its default\n", key.as_str())
         }
     })
@@ -188,7 +188,10 @@ mod tests {
 
         assert_eq!(set, "set max_keys_per_user to 5\n");
         assert!(
-            listed.contains("max_keys_per_user\t5\tset by cli at "),
+            listed.contains(&format!(
+                "max_keys_per_user\t5\tset by {} at ",
+                crate::store::audit::AuditActor::cli().stored_label()
+            )),
             "{listed}"
         );
         assert!(
