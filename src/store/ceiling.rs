@@ -446,6 +446,7 @@ pub fn cap(grant: &BTreeMap<String, Access>, ceiling: &Ceiling) -> BTreeMap<Stri
 mod tests {
     use super::*;
     use crate::db::{test_db, TEST_TEAM, TEST_USER};
+    use crate::store::audit::AuditActor;
     use crate::store::teams::{self, NewTeam, Role};
     use crate::store::users::NewUser;
     use chrono::TimeZone;
@@ -813,7 +814,9 @@ mod tests {
         let carol = id(pool, "carol").await;
         assert!(ceilings(pool).await.unwrap().contains_key(&carol));
         last = catalogs::admin_generation(pool).await.unwrap();
-        users::delete(pool, "carol").await.unwrap();
+        users::delete(pool, "carol", false, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         moved(pool, "deleting a user", &mut last, &carol, Ceiling::new()).await;
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM user_catalogs WHERE user_id = $1")
             .bind(&carol)

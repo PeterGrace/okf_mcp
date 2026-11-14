@@ -703,26 +703,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_user_with_a_credential_cannot_be_deleted() {
-        // Arrange: a user and a key that names it.
+    async fn a_users_credentials_go_with_it_but_its_personal_team_restricts() {
+        // Arrange: alice holds a key, a sign-in code and a membership, and
+        // bob has a personal team (migration 0013).
         let db = test_db().await;
         sqlx::raw_sql(
-            "INSERT INTO users (name, created_at) VALUES ('alice', now());
+            "INSERT INTO users (name, created_at) VALUES ('alice', now()), ('bob', now());
              INSERT INTO api_keys (name, sha256, access, all_catalogs, actor, created_at, user_id)
                  SELECT 'k', decode(repeat('ef', 32), 'hex'), 'read', true, 'k', now(), id
-                 FROM users WHERE name = 'alice';",
+                 FROM users WHERE name = 'alice';
+             INSERT INTO sign_in_codes
+                     (name, sha256, access, all_catalogs, actor, created_at, expires_at, user_id)
+                 SELECT 'c', decode(repeat('cd', 32), 'hex'), 'read', true, 'c', now(),
+                        now() + interval '1 hour', id
+                 FROM users WHERE name = 'alice';
+             INSERT INTO teams (name, created_at) VALUES ('family', now());
+             INSERT INTO team_members (team_id, user_id, role, created_at)
+                 SELECT t.id, u.id, 'member', now() FROM teams t, users u
+                 WHERE t.name = 'family' AND u.name = 'alice';
+             INSERT INTO teams (name, personal_of, created_at)
+                 SELECT 'bob', id, now() FROM users WHERE name = 'bob';",
         )
         .execute(&db.pool)
         .await
         .unwrap();
 
         // Act
-        let deleted = sqlx::query("DELETE FROM users WHERE name = 'alice'")
+        sqlx::query("DELETE FROM users WHERE name = 'alice'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let bob = sqlx::query("DELETE FROM users WHERE name = 'bob'")
             .execute(&db.pool)
             .await;
 
-        // Assert: `ON DELETE RESTRICT` keeps the key's user.
-        let error = deleted.expect_err("RESTRICT refuses");
+        // Assert: the key, code and membership cascaded; `teams.personal_of`
+        // stays `ON DELETE RESTRICT`.
+        let left: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM api_keys) + (SELECT count(*) FROM sign_in_codes) \
+                  + (SELECT count(*) FROM team_members m JOIN teams t ON t.id = m.team_id \
+                     WHERE t.name = 'test-team' AND m.user_id NOT IN (SELECT id FROM users))",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(left, 0);
+        let error = bob.expect_err("RESTRICT refuses");
         assert_eq!(
             error.as_database_error().and_then(|e| e.code()).as_deref(),
             Some("23503"),

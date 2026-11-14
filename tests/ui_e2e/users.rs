@@ -1,8 +1,9 @@
 //! The Users page (M11 Task 8): create a user (and see its personal team),
-//! open its detail and delete it; the deletes a held key, another team or
-//! a catalog its personal team owns refuse, and that clearing the cause
-//! enables Delete; and what an admin that does not reach every catalog may
-//! do. M12 Task 15 adds the drawer's account sections: the email, the admin
+//! open its detail and delete it; and what an admin that does not reach
+//! every catalog may do. M14 Task 4 (#379): a user's keys, revoked ones
+//! included, go with it, a catalog its personal team owns disables Delete,
+//! the last owner of a shared team is refused with the reason kept in the
+//! drawer, and Delete is one pending write. M12 Task 15 adds the drawer's account sections: the email, the admin
 //! flag (and the last-admin refusal), Send setup email, entitlements, the
 //! user's console sessions and recent sign-ins.
 
@@ -12,7 +13,7 @@ use chrono::Utc;
 use okf_mcp::config::Config;
 use okf_mcp::store::catalogs;
 use okf_mcp::store::ceiling;
-use okf_mcp::store::keys::Access;
+use okf_mcp::store::keys::{self, Access, Grants, NewKey};
 use okf_mcp::store::sign_in_events::{self, Method, Outcome};
 use okf_mcp::store::teams::{self, NewTeam, Role};
 use okf_mcp::store::user_sessions;
@@ -54,20 +55,135 @@ async fn an_admin_creates_a_user_and_deletes_it() {
     .await;
 }
 
+/// Gives user `user` one key on `main`, revoked when `revoked`.
+async fn key_of(server: &TestServer, user: &str, name: &str, revoked: bool) {
+    let catalogs = ["main".to_string()];
+    let created = keys::create_with_id(
+        &server.db.pool,
+        &NewKey {
+            name,
+            access: Access::Read,
+            maintenance_report: false,
+            grants: Grants::Catalogs(&catalogs),
+            default_catalog: None,
+            actor: name,
+            user,
+            self_issued: false,
+            expires_at: None,
+            levels: &[],
+        },
+        Utc::now(),
+    )
+    .await
+    .expect("create a key");
+    if revoked {
+        keys::revoke_by_id(&server.db.pool, &created.id, Utc::now())
+            .await
+            .expect("revoke the key");
+    }
+}
+
+/// How many keys and grants name user `user`.
+async fn keys_of(server: &TestServer, user: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM api_keys k JOIN users u ON u.id = k.user_id WHERE u.name = $1",
+    )
+    .bind(user)
+    .fetch_one(&server.db.pool)
+    .await
+    .expect("count keys")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_user_holding_a_key_shows_why_it_cannot_be_deleted() {
+async fn a_user_whose_only_key_is_revoked_is_deleted_from_the_console() {
+    // Issue #379: the revoked key used to keep Delete disabled.
     let server = server().await;
     let admin = server.key("console-admin", Access::Admin, &[], None).await;
-    drive(server.base.clone(), move |ui| {
+    let alice = NewUser {
+        name: "alice",
+        display_name: "",
+    };
+    users::create(&server.db.pool, &alice, Utc::now())
+        .await
+        .expect("create alice");
+    key_of(&server, "alice", "alice-laptop", true).await;
+    server.app.poll().await.expect("poll");
+    let ran = drive(server.base.clone(), move |ui| {
         ui.login(&admin);
         ui.open("/users");
-        // The fixture user holds console-admin itself.
-        ui.click(&format!("[data-test=user-{OWNER}]"));
-        ui.wait_text("#user-keys", "console-admin");
-        ui.wait_visible("#user-delete[disabled]");
-        ui.wait_text("#user-delete-reason", "key");
+        ui.click("[data-test=user-alice]");
+        ui.wait_text("#user-keys", "alice-laptop");
+        ui.wait_visible("#user-delete:not([disabled])");
+        assert!(!ui.page.is_visible("#user-delete-reason").expect("visible"));
+        ui.click("#user-delete");
+        ui.wait_text(
+            "dialog.confirm",
+            "keys, grants and sign-in codes (revoked ones too)",
+        );
+        ui.click("#confirm-ok");
+        ui.wait_text("#toasts", "Deleted user alice.");
+        ui.wait_hidden("#user-detail");
+        ui.wait_hidden("[data-test=user-alice]");
     })
     .await;
+    if !ran {
+        return;
+    }
+    assert!(users::find(&server.db.pool, "alice").await.is_err());
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM api_keys WHERE name = 'alice-laptop'")
+        .fetch_one(&server.db.pool)
+        .await
+        .expect("count");
+    assert_eq!(left, 0, "the revoked key went with its user");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_clicked_again_while_it_runs_sends_one_request() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let alice = NewUser {
+        name: "alice",
+        display_name: "",
+    };
+    users::create(&server.db.pool, &alice, Utc::now())
+        .await
+        .expect("create alice");
+    key_of(&server, "alice", "alice-laptop", false).await;
+    server.app.poll().await.expect("poll");
+    assert_eq!(keys_of(&server, "alice").await, 1);
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/users");
+        ui.click("[data-test=user-alice]");
+        ui.wait_visible("#user-delete:not([disabled])");
+        // Hold the DELETE: while it runs, Delete is disabled, in this
+        // drawer and in the one drawn when alice is opened again.
+        ui.hold_next("DELETE", "/users/alice");
+        ui.click("#user-delete");
+        ui.click("#confirm-ok");
+        ui.wait_visible("#user-delete[disabled]");
+        ui.mark("#user-delete");
+        ui.click("#drawer-close");
+        ui.click("[data-test=user-alice]");
+        ui.wait_redrawn("#user-delete");
+        ui.wait_visible("#user-delete[disabled]");
+        assert!(
+            ui.click_twice("#user-delete"),
+            "the redrawn Delete is enabled"
+        );
+        assert_eq!(ui.held_matches(), 1, "a second DELETE was sent");
+        // Once it settles, the drawer that shows alice now closes.
+        ui.release_held();
+        ui.wait_hidden("#user-detail");
+        ui.wait_hidden("[data-test=user-alice]");
+        assert_eq!(ui.held_matches(), 1);
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    assert!(users::find(&server.db.pool, "alice").await.is_err());
+    assert_eq!(keys_of(&server, "alice").await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -91,13 +207,14 @@ async fn a_scoped_admin_lists_users_but_cannot_change_them() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn another_team_or_an_owned_catalog_refuses_the_delete_until_cleared() {
+async fn a_last_owner_or_an_owned_catalog_refuses_the_delete_until_cleared() {
     let server = server().await;
     let admin = server.key("console-admin", Access::Admin, &[], None).await;
     let pool = &server.db.pool;
-    // Neither user holds a credential: alice is in a shared team, and bob's
-    // personal team owns a catalog.
-    for name in ["alice", "bob"] {
+    // alice is the only owner of a shared team, and bob's personal team owns
+    // a catalog; carol is a plain member of that team, which never stops a
+    // deletion.
+    for name in ["alice", "bob", "carol"] {
         let user = NewUser {
             name,
             display_name: "",
@@ -109,36 +226,41 @@ async fn another_team_or_an_owned_catalog_refuses_the_delete_until_cleared() {
     let family = NewTeam {
         name: "family",
         display_name: "",
-        owner: OWNER,
+        owner: "alice",
     };
     teams::create(pool, &family, Utc::now())
         .await
         .expect("create a team");
-    teams::set_member(pool, "family", "alice", Role::Member, Utc::now())
+    teams::set_member(pool, "family", "carol", Role::Member, Utc::now())
         .await
-        .expect("add alice");
+        .expect("add carol");
     catalogs::create(pool, "bobs", "", "bob", Utc::now())
         .await
         .expect("create bob's catalog");
     server.app.poll().await.expect("poll");
-    drive(server.base.clone(), move |ui| {
+    let ran = drive(server.base.clone(), move |ui| {
         ui.login(&admin);
-        // alice: another team.
-        ui.open("/users");
-        ui.click("[data-test=user-alice]");
-        ui.wait_visible("#user-delete[disabled]");
-        ui.wait_text("#user-delete-reason", "belongs to other teams: family");
-        ui.click("#drawer-close");
-        ui.open("/teams");
-        ui.click("[data-test=team-family]");
-        ui.click("[data-test=member-remove-alice]");
-        ui.wait_hidden("[data-test=member-remove-alice]");
-        ui.click("#drawer-close");
+        // alice: the server refuses, and reading her again then fails; the
+        // drawer keeps the reason, marked stale, with Delete usable again.
         ui.open("/users");
         ui.click("[data-test=user-alice]");
         ui.wait_visible("#user-delete:not([disabled])");
-        assert!(!ui.page.is_visible("#user-delete-reason").expect("visible"));
+        ui.fail_next("GET", "/users/alice", 503, "the server is unavailable");
+        ui.click("#user-delete");
+        ui.click("#confirm-ok");
+        ui.wait_text("#toasts", "last owner of team(s)");
+        ui.wait_visible("#user-stale");
+        ui.wait_visible("#user-refusal");
+        ui.wait_text("#user-refusal", "last owner of team(s) \"family\"");
+        ui.wait_visible("#user-delete:not([disabled])");
+        ui.wait_visible("[data-test=user-alice]");
         ui.click("#drawer-close");
+        // carol: a member of family, deleted with her membership.
+        ui.click("[data-test=user-carol]");
+        ui.wait_visible("#user-delete:not([disabled])");
+        ui.click("#user-delete");
+        ui.click("#confirm-ok");
+        ui.wait_hidden("[data-test=user-carol]");
         // bob: a catalog his personal team owns.
         ui.click("[data-test=user-bob]");
         ui.wait_visible("#user-delete[disabled]");
@@ -155,6 +277,16 @@ async fn another_team_or_an_owned_catalog_refuses_the_delete_until_cleared() {
         assert!(!ui.page.is_visible("#user-delete-reason").expect("visible"));
     })
     .await;
+    if !ran {
+        return;
+    }
+    assert!(
+        users::find(pool, "alice").await.is_ok(),
+        "the refusal kept alice"
+    );
+    assert!(users::find(pool, "carol").await.is_err());
+    let family = teams::find(pool, "family").await.expect("family");
+    assert_eq!(family.members.len(), 1, "only alice is left in family");
 }
 
 /// The text nodes directly inside the page's view: a conditional `null`
