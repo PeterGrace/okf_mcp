@@ -381,4 +381,32 @@ mod tests {
         assert!(queue::list(&db.pool).await.expect("the queue").is_empty());
         assert_eq!(setup_tokens(&db.pool).await, 0, "no link without its entry");
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admins_inviting_each_other_at_once_both_finish() {
+        use crate::store::users::tests::{both_finish_while_a_person_is_held, two_admins};
+        let db = test_db().await;
+        let [(low_name, low), (high_name, high)] = two_admins(&db.pool).await;
+        set_email(&db.pool, &low_name, "low@example.com").await;
+        set_email(&db.pool, &high_name, "high@example.com").await;
+        let held = low.user_id.clone().expect("a session actor has a user");
+        let pool = db.pool.clone();
+        let first = async move {
+            send_setup(&pool, &with_public_url(), &high_name, &low, Utc::now())
+                .await
+                .map(drop)
+        };
+        let pool = db.pool.clone();
+        let second = async move {
+            send_setup(&pool, &with_public_url(), &low_name, &high, Utc::now())
+                .await
+                .map(drop)
+        };
+
+        let (one, other) = both_finish_while_a_person_is_held(&db.pool, &held, first, second).await;
+
+        one.expect("the first invite");
+        other.expect("the second invite");
+        assert_eq!(invited(&db.pool).await.len(), 2);
+    }
 }

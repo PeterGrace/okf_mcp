@@ -1332,4 +1332,50 @@ mod tests {
             .all(|action| Action::parse(action.as_str()) == Some(*action)));
         assert_eq!(Action::parse("user.unknown"), None);
     }
+
+    /// Records `team.suspended` on `team` (a personal team) as `actor`, the
+    /// team resolved first through [`team_ref`], as a team write does.
+    async fn record_on_team(pool: PgPool, team: String, actor: AuditActor) -> Result<(), OkfError> {
+        let mut tx = pool.begin().await?;
+        let team_id = team_ref(&mut tx, &team).await?;
+        record(
+            &mut tx,
+            &actor,
+            &Entry {
+                teams: &[team_id],
+                ..entry(Action::TeamSuspended, Target::Team(&team))
+            },
+            now(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admins_acting_on_each_others_personal_teams_at_once_both_finish() {
+        use crate::store::users::tests::{both_finish_while_a_person_is_held, two_admins};
+        let db = test_db().await;
+        let [(low_name, low), (high_name, high)] = two_admins(&db.pool).await;
+        let held = low.user_id.clone().expect("a session actor has a user");
+        // Each resolves the other's personal team (its person) first, then
+        // records with itself as the actor.
+        let first = record_on_team(db.pool.clone(), high_name, low);
+        let second = record_on_team(db.pool.clone(), low_name, high);
+
+        let (one, other) = both_finish_while_a_person_is_held(&db.pool, &held, first, second).await;
+
+        one.expect("the first entry");
+        other.expect("the second entry");
+        let recorded = testing::entries(&db.pool, "team.suspended").await;
+        assert_eq!(recorded.len(), 2);
+        // The stale snapshots were refreshed by whichever entry could.
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT display_name FROM audit_people WHERE name IN ('ann', 'ben')",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert!(names.iter().any(|name| name == "renamed"), "{names:?}");
+    }
 }

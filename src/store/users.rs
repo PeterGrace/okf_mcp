@@ -242,6 +242,10 @@ pub async fn create(
         now,
     )
     .await?;
+    // The personal team's audit row from birth, like the user's own (which
+    // the entry above makes): later entries naming either only read them
+    // (`migrations/0014_audit_row_locks.sql`).
+    audit::team_ref(&mut tx, new.name).await?;
     tx.commit().await?;
     Ok(UserRecord {
         name: new.name.to_string(),
@@ -2934,5 +2938,120 @@ pub(crate) mod tests {
                 .as_deref(),
             Some("staff")
         );
+    }
+
+    /// Two admins acting by session, the lower user id first, with their
+    /// audit rows made stale (a display-name change) so the next entry
+    /// naming them refreshes both rows.
+    pub(crate) async fn two_admins(pool: &PgPool) -> [(String, AuditActor); 2] {
+        let mut pair = [
+            ("ann".to_string(), admin_session_actor(pool, "ann").await),
+            ("ben".to_string(), admin_session_actor(pool, "ben").await),
+        ];
+        // `sort_by` with the user ids: the lower id first.
+        pair.sort_by(|left, right| left.1.user_id.cmp(&right.1.user_id));
+        sqlx::query("UPDATE users SET display_name = 'renamed' WHERE name IN ('ann', 'ben')")
+            .execute(pool)
+            .await
+            .unwrap();
+        pair
+    }
+
+    /// Runs `first` and `second`, two changes that name the same two people
+    /// in opposite order, at once, while another transaction holds
+    /// `held_user`'s audit row as a refresh does (`FOR NO KEY UPDATE`).
+    /// Resolving a person must never wait on that row: when every resolver
+    /// upserted (and so locked) each row it named, the two changes each held
+    /// one person's row and waited for the other's, a deadlock; here both
+    /// would wait for the holder and time out.
+    ///
+    /// # Returns
+    /// Both results, each within 30 s; the holder is released after.
+    pub(crate) async fn both_finish_while_a_person_is_held<F, G>(
+        pool: &PgPool,
+        held_user: &str,
+        first: F,
+        second: G,
+    ) -> (Result<(), OkfError>, Result<(), OkfError>)
+    where
+        // Any futures the runtime can move to another thread.
+        F: std::future::Future<Output = Result<(), OkfError>> + Send + 'static,
+        G: std::future::Future<Output = Result<(), OkfError>> + Send + 'static,
+    {
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM audit_people WHERE user_id = $1 FOR NO KEY UPDATE")
+            .bind(held_user)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let (first, second) = (tokio::spawn(first), tokio::spawn(second));
+        let first = tokio::time::timeout(LOCK_WAIT, first)
+            .await
+            .expect("the first change finished while a person's audit row was held")
+            .expect("the first change did not panic");
+        let second = tokio::time::timeout(LOCK_WAIT, second)
+            .await
+            .expect("the second change finished while a person's audit row was held")
+            .expect("the second change did not panic");
+        holder.rollback().await.unwrap();
+        (first, second)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admins_setting_each_others_email_at_once_both_finish() {
+        let db = test_db().await;
+        let [(low_name, low), (high_name, high)] = two_admins(&db.pool).await;
+        let held = low.user_id.clone().unwrap();
+        let pool = db.pool.clone();
+        let first = async move {
+            set_email(&pool, &high_name, Some("high@example.com"), &low, now()).await
+        };
+        let pool = db.pool.clone();
+        let second =
+            async move { set_email(&pool, &low_name, Some("low@example.com"), &high, now()).await };
+
+        let (one, other) = both_finish_while_a_person_is_held(&db.pool, &held, first, second).await;
+
+        one.expect("the first email change");
+        other.expect("the second email change");
+        assert_eq!(
+            audit::testing::entries(&db.pool, "user.email_changed")
+                .await
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admins_ending_each_others_sessions_at_once_both_finish() {
+        let db = test_db().await;
+        let [(low_name, low), (high_name, high)] = two_admins(&db.pool).await;
+        let held = low.user_id.clone().unwrap();
+        let pool = db.pool.clone();
+        let target = high_name.clone();
+        let first = async move {
+            let session = seed_session_of(&pool, &target).await;
+            end_session_by_prefix(&pool, &target, &session, &low, now()).await
+        };
+        let pool = db.pool.clone();
+        let target = low_name.clone();
+        let second = async move {
+            let session = seed_session_of(&pool, &target).await;
+            end_session_by_prefix(&pool, &target, &session, &high, now()).await
+        };
+
+        let (one, other) = both_finish_while_a_person_is_held(&db.pool, &held, first, second).await;
+
+        one.expect("the first revoke");
+        other.expect("the second revoke");
+    }
+
+    /// Gives user `name` a console session and answers its id prefix.
+    async fn seed_session_of(pool: &PgPool, name: &str) -> String {
+        let id = id_by_name(pool, name).await.unwrap();
+        seed_session(pool, &id).await;
+        user_sessions::list(pool, &id, None).await.unwrap()[0]
+            .id_prefix
+            .clone()
     }
 }
