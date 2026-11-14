@@ -436,7 +436,7 @@ async fn a_suspension_write_runs_once_and_settles_in_a_reopened_drawer() {
         ui.wait_visible("#team-suspend-form textarea[disabled]");
         assert!(
             ui.click_twice("#team-suspend"),
-            "the reopened Suspend is enabled"
+            "the reopened Suspend is not disabled"
         );
         assert_eq!(ui.held_matches(), 1, "a second suspend was sent");
         // Once it settles, the reopened drawer shows the suspension.
@@ -454,7 +454,7 @@ async fn a_suspension_write_runs_once_and_settles_in_a_reopened_drawer() {
         ui.wait_redrawn("#team-unsuspend");
         assert!(
             ui.click_twice("#team-unsuspend"),
-            "the redrawn Lift is enabled"
+            "the redrawn Lift is not disabled"
         );
         assert_eq!(ui.held_matches(), 1, "the redrawn Lift sent a second lift");
         ui.release_held();
