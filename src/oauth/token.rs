@@ -700,9 +700,14 @@ mod tests {
             .fetch_one(test.app.pool())
             .await
             .unwrap();
-        crate::store::keys::revoke_by_id(test.app.pool(), &grant, test.app.clock().now())
-            .await
-            .unwrap();
+        crate::store::keys::revoke_by_id(
+            test.app.pool(),
+            &grant,
+            &crate::store::audit::AuditActor::cli(),
+            test.app.clock().now(),
+        )
+        .await
+        .unwrap();
         test.app.poll().await.unwrap();
 
         let (status, _, body) = token(&test, exchange(&code)).await;

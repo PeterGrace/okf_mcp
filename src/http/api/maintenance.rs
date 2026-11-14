@@ -440,6 +440,7 @@ mod tests {
                 expires_at: None,
                 levels: &[],
             },
+            &crate::store::audit::AuditActor::cli(),
             Utc::now(),
         )
         .await

@@ -449,10 +449,15 @@ pub(crate) async fn stored_secret(
         expires_at: None,
         levels: &[],
     };
-    let secret = crate::store::keys::create_with_id(test.app.pool(), &new, Utc::now())
-        .await
-        .expect("create the key")
-        .key;
+    let secret = crate::store::keys::create_with_id(
+        test.app.pool(),
+        &new,
+        &crate::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("create the key")
+    .key;
     test.app.poll().await.expect("poll the key in");
     secret
 }

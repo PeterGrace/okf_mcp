@@ -121,7 +121,7 @@ pub struct AccessRecord { /* audit ids and catalog scope, resolved at admission 
 pub async fn record_admin_read(pool: &PgPool, record: &AccessRecord)
                                -> Result<(), OkfError>;                               // Task 7b
 pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError>;   // Task 6d
-pub enum RowLock { Update, NoKeyUpdate, KeyShare } // Task 6a/6b merged lock modes
+pub enum RowLock { Update, NoKeyUpdate, KeyShare, Share } // Task 6c: guarded consent insert
 pub struct People<'a> { pub target: Option<(&'a str, RowLock)>,
                        pub users: &'a [&'a str], pub teams: &'a [&'a str],
                        pub catalogs: &'a [&'a str] }                             // Task 6b
@@ -3323,6 +3323,25 @@ git commit -m "feat(audit): record team, membership, suspension, catalog and imp
 ---
 
 ### Task 6c: Recording credential changes
+
+> **Corrected (issue #398, 2026-11-14).** Credential writers use the merged
+> `audit::lock_people` / `People::target` API, before locking a credential or
+> bumping `admin_generation`. `audit::lock_credential_people` snapshots the
+> credential owner and granted catalog names, locks their people with the
+> actor in the shared admin-first order, then locks and rechecks the credential;
+> an intervening assignment/grant change is refused for retry rather than
+> locking a newly discovered user out of order. OAuth consent uses the new
+> `RowLock::Share` mode to retain its guarded-insert protection against
+> credential resets. Assignment, grants and reporting writes take `audit, now`
+> even where the old API had no clock; assignment to the existing owner is a
+> no-op (no entry or generation bump). Every creation transaction records its
+> new credential, eagerly creating its reference. No credential-reference
+> migration/backfill is added: absent references of pre-audit credentials can
+> still wait at first resolution, as a bounded regression test demonstrates;
+> migration `0014_audit_row_locks.sql` makes existing-reference refreshes
+> skip-locked, not all resolver calls nonblocking. `0015_provisioner.sql` is
+> unchanged. The provisioner every-use audit design gap is tracked by #423,
+> not implemented or claimed complete here.
 
 **Files:** `src/store/keys.rs`, `src/store/oauth/codes.rs`, `src/store/oauth/grants.rs`, `src/cli.rs` (`run_key`, `run_oauth`), `src/http/api/keys.rs`, `src/http/api/oauth.rs`, `src/http/api/me.rs`, the consent and token handlers that call `grants::create_self_issued` and `codes::redeem` (`grep -rn "create_self_issued\|codes::redeem" src`), every test caller, `docs/operations.md`
 

@@ -210,15 +210,25 @@ async fn seed_unassigned(server: &TestServer) -> String {
         .expect("read the client")
         .expect("the client exists");
     let main = ["main".to_string()];
-    let redeemed = codes::create(pool, &new_code("laptop", &main), Utc::now())
-        .await
-        .expect("mint the code a grant comes from");
+    let redeemed = codes::create(
+        pool,
+        &new_code("laptop", &main),
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("mint the code a grant comes from");
     let grant_id = codes::redeem(pool, &redeemed.id, &client, Utc::now())
         .await
         .expect("redeem the code");
-    codes::create(pool, &new_code("tablet", &main), Utc::now())
-        .await
-        .expect("mint a code");
+    codes::create(
+        pool,
+        &new_code("tablet", &main),
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("mint a code");
     sqlx::query("UPDATE api_keys SET user_id = NULL WHERE id = $1")
         .bind(&grant_id)
         .execute(pool)

@@ -99,10 +99,15 @@ pub(crate) async fn sign_in_code(test: &TestApp, access: Access) -> String {
         expires_at: Utc::now() + TimeDelta::hours(24),
         user: crate::db::TEST_USER,
     };
-    code_rows::create(test.app.pool(), &new, Utc::now())
-        .await
-        .expect("create a sign-in code")
-        .code
+    code_rows::create(
+        test.app.pool(),
+        &new,
+        &crate::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("create a sign-in code")
+    .code
 }
 
 /// A valid authorization request's query string on the sign-in code path

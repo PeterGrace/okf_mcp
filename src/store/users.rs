@@ -1940,14 +1940,20 @@ pub(crate) mod tests {
                 expires_at: None,
                 levels: &[],
             },
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await
         .unwrap();
         if revoked {
-            key_rows::revoke_by_id(pool, &created.id, now())
-                .await
-                .unwrap();
+            key_rows::revoke_by_id(
+                pool,
+                &created.id,
+                &crate::store::audit::AuditActor::cli(),
+                now(),
+            )
+            .await
+            .unwrap();
         }
         created.id
     }

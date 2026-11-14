@@ -897,9 +897,14 @@ mod tests {
         )
         .await
         .unwrap();
-        key_rows::revoke(&db.pool, "reader", Utc::now())
-            .await
-            .unwrap();
+        key_rows::revoke(
+            &db.pool,
+            "reader",
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         app.poll().await.unwrap();
 
         assert_eq!(names(&app), ["pg", "work"]);
@@ -916,9 +921,14 @@ mod tests {
         let key = new_key(&db.pool, "reader").await;
         let app = app(&db.pool).await;
 
-        key_rows::revoke(&db.pool, "reader", Utc::now())
-            .await
-            .unwrap();
+        key_rows::revoke(
+            &db.pool,
+            "reader",
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         // `join!` runs both passes concurrently; `polling` serializes them.
         let (first, second) = tokio::join!(app.poll(), app.poll());
 
@@ -1183,9 +1193,14 @@ mod tests {
         let db = test_db().await;
         let key = new_key(&db.pool, "reader").await;
         let app = app(&db.pool).await;
-        key_rows::revoke(&db.pool, "reader", Utc::now())
-            .await
-            .unwrap();
+        key_rows::revoke(
+            &db.pool,
+            "reader",
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         catalogs::create(
             &db.pool,
             &crate::store::catalogs::NewCatalog {

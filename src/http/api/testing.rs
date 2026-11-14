@@ -76,10 +76,15 @@ pub(crate) async fn keys(test: &TestApp) -> Keys {
                 expires_at: None,
                 levels: &[],
             };
-            key_rows::create_with_id(&pool, &new, Utc::now())
-                .await
-                .expect("create a test key")
-                .key
+            key_rows::create_with_id(
+                &pool,
+                &new,
+                &crate::store::audit::AuditActor::cli(),
+                Utc::now(),
+            )
+            .await
+            .expect("create a test key")
+            .key
         }
     };
     let keys = Keys {
@@ -112,10 +117,15 @@ pub(crate) async fn every_catalog_admin(test: &TestApp) -> String {
         expires_at: None,
         levels: &[],
     };
-    let key = key_rows::create_with_id(test.app.pool(), &new, Utc::now())
-        .await
-        .expect("create the every-catalog admin key")
-        .key;
+    let key = key_rows::create_with_id(
+        test.app.pool(),
+        &new,
+        &crate::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("create the every-catalog admin key")
+    .key;
     test.app.poll().await.expect("poll the key in");
     key
 }

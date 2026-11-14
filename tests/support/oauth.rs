@@ -127,6 +127,7 @@ pub async fn sign_in_code(server: &TestServer, access: Access, catalogs: &[&str]
             expires_at: Utc::now() + TimeDelta::hours(1),
             user: crate::support::server::OWNER,
         },
+        &okf_mcp::store::audit::AuditActor::cli(),
         Utc::now(),
     )
     .await

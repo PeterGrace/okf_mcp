@@ -228,6 +228,7 @@ async fn list_codes(
 /// `oauth.code_max_expiry`; 422 for an unknown or missing field.
 async fn create_code(
     State(app): State<Arc<App>>,
+    audit: crate::store::audit::AuditActor,
     Extension(principal): Extension<Arc<Principal>>,
     Json(body): Json<CreateCodeBody>,
 ) -> Result<Json<CreatedSignInCodeView>, AppError> {
@@ -266,7 +267,7 @@ async fn create_code(
         expires_at,
         user: &body.user,
     };
-    let created = codes::create(app.pool(), &new, now).await?;
+    let created = codes::create(app.pool(), &new, &audit, now).await?;
     let record = managed_code(&app, &principal, &created.id).await?;
     Ok(Json(CreatedSignInCodeView {
         code: SignInCodeView::new(record, now),
@@ -281,12 +282,13 @@ async fn create_code(
 /// redeemed or already revoked.
 async fn revoke_code(
     State(app): State<Arc<App>>,
+    audit: crate::store::audit::AuditActor,
     Extension(principal): Extension<Arc<Principal>>,
     Path(id): Path<String>,
 ) -> Result<Json<SignInCodeView>, AppError> {
     let target = managed_code(&app, &principal, &id).await?;
     let now = app.clock().now();
-    codes::revoke(app.pool(), &target.id, now).await?;
+    codes::revoke(app.pool(), &target.id, &audit, now).await?;
     let record = managed_code(&app, &principal, &target.id).await?;
     Ok(Json(SignInCodeView::new(record, now)))
 }
@@ -301,12 +303,20 @@ async fn revoke_code(
 /// unknown user; 422 for a body without `user`.
 async fn assign_code_user(
     State(app): State<Arc<App>>,
+    audit: crate::store::audit::AuditActor,
     Extension(principal): Extension<Arc<Principal>>,
     Path(id): Path<String>,
     Json(body): Json<AssignUserBody>,
 ) -> Result<Json<SignInCodeView>, AppError> {
     let target = managed_code(&app, &principal, &id).await?;
-    codes::assign_user(app.pool(), &target.id, &body.user).await?;
+    codes::assign_user(
+        app.pool(),
+        &target.id,
+        &body.user,
+        &audit,
+        app.clock().now(),
+    )
+    .await?;
     let record = managed_code(&app, &principal, &target.id).await?;
     Ok(Json(SignInCodeView::new(record, app.clock().now())))
 }
@@ -334,9 +344,14 @@ mod tests {
             expires_at: Utc::now() + TimeDelta::hours(1),
             user: crate::db::TEST_USER,
         };
-        codes::create(test.app.pool(), &new, Utc::now())
-            .await
-            .expect("mint a code")
+        codes::create(
+            test.app.pool(),
+            &new,
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("mint a code")
     }
 
     #[tokio::test]

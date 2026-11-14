@@ -339,8 +339,17 @@ pub(super) async fn assign_key(
     target: &str,
     actor: Option<&str>,
     user: &str,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<String> {
-    let resolved = keys::assign_user_target(pool, target, actor, user).await?;
+    let resolved = keys::assign_user_target(
+        pool,
+        target,
+        actor,
+        user,
+        &crate::store::audit::AuditActor::cli(),
+        now,
+    )
+    .await?;
     Ok(format!("key {resolved} now belongs to {user}\n"))
 }
 
@@ -356,8 +365,13 @@ pub(super) async fn assign_key(
 ///
 /// # Errors
 /// An unknown code or user, or a database error.
-pub(super) async fn assign_code(pool: &PgPool, id: &str, user: &str) -> anyhow::Result<String> {
-    codes::assign_user(pool, id, user).await?;
+pub(super) async fn assign_code(
+    pool: &PgPool,
+    id: &str,
+    user: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<String> {
+    codes::assign_user(pool, id, user, &crate::store::audit::AuditActor::cli(), now).await?;
     Ok(format!("sign-in code {id} now belongs to {user}\n"))
 }
 
@@ -557,10 +571,10 @@ mod tests {
                 set_member_access(pool, &name, access, now).await
             }
             Command::Key(KeyCommand::Assign { id, actor, user }) => {
-                assign_key(pool, &id, actor.as_deref(), &user).await
+                assign_key(pool, &id, actor.as_deref(), &user, Utc::now()).await
             }
             Command::Oauth(OauthCommand::Code(CodeCommand::Assign { id, user })) => {
-                assign_code(pool, &id, &user).await
+                assign_code(pool, &id, &user, Utc::now()).await
             }
             other => {
                 let cli = Cli {

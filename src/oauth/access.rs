@@ -280,9 +280,14 @@ mod tests {
         let token = mint_access(&test.app, &grant, RESOURCE, TimeDelta::hours(1)).await;
         assert!(authenticate(&test.app, &token).await.unwrap().is_some());
 
-        key_rows::revoke_by_id(test.app.pool(), &grant, test.app.clock().now())
-            .await
-            .unwrap();
+        key_rows::revoke_by_id(
+            test.app.pool(),
+            &grant,
+            &crate::store::audit::AuditActor::cli(),
+            test.app.clock().now(),
+        )
+        .await
+        .unwrap();
         test.app.poll().await.unwrap();
 
         assert!(authenticate(&test.app, &token).await.unwrap().is_none());
