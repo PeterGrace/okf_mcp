@@ -699,6 +699,7 @@ mod tests {
     use crate::db::test_db;
     use crate::mcp::testing::app_with;
     use crate::okf::workspace::StoredFile;
+    use crate::store::audit::AuditActor;
     use crate::store::changesets::{ChangesetState, EntryRow};
     use crate::store::import::{import, ImportOptions, ImportScope};
     use crate::store::keys as key_rows;
@@ -899,7 +900,7 @@ mod tests {
             name: "alice",
             display_name: "",
         };
-        crate::store::users::create(&db.pool, &alice, Utc::now())
+        crate::store::users::create(&db.pool, &alice, &AuditActor::cli(), Utc::now())
             .await
             .unwrap();
         catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())

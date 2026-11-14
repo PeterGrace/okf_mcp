@@ -701,6 +701,7 @@ fn unknown(name: &str) -> OkfError {
 mod tests {
     use super::*;
     use crate::db::{test_db, TEST_USER};
+    use crate::store::audit::AuditActor;
     use crate::store::users::{self, NewUser};
 
     fn now() -> DateTime<Utc> {
@@ -716,6 +717,7 @@ mod tests {
                 name: "alice",
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await
@@ -987,6 +989,7 @@ mod tests {
                 name: "alice",
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await

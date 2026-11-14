@@ -6,9 +6,11 @@ use base64::Engine as _;
 use chrono::Utc;
 use okf_mcp::archive::{write_tarball, ExportFile};
 use okf_mcp::config::Config;
+use okf_mcp::store::audit::AuditActor;
 use okf_mcp::store::ceiling::{self, MemberAccess};
 use okf_mcp::store::keys::Access;
 use okf_mcp::store::teams::{self, NewTeam, Role};
+use okf_mcp::store::users::AdminChange;
 use serde_json::json;
 
 use crate::harness::{drive, Ui};
@@ -398,9 +400,18 @@ async fn an_admin_signed_in_with_a_password_imports_an_archive() {
     server
         .user_with_password("erin", "erin@example.com", password)
         .await;
-    okf_mcp::store::users::set_admin(&server.db.pool, "erin", true, false)
-        .await
-        .expect("make erin an admin");
+    okf_mcp::store::users::set_admin(
+        &server.db.pool,
+        "erin",
+        AdminChange {
+            on: true,
+            allow_last: false,
+        },
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("make erin an admin");
     server.app.poll().await.expect("poll");
     let generation = server
         .app

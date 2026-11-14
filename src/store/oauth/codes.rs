@@ -674,6 +674,7 @@ mod tests {
 
     use crate::db::pg_support::TestDb;
     use crate::db::test_db;
+    use crate::store::audit::AuditActor;
     use crate::store::catalogs;
     use crate::store::keys::{self as key_rows, KeyKind};
     use crate::store::oauth::testing::{insert_client, insert_grant};
@@ -1436,7 +1437,9 @@ mod tests {
             name: "alice",
             display_name: "",
         };
-        users::create(&db.pool, &alice, now()).await.unwrap();
+        users::create(&db.pool, &alice, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let legacy = create(&db.pool, &new_code("old", Grants::All, None), now())
             .await
             .unwrap();

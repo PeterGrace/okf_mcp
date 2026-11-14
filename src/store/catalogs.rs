@@ -386,6 +386,7 @@ pub(crate) fn is_unique_violation(error: &sqlx::Error) -> bool {
 pub(crate) mod tests {
     use super::*;
     use crate::db::{test_db, TEST_TEAM};
+    use crate::store::audit::AuditActor;
     use chrono::TimeZone;
 
     fn now() -> DateTime<Utc> {
@@ -457,7 +458,7 @@ pub(crate) mod tests {
             name: "alice",
             display_name: "",
         };
-        crate::store::users::create(&db.pool, &alice, now())
+        crate::store::users::create(&db.pool, &alice, &AuditActor::cli(), now())
             .await
             .unwrap();
         create(&db.pool, "pg", "", TEST_TEAM, now()).await.unwrap();

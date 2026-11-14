@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use serde_json::json;
 use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
@@ -174,6 +175,7 @@ pub(crate) fn or_name_taken<T>(
 /// # Arguments
 /// * `pool` - the database.
 /// * `new` - its name and display name.
+/// * `actor` - who, for the `user.created` audit entry.
 /// * `now` - the creation time (server clock).
 ///
 /// # Returns
@@ -186,12 +188,20 @@ pub(crate) fn or_name_taken<T>(
 pub async fn create(
     pool: &PgPool,
     new: &NewUser<'_>,
+    actor: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<UserRecord, OkfError> {
     check_name("user", new.name)?;
     // A transaction rolls back when `tx` is dropped without `commit`, so
     // every early `?` return below undoes the rows inserted before it.
     let mut tx = pool.begin().await?;
+    // The acting user's rows before anything else (`lock_users`).
+    let actor_only = UserLocks {
+        target: None,
+        actor,
+        catalog: None,
+    };
+    lock_users(&mut tx, &actor_only).await?;
     check_free(&mut tx, new.name).await?;
     let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO users (name, display_name, created_at) VALUES ($1, $2, $3) RETURNING id",
@@ -225,6 +235,17 @@ pub async fn create(
     .execute(&mut *tx)
     .await?;
     bump_admin_generation(&mut tx).await?;
+    audit::record(
+        &mut tx,
+        actor,
+        &user_entry(Action::UserCreated, &user_id, json!({})),
+        now,
+    )
+    .await?;
+    // The personal team's audit row from birth, like the user's own (which
+    // the entry above makes): later entries naming either only read them
+    // (`migrations/0014_audit_row_locks.sql`).
+    audit::team_ref(&mut tx, new.name).await?;
     tx.commit().await?;
     Ok(UserRecord {
         name: new.name.to_string(),
@@ -342,38 +363,241 @@ pub async fn id_by_name<'e>(
 }
 
 /// Ends every console session of the user called `name` (an admin's "sign
-/// out everywhere"), under the user's row lock.
+/// out everywhere"), under the user's row lock, and records
+/// `user.sessions_revoked` when any ended (none ended records nothing).
 ///
 /// The lock (`FOR NO KEY UPDATE`) conflicts with the `FOR SHARE` that
 /// `user_sessions::start` takes on the same row, so a session whose insert
 /// is still uncommitted when this starts is waited for and then ended too;
 /// one that starts later is a sign-in after the sign-out. Lock order: the
-/// user's row, then its sessions (`email_tokens`' module docs).
+/// user's row (with the actor's, `lock_users`), then its sessions
+/// (`email_tokens`' module docs).
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `name` - the user's name.
+/// * `actor` - who, for the audit log.
+/// * `now` - the server clock.
 ///
 /// # Returns
 /// How many sessions ended.
 ///
 /// # Errors
 /// [`OkfError::UnknownName`]; [`OkfError::Database`].
-pub async fn end_sessions(pool: &PgPool, name: &str) -> Result<u64, OkfError> {
-    if !is_valid_name(name) {
-        return Err(unknown(name));
-    }
+pub async fn end_sessions(
+    pool: &PgPool,
+    name: &str,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<u64, OkfError> {
     let mut tx = pool.begin().await?;
-    let user_id: String =
-        sqlx::query_scalar("SELECT id FROM users WHERE name = $1 FOR NO KEY UPDATE")
-            .bind(name)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| unknown(name))?;
+    let (user_id, _) = lock_target(&mut tx, name, RowLock::NoKeyUpdate, actor).await?;
     // The session store owns its SQL; `&mut *tx` runs it in this transaction.
     let ended = user_sessions::revoke_all(&mut *tx, &user_id, None).await?;
+    if ended > 0 {
+        let details = json!({ "sessions": ended });
+        audit::record(
+            &mut tx,
+            actor,
+            &user_entry(Action::UserSessionsRevoked, &user_id, details),
+            now,
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(ended)
+}
+
+/// Ends one console session of the user called `name`, by its id prefix
+/// (an admin's per-row revoke), and records `user.sessions_revoked`, in
+/// one transaction under the user's row lock (as [`end_sessions`]: the
+/// user's row, then its sessions). The user's own revoke from the account
+/// page calls `user_sessions::revoke_by_prefix` and records nothing.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `name` - the user's name.
+/// * `id_prefix` - the session's `SessionInfo::id_prefix`.
+/// * `actor` - who, for the audit log.
+/// * `now` - the server clock.
+///
+/// # Errors
+/// [`OkfError::UnknownName`] for an unknown user (noun `"user"`) or for a
+/// malformed prefix or one matching none of the user's sessions (noun
+/// `"session"`); [`OkfError::Refused`] for a prefix matching several;
+/// [`OkfError::Database`].
+pub async fn end_session_by_prefix(
+    pool: &PgPool,
+    name: &str,
+    id_prefix: &str,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
+    let mut tx = pool.begin().await?;
+    let (user_id, _) = lock_target(&mut tx, name, RowLock::NoKeyUpdate, actor).await?;
+    user_sessions::revoke_by_prefix_in(&mut tx, &user_id, id_prefix).await?;
+    let details = json!({ "sessions": 1 });
+    audit::record(
+        &mut tx,
+        actor,
+        &user_entry(Action::UserSessionsRevoked, &user_id, details),
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// How a change locks its target user's row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowLock {
+    /// `FOR UPDATE`: the change writes the row's key-adjacent columns or
+    /// must exclude `set_admin` (an email, the admin flag).
+    Update,
+    /// `FOR NO KEY UPDATE`: the change ends or replaces the user's child
+    /// rows (sessions, emailed links).
+    NoKeyUpdate,
+    /// `FOR KEY SHARE`: the change only needs the user to stay (an
+    /// entitlement), as [`id_of`] holds it.
+    KeyShare,
+}
+
+/// The user rows one change locks before anything else.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UserLocks<'a> {
+    /// The user the change is about, by name, and how it is locked.
+    pub target: Option<(&'a str, RowLock)>,
+    /// Who acts: its user and its credential's owner, which
+    /// [`audit::record`] holds `FOR KEY SHARE` when it resolves them.
+    pub actor: &'a AuditActor,
+    /// A catalog whose owner team may be a personal team: its person, which
+    /// [`audit::catalog_teams`] holds `FOR KEY SHARE` too.
+    pub catalog: Option<&'a str>,
+}
+
+/// Locks every user row a change and its audit entry will lock, in the
+/// one order every user write takes them: admin users first, then the
+/// rest, each in id order, as [`set_admin`] locks every admin row in id
+/// order before its target. Callers take these before any other row, and
+/// before `server_state` (`bump_admin_generation`), so a later
+/// [`audit::record`] only re-takes locks the transaction holds: a change
+/// recorded as an admin cannot wait on that admin's row while holding a
+/// row `set_admin` waits on.
+///
+/// The rows are read without a lock to sort them, then locked one by one;
+/// the target's admin flag is read again under its lock.
+///
+/// # Arguments
+/// * `conn` - the change's transaction (pass `&mut tx`).
+/// * `locks` - the rows and the target's lock.
+///
+/// # Returns
+/// The target's id and admin flag (under its lock), or `None` without a
+/// target.
+///
+/// # Errors
+/// [`OkfError::UnknownName`] for a malformed or unknown target name;
+/// [`OkfError::Database`].
+pub(crate) async fn lock_users(
+    conn: &mut PgConnection,
+    locks: &UserLocks<'_>,
+) -> Result<Option<(String, bool)>, OkfError> {
+    let target = locks.target.map(|(name, _)| name);
+    // A malformed name (a NUL, which Postgres refuses) names nobody.
+    if let Some(name) = target.filter(|name| !is_valid_name(name)) {
+        return Err(unknown(name));
+    }
+    // Each row: id, admin flag, whether it is the target.
+    // `COALESCE(.., false)`: `name = NULL` is NULL without a target.
+    let rows: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT id, is_admin, COALESCE(name = $1, false) FROM users \
+         WHERE name = $1 OR id = $2 \
+            OR id = (SELECT user_id FROM api_keys WHERE id = $3) \
+            OR id = (SELECT user_id FROM sign_in_codes WHERE id = $3) \
+            OR id = (SELECT t.personal_of FROM catalogs c \
+                     JOIN teams t ON t.id = c.owner_team_id WHERE c.name = $4) \
+         ORDER BY is_admin DESC, id",
+    )
+    .bind(target)
+    .bind(&locks.actor.user_id)
+    .bind(&locks.actor.credential)
+    .bind(locks.catalog)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut locked = None;
+    for (id, _, is_target) in &rows {
+        let sql = match locks.target {
+            Some((_, RowLock::Update)) if *is_target => {
+                "SELECT is_admin FROM users WHERE id = $1 FOR UPDATE"
+            }
+            Some((_, RowLock::NoKeyUpdate)) if *is_target => {
+                "SELECT is_admin FROM users WHERE id = $1 FOR NO KEY UPDATE"
+            }
+            _ => "SELECT is_admin FROM users WHERE id = $1 FOR KEY SHARE",
+        };
+        let is_admin: Option<bool> = sqlx::query_scalar(sql)
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        // A row deleted meanwhile is skipped; a deleted target is unknown.
+        if let (true, Some(is_admin)) = (*is_target, is_admin) {
+            locked = Some((id.clone(), is_admin));
+        }
+    }
+    match (target, locked) {
+        (Some(name), None) => Err(unknown(name)),
+        (_, locked) => Ok(locked),
+    }
+}
+
+/// `lock_users` for a change with a target: its id and admin flag.
+///
+/// # Arguments
+/// * `conn` - the change's transaction.
+/// * `name` - the target's name.
+/// * `lock` - how the target is locked.
+/// * `actor` - who acts.
+///
+/// # Returns
+/// The target's id and admin flag, under its lock.
+///
+/// # Errors
+/// As `lock_users`.
+pub(crate) async fn lock_target(
+    conn: &mut PgConnection,
+    name: &str,
+    lock: RowLock,
+    actor: &AuditActor,
+) -> Result<(String, bool), OkfError> {
+    let locks = UserLocks {
+        target: Some((name, lock)),
+        actor,
+        catalog: None,
+    };
+    // `lock_users` answers `Some` whenever it is given a target.
+    lock_users(conn, &locks).await?.ok_or_else(|| unknown(name))
+}
+
+/// An audit entry about one user (plan Task 6a): the user is the target,
+/// and the entry belongs to no team. A caller whose entry belongs to teams
+/// (an entitlement) sets `teams` with struct-update syntax:
+/// `Entry { teams: &teams, ..user_entry(..) }`.
+///
+/// # Arguments
+/// * `action` - what happened.
+/// * `user_id` - the user's `users.id`.
+/// * `details` - a small JSON object; never an email address or a secret.
+///
+/// # Returns
+/// The entry, to pass to [`audit::record`].
+pub(crate) fn user_entry(action: Action, user_id: &str, details: serde_json::Value) -> Entry<'_> {
+    Entry {
+        action,
+        target: Target::User(user_id),
+        person: None,
+        teams: &[],
+        details,
+    }
 }
 
 /// The error for a user name that names no user.
@@ -450,20 +674,35 @@ pub(crate) fn is_lookup_email(email: &str) -> bool {
 
 /// Sets or clears a user's email address. A changed address also deletes
 /// the user's outstanding emailed links, so a link sent to the old address
-/// stops working, and bumps the administrative generation, so the key
-/// cache (which console sessions read the email from) reloads. A change of
-/// letter case only is not a change.
+/// stops working, bumps the administrative generation, so the key cache
+/// (which console sessions read the email from) reloads, and records
+/// `user.email_changed` (whether it was cleared, never the address). A
+/// change of letter case only is not a change: it is stored, and records
+/// nothing.
+///
+/// The user's row is locked (`FOR UPDATE`, which `set_admin` also takes)
+/// with the actor's rows before anything else (`lock_users`), so a
+/// provisioner's refusal of an admin user cannot race a promotion.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `name` - the user's name.
 /// * `email` - the new address, or `None` to clear it.
+/// * `actor` - who, for the audit log; a provisioner is refused an admin.
+/// * `now` - the server clock.
 ///
 /// # Errors
 /// [`OkfError::LimitExceeded`] for a malformed address; [`OkfError::Refused`]
-/// when another user has it (in any letter case); [`OkfError::UnknownName`];
+/// when another user has it (in any letter case); [`OkfError::Forbidden`]
+/// for a provisioner and an admin user; [`OkfError::UnknownName`];
 /// [`OkfError::Database`].
-pub async fn set_email(pool: &PgPool, name: &str, email: Option<&str>) -> Result<(), OkfError> {
+pub async fn set_email(
+    pool: &PgPool,
+    name: &str,
+    email: Option<&str>,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
     // `Option::map(check_email)` runs the check only for `Some`;
     // `transpose` turns `Option<Result<..>>` into `Result<Option<..>>` for `?`.
     email.map(check_email).transpose()?;
@@ -472,22 +711,23 @@ pub async fn set_email(pool: &PgPool, name: &str, email: Option<&str>) -> Result
         return Err(unknown(name));
     }
     let mut tx = pool.begin().await?;
-    // The subquery reads (and locks) the old value, so `changed` compares it
-    // with the new one in the same statement. Both sides are `citext`, so
-    // `IS DISTINCT FROM` ignores letter case.
-    let updated = sqlx::query_as::<_, (String, bool)>(
+    let (user_id, is_admin) = lock_target(&mut tx, name, RowLock::Update, actor).await?;
+    audit::refuse_admin_target(actor, is_admin, name)?;
+    // The subquery reads the old value (the row is already locked), so
+    // `changed` compares it with the new one in the same statement. Both
+    // sides are `citext`, so `IS DISTINCT FROM` ignores letter case.
+    let updated = sqlx::query_scalar::<_, bool>(
         "UPDATE users u SET email = $2::citext \
-         FROM (SELECT id, email FROM users WHERE name = $1 FOR UPDATE) old \
+         FROM (SELECT id, email FROM users WHERE id = $1) old \
          WHERE u.id = old.id \
-         RETURNING u.id, old.email IS DISTINCT FROM u.email",
+         RETURNING old.email IS DISTINCT FROM u.email",
     )
-    .bind(name)
+    .bind(&user_id)
     .bind(email)
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await;
-    let (user_id, changed) = match updated {
-        Ok(Some(row)) => row,
-        Ok(None) => return Err(unknown(name)),
+    let changed = match updated {
+        Ok(changed) => changed,
         // `users.email` is the only UNIQUE column this statement writes.
         Err(error) if is_unique_violation(&error) => {
             return Err(OkfError::Refused {
@@ -504,20 +744,41 @@ pub async fn set_email(pool: &PgPool, name: &str, email: Option<&str>) -> Result
         // The key cache holds every user's email for console sessions
         // (`auth_by_id`), so a change reloads it.
         bump_admin_generation(&mut tx).await?;
+        // Never the address: only that it changed (spec "People in entries").
+        let details = json!({ "cleared": email.is_none() });
+        audit::record(
+            &mut tx,
+            actor,
+            &user_entry(Action::UserEmailChanged, &user_id, details),
+            now,
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(())
 }
 
+/// What [`set_admin`] is asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminChange {
+    /// The new flag.
+    pub on: bool,
+    /// Lets the last admin user be cleared (the CLI, which has operator
+    /// access; Decision 16). The API passes `false`.
+    pub allow_last: bool,
+}
+
 /// Turns a user's admin flag on or off. A change bumps the administrative
-/// generation (a session's level depends on it) and ends the user's console
+/// generation (a session's level depends on it), ends the user's console
 /// sessions, so its next request signs in again with the new flag
-/// (Decision 20).
+/// (Decision 20), and records `user.admin_changed`. No change records
+/// nothing.
 ///
 /// This is the only code that writes `users.is_admin` (a new user starts
 /// with `false`), so every route that changes the flag ends the sessions.
 ///
-/// Every admin row is locked first, in id order, then the user's row: two
+/// Every admin row is locked first, in id order, then the user's row and
+/// the actor's (`lock_users`), then `server_state`: two
 /// concurrent "off" calls on the last two admins serialize, and the second
 /// sees only one admin left. (A concurrent "on" for another user is not
 /// counted until it commits, which only ever refuses more, never less.)
@@ -525,9 +786,9 @@ pub async fn set_email(pool: &PgPool, name: &str, email: Option<&str>) -> Result
 /// # Arguments
 /// * `pool` - the database.
 /// * `name` - the user's name.
-/// * `on` - the new flag.
-/// * `allow_last` - lets the last admin user be cleared (the CLI, which has
-///   operator access; Decision 16). The API passes `false`.
+/// * `change` - the new flag, and whether the last admin may be cleared.
+/// * `actor` - who, for the audit log.
+/// * `now` - the server clock.
 ///
 /// # Returns
 /// The flag before the call.
@@ -538,9 +799,12 @@ pub async fn set_email(pool: &PgPool, name: &str, email: Option<&str>) -> Result
 pub async fn set_admin(
     pool: &PgPool,
     name: &str,
-    on: bool,
-    allow_last: bool,
+    change: AdminChange,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
 ) -> Result<bool, OkfError> {
+    // Destructuring copies both fields out (`AdminChange` is `Copy`).
+    let AdminChange { on, allow_last } = change;
     // A malformed name (a NUL, which Postgres refuses) names nobody.
     if !is_valid_name(name) {
         return Err(unknown(name));
@@ -553,12 +817,9 @@ pub async fn set_admin(
         sqlx::query_scalar("SELECT id FROM users WHERE is_admin ORDER BY id FOR UPDATE")
             .fetch_all(&mut *tx)
             .await?;
-    let (user_id, previous): (String, bool) =
-        sqlx::query_as("SELECT id, is_admin FROM users WHERE name = $1 FOR UPDATE")
-            .bind(name)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| unknown(name))?;
+    // Then the user and the actor's rows, in the same order (the admins
+    // among them are held already).
+    let (user_id, previous) = lock_target(&mut tx, name, RowLock::Update, actor).await?;
     if previous == on {
         // Nothing to write; dropping `tx` rolls back and releases the locks.
         return Ok(previous);
@@ -576,6 +837,14 @@ pub async fn set_admin(
     // The session store owns its SQL; `&mut *tx` runs it in this transaction.
     user_sessions::revoke_all(&mut *tx, &user_id, None).await?;
     bump_admin_generation(&mut tx).await?;
+    let details = json!({ "from": previous, "to": on });
+    audit::record(
+        &mut tx,
+        actor,
+        &user_entry(Action::UserAdminChanged, &user_id, details),
+        now,
+    )
+    .await?;
     tx.commit().await?;
     Ok(previous)
 }
@@ -835,20 +1104,15 @@ pub async fn delete(
         discarded,
     };
     // Recorded while the user row exists, so the entry's person resolves.
+    let details = json!({
+        "keys": deleted.keys,
+        "codes": deleted.codes,
+        "changesets_discarded": deleted.discarded,
+    });
     audit::record(
         &mut tx,
         actor,
-        &Entry {
-            action: Action::UserDeleted,
-            target: Target::User(&user_id),
-            person: None,
-            teams: &[],
-            details: serde_json::json!({
-                "keys": deleted.keys,
-                "codes": deleted.codes,
-                "changesets_discarded": deleted.discarded,
-            }),
-        },
+        &user_entry(Action::UserDeleted, &user_id, details),
         now,
     )
     .await?;
@@ -991,6 +1255,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::db::test_db;
     use crate::store::catalogs::{self, tests::until_a_lock_is_awaited};
+    use crate::store::ceiling::NewEntitlement;
     use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
     use crate::store::teams;
 
@@ -1029,11 +1294,14 @@ pub(crate) mod tests {
                 name,
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await
         .unwrap();
-        set_email(pool, name, email).await.unwrap();
+        set_email(pool, name, email, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let id: String = sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
             .bind(name)
             .fetch_one(pool)
@@ -1090,7 +1358,9 @@ pub(crate) mod tests {
     async fn a_new_user_has_no_email_no_password_and_is_not_an_admin() {
         let db = test_db().await;
 
-        let user = create(&db.pool, &alice(), now()).await.unwrap();
+        let user = create(&db.pool, &alice(), &AuditActor::cli(), now())
+            .await
+            .unwrap();
 
         assert_eq!(user.email, None);
         assert!(!user.is_admin);
@@ -1104,7 +1374,9 @@ pub(crate) mod tests {
         let alice = seed_user(&db.pool, "alice", Some("Alice@Example.com")).await;
 
         let found = find_by_email(&db.pool, "alice@example.COM").await.unwrap();
-        set_email(&db.pool, "alice", None).await.unwrap();
+        set_email(&db.pool, "alice", None, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let cleared = find(&db.pool, "alice").await.unwrap();
 
         assert_eq!(found, Some(alice.clone()));
@@ -1144,13 +1416,25 @@ pub(crate) mod tests {
         let generation = || catalogs::admin_generation(&db.pool);
         let start = generation().await.unwrap();
 
-        set_email(&db.pool, "alice", Some("ALICE@example.com"))
-            .await
-            .unwrap();
+        set_email(
+            &db.pool,
+            "alice",
+            Some("ALICE@example.com"),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let after_case_only = generation().await.unwrap();
-        set_email(&db.pool, "alice", Some("alice@example.org"))
-            .await
-            .unwrap();
+        set_email(
+            &db.pool,
+            "alice",
+            Some("alice@example.org"),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let after_change = generation().await.unwrap();
 
         assert_eq!(after_case_only, start, "a case-only change is no change");
@@ -1161,7 +1445,18 @@ pub(crate) mod tests {
     async fn auth_by_id_holds_every_user_by_id() {
         let db = test_db().await;
         let alice = seed_user(&db.pool, "alice", Some("alice@example.com")).await;
-        set_admin(&db.pool, "alice", true, false).await.unwrap();
+        set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let users = auth_by_id(&db.pool).await.unwrap();
 
@@ -1184,7 +1479,14 @@ pub(crate) mod tests {
         seed_user(&db.pool, "alice", Some("alice@example.com")).await;
         seed_user(&db.pool, "bob", None).await;
 
-        let clash = set_email(&db.pool, "bob", Some("ALICE@example.com")).await;
+        let clash = set_email(
+            &db.pool,
+            "bob",
+            Some("ALICE@example.com"),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         assert!(
             matches!(&clash, Err(OkfError::Refused { reason }) if reason == "Another user has this email"),
@@ -1214,8 +1516,22 @@ pub(crate) mod tests {
         .into_iter()
         .map(check_email)
         .collect();
-        let unknown = set_email(&db.pool, "nobody", Some("nobody@example.com")).await;
-        let stored = set_email(&db.pool, "alice", Some("a b@example.com")).await;
+        let unknown = set_email(
+            &db.pool,
+            "nobody",
+            Some("nobody@example.com"),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
+        let stored = set_email(
+            &db.pool,
+            "alice",
+            Some("a b@example.com"),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         for result in malformed {
             assert!(
@@ -1240,9 +1556,41 @@ pub(crate) mod tests {
         seed_user(&db.pool, "alice", None).await;
         let start = catalogs::admin_generation(&db.pool).await.unwrap();
 
-        let was = set_admin(&db.pool, "alice", true, false).await.unwrap();
-        let again = set_admin(&db.pool, "alice", true, false).await.unwrap();
-        let unknown = set_admin(&db.pool, "nobody", true, false).await;
+        let was = set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let again = set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let unknown = set_admin(
+            &db.pool,
+            "nobody",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         assert!(!was);
         assert!(again);
@@ -1261,10 +1609,41 @@ pub(crate) mod tests {
     async fn the_last_admin_user_is_kept_unless_allowed() {
         let db = test_db().await;
         seed_user(&db.pool, "alice", None).await;
-        set_admin(&db.pool, "alice", true, false).await.unwrap();
+        set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
-        let refused = set_admin(&db.pool, "alice", false, false).await;
-        let allowed = set_admin(&db.pool, "alice", false, true).await;
+        let refused = set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: false,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
+        let allowed = set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: false,
+                allow_last: true,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         assert!(
             matches!(refused, Err(OkfError::Refused { .. })),
@@ -1279,15 +1658,49 @@ pub(crate) mod tests {
         let db = test_db().await;
         seed_user(&db.pool, "alice", None).await;
         seed_user(&db.pool, "bob", None).await;
-        set_admin(&db.pool, "alice", true, false).await.unwrap();
-        set_admin(&db.pool, "bob", true, false).await.unwrap();
+        set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        set_admin(
+            &db.pool,
+            "bob",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         // Both run at once (`tokio::spawn`, on the multi-threaded runtime):
         // the admin rows are locked in one order, so the second sees the
         // first's change and refuses.
         let clear = |name: &'static str| {
             let pool = db.pool.clone();
-            tokio::spawn(async move { set_admin(&pool, name, false, false).await })
+            tokio::spawn(async move {
+                set_admin(
+                    &pool,
+                    name,
+                    AdminChange {
+                        on: false,
+                        allow_last: false,
+                    },
+                    &AuditActor::cli(),
+                    now(),
+                )
+                .await
+            })
         };
         let (alice, bob) = (clear("alice"), clear("bob"));
         let (alice, bob) = (alice.await.unwrap(), bob.await.unwrap());
@@ -1314,15 +1727,49 @@ pub(crate) mod tests {
         let db = test_db().await;
         seed_user(&db.pool, "alice", None).await;
         seed_user(&db.pool, "bob", None).await;
-        set_admin(&db.pool, "alice", true, false).await.unwrap();
-        set_admin(&db.pool, "bob", true, false).await.unwrap();
+        set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        set_admin(
+            &db.pool,
+            "bob",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let mut clearing = db.pool.begin().await.unwrap();
         sqlx::query("UPDATE users SET is_admin = false WHERE name = 'alice'")
             .execute(&mut *clearing)
             .await
             .unwrap();
         let pool = db.pool.clone();
-        let waiting = tokio::spawn(async move { set_admin(&pool, "bob", false, false).await });
+        let waiting = tokio::spawn(async move {
+            set_admin(
+                &pool,
+                "bob",
+                AdminChange {
+                    on: false,
+                    allow_last: false,
+                },
+                &AuditActor::cli(),
+                now(),
+            )
+            .await
+        });
         until_a_lock_is_awaited(&db.pool).await;
 
         clearing.commit().await.unwrap();
@@ -1341,9 +1788,31 @@ pub(crate) mod tests {
         let alice = seed_user(&db.pool, "alice", None).await;
         seed_session(&db.pool, &alice.id).await;
 
-        set_admin(&db.pool, "alice", false, false).await.unwrap();
+        set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: false,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let after_no_change = session_count(&db.pool).await;
-        set_admin(&db.pool, "alice", true, false).await.unwrap();
+        set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(after_no_change, 1, "no change keeps the session");
         assert_eq!(session_count(&db.pool).await, 0);
@@ -1372,9 +1841,26 @@ pub(crate) mod tests {
     async fn a_malformed_name_is_an_unknown_user_for_every_write() {
         let db = test_db().await;
 
-        let admin = set_admin(&db.pool, "a\0b", true, false).await;
-        let email = set_email(&db.pool, "a\0b", Some("a@example.com")).await;
-        let sessions = end_sessions(&db.pool, "a\0b").await;
+        let admin = set_admin(
+            &db.pool,
+            "a\0b",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
+        let email = set_email(
+            &db.pool,
+            "a\0b",
+            Some("a@example.com"),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
+        let sessions = end_sessions(&db.pool, "a\0b", &AuditActor::cli(), now()).await;
 
         for outcome in [admin.map(|_| ()), email, sessions.map(|_| ())] {
             assert!(
@@ -1393,8 +1879,10 @@ pub(crate) mod tests {
         seed_session(&db.pool, &alice.id).await;
         seed_session(&db.pool, &bob.id).await;
 
-        let ended = end_sessions(&db.pool, "alice").await.unwrap();
-        let unknown = end_sessions(&db.pool, "nobody").await;
+        let ended = end_sessions(&db.pool, "alice", &AuditActor::cli(), now())
+            .await
+            .unwrap();
+        let unknown = end_sessions(&db.pool, "nobody", &AuditActor::cli(), now()).await;
 
         assert_eq!(ended, 2);
         assert_eq!(session_count(&db.pool).await, 1, "bob's session stays");
@@ -1419,7 +1907,9 @@ pub(crate) mod tests {
     async fn creating_a_user_creates_its_personal_team_with_it_as_owner() {
         let db = test_db().await;
 
-        let user = create(&db.pool, &alice(), now()).await.unwrap();
+        let user = create(&db.pool, &alice(), &AuditActor::cli(), now())
+            .await
+            .unwrap();
 
         assert_eq!(user.name, "alice");
         assert_eq!(user.teams, ["alice"]);
@@ -1434,7 +1924,9 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_user_name_taken_by_a_team_is_refused() {
         let db = test_db().await;
-        create(&db.pool, &alice(), now()).await.unwrap();
+        create(&db.pool, &alice(), &AuditActor::cli(), now())
+            .await
+            .unwrap();
         teams::create(&db.pool, &family_owned_by_alice(), now())
             .await
             .unwrap();
@@ -1445,6 +1937,7 @@ pub(crate) mod tests {
                 name: "family",
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await;
@@ -1455,15 +1948,18 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_invalid_or_duplicate_name_is_refused() {
         let db = test_db().await;
-        create(&db.pool, &alice(), now()).await.unwrap();
+        create(&db.pool, &alice(), &AuditActor::cli(), now())
+            .await
+            .unwrap();
 
-        let duplicate = create(&db.pool, &alice(), now()).await;
+        let duplicate = create(&db.pool, &alice(), &AuditActor::cli(), now()).await;
         let invalid = create(
             &db.pool,
             &NewUser {
                 name: "Alice",
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await;
@@ -1479,7 +1975,9 @@ pub(crate) mod tests {
         // a transaction that passed `check_free` before another committed the
         // same team name.
         let db = test_db().await;
-        create(&db.pool, &alice(), now()).await.unwrap();
+        create(&db.pool, &alice(), &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let mut tx = db.pool.begin().await.unwrap();
         check_free(&mut tx, "family").await.unwrap();
         teams::create(&db.pool, &family_owned_by_alice(), now())
@@ -1502,16 +2000,20 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn concurrent_user_and_team_creates_of_one_name_give_one_winner_and_a_409() {
         let db = test_db().await;
-        create(&db.pool, &alice(), now()).await.unwrap();
+        create(&db.pool, &alice(), &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let user = NewUser {
             name: "family",
             display_name: "",
         };
         let team = family_owned_by_alice();
 
+        let actor = AuditActor::cli();
+
         // `tokio::join!` runs both futures concurrently, like `asyncio.gather`.
         let (made_user, made_team) = tokio::join!(
-            create(&db.pool, &user, now()),
+            create(&db.pool, &user, &actor, now()),
             teams::create(&db.pool, &team, now()),
         );
 
@@ -1529,7 +2031,9 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn list_includes_the_fixture_and_counts_credentials() {
         let db = test_db().await;
-        create(&db.pool, &alice(), now()).await.unwrap();
+        create(&db.pool, &alice(), &AuditActor::cli(), now())
+            .await
+            .unwrap();
 
         let users = list(&db.pool).await.unwrap();
 
@@ -1602,7 +2106,9 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unreferenced_user_is_deleted_with_its_personal_team() {
         let db = test_db().await;
-        create(&db.pool, &alice(), now()).await.unwrap();
+        create(&db.pool, &alice(), &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let before = crate::store::catalogs::admin_generation(&db.pool)
             .await
             .unwrap();
@@ -1644,9 +2150,18 @@ pub(crate) mod tests {
         key_for(&db.pool, "alice", "alice-old", true).await;
         code_for(&db.pool, "alice").await;
         seed_session(&db.pool, &id_by_name(&db.pool, "alice").await.unwrap()).await;
-        crate::store::ceiling::entitle(&db.pool, "alice", "shared", Access::Read, now())
-            .await
-            .unwrap();
+        crate::store::ceiling::entitle(
+            &db.pool,
+            &NewEntitlement {
+                user: "alice",
+                catalog: "shared",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         // A revision alice's key wrote: history keeps its actor text.
         sqlx::query(
             "INSERT INTO revisions (catalog_id, path, revision, op, content, executable, actor, \
@@ -1791,7 +2306,18 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        set_admin(&db.pool, "alice", true, true).await.unwrap();
+        set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: true,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let last_admin = delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await;
         let by_the_cli = delete(&db.pool, "alice", true, &AuditActor::cli(), now()).await;
 
@@ -1810,7 +2336,18 @@ pub(crate) mod tests {
     async fn a_provisioner_is_refused_an_admin_user() {
         let db = test_db().await;
         seed_user(&db.pool, "alice", None).await;
-        set_admin(&db.pool, "alice", true, true).await.unwrap();
+        set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: true,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let provisioner = AuditActor {
             provisioner: true,
             ..AuditActor::cli()
@@ -1840,10 +2377,14 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_refused_deletion_changes_nothing() {
         let db = test_db().await;
-        create(&db.pool, &alice(), now()).await.unwrap();
+        create(&db.pool, &alice(), &AuditActor::cli(), now())
+            .await
+            .unwrap();
         seed_catalog_owned_by(&db.pool, "alice").await;
         code_for(&db.pool, "alice").await;
         let generation = catalogs::admin_generation(&db.pool).await.unwrap();
+        let entries = "SELECT count(*) FROM audit_entries";
+        let recorded = count(&db.pool, entries).await;
 
         let refused = delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await;
 
@@ -1851,10 +2392,7 @@ pub(crate) mod tests {
         assert_unchanged(&db.pool, 1, generation).await;
         let team = teams::find(&db.pool, "alice").await.unwrap();
         assert_eq!(team.catalogs, ["shared"]);
-        assert_eq!(
-            count(&db.pool, "SELECT count(*) FROM audit_entries").await,
-            0
-        );
+        assert_eq!(count(&db.pool, entries).await, recorded, "no new entry");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1862,7 +2400,9 @@ pub(crate) mod tests {
         // Arrange: a transaction assigns a catalog to alice's personal team
         // and holds its commit while the delete runs.
         let db = test_db().await;
-        create(&db.pool, &alice(), now()).await.unwrap();
+        create(&db.pool, &alice(), &AuditActor::cli(), now())
+            .await
+            .unwrap();
         catalogs::create(&db.pool, "shared", "", crate::db::TEST_TEAM, now())
             .await
             .unwrap();
@@ -1982,7 +2522,18 @@ pub(crate) mod tests {
     async fn id_and_admin_of_reads_the_flag_and_knows_no_stranger() {
         let db = test_db().await;
         let alice = seed_user(&db.pool, "alice", None).await;
-        set_admin(&db.pool, "alice", true, true).await.unwrap();
+        set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: true,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let mut tx = db.pool.begin().await.unwrap();
 
         let found = id_and_admin_of(&mut tx, "alice").await.unwrap();
@@ -1992,5 +2543,515 @@ pub(crate) mod tests {
         assert_eq!(found, (alice.id, true));
         assert!(matches!(stranger, Err(OkfError::UnknownName { .. })));
         assert!(matches!(malformed, Err(OkfError::UnknownName { .. })));
+    }
+
+    /// The CLI's admin-flag change (it may clear the last admin).
+    fn admin(on: bool) -> AdminChange {
+        AdminChange {
+            on,
+            allow_last: true,
+        }
+    }
+
+    /// The CLI actor with the provisioner flag (Task 5 sets it from a key).
+    fn provisioner() -> AuditActor {
+        AuditActor {
+            provisioner: true,
+            ..AuditActor::cli()
+        }
+    }
+
+    /// The entries with `action` about user `name`, oldest first.
+    async fn entries_about(
+        pool: &PgPool,
+        action: &str,
+        name: &str,
+    ) -> Vec<audit::testing::RecordedEntry> {
+        audit::testing::entries(pool, action)
+            .await
+            .into_iter()
+            .filter(|entry| entry.person.as_deref() == Some(name))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_records_one_entry_and_a_refused_create_none() {
+        let db = test_db().await;
+
+        create(&db.pool, &alice(), &AuditActor::cli(), now())
+            .await
+            .unwrap();
+        let taken = create(&db.pool, &alice(), &AuditActor::cli(), now()).await;
+
+        assert!(matches!(taken, Err(OkfError::Refused { .. })), "{taken:?}");
+        let entries = entries_about(&db.pool, "user.created", "alice").await;
+        assert_eq!(entries.len(), 1, "the refused create recorded nothing");
+        assert_eq!(entries[0].source, "cli");
+        assert_eq!(entries[0].target_kind, "user");
+        assert!(entries[0].teams.is_empty());
+        assert_eq!(entries[0].details, json!({}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_email_records_one_entry_and_none_for_no_change() {
+        let db = test_db().await;
+        seed_user(&db.pool, "alice", None).await;
+        let cli = AuditActor::cli();
+
+        set_email(&db.pool, "alice", Some("alice@example.com"), &cli, now())
+            .await
+            .unwrap();
+        set_email(&db.pool, "alice", Some("ALICE@example.com"), &cli, now())
+            .await
+            .unwrap();
+        set_email(&db.pool, "alice", None, &cli, now())
+            .await
+            .unwrap();
+        set_email(&db.pool, "alice", None, &cli, now())
+            .await
+            .unwrap();
+
+        let entries = entries_about(&db.pool, "user.email_changed", "alice").await;
+        assert_eq!(
+            entries.len(),
+            2,
+            "a change of letter case, or clearing no address, is not a change"
+        );
+        assert_eq!(entries[0].details, json!({"cleared": false}));
+        assert_eq!(entries[1].details, json!({"cleared": true}));
+        assert!(entries[0].teams.is_empty());
+        assert!(
+            !entries[0].details.to_string().contains('@'),
+            "no email in details"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_audit_write_fails_the_change() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        seed_session(&db.pool, &alice.id).await;
+        crate::http::api::testing::fail_on(&db.pool, "BEFORE INSERT ON audit_entries FOR EACH ROW")
+            .await;
+        let cli = AuditActor::cli();
+
+        let email = set_email(&db.pool, "alice", Some("alice@example.com"), &cli, now()).await;
+        let flag = set_admin(&db.pool, "alice", admin(true), &cli, now()).await;
+        let ended = end_sessions(&db.pool, "alice", &cli, now()).await;
+        let made = create(
+            &db.pool,
+            &NewUser {
+                name: "bob",
+                display_name: "",
+            },
+            &cli,
+            now(),
+        )
+        .await;
+
+        assert!(email.is_err() && flag.is_err() && ended.is_err() && made.is_err());
+        let after = find(&db.pool, "alice").await.unwrap();
+        assert_eq!(after.email, None, "the email change rolled back");
+        assert!(!after.is_admin, "the admin change rolled back");
+        assert_eq!(session_count(&db.pool).await, 1, "the session stayed");
+        assert!(matches!(
+            find(&db.pool, "bob").await,
+            Err(OkfError::UnknownName { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provisioner_cannot_set_an_admins_email() {
+        let db = test_db().await;
+        seed_user(&db.pool, "staff", None).await;
+        seed_user(&db.pool, "alice", None).await;
+        set_admin(&db.pool, "staff", admin(true), &AuditActor::cli(), now())
+            .await
+            .unwrap();
+
+        let refused = set_email(
+            &db.pool,
+            "staff",
+            Some("x@example.com"),
+            &provisioner(),
+            now(),
+        )
+        .await;
+        let allowed = set_email(
+            &db.pool,
+            "alice",
+            Some("a@example.com"),
+            &provisioner(),
+            now(),
+        )
+        .await;
+
+        assert!(
+            matches!(refused, Err(OkfError::Forbidden { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(find(&db.pool, "staff").await.unwrap().email, None);
+        assert!(entries_about(&db.pool, "user.email_changed", "staff")
+            .await
+            .is_empty());
+        allowed.expect("a provisioner may set a non-admin's email");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_admin_records_one_entry_and_none_for_no_change() {
+        let db = test_db().await;
+        seed_user(&db.pool, "alice", None).await;
+        let cli = AuditActor::cli();
+
+        set_admin(&db.pool, "alice", admin(true), &cli, now())
+            .await
+            .unwrap();
+        set_admin(&db.pool, "alice", admin(true), &cli, now())
+            .await
+            .unwrap();
+        set_admin(&db.pool, "alice", admin(false), &cli, now())
+            .await
+            .unwrap();
+        let last = set_admin(
+            &db.pool,
+            "alice",
+            AdminChange {
+                on: false,
+                allow_last: false,
+            },
+            &cli,
+            now(),
+        )
+        .await;
+
+        last.expect("clearing a flag already clear is no change, not a refusal");
+        let entries = entries_about(&db.pool, "user.admin_changed", "alice").await;
+        assert_eq!(entries.len(), 2, "no change records nothing");
+        assert_eq!(entries[0].details, json!({"from": false, "to": true}));
+        assert_eq!(entries[1].details, json!({"from": true, "to": false}));
+        assert!(entries[0].teams.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ending_sessions_records_the_count_and_nothing_when_none_ended() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        seed_session(&db.pool, &alice.id).await;
+        seed_session(&db.pool, &alice.id).await;
+
+        end_sessions(&db.pool, "alice", &AuditActor::cli(), now())
+            .await
+            .unwrap();
+        let none = end_sessions(&db.pool, "alice", &AuditActor::cli(), now())
+            .await
+            .unwrap();
+
+        assert_eq!(none, 0);
+        let entries = entries_about(&db.pool, "user.sessions_revoked", "alice").await;
+        assert_eq!(entries.len(), 1, "ending no session records nothing");
+        assert_eq!(entries[0].details, json!({"sessions": 2}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ending_one_session_records_one_entry_and_a_refusal_none() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        seed_session(&db.pool, &alice.id).await;
+        seed_session(&db.pool, &alice.id).await;
+        let sessions = user_sessions::list(&db.pool, &alice.id, None)
+            .await
+            .unwrap();
+        let cli = AuditActor::cli();
+
+        end_session_by_prefix(&db.pool, "alice", &sessions[0].id_prefix, &cli, now())
+            .await
+            .unwrap();
+        let again =
+            end_session_by_prefix(&db.pool, "alice", &sessions[0].id_prefix, &cli, now()).await;
+        let malformed = end_session_by_prefix(&db.pool, "alice", "xyz", &cli, now()).await;
+        let stranger =
+            end_session_by_prefix(&db.pool, "nobody", &sessions[1].id_prefix, &cli, now()).await;
+        // The user's own revoke (the account page) is not an administrative
+        // change, so it records nothing.
+        user_sessions::revoke_by_prefix(&db.pool, &alice.id, &sessions[1].id_prefix)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            again,
+            Err(OkfError::UnknownName {
+                noun: "session",
+                ..
+            })
+        ));
+        assert!(matches!(
+            malformed,
+            Err(OkfError::UnknownName {
+                noun: "session",
+                ..
+            })
+        ));
+        assert!(matches!(
+            stranger,
+            Err(OkfError::UnknownName { noun: "user", .. })
+        ));
+        assert_eq!(session_count(&db.pool).await, 0);
+        let entries = entries_about(&db.pool, "user.sessions_revoked", "alice").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].details, json!({"sessions": 1}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ending_one_session_waits_for_a_sign_in_holding_the_user() {
+        // `user_sessions::start` holds the user `FOR SHARE` while it inserts
+        // a session; the admin's revoke locks the user first, so it waits
+        // rather than taking the session rows first.
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        seed_session(&db.pool, &alice.id).await;
+        let prefix = user_sessions::list(&db.pool, &alice.id, None)
+            .await
+            .unwrap()[0]
+            .id_prefix
+            .clone();
+        let mut holder = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM users WHERE name = 'alice' FOR SHARE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let pool = db.pool.clone();
+        // `tokio::spawn` runs the revoke on another task, so this one can
+        // watch it wait and then release the row.
+        let revoke = tokio::spawn(async move {
+            end_session_by_prefix(&pool, "alice", &prefix, &AuditActor::cli(), now()).await
+        });
+        tokio::time::timeout(LOCK_WAIT, until_a_lock_is_awaited(&db.pool))
+            .await
+            .expect("the revoke never waited on the user's row");
+        holder.rollback().await.unwrap();
+
+        tokio::time::timeout(LOCK_WAIT, revoke)
+            .await
+            .expect("the revoke never finished")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(session_count(&db.pool).await, 0);
+    }
+
+    /// User `name`, made an admin, acting through a console session: its
+    /// entries resolve (and lock) its row, as a REST change by an admin does.
+    pub(crate) async fn admin_session_actor(pool: &PgPool, name: &str) -> AuditActor {
+        let user = seed_user(pool, name, None).await;
+        set_admin(pool, name, admin(true), &AuditActor::cli(), now())
+            .await
+            .unwrap();
+        AuditActor {
+            source: audit::Source::Console,
+            user_id: Some(user.id),
+            label: name.to_string(),
+            via: audit::Via::Session,
+            ..AuditActor::cli()
+        }
+    }
+
+    /// Runs `change` and a `set_admin` that promotes `promoted` with their
+    /// order forced: a held `server_state` row queues `change` first, then
+    /// `set_admin`, and is released only once both wait. A change that
+    /// locked the generation row before its actor's row would then wait on
+    /// the actor (an admin, which `set_admin` holds `FOR UPDATE`) while
+    /// `set_admin` waited on the generation row: a deadlock Postgres aborts.
+    ///
+    /// # Returns
+    /// Both results, each within 30 s.
+    pub(crate) async fn queued_with_set_admin<F>(
+        pool: &PgPool,
+        promoted: &str,
+        change: F,
+    ) -> (Result<(), OkfError>, Result<bool, OkfError>)
+    where
+        // `F` is any future the runtime can move to another thread.
+        F: std::future::Future<Output = Result<(), OkfError>> + Send + 'static,
+    {
+        use crate::http::api::testing::wait_for_lock_waiters;
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("UPDATE server_state SET admin_generation = admin_generation")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let changing = tokio::spawn(change);
+        tokio::time::timeout(LOCK_WAIT, wait_for_lock_waiters(pool, 1))
+            .await
+            .expect("the change never queued");
+        let promoting = tokio::spawn({
+            let pool = pool.clone();
+            let promoted = promoted.to_string();
+            async move { set_admin(&pool, &promoted, admin(true), &AuditActor::cli(), now()).await }
+        });
+        tokio::time::timeout(LOCK_WAIT, wait_for_lock_waiters(pool, 2))
+            .await
+            .expect("set_admin never queued");
+        holder.commit().await.unwrap();
+        let changed = tokio::time::timeout(LOCK_WAIT, changing)
+            .await
+            .expect("the change finished within 30 s")
+            .expect("the change did not panic");
+        let promoted = tokio::time::timeout(LOCK_WAIT, promoting)
+            .await
+            .expect("set_admin finished within 30 s")
+            .expect("set_admin did not panic");
+        (changed, promoted)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_admins_change_and_a_concurrent_set_admin_both_finish() {
+        let db = test_db().await;
+        let staff = admin_session_actor(&db.pool, "staff").await;
+        seed_user(&db.pool, "alice", None).await;
+        seed_user(&db.pool, "bob", None).await;
+        seed_user(&db.pool, "carol", None).await;
+        let pool = db.pool.clone();
+        let actor = staff.clone();
+        let email = async move {
+            set_email(&pool, "alice", Some("alice@example.com"), &actor, now()).await
+        };
+        let pool = db.pool.clone();
+        let actor = staff.clone();
+        let created = async move {
+            let new = NewUser {
+                name: "dave",
+                display_name: "",
+            };
+            create(&pool, &new, &actor, now()).await.map(|_| ())
+        };
+
+        let (emailed, first) = queued_with_set_admin(&db.pool, "bob", email).await;
+        let (made, second) = queued_with_set_admin(&db.pool, "carol", created).await;
+
+        emailed.expect("the email change");
+        first.expect("the first promotion");
+        made.expect("the create");
+        second.expect("the second promotion");
+        assert_eq!(
+            entries_about(&db.pool, "user.email_changed", "alice").await[0]
+                .actor_person
+                .as_deref(),
+            Some("staff")
+        );
+    }
+
+    /// Two admins acting by session, the lower user id first, with their
+    /// audit rows made stale (a display-name change) so the next entry
+    /// naming them refreshes both rows.
+    pub(crate) async fn two_admins(pool: &PgPool) -> [(String, AuditActor); 2] {
+        let mut pair = [
+            ("ann".to_string(), admin_session_actor(pool, "ann").await),
+            ("ben".to_string(), admin_session_actor(pool, "ben").await),
+        ];
+        // `sort_by` with the user ids: the lower id first.
+        pair.sort_by(|left, right| left.1.user_id.cmp(&right.1.user_id));
+        sqlx::query("UPDATE users SET display_name = 'renamed' WHERE name IN ('ann', 'ben')")
+            .execute(pool)
+            .await
+            .unwrap();
+        pair
+    }
+
+    /// Runs `first` and `second`, two changes that name the same two people
+    /// in opposite order, at once, while another transaction holds
+    /// `held_user`'s audit row as a refresh does (`FOR NO KEY UPDATE`).
+    /// Resolving a person must never wait on that row: when every resolver
+    /// upserted (and so locked) each row it named, the two changes each held
+    /// one person's row and waited for the other's, a deadlock; here both
+    /// would wait for the holder and time out.
+    ///
+    /// # Returns
+    /// Both results, each within 30 s; the holder is released after.
+    pub(crate) async fn both_finish_while_a_person_is_held<F, G>(
+        pool: &PgPool,
+        held_user: &str,
+        first: F,
+        second: G,
+    ) -> (Result<(), OkfError>, Result<(), OkfError>)
+    where
+        // Any futures the runtime can move to another thread.
+        F: std::future::Future<Output = Result<(), OkfError>> + Send + 'static,
+        G: std::future::Future<Output = Result<(), OkfError>> + Send + 'static,
+    {
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM audit_people WHERE user_id = $1 FOR NO KEY UPDATE")
+            .bind(held_user)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let (first, second) = (tokio::spawn(first), tokio::spawn(second));
+        let first = tokio::time::timeout(LOCK_WAIT, first)
+            .await
+            .expect("the first change finished while a person's audit row was held")
+            .expect("the first change did not panic");
+        let second = tokio::time::timeout(LOCK_WAIT, second)
+            .await
+            .expect("the second change finished while a person's audit row was held")
+            .expect("the second change did not panic");
+        holder.rollback().await.unwrap();
+        (first, second)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admins_setting_each_others_email_at_once_both_finish() {
+        let db = test_db().await;
+        let [(low_name, low), (high_name, high)] = two_admins(&db.pool).await;
+        let held = low.user_id.clone().unwrap();
+        let pool = db.pool.clone();
+        let first = async move {
+            set_email(&pool, &high_name, Some("high@example.com"), &low, now()).await
+        };
+        let pool = db.pool.clone();
+        let second =
+            async move { set_email(&pool, &low_name, Some("low@example.com"), &high, now()).await };
+
+        let (one, other) = both_finish_while_a_person_is_held(&db.pool, &held, first, second).await;
+
+        one.expect("the first email change");
+        other.expect("the second email change");
+        assert_eq!(
+            audit::testing::entries(&db.pool, "user.email_changed")
+                .await
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admins_ending_each_others_sessions_at_once_both_finish() {
+        let db = test_db().await;
+        let [(low_name, low), (high_name, high)] = two_admins(&db.pool).await;
+        let held = low.user_id.clone().unwrap();
+        let pool = db.pool.clone();
+        let target = high_name.clone();
+        let first = async move {
+            let session = seed_session_of(&pool, &target).await;
+            end_session_by_prefix(&pool, &target, &session, &low, now()).await
+        };
+        let pool = db.pool.clone();
+        let target = low_name.clone();
+        let second = async move {
+            let session = seed_session_of(&pool, &target).await;
+            end_session_by_prefix(&pool, &target, &session, &high, now()).await
+        };
+
+        let (one, other) = both_finish_while_a_person_is_held(&db.pool, &held, first, second).await;
+
+        one.expect("the first revoke");
+        other.expect("the second revoke");
+    }
+
+    /// Gives user `name` a console session and answers its id prefix.
+    async fn seed_session_of(pool: &PgPool, name: &str) -> String {
+        let id = id_by_name(pool, name).await.unwrap();
+        seed_session(pool, &id).await;
+        user_sessions::list(pool, &id, None).await.unwrap()[0]
+            .id_prefix
+            .clone()
     }
 }

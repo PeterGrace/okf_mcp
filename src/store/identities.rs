@@ -498,6 +498,7 @@ mod tests {
 
     use super::*;
     use crate::db::test_db;
+    use crate::store::audit::AuditActor;
     use crate::store::{passwords, users};
 
     fn now() -> DateTime<Utc> {
@@ -513,6 +514,7 @@ mod tests {
                 name,
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await
@@ -662,9 +664,15 @@ mod tests {
     async fn signing_in_by_email_links_case_insensitively_and_never_errs_on_bad_text() {
         let db = test_db().await;
         let alice = user(&db.pool, "alice").await;
-        users::set_email(&db.pool, "alice", Some("alice@example.com"))
-            .await
-            .expect("email");
+        users::set_email(
+            &db.pool,
+            "alice",
+            Some("alice@example.com"),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .expect("email");
 
         let linked = sign_in(&db.pool, &oidc("sub-1", Some("Alice@Example.com")), now())
             .await

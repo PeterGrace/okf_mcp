@@ -1611,7 +1611,13 @@ mod tests {
         use std::time::Duration;
         let boss = seed_user(pool, "boss", None).await;
         let alice = seed_user(pool, "alice", None).await;
-        users::set_admin(pool, "boss", true, false).await.unwrap();
+        let on = users::AdminChange {
+            on: true,
+            allow_last: false,
+        };
+        users::set_admin(pool, "boss", on, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         set(
             pool,
             SettingKey::MaxKeysPerUser,
@@ -1650,7 +1656,7 @@ mod tests {
         // `tokio::spawn` runs each on its own task (and connection).
         let promotion = tokio::spawn({
             let pool = pool.clone();
-            async move { users::set_admin(&pool, "alice", true, false).await }
+            async move { users::set_admin(&pool, "alice", on, &AuditActor::cli(), now()).await }
         });
         wait_for_lock_waiters(pool, 1).await;
         let settings_write = tokio::spawn({

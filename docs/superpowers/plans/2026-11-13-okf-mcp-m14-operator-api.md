@@ -37,7 +37,7 @@
 Checked against `origin/main` at `4b7fcf1` (all of M13 merged) on 2026-11-14; line numbers are on that commit. *(Corrected, M13 merged, 2026-11-14: first checked at `9a84af6`, v0.15.0, plus the M13 plan. Facts in files M13 did not touch kept their line numbers; the others were re-read and updated.)*
 
 **What M13 shipped (on `main`):**
-- Migration `0011_team_suspension.sql`, so this milestone's migrations are `0012` to `0016`.
+- Migration `0011_team_suspension.sql`, so this milestone's migrations are `0012` to `0017`. *(Corrected, issue #396, 2026-11-14: Task 6a added `0014_audit_row_locks.sql`, so Task 5's migration is `0015`, Task 9a's `0016` and Task 9c's `0017`.)*
 - `teams::suspend(pool: &PgPool, name: &str, notice: Option<&str>, now) -> Result<TeamRecord, OkfError>` and `teams::unsuspend(pool: &PgPool, name: &str) -> Result<TeamRecord, OkfError>` (no `now`) (`src/store/teams.rs:482-504`, `:518-534`). Each opens its own transaction, takes `lock_team` (which returns only `LockedTeam { id, personal_of }`, `:564-569`, `:581-594`), runs one `UPDATE`, bumps `admin_generation` (`unsuspend` only when `rows_affected() > 0`), commits, then answers `find(pool, name)` after the commit. `suspend` keeps the first `suspended_at` with `COALESCE` and does not read whether the team was already suspended. `clean_notice` (`:446-464`, private) runs before the transaction: it trims, turns a blank notice into `None`, and refuses (`Refused`) a notice holding a NUL or over `MAX_NOTICE_CHARS` (2000, `:107`).
 - Malformed team names are unknown: `teams::find` (`:281-286`), `lock_team` (`:581-585`) and `teams::id_of` (`:680-684`) refuse a name that fails `catalogs::is_valid_name` (`[a-z0-9-]+`, `src/store/catalogs.rs:52`) with `UnknownName` before any SQL, so a NUL in a team name is a 404, never a 500 (the team part of #339, M13 issue #367).
 - `TeamRecord.suspension: Option<Suspension { since, notice }>` (`src/store/teams.rs:78-93`, `:111-116`); `SuspendedCatalog { team, notice }` (`:120-125`); `teams::suspended_catalogs(pool)` (`:547-561`).
@@ -197,7 +197,7 @@ Why each edge, and the shared files to merge with care:
 - **4 and 7a need 1** (`store::audit`, `AuditActor`, `Requester`). **6d needs 1 and 2** (2 adds the branding keys to `settings.rs`, 6d the actor and retention). 4, 7a and 6d can run in parallel: 4 owns `users::delete`, 7a `publish`, `discard`, `revert` and `ToolContext`, 6d `settings.rs`.
 - **6a and 6b need 4**: 6a rewrites the rest of `users.rs`, and 6b's guards call `users::id_and_admin_of`, which 4 adds. 6a and 6b run in parallel; both change `src/cli/people.rs`, `src/http/api/people.rs` and `src/store/ceiling.rs`, in different functions (6a the user and entitlement ones, 6b the team and member-access ones). Merge `main` before review and keep both sides.
 - **5 needs 3, 6a and 6b**: its allow-list includes the lookup (3), and its admin-target refusals are the guards 4, 6a and 6b put in the store, which only refuse once 5 sets `AuditActor.provisioner`.
-- **6c, 8a and 9a need 5.** 6c changes `keys.rs` after 5's `create_provisioner`; 8a's provisioner viewer needs `Principal.provisioner`; 9a's migration `0015` must follow 5's `0014` (migrations merge in number order: `0012` Task 1, `0013` Task 4, `0014` Task 5, `0015` Task 9a, `0016` Task 9c). 9a also needs 6d (`settings.rs`). 6c, 8a and 9a share no file but `docs/operations.md`.
+- **6c, 8a and 9a need 5.** 6c changes `keys.rs` after 5's `create_provisioner`; 8a's provisioner viewer needs `Principal.provisioner`; 9a's migration `0016` must follow 5's `0015` (migrations merge in number order: `0012` Task 1, `0013` Task 4, `0014` Task 6a, `0015` Task 5, `0016` Task 9a, `0017` Task 9c). 9a also needs 6d (`settings.rs`). 6c, 8a and 9a share no file but `docs/operations.md`.
 - **7b needs 6c and 7a**: its tests create keys with 6c's signatures, and its `ToolContext::admit` uses 7a's requester. **8b and 8c need 8a** (the reader and the routes); 8b and 9d both add a command group to `src/cli.rs` and `tests/admin_parity.rs`: keep both. **9d needs 9a** (`store::unlocks`) **and 8a** (its owner test reads `/api/v1/audit` and its export; *corrected, PR #375 review, 2026-11-13*), and can run beside 9b.
 - **9b needs 7b and 9a** (it extends `AccessGates` and `admission`, and reads `unlocks::live`). **9c needs 9b** (its runner test needs the `MaintenanceOff` refusal at the choke points). **9e needs 8c, 9c and 9d** (the console for all three; it and 8c both add nav links to `index.html` and the manifest).
 - **10** last: it edits the sections of `docs/operations.md` the tasks leave alone.
@@ -212,7 +212,7 @@ Why each edge, and the shared files to merge with care:
 | 2 | Branding: `product_name` and `support_contact` settings; mail, server pages and console shell use them |
 | 3 | `GET /api/v1/users?email=`, `user list --email`, the Users filter box; the parity test learns `--flag` entries |
 | 4 | Migration `0013`; user deletion with credentials, refusals, discarded changesets and anonymized people |
-| 5 | Migration `0014`; the provisioner key, its allow-list, admin-target refusals, CLI, REST and console |
+| 5 | Migration `0015`; the provisioner key, its allow-list, admin-target refusals, CLI, REST and console |
 | 6a | Audit of user changes: create, email, admin flag, invite, entitlements, sessions |
 | 6b | Audit of team and catalog changes: teams, members, suspension, catalogs, owner, member access, description, import |
 | 6c | Audit of credential changes: keys, grants, reporting flag, assignment, sign-in codes, OAuth grants |
@@ -222,9 +222,9 @@ Why each edge, and the shared files to merge with care:
 | 8a | Reading the log: `store::audit::list`, owner redaction, `GET /api/v1/audit`, `GET /api/v1/audit/export`, `/me` owned teams |
 | 8b | `okf-mcp audit list` and `audit export`; parity |
 | 8c | Console Audit page |
-| 9a | Migration `0015`; unlock settings, `store::unlocks`, the two error kinds, the owner email |
+| 9a | Migration `0016`; unlock settings, `store::unlocks`, the two error kinds, the owner email |
 | 9b | The unlock check at every content choke point; tallies; the maintenance runner's exemption |
-| 9c | Migration `0016`; the per-catalog `maintenance` flag (store, REST, CLI), `catalog.maintenance_run` entries, the runner's skip |
+| 9c | Migration `0017`; the per-catalog `maintenance` flag (store, REST, CLI), `catalog.maintenance_run` entries, the runner's skip |
 | 9d | `POST/GET/DELETE /api/v1/unlocks`, `okf-mcp unlock create/list/end`; parity |
 | 9e | Console: Unlock form on refusal, Unlocks page, catalog maintenance switch |
 | 10 | Documentation, README status, spec "What shipped differently", close-out |
@@ -247,9 +247,9 @@ Why each edge, and the shared files to merge with care:
 |---|---|---|
 | `migrations/0012_audit.sql` | Create | 1 |
 | `migrations/0013_user_deletion.sql` | Create | 4 |
-| `migrations/0014_provisioner.sql` | Create | 5 |
-| `migrations/0015_unlocks.sql` | Create | 9a |
-| `migrations/0016_maintenance_audit.sql` | Create | 9c |
+| `migrations/0015_provisioner.sql` | Create | 5 |
+| `migrations/0016_unlocks.sql` | Create | 9a |
+| `migrations/0017_maintenance_audit.sql` | Create | 9c |
 | `src/store/audit.rs` | Create (write helper); `prune` (6d); `record_admin_read`, `record_export` (7b); `list`, `Viewer`, `AuditQuery`, `AuditRecord` (8a) | 1, 6d, 7b, 8a |
 | `src/store/unlocks.rs` | Create | 9a, 9b |
 | `src/store/gates.rs` | Create (memberships, admins); entitlements, unlocks, maintenance flags, `require_unlock` (9b) | 7b, 9b |
@@ -2589,7 +2589,7 @@ git commit -m "feat(users): deleting a user takes its credentials; catalogs and 
 ### Task 5: The provisioner key
 
 **Files:**
-- Create: `migrations/0014_provisioner.sql`
+- Create: `migrations/0015_provisioner.sql`
 - Modify: `src/store/keys.rs` (`create_provisioner`, `KeyRecord.provisioner`, `list`), `src/auth.rs` (`Principal.provisioner`, `require_key`), `src/store/audit.rs` (`AuditActor::of`), `src/http/api/mod.rs` (allow-list, gate, `require_manager`, `require_reader`), `src/http/api/people.rs`, `src/http/api/catalogs.rs`, `src/store/ceiling.rs` (`may_set_member_access`), `src/http/api/keys.rs` (body, `KeyView.provisioner`), `src/cli.rs` (`KeyCreateArgs`, `run_key`, `format_key_record`), `src/http/ui/js/pages/keys.js`, `tests/admin_parity.rs`, `docs/operations.md`
 - Test: `tests/ui_e2e/keys.rs`
 
@@ -3124,7 +3124,7 @@ the `POST /api/v1/keys` row documents `provisioner`, and a new subsection under 
 Run the narrow tests, `tools/agentic/gate.sh test`, `tools/agentic/gate.sh test-ui`, `fmt`, `lint`.
 
 ```bash
-git add migrations/0014_provisioner.sql src tests docs/operations.md changelog/
+git add migrations/0015_provisioner.sql src tests docs/operations.md changelog/
 git commit -m "feat(auth): provisioner keys manage accounts, teams and catalogs and read nothing (M14 task 5)" \
            -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3238,6 +3238,15 @@ Run per task: `tools/agentic/gate.sh narrow --lib store::<module>::tests` for ea
 | `users::end_session_by_prefix(pool, name, id_prefix, actor, now)` (new: the admin route's one-session revoke, in one transaction with the user's row lock; `user_sessions::revoke_by_prefix` gets a `revoke_by_prefix_in(conn, ..)` body it shares) | `user.sessions_revoked` | `User` | none | `{"sessions": 1}` | |
 
 The self-service `DELETE /me/sessions/...` keeps calling `user_sessions::revoke_by_prefix` and records nothing: it is the user's own session, not an administrative change. Callers of `users::create` outside the CLI and the API (an OIDC first sign-in, if it creates users: `grep -rn "users::create(" src`) pass `&AuditActor::system("oidc")`.
+
+> **Corrected (issue #396, 2026-11-14).** What shipped differs from the table and the common pattern here:
+> - `invite::send_setup`'s guard reads `SELECT is_admin FROM users WHERE name = $1 FOR NO KEY UPDATE`, not `FOR SHARE`: `email_tokens::issue_for_user_in` locks the same row `FOR NO KEY UPDATE` right after, and two invites each holding `FOR SHARE` would deadlock upgrading. The lock still conflicts with `set_admin`'s `FOR UPDATE`, and the guard runs before the "no email" check, so a provisioner learns nothing about whether an admin has an email.
+> - `users::set_email` locks the user first (`SELECT id, is_admin ... FOR UPDATE`) and refuses a provisioner before its `UPDATE`, not after it as the sketch above shows, so the refusal comes before "Another user has this email".
+> - `user.entitlement_set` and `user.sessions_revoked` are recorded only when something changed (an unchanged level, no session ended), like the rows marked "(when changed)". `entitle` takes `previous` from its own upsert (`RETURNING xmax = 0`: inserted is `null`, updated is the other level), not from a separate read.
+> - Lock order. `audit::record` locks the acting user's row (and its credential's owner, and a personal team's person) `FOR KEY SHARE` through `audit_person`, and `set_admin` locks every admin row `FOR UPDATE` before `server_state`. So every 6a function first calls `users::lock_users(conn, &UserLocks { target: Some((name, RowLock::..)), actor, catalog })` (or `users::lock_target`), which locks the target, the actor's user and credential owner, and a catalog's personal owner in `set_admin`'s order (admin users first, then the rest, each by id), before `server_state` and anything else; `set_admin` calls it after its admin rows. Tests: `an_admins_change_and_a_concurrent_set_admin_both_finish` (`store::users`) and `an_admins_entitlement_change_and_a_concurrent_set_admin_both_finish` (`store::ceiling`), each forced through a held `server_state` row. Tasks 6b and 6c should take their user rows through `lock_users` the same way.
+> - **Migration `0014_audit_row_locks.sql`** (review of PR #419). `audit_person`, `audit_team_ref` and `audit_credential` (same arguments and results) read an existing row without a lock and refresh a stale one only under `FOR NO KEY UPDATE SKIP LOCKED`; it backfills an `audit_people` row for every user and an `audit_teams` row for every team, and `users::create` makes the personal team's row (`audit::team_ref`) with the user's. Before, every call upserted, and `ON CONFLICT DO UPDATE` locks the row, so two admins acting on each other (invites, email changes, session revokes, each other's personal teams through `team_ref`) deadlocked on two `audit_people` rows. `store::audit`'s Rust interface is unchanged. Later tasks' migrations move up one: Task 5 `0015`, Task 9a `0016`, Task 9c `0017`. Tests: `admins_inviting_each_other_at_once_both_finish`, `admins_setting_each_others_email_at_once_both_finish`, `admins_ending_each_others_sessions_at_once_both_finish`, `admins_acting_on_each_others_personal_teams_at_once_both_finish` (helpers `users::tests::{two_admins, both_finish_while_a_person_is_held}`).
+> - `users::user_entry(action, user_id, details) -> Entry` (`pub(crate)`) builds every user-targeted entry, `user.deleted` included; `ceiling` sets `teams` on it with struct-update syntax. `user_sessions::revoke_by_prefix_in(conn, user_id, id_prefix)` is `pub(crate)`.
+> - `crate::db::test_db()` and `tests/support/server.rs` create their fixture user through `users::create`, so every test database starts with a `user.created` entry (person `test-user`; `tester` in the integration tests). A test that counts the whole log, or every entry of one action, must allow for it: `store::audit`'s tests now filter by action, and Task 8a's export test is corrected below.
 
 Commit:
 
@@ -4623,8 +4632,11 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let lines: Vec<serde_json::Value> = std::str::from_utf8(&bytes).unwrap().lines()
             .map(|line| serde_json::from_str(line).unwrap()).collect();
-        assert_eq!(lines.len(), 1);
+        // The fixture user's own `user.created` entry is the older one
+        // (corrected, issue #396, 2026-11-14: `test_db` records it).
+        assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["action"], "user.created");
+        assert_eq!(lines[0]["target"]["person"], "alice");
     }
 }
 ```
@@ -5479,7 +5491,7 @@ git commit -m "feat(console): the Audit page for admins and team owners (M14 tas
 ### Task 9a: Unlock storage, settings, errors and the owner email
 
 **Files:**
-- Create: `migrations/0015_unlocks.sql`, `src/store/unlocks.rs`
+- Create: `migrations/0016_unlocks.sql`, `src/store/unlocks.rs`
 - Modify: `src/store/mod.rs`, `src/store/settings.rs`, `src/error.rs`, `src/http/mod.rs` (status), `src/mcp/mod.rs` (only if it matches variants), `src/mail/templates.rs`, `docs/operations.md` (Settings rows, error rows)
 
 - [ ] **Step 1: Write the migration**
@@ -5908,7 +5920,7 @@ pub async fn create(
 - [ ] **Step 6: Run, gate, commit**
 
 ```bash
-git add migrations/0015_unlocks.sql src docs/operations.md changelog/
+git add migrations/0016_unlocks.sql src docs/operations.md changelog/
 git commit -m "feat(unlocks): unlock records, settings, error kinds and the owner email (M14 task 9a)" \
            -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -6191,7 +6203,7 @@ git commit -m "feat(auth): operator access to customer catalogs needs an unlock 
 ### Task 9c: The per-catalog maintenance flag and maintenance passes
 
 **Files:**
-- Create: `migrations/0016_maintenance_audit.sql`
+- Create: `migrations/0017_maintenance_audit.sql`
 - Modify: `src/store/catalogs.rs` (`Catalog.maintenance`, `set_maintenance`), `src/store/teams.rs` (`owns_catalog`), `src/http/api/catalogs.rs` (route, `CatalogSummary.maintenance`), `src/cli.rs` (`CatalogCommand::SetMaintenance`), `src/investigator/{error,contract,supervisor,types}.rs`, `tests/admin_parity.rs`, `docs/operations.md`
 
 - [ ] **Step 1: Write the migration**
@@ -6494,7 +6506,7 @@ and the API row; "Report-only runner" gains the `maintenance_off` reason.
 - [ ] **Step 5: Run, gate, commit**
 
 ```bash
-git add migrations/0016_maintenance_audit.sql src tests/admin_parity.rs docs/operations.md changelog/
+git add migrations/0017_maintenance_audit.sql src tests/admin_parity.rs docs/operations.md changelog/
 git commit -m "feat(maintenance): a per-catalog maintenance switch; runner passes are audited and skipped when off (M14 task 9c)" \
            -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -6811,7 +6823,7 @@ git commit -m "feat(console): unlock a locked catalog, the Unlocks page and the 
 - [ ] **Step 1: `docs/operations.md`**
   - "Users and teams": a lead paragraph on running okf-mcp for other people (branding, provisioner, audit, unlocks), linking each section.
   - "### Audit log": what is recorded (the full action table, grouped as the spec groups it), what is not (members' reads, sign-ins, runner reads), people, teams and credentials in entries (`audit_people`, `audit_teams`, `audit_credentials`; `deleted user #N`; no name in an immutable column), append-only and retention, who reads it (admins, owners through a console session, provisioners their own), the redaction rules, the CLI, REST and console surfaces, and a sample entry.
-  - "Upgrades": migrations `0012` to `0016`; `0013` changes three foreign keys to `CASCADE` (deleting a user now deletes its credentials); all others are additive; `require_unlock` is off until an operator turns it on.
+  - "Upgrades": migrations `0012` to `0017`; `0013` changes three foreign keys to `CASCADE` (deleting a user now deletes its credentials); all others are additive; `require_unlock` is off until an operator turns it on.
   - "Troubleshooting": `UnlockRequired` on a key with no user (assign it a user); `maintenance_off` from the runner.
   - Check every new route has an API reference row and every new subcommand a parity row (`tools/agentic/gate.sh narrow --test admin_parity`).
   - The API reference's counts (`docs/operations.md`, "### API reference" lead). M13 left them at 88 endpoints, "Users and teams" 21. This milestone adds six: `GET /api/v1/audit` and `GET /api/v1/audit/export` (8a), `PUT /api/v1/catalogs/{catalog}/maintenance` (9c), and `POST /api/v1/unlocks`, `GET /api/v1/unlocks`, `DELETE /api/v1/unlocks/{id}` (9d), so 94, with "Catalogs and import/export" 9 to 10 and two new areas in the lead's list, Audit (2) and Unlocks (3); "Users and teams" stays 21 (Tasks 3 to 5 change existing routes only). Recount from the router before writing them: a task may have added or merged a route since. `/ui/brand.json` (Task 2) is not under `/api/v1` and not counted. *(Corrected, M13 merged, 2026-11-14: the plan named no counts; M13 Task 8 found them stale.)*

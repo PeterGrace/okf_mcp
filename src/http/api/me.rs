@@ -1117,6 +1117,7 @@ mod tests {
     use crate::mail::queue as mail_queue;
     use crate::mcp::testing::TestApp;
     use crate::store::audit::AuditActor;
+    use crate::store::ceiling::NewEntitlement;
     use crate::store::ceiling::{self, Ceiling};
     use crate::store::keys::{insert_legacy_test_key, Access, Grants};
     use crate::store::oauth::clients::ClientKind;
@@ -1124,6 +1125,7 @@ mod tests {
     use crate::store::passkeys::{self, testing::passkey_for};
     use crate::store::settings::{self, SettingKey};
     use crate::store::sign_in_events::{self, Method, Outcome};
+    use crate::store::users::AdminChange;
     use crate::store::users::{self, NewUser};
     use crate::store::{identities, passwords};
 
@@ -1136,14 +1138,24 @@ mod tests {
                 name,
                 display_name: "",
             },
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await
         .expect("create the user");
         for (catalog, access) in grants {
-            ceiling::entitle(pool, name, catalog, *access, Utc::now())
-                .await
-                .expect("entitle");
+            ceiling::entitle(
+                pool,
+                &NewEntitlement {
+                    user: name,
+                    catalog,
+                    access: *access,
+                },
+                &AuditActor::cli(),
+                Utc::now(),
+            )
+            .await
+            .expect("entitle");
         }
         test.app.poll().await.expect("poll the user in");
         Browser::session_for(test, name).await
@@ -1596,16 +1608,35 @@ mod tests {
                 name: "alice",
                 display_name: "",
             },
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await
         .expect("create alice");
-        ceiling::entitle(test.app.pool(), "alice", "main", Access::Read, Utc::now())
-            .await
-            .expect("entitle");
-        users::set_admin(test.app.pool(), "alice", true, true)
-            .await
-            .expect("make alice admin");
+        ceiling::entitle(
+            test.app.pool(),
+            &NewEntitlement {
+                user: "alice",
+                catalog: "main",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("entitle");
+        users::set_admin(
+            test.app.pool(),
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: true,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("make alice admin");
         test.app.poll().await.expect("poll");
         let mut alice = Browser::session_for(&test, "alice").await;
 
@@ -1715,9 +1746,15 @@ mod tests {
             &[("main", Access::Read), ("other", Access::Write)],
         )
         .await;
-        users::set_email(test.app.pool(), "alice", Some("alice@example.com"))
-            .await
-            .expect("email");
+        users::set_email(
+            test.app.pool(),
+            "alice",
+            Some("alice@example.com"),
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("email");
 
         let (status, me) = alice
             .send(&test, "GET", "/api/v1/me", Payload::Empty)
@@ -1866,9 +1903,15 @@ mod tests {
         let mut first = member(&test, "alice", &[]).await;
         let mut second = Browser::session_for(&test, "alice").await;
         let id = user_id(&test, "alice").await;
-        users::set_email(test.app.pool(), "alice", Some("alice@example.com"))
-            .await
-            .expect("email");
+        users::set_email(
+            test.app.pool(),
+            "alice",
+            Some("alice@example.com"),
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("email");
         passwords::set(test.app.pool(), &id, "correct horse battery", Utc::now())
             .await
             .expect("password");

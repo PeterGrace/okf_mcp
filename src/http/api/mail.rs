@@ -175,7 +175,9 @@ mod tests {
     use crate::http::api::testing::{Browser, Payload};
     use crate::mail::{queue, Template};
     use crate::mcp::testing::TestApp;
+    use crate::store::audit::AuditActor;
     use crate::store::users;
+    use crate::store::users::AdminChange;
 
     #[tokio::test]
     async fn mail_routes_need_an_admin_to_read_and_one_reaching_every_catalog_to_write() {
@@ -323,14 +325,24 @@ mod tests {
                     name,
                     display_name: "",
                 },
+                &AuditActor::cli(),
                 Utc::now(),
             )
             .await
             .expect("create the user");
         }
-        users::set_admin(test.app.pool(), "boss", true, false)
-            .await
-            .expect("make boss an admin");
+        users::set_admin(
+            test.app.pool(),
+            "boss",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("make boss an admin");
         (
             Browser::session_for(test, "plain").await,
             Browser::session_for(test, "boss").await,

@@ -318,6 +318,7 @@ mod tests {
 
     use crate::http::api::testing::{app, assert_matrix, keys, send, Row};
     use crate::mcp::testing::TestApp;
+    use crate::store::audit::AuditActor;
     use crate::store::keys::{Access, Grants};
     use crate::store::oauth::codes::{self, CreatedSignInCode, NewSignInCode};
 
@@ -547,6 +548,7 @@ mod tests {
                 name: "alice",
                 display_name: "",
             },
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await

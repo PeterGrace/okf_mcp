@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::http::console_session::{start_session, COOKIE, CSRF_HEADER};
 use crate::http::router;
 use crate::mcp::testing::{app_with, TestApp};
+use crate::store::audit::AuditActor;
 use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
 use crate::store::passwords;
 use crate::store::users::{self, UserAuth};
@@ -295,11 +296,12 @@ pub(crate) async fn user_with_password(
             name,
             display_name: "",
         },
+        &AuditActor::cli(),
         Utc::now(),
     )
     .await
     .expect("create the user");
-    users::set_email(pool, name, Some(email))
+    users::set_email(pool, name, Some(email), &AuditActor::cli(), Utc::now())
         .await
         .expect("set the email");
     let user = users::find_by_email(pool, email)

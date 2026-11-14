@@ -1990,7 +1990,14 @@ mod tests {
         let change = || {
             let pool = pool.clone();
             tokio::spawn(async move {
-                users::set_email(&pool, "alice", Some("alice@example.net")).await
+                users::set_email(
+                    &pool,
+                    "alice",
+                    Some("alice@example.net"),
+                    &AuditActor::cli(),
+                    Utc::now(),
+                )
+                .await
             })
         };
         // Each task is queued only once the one before it waits on the row.
@@ -2136,7 +2143,14 @@ mod tests {
                     .await
                     .map(|_| ()),
                     Rival::EmailChange => {
-                        users::set_email(&pool, "alice", Some("alice@example.net")).await
+                        users::set_email(
+                            &pool,
+                            "alice",
+                            Some("alice@example.net"),
+                            &AuditActor::cli(),
+                            Utc::now(),
+                        )
+                        .await
                     }
                 }
             })
