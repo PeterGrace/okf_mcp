@@ -26,6 +26,13 @@ Issue #391, epic #390. Plan: `docs/superpowers/plans/2026-11-13-okf-mcp-m14-oper
 - `ConsoleSession::for_test()` (tests only).
 - Test `both_middlewares_record_the_client_ip_and_the_credentials_user`:
   the real middlewares in front of the extractors (beyond the plan's list).
+- Tests `forgetting_a_user_clears_its_credentials_and_keeps_every_entry` and
+  `forgetting_a_user_clears_a_key_assigned_to_it_after_it_was_recorded`
+  (review of PR #412): a user's key as actor and a sign-in code as target
+  (no `Entry.person`) resolve to the user's person, and `forget_person` sets
+  their ids and labels to NULL while the entry and its references survive the
+  user's deletion; a key assigned after it was recorded (an audit row with no
+  person) is found through `api_keys` and cleared too.
 
 ## Changed
 - `Principal` has `user_id: Option<String>`: the key's `user_id` from

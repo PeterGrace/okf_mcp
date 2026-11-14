@@ -646,25 +646,54 @@ mod tests {
         }
     }
 
-    /// Stores a legacy-style key `k1` of `user_id` (no grants), so the
-    /// actor's credential has a row to resolve.
-    async fn store_key(pool: &PgPool, user_id: &str) {
+    /// Stores a legacy-style admin key `id` (its id is also its name) of
+    /// `user_id`, or of no user, with no grants, so a credential naming it
+    /// has a row to resolve.
+    async fn store_key(pool: &PgPool, id: &str, user_id: Option<&str>) {
         sqlx::query(
             "INSERT INTO api_keys \
                  (id, name, sha256, access, all_catalogs, actor, created_at, user_id) \
-             VALUES ('k1', 'k1', sha256('k1'::bytea), 'admin', true, 'root', now(), $1)",
+             VALUES ($1, $1, sha256($1::bytea), 'admin', true, 'root', now(), $2)",
         )
+        .bind(id)
         .bind(user_id)
         .execute(pool)
         .await
         .unwrap();
     }
 
+    /// Stores an unredeemed sign-in code `id` of `user_id`.
+    async fn store_code(pool: &PgPool, id: &str, user_id: &str) {
+        sqlx::query(
+            "INSERT INTO sign_in_codes (id, name, sha256, access, all_catalogs, actor, \
+                 created_at, expires_at, user_id) \
+             VALUES ($1, $1, sha256($1::bytea), 'read', true, 'root', now(), \
+                     now() + interval '1 day', $2)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The `(credential_id, label, person_id)` of every `audit_credentials`
+    /// row, in id order.
+    /// Takes a connection, so it also reads inside an open transaction.
+    async fn audit_credentials(
+        conn: &mut PgConnection,
+    ) -> Vec<(Option<String>, Option<String>, Option<i64>)> {
+        sqlx::query_as("SELECT credential_id, label, person_id FROM audit_credentials ORDER BY id")
+            .fetch_all(conn)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn record_writes_one_entry_with_its_actor_target_and_teams() {
         let db = test_db().await;
         let me = user_id(&db.pool, TEST_USER).await;
-        store_key(&db.pool, &me).await;
+        store_key(&db.pool, "k1", Some(&me)).await;
         let mut tx = db.pool.begin().await.unwrap();
         let team = team_ref(&mut tx, TEST_TEAM).await.unwrap();
 
@@ -816,6 +845,134 @@ mod tests {
         );
         assert!(stored.contains("console session"), "{stored}");
         assert!(stored.contains("deleted user #"), "{stored}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_a_user_clears_its_credentials_and_keeps_every_entry() {
+        let db = test_db().await;
+        let new = NewUser {
+            name: "alice",
+            display_name: "Alice Example",
+        };
+        users::create(&db.pool, &new, now()).await.unwrap();
+        let alice = user_id(&db.pool, "alice").await;
+        // A legacy key's id is its name, and a code's name is the user's
+        // choice: both identify alice until they are forgotten.
+        store_key(&db.pool, "alice-laptop", Some(&alice)).await;
+        store_code(&db.pool, "alice-phone", &alice).await;
+        let actor = AuditActor {
+            credential: Some("alice-laptop".to_string()),
+            user_id: Some(alice.clone()),
+            label: "alice-laptop".to_string(),
+            ..admin_actor(&alice)
+        };
+        let mut tx = db.pool.begin().await.unwrap();
+        // The target names no person: its owner comes from `sign_in_codes`.
+        let id = record(
+            &mut tx,
+            &actor,
+            &entry(Action::OauthCodeRevoked, Target::Code("alice-phone")),
+            now(),
+        )
+        .await
+        .unwrap();
+        let person: i64 = sqlx::query_scalar("SELECT id FROM audit_people WHERE user_id = $1")
+            .bind(&alice)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            audit_credentials(&mut tx).await,
+            [
+                (
+                    Some("alice-laptop".to_string()),
+                    Some("alice-laptop".to_string()),
+                    Some(person)
+                ),
+                (Some("alice-phone".to_string()), None, Some(person)),
+            ],
+            "both credentials resolved to alice's person"
+        );
+
+        // As user deletion will: forget first, then remove the user's rows.
+        forget_person(&mut tx, &alice).await.unwrap();
+        tx.commit().await.unwrap();
+        for table in ["api_keys", "sign_in_codes"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE user_id = $1"
+            )))
+            .bind(&alice)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        users::delete(&db.pool, "alice").await.unwrap();
+
+        assert_eq!(
+            audit_credentials(&mut db.pool.acquire().await.unwrap()).await,
+            [(None, None, Some(person)), (None, None, Some(person))],
+            "the ids and labels are SQL NULL; the rows stay"
+        );
+        let stored: String = sqlx::query_scalar(
+            "SELECT row_to_json(e)::text || row_to_json(a)::text || row_to_json(t)::text \
+                    || row_to_json(p)::text \
+             FROM audit_entries e \
+             JOIN audit_credentials a ON a.id = e.actor_credential_ref \
+             JOIN audit_credentials t ON t.id = e.target_credential_ref \
+             JOIN audit_people p ON p.id = e.actor_person_id \
+             WHERE e.id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            !stored.contains("alice") && !stored.contains("Alice"),
+            "{stored}"
+        );
+        assert!(stored.contains("deleted user #"), "{stored}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_a_user_clears_a_key_assigned_to_it_after_it_was_recorded() {
+        let db = test_db().await;
+        let new = NewUser {
+            name: "alice",
+            display_name: "",
+        };
+        users::create(&db.pool, &new, now()).await.unwrap();
+        let alice = user_id(&db.pool, "alice").await;
+        // A legacy key with no user yet: its audit row has no person.
+        store_key(&db.pool, "alice-legacy", None).await;
+        let mut tx = db.pool.begin().await.unwrap();
+        record(
+            &mut tx,
+            &AuditActor::cli(),
+            &entry(Action::KeyRevoked, Target::Key("alice-legacy")),
+            now(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            audit_credentials(&mut db.pool.acquire().await.unwrap()).await,
+            [(Some("alice-legacy".to_string()), None, None)]
+        );
+        sqlx::query("UPDATE api_keys SET user_id = $1 WHERE id = 'alice-legacy'")
+            .bind(&alice)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let mut tx = db.pool.begin().await.unwrap();
+        forget_person(&mut tx, &alice).await.unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            audit_credentials(&mut db.pool.acquire().await.unwrap()).await,
+            [(None, None, None)],
+            "found through the live key, though the audit row names no person"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
