@@ -819,7 +819,10 @@ async fn remove_member(
 
 /// `PUT /teams/{name}/suspension`: suspends the team (or replaces its
 /// notice, keeping the first suspension time), or lifts its suspension.
-/// Polls before answering, so the next request is refused (or served).
+/// Polls before answering, so when that poll succeeds the next request is
+/// refused (or served again). A failed poll is logged, not returned (see
+/// `settle`): the committed change then takes effect at the poll loop's next
+/// successful pass.
 ///
 /// # Returns
 /// The team as it now is.
