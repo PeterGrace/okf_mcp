@@ -20,7 +20,9 @@ Issue #394 (also closes #379), epic #390. Plan:
   `a_refused_deletion_changes_nothing`,
   `id_and_admin_of_reads_the_flag_and_knows_no_stranger`; REST
   `deleting_a_user_over_rest_takes_its_keys_and_refuses_the_last_admin`; CLI
-  `deleting_a_user_takes_its_keys_and_may_delete_the_last_admin`.
+  `deleting_a_user_takes_its_keys_and_may_delete_the_last_admin`; schema
+  `a_users_credentials_go_with_it_but_its_personal_team_restricts` (replaces
+  `db::tests::a_user_with_a_credential_cannot_be_deleted`).
 - Browser journeys (#379): `a_user_whose_only_key_is_revoked_is_deleted_from_the_console`,
   `a_delete_clicked_again_while_it_runs_sends_one_request`,
   `a_last_owner_or_an_owned_catalog_refuses_the_delete_until_cleared`.
