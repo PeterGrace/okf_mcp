@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. In this project each task is one GitHub sub-issue and one PR (`github-issue-to-pr`).
 
-**Goal:** Run the server on the home k3s cluster, reachable at `https://okf-mcp.k.vsix.me` behind bearer keys. The pieces:
+**Goal:** Run the server on the home k3s cluster, reachable at `https://okf-mcp.example.com` behind bearer keys. The pieces:
 - the design's "Time" clock check, an SNTP query of `time_server` at startup and every 15 minutes, reported by `/healthz`;
 - TLS to Postgres;
 - a container image built by GitHub Actions and published to GHCR;
@@ -67,7 +67,7 @@ Deliberately deferred:
 
 Decisions 1 to 6 are pgrace's answers on 2026-11-03. The rest are Claude's, each marked **(decided by Claude)**.
 
-1. **Exposure: public, keys only (pgrace).** `https://okf-mcp.k.vsix.me`, through ingress-nginx with a `letsencrypt-prod` certificate, as the autobots API is. `*.k.vsix.me` is a wildcard that already resolves to the ingress, so no DNS change is needed. Every route but `/healthz` needs a bearer key (M4). `/healthz` names no catalog (a count only), no secret and no internal host: its `clock` carries only coarse fields (Decision 7). `allowed_hosts` is `["okf-mcp.k.vsix.me"]`.
+1. **Exposure: public, keys only (pgrace).** `https://okf-mcp.example.com`, through ingress-nginx with a `letsencrypt-prod` certificate, as the autobots API is. `*.example.com` is a wildcard that already resolves to the ingress, so no DNS change is needed. Every route but `/healthz` needs a bearer key (M4). `/healthz` names no catalog (a count only), no secret and no internal host: its `clock` carries only coarse fields (Decision 7). `allowed_hosts` is `["okf-mcp.example.com"]`.
 2. **Database: a new CNPG cluster (pgrace).** `okf-mcp-db`, 3 instances, in namespace `okf-mcp`. Its database and owner are `okf_mcp`. `spec.imageName` is the cluster's image-mirror path for the PostgreSQL image, as every CNPG `Cluster` on this cluster must be (the private catalog's CNPG playbook explains why).
 3. **Backups: barman-cloud to Garage (pgrace).**
    - plugin-barman-cloud is the WAL archiver, writing to a bucket of its own with a key allowed only on that bucket. A daily `ScheduledBackup` takes a base backup. Retention is 30 days.
@@ -1950,7 +1950,7 @@ This task changes other systems. Its PR in this repo carries only:
   - **`extsec.pgbackups.yaml`:** `ExternalSecret` to secret `okf-mcp-pgbackups`, with the two keys from Vault's `okf-mcp` entry. Use `sync-wave: "-1"`.
   - **`configmap.yaml`:** `config.toml` with:
     - `listen = "[::]:8080"`;
-    - `allowed_hosts = ["okf-mcp.k.vsix.me"]`;
+    - `allowed_hosts = ["okf-mcp.example.com"]`;
     - `default_catalog = "pg"`;
     - `time_server` = the network's time server name;
     - `session_idle_timeout`, `poll_interval` and `max_import_bytes` at their defaults.
@@ -1961,7 +1961,7 @@ This task changes other systems. Its PR in this repo carries only:
     - the probes and `securityContext` of Decision 10 and `docs/operations.md`;
     - resources: requests `100m`/`256Mi`, limit `1Gi` memory.
   - **`service.yaml`:** ClusterIP, port 8080. No `ipFamilyPolicy`: the cluster forces `RequireDualStack`, and `PreferDualStack` kept the app out of sync (see the correction above).
-  - **`ingress.yaml`:** class `nginx`, `cert-manager.io/cluster-issuer: letsencrypt-prod`, the annotations of Decision 11, host `okf-mcp.k.vsix.me`, TLS secret `okf-mcp-tls`.
+  - **`ingress.yaml`:** class `nginx`, `cert-manager.io/cluster-issuer: letsencrypt-prod`, the annotations of Decision 11, host `okf-mcp.example.com`, TLS secret `okf-mcp-tls`.
   - **`app-okf-mcp.yaml`:** as `app-sish.yaml`, with name and path `okf-mcp` and sync-wave `"20"`. Add it to `kustomizations/kustomization.yaml`.
 
 - [ ] **Step 5: Validate**:
@@ -1976,7 +1976,7 @@ This task changes other systems. Its PR in this repo carries only:
   - **Argo:** the `okf-mcp` app reaches Synced and Healthy.
   - **Database:** `okf-mcp-db` is 3/3 with `ContinuousArchiving` True.
   - **Server:** the pod is Ready, and the certificate is issued.
-  - **`/healthz`:** `curl -s https://okf-mcp.k.vsix.me/healthz` gives `{"database":"ok","catalogs":0,"clock":{...}}`. `clock.ok` is true and `clock.offset_ms` is small. If `clock.ok` is false, read the pod's `warn` line for the cause. If it is DNS, set `time_server` to the address; that value stays in the private ConfigMap and never reaches `/healthz`.
+  - **`/healthz`:** `curl -s https://okf-mcp.example.com/healthz` gives `{"database":"ok","catalogs":0,"clock":{...}}`. `clock.ok` is true and `clock.offset_ms` is small. If `clock.ok` is false, read the pod's `warn` line for the cause. If it is DNS, set `time_server` to the address; that value stays in the private ConfigMap and never reaches `/healthz`.
   - **TLS:** on the database's primary, every `okf_mcp` connection is encrypted: `SELECT bool_and(ssl) FROM pg_stat_ssl JOIN pg_stat_activity USING (pid) WHERE usename = 'okf_mcp'` is true. These are the live server's own sessions, so this proves `PGSSLMODE`/`PGSSLROOTCERT` took effect (no test exercises the environment path). Also confirm the CNPG app secret's `uri` carries no `sslmode` or `sslrootcert`, which would override the environment: check for the parameter names without printing the value.
 
     > **Corrected (issue #143), 2026-11-03.** Brooke's review of PR #150: a URL's `sslmode` overrides `PGSSLMODE`, so the check now names the `uri` and says why the `pg_stat_ssl` query is the proof.
@@ -1993,8 +1993,8 @@ This task changes other systems. Its PR in this repo carries only:
   - **Check:** `/healthz` shows `"catalogs": 1`.
 
 - [ ] **Step 9: An end-to-end check with pgrace's key.**
-  - **Export round trip:** pgrace runs `! curl -sf -H "Authorization: Bearer $OKF_MCP_KEY" https://okf-mcp.k.vsix.me/catalogs/pg/export -o <scratch>/export.tar.gz`. You compare its files with `git archive`'s, byte for byte and mode for mode, as M3's roundtrip test does.
-  - **MCP:** pgrace adds the server to a harness (e.g. `claude mcp add --transport http okf https://okf-mcp.k.vsix.me/mcp --header "Authorization: Bearer ..."`) and runs `list_catalogs` and one `search`.
+  - **Export round trip:** pgrace runs `! curl -sf -H "Authorization: Bearer $OKF_MCP_KEY" https://okf-mcp.example.com/catalogs/pg/export -o <scratch>/export.tar.gz`. You compare its files with `git archive`'s, byte for byte and mode for mode, as M3's roundtrip test does.
+  - **MCP:** pgrace adds the server to a harness (e.g. `claude mcp add --transport http okf https://okf-mcp.example.com/mcp --header "Authorization: Bearer ..."`) and runs `list_catalogs` and one `search`.
   - **Record** what each returned.
 
 - [ ] **Step 10: Record it.**
@@ -2101,4 +2101,4 @@ git commit -m "docs: M7 wrap-up: README, design, milestone changelog (M7.09)" -m
   - `ClockStatus`, `check_once`, `CHECK_INTERVAL`, `QUERY_TIMEOUT`, `MAX_OFFSET_MS` (T3);
   - `App::{clock_status, set_clock_status, check_clock_until}` (T3);
   - the `okf-mcp-db`, `okf-mcp-db-app`, `okf-mcp-db-ca`, `okf-mcp-backup` and `okf-mcp-pgbackups` names (T7, T8).
-- **Nothing site-specific in this file:** no internal address, bucket name, Vault mount or path, registry mirror or policy name. It does name the Vault entry `okf-mcp` and the `ClusterSecretStore` `vault-backend` (verified fact 8): object names, not addresses or secrets. The only site name is the public host `okf-mcp.k.vsix.me`, which Decision 1 makes public anyway.
+- **Nothing site-specific in this file:** no internal address, bucket name, Vault mount or path, registry mirror or policy name. It does name the Vault entry `okf-mcp` and the `ClusterSecretStore` `vault-backend` (verified fact 8): object names, not addresses or secrets. The only site name is the public host `okf-mcp.example.com`, which Decision 1 makes public anyway.

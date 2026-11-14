@@ -21,8 +21,7 @@ entitlements, OAuth consent as the signed-in user, and mail through a job
 queue in Postgres (`docs/operations.md`, "Signing in and self-service";
 design: `docs/superpowers/specs/2026-11-12-okf-user-login-design.md`).
 
-Deployed: `https://okf-mcp.k.vsix.me` (every route but `/healthz` needs a
-bearer key), from the image `ghcr.io/hypotheosis/okf-mcp`, with its database
+Deployed (every route but `/healthz` needs a bearer key) from the image `ghcr.io/hypotheosis/okf-mcp`, with its database
 backed up continuously and a restore drill done.
 
 The library reads a catalog into an in-memory `Snapshot` and runs `okf.py`'s
