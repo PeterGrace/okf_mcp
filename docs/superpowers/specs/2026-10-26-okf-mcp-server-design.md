@@ -705,7 +705,7 @@ service. Lint's future-timestamp check keeps `okf.py`'s 2-minute slack. Revision
 
 ## Deployment
 
-The server runs at `https://okf-mcp.k.vsix.me`, behind bearer keys (every route but
+The server runs at `https://okf-mcp.example.com`, behind bearer keys (every route but
 `/healthz`). `docs/operations.md` is the generic operator guide; this section says what
 the deployment is.
 

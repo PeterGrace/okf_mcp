@@ -55,8 +55,11 @@ export async function render(main, rest) {
     let listing;
     try {
         listing = await api.get(`${base(where)}/tree`);
-    } catch {
+    } catch (error) {
         clear(side);
+        // A catalog whose owner team is suspended: say so, and point at
+        // export, which still works.
+        if (error?.body?.error === 'Suspended') showSuspended(view, where.catalog, error.body);
         return;
     }
     clear(side).append(tree(listing.documents, { catalog: where.catalog, selected: `/${where.path}` }));
@@ -70,6 +73,18 @@ export async function render(main, rest) {
     // server sends only the outline, and the heading to scroll to would be
     // missing (every navigation, an outline click included, renders afresh).
     else await showConcept(view, where, where.section !== null);
+}
+
+// A catalog whose owner team is suspended (`body` is the 403's error body:
+// `team` and the operator's `notice`, or null): the notice, and the one
+// thing that still works, export. A missing notice draws no paragraph of
+// "null": every child goes through h() (core/dom.js, issue #302).
+function showSuspended(view, catalog, body) {
+    clear(view).append(h('div', { id: 'browse-suspended', class: 'notice', role: 'status' },
+        h('h2', {}, `${catalog} is unavailable`),
+        h('p', {}, `Its team ${body.team} is suspended.`),
+        body.notice ? h('p', {}, body.notice) : h('p', { class: 'muted' }, 'Ask the server operator for details.'),
+        h('p', {}, h('a', { href: `#/transfer/${enc(catalog)}` }, 'Export a copy'))));
 }
 
 // A folder without index.md: its documents, as links.

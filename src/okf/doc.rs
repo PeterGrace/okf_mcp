@@ -430,8 +430,15 @@ impl Doc {
         }
         let mut spans: Vec<Range<usize>> = Vec::new();
         let mut item_indent: Option<usize> = None;
-        for i in b.start + 1..b.end {
-            let line = &self.frontmatter[i];
+        // `enumerate` before `skip` keeps `i` the line's index in the whole
+        // frontmatter, as the spans below need.
+        for (i, line) in self
+            .frontmatter
+            .iter()
+            .enumerate()
+            .take(b.end)
+            .skip(b.start + 1)
+        {
             let stripped = py_strip(line);
             if stripped.is_empty() || stripped.starts_with('#') {
                 continue;

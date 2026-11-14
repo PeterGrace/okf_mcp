@@ -152,7 +152,9 @@ impl ToolContext {
     ///
     /// # Errors
     /// [`OkfError::CatalogNotSelected`] naming the first listed catalog that
-    /// does not exist or that the key does not reach.
+    /// does not exist or that the key does not reach; then
+    /// [`OkfError::Suspended`] when every listed catalog is suspended (and
+    /// the key is not admin), as [`resolve`] refuses such a list.
     pub fn check_connection(&self) -> Result<(), OkfError> {
         match self.connection.as_deref() {
             // With a list, `select(None)` resolves to exactly that list.
@@ -693,5 +695,144 @@ mod tests {
         );
         assert!(inside.is_ok());
         assert!(require_selected(None, &[]).is_ok());
+    }
+
+    /// Every way a tool picks catalogs through the selection (M13 Task 4):
+    /// `select`, `states`, `read_set`, `one`, `report_catalog`,
+    /// `check_connection` and the `search` tool. Each refuses a named
+    /// suspended catalog, drops it from a connection's list, refuses a list
+    /// of only suspended catalogs, answers `CatalogNotSelected` to a key that
+    /// does not reach it, and leaves an admin alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_selection_path_refuses_or_drops_a_suspended_catalog() {
+        use crate::error::OkfError;
+        use crate::mcp::search::{run, SearchParams};
+        use crate::mcp::testing::{cached_principal, stored_secret, suspend_catalogs};
+        let test = app_with(
+            &[
+                ("pg", &[("a.md", "# Alpha\n")]),
+                ("work", &[("a.md", "# Alpha\n")]),
+            ],
+            Config::default(),
+        )
+        .await;
+        let member = stored_secret(&test, "member", Access::Read, &["pg", "work"], false).await;
+        let stranger = stored_secret(&test, "stranger", Access::Read, &["work"], false).await;
+        let root = stored_secret(&test, "root", Access::Admin, &[], false).await;
+        suspend_catalogs(&test, &["pg"]).await;
+        let on = |secret: &str, connection: Option<&[&str]>| {
+            context(&test, cached_principal(&test, secret), connection)
+        };
+        // Each path's answer for `catalog` (`None`: the connection's list),
+        // as the selected names or the error's kind.
+        async fn paths(ctx: &ToolContext, catalog: Option<&str>) -> Vec<(&'static str, String)> {
+            fn kind(error: OkfError) -> String {
+                error.kind().to_string()
+            }
+            fn named(states: Vec<std::sync::Arc<crate::catalog::CatalogState>>) -> String {
+                names(&states).join(",")
+            }
+            let argument = catalog.map(|name| vec![name.to_string()]);
+            let searched = run(
+                ctx,
+                SearchParams {
+                    query: "alpha".to_string(),
+                    catalogs: argument.clone(),
+                    concept_type: None,
+                    tags: Vec::new(),
+                    status: None,
+                    limit: None,
+                    changeset: None,
+                },
+            )
+            .await
+            .map(|result| {
+                let mut catalogs: Vec<String> =
+                    result.hits.into_iter().map(|hit| hit.catalog).collect();
+                catalogs.dedup();
+                catalogs.join(",")
+            });
+            vec![
+                (
+                    "select",
+                    ctx.select(argument.as_deref())
+                        .map_or_else(kind, |selection| selection.catalogs().join(",")),
+                ),
+                (
+                    "states",
+                    ctx.states(argument.as_deref()).map_or_else(kind, named),
+                ),
+                ("read_set", ctx.read_set(catalog).map_or_else(kind, named)),
+                (
+                    "one",
+                    ctx.one(catalog)
+                        .map_or_else(kind, |state| state.name().to_string()),
+                ),
+                (
+                    "report_catalog",
+                    ctx.report_catalog(catalog, None)
+                        .map_or_else(kind, |state| state.name().to_string()),
+                ),
+                ("search", searched.unwrap_or_else(kind)),
+            ]
+        }
+        // `one` and `report_catalog` answer only the first selected catalog.
+        let expect = |answers: &[(&'static str, String)], want: &str, case: &str| {
+            for (path, answer) in answers {
+                let want = match *path {
+                    "one" | "report_catalog" => want.split(',').next().unwrap_or(want),
+                    _ => want,
+                };
+                assert_eq!(answer, want, "{path}: {case}");
+            }
+        };
+
+        expect(
+            &paths(&on(&member, None), Some("pg")).await,
+            "Suspended",
+            "named",
+        );
+        expect(
+            &paths(&on(&member, Some(&["pg", "work"])), Some("pg")).await,
+            "Suspended",
+            "named on a connection listing it",
+        );
+        expect(
+            &paths(&on(&member, Some(&["pg", "work"])), None).await,
+            "work",
+            "a mixed connection list keeps the active catalog",
+        );
+        expect(
+            &paths(&on(&member, Some(&["pg"])), None).await,
+            "Suspended",
+            "a connection list of only suspended catalogs",
+        );
+        expect(
+            &paths(&on(&stranger, None), Some("pg")).await,
+            "CatalogNotSelected",
+            "a key that does not reach pg never learns it is suspended",
+        );
+        expect(
+            &paths(&on(&root, None), Some("pg")).await,
+            "pg",
+            "an admin, named",
+        );
+        expect(
+            &paths(&on(&root, Some(&["pg", "work"])), None).await,
+            "pg,work",
+            "an admin keeps the whole connection list",
+        );
+        assert!(on(&member, Some(&["pg", "work"]))
+            .check_connection()
+            .is_ok());
+        assert!(matches!(
+            on(&member, Some(&["pg"])).check_connection(),
+            Err(OkfError::Suspended { .. })
+        ));
+        assert!(matches!(
+            on(&stranger, Some(&["pg"])).check_connection(),
+            Err(OkfError::CatalogNotSelected { .. })
+        ));
+        assert!(on(&root, Some(&["pg"])).check_connection().is_ok());
     }
 }

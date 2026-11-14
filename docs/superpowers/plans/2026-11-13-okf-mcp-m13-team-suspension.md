@@ -1183,6 +1183,14 @@ where `catalogs_of` collects each listed changeset's catalog name (use the field
 
 (Test principals are built by hand rather than from the cache, so the test gives one the cache's map, as the cache would.)
 
+> **Corrected (issue #366, 2026-11-13).** `resolve`, `refuse_suspended`, `without_suspended`, the REST search filter, the `list_changesets` filter, `SuspensionInfo` and `CatalogInfo.suspended` shipped as above, and the four selection tests passed as written. Differences:
+> - `CatalogSummary::of(name, state, principal)` takes the caller and fills `suspended` itself (with `.map(SuspensionInfo::from)`; the `From<&SuspendedCatalog>` impl is in `src/mcp/catalogs.rs`), rather than `list_catalogs` setting it after. `POST /api/v1/catalogs`' answer reads `suspended` from `app.keys().suspensions()` after `settle`, so a catalog created for a suspended team is marked (null if that poll failed, until the next).
+> - `ToolContext::check_connection` goes through `select(None)`, so a connection list whose every catalog is suspended is now refused with `Suspended` there too (`list_changesets` without `catalog`, and a changeset handle on such a connection); a mixed list passes.
+> - Step 6's test and Step 5b's use `mcp::testing::{suspend_catalogs, stored_secret, cached_principal}` (Task 3's helpers: `main` or `pg` moved to the suspended team `family`, keys from the cache) instead of suspending `TEST_TEAM` and building principals by hand. Step 5b's test is `mcp::changesets::suspension_tests::list_changesets_leaves_a_suspended_catalog_out_but_to_an_admin`, and also covers a connection list of only suspended catalogs, an unreached key (`CatalogNotSelected`), an admin and the lift.
+> - Added for the whole class (each path refuses a named suspended catalog, drops it from a connection's list, answers `CatalogNotSelected` to a key that does not reach it, and leaves an admin alone): `selection::tests::{an_unreached_suspended_catalog_is_not_selected_rather_than_suspended, an_admin_selects_suspended_catalogs}`; `mcp::context::tests::every_selection_path_refuses_or_drops_a_suspended_catalog` (`select`, `states`, `read_set`, `one`, `report_catalog`, `check_connection` and the `search` tool); `http::api::browse::tests::every_selection_backed_read_route_refuses_a_suspended_catalog_to_members` (tree, concept, links, history, document, health and the five reports, for keys and a member session); `http::api::search::tests::search_leaves_out_or_refuses_a_suspended_catalog`; `http::api::catalogs::tests::the_list_marks_a_suspended_catalog_and_never_hides_it`; and `http::api::changesets::tests::the_changeset_list_leaves_out_a_suspended_catalog_but_to_an_admin`, which is the REST changeset case Step 5b gave Task 5 (Task 5's member test may keep it or rely on this one).
+> - Tools that select their catalog before checking their own level (`open_changeset`, `maintenance_dispose`, the maintenance work tools) now refuse a suspended catalog at the selection, so a key that reaches it below the level the tool needs gets 403 `Suspended` rather than 403 `Forbidden`. Reach is still checked first, so Decision 2's guarantee holds; Task 3's `http::api::maintenance` test now expects `Suspended` for the read key's disposition.
+> - Searching every reached catalog when every one is suspended falls back to the key's default, as for a key that reaches nothing, and that default is then refused as named (403 `Suspended`).
+
 - [ ] **Step 7: Run, gate, commit**
 
 Run: `tools/agentic/gate.sh narrow --lib selection::tests`, `tools/agentic/gate.sh narrow --lib mcp::catalogs` and `tools/agentic/gate.sh narrow --lib mcp::changesets` (one filter per run), then `tools/agentic/gate.sh test`.
@@ -1362,12 +1370,17 @@ Route, beside the other team routes:
 
 Add the route to the module doc comment's access list ("suspending and lifting a team need an admin key that reaches every catalog").
 
+> **Corrected (issue #367, 2026-11-14).** The view fields, body, handler and route shipped as above (`TeamView.suspended_at` and `suspension_notice`, body `{suspended, notice?}` with `deny_unknown_fields`, answer the team; Tasks 6 and 7 can rely on these names). Differences:
+> - The tests import `axum::http::StatusCode` and `teams::MAX_NOTICE_CHARS` (the test module has no `use super::*`). The route test also checks every key below an every-catalog admin (read, write, scoped admin, stranger) gets 403 `Forbidden` and changed nothing, 422 for an unknown field, 409 `Refused` for a notice over the limit and for one holding a NUL, 404 for an unknown team, and that a repeat suspend keeps `suspended_at` while a blank notice clears the old one. A helper `put_suspension` sends the request.
+> - The member test suspends `TEST_TEAM` through the route (so the listing's team is `TEST_TEAM`, as written), sends no `poll` of its own (the route settles), and also covers search and `GET /api/v1/changesets?catalog=main` (403 `Suspended` with the notice), the unfiltered changeset list (empty), the scoped admin (exempt), and then lifts and checks the member is served again and the listing's `suspended` is null.
+> - `store::teams::find`, `lock_team` and `id_of` refuse a name that is not `[a-z0-9-]+` with `UnknownName` before SQL, so a NUL in a team path (`/teams/a%00b/...`) is a 404, never a 500 (part of #339, for every team route, including this one and the CLI). `a_nul_or_malformed_name_in_a_path_is_a_404_never_a_500` now covers the team routes. Read `src/http/api/people.rs` for the shipped code.
+
 - [ ] **Step 4: Run, gate, commit**
 
 Run the two tests, then `tools/agentic/gate.sh test`.
 
 ```bash
-git add src/http/api/people.rs changelog/
+git add src/http/api/people.rs src/store/teams.rs changelog/
 git commit -m "feat(api): PUT /teams/{name}/suspension; teams show their suspension (M13 task 5)"
 ```
 
@@ -1487,10 +1500,12 @@ Expected: "`okf-mcp team suspend` is not a subcommand"; compile error for the va
 and in the API reference table, after the `DELETE /api/v1/teams/{name}/members/{user}` row:
 
 ```markdown
-| `PUT /api/v1/teams/{name}/suspension` | admin, every catalog | Body `{suspended: bool, notice?}`. `true` suspends the team, or replaces the notice of a suspended one (its `suspended_at` is kept); `false` lifts it (no change when active). Answers the team. Its catalogs then refuse every non-admin credential with 403 `Suspended`, except export. 404 for an unknown team, 409 for a notice over 2000 characters, 422 without `suspended` |
+| `PUT /api/v1/teams/{name}/suspension` | admin, every catalog | Body `{suspended: bool, notice?}`. `true` suspends the team, or replaces the notice of a suspended one (its `suspended_at` is kept); `false` lifts it (no change when active). Answers the team. Its catalogs then refuse every non-admin credential with 403 `Suspended`, except export. 404 for an unknown or malformed team name, 409 for a notice over 2000 characters or holding a NUL, 422 without `suspended` or with an unknown field. *(Corrected, issue #367, 2026-11-14.)* |
 ```
 
 Update the `okf-mcp team list` line's documented columns to include `suspended TIME` (`-` when active).
+
+> **Corrected (issue #368, 2026-11-14).** The subcommands, the `team()` arms, the `format_team` cell, the parity rows and the API row shipped as written (the API row was not yet in `docs/operations.md`; this task added it). Differences: the tests run the commands through the test module's `okf(&db, &[...])` helper, which parses them with clap as the binary does (the module has no `now()` helper), and the list check asserts the exact cell `suspended <the stored since>` rather than `suspended 2026-`, then that the lifted team lists `suspended -`. A second test, `team_suspend_without_a_notice_and_its_refusals`, covers a missing notice, unknown and NUL names for both subcommands (`UnknownName`), and a long or NUL notice (`Refused`, leaving the suspension unchanged). `team_membership_round_trip` expects the new `suspended -` cell. Read `src/cli/people.rs` for the shipped code.
 
 - [ ] **Step 4: Run, gate, commit**
 
@@ -1678,6 +1693,12 @@ function showSuspended(view, catalog, body) {
 ```
 
 
+> **Corrected (issue #369, 2026-11-14).** Steps 3, 5 and 6 shipped as written in substance (Step 3 names its test `generic`; Step 6 adds `role="status"`). Differences:
+> - `core/dom.js`'s `pill` has no `danger` kind (only `ok`, `warn`, `error`, `info`, `muted`), so both "suspended" pills use `error`.
+> - Step 4's section is a function, `suspensionSection(team, refusal)` inside `render` in `pages/teams.js`, and follows `tools/agentic/lessons.md`'s console rules, which the plan's code did not: the Suspend button, the notice and Lift are `guard`ed by the pending-write key `team:<name>:suspension` and the PUT runs under `once`, so they stay disabled while it runs, in a drawer closed and opened again meanwhile too; a refused write shows its reason in `#team-suspension-error` until the next write. To make that work the drawer took `pages/users.js`'s shape: `openDetail(name, ticket, { known, refusal, last })` (was `openDetail(name, known, ticket)`) numbers its reads and draws only the newest, and settles the team (a write's answer or a read) and the users (for Add member) one by one with `Promise.allSettled`: a part that fails is drawn from the last answer with `#team-stale` ("may be out of date"), so the reason and the controls still come back, and a write's answer is never thrown away for a failed users read (PR #384 review); `changed(name, team, { message, refusal })` (was `changed(team, message, ticket)`) redraws whichever drawer shows that team now, through that drawer's own ticket, and the membership controls use it too; it takes the drawer's read number as the write settles, before reading the list again, so an older write whose list read answers late never redraws over a newer one (PR #384 review, journey `an_older_writes_late_list_read_never_redraws_over_a_newer_write`). It takes that number only while the drawer shows that team, so a write of one team never cancels the loading drawer of another (journey `a_write_settling_for_one_team_never_cancels_opening_another`). The list's `load()` numbers its reads as well. The suspended state reads "Suspended since <when>."; the active one says what suspending does. Read `src/http/ui/js/pages/teams.js` for the shipped code.
+> - Step 6's notice uses a `.notice` rule added to `src/http/ui/styles.css` (it existed only in `signin.css`), with `role="status"`.
+> - Step 1's first journey waits for "Suspended since", also checks the catalog pill's `title` is the notice, and checks the stored suspension (no notice) afterwards. The member journey also checks the toast is the 403's own message (not "cannot do this") and follows the link to export a copy. Two more journeys cover the lessons: `a_suspension_write_runs_once_and_settles_in_a_reopened_drawer` (`hold_next`, `click_twice`, a redrawn Lift) and `a_refused_lift_keeps_its_reason_and_a_late_read_never_draws_over_a_newer_one` (`fail_next` on the PUT and the follow-up GET, then `hold_answer` on a refused lift's read that settles after a successful one), and `a_written_suspension_shows_when_reading_the_users_again_fails` (PR #384 review).
+
 - [ ] **Step 7: Run, gate, commit**
 
 Run: `tools/agentic/gate.sh test-ui`, then `tools/agentic/gate.sh lint`.
@@ -1700,9 +1721,17 @@ git commit -m "feat(console): suspend and lift teams; suspended pills and the Br
   - In the error table, a `Suspended` row: 403, when, and its body fields (`catalog`, `team`, `notice`).
   - In the MCP tools table, note `list_catalogs`' `suspended` field; in the API reference, note `GET /api/v1/catalogs`' `suspended` field and `GET /api/v1/teams`' `suspended_at` and `suspension_notice`.
   - In "Upgrades", one line: migration `0011` is additive.
+  - In "Users and teams"' command table, rows for `okf-mcp team suspend NAME [--notice TEXT]` (prints `suspended team NAME`; repeating it replaces the notice and keeps the first time) and `okf-mcp team unsuspend NAME` (prints `lifted the suspension of team NAME`; no change when active). *(Corrected, issue #368, 2026-11-14: Task 6 added the parity rows, the API row and the `team list` column only.)*
 - [ ] **Step 2: `README.md`** status paragraph: "Milestone 13 added team suspension: an operator can suspend a team, whose catalogs then refuse every non-admin credential except export until it is lifted (`docs/operations.md`, "Suspending a team"; design: `docs/superpowers/specs/2026-11-13-okf-team-suspension-design.md`)."
 - [ ] **Step 3: The spec**: add a "What shipped differently" section listing any deviation the tasks recorded (or "None").
 - [ ] **Step 4: The changelog entry** for the milestone, in the format of `changelog/2026-11-13T15-30-24Z-milestone-12-user-login.md`.
+> **Corrected (issue #370, 2026-11-14).** Shipped as above, with these differences:
+> - `docs/operations.md` has no table of error kinds, so the `Suspended` body fields are in the new "Suspending a team" subsection, and the "error table" row is a Troubleshooting row (403 `Suspended`, its fields, export still works, `team unsuspend`).
+> - The MCP tools table is in `README.md` ("Tools"), so `list_catalogs`' `suspended` note is there; the README's "Routes" paragraph also names the 403 `Suspended`, and its command and console summaries name `suspend|unsuspend` and team suspension.
+> - The API reference's endpoint counts went from 87 to 88 and Users and teams from 20 to 21 (Task 5's route; Task 6 added its row but not the counts).
+> - The "Upgrades" line is a bullet that also says `team list`'s display name moved from field 5 to field 6.
+> - Following M12's close-out, Task 8 also wrote its own task changelog (`changelog/<ts>-m13-task-08-docs.md`, same timestamp as the milestone entry). The deferred "provisioner" scope was not filed as an issue: milestone 14's design (PR #375) covers it.
+
 - [ ] **Step 5: Gates and commit**
 
 Run: `tools/agentic/gate.sh fmt`, `tools/agentic/gate.sh lint`, `tools/agentic/gate.sh test`.
@@ -1717,7 +1746,7 @@ git commit -m "docs: team suspension operations, API reference and close-out (M1
 ## Decisions taken while planning (2026-11-13)
 
 1. **Admins are exempt** (`Principal.access == Admin`), including admin console sessions: the operator must still be able to inspect, export and repair a suspended team's catalogs.
-2. **Order of checks:** reach, then level, then suspension. A credential that doesn't reach a catalog never learns it is suspended.
+2. **Order of checks:** reach, then level, then suspension. A credential that doesn't reach a catalog never learns it is suspended. *(Qualified, issue #366, 2026-11-13: `Principal::require` keeps this order; a tool that selects its catalog first refuses a suspended one at the selection, after reach but before the tool's own level check.)*
 3. **Connection lists drop, explicit names refuse.** One suspended team doesn't break a connection that also reads other teams' catalogs, while a call that names a suspended catalog gets a clear `Suspended`.
 4. **The suspension map lives in the key cache**, not in each grant's levels, so lifting a suspension restores every credential exactly as it was, with no recomputation of ceilings.
 5. **Import into a suspended catalog** stays behind `require(Admin, ..)`, so only admins (who are exempt) can import; no special case.

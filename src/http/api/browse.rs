@@ -802,4 +802,73 @@ mod tests {
             "an admin session is exempt: {answer}"
         );
     }
+
+    /// M13 Task 4: the read routes that run a tool through a `ToolContext`
+    /// (browse, health and reports) select their catalog through
+    /// `selection::resolve`, which refuses a suspended one to members, keeps
+    /// it for an admin and answers 404 to a key that does not reach it. The
+    /// same routes on the other team's catalog still answer the member.
+    #[tokio::test]
+    async fn every_selection_backed_read_route_refuses_a_suspended_catalog_to_members() {
+        use crate::http::api::testing::{assert_answers, Browser, Expect, Payload};
+        use crate::mcp::testing::suspend_catalogs;
+        let test = app().await;
+        let keys = keys(&test).await;
+        suspend_catalogs(&test, &["main"]).await;
+        let uris = [
+            "/api/v1/catalogs/main/tree",
+            "/api/v1/catalogs/main/concepts/systems/alpha.md",
+            "/api/v1/catalogs/main/links/systems/alpha.md",
+            "/api/v1/catalogs/main/history/systems/alpha.md",
+            "/api/v1/catalogs/main/documents/systems/index.md",
+            "/api/v1/catalogs/main/health",
+            "/api/v1/catalogs/main/reports/lint",
+            "/api/v1/catalogs/main/reports/sprawl",
+            "/api/v1/catalogs/main/reports/links",
+            "/api/v1/catalogs/main/reports/oldest",
+            "/api/v1/catalogs/main/reports/questions",
+        ];
+        let mut expected = Vec::new();
+        for uri in uris {
+            let expect = |who, key, status, error| Expect {
+                method: "GET",
+                uri,
+                body: None,
+                key,
+                who,
+                status,
+                error,
+            };
+            expected.extend([
+                expect("read", &keys.read, 403, Some("Suspended")),
+                expect("write", &keys.write, 403, Some("Suspended")),
+                expect("stranger", &keys.stranger, 404, Some("CatalogNotSelected")),
+                expect("admin", &keys.admin, 200, None),
+            ]);
+        }
+
+        assert_answers(&test, &expected).await;
+
+        // The fixture user's session reaches `main` (suspended) and `other`
+        // (its personal team, still active).
+        let mut member = Browser::session_for(&test, crate::db::TEST_USER).await;
+        for uri in uris {
+            let (refused, why) = member.send(&test, "GET", uri, Payload::Empty).await.parts();
+            assert_eq!(refused.as_u16(), 403, "{uri} as the member session: {why}");
+            assert_eq!(why["error"], "Suspended", "{uri}");
+            // `other` holds only a non-concept `index.md`, so the concept
+            // routes are not repeated there.
+            if uri.contains("systems/alpha.md") {
+                continue;
+            }
+            let elsewhere = uri
+                .replace("/main/", "/other/")
+                .replace("systems/index.md", "index.md");
+            let (active, body) = member
+                .send(&test, "GET", &elsewhere, Payload::Empty)
+                .await
+                .parts();
+            assert_eq!(active.as_u16(), 200, "{elsewhere} still answers: {body}");
+        }
+    }
 }

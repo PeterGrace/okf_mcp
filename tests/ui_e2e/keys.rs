@@ -452,3 +452,126 @@ async fn a_late_assign_never_replaces_a_newer_drawer_or_reopens_a_dismissed_one(
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_assigned_user_shows_when_reading_the_users_again_fails() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    server.key("alpha", Access::Read, &["main"], None).await;
+    alice(&server).await;
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        ui.click("[data-test=key-alpha]");
+        ui.wait_text("#drawer-title", "alpha");
+        // The assign succeeds, and the users read for the redrawn drawer
+        // fails: the drawer still shows the user the PUT answered.
+        ui.select("#key-user-select", "alice");
+        ui.fail_next("GET", "/api/v1/users", 503, "the server is unavailable");
+        ui.click("#key-assign");
+        ui.wait_text("#toasts", "alpha now belongs to alice");
+        ui.wait_text("#drawer dl.facts", "alice");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let keys = key_rows::list(&server.db.pool).await.expect("list keys");
+    let user = keys
+        .iter()
+        .find(|key| key.name == "alpha")
+        .and_then(|key| key.user.clone());
+    assert_eq!(user.as_deref(), Some("alice"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_writes_late_table_read_never_redraws_over_a_newer_write() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    server.key("alpha", Access::Read, &["main"], None).await;
+    alice(&server).await;
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        ui.click("[data-test=key-alpha]");
+        ui.wait_text("#drawer-title", "alpha");
+        // Reporting is enabled; the table read after it answers late.
+        ui.hold_answer("GET", "/api/v1/keys", || ui.click("#key-report-toggle"));
+        ui.wait_text("#toasts", "alpha may now report");
+        // Meanwhile alpha is given to alice in the same drawer, and drawn.
+        ui.select("#key-user-select", "alice");
+        ui.click("#key-assign");
+        ui.wait_text("#toasts", "alpha now belongs to alice");
+        ui.wait_text("#drawer dl.facts", "alice");
+        // The older write's late table answer must not redraw its answer
+        // (no user change) over the newer one.
+        ui.release_held();
+        let facts = ui.text("#drawer dl.facts");
+        assert!(
+            facts.contains("alice"),
+            "the older write redrew the drawer: {facts}"
+        );
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let keys = key_rows::list(&server.db.pool).await.expect("list keys");
+    let alpha = keys
+        .iter()
+        .find(|key| key.name == "alpha")
+        .expect("alpha is stored");
+    assert_eq!(alpha.user.as_deref(), Some("alice"));
+    assert!(alpha.maintenance_report);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_settling_for_one_key_never_cancels_opening_another() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    server.key("alpha", Access::Read, &["main"], None).await;
+    server.key("bravo", Access::Read, &["main"], None).await;
+    alice(&server).await;
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        ui.click("[data-test=key-alpha]");
+        ui.wait_text("#drawer-title", "alpha");
+        // alpha's assign is held; its drawer is closed, and bravo's drawer
+        // is asked for with its users read held too.
+        ui.select("#key-user-select", "alice");
+        ui.hold_next("PUT", "/user");
+        ui.click("#key-assign");
+        ui.eval(
+            "() => { window.releaseFirst = window.releaseHeld; }",
+            serde_json::json!(null),
+        );
+        ui.click("#drawer-close");
+        ui.wait_hidden("#drawer");
+        ui.hold_next("GET", "/api/v1/users");
+        ui.click("[data-test=key-bravo]");
+        // alpha's assign settles first, then bravo's read answers: bravo
+        // opens.
+        ui.eval("() => window.releaseFirst()", serde_json::json!(null));
+        ui.wait_text("#toasts", "alpha now belongs to alice");
+        ui.release_held();
+        ui.wait_visible("#drawer");
+        ui.wait_text("#drawer-title", "bravo");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let keys = key_rows::list(&server.db.pool).await.expect("list keys");
+    let alpha = keys
+        .iter()
+        .find(|key| key.name == "alpha")
+        .expect("alpha is stored");
+    assert_eq!(alpha.user.as_deref(), Some("alice"));
+}

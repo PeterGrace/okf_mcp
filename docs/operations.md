@@ -709,11 +709,13 @@ takes effect at once.
 | `okf-mcp user revoke-sessions NAME` | Signs the user out of every console session; keys and grants keep working. Prints `revoked N sessions of NAME` |
 | `okf-mcp user sign-ins NAME [--limit N]` | The user's recent sign-in attempts (20 by default), newest first: time, method, outcome, `ip A` |
 | `okf-mcp team create NAME [--display-name TEXT] --owner USER` | Creates a shared team with `USER` as its first owner |
-| `okf-mcp team list` | One line per team: name, `personal U` (`-` for a shared team), `members u(role),...`, `catalogs c,...` (`-` for none), then the display name |
+| `okf-mcp team list` | One line per team: name, `personal U` (`-` for a shared team), `members u(role),...`, `catalogs c,...` (`-` for none), `suspended TIME` (`-` when active), then the display name |
 | `okf-mcp team add-member TEAM USER [--role owner\|member]` | Adds a member (`member` by default), or gives a member that role |
 | `okf-mcp team set-role TEAM USER --role owner\|member` | Changes a member's role, adding the user if it is not a member |
 | `okf-mcp team remove-member TEAM USER` | Removes a member |
 | `okf-mcp team delete NAME` | Deletes a shared team that owns no catalog; its memberships go with it |
+| `okf-mcp team suspend NAME [--notice TEXT]` | Suspends the team: its catalogs refuse every non-admin credential except export (see [Suspending a team](#suspending-a-team)). Prints `suspended team NAME`. Repeating it replaces the notice (none when `--notice` is left out) and keeps the first suspension time |
+| `okf-mcp team unsuspend NAME` | Lifts the suspension. Prints `lifted the suspension of team NAME`; no change when the team is active |
 | `okf-mcp catalog create NAME --owner TEAM [--description TEXT]` | `--owner` is required |
 | `okf-mcp catalog set-owner NAME --team TEAM` | Moves a catalog to another team, or gives a legacy catalog its first owner. Prints `catalog C: owner OLD -> NEW` (`(none)` for a legacy catalog) |
 | `okf-mcp catalog set-member-access NAME --access none\|read\|write` | What members of the owner team reach through their own keys and grants (default `write`). Prints `catalog C: member access OLD -> NEW` |
@@ -807,6 +809,82 @@ it. A create body without its required `user` or `owner` is a 422; on the
 command line a missing `--user` or `--owner` is clap's usage error (exit 2).
 Disabling a user or team instead of deleting it is future work (#297).
 
+### Suspending a team
+
+Suspending a team stops every catalog it owns from answering its members,
+through MCP, the REST API and the console, until the suspension is lifted.
+Nothing is deleted or changed: documents, history, open changesets, keys,
+grants and memberships all stay, and lifting the suspension restores every
+credential exactly as it was. okf-mcp records no reason; the optional
+**notice** (at most 2000 characters) is what members are told.
+
+```sh
+okf-mcp team suspend family --notice "Paused while the account is reviewed."
+okf-mcp team list             # family ... suspended 2026-11-13T12:00:00Z ...
+okf-mcp team unsuspend family
+```
+
+Over REST it is `PUT /api/v1/teams/{name}/suspension` with
+`{"suspended": true, "notice": "..."}` or `{"suspended": false}` (the
+[API reference](#users-and-teams-api) has the details); in the console,
+Teams → a team → Suspension → Suspend, or Lift suspension. The route and the
+console need an admin that reaches every catalog, as the other team writes
+do; the command line needs only the database, as every subcommand does.
+
+- **What it refuses.** Every read and write of the team's catalogs by a
+  non-admin credential (API keys, OAuth grants and console sessions, whoever
+  issued them): every MCP tool but `list_catalogs`, changeset writes and
+  publish, the
+  maintenance tools, and the `/api/v1` browse, search, history, health,
+  report, changeset and maintenance routes. The answer is 403 with
+  `{"error": "Suspended", "message", "catalog", "team", "notice"}`
+  (`notice` is `null` when there is none); the message names the catalog
+  and the team and ends with the notice.
+- **What stays open.** **Export** (`GET /catalogs/{name}/export` and
+  `GET /api/v1/catalogs/{name}/export`) for any credential that reaches the
+  catalog, so members can take a copy. Console sign-in. **Listing:**
+  `list_catalogs` and `GET /api/v1/catalogs` still show the catalog, with
+  `suspended` set to `{"team", "notice"}` (null for an active catalog), and
+  `GET /api/v1/me`'s ceiling is unchanged. In the console the team and its
+  catalogs carry a "suspended" pill, Browse shows the notice with a link to
+  Import & export, and the 403 shows its own message.
+- **Admins are exempt.** An `admin` key, or an admin user's console session,
+  is not affected, so the operator can still inspect, export and repair the
+  catalogs. Import needs `admin` anyway, so only an admin can import into a
+  suspended catalog.
+- **Only credentials that reach the catalog learn of it.** Reach is checked
+  first: a credential that doesn't reach the catalog still gets
+  `CatalogNotSelected` (404), and no listing shows it the catalog. A
+  credential that reaches it below the level a route needs gets `Forbidden`
+  from routes that check the level first, and `Suspended` from tools that
+  select their catalog first (`open_changeset`, the maintenance tools).
+- **Connection lists drop, named catalogs refuse.** A call that names a
+  suspended catalog (an argument, the key's default or the server's
+  `default_catalog`) is refused with `Suspended`. A call that falls back to
+  the connection's list (`X-OKF-Catalogs`) leaves suspended catalogs out and
+  reads the rest, so one suspended team doesn't break a connection that also
+  reads other teams' catalogs; only a list whose every catalog is suspended
+  is refused. `GET /api/v1/search` without `catalogs`, and `list_changesets`
+  (and `GET /api/v1/changesets`) without `catalog`, leave suspended catalogs
+  out the same way.
+- **It follows ownership.** The suspension is the owner team's: a catalog
+  moved to a suspended team (`catalog set-owner`), or created for one, is
+  suspended too, and one moved away is not.
+- **Repeating and lifting.** Suspending a suspended team keeps its first
+  `suspended_at` and replaces the notice (a missing or blank notice clears
+  it). Lifting a team that is not suspended changes nothing. An unknown team
+  is a 404 (`UnknownName`); a notice over 2000 characters or holding a NUL
+  is refused (409 `Refused`, a non-zero exit on the command line), leaving
+  the team as it was. The console can't change a suspended team's notice
+  without lifting it (#361); the CLI and REST can.
+- **Timing.** On the single replica the server runs as, the REST route
+  (which the console uses) polls before answering, so the next request sees
+  the change.
+  If that poll fails the change is still committed and takes effect at the
+  poll loop's next successful pass, within `poll_interval`. The command line
+  writes the database only, so a running server picks it up within
+  `poll_interval`, as for every other `team` command.
+
 ### CLI, API and console parity
 
 Every admin command for users, teams, assignment, sign-in, settings and
@@ -826,6 +904,8 @@ does not document.
 | `okf-mcp team set-role` | `PUT /api/v1/teams/{name}/members/{user}` | Teams → team → a member's role |
 | `okf-mcp team remove-member` | `DELETE /api/v1/teams/{name}/members/{user}` | Teams → team → Remove |
 | `okf-mcp team delete` | `DELETE /api/v1/teams/{name}` | Teams → team → Delete team |
+| `okf-mcp team suspend` | `PUT /api/v1/teams/{name}/suspension` | Teams → team → Suspension → Suspend |
+| `okf-mcp team unsuspend` | `PUT /api/v1/teams/{name}/suspension` | Teams → team → Suspension → Lift suspension |
 | `okf-mcp catalog set-owner` | `PUT /api/v1/catalogs/{catalog}/owner` | Catalogs → catalog → Change owner (Assign when unassigned); Users → What is unassigned |
 | `okf-mcp key assign` | `PUT /api/v1/keys/{id}/user` | API keys → key or grant → Assign / Change user; Users → What is unassigned |
 | `okf-mcp oauth code assign` | `PUT /api/v1/oauth/codes/{id}/user` | API keys → sign-in code → Assign / Change user; Users → What is unassigned |
@@ -1789,11 +1869,11 @@ admin routes (403).
 
 ### API reference
 
-The API has 87 endpoints (a method and path each). The identity endpoints
+The API has 88 endpoints (a method and path each). The identity endpoints
 are below (3), and each area's endpoints are in its own subsection:
 [API keys](#api-keys) (7),
 [OAuth sign-in codes](#oauth-sign-in-codes) (4),
-[Users and teams](#users-and-teams-api) (20),
+[Users and teams](#users-and-teams-api) (21),
 [Your account](#your-account-api) (19),
 [Settings and mail](#settings-and-mail-api) (7),
 [Health](#health) (2), [Browse and search](#browse-and-search) (7),
@@ -1916,12 +1996,13 @@ admin). Every change takes effect at once. A refusal under the
 | `DELETE /api/v1/users/{name}/sessions` | admin, every catalog | Signs the user out of every console session (keys and grants keep working); answers `{name, revoked}` |
 | `DELETE /api/v1/users/{name}/sessions/{id_prefix}` | admin, every catalog | Signs one session out; 204. 404 for a malformed prefix or one that matches none of the user's sessions, 409 for one that matches several (none is ended) |
 | `GET /api/v1/users/{name}/sign-ins` | admin | `{sign_ins}`, newest first (at most 50): `method`, `outcome`, `ip`, `at` |
-| `GET /api/v1/teams` | admin | `{teams}`, by name: `name`, `display_name`, `personal_of` (the user whose personal team it is, or `null`), `created_at`, `members` (`[{user, role}]`, by user), `catalogs` (the names it owns) |
+| `GET /api/v1/teams` | admin | `{teams}`, by name: `name`, `display_name`, `personal_of` (the user whose personal team it is, or `null`), `created_at`, `members` (`[{user, role}]`, by user), `catalogs` (the names it owns), `suspended_at` (when it was suspended, `null` while active) and `suspension_notice` (`null` when there is none; see [Suspending a team](#suspending-a-team)) |
 | `POST /api/v1/teams` | admin, every catalog | Body `{name, display_name, owner}` (`owner` required: the first owner's user name). 201 with the team. 404 for an unknown owner, 409 for an invalid or taken name, 422 without `owner` |
 | `GET /api/v1/teams/{name}` | admin | The team, as in the list |
 | `DELETE /api/v1/teams/{name}` | admin, every catalog | Deletes a shared team that owns no catalog; 204. 409 for a personal team or one that owns a catalog |
 | `PUT /api/v1/teams/{name}/members/{user}` | admin, every catalog | Body `{role: "owner"\|"member"}`. Adds the user, or gives a member that role; answers `{change: "added"\|"role_changed"\|"unchanged", team}`. 409 for demoting the last owner, 422 for a missing or unknown `role` |
 | `DELETE /api/v1/teams/{name}/members/{user}` | admin, every catalog | Removes a member; answers the team. 409 for a non-member, the last owner, or a personal team's user |
+| `PUT /api/v1/teams/{name}/suspension` | admin, every catalog | Body `{suspended: bool, notice?}`. `true` suspends the team, or replaces the notice of a suspended one (its `suspended_at` is kept); `false` lifts it (no change when active). Answers the team. Its catalogs then refuse every non-admin credential with 403 `Suspended`, except export. 404 for an unknown or malformed team name, 409 for a notice over 2000 characters or holding a NUL, 422 without `suspended` or with an unknown field |
 | `GET /api/v1/unassigned` | admin, every catalog | `{keys, codes, catalogs}`: the keys and grants (live and revoked) and codes with no user, as in their own lists, and the names of the catalogs with no owner |
 
 ```sh
@@ -2048,7 +2129,7 @@ curl -s -H "Authorization: Bearer $OKF_MCP_KEY" \
 
 | Method and path | Key | Does |
 |---|---|---|
-| `GET /api/v1/catalogs` | any | The catalogs the key reaches, by name: `name`, `description`, `owner_team` (`null` when unassigned), `files`, `concepts`, `generation` (of the loaded snapshot, what `expect_generation` compares against) and `last_change` (`null` when empty) |
+| `GET /api/v1/catalogs` | any | The catalogs the key reaches, by name: `name`, `description`, `owner_team` (`null` when unassigned), `files`, `concepts`, `generation` (of the loaded snapshot, what `expect_generation` compares against), `last_change` (`null` when empty) and `suspended` (`{team, notice}` while its owner team is suspended, otherwise `null`: a suspended catalog is listed, never hidden; see [Suspending a team](#suspending-a-team)) |
 | `POST /api/v1/catalogs` | admin, every catalog | `{name, description, owner}` (`description` optional; `owner` required, a team's name). 201 with the new catalog's summary; 403 for a key granted named catalogs, since it would not reach the new one; 404 for an unknown owner; 409 for an invalid or taken name; 422 without `owner` |
 | `PATCH /api/v1/catalogs/{catalog}` | admin | `{description}`. Answers `{name, previous, description}` |
 | `PUT /api/v1/catalogs/{catalog}/owner` | admin, every catalog | `{team}`. Makes the team the owner; answers `{name, previous, owner_team}` (`previous` is `null` for a legacy catalog). 404 for an unknown catalog or team, 422 without `team`. Ownership grants no access |
@@ -2525,6 +2606,15 @@ take the server out of service. Alert on the `error` log line, not on
   `/auth/passkey/*` and `/auth/oidc/*`; a proxy that routes only some paths
   must pass them. Then follow
   [Rollout](#rollout) to give the first admin a sign-in.
+- **Team suspension (the first release after 0.15.0)** adds migration
+  `0011_team_suspension.sql`, which only adds two nullable columns to
+  `teams` (`suspended_at`, `suspension_notice`): every team stays active and
+  nothing else changes until an admin suspends one. An older binary refuses
+  the migrated database. `GET /api/v1/teams`, `GET /api/v1/catalogs` and
+  `list_catalogs` gain fields, and `okf-mcp team list` a `suspended` cell
+  before the display name, so a script that reads that listing by position
+  (`cut -f`) takes the display name from field 6, not 5
+  ([Suspending a team](#suspending-a-team)).
 
 ### Preparing and shipping a release
 
@@ -2793,6 +2883,7 @@ curl -sf -H "Authorization: Bearer $OKF_MCP_KEY" -o notes.tar.gz \
 | 403 on every `/mcp` request through the ingress | The `Host` is not in `allowed_hosts` (rmcp's DNS-rebinding check). Add the public host name and restart the pod |
 | 404 on `/mcp` with "Session not found" | The `Mcp-Session-Id` was opened by another key, idled out past `session_idle_timeout`, or predates a restart. Reconnect with the key that opened it |
 | A tool returns `UnknownChangeset`, or `Refused` naming a closed changeset ("is published", "is discarded", "was published or discarded while this write waited", "is no longer open") | `UnknownChangeset`: the handle is mistyped or belongs to another key (only its key, and an `admin` that reaches its catalog, may use it). `Refused`: its changeset is closed, by `publish`, by `discard`, or by the prune of changesets left empty for 24 hours, possibly while the call waited for it. `list_changesets` lists the open handles the key may use; otherwise call `open_changeset` |
+| A tool or `/api/v1` route returns 403 `Suspended` | The catalog's owner team is suspended (the body names the `catalog`, the `team` and the operator's `notice`). Export still works. An admin lifts it with `okf-mcp team unsuspend TEAM` ([Suspending a team](#suspending-a-team)) |
 | A tool returns `CatalogNotSelected` or `Forbidden` | The key is not granted that catalog, or its access level is too low (a `read` key calling a write tool). `okf-mcp key grant`, or a key with more access |
 | 404 on an archive route | The catalog doesn't exist or the key isn't granted it (never 403, so a key can't probe which catalogs exist) |
 | 403 on an archive route | The key reaches the catalog but its level is too low: import needs `admin` |

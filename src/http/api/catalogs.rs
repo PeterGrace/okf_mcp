@@ -19,6 +19,7 @@ use crate::catalog::CatalogState;
 use crate::clock::format_timestamp;
 use crate::error::OkfError;
 use crate::http::{archives, AppError};
+use crate::mcp::catalogs::SuspensionInfo;
 use crate::store::catalogs as catalog_rows;
 use crate::store::ceiling::{self, MemberAccess};
 use crate::store::keys::Access;
@@ -67,15 +68,20 @@ pub(crate) struct CatalogSummary {
     pub generation: i64,
     /// Its newest change (`2026-11-02T21:00:00Z`), or null when empty.
     pub last_change: Option<String>,
+    /// Set when its owner team is suspended (M13): `{"team", "notice"}`;
+    /// null for an active catalog.
+    pub suspended: Option<SuspensionInfo>,
 }
 
 impl CatalogSummary {
-    /// The summary of one loaded catalog.
+    /// The summary of one loaded catalog, as `principal` sees it.
     ///
     /// # Arguments
     /// * `name` - its name.
     /// * `state` - its state.
-    fn of(name: &str, state: &CatalogState) -> Self {
+    /// * `principal` - the caller, which must reach the catalog (its
+    ///   suspension is shown only to those who do).
+    fn of(name: &str, state: &CatalogState, principal: &Principal) -> Self {
         // `current()` is an `Arc` of the loaded snapshot: one consistent
         // generation, file count and concept count.
         let loaded = state.current();
@@ -88,6 +94,7 @@ impl CatalogSummary {
             concepts: loaded.snapshot().concepts().count(),
             generation: loaded.generation(),
             last_change: loaded.last_change().map(format_timestamp),
+            suspended: principal.suspension(name).map(SuspensionInfo::from),
         }
     }
 }
@@ -179,7 +186,7 @@ async fn list_catalogs(
     let catalogs = loaded
         .iter()
         .filter(|(name, _)| principal.reaches(name))
-        .map(|(name, state)| CatalogSummary::of(name, state))
+        .map(|(name, state)| CatalogSummary::of(name, state, &principal))
         .collect();
     Ok(Json(CatalogListing { catalogs }))
 }
@@ -215,6 +222,14 @@ async fn create_catalog(
     tracing::info!(catalog = %row.name, key = %principal.key_id, actor = %principal.actor,
                    "catalog created");
     settle(&app).await;
+    // The owner may be a suspended team. Creating bumps the admin generation,
+    // so the poll `settle` ran reloaded the cache's suspension map; if that
+    // poll failed, this reads null until the next one, as for every team write.
+    let suspended = app
+        .keys()
+        .suspensions()
+        .get(&row.name)
+        .map(SuspensionInfo::from);
     // Built from the row, not the loaded state: a new catalog is empty, and
     // the answer must not depend on the poll having loaded it.
     let summary = CatalogSummary {
@@ -225,6 +240,7 @@ async fn create_catalog(
         concepts: 0,
         generation: row.generation,
         last_change: None,
+        suspended,
     };
     Ok((StatusCode::CREATED, Json(summary)))
 }
@@ -685,6 +701,70 @@ mod tests {
         assert_eq!(main["generation"], generation);
         assert!(main["last_change"].is_string());
         assert_eq!(names(&test, &keys.stranger).await, ["other"]);
+    }
+
+    /// M13 Task 4: the listing marks a suspended catalog rather than
+    /// hiding it, to every key that reaches it, and a catalog created for a
+    /// suspended team is marked in the answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_list_marks_a_suspended_catalog_and_never_hides_it() {
+        use crate::mcp::testing::{suspend_catalogs, SUSPENDED_TEAM, SUSPENSION_NOTICE};
+        let test = app().await;
+        let keys = keys(&test).await;
+        let root = every_catalog_admin(&test).await;
+        suspend_catalogs(&test, &["main"]).await;
+        let listed = |body: &serde_json::Value, name: &str| -> serde_json::Value {
+            body["catalogs"]
+                .as_array()
+                .expect("a list")
+                .iter()
+                .find(|catalog| catalog["name"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} in {body}"))
+        };
+        let marked = json!({ "team": SUSPENDED_TEAM, "notice": SUSPENSION_NOTICE });
+
+        let (_, readers) = send(&test, "GET", "/api/v1/catalogs", Some(&keys.read), None).await;
+        let (_, roots) = send(&test, "GET", "/api/v1/catalogs", Some(&root), None).await;
+        let (_, strangers) =
+            send(&test, "GET", "/api/v1/catalogs", Some(&keys.stranger), None).await;
+        let (created, in_suspended) = send(
+            &test,
+            "POST",
+            "/api/v1/catalogs",
+            Some(&root),
+            Some(json!({ "name": "paused", "owner": SUSPENDED_TEAM })),
+        )
+        .await;
+        let (_, in_active) = send(
+            &test,
+            "POST",
+            "/api/v1/catalogs",
+            Some(&root),
+            Some(json!({ "name": "active", "owner": TEST_TEAM })),
+        )
+        .await;
+
+        assert_eq!(listed(&readers, "main")["suspended"], marked);
+        assert_eq!(
+            listed(&roots, "main")["suspended"],
+            marked,
+            "an admin sees it too"
+        );
+        // `get`, not `[]`: a missing key would read as null too.
+        assert_eq!(
+            listed(&roots, "other").get("suspended"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(names(&test, &keys.stranger).await, ["other"]);
+        assert_eq!(
+            listed(&strangers, "other").get("suspended"),
+            Some(&serde_json::Value::Null),
+            "a key that does not reach main never learns it is suspended"
+        );
+        assert_eq!(created, StatusCode::CREATED, "{in_suspended}");
+        assert_eq!(in_suspended["suspended"]["team"], SUSPENDED_TEAM);
+        assert_eq!(in_active.get("suspended"), Some(&serde_json::Value::Null));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -47,7 +47,7 @@
 
 **Files:** Under `/home/pgrace/repos/argo2025/kustomizations/okf-mcp`, create `maintenance-cronjob.yaml`, `maintenance-configmap.yaml`, `maintenance-pvc.yaml`, `maintenance-externalsecret.yaml`, `README.maintenance.md`; modify existing `kustomization.yaml`. Add focused local validation test/script for these resources without modifying unrelated repository-wide policies.
 
-**Interfaces:** Consume Task 1 image/paths/UID. Config path `/etc/okf-maintenance/config.toml`; journal `/var/lib/okf-maintenance/journal`; persistent mount ancestor `/var/lib/okf-maintenance`; endpoint `https://okf-mcp.k.vsix.me/mcp`, catalog `pg`. ConfigMap/Secret/PVC resources named `okf-maintenance-config`, `okf-maintenance-credentials`, `okf-maintenance-state`. CronJob `okf-maintenance`.
+**Interfaces:** Consume Task 1 image/paths/UID. Config path `/etc/okf-maintenance/config.toml`; journal `/var/lib/okf-maintenance/journal`; persistent mount ancestor `/var/lib/okf-maintenance`; endpoint `https://okf-mcp.example.com/mcp`, catalog `pg`. ConfigMap/Secret/PVC resources named `okf-maintenance-config`, `okf-maintenance-credentials`, `okf-maintenance-state`. CronJob `okf-maintenance`.
 
 - [ ] Write offline rendered-manifest assertions for all global limits, false consents, suspension, named credential references (not values), protected persistent storage, no service-account token/fsGroup, non-root/read-only main, temporary writable /tmp, version alignment, and unchanged server resources.
 - [ ] Run before manifests exist and record missing-resource failure.

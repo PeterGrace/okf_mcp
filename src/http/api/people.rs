@@ -6,7 +6,9 @@
 //! Access (plan Decision 3):
 //! - creating, deleting and changing users, teams and memberships, and
 //!   listing what is unassigned, need an admin key that reaches every
-//!   catalog: users and teams are not catalog-scoped;
+//!   catalog: users and teams are not catalog-scoped; so do suspending a
+//!   team and lifting its suspension (`PUT /teams/{name}/suspension`,
+//!   milestone 13);
 //! - listing and reading users and teams needs any admin key, so a scoped
 //!   admin can pick the user of a key it creates;
 //! - a user's detail shows only the keys, grants and codes the caller
@@ -208,6 +210,10 @@ pub(crate) struct TeamView {
     pub members: Vec<MemberView>,
     /// The catalogs it owns, sorted.
     pub catalogs: Vec<String>,
+    /// When it was suspended; null while active.
+    pub suspended_at: Option<String>,
+    /// The notice its members see; null without one (or while active).
+    pub suspension_notice: Option<String>,
 }
 
 impl From<TeamRecord> for TeamView {
@@ -219,10 +225,7 @@ impl From<TeamRecord> for TeamView {
             created_at,
             members,
             catalogs,
-            // Not shown yet: Task 5 of milestone 13 adds it to the view.
-            // `_` ignores the field; naming it keeps this pattern exhaustive,
-            // so a new `TeamRecord` field is still a compile error here.
-            suspension: _,
+            suspension,
         } = record;
         Self {
             name,
@@ -237,6 +240,12 @@ impl From<TeamRecord> for TeamView {
                 })
                 .collect(),
             catalogs,
+            // `as_ref` borrows inside the `Option`, so the second field can
+            // still take the notice out of it by value.
+            suspended_at: suspension
+                .as_ref()
+                .map(|suspended| format_timestamp(suspended.since)),
+            suspension_notice: suspension.and_then(|suspended| suspended.notice),
         }
     }
 }
@@ -292,6 +301,18 @@ struct CreateTeamBody {
     display_name: String,
     /// The user who is its first owner (required; must exist).
     owner: String,
+}
+
+/// `PUT /teams/{name}/suspension`'s body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuspensionBody {
+    /// `true` suspends (or replaces the notice); `false` lifts.
+    suspended: bool,
+    /// What members are told; blank or left out for none; ignored when
+    /// lifting.
+    #[serde(default)]
+    notice: Option<String>,
 }
 
 /// `PUT /teams/{name}/members/{user}`'s body.
@@ -355,6 +376,7 @@ pub(crate) fn routes() -> Router<Arc<App>> {
             "/teams/{name}/members/{user}",
             put(set_member).delete(remove_member),
         )
+        .route("/teams/{name}/suspension", put(set_suspension))
         .route("/unassigned", get(list_unassigned))
 }
 
@@ -795,6 +817,37 @@ async fn remove_member(
     Ok(Json(teams::find(app.pool(), &team).await?.into()))
 }
 
+/// `PUT /teams/{name}/suspension`: suspends the team (or replaces its
+/// notice, keeping the first suspension time), or lifts its suspension.
+/// Polls before answering, so when that poll succeeds the next request is
+/// refused (or served again). A failed poll is logged, not returned (see
+/// `settle`): the committed change then takes effect at the poll loop's next
+/// successful pass.
+///
+/// # Returns
+/// The team as it now is.
+///
+/// # Errors
+/// 403 unless the key is an admin reaching every catalog; 404 for an unknown
+/// or malformed team name; 409 for a notice over 2000 characters or holding
+/// a NUL; 422 for a body without `suspended` or with an unknown field; 500
+/// for a database failure.
+async fn set_suspension(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Arc<Principal>>,
+    Path(name): Path<String>,
+    Json(body): Json<SuspensionBody>,
+) -> Result<Json<TeamView>, AppError> {
+    require_every_catalog(&principal)?;
+    let team = if body.suspended {
+        teams::suspend(app.pool(), &name, body.notice.as_deref(), app.clock().now()).await?
+    } else {
+        teams::unsuspend(app.pool(), &name).await?
+    };
+    settle(&app).await;
+    Ok(Json(team.into()))
+}
+
 /// `GET /unassigned`: every key, grant, code and catalog without a user or
 /// owner. Unfiltered, so it needs a key that manages all of them.
 ///
@@ -821,6 +874,7 @@ async fn list_unassigned(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
     use chrono::{TimeDelta, Utc};
     use serde_json::json;
 
@@ -836,6 +890,7 @@ mod tests {
     use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
     use crate::store::oauth::codes::{self, NewSignInCode};
     use crate::store::sign_in_events::{self, Method, Outcome};
+    use crate::store::teams::MAX_NOTICE_CHARS;
     use crate::store::user_sessions::{self, SessionStart};
     use crate::store::users as user_rows;
 
@@ -1534,6 +1589,29 @@ mod tests {
             ("POST", "/api/v1/mail/queue/a%00b/retry".to_string(), None),
             ("DELETE", "/api/v1/mail/queue/a%00b".to_string(), None),
         ]);
+        for team in ["a%00b", "UPPER"] {
+            let base = format!("/api/v1/teams/{team}");
+            routes.extend([
+                ("GET", base.clone(), None),
+                ("DELETE", base.clone(), None),
+                (
+                    "PUT",
+                    format!("{base}/members/alice"),
+                    Some(json!({"role": "member"})),
+                ),
+                ("DELETE", format!("{base}/members/alice"), None),
+                (
+                    "PUT",
+                    format!("{base}/suspension"),
+                    Some(json!({"suspended": true})),
+                ),
+                (
+                    "PUT",
+                    format!("{base}/suspension"),
+                    Some(json!({"suspended": false})),
+                ),
+            ]);
+        }
         user(&test, &root, "alice").await;
 
         for (method, uri, body) in routes {
@@ -2003,5 +2081,196 @@ mod tests {
         assert_eq!(listing["catalogs"][0]["name"], "main");
         assert_eq!(listing["catalogs"][0]["owner_team"], "alice");
         assert_eq!(team["catalogs"], json!(["main"]));
+    }
+
+    /// `PUT /api/v1/teams/{TEST_TEAM}/suspension` with `body` as `key`.
+    async fn put_suspension(
+        test: &TestApp,
+        key: &str,
+        body: serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        let uri = format!("/api/v1/teams/{TEST_TEAM}/suspension");
+        let (status, answer) = send(test, "PUT", &uri, Some(key), Some(body)).await;
+        (status.as_u16(), answer)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suspension_route_suspends_lifts_and_needs_an_every_catalog_admin() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        let scoped = keys(&test).await;
+        let suspend = json!({"suspended": true, "notice": "Contact the operator."});
+        let too_long = "x".repeat(MAX_NOTICE_CHARS + 1);
+
+        let mut denied = Vec::new();
+        for (who, key) in [
+            ("read", &scoped.read),
+            ("write", &scoped.write),
+            ("scoped admin", &scoped.admin),
+            ("stranger", &scoped.stranger),
+        ] {
+            denied.push((who, put_suspension(&test, key, suspend.clone()).await));
+        }
+        let (_, untouched) = send(
+            &test,
+            "GET",
+            &format!("/api/v1/teams/{TEST_TEAM}"),
+            Some(&root),
+            None,
+        )
+        .await;
+        let (missing, _) = put_suspension(&test, &root, json!({"notice": "x"})).await;
+        let (unknown_field, _) =
+            put_suspension(&test, &root, json!({"suspended": true, "reason": "x"})).await;
+        let (long, long_body) =
+            put_suspension(&test, &root, json!({"suspended": true, "notice": too_long})).await;
+        let (nul, nul_body) = put_suspension(
+            &test,
+            &root,
+            json!({"suspended": true, "notice": "a\u{0}b"}),
+        )
+        .await;
+        let (no_team, _) = send(
+            &test,
+            "PUT",
+            "/api/v1/teams/nobody/suspension",
+            Some(&root),
+            Some(suspend.clone()),
+        )
+        .await;
+        let (suspended, team) = put_suspension(&test, &root, suspend.clone()).await;
+        let (again, replaced) =
+            put_suspension(&test, &root, json!({"suspended": true, "notice": "  "})).await;
+        let (lifted, after) = put_suspension(&test, &root, json!({"suspended": false})).await;
+
+        for (who, (status, body)) in denied {
+            assert_eq!(status, 403, "{who}: {body}");
+            assert_eq!(body["error"], "Forbidden", "{who}: {body}");
+        }
+        assert_eq!(
+            untouched.get("suspended_at"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(missing, 422);
+        assert_eq!(unknown_field, 422);
+        assert_eq!(long, 409, "{long_body}");
+        assert_eq!(long_body["error"], "Refused");
+        assert_eq!(
+            nul, 409,
+            "a NUL is refused before SQL, never a 500: {nul_body}"
+        );
+        assert_eq!(no_team.as_u16(), 404);
+        assert_eq!(suspended, 200, "{team}");
+        assert_eq!(team["name"], TEST_TEAM);
+        assert_eq!(team["suspension_notice"], "Contact the operator.");
+        assert!(team["suspended_at"].is_string(), "{team}");
+        assert_eq!(again, 200, "{replaced}");
+        assert_eq!(
+            replaced["suspended_at"], team["suspended_at"],
+            "a repeat keeps the first suspension time"
+        );
+        assert_eq!(
+            replaced.get("suspension_notice"),
+            Some(&serde_json::Value::Null),
+            "a blank notice replaces the old one with none"
+        );
+        assert_eq!(lifted, 200, "{after}");
+        // `get`: `after["suspended_at"]` is `Null` for a missing key too.
+        assert_eq!(after.get("suspended_at"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            after.get("suspension_notice"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_of_a_suspended_team_may_export_but_not_browse_or_search() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        let scoped = keys(&test).await;
+        // `app()`'s catalogs are both owned by `TEST_TEAM`, so suspending it
+        // through the route suspends `main` and `other`.
+        let (status, _) = put_suspension(
+            &test,
+            &root,
+            json!({"suspended": true, "notice": "Paused."}),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // No `poll` here: the route settled before answering, so the very
+        // next request already sees the suspension.
+        let refusals = [
+            "/api/v1/catalogs/main/tree",
+            "/api/v1/search?q=alpha",
+            "/api/v1/changesets?catalog=main",
+        ];
+        let mut refused = Vec::new();
+        for uri in refusals {
+            refused.push((uri, send(&test, "GET", uri, Some(&scoped.read), None).await));
+        }
+        let (changesets, open) = send(
+            &test,
+            "GET",
+            "/api/v1/changesets",
+            Some(&scoped.write),
+            None,
+        )
+        .await;
+        let (export, _) = send(
+            &test,
+            "GET",
+            "/api/v1/catalogs/main/export",
+            Some(&scoped.read),
+            None,
+        )
+        .await;
+        let (listed, listing) =
+            send(&test, "GET", "/api/v1/catalogs", Some(&scoped.read), None).await;
+        let mut admins = Vec::new();
+        for key in [&root, &scoped.admin] {
+            admins.push(send(&test, "GET", "/api/v1/catalogs/main/tree", Some(key), None).await);
+        }
+        let (status, _) = put_suspension(&test, &root, json!({"suspended": false})).await;
+        assert_eq!(status, 200);
+        let (served, _) = send(
+            &test,
+            "GET",
+            "/api/v1/catalogs/main/tree",
+            Some(&scoped.read),
+            None,
+        )
+        .await;
+        let (searched, _) = send(
+            &test,
+            "GET",
+            "/api/v1/search?q=alpha",
+            Some(&scoped.read),
+            None,
+        )
+        .await;
+        let (_, relisted) = send(&test, "GET", "/api/v1/catalogs", Some(&scoped.read), None).await;
+
+        for (uri, (status, body)) in refused {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            assert_eq!(body["error"], "Suspended", "{uri}: {body}");
+            assert_eq!(body["notice"], "Paused.", "{uri}: {body}");
+        }
+        assert_eq!(changesets, StatusCode::OK, "{open}");
+        assert_eq!(open["changesets"], json!([]), "{open}");
+        assert_eq!(export, StatusCode::OK, "export stays open");
+        assert_eq!(listed, StatusCode::OK);
+        assert_eq!(listing["catalogs"][0]["name"], "main");
+        assert_eq!(listing["catalogs"][0]["suspended"]["team"], TEST_TEAM);
+        assert_eq!(listing["catalogs"][0]["suspended"]["notice"], "Paused.");
+        for (status, body) in admins {
+            assert_eq!(status, StatusCode::OK, "admins are not suspended: {body}");
+        }
+        assert_eq!(served, StatusCode::OK, "the lift takes effect at once");
+        assert_eq!(searched, StatusCode::OK);
+        assert_eq!(
+            relisted["catalogs"][0].get("suspended"),
+            Some(&serde_json::Value::Null)
+        );
     }
 }

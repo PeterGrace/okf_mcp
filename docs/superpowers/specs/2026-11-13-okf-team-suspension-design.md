@@ -1,7 +1,10 @@
 # okf-mcp team suspension: design
 
-Status: approved, 2026-11-13. Delivered by milestone 13 (plan
-`docs/superpowers/plans/2026-11-13-okf-mcp-m13-team-suspension.md`).
+Status: delivered in milestone 13 (epic #362; sub-issues #363-#370; PRs
+#374, #376-#378, #380, #382, #384 and #387), 2026-11-14 (plan
+`docs/superpowers/plans/2026-11-13-okf-mcp-m13-team-suspension.md`). What
+differs from this design is under "What shipped differently" at the end;
+the operator's view is `docs/operations.md`, "Suspending a team".
 
 ## Goal
 
@@ -86,3 +89,85 @@ shares it (`Arc`).
 - MCP: a member's `search` and `open_changeset` refused; `list_catalogs`
   marks it; another team's catalog on the same connection still answers.
 - CLI parity table rows; console journey: suspend, see the pill, lift.
+
+## What shipped differently
+
+Read the plan's "Decisions taken while planning" and its dated `Corrected
+(issue #N)` and `Qualified` notes for the detail; the per-task changelogs
+(`changelog/*-m13-task-*`) give the reasons. The design above held; these
+are the places where what shipped is narrower, wider or more exact.
+
+### Behaviour
+
+- **`Forbidden` or `Suspended` for a key below the needed level.**
+  `Principal::require` checks reach, then level, then suspension, as
+  "Order of checks" says. Tools that pick their catalog through the
+  selection before checking their own level (`open_changeset`,
+  `maintenance_dispose` and the maintenance work tools) refuse a suspended
+  catalog at the selection, so a key that reaches it below the level the
+  tool needs gets 403 `Suspended` rather than 403 `Forbidden`. Reach is
+  still checked first, so a credential that doesn't reach the catalog never
+  learns it is suspended (#366).
+- **A connection of only suspended catalogs is refused everywhere.**
+  `ToolContext::check_connection` goes through the selection, so
+  `list_changesets` without `catalog`, and a changeset handle on such a
+  connection, are refused with `Suspended` too; a mixed list passes (#366).
+- **Search over every reached catalog, all suspended.** `GET /api/v1/search`
+  without `catalogs` leaves suspended catalogs out; when that leaves
+  nothing, it falls back to the key's default, as for a key that reaches
+  nothing, and that default is then refused as named (403 `Suspended`)
+  (#366).
+- **A new catalog is marked at once.** `POST /api/v1/catalogs`' answer reads
+  `suspended` from the key cache after its poll, so a catalog created for a
+  suspended team is marked (null if that poll failed, until the next)
+  (#366). More generally the suspension follows ownership: a catalog moved
+  to or from a suspended team changes with it.
+- **The notice is cleaned.** A blank notice (after trimming) is no notice,
+  so re-suspending without one clears the old one; a notice holding a NUL is
+  refused (409 `Refused`) like one over 2000 characters, since Postgres text
+  can't store it (#363).
+- **Malformed team names are unknown.** `store::teams::find`, `lock_team`
+  and `id_of` refuse a name that is not `[a-z0-9-]+` with `UnknownName`
+  before SQL, so a NUL in a team path is a 404, never a 500, on every team
+  route, the suspension route and the CLI included (the team part of #339;
+  #367).
+- **The route's errors.** `PUT /api/v1/teams/{name}/suspension` takes
+  `{suspended, notice?}` with unknown fields refused: 422 without
+  `suspended` or with an unknown field, 409 for a bad notice, 404 for an
+  unknown team (#367).
+
+### Surfaces
+
+- **`okf-mcp team list`** gained a `suspended TIME` cell (`-` when active)
+  after `catalogs`, before the display name, so the display name moved from
+  field 5 to field 6. `team suspend` prints `suspended team NAME`, `team
+  unsuspend` prints `lifted the suspension of team NAME` (#368).
+- **Console.** The "suspended" pills use the `error` kind (the console's
+  `pill` has no `danger`). The team drawer's Suspension section follows the
+  console rules in `tools/agentic/lessons.md`: its writes are guarded by a
+  pending-write key, a refused write keeps its reason in the drawer, only
+  the newest read draws, a settled write redraws the drawer that shows its
+  team now, and a failed users read never discards a write's answer. The
+  Browse notice uses a `.notice` style with `role="status"`. The console
+  can suspend and lift but not replace a suspended team's notice; the CLI
+  and REST can (#361, follow-up; #369).
+
+### Internals
+
+- `suspended_message` takes `Option<&str>`; the MCP tool-error mapping
+  needed no change, since it builds its body from `to_json` (#364).
+- `CatalogSummary::of(name, state, principal)` takes the caller and fills
+  `suspended` itself, through `From<&SuspendedCatalog> for SuspensionInfo`
+  (#366).
+- Shared test helpers: `mcp::testing::{suspend_catalogs, lift_suspension,
+  stored_secret, cached_principal}` and `http::api::testing::{Expect,
+  assert_answers}` (#365).
+
+### Not built here
+
+- A narrower "provisioner" admin scope for automation: milestone 14's
+  design (PR #375), not a separate issue.
+- Follow-ups filed during the milestone: #361 (edit a suspended team's
+  notice in the console), #381 (the team drawer's membership and delete
+  controls are not guarded by a pending-write key), #385 (the users and My
+  keys drawers number their redraw after the list refresh).
