@@ -285,12 +285,30 @@ mod tests {
         pool: &PgPool,
         grants: &[(&str, Access)],
     ) -> (ClientRecord, String, String) {
-        catalogs::create(pool, "main", "", crate::db::TEST_TEAM, now())
-            .await
-            .expect("main");
-        catalogs::create(pool, "other", "", crate::db::TEST_TEAM, now())
-            .await
-            .expect("other");
+        catalogs::create(
+            pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "main",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .expect("main");
+        catalogs::create(
+            pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "other",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .expect("other");
         users::create(
             pool,
             &NewUser {

@@ -137,9 +137,18 @@ async fn storage_round_trip_on_a_real_catalog() {
     let root = std::env::var_os("OKF_PARITY_CATALOG").expect("set OKF_PARITY_CATALOG");
     let db = support::pg::TestDb::start_migrated().await;
     support::server::migrate_with_owner(&db.pool).await;
-    catalogs::create(&db.pool, "pg", "", support::server::OWNER, Utc::now())
-        .await
-        .unwrap();
+    catalogs::create(
+        &db.pool,
+        &okf_mcp::store::catalogs::NewCatalog {
+            name: "pg",
+            description: "",
+            owner_team: support::server::OWNER,
+        },
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
 
     let started = Instant::now();
     let files = archive::read_directory(std::path::Path::new(&root), u64::MAX).unwrap();
@@ -155,6 +164,7 @@ async fn storage_round_trip_on_a_real_catalog() {
         scope: ImportScope::Everything,
         expect_generation: None,
         actor: "smoke",
+        audit: &okf_mcp::store::audit::AuditActor::cli(),
         now: Utc::now(),
     };
     let report = import(&db.pool, "pg", files, &options).await.unwrap();

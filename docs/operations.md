@@ -965,6 +965,19 @@ reads `deleted user #N` once the user is deleted.
 | `catalog.reverted` | A `revert` succeeds: a document's old revision (or its deletion) goes into a changeset. A refused revert records nothing | `path`, `revision`, `changeset` |
 | `catalog.changeset_discarded` | An admin closes another key's changeset (`discard` without `paths`, or `DELETE /api/v1/changesets/{handle}`), or a user deletion discards an open changeset of one of the user's keys (the entry's person is that user). A key discarding its own changeset records nothing | `changeset`, `files` (entries dropped), `reason` (`admin` or `user_deleted`) |
 | `user.deleted` | A user is deleted (`user delete`, `DELETE /api/v1/users/{name}`, the console). A refused deletion records nothing | `keys` (keys and grants deleted), `codes` (sign-in codes deleted), `changesets_discarded` |
+| `team.created` | A shared team is created (`team create`, `POST /api/v1/teams`); its person is the first owner | none |
+| `team.member_added` | A user joins a team (`team add-member`, `PUT /api/v1/teams/{name}/members/{user}`); its person is the user | `role`, `from` (`null`) |
+| `team.role_changed` | A member's role changes (`team set-role`, the same `PUT`). Setting the role a member already has records nothing | `role`, `from` |
+| `team.member_removed` | A member leaves a team (`team remove-member`, `DELETE /api/v1/teams/{name}/members/{user}`); its person is the user. A refused removal records nothing | none |
+| `team.deleted` | A shared team is deleted (`team delete`, `DELETE /api/v1/teams/{name}`), recorded before the row goes. A refused deletion records nothing | none |
+| `team.suspended` | A team is suspended or its notice changes (`team suspend`, `PUT /api/v1/teams/{name}/suspension`). Suspending a suspended team with the same notice, a refused notice and an unknown or malformed name record nothing | `notice` (whether there is one; never its text), `already` (it was suspended before) |
+| `team.unsuspended` | A suspension is lifted (`team unsuspend`, the same `PUT`). Lifting an active team's suspension records nothing | none |
+| `catalog.created` | A catalog is created (`catalog create`, `POST /api/v1/catalogs`) | none |
+| `catalog.owner_changed` | A catalog gets another owner team (`catalog set-owner`, `PUT /api/v1/catalogs/{catalog}/owner`); the entry belongs to both teams. Giving it to the team that owns it records nothing | `from` (the old team's audit id, `null` for a catalog that had no owner), `to` |
+| `catalog.description_changed` | A catalog's description changes (`catalog update`, `PATCH /api/v1/catalogs/{catalog}`). The same text again records nothing | `length` (in characters; never the text) |
+| `catalog.member_access_changed` | A catalog's member access changes (`catalog set-member-access`, `PUT /api/v1/catalogs/{catalog}/member-access`). The same value again records nothing | `from`, `to` (`none`, `read` or `write`) |
+| `catalog.deleted` | A catalog is deleted (`catalog delete`, `DELETE /api/v1/catalogs/{catalog}`), recorded before the row goes. A refused deletion records nothing | `forced` (unpublished changes were deleted with it), `generation` |
+| `catalog.imported` | An import writes or deletes at least one file (`okf-mcp import`, `POST /catalogs/{name}/import` and its `/api/v1` twin, the console). An import that changes nothing, or is refused, records nothing | `replace`, `scope` (`everything` or `machinery`), `written` (files added or changed), `deleted`, `generation` (after the import) |
 
 ## Signing in and self-service
 

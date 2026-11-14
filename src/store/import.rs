@@ -12,7 +12,8 @@ use crate::okf::analysis::lint::{lint, LintReport};
 use crate::okf::rules::is_machinery;
 use crate::okf::snapshot::Snapshot;
 use crate::okf::workspace::{MemWorkspace, StoredFile};
-use crate::store::catalogs;
+use crate::store::audit::{self, Action, AuditActor};
+use crate::store::catalogs::{self, CatalogEvent};
 use crate::store::documents::{self, Derived, DocumentWrite, RevisionRecord};
 
 /// Which of a catalog's paths an import replaces.
@@ -43,6 +44,8 @@ pub struct ImportOptions<'a> {
     pub expect_generation: Option<i64>,
     /// Recorded as `updated_by` and the revisions' `actor`.
     pub actor: &'a str,
+    /// Who, for the audit log's `catalog.imported` entry.
+    pub audit: &'a AuditActor,
     /// The time of every row written, and lint's "now" (server clock).
     pub now: DateTime<Utc>,
 }
@@ -106,6 +109,8 @@ struct Analyzed {
 ///
 /// The files are checked, snapshotted and linted under the catalog's lock,
 /// because the machinery scope's snapshot includes the catalog's documents.
+/// An import that wrote anything records `catalog.imported` in the same
+/// transaction; one that wrote nothing records nothing.
 ///
 /// # Arguments
 /// * `pool` - the database.
@@ -120,9 +125,10 @@ struct Analyzed {
 /// [`OkfError::ImportRefused`] if a markdown file is not UTF-8 text;
 /// [`OkfError::InvalidPath`] if `files` holds paths no workspace can (see
 /// [`MemWorkspace::from_stored`]); [`OkfError::CatalogNotSelected`] for an
-/// unknown catalog, or one deleted while the import waited for its lock;
-/// [`OkfError::Refused`] for a non-empty catalog without `replace`, or one
-/// not at `expect_generation`; [`OkfError::Database`].
+/// unknown (or malformed) catalog, or one deleted while the import waited
+/// for its lock; [`OkfError::Refused`] for a non-empty catalog without
+/// `replace`, or one not at `expect_generation`; [`OkfError::Database`], a
+/// failed audit write included.
 pub async fn import(
     pool: &PgPool,
     catalog: &str,
@@ -132,6 +138,7 @@ pub async fn import(
     let now = options.now;
     // Dropping `tx` without `commit()` (any `?` or early `return`) rolls back.
     let mut tx = pool.begin().await?;
+    audit::lock_actor(&mut tx, options.audit).await?;
     let found = catalogs::find(&mut *tx, catalog).await?;
     catalogs::lock(&mut tx, found.id).await?;
     // A delete holding the lock may have removed (or replaced) the catalog
@@ -230,11 +237,36 @@ pub async fn import(
         documents::record_revision(&mut tx, &write, &RevisionRecord::import(None)).await?;
         report.deleted.push(row.path.clone());
     }
-    if !(report.added.is_empty() && report.updated.is_empty() && report.deleted.is_empty()) {
-        sqlx::query("UPDATE catalogs SET generation = generation + 1 WHERE id = $1")
-            .bind(found.id)
-            .execute(&mut *tx)
-            .await?;
+    let written = report.added.len() + report.updated.len();
+    if written + report.deleted.len() > 0 {
+        let generation: i64 = sqlx::query_scalar(
+            "UPDATE catalogs SET generation = generation + 1 WHERE id = $1 RETURNING generation",
+        )
+        .bind(found.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let scope = match options.scope {
+            ImportScope::Everything => "everything",
+            ImportScope::Machinery => "machinery",
+        };
+        catalogs::record_catalog(
+            &mut tx,
+            options.audit,
+            CatalogEvent {
+                action: Action::CatalogImported,
+                catalog_id: found.id,
+                catalog,
+                details: serde_json::json!({
+                    "replace": options.replace,
+                    "scope": scope,
+                    "written": written,
+                    "deleted": report.deleted.len(),
+                    "generation": generation,
+                }),
+            },
+            now,
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(report)
@@ -327,12 +359,18 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 11, 2, 12, minute, 0).unwrap()
     }
 
+    /// The CLI actor, built once: `options` hands out `'static` borrows of
+    /// it (`LazyLock` is a lazily initialised global, like a module-level
+    /// singleton).
+    static CLI: std::sync::LazyLock<AuditActor> = std::sync::LazyLock::new(AuditActor::cli);
+
     fn options(replace: bool, now: DateTime<Utc>) -> ImportOptions<'static> {
         ImportOptions {
             replace,
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "test/import",
+            audit: &CLI,
             now,
         }
     }
@@ -369,9 +407,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_import_fills_an_empty_catalog() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            at(0),
+        )
+        .await
+        .unwrap();
         let incoming = files(&[
             ("a.md", CONCEPT, false),
             ("index.md", b"# Index\n- [A](a.md)\n", false),
@@ -448,9 +495,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_second_import_needs_replace_and_writes_only_differences() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            at(0),
+        )
+        .await
+        .unwrap();
         let first = files(&[
             ("keep.md", b"# Keep\n", false),
             ("change.md", b"# Old\n", false),
@@ -520,9 +576,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_recreated_path_continues_its_revisions_and_a_same_import_changes_nothing() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            at(0),
+        )
+        .await
+        .unwrap();
         import(
             &db.pool,
             "pg",
@@ -565,9 +630,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_machinery_import_replaces_machinery_and_keeps_every_concept() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            at(0),
+        )
+        .await
+        .unwrap();
         let exported = files(&[
             ("a.md", CONCEPT, false),
             ("AGENTS.md", b"# Old rules\n", false),
@@ -631,9 +705,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_import_expecting_another_generation_is_refused() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            at(0),
+        )
+        .await
+        .unwrap();
         import(
             &db.pool,
             "pg",
@@ -674,9 +757,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_import_that_waited_for_a_publish_checks_the_generation_it_left() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
-            .await
-            .unwrap();
+        let catalog = catalogs::create(
+            &db.pool,
+            &catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            at(0),
+        )
+        .await
+        .unwrap();
         import(
             &db.pool,
             "pg",
@@ -751,9 +843,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_changed_execute_bit_is_an_update() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            at(0),
+        )
+        .await
+        .unwrap();
         import(
             &db.pool,
             "pg",
@@ -787,9 +888,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn markdown_that_is_not_text_and_unknown_catalogs_are_refused() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            at(0),
+        )
+        .await
+        .unwrap();
         let binary_markdown = files(&[
             ("a.md", b"\xff\xfe", false),
             ("b.md", b"# B\n", false),
@@ -823,9 +933,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_import_that_waited_for_a_delete_finds_the_catalog_gone() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at(0))
-            .await
-            .unwrap();
+        let catalog = catalogs::create(
+            &db.pool,
+            &catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            at(0),
+        )
+        .await
+        .unwrap();
         // Hold the catalog's lock, as a delete in progress would.
         let mut holder = db.pool.begin().await.unwrap();
         catalogs::lock(&mut holder, catalog.id).await.unwrap();
@@ -851,5 +970,73 @@ mod tests {
         let result = waiting.await.unwrap();
 
         assert!(matches!(result, Err(OkfError::CatalogNotSelected { .. })));
+    }
+
+    /// Creates the empty catalog `pg`, owned by the fixture team.
+    async fn seed_pg(pool: &PgPool) {
+        let new = catalogs::NewCatalog {
+            name: "pg",
+            description: "",
+            owner_team: crate::db::TEST_TEAM,
+        };
+        catalogs::create(pool, &new, &AuditActor::cli(), at(0))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_import_that_writes_records_one_entry_and_one_that_writes_nothing_none() {
+        let db = test_db().await;
+        seed_pg(&db.pool).await;
+        let first = files(&[("a.md", CONCEPT, false), ("b.md", CONCEPT, false)]);
+        let second = files(&[("a.md", b"# Changed\n", false)]);
+
+        import(&db.pool, "pg", first, &options(false, at(1)))
+            .await
+            .unwrap();
+        import(&db.pool, "pg", second.clone(), &options(true, at(2)))
+            .await
+            .unwrap();
+        let same = import(&db.pool, "pg", second, &options(true, at(3)))
+            .await
+            .unwrap();
+        let refused = import(&db.pool, "pg", files(&[]), &options(false, at(4))).await;
+
+        assert_eq!(same.unchanged, 1);
+        assert!(matches!(refused, Err(OkfError::Refused { .. })));
+        let imported = crate::store::audit::testing::entries(&db.pool, "catalog.imported").await;
+        assert_eq!(imported.len(), 2, "nothing for no change: {imported:?}");
+        assert_eq!(imported[0].target.as_deref(), Some("pg"));
+        assert_eq!(imported[0].teams, [crate::db::TEST_USER]);
+        assert_eq!(
+            imported[0].details,
+            serde_json::json!({"replace": false, "scope": "everything", "written": 2,
+                               "deleted": 0, "generation": 1})
+        );
+        assert_eq!(
+            imported[1].details,
+            serde_json::json!({"replace": true, "scope": "everything", "written": 1,
+                               "deleted": 1, "generation": 2})
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_audit_write_fails_the_import() {
+        let db = test_db().await;
+        seed_pg(&db.pool).await;
+        crate::http::api::testing::fail_on(&db.pool, "BEFORE INSERT ON audit_entries FOR EACH ROW")
+            .await;
+
+        let refused = import(
+            &db.pool,
+            "pg",
+            files(&[("a.md", CONCEPT, false)]),
+            &options(false, at(1)),
+        )
+        .await;
+
+        assert!(refused.is_err());
+        assert!(rows(&db.pool).await.is_empty(), "nothing was imported");
+        assert_eq!(generation(&db.pool).await, 0);
     }
 }

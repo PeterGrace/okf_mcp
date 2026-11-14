@@ -296,6 +296,7 @@ async fn server(aging: bool) -> TestServer {
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "fixture",
+            audit: &okf_mcp::store::audit::AuditActor::cli(),
             now: chrono::Utc::now() - chrono::Duration::days(1),
         },
     )
@@ -577,6 +578,7 @@ async fn investigator_lost_response_replay_and_historical_superseded() {
                     scope: ImportScope::Everything,
                     expect_generation: None,
                     actor: "fixture",
+                    audit: &okf_mcp::store::audit::AuditActor::cli(),
                     now: chrono::Utc::now(),
                 },
             )

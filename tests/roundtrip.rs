@@ -26,14 +26,24 @@ use support::pg::TestDb;
 async fn round_trip(files: &Files) -> (Files, ImportReport) {
     let db = TestDb::start_migrated().await;
     support::server::migrate_with_owner(&db.pool).await;
-    catalogs::create(&db.pool, "rt", "", support::server::OWNER, Utc::now())
-        .await
-        .unwrap();
+    catalogs::create(
+        &db.pool,
+        &okf_mcp::store::catalogs::NewCatalog {
+            name: "rt",
+            description: "",
+            owner_team: support::server::OWNER,
+        },
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
     let first = ImportOptions {
         replace: false,
         scope: ImportScope::Everything,
         expect_generation: None,
         actor: "test/roundtrip",
+        audit: &okf_mcp::store::audit::AuditActor::cli(),
         now: Utc::now(),
     };
     import(&db.pool, "rt", files.clone(), &first).await.unwrap();
@@ -45,6 +55,7 @@ async fn round_trip(files: &Files) -> (Files, ImportReport) {
         scope: ImportScope::Everything,
         expect_generation: None,
         actor: "test/roundtrip",
+        audit: &okf_mcp::store::audit::AuditActor::cli(),
         now: Utc::now(),
     };
     let report = import(&db.pool, "rt", exported.clone(), &again)

@@ -421,12 +421,30 @@ mod tests {
     async fn published_lists_live_documents_by_path() {
         let db = test_db().await;
         let at = Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap();
-        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, at)
-            .await
-            .unwrap();
-        let other = catalogs::create(&db.pool, "other", "", crate::db::TEST_TEAM, at)
-            .await
-            .unwrap();
+        let catalog = catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            at,
+        )
+        .await
+        .unwrap();
+        let other = catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "other",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            at,
+        )
+        .await
+        .unwrap();
         for (catalog_id, path, deleted) in [
             (catalog.id, "b.md", false),
             (catalog.id, "a.md", false),

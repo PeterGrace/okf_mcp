@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
+use crate::store::audit::{self, Action, AuditActor, Entry, Target};
 use crate::store::catalogs::{bump_admin_generation, is_valid_name};
 use crate::store::users;
 
@@ -62,6 +63,17 @@ pub struct NewTeam<'a> {
     pub display_name: &'a str,
     /// The user who becomes its first owner.
     pub owner: &'a str,
+}
+
+/// A membership to set: [`set_member`]'s input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Membership<'a> {
+    /// The team's name.
+    pub team: &'a str,
+    /// The user's name.
+    pub user: &'a str,
+    /// The role it should have.
+    pub role: Role,
 }
 
 /// One membership of a team.
@@ -195,12 +207,14 @@ fn assemble(rows: Vec<TeamRow>, member_rows: Vec<MemberRow>) -> Vec<TeamRecord> 
         .collect()
 }
 
-/// Creates a shared team with `owner` as its first owner, and bumps the
-/// administrative generation, in one transaction.
+/// Creates a shared team with `owner` as its first owner, records
+/// `team.created`, and bumps the administrative generation, in one
+/// transaction.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `new` - its name, display name and owner.
+/// * `actor` - who, for the audit log; a provisioner is refused an admin owner.
 /// * `now` - the creation time (server clock).
 ///
 /// # Returns
@@ -209,16 +223,23 @@ fn assemble(rows: Vec<TeamRow>, member_rows: Vec<MemberRow>) -> Vec<TeamRecord> 
 /// # Errors
 /// [`OkfError::Refused`] for an invalid name or one a user or team already
 /// has (including one taken by a concurrent create);
-/// [`OkfError::UnknownName`] for an unknown owner; [`OkfError::Database`].
+/// [`OkfError::UnknownName`] for an unknown (or malformed) owner;
+/// [`OkfError::Forbidden`] for a provisioner and an admin owner;
+/// [`OkfError::Database`], a failed audit write included.
 pub async fn create(
     pool: &PgPool,
     new: &NewTeam<'_>,
+    actor: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<TeamRecord, OkfError> {
     users::check_name("team", new.name)?;
     let mut tx = pool.begin().await?;
+    audit::lock_actor(&mut tx, actor).await?;
     users::check_free(&mut tx, new.name).await?;
-    let owner_id = users::id_of(&mut tx, new.owner).await?;
+    // `FOR KEY SHARE` on the owner conflicts with `users::set_admin`'s
+    // `FOR UPDATE`, so the guard below cannot race a promotion.
+    let (owner_id, owner_is_admin) = users::id_and_admin_of(&mut tx, new.owner).await?;
+    audit::refuse_admin_target(actor, owner_is_admin, new.owner)?;
     let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO teams (name, display_name, created_at) VALUES ($1, $2, $3) RETURNING id",
     )
@@ -229,6 +250,18 @@ pub async fn create(
     .await;
     let team_id = users::or_name_taken(inserted, new.name)?;
     insert_member(&mut tx, &team_id, &owner_id, Role::Owner, now).await?;
+    record_team(
+        &mut tx,
+        actor,
+        TeamEvent {
+            action: Action::TeamCreated,
+            team: new.name,
+            person: Some(&owner_id),
+            details: serde_json::json!({}),
+        },
+        now,
+    )
+    .await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(TeamRecord {
@@ -302,38 +335,42 @@ pub async fn find(pool: &PgPool, name: &str) -> Result<TeamRecord, OkfError> {
         .expect("one team row gives one record"))
 }
 
-/// Adds `user` to `team` with `role`, or changes its role, and bumps the
-/// administrative generation when anything changed.
+/// Adds a user to a team with a role, or changes its role, records
+/// `team.member_added` or `team.role_changed`, and bumps the administrative
+/// generation, when anything changed.
 ///
 /// # Arguments
 /// * `pool` - the database.
-/// * `team` - the team's name.
-/// * `user` - the user's name.
-/// * `role` - the role it should have.
+/// * `membership` - the team, the user and the role it should have.
+/// * `actor` - who, for the audit log; a provisioner is refused an admin user.
 /// * `now` - the membership's creation time, when added (server clock).
 ///
 /// # Returns
 /// Whether the user was added, its role changed, or nothing changed.
 ///
 /// # Errors
-/// [`OkfError::UnknownName`] for the team or user; [`OkfError::Refused`]
-/// for demoting the team's last owner; [`OkfError::Database`].
+/// [`OkfError::UnknownName`] for the team or user (a malformed name
+/// included); [`OkfError::Forbidden`] for a provisioner and an admin user;
+/// [`OkfError::Refused`] for demoting the team's last owner;
+/// [`OkfError::Database`], a failed audit write included.
 pub async fn set_member(
     pool: &PgPool,
-    team: &str,
-    user: &str,
-    role: Role,
+    membership: &Membership<'_>,
+    actor: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<MemberChange, OkfError> {
+    let Membership { team, user, role } = *membership;
     let mut tx = pool.begin().await?;
-    // The user before the team: `users::delete` locks the user and then its
-    // personal team, so taking them in the other order could deadlock.
-    let user_id = users::id_of(&mut tx, user).await?;
+    // Users before the team: `users::delete` locks the user and then its
+    // teams, so taking them in the other order could deadlock.
+    audit::lock_actor(&mut tx, actor).await?;
+    let (user_id, is_admin) = users::id_and_admin_of(&mut tx, user).await?;
+    audit::refuse_admin_target(actor, is_admin, user)?;
     let locked = lock_team(&mut tx, team).await?;
-    let change = match current_role(&mut tx, &locked.id, &user_id).await? {
+    let (change, action, from) = match current_role(&mut tx, &locked.id, &user_id).await? {
         None => {
             insert_member(&mut tx, &locked.id, &user_id, role, now).await?;
-            MemberChange::Added
+            (MemberChange::Added, Action::TeamMemberAdded, None)
         }
         // Dropping `tx` here rolls back the (read-only) transaction.
         Some(existing) if existing == role => return Ok(MemberChange::Unchanged),
@@ -347,29 +384,59 @@ pub async fn set_member(
                 .bind(role.as_str())
                 .execute(&mut *tx)
                 .await?;
-            MemberChange::RoleChanged
+            (
+                MemberChange::RoleChanged,
+                Action::TeamRoleChanged,
+                Some(existing.as_str()),
+            )
         }
     };
+    record_team(
+        &mut tx,
+        actor,
+        TeamEvent {
+            action,
+            team,
+            person: Some(&user_id),
+            // `from` is `None` (JSON null) for a new member.
+            details: serde_json::json!({"role": role.as_str(), "from": from}),
+        },
+        now,
+    )
+    .await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(change)
 }
 
-/// Removes `user` from `team`, and bumps the administrative generation.
+/// Removes a user from a team, records `team.member_removed`, and bumps
+/// the administrative generation.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `team` - the team's name.
 /// * `user` - the user's name.
+/// * `actor` - who, for the audit log; a provisioner is refused an admin user.
+/// * `now` - the server clock.
 ///
 /// # Errors
-/// [`OkfError::UnknownName`] for the team or user; [`OkfError::Refused`]
-/// when the user is not a member, is the team's last owner, or is the user
-/// whose personal team this is; [`OkfError::Database`].
-pub async fn remove_member(pool: &PgPool, team: &str, user: &str) -> Result<(), OkfError> {
+/// [`OkfError::UnknownName`] for the team or user (a malformed name
+/// included); [`OkfError::Forbidden`] for a provisioner and an admin user;
+/// [`OkfError::Refused`] when the user is not a member, is the team's last
+/// owner, or is the user whose personal team this is;
+/// [`OkfError::Database`], a failed audit write included.
+pub async fn remove_member(
+    pool: &PgPool,
+    team: &str,
+    user: &str,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
-    // The user before the team, as in `set_member`.
-    let user_id = users::id_of(&mut tx, user).await?;
+    // Users before the team, as in `set_member`.
+    audit::lock_actor(&mut tx, actor).await?;
+    let (user_id, is_admin) = users::id_and_admin_of(&mut tx, user).await?;
+    audit::refuse_admin_target(actor, is_admin, user)?;
     let locked = lock_team(&mut tx, team).await?;
     if locked.personal_of.as_deref() == Some(user_id.as_str()) {
         return Err(OkfError::Refused {
@@ -390,23 +457,46 @@ pub async fn remove_member(pool: &PgPool, team: &str, user: &str) -> Result<(), 
         .bind(&user_id)
         .execute(&mut *tx)
         .await?;
+    record_team(
+        &mut tx,
+        actor,
+        TeamEvent {
+            action: Action::TeamMemberRemoved,
+            team,
+            person: Some(&user_id),
+            details: serde_json::json!({}),
+        },
+        now,
+    )
+    .await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     Ok(())
 }
 
 /// Deletes a shared team that owns no catalog (its memberships cascade),
-/// and bumps the administrative generation (spec "Deletion").
+/// records `team.deleted`, and bumps the administrative generation (spec
+/// "Deletion").
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `name` - the team's name.
+/// * `actor` - who, for the audit log.
+/// * `now` - the server clock.
 ///
 /// # Errors
-/// [`OkfError::UnknownName`]; [`OkfError::Refused`] for a personal team
-/// (it goes with its user) or one that owns a catalog; [`OkfError::Database`].
-pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError> {
+/// [`OkfError::UnknownName`] (a malformed name included);
+/// [`OkfError::Refused`] for a personal team (it goes with its user) or one
+/// that owns a catalog; [`OkfError::Database`], a failed audit write
+/// included.
+pub async fn delete(
+    pool: &PgPool,
+    name: &str,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
+    audit::lock_actor(&mut tx, actor).await?;
     let locked = lock_team(&mut tx, name).await?;
     if locked.personal_of.is_some() {
         return Err(OkfError::Refused {
@@ -422,6 +512,20 @@ pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError> {
             reason: format!("team {name:?} owns {owned} catalog(s); give them another owner first"),
         });
     }
+    // Recorded while the row exists: the entry's team reference is
+    // resolved from it.
+    record_team(
+        &mut tx,
+        actor,
+        TeamEvent {
+            action: Action::TeamDeleted,
+            team: name,
+            person: None,
+            details: serde_json::json!({}),
+        },
+        now,
+    )
+    .await?;
     sqlx::query("DELETE FROM teams WHERE id = $1")
         .bind(&locked.id)
         .execute(&mut *tx)
@@ -464,30 +568,47 @@ fn clean_notice(notice: Option<&str>) -> Result<Option<&str>, OkfError> {
 }
 
 /// Suspends a team, or replaces the notice of one already suspended
-/// (keeping its first `suspended_at`), and bumps the administrative
-/// generation.
+/// (keeping its first `suspended_at`), records `team.suspended`, and bumps
+/// the administrative generation. Suspending a team already suspended with
+/// the same notice changes nothing, so it writes and records nothing.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `name` - the team's name.
 /// * `notice` - what members are told; blank or `None` for no notice.
+/// * `actor` - who, for the audit log.
 /// * `now` - the suspension time, if it was not suspended (server clock).
 ///
 /// # Returns
 /// The team as it now is.
 ///
 /// # Errors
-/// [`OkfError::UnknownName`]; [`OkfError::Refused`] for a notice over
-/// [`MAX_NOTICE_CHARS`]; [`OkfError::Database`].
+/// [`OkfError::UnknownName`] (a malformed name included);
+/// [`OkfError::Refused`] for a notice over [`MAX_NOTICE_CHARS`] or holding
+/// a NUL; [`OkfError::Database`], a failed audit write included.
 pub async fn suspend(
     pool: &PgPool,
     name: &str,
     notice: Option<&str>,
+    actor: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<TeamRecord, OkfError> {
     let notice = clean_notice(notice)?;
     let mut tx = pool.begin().await?;
+    audit::lock_actor(&mut tx, actor).await?;
     let locked = lock_team(&mut tx, name).await?;
+    // The state before the write, under the team's lock.
+    let (already, previous_notice): (bool, Option<String>) = sqlx::query_as(
+        "SELECT suspended_at IS NOT NULL, suspension_notice FROM teams WHERE id = $1",
+    )
+    .bind(&locked.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if already && previous_notice.as_deref() == notice {
+        // Dropping `tx` rolls back the read-only transaction.
+        drop(tx);
+        return find(pool, name).await;
+    }
     // `COALESCE` keeps the first suspension time on a repeat.
     sqlx::query(
         "UPDATE teams SET suspended_at = COALESCE(suspended_at, $2), suspension_notice = $3 \
@@ -498,25 +619,47 @@ pub async fn suspend(
     .bind(notice)
     .execute(&mut *tx)
     .await?;
+    record_team(
+        &mut tx,
+        actor,
+        TeamEvent {
+            action: Action::TeamSuspended,
+            team: name,
+            person: None,
+            // Whether there is a notice, never its text.
+            details: serde_json::json!({"notice": notice.is_some(), "already": already}),
+        },
+        now,
+    )
+    .await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
     find(pool, name).await
 }
 
-/// Lifts a team's suspension, and bumps the administrative generation when
-/// there was one.
+/// Lifts a team's suspension, and records `team.unsuspended` and bumps
+/// the administrative generation when there was one.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `name` - the team's name.
+/// * `actor` - who, for the audit log.
+/// * `now` - the server clock.
 ///
 /// # Returns
 /// The team as it now is.
 ///
 /// # Errors
-/// [`OkfError::UnknownName`]; [`OkfError::Database`].
-pub async fn unsuspend(pool: &PgPool, name: &str) -> Result<TeamRecord, OkfError> {
+/// [`OkfError::UnknownName`] (a malformed name included);
+/// [`OkfError::Database`], a failed audit write included.
+pub async fn unsuspend(
+    pool: &PgPool,
+    name: &str,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<TeamRecord, OkfError> {
     let mut tx = pool.begin().await?;
+    audit::lock_actor(&mut tx, actor).await?;
     let locked = lock_team(&mut tx, name).await?;
     let lifted = sqlx::query(
         "UPDATE teams SET suspended_at = NULL, suspension_notice = NULL \
@@ -527,6 +670,18 @@ pub async fn unsuspend(pool: &PgPool, name: &str) -> Result<TeamRecord, OkfError
     .await?
     .rows_affected();
     if lifted > 0 {
+        record_team(
+            &mut tx,
+            actor,
+            TeamEvent {
+                action: Action::TeamUnsuspended,
+                team: name,
+                person: None,
+                details: serde_json::json!({}),
+            },
+            now,
+        )
+        .await?;
         bump_admin_generation(&mut tx).await?;
     }
     tx.commit().await?;
@@ -574,7 +729,9 @@ struct LockedTeam {
 ///
 /// Lock order: a caller that also needs a user resolves it first
 /// ([`users::id_of`], `FOR KEY SHARE`), because `users::delete` locks the
-/// user and then its personal team.
+/// user and then its personal team. For the same reason a personal team's
+/// user is locked here before the team ([`lock_team_person`]): recording an
+/// entry about the team resolves that person under `FOR KEY SHARE`.
 ///
 /// # Errors
 /// [`OkfError::UnknownName`]; [`OkfError::Database`].
@@ -583,6 +740,7 @@ async fn lock_team(conn: &mut PgConnection, name: &str) -> Result<LockedTeam, Ok
     if !is_valid_name(name) {
         return Err(unknown(name));
     }
+    let person = lock_team_person(conn, name).await?;
     let (id, personal_of) = sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT id, personal_of FROM teams WHERE name = $1 FOR UPDATE",
     )
@@ -590,7 +748,41 @@ async fn lock_team(conn: &mut PgConnection, name: &str) -> Result<LockedTeam, Ok
     .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(|| unknown(name))?;
+    // A team's `personal_of` never changes; a different one means the team
+    // was deleted and another made under its name meanwhile.
+    if personal_of != person {
+        return Err(OkfError::Busy {
+            reason: format!("team {name:?} was replaced while it was being locked"),
+        });
+    }
     Ok(LockedTeam { id, personal_of })
+}
+
+/// Locks the user whose personal team `name` is, if it is one, `FOR KEY
+/// SHARE`, before the caller locks the team: the order `users::delete`
+/// takes them in (the user, then its personal team). Without it, an audit
+/// entry naming the team (whose `audit_teams` row resolves that person)
+/// would lock the user after the team and could deadlock with the user's
+/// deletion.
+///
+/// # Arguments
+/// * `conn` - the caller's transaction.
+/// * `name` - a valid team name.
+///
+/// # Returns
+/// The `users.id` whose personal team it is, or `None` for a shared team
+/// (or no team; the caller's lock then finds none).
+///
+/// # Errors
+/// [`OkfError::Database`].
+async fn lock_team_person(conn: &mut PgConnection, name: &str) -> Result<Option<String>, OkfError> {
+    Ok(sqlx::query_scalar(
+        "SELECT u.id FROM users u WHERE u.id = (SELECT personal_of FROM teams WHERE name = $1) \
+         FOR KEY SHARE",
+    )
+    .bind(name)
+    .fetch_optional(&mut *conn)
+    .await?)
 }
 
 /// The user's role in the team, or `None` if it is not a member.
@@ -682,11 +874,54 @@ pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String,
     if !is_valid_name(name) {
         return Err(unknown(name));
     }
+    // The person before the team, as in `lock_team`: a catalog entry's
+    // teams resolve a personal team's person.
+    lock_team_person(conn, name).await?;
     sqlx::query_scalar("SELECT id FROM teams WHERE name = $1 FOR KEY SHARE")
         .bind(name)
         .fetch_optional(&mut *conn)
         .await?
         .ok_or_else(|| unknown(name))
+}
+
+/// One team event to record: [`record_team`]'s input.
+struct TeamEvent<'a> {
+    /// What happened.
+    action: Action,
+    /// The team's name; it must still exist.
+    team: &'a str,
+    /// The `users.id` the event is also about (a member, the owner).
+    person: Option<&'a str>,
+    /// The entry's details.
+    details: serde_json::Value,
+}
+
+/// Records an entry about a team in the change's transaction: the team is
+/// both the target and the one team the entry belongs to.
+///
+/// # Errors
+/// [`OkfError::Database`] (which fails the change).
+async fn record_team(
+    conn: &mut PgConnection,
+    actor: &AuditActor,
+    event: TeamEvent<'_>,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
+    let team_ref = audit::team_ref(conn, event.team).await?;
+    audit::record(
+        conn,
+        actor,
+        &Entry {
+            action: event.action,
+            target: Target::Team(event.team),
+            person: event.person,
+            teams: &[team_ref],
+            details: event.details,
+        },
+        now,
+    )
+    .await?;
+    Ok(())
 }
 
 /// The error for a team name that names no team.
@@ -727,6 +962,7 @@ mod tests {
                 display_name: "The family",
                 owner: "alice",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await
@@ -764,9 +1000,18 @@ mod tests {
     async fn list_groups_members_by_team() {
         let db = test_db().await;
         family(&db.pool).await;
-        set_member(&db.pool, "family", TEST_USER, Role::Member, now())
-            .await
-            .unwrap();
+        set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: TEST_USER,
+                role: Role::Member,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let teams = list(&db.pool).await.unwrap();
 
@@ -798,6 +1043,7 @@ mod tests {
                 display_name: "",
                 owner: "nobody",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await;
@@ -812,15 +1058,42 @@ mod tests {
         let db = test_db().await;
         family(&db.pool).await;
 
-        let added = set_member(&db.pool, "family", TEST_USER, Role::Member, now())
-            .await
-            .unwrap();
-        let changed = set_member(&db.pool, "family", TEST_USER, Role::Owner, now())
-            .await
-            .unwrap();
-        let same = set_member(&db.pool, "family", TEST_USER, Role::Owner, now())
-            .await
-            .unwrap();
+        let added = set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: TEST_USER,
+                role: Role::Member,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let changed = set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: TEST_USER,
+                role: Role::Owner,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let same = set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: TEST_USER,
+                role: Role::Owner,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             (added, changed, same),
@@ -837,8 +1110,28 @@ mod tests {
         let db = test_db().await;
         family(&db.pool).await;
 
-        let no_team = set_member(&db.pool, "nowhere", TEST_USER, Role::Member, now()).await;
-        let no_user = set_member(&db.pool, "family", "nobody", Role::Member, now()).await;
+        let no_team = set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "nowhere",
+                user: TEST_USER,
+                role: Role::Member,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
+        let no_user = set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: "nobody",
+                role: Role::Member,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         assert!(matches!(
             no_team,
@@ -855,8 +1148,19 @@ mod tests {
         let db = test_db().await;
         family(&db.pool).await;
 
-        let removed = remove_member(&db.pool, "family", "alice").await;
-        let demoted = set_member(&db.pool, "family", "alice", Role::Member, now()).await;
+        let removed =
+            remove_member(&db.pool, "family", "alice", &AuditActor::cli(), Utc::now()).await;
+        let demoted = set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: "alice",
+                role: Role::Member,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         assert!(
             matches!(removed, Err(OkfError::Refused { .. })),
@@ -874,13 +1178,23 @@ mod tests {
         // the team-row lock makes the second see the first's delete.
         let db = test_db().await;
         family(&db.pool).await;
-        set_member(&db.pool, "family", TEST_USER, Role::Owner, now())
-            .await
-            .unwrap();
+        set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: TEST_USER,
+                role: Role::Owner,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
+        let actor = AuditActor::cli();
         let (first, second) = tokio::join!(
-            remove_member(&db.pool, "family", "alice"),
-            remove_member(&db.pool, "family", TEST_USER),
+            remove_member(&db.pool, "family", "alice", &actor, now()),
+            remove_member(&db.pool, "family", TEST_USER, &actor, now()),
         );
 
         assert_eq!(
@@ -900,11 +1214,21 @@ mod tests {
     async fn a_personal_teams_own_user_cannot_be_removed() {
         let db = test_db().await;
         family(&db.pool).await;
-        set_member(&db.pool, "alice", TEST_USER, Role::Owner, now())
-            .await
-            .unwrap();
+        set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "alice",
+                user: TEST_USER,
+                role: Role::Owner,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
-        let removed = remove_member(&db.pool, "alice", "alice").await;
+        let removed =
+            remove_member(&db.pool, "alice", "alice", &AuditActor::cli(), Utc::now()).await;
 
         assert!(
             matches!(removed, Err(OkfError::Refused { .. })),
@@ -916,12 +1240,36 @@ mod tests {
     async fn a_member_is_removed_but_a_non_member_is_refused() {
         let db = test_db().await;
         family(&db.pool).await;
-        set_member(&db.pool, "family", TEST_USER, Role::Member, now())
-            .await
-            .unwrap();
+        set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: TEST_USER,
+                role: Role::Member,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
-        remove_member(&db.pool, "family", TEST_USER).await.unwrap();
-        let again = remove_member(&db.pool, "family", TEST_USER).await;
+        remove_member(
+            &db.pool,
+            "family",
+            TEST_USER,
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let again = remove_member(
+            &db.pool,
+            "family",
+            TEST_USER,
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await;
 
         assert_eq!(find(&db.pool, "family").await.unwrap().members.len(), 1);
         assert!(matches!(again, Err(OkfError::Refused { .. })), "{again:?}");
@@ -932,8 +1280,10 @@ mod tests {
         let db = test_db().await;
         family(&db.pool).await;
 
-        let personal = delete(&db.pool, "alice").await;
-        delete(&db.pool, "family").await.unwrap();
+        let personal = delete(&db.pool, "alice", &AuditActor::cli(), Utc::now()).await;
+        delete(&db.pool, "family", &AuditActor::cli(), Utc::now())
+            .await
+            .unwrap();
 
         assert!(matches!(personal, Err(OkfError::Refused { .. })));
         assert!(matches!(
@@ -951,7 +1301,7 @@ mod tests {
             .await
             .unwrap();
 
-        let refused = delete(&db.pool, "family").await;
+        let refused = delete(&db.pool, "family", &AuditActor::cli(), Utc::now()).await;
 
         assert!(
             matches!(&refused, Err(OkfError::Refused { reason }) if reason.contains("catalog")),
@@ -1002,10 +1352,21 @@ mod tests {
         let pool = db.pool.clone();
         let changing = tokio::spawn(async move {
             match change {
-                Change::SetMember => set_member(&pool, "alice", "alice", Role::Owner, now())
-                    .await
-                    .map(|_| ()),
-                Change::RemoveMember => remove_member(&pool, "alice", "alice").await,
+                Change::SetMember => set_member(
+                    &pool,
+                    &crate::store::teams::Membership {
+                        team: "alice",
+                        user: "alice",
+                        role: Role::Owner,
+                    },
+                    &AuditActor::cli(),
+                    now(),
+                )
+                .await
+                .map(|_| ()),
+                Change::RemoveMember => {
+                    remove_member(&pool, "alice", "alice", &AuditActor::cli(), Utc::now()).await
+                }
             }
         });
         crate::store::catalogs::tests::until_a_lock_is_awaited(&db.pool).await;
@@ -1060,15 +1421,27 @@ mod tests {
             .await
             .unwrap();
 
-        let first = suspend(&db.pool, "family", Some("Contact the operator."), now())
-            .await
-            .unwrap();
+        let first = suspend(
+            &db.pool,
+            "family",
+            Some("Contact the operator."),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let after_first = crate::store::catalogs::admin_generation(&db.pool)
             .await
             .unwrap();
-        let again = suspend(&db.pool, "family", Some("Still paused."), later)
-            .await
-            .unwrap();
+        let again = suspend(
+            &db.pool,
+            "family",
+            Some("Still paused."),
+            &AuditActor::cli(),
+            later,
+        )
+        .await
+        .unwrap();
 
         assert!(after_first > before, "suspending bumps the generation");
 
@@ -1089,15 +1462,22 @@ mod tests {
         let db = test_db().await;
         family(&db.pool).await;
 
-        let blank = suspend(&db.pool, "family", Some("   "), now())
+        let blank = suspend(&db.pool, "family", Some("   "), &AuditActor::cli(), now())
             .await
             .unwrap();
         let long = "x".repeat(MAX_NOTICE_CHARS + 1);
-        let refused = suspend(&db.pool, "family", Some(&long), now()).await;
+        let refused = suspend(&db.pool, "family", Some(&long), &AuditActor::cli(), now()).await;
 
-        let nul = suspend(&db.pool, "family", Some("a\0b"), now()).await;
+        let nul = suspend(&db.pool, "family", Some("a\0b"), &AuditActor::cli(), now()).await;
         let at_limit = "\u{e9}".repeat(MAX_NOTICE_CHARS);
-        let multibyte = suspend(&db.pool, "family", Some(&at_limit), now()).await;
+        let multibyte = suspend(
+            &db.pool,
+            "family",
+            Some(&at_limit),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
 
         assert_eq!(blank.suspension.unwrap().notice, None);
         assert!(
@@ -1138,16 +1518,22 @@ mod tests {
     async fn unsuspend_lifts_and_is_a_no_op_when_active() {
         let db = test_db().await;
         family(&db.pool).await;
-        suspend(&db.pool, "family", None, now()).await.unwrap();
+        suspend(&db.pool, "family", None, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let before = crate::store::catalogs::admin_generation(&db.pool)
             .await
             .unwrap();
 
-        let lifted = unsuspend(&db.pool, "family").await.unwrap();
+        let lifted = unsuspend(&db.pool, "family", &AuditActor::cli(), Utc::now())
+            .await
+            .unwrap();
         let after_lift = crate::store::catalogs::admin_generation(&db.pool)
             .await
             .unwrap();
-        let unchanged = unsuspend(&db.pool, "family").await.unwrap();
+        let unchanged = unsuspend(&db.pool, "family", &AuditActor::cli(), Utc::now())
+            .await
+            .unwrap();
         let after_noop = crate::store::catalogs::admin_generation(&db.pool)
             .await
             .unwrap();
@@ -1162,8 +1548,8 @@ mod tests {
     async fn suspending_an_unknown_team_is_unknown_name() {
         let db = test_db().await;
 
-        let suspended = suspend(&db.pool, "nobody", None, now()).await;
-        let lifted = unsuspend(&db.pool, "nobody").await;
+        let suspended = suspend(&db.pool, "nobody", None, &AuditActor::cli(), now()).await;
+        let lifted = unsuspend(&db.pool, "nobody", &AuditActor::cli(), Utc::now()).await;
 
         assert!(matches!(
             suspended,
@@ -1179,15 +1565,39 @@ mod tests {
     async fn suspended_catalogs_names_each_catalog_of_a_suspended_team() {
         let db = test_db().await;
         family(&db.pool).await;
-        crate::store::catalogs::create(&db.pool, "shared", "", "family", now())
-            .await
-            .unwrap();
-        crate::store::catalogs::create(&db.pool, "mine", "", TEST_USER, now())
-            .await
-            .unwrap();
-        suspend(&db.pool, "family", Some("Paused."), now())
-            .await
-            .unwrap();
+        crate::store::catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "shared",
+                description: "",
+                owner_team: "family",
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        crate::store::catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "mine",
+                description: "",
+                owner_team: TEST_USER,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        suspend(
+            &db.pool,
+            "family",
+            Some("Paused."),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let map = suspended_catalogs(&db.pool).await.unwrap();
 
@@ -1199,5 +1609,481 @@ mod tests {
                 notice: Some("Paused.".to_string()),
             })
         );
+    }
+
+    // ---- The audit log (M14 Task 6b) ----
+
+    use crate::store::audit::testing::entries;
+    use crate::store::audit::{Source, Via};
+    use serde_json::json;
+
+    /// How long a race test waits for a held lock before it fails.
+    const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Creates user `name` (and its personal team of the same name).
+    async fn seed_user(pool: &PgPool, name: &str) {
+        users::create(
+            pool,
+            &NewUser {
+                name,
+                display_name: "",
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Makes `name` an admin user directly, without `users::set_admin`.
+    async fn make_admin(pool: &PgPool, name: &str) {
+        sqlx::query("UPDATE users SET is_admin = true WHERE name = $1")
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A provisioner, as Task 5's keys will set it.
+    fn provisioner() -> AuditActor {
+        AuditActor {
+            provisioner: true,
+            ..AuditActor::cli()
+        }
+    }
+
+    /// The `users.id` of `name`.
+    async fn user_id(pool: &PgPool, name: &str) -> String {
+        sqlx::query_scalar("SELECT id FROM users WHERE name = $1")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A console session of user `name`, as `AuditActor::of` builds it.
+    async fn session_of(pool: &PgPool, name: &str) -> AuditActor {
+        AuditActor {
+            source: Source::Console,
+            user_id: Some(user_id(pool, name).await),
+            label: name.to_string(),
+            via: Via::Session,
+            operator: true,
+            ..AuditActor::cli()
+        }
+    }
+
+    fn membership<'a>(team: &'a str, user: &'a str, role: Role) -> Membership<'a> {
+        Membership { team, user, role }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_records_team_created_with_its_owner() {
+        let db = test_db().await;
+
+        family(&db.pool).await;
+
+        let recorded = entries(&db.pool, "team.created").await;
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].target_kind, "team");
+        assert_eq!(recorded[0].target.as_deref(), Some("family"));
+        assert_eq!(recorded[0].person.as_deref(), Some("alice"));
+        assert_eq!(recorded[0].teams, ["family"]);
+        assert_eq!(recorded[0].details, json!({}));
+        assert_eq!(recorded[0].source, "cli");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_member_records_an_addition_and_a_role_change_and_none_for_no_change() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let actor = AuditActor::cli();
+
+        set_member(
+            &db.pool,
+            &membership("family", TEST_USER, Role::Member),
+            &actor,
+            now(),
+        )
+        .await
+        .unwrap();
+        set_member(
+            &db.pool,
+            &membership("family", TEST_USER, Role::Owner),
+            &actor,
+            now(),
+        )
+        .await
+        .unwrap();
+        let unchanged = set_member(
+            &db.pool,
+            &membership("family", TEST_USER, Role::Owner),
+            &actor,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(unchanged, MemberChange::Unchanged);
+        let added = entries(&db.pool, "team.member_added").await;
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0].target.as_deref(), Some("family"));
+        assert_eq!(added[0].person.as_deref(), Some(TEST_USER));
+        assert_eq!(added[0].teams, ["family"]);
+        assert_eq!(added[0].details, json!({"role": "member", "from": null}));
+        let changed = entries(&db.pool, "team.role_changed").await;
+        assert_eq!(changed.len(), 1, "no entry for no change: {changed:?}");
+        assert_eq!(changed[0].person.as_deref(), Some(TEST_USER));
+        assert_eq!(
+            changed[0].details,
+            json!({"role": "owner", "from": "member"})
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_member_records_one_entry_and_none_when_refused() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let actor = AuditActor::cli();
+        set_member(
+            &db.pool,
+            &membership("family", TEST_USER, Role::Member),
+            &actor,
+            now(),
+        )
+        .await
+        .unwrap();
+
+        remove_member(&db.pool, "family", TEST_USER, &actor, now())
+            .await
+            .unwrap();
+        let not_a_member = remove_member(&db.pool, "family", TEST_USER, &actor, now()).await;
+        let last_owner = remove_member(&db.pool, "family", "alice", &actor, now()).await;
+
+        assert!(matches!(not_a_member, Err(OkfError::Refused { .. })));
+        assert!(matches!(last_owner, Err(OkfError::Refused { .. })));
+        let removed = entries(&db.pool, "team.member_removed").await;
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert_eq!(removed[0].target.as_deref(), Some("family"));
+        assert_eq!(removed[0].person.as_deref(), Some(TEST_USER));
+        assert_eq!(removed[0].teams, ["family"]);
+        assert_eq!(removed[0].details, json!({}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_records_the_team_before_it_goes_and_nothing_when_refused() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let actor = AuditActor::cli();
+
+        let personal = delete(&db.pool, "alice", &actor, now()).await;
+        delete(&db.pool, "family", &actor, now()).await.unwrap();
+
+        assert!(matches!(personal, Err(OkfError::Refused { .. })));
+        let deleted = entries(&db.pool, "team.deleted").await;
+        assert_eq!(deleted.len(), 1, "{deleted:?}");
+        // The team row is gone; its `audit_teams` row keeps the name.
+        assert_eq!(deleted[0].target.as_deref(), Some("family"));
+        assert_eq!(deleted[0].teams, ["family"]);
+        assert_eq!(deleted[0].details, json!({}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suspend_records_each_change_and_nothing_for_a_repeat_or_a_refusal() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let actor = AuditActor::cli();
+        let long = "x".repeat(MAX_NOTICE_CHARS + 1);
+
+        suspend(&db.pool, "family", Some("Paused."), &actor, now())
+            .await
+            .unwrap();
+        let generation = crate::store::catalogs::admin_generation(&db.pool)
+            .await
+            .unwrap();
+        let repeat = suspend(&db.pool, "family", Some(" Paused. "), &actor, now())
+            .await
+            .unwrap();
+        let after_repeat = crate::store::catalogs::admin_generation(&db.pool)
+            .await
+            .unwrap();
+        suspend(&db.pool, "family", Some("Still paused."), &actor, now())
+            .await
+            .unwrap();
+        suspend(&db.pool, "family", Some("   "), &actor, now())
+            .await
+            .unwrap();
+        let nul = suspend(&db.pool, "family", Some("a\0b"), &actor, now()).await;
+        let too_long = suspend(&db.pool, "family", Some(&long), &actor, now()).await;
+        let bad_name = suspend(&db.pool, "fam\0ily", None, &actor, now()).await;
+
+        assert_eq!(
+            repeat.suspension.unwrap().notice.as_deref(),
+            Some("Paused.")
+        );
+        assert_eq!(after_repeat, generation, "a repeat writes nothing");
+        assert!(matches!(nul, Err(OkfError::Refused { .. })), "{nul:?}");
+        assert!(matches!(too_long, Err(OkfError::Refused { .. })));
+        assert!(matches!(bad_name, Err(OkfError::UnknownName { .. })));
+        let suspended = entries(&db.pool, "team.suspended").await;
+        let details: Vec<_> = suspended.iter().map(|entry| &entry.details).collect();
+        assert_eq!(
+            details,
+            [
+                &json!({"notice": true, "already": false}),
+                &json!({"notice": true, "already": true}),
+                &json!({"notice": false, "already": true}),
+            ]
+        );
+        assert_eq!(suspended[0].target.as_deref(), Some("family"));
+        assert_eq!(suspended[0].teams, ["family"]);
+        assert!(
+            !suspended
+                .iter()
+                .any(|e| e.details.to_string().contains("aused")),
+            "never the notice's text"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsuspend_records_a_lift_and_nothing_for_an_active_team() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let actor = AuditActor::cli();
+        suspend(&db.pool, "family", None, &actor, now())
+            .await
+            .unwrap();
+
+        unsuspend(&db.pool, "family", &actor, now()).await.unwrap();
+        unsuspend(&db.pool, "family", &actor, now()).await.unwrap();
+        let bad_name = unsuspend(&db.pool, "fam\0ily", &actor, now()).await;
+
+        assert!(matches!(bad_name, Err(OkfError::UnknownName { .. })));
+        let lifted = entries(&db.pool, "team.unsuspended").await;
+        assert_eq!(lifted.len(), 1, "{lifted:?}");
+        assert_eq!(lifted[0].target.as_deref(), Some("family"));
+        assert_eq!(lifted[0].teams, ["family"]);
+        assert_eq!(lifted[0].details, json!({}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_audit_write_fails_the_team_change() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        crate::http::api::testing::fail_on(&db.pool, "BEFORE INSERT ON audit_entries FOR EACH ROW")
+            .await;
+        let actor = AuditActor::cli();
+
+        let added = set_member(
+            &db.pool,
+            &membership("family", TEST_USER, Role::Member),
+            &actor,
+            now(),
+        )
+        .await;
+        let suspended = suspend(&db.pool, "family", None, &actor, now()).await;
+        let deleted = delete(&db.pool, "family", &actor, now()).await;
+
+        assert!(added.is_err() && suspended.is_err() && deleted.is_err());
+        let team = find(&db.pool, "family").await.unwrap();
+        assert_eq!(team.members.len(), 1, "the addition rolled back");
+        assert_eq!(team.suspension, None, "the suspension rolled back");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provisioner_cannot_make_an_admin_an_owner_or_change_an_admins_membership() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        seed_user(&db.pool, "staff").await;
+        set_member(
+            &db.pool,
+            &membership("family", "staff", Role::Member),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        make_admin(&db.pool, "staff").await;
+        let provisioner = provisioner();
+        let owned_by_staff = NewTeam {
+            name: "ops",
+            display_name: "",
+            owner: "staff",
+        };
+
+        let created = create(&db.pool, &owned_by_staff, &provisioner, now()).await;
+        let promoted = set_member(
+            &db.pool,
+            &membership("family", "staff", Role::Owner),
+            &provisioner,
+            now(),
+        )
+        .await;
+        let removed = remove_member(&db.pool, "family", "staff", &provisioner, now()).await;
+        // A plain user is still the provisioner's to manage.
+        let plain = set_member(
+            &db.pool,
+            &membership("family", TEST_USER, Role::Member),
+            &provisioner,
+            now(),
+        )
+        .await;
+
+        for refused in [created.map(|_| ()), promoted.map(|_| ()), removed] {
+            assert!(
+                matches!(refused, Err(OkfError::Forbidden { .. })),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(plain.unwrap(), MemberChange::Added);
+        assert!(matches!(
+            find(&db.pool, "ops").await,
+            Err(OkfError::UnknownName { .. })
+        ));
+        let members = find(&db.pool, "family").await.unwrap().members;
+        assert!(members.contains(&Member {
+            user: "staff".to_string(),
+            role: Role::Member,
+        }));
+        assert_eq!(
+            entries(&db.pool, "team.created").await.len(),
+            1,
+            "family only"
+        );
+        assert_eq!(entries(&db.pool, "team.role_changed").await.len(), 0);
+        assert_eq!(entries(&db.pool, "team.member_removed").await.len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provisioners_membership_change_waits_for_a_promotion_in_flight() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        seed_user(&db.pool, "staff").await;
+        // A promotion in flight: `users::set_admin` holds the row `FOR UPDATE`.
+        let mut promoting = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM users WHERE name = 'staff' FOR UPDATE")
+            .execute(&mut *promoting)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET is_admin = true WHERE name = 'staff'")
+            .execute(&mut *promoting)
+            .await
+            .unwrap();
+        let pool = db.pool.clone();
+        let adding = tokio::spawn(async move {
+            let staff = membership("family", "staff", Role::Member);
+            set_member(&pool, &staff, &provisioner(), now()).await
+        });
+        tokio::time::timeout(
+            LOCK_WAIT,
+            crate::store::catalogs::tests::until_a_lock_is_awaited(&db.pool),
+        )
+        .await
+        .expect("the provisioner's change waits on the promotion's row lock");
+
+        promoting.commit().await.unwrap();
+        let added = tokio::time::timeout(LOCK_WAIT, adding)
+            .await
+            .expect("the change finishes once the promotion commits")
+            .unwrap();
+
+        // It read the flag after the promotion: refused, not added.
+        assert!(
+            matches!(added, Err(OkfError::Forbidden { .. })),
+            "{added:?}"
+        );
+        assert_eq!(find(&db.pool, "family").await.unwrap().members.len(), 1);
+    }
+
+    /// Which change races a user's deletion (the user's row, then its teams).
+    #[derive(Debug, Clone, Copy)]
+    enum Recorded {
+        /// Suspending alice's personal team: its entry resolves alice.
+        SuspendPersonalTeam,
+        /// Alice's own session changing a membership of `family`, a team she
+        /// is in: its entry resolves her as the actor.
+        MembershipBySession,
+        /// A catalog created for alice's personal team.
+        CatalogForPersonalTeam,
+    }
+
+    /// Holds alice's row `FOR UPDATE`, as `users::delete` takes it first,
+    /// while `change` runs, then takes `team` `FOR UPDATE`, as the deletion
+    /// takes her teams next. A change that locked the team before the user
+    /// would deadlock here; one that waits on the user first lets the
+    /// deletion through.
+    async fn race_with_deleting_alice(change: Recorded) {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let session = session_of(&db.pool, "alice").await;
+        let mut deleting = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM users WHERE name = 'alice' FOR UPDATE")
+            .execute(&mut *deleting)
+            .await
+            .unwrap();
+        let pool = db.pool.clone();
+        let changing = tokio::spawn(async move {
+            match change {
+                Recorded::SuspendPersonalTeam => {
+                    suspend(&pool, "alice", None, &AuditActor::cli(), now())
+                        .await
+                        .map(|_| ())
+                }
+                Recorded::MembershipBySession => {
+                    let member = membership("family", TEST_USER, Role::Member);
+                    set_member(&pool, &member, &session, now())
+                        .await
+                        .map(|_| ())
+                }
+                Recorded::CatalogForPersonalTeam => {
+                    let new = crate::store::catalogs::NewCatalog {
+                        name: "notes",
+                        description: "",
+                        owner_team: "alice",
+                    };
+                    crate::store::catalogs::create(&pool, &new, &AuditActor::cli(), now())
+                        .await
+                        .map(|_| ())
+                }
+            }
+        });
+        tokio::time::timeout(
+            LOCK_WAIT,
+            crate::store::catalogs::tests::until_a_lock_is_awaited(&db.pool),
+        )
+        .await
+        .expect("the change waits on alice's row");
+        let team = match change {
+            Recorded::MembershipBySession => "family",
+            Recorded::SuspendPersonalTeam | Recorded::CatalogForPersonalTeam => "alice",
+        };
+
+        // A deadlock makes Postgres abort one side; the timeout bounds a hang.
+        let team_lock = tokio::time::timeout(
+            LOCK_WAIT,
+            sqlx::query("SELECT id FROM teams WHERE name = $1 FOR UPDATE")
+                .bind(team)
+                .execute(&mut *deleting),
+        )
+        .await
+        .expect("the team lock does not hang");
+        assert!(team_lock.is_ok(), "{change:?}: {team_lock:?}");
+        // The deletion gives up; the change then goes ahead and records.
+        deleting.rollback().await.unwrap();
+        let changed = tokio::time::timeout(LOCK_WAIT, changing)
+            .await
+            .expect("the change finishes")
+            .unwrap();
+        assert!(changed.is_ok(), "{change:?}: {changed:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_change_locks_the_users_it_names_before_the_team() {
+        for change in [
+            Recorded::SuspendPersonalTeam,
+            Recorded::MembershipBySession,
+            Recorded::CatalogForPersonalTeam,
+        ] {
+            race_with_deleting_alice(change).await;
+        }
     }
 }

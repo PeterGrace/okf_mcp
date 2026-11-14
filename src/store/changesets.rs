@@ -623,9 +623,18 @@ mod tests {
     /// Creates catalog `pg` and the keys `alice` and `bob` (the foreign key
     /// `changesets.key_id` needs them), returning the catalog's id.
     async fn setup(pool: &PgPool) -> i64 {
-        let pg = catalogs::create(pool, "pg", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        let pg = catalogs::create(
+            pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         for id in ["alice", "bob"] {
             crate::store::keys::insert_legacy_test_key(
                 pool,
@@ -934,7 +943,16 @@ mod tests {
         });
         ready_rx.await.unwrap();
         let pool = db.pool.clone();
-        let deleting = tokio::spawn(async move { catalogs::delete(&pool, "pg", false).await });
+        let deleting = tokio::spawn(async move {
+            catalogs::delete(
+                &pool,
+                "pg",
+                false,
+                &crate::store::audit::AuditActor::cli(),
+                chrono::Utc::now(),
+            )
+            .await
+        });
         until_a_lock_is_awaited(&db.pool).await;
 
         commit_tx.send(()).unwrap();
@@ -991,9 +1009,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn lock_waits_for_the_holder_and_reads_its_commit() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        let catalog = catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         // `changesets.key_id` is a foreign key: the key needs a row.
         crate::store::keys::insert_legacy_test_key(
             &db.pool,

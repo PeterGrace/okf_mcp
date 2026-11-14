@@ -14,6 +14,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::config::Config;
 use crate::db::pg_support::TestDb;
 use crate::mcp::context::ToolContext;
+use crate::store::audit::AuditActor;
 use crate::store::catalogs;
 use crate::store::changesets::{self, ChangesetRow, EntryRow};
 use crate::store::import::{import, ImportOptions, ImportScope};
@@ -74,14 +75,24 @@ pub(crate) async fn app_at(
 ) -> TestApp {
     let db = crate::db::test_db().await;
     for (name, entries) in catalogs_and_files {
-        catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, imported)
-            .await
-            .expect("create the test catalog");
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: name,
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            imported,
+        )
+        .await
+        .expect("create the test catalog");
         let options = ImportOptions {
             replace: false,
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "tester",
+            audit: &AuditActor::cli(),
             now: imported,
         };
         import(&db.pool, name, files(entries), &options)
@@ -367,15 +378,16 @@ pub(crate) async fn suspend_catalogs(test: &TestApp, catalogs: &[&str]) {
         display_name: "Family",
         owner: crate::db::TEST_USER,
     };
-    crate::store::teams::create(pool, &team, now)
+    let actor = AuditActor::cli();
+    crate::store::teams::create(pool, &team, &actor, now)
         .await
         .expect("create the team to suspend");
     for catalog in catalogs {
-        catalogs::set_owner(pool, catalog, SUSPENDED_TEAM)
+        catalogs::set_owner(pool, catalog, SUSPENDED_TEAM, &actor, now)
             .await
             .expect("move the catalog to the team");
     }
-    crate::store::teams::suspend(pool, SUSPENDED_TEAM, Some(SUSPENSION_NOTICE), now)
+    crate::store::teams::suspend(pool, SUSPENDED_TEAM, Some(SUSPENSION_NOTICE), &actor, now)
         .await
         .expect("suspend the team");
     test.app.poll().await.expect("poll the suspension in");
@@ -386,9 +398,14 @@ pub(crate) async fn suspend_catalogs(test: &TestApp, catalogs: &[&str]) {
 /// # Panics
 /// If the store or the poll fails.
 pub(crate) async fn lift_suspension(test: &TestApp) {
-    crate::store::teams::unsuspend(test.app.pool(), SUSPENDED_TEAM)
-        .await
-        .expect("lift the suspension");
+    crate::store::teams::unsuspend(
+        test.app.pool(),
+        SUSPENDED_TEAM,
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("lift the suspension");
     test.app.poll().await.expect("poll the lift in");
 }
 

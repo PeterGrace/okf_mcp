@@ -26,7 +26,7 @@ use crate::store::ceiling::{self, MemberAccess};
 use crate::store::keys::{self, KeyKind};
 use crate::store::oauth::codes;
 use crate::store::sign_in_events::{self, SignInEvent};
-use crate::store::teams::{self, MemberChange, NewTeam, Role, TeamRecord};
+use crate::store::teams::{self, MemberChange, Membership, NewTeam, Role, TeamRecord};
 use crate::store::unassigned;
 use crate::store::user_sessions::{self, SessionInfo};
 use crate::store::users::{self, NewUser, UserRecord};
@@ -158,8 +158,9 @@ pub(super) async fn user(
 /// # Arguments
 /// * `pool` - the migrated database.
 /// * `command` - which team subcommand.
-/// * `now` - the creation time for `create` and new memberships, and the
-///   suspension time for `suspend` of an active team.
+/// * `now` - the creation time for `create` and new memberships, the
+///   suspension time for `suspend` of an active team, and every audit
+///   entry's time (the actor is the CLI, [`AuditActor::cli`]).
 ///
 /// # Returns
 /// The text to print.
@@ -185,32 +186,37 @@ pub(super) async fn team(
                 display_name: &display_name,
                 owner: &owner,
             };
-            let created = teams::create(pool, &new, now).await?;
+            let created = teams::create(pool, &new, &AuditActor::cli(), now).await?;
             format!("created team {} (owner {owner})\n", created.name)
         }
         TeamCommand::List => lines(teams::list(pool).await?.iter().map(format_team)),
         // `|` matches either variant and binds the same names from both,
         // like two `case` patterns sharing one body.
         TeamCommand::AddMember { team, user, role } | TeamCommand::SetRole { team, user, role } => {
-            let change = teams::set_member(pool, &team, &user, role, now).await?;
+            let membership = Membership {
+                team: &team,
+                user: &user,
+                role,
+            };
+            let change = teams::set_member(pool, &membership, &AuditActor::cli(), now).await?;
             describe_member_change(change, &team, &user, role)
         }
         TeamCommand::RemoveMember { team, user } => {
-            teams::remove_member(pool, &team, &user).await?;
+            teams::remove_member(pool, &team, &user, &AuditActor::cli(), now).await?;
             format!("removed {user} from team {team}\n")
         }
         TeamCommand::Delete { name } => {
-            teams::delete(pool, &name).await?;
+            teams::delete(pool, &name, &AuditActor::cli(), now).await?;
             format!("deleted team {name}\n")
         }
         TeamCommand::Suspend { name, notice } => {
             // `as_deref` turns `Option<String>` into `Option<&str>`, the
             // borrowed form the store takes, without copying the text.
-            teams::suspend(pool, &name, notice.as_deref(), now).await?;
+            teams::suspend(pool, &name, notice.as_deref(), &AuditActor::cli(), now).await?;
             format!("suspended team {name}\n")
         }
         TeamCommand::Unsuspend { name } => {
-            teams::unsuspend(pool, &name).await?;
+            teams::unsuspend(pool, &name, &AuditActor::cli(), now).await?;
             format!("lifted the suspension of team {name}\n")
         }
     })
@@ -255,6 +261,7 @@ pub(super) async fn unassigned(pool: &PgPool) -> anyhow::Result<String> {
 /// * `pool` - the migrated database.
 /// * `catalog` - the catalog's name.
 /// * `team` - the team that owns it from now on.
+/// * `now` - the audit entry's time (server clock).
 ///
 /// # Returns
 /// `catalog C: owner OLD -> NEW`, with `(none)` for a catalog that had no
@@ -262,8 +269,13 @@ pub(super) async fn unassigned(pool: &PgPool) -> anyhow::Result<String> {
 ///
 /// # Errors
 /// An unknown catalog or team, or a database error.
-pub(super) async fn set_owner(pool: &PgPool, catalog: &str, team: &str) -> anyhow::Result<String> {
-    let previous = catalogs::set_owner(pool, catalog, team).await?;
+pub(super) async fn set_owner(
+    pool: &PgPool,
+    catalog: &str,
+    team: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<String> {
+    let previous = catalogs::set_owner(pool, catalog, team, &AuditActor::cli(), now).await?;
     Ok(format!(
         "catalog {catalog}: owner {} -> {team}\n",
         previous.as_deref().unwrap_or("(none)")
@@ -276,6 +288,7 @@ pub(super) async fn set_owner(pool: &PgPool, catalog: &str, team: &str) -> anyho
 /// * `pool` - the migrated database.
 /// * `catalog` - the catalog's name.
 /// * `access` - what the owning team's members may reach from now on.
+/// * `now` - the audit entry's time (server clock).
 ///
 /// # Returns
 /// `catalog C: member access OLD -> NEW`.
@@ -286,8 +299,10 @@ pub(super) async fn set_member_access(
     pool: &PgPool,
     catalog: &str,
     access: MemberAccess,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<String> {
-    let previous = ceiling::set_member_access(pool, catalog, access).await?;
+    let previous =
+        ceiling::set_member_access(pool, catalog, access, &AuditActor::cli(), now).await?;
     Ok(format!(
         "catalog {catalog}: member access {} -> {}\n",
         previous.as_str(),
@@ -526,10 +541,10 @@ mod tests {
             }
             Command::Mail(command) => crate::cli::admin::mail(pool, command, now).await,
             Command::Catalog(CatalogCommand::SetOwner { name, team }) => {
-                set_owner(pool, &name, &team).await
+                set_owner(pool, &name, &team, now).await
             }
             Command::Catalog(CatalogCommand::SetMemberAccess { name, access }) => {
-                set_member_access(pool, &name, access).await
+                set_member_access(pool, &name, access, now).await
             }
             Command::Key(KeyCommand::Assign { id, actor, user }) => {
                 assign_key(pool, &id, actor.as_deref(), &user).await

@@ -1276,9 +1276,18 @@ mod tests {
     async fn maintenance_capability_change_refreshes_cache() {
         use crate::store::{catalogs, keys as key_rows};
         let db = crate::db::test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         let new = key_rows::NewKey {
             name: "reporter",
             access: Access::Read,
@@ -1333,9 +1342,18 @@ mod tests {
     async fn keys_load_from_the_database_and_reload_after_a_revoke() {
         use crate::store::{catalogs, keys as key_rows};
         let db = crate::db::test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         let names = ["pg".to_string()];
         let new = key_rows::NewKey {
             name: "reader",
@@ -1470,13 +1488,38 @@ mod tests {
             display_name: "",
             owner: "alice",
         };
-        teams::create(&db.pool, &team, now).await.unwrap();
-        catalogs::create(&db.pool, "shared", "", "family", now)
-            .await
-            .unwrap();
-        catalogs::create(&db.pool, "solo", "", "alice", now)
-            .await
-            .unwrap();
+        teams::create(
+            &db.pool,
+            &team,
+            &crate::store::audit::AuditActor::cli(),
+            now,
+        )
+        .await
+        .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "shared",
+                description: "",
+                owner_team: "family",
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now,
+        )
+        .await
+        .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "solo",
+                description: "",
+                owner_team: "alice",
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now,
+        )
+        .await
+        .unwrap();
         let names = ["shared".to_string(), "solo".to_string()];
         let new = |name: &'static str, self_issued: bool| key_rows::NewKey {
             name,
@@ -1547,9 +1590,15 @@ mod tests {
 
         // Member access: read-only for the team's members.
         let before = generation().await.unwrap();
-        ceiling::set_member_access(&db.pool, "shared", ceiling::MemberAccess::Read)
-            .await
-            .unwrap();
+        ceiling::set_member_access(
+            &db.pool,
+            "shared",
+            ceiling::MemberAccess::Read,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(generation().await.unwrap(), before + 1);
         assert_eq!(
             level(&mine.key, "shared"),
@@ -1573,9 +1622,15 @@ mod tests {
         assert_eq!(level(&mine.key, "shared"), Some(Access::Write));
 
         // A new owner the user is not in: the catalog leaves her ceiling.
-        catalogs::set_owner(&db.pool, "solo", crate::db::TEST_TEAM)
-            .await
-            .unwrap();
+        catalogs::set_owner(
+            &db.pool,
+            "solo",
+            crate::db::TEST_TEAM,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         app.poll().await.unwrap();
         assert_eq!(level(&mine.key, "solo"), None);
         assert_eq!(
@@ -1773,9 +1828,18 @@ mod tests {
         use crate::store::{catalogs, keys as key_rows};
         let db = crate::db::test_db().await;
         for name in ["main", "other"] {
-            catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, Utc::now())
-                .await
-                .unwrap();
+            catalogs::create(
+                &db.pool,
+                &crate::store::catalogs::NewCatalog {
+                    name: name,
+                    description: "",
+                    owner_team: crate::db::TEST_TEAM,
+                },
+                &crate::store::audit::AuditActor::cli(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
         }
         let names = ["main".to_string()];
         let new = key_rows::NewKey {
@@ -1794,9 +1858,15 @@ mod tests {
             .await
             .unwrap()
             .key;
-        teams::suspend(&db.pool, crate::db::TEST_TEAM, Some("Paused."), Utc::now())
-            .await
-            .unwrap();
+        teams::suspend(
+            &db.pool,
+            crate::db::TEST_TEAM,
+            Some("Paused."),
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
 
         let keys = Keys::load(&db.pool, Arc::new(crate::clock::SystemClock))
             .await
@@ -1813,9 +1883,14 @@ mod tests {
             Err(OkfError::Suspended { ref notice, .. }) if notice.as_deref() == Some("Paused.")
         ));
 
-        teams::unsuspend(&db.pool, crate::db::TEST_TEAM)
-            .await
-            .unwrap();
+        teams::unsuspend(
+            &db.pool,
+            crate::db::TEST_TEAM,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         keys.reload(&db.pool).await.unwrap();
         let writer = keys.find(&secret).expect("the key is live");
 

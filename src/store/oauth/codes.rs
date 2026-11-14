@@ -702,9 +702,18 @@ mod tests {
     async fn with_catalogs(names: &[&str]) -> TestDb {
         let db = test_db().await;
         for name in names {
-            catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, now())
-                .await
-                .unwrap();
+            catalogs::create(
+                &db.pool,
+                &crate::store::catalogs::NewCatalog {
+                    name: name,
+                    description: "",
+                    owner_team: crate::db::TEST_TEAM,
+                },
+                &crate::store::audit::AuditActor::cli(),
+                now(),
+            )
+            .await
+            .unwrap();
         }
         db
     }
@@ -1127,7 +1136,15 @@ mod tests {
         .await
         .unwrap();
 
-        catalogs::delete(&db.pool, "main", true).await.unwrap();
+        catalogs::delete(
+            &db.pool,
+            "main",
+            true,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
 
         // Deleting the catalog cascades to the code's grants and clears its default.
         let listed = list(&db.pool).await.unwrap().remove(0);
@@ -1246,9 +1263,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prune_deletes_only_old_unredeemed_codes() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "main",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let client = insert_client(
             &db.pool,
             "https://client.example.com/client.json",

@@ -411,6 +411,34 @@ pub async fn record(
     .await?)
 }
 
+/// Takes the acting user's row `FOR KEY SHARE` for the rest of the
+/// transaction, as [`record`] will when it resolves the actor: call it
+/// first in a change's transaction, so the user row is locked before any
+/// team, catalog or changeset row (`tools/agentic/lessons.md`: the user row
+/// first). Recording the actor only at the end would lock the user last,
+/// and a deletion of that user (the user, then its teams and changesets)
+/// could deadlock with the change. Nothing for an actor with no user (the
+/// CLI, the system, a legacy key).
+///
+/// # Arguments
+/// * `conn` - the change's transaction (`&mut tx`).
+/// * `actor` - who.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn lock_actor(conn: &mut PgConnection, actor: &AuditActor) -> Result<(), OkfError> {
+    // `if let` runs the block only for `Some`, binding the id inside it.
+    if let Some(user_id) = &actor.user_id {
+        // No row (the user was deleted meanwhile) is not an error here:
+        // `record` then stores no person for it (plan Decision 21).
+        sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR KEY SHARE")
+            .bind(user_id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
 /// How entries name a team: its `audit_teams` id, which follows the team's
 /// immutable `teams.id`, so a later team with the same name is another id.
 ///
@@ -776,12 +804,18 @@ mod tests {
             display_name: "",
             owner: TEST_USER,
         };
-        teams::create(&db.pool, &family, now()).await.unwrap();
+        teams::create(&db.pool, &family, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let mut tx = db.pool.begin().await.unwrap();
         let first = team_ref(&mut tx, "family").await.unwrap();
         tx.commit().await.unwrap();
-        teams::delete(&db.pool, "family").await.unwrap();
-        teams::create(&db.pool, &family, now()).await.unwrap();
+        teams::delete(&db.pool, "family", &AuditActor::cli(), Utc::now())
+            .await
+            .unwrap();
+        teams::create(&db.pool, &family, &AuditActor::cli(), now())
+            .await
+            .unwrap();
 
         let mut tx = db.pool.begin().await.unwrap();
         let second = team_ref(&mut tx, "family").await.unwrap();
@@ -1135,12 +1169,16 @@ mod tests {
             display_name: "",
             owner: TEST_USER,
         };
-        teams::create(&db.pool, &family, now()).await.unwrap();
+        teams::create(&db.pool, &family, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let staff = NewTeam {
             name: "staff",
             ..family
         };
-        teams::create(&db.pool, &staff, now()).await.unwrap();
+        teams::create(&db.pool, &staff, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let mine = store_catalog(&db.pool, "mine", Some(TEST_TEAM)).await;
         let mine_too = store_catalog(&db.pool, "mine-too", Some(TEST_TEAM)).await;
         let theirs = store_catalog(&db.pool, "theirs", Some("family")).await;

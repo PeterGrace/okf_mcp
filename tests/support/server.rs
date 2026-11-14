@@ -144,14 +144,24 @@ impl TestServer {
         let db = TestDb::start_migrated().await;
         migrate_with_owner(&db.pool).await;
         for (name, files) in catalogs_and_files {
-            catalogs::create(&db.pool, name, "", OWNER, Utc::now())
-                .await
-                .expect("create catalog");
+            catalogs::create(
+                &db.pool,
+                &okf_mcp::store::catalogs::NewCatalog {
+                    name: name,
+                    description: "",
+                    owner_team: OWNER,
+                },
+                &okf_mcp::store::audit::AuditActor::cli(),
+                Utc::now(),
+            )
+            .await
+            .expect("create catalog");
             let options = ImportOptions {
                 replace: false,
                 scope: ImportScope::Everything,
                 expect_generation: None,
                 actor: "tester",
+                audit: &okf_mcp::store::audit::AuditActor::cli(),
                 now: Utc::now(),
             };
             import(&db.pool, name, files, &options)

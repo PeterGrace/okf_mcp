@@ -17,6 +17,7 @@ use crate::auth::Principal;
 use crate::error::OkfError;
 use crate::http::{timeout_layer, AppError, REQUEST_TIMEOUT};
 use crate::mcp::blocking;
+use crate::store::audit::AuditActor;
 use crate::store::export::export;
 use crate::store::import::{import, ImportOptions, ImportScope};
 use crate::store::keys::Access;
@@ -155,6 +156,7 @@ struct ImportQuery {
 /// # Arguments
 /// * `app` - the shared state.
 /// * `principal` - the caller, from the auth layer.
+/// * `actor` - the caller, as the audit log's `catalog.imported` records it.
 /// * `name` - the catalog, from the path.
 /// * `query` - the import options.
 /// * `request` - the rest of the request: its body is the tarball.
@@ -174,6 +176,7 @@ struct ImportQuery {
 async fn import_catalog(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(name): Path<String>,
     Query(query): Query<ImportQuery>,
     // The whole request, unread, must come last: reading its body consumes
@@ -215,6 +218,7 @@ async fn import_catalog(
         },
         expect_generation: query.expect_generation,
         actor: &principal.actor,
+        audit: &actor,
         now: app.clock().now(),
     };
     let report = import(app.pool(), &name, files, &options)

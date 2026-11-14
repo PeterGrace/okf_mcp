@@ -965,12 +965,6 @@ async fn discard_open_changesets(
 /// # Errors
 /// [`OkfError::UnknownName`] (a malformed name included);
 /// [`OkfError::Database`].
-// Task 6b's provisioner guards call it; until then only the tests do.
-// `expect` (unlike `allow`) warns once it is used, so the line goes then.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "M14 Task 6b's guards are its first callers")
-)]
 pub(crate) async fn id_and_admin_of(
     conn: &mut PgConnection,
     name: &str,
@@ -999,9 +993,18 @@ pub(crate) mod tests {
 
     /// Gives `team` a catalog, `shared`.
     pub(crate) async fn seed_catalog_owned_by(pool: &PgPool, team: &str) {
-        catalogs::create(pool, "shared", "", team, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "shared",
+                description: "",
+                owner_team: team,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
     }
 
     /// Makes catalog `shared` belong to the team named `$1`, by writing
@@ -1435,9 +1438,14 @@ pub(crate) mod tests {
     async fn a_user_name_taken_by_a_team_is_refused() {
         let db = test_db().await;
         create(&db.pool, &alice(), now()).await.unwrap();
-        teams::create(&db.pool, &family_owned_by_alice(), now())
-            .await
-            .unwrap();
+        teams::create(
+            &db.pool,
+            &family_owned_by_alice(),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let clash = create(
             &db.pool,
@@ -1482,9 +1490,14 @@ pub(crate) mod tests {
         create(&db.pool, &alice(), now()).await.unwrap();
         let mut tx = db.pool.begin().await.unwrap();
         check_free(&mut tx, "family").await.unwrap();
-        teams::create(&db.pool, &family_owned_by_alice(), now())
-            .await
-            .unwrap();
+        teams::create(
+            &db.pool,
+            &family_owned_by_alice(),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let inserted = sqlx::query_scalar::<_, String>(
             "INSERT INTO teams (name, created_at) VALUES ('family', now()) RETURNING id",
@@ -1510,9 +1523,10 @@ pub(crate) mod tests {
         let team = family_owned_by_alice();
 
         // `tokio::join!` runs both futures concurrently, like `asyncio.gather`.
+        let actor = AuditActor::cli();
         let (made_user, made_team) = tokio::join!(
             create(&db.pool, &user, now()),
-            teams::create(&db.pool, &team, now()),
+            teams::create(&db.pool, &team, &actor, now()),
         );
 
         let refused = [made_user.is_err(), made_team.is_err()];
@@ -1635,10 +1649,21 @@ pub(crate) mod tests {
             display_name: "",
             owner: crate::db::TEST_USER,
         };
-        teams::create(&db.pool, &family, now()).await.unwrap();
-        teams::set_member(&db.pool, "family", "alice", teams::Role::Member, now())
+        teams::create(&db.pool, &family, &AuditActor::cli(), now())
             .await
             .unwrap();
+        teams::set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: "alice",
+                role: teams::Role::Member,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         seed_catalog_owned_by(&db.pool, "family").await;
         key_for(&db.pool, "alice", "alice-laptop", false).await;
         key_for(&db.pool, "alice", "alice-old", true).await;
@@ -1777,16 +1802,26 @@ pub(crate) mod tests {
         seed_user(&db.pool, "alice", None).await;
         seed_catalog_owned_by(&db.pool, "alice").await;
         let owns = delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await;
-        catalogs::delete(&db.pool, "shared", true).await.unwrap();
-        teams::create(&db.pool, &family_owned_by_alice(), now())
+        catalogs::delete(&db.pool, "shared", true, &AuditActor::cli(), Utc::now())
             .await
             .unwrap();
+        teams::create(
+            &db.pool,
+            &family_owned_by_alice(),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let sole = delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await;
         teams::set_member(
             &db.pool,
-            "family",
-            crate::db::TEST_USER,
-            teams::Role::Owner,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: crate::db::TEST_USER,
+                role: teams::Role::Owner,
+            },
+            &AuditActor::cli(),
             now(),
         )
         .await
@@ -1863,9 +1898,18 @@ pub(crate) mod tests {
         // and holds its commit while the delete runs.
         let db = test_db().await;
         create(&db.pool, &alice(), now()).await.unwrap();
-        catalogs::create(&db.pool, "shared", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "shared",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let mut assigning = db.pool.begin().await.unwrap();
         sqlx::query(OWN_SHARED)
             .bind("alice")
