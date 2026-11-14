@@ -326,3 +326,342 @@ async fn a_grant_a_code_and_a_catalog_are_assigned_from_the_unassigned_view() {
     let owned = teams::find(pool, "family").await.expect("read the team");
     assert_eq!(owned.catalogs, ["orphan"]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_team_is_suspended_with_a_notice_shown_on_its_catalogs_then_lifted() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/teams");
+        ui.click(&format!("[data-test=team-{OWNER}]"));
+        ui.fill(
+            "#team-suspend-form textarea[name=notice]",
+            "Paused for review.",
+        );
+        ui.click("#team-suspend");
+        ui.click("#confirm-ok");
+        ui.wait_text("#toasts", &format!("Suspended team {OWNER}."));
+        ui.wait_text("#team-suspension", "Paused for review.");
+        ui.wait_visible(&format!("[data-test=team-suspended-{OWNER}]"));
+        ui.click("#drawer-close");
+        // Its catalog is marked, with the notice as the pill's title.
+        ui.open("/catalogs");
+        ui.wait_visible("[data-test=catalog-suspended-main]");
+        assert_eq!(
+            ui.eval(
+                "() => document.querySelector('[data-test=catalog-suspended-main]').title",
+                json!(null)
+            ),
+            json!("Paused for review.")
+        );
+        ui.open("/teams");
+        ui.click(&format!("[data-test=team-{OWNER}]"));
+        ui.click("#team-unsuspend");
+        ui.wait_text(
+            "#toasts",
+            &format!("Lifted the suspension of team {OWNER}."),
+        );
+        ui.wait_hidden(&format!("[data-test=team-suspended-{OWNER}]"));
+        // Suspended without a notice: no notice paragraph, and never the
+        // text "null" (core/dom.js, issue #302).
+        ui.click("#team-suspend");
+        ui.click("#confirm-ok");
+        ui.wait_text("#team-suspension", "Suspended since");
+        ui.wait_hidden("#team-suspension-notice");
+        ui.wait_text_gone("#team-suspension", "null");
+        ui.wait_visible(&format!("[data-test=team-suspended-{OWNER}]"));
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let team = teams::find(&server.db.pool, OWNER)
+        .await
+        .expect("read the team");
+    let suspension = team.suspension.expect("suspended again");
+    assert_eq!(suspension.notice, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_sees_the_notice_on_browse_with_a_link_to_export() {
+    let server = server().await;
+    let reader = server
+        .key("member-reader", Access::Read, &["main"], Some("main"))
+        .await;
+    teams::suspend(
+        &server.db.pool,
+        OWNER,
+        Some("Paused for review."),
+        Utc::now(),
+    )
+    .await
+    .expect("suspend the owner team");
+    server.app.poll().await.expect("poll");
+    drive(server.base.clone(), move |ui| {
+        ui.login(&reader);
+        ui.open("/browse/main");
+        ui.wait_visible("#browse-suspended");
+        ui.wait_text("#browse-suspended", "Paused for review.");
+        // The 403's own message is toasted, not "cannot do this".
+        ui.wait_text("#toasts", "is suspended");
+        ui.wait_text_gone("#toasts", "cannot do this");
+        // Export still works from the page the notice links to.
+        ui.click("#browse-suspended a[href='#/transfer/main']");
+        ui.wait_visible("#export-btn");
+        ui.click("#export-btn");
+        ui.wait_visible("#export-link");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspension_write_runs_once_and_settles_in_a_reopened_drawer() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let team_row = format!("[data-test=team-{OWNER}]");
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/teams");
+        ui.click(&team_row);
+        // Suspend, holding the write: Suspend is disabled while it runs,
+        // and in the drawer closed and opened again meanwhile too.
+        ui.fill("#team-suspend-form textarea[name=notice]", "Held.");
+        ui.hold_next("PUT", "/suspension");
+        ui.click("#team-suspend");
+        ui.click("#confirm-ok");
+        ui.wait_visible("#team-suspend[disabled]");
+        ui.click("#drawer-close");
+        ui.click(&team_row);
+        ui.wait_visible("#team-suspend-form textarea[disabled]");
+        assert!(
+            ui.click_twice("#team-suspend"),
+            "the reopened Suspend is not disabled"
+        );
+        assert_eq!(ui.held_matches(), 1, "a second suspend was sent");
+        // Once it settles, the reopened drawer shows the suspension.
+        ui.release_held();
+        ui.wait_text("#team-suspension-notice", "Held.");
+        ui.wait_visible("#team-unsuspend:not([disabled])");
+        // Lift, held: a double click sends one request, and so does the
+        // button of the drawer opened again while it runs.
+        ui.hold_next("PUT", "/suspension");
+        assert!(ui.click_twice("#team-unsuspend"));
+        assert_eq!(ui.held_matches(), 1, "a second lift was sent");
+        ui.mark("#team-unsuspend");
+        ui.click("#drawer-close");
+        ui.click(&team_row);
+        ui.wait_redrawn("#team-unsuspend");
+        assert!(
+            ui.click_twice("#team-unsuspend"),
+            "the redrawn Lift is not disabled"
+        );
+        assert_eq!(ui.held_matches(), 1, "the redrawn Lift sent a second lift");
+        ui.release_held();
+        ui.wait_text(
+            "#toasts",
+            &format!("Lifted the suspension of team {OWNER}."),
+        );
+        ui.wait_visible("#team-suspend:not([disabled])");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let team = teams::find(&server.db.pool, OWNER)
+        .await
+        .expect("read the team");
+    assert_eq!(team.suspension, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_lift_keeps_its_reason_and_a_late_read_never_draws_over_a_newer_one() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    teams::suspend(&server.db.pool, OWNER, Some("Paused."), Utc::now())
+        .await
+        .expect("suspend the owner team");
+    server.app.poll().await.expect("poll");
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/teams");
+        ui.click(&format!("[data-test=team-{OWNER}]"));
+        ui.wait_visible("#team-unsuspend:not([disabled])");
+        // Refused, and reading the team again fails too: the reason shows,
+        // the drawer is marked out of date, and Lift can be tried again.
+        // No console control gets a full admin's lift refused, so the
+        // page's fetch answers this one.
+        let team_path = format!("/teams/{OWNER}");
+        ui.fail_next("PUT", "/suspension", 409, "refused by the test");
+        ui.fail_next("GET", &team_path, 503, "the server is unavailable");
+        ui.click("#team-unsuspend");
+        ui.wait_visible("#team-stale");
+        ui.wait_visible("#team-suspension-error");
+        ui.wait_text("#team-suspension-error", "refused by the test");
+        ui.wait_visible("#team-unsuspend:not([disabled])");
+        // Refused again, and its read answers late, after a lift that
+        // succeeded: the late answer (still suspended) is dropped.
+        ui.fail_next("PUT", "/suspension", 409, "refused again");
+        ui.hold_answer("GET", &team_path, || ui.click("#team-unsuspend"));
+        ui.click("#team-unsuspend");
+        ui.wait_text(
+            "#toasts",
+            &format!("Lifted the suspension of team {OWNER}."),
+        );
+        ui.wait_visible("#team-suspend-form");
+        ui.wait_hidden("#team-stale");
+        ui.wait_hidden("#team-suspension-error");
+        ui.release_held();
+        // release_held gave the page time to draw the late answer.
+        let section = ui.text("#team-suspension");
+        assert!(
+            section.contains("Active") && !section.contains("Suspended since"),
+            "the late read drew the team as suspended: {section}"
+        );
+        assert!(!ui.text("#drawer").contains("refused again"));
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let team = teams::find(&server.db.pool, OWNER)
+        .await
+        .expect("read the team");
+    assert_eq!(team.suspension, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_written_suspension_shows_when_reading_the_users_again_fails() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/teams");
+        ui.click(&format!("[data-test=team-{OWNER}]"));
+        // The suspend succeeds, and the drawer's read of the users after it
+        // fails: the drawer shows the suspension the PUT answered, noting
+        // only that the users may be out of date.
+        ui.fill("#team-suspend-form textarea[name=notice]", "Paused.");
+        ui.fail_next("GET", "/api/v1/users", 503, "the server is unavailable");
+        ui.click("#team-suspend");
+        ui.click("#confirm-ok");
+        ui.wait_text("#toasts", &format!("Suspended team {OWNER}."));
+        ui.wait_text("#team-suspension-notice", "Paused.");
+        ui.wait_visible("#team-unsuspend:not([disabled])");
+        ui.wait_visible("#team-stale");
+        ui.wait_text("#team-stale", "users");
+        // The same for a lift.
+        ui.fail_next("GET", "/api/v1/users", 503, "the server is unavailable");
+        ui.click("#team-unsuspend");
+        ui.wait_text(
+            "#toasts",
+            &format!("Lifted the suspension of team {OWNER}."),
+        );
+        ui.wait_visible("#team-suspend-form");
+        ui.wait_visible("#team-stale");
+        // The next good read clears the note.
+        ui.click("#drawer-close");
+        ui.click(&format!("[data-test=team-{OWNER}]"));
+        ui.wait_visible("#team-suspend-form");
+        ui.wait_hidden("#team-stale");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let team = teams::find(&server.db.pool, OWNER)
+        .await
+        .expect("read the team");
+    assert_eq!(team.suspension, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_writes_late_list_read_never_redraws_over_a_newer_write() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let team_row = format!("[data-test=team-{OWNER}]");
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/teams");
+        ui.click(&team_row);
+        // The suspend succeeds; the list read after it answers late.
+        ui.fill("#team-suspend-form textarea[name=notice]", "First.");
+        ui.hold_answer("GET", "/api/v1/teams", || {
+            ui.click("#team-suspend");
+            ui.click("#confirm-ok");
+        });
+        // Meanwhile the drawer is opened again (it reads the suspension),
+        // and a lift succeeds and is drawn.
+        ui.click("#drawer-close");
+        ui.click(&team_row);
+        ui.wait_visible("#team-unsuspend:not([disabled])");
+        ui.click("#team-unsuspend");
+        ui.wait_text(
+            "#toasts",
+            &format!("Lifted the suspension of team {OWNER}."),
+        );
+        ui.wait_visible("#team-suspend-form");
+        // The suspend's late list answer must not redraw it as suspended.
+        ui.release_held();
+        let section = ui.text("#team-suspension");
+        assert!(
+            section.contains("Active") && !section.contains("Suspended since"),
+            "the older suspend redrew the drawer: {section}"
+        );
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let team = teams::find(&server.db.pool, OWNER)
+        .await
+        .expect("read the team");
+    assert_eq!(team.suspension, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_settling_for_one_team_never_cancels_opening_another() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let family = NewTeam {
+        name: "family",
+        display_name: "",
+        owner: OWNER,
+    };
+    teams::create(&server.db.pool, &family, Utc::now())
+        .await
+        .expect("create a second team");
+    server.app.poll().await.expect("poll");
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/teams");
+        ui.click(&format!("[data-test=team-{OWNER}]"));
+        // A's suspend is held; A's drawer is closed, and B's drawer is
+        // asked for with its read held too.
+        ui.hold_next("PUT", "/suspension");
+        ui.click("#team-suspend");
+        ui.click("#confirm-ok");
+        ui.eval(
+            "() => { window.releaseFirst = window.releaseHeld; }",
+            json!(null),
+        );
+        ui.click("#drawer-close");
+        ui.hold_next("GET", "/teams/family");
+        ui.click("[data-test=team-family]");
+        // A's suspend settles first, then B's read answers: B opens.
+        ui.eval("() => window.releaseFirst()", json!(null));
+        ui.wait_text("#toasts", &format!("Suspended team {OWNER}."));
+        ui.release_held();
+        ui.wait_visible("#drawer");
+        ui.wait_text("#drawer-title", "family");
+        ui.wait_visible("#team-suspend-form");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let team = teams::find(&server.db.pool, OWNER)
+        .await
+        .expect("read the team");
+    assert!(team.suspension.is_some());
+}
