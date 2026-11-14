@@ -20,4 +20,4 @@
 
 - `0014_audit_row_locks.sql` was already shipped and is unchanged. Provisioner uses `0015`; downstream unlock and maintenance migrations remain `0016` and `0017`.
 - The allow-list reserves `GET /api/v1/audit`; Task 8a supplies the reader and limits provisioners to their own entries.
-- No claims ledger or claims MCP server is available; use a fresh read-only, different-model claims audit and record its results in the PR.
+- A fresh read-only GPT-6.1 Terra audit reconciled claims against source and own gate logs; no claims MCP server or ledger is available. The PR reports two plan/spec questions to the coordinator: server-wide team management includes admin personal teams, and metadata reads/no-ops/refusals have no use-log entry despite the spec's broader “every use” wording. No follow-up issue was created.

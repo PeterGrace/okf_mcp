@@ -743,8 +743,12 @@ or an OAuth grant. Scoped admins cannot manage a provisioner key.
 Protect it like an admin key: it can take over any non-admin account by changing
 its email and sending a setup link. It cannot act on admin users: lookup leaves
 them out, detail refuses them, and mutations check the live flag under the user
-row lock. User detail never shows keys or sign-in codes to a provisioner. Every
-administrative change is audited with its key as actor.
+row lock. User detail never shows key, grant or sign-in-code lists to a
+provisioner; the user view retains their aggregate count. Administrative state
+changes are audited with its key as actor; metadata reads, unchanged operations
+and refusals do not themselves create use-log entries. Team and catalog
+management remains server-wide, as the allow-list specifies; the admin-target
+refusal applies to named user operations and membership/initial-owner targets.
 
 The explicit allow-list has these 16 method/template pairs (adding a new route
 does not add permission):
