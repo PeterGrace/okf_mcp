@@ -9,6 +9,7 @@ use okf_mcp::mail::queue;
 use okf_mcp::mail::Template;
 use okf_mcp::store::keys::Access;
 use okf_mcp::store::settings::{self, SettingKey};
+use rustwright::GotoOptions;
 use serde_json::json;
 
 use crate::harness::{drive, Ui};
@@ -296,4 +297,58 @@ async fn a_late_queue_read_never_draws_over_a_newer_one() {
         .find(|mail| mail.id == failed_id)
         .expect("the mail is still queued (no worker runs here)");
     assert_eq!(mail.status, "pending");
+}
+
+/// Waits until the tab title is `want`.
+///
+/// # Panics
+/// When it is still something else after 10 seconds.
+fn wait_title(ui: &Ui, want: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let title = ui.eval("() => document.title", json!(null));
+        if title == json!(want) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the title stayed {title}, not {want:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_product_name_set_on_the_settings_page_brands_the_console() {
+    let server = login_server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let ran = drive(console_base(&server), move |ui| {
+        ui.login(&admin);
+        ui.wait_text(".brand-block .brand", "okf");
+        wait_title(ui, "okf console");
+        ui.click("a[data-nav=settings]");
+        ui.wait_text("[data-test=setting-source-product_name]", "default");
+        ui.fill("[data-test=setting-input-product_name]", "Acme Notes");
+        ui.click("[data-test=setting-save-product_name]");
+        ui.wait_text("[data-test=setting-source-product_name]", "override");
+        // The shell follows the save without a reload.
+        ui.wait_text(".brand-block .brand", "Acme Notes");
+        wait_title(ui, "Acme Notes console");
+        // A fresh load reads it at boot, on the login card too.
+        ui.mark(".brand-block .brand");
+        ui.page.reload(GotoOptions::default()).expect("reload");
+        ui.wait_redrawn(".brand-block .brand");
+        ui.wait_text(".brand-block .brand", "Acme Notes");
+        ui.wait_text("#login .brand", "Acme Notes");
+        wait_title(ui, "Acme Notes console");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let brand = settings::load(&server.db.pool, &AuthConfig::default())
+        .await
+        .expect("load settings")
+        .brand();
+    assert_eq!(brand.product_name, "Acme Notes");
 }

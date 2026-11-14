@@ -5,7 +5,7 @@ import { api, ApiError, authHeaders, setUnauthorizedHandler } from './core/api.j
 import { start, route } from './core/router.js';
 import { closeDrawer } from './core/drawer.js';
 import { toast } from './core/toast.js';
-import { refreshIdentity, refreshUnassigned, setSignedOutHandler } from './core/shell.js';
+import { applyBrand, refreshIdentity, refreshUnassigned, setSignedOutHandler } from './core/shell.js';
 import { refreshFindingsBadge } from './pages/findings.js';
 
 // Surface script errors and CSP violations as console errors: the browser
@@ -163,4 +163,6 @@ async function boot() {
 }
 
 applyTheme(store.theme);
+// Not awaited: the brand never holds up signing in.
+applyBrand();
 boot();

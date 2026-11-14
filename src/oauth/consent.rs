@@ -17,6 +17,7 @@ use crate::http::pages;
 pub(crate) use crate::http::pages::escape;
 use crate::store::ceiling::Ceiling;
 use crate::store::keys::Access;
+use crate::store::settings::Brand;
 
 /// What every page shows about the request.
 // `Debug` by hand: the pending id and the CSRF token never reach a log.
@@ -91,13 +92,21 @@ pub(crate) fn content_security_policy(redirect_origin: Option<&str>) -> String {
     )
 }
 
-/// A consent page: [`pages::page`] with [`content_security_policy`].
-fn page(status: StatusCode, title: &str, body: &str, redirect_origin: Option<&str>) -> Response {
+/// A consent page: [`pages::page`] with [`content_security_policy`],
+/// branded with `brand`.
+fn page(
+    status: StatusCode,
+    title: &str,
+    body: &str,
+    redirect_origin: Option<&str>,
+    brand: &Brand,
+) -> Response {
     pages::page(
         status,
         title,
         body,
         &content_security_policy(redirect_origin),
+        brand,
     )
 }
 
@@ -171,15 +180,17 @@ pub(crate) fn code_page_html(view: &PageView, error: Option<&str>) -> String {
 /// # Arguments
 /// * `view` - the request.
 /// * `error` - a message from a failed attempt, if any.
+/// * `brand` - the product name and support contact.
 ///
 /// # Returns
 /// 200 with the page.
-pub fn code_page(view: &PageView, error: Option<&str>) -> Response {
+pub fn code_page(view: &PageView, error: Option<&str>, brand: &Brand) -> Response {
     page(
         StatusCode::OK,
         "Connect a client",
         &code_page_html(view, error),
         Some(&view.redirect_origin),
+        brand,
     )
 }
 
@@ -243,15 +254,22 @@ pub(crate) fn summary_page_html(
 /// * `grant` - what the sign-in code grants.
 /// * `summary_nonce` - this summary's token, rendered as the hidden
 ///   `summary` input that binds its Approve to the code it shows.
+/// * `brand` - the product name and support contact.
 ///
 /// # Returns
 /// 200 with the page.
-pub fn summary_page(view: &PageView, grant: &GrantSummary, summary_nonce: &str) -> Response {
+pub fn summary_page(
+    view: &PageView,
+    grant: &GrantSummary,
+    summary_nonce: &str,
+    brand: &Brand,
+) -> Response {
     page(
         StatusCode::OK,
         "Allow access?",
         &summary_page_html(view, grant, summary_nonce),
         Some(&view.redirect_origin),
+        brand,
     )
 }
 
@@ -385,15 +403,22 @@ pub(crate) fn user_page_html(view: &PageView, user: &UserPage<'_>, error: Option
 /// * `view` - the request.
 /// * `user` - the user, ceiling, nonce and link.
 /// * `error` - a message from a refused choice, if any.
+/// * `brand` - the product name and support contact.
 ///
 /// # Returns
 /// 200 with the page.
-pub fn user_page(view: &PageView, user: &UserPage<'_>, error: Option<&str>) -> Response {
+pub fn user_page(
+    view: &PageView,
+    user: &UserPage<'_>,
+    error: Option<&str>,
+    brand: &Brand,
+) -> Response {
     page(
         StatusCode::OK,
         "Allow access?",
         &user_page_html(view, user, error),
         Some(&view.redirect_origin),
+        brand,
     )
 }
 
@@ -418,11 +443,18 @@ pub(crate) fn error_page_html(message: &str) -> String {
 /// # Arguments
 /// * `status` - the HTTP status.
 /// * `message` - what went wrong, for a person.
+/// * `brand` - the product name and support contact.
 ///
 /// # Returns
 /// The page with `status`.
-pub fn error_page(status: StatusCode, message: &str) -> Response {
-    page(status, "Cannot connect", &error_page_html(message), None)
+pub fn error_page(status: StatusCode, message: &str, brand: &Brand) -> Response {
+    page(
+        status,
+        "Cannot connect",
+        &error_page_html(message),
+        None,
+        brand,
+    )
 }
 
 #[cfg(test)]
@@ -493,7 +525,7 @@ mod tests {
 
     #[test]
     fn pages_carry_the_security_headers() {
-        let response = code_page(&view(), None);
+        let response = code_page(&view(), None, &Brand::default());
         let headers = response.headers();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(headers["cache-control"], "no-store");
@@ -552,9 +584,19 @@ mod tests {
             default_catalog: None,
         };
         for html in [
-            pages::document("t", &code_page_html(&view(), Some("e")), &[]),
-            pages::document("t", &summary_page_html(&view(), &grant, "n1"), &[]),
-            pages::document("t", &error_page_html("e"), &[]),
+            pages::document(
+                "t",
+                &code_page_html(&view(), Some("e")),
+                &[],
+                &Brand::default(),
+            ),
+            pages::document(
+                "t",
+                &summary_page_html(&view(), &grant, "n1"),
+                &[],
+                &Brand::default(),
+            ),
+            pages::document("t", &error_page_html("e"), &[], &Brand::default()),
         ] {
             assert!(!html.contains("<script"), "{html}");
             assert!(!html.contains("<style"), "{html}");
@@ -628,7 +670,7 @@ mod tests {
         assert!(html.contains(r#"href="/oauth/authorize?a=1&amp;signin=code""#));
         assert!(html.contains("bad &lt;choice&gt;"));
         assert!(html.contains(r#"id="consent-approve""#));
-        let document = pages::document("t", &html, &[]);
+        let document = pages::document("t", &html, &[], &Brand::default());
         assert!(!document.contains("<script"));
         assert!(!document.contains("style="));
     }
@@ -654,7 +696,11 @@ mod tests {
 
     #[test]
     fn the_error_page_has_no_form_and_its_status() {
-        let response = error_page(StatusCode::BAD_REQUEST, "Unknown <client>.");
+        let response = error_page(
+            StatusCode::BAD_REQUEST,
+            "Unknown <client>.",
+            &Brand::default(),
+        );
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(response.headers()["content-security-policy"]
             .to_str()

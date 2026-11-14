@@ -47,6 +47,7 @@ use crate::http::{timeout_layer, AppError};
 use crate::keys;
 use crate::oidc::{Flow, Identity, LinkRequest, OidcError, OidcProviders, FLOW_TTL};
 use crate::store::identities::{self, OidcOutcome, OidcSignIn, SessionLink};
+use crate::store::settings::Brand;
 use crate::store::sign_in_events::{Method, Outcome};
 use crate::store::user_sessions;
 use crate::store::users::UserAuth;
@@ -73,6 +74,9 @@ const TOO_MANY_LINKS: &str = "Too many links started; wait a few minutes and try
 const ACCOUNT_PAGE: &str = "/ui/#/account";
 /// The pages' title.
 const TITLE: &str = "Sign in";
+
+/// The message for a provider id no configured provider has.
+const NO_SUCH_PROVIDER: &str = "No such sign-in provider.";
 
 /// The open routes, merged only when providers are configured.
 ///
@@ -200,8 +204,9 @@ async fn start(
     let Some(oidc) = app.oidc() else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let brand = app.settings().brand();
     if oidc.label(&provider).is_none() {
-        return message_page(StatusCode::NOT_FOUND, TITLE, "No such sign-in provider.");
+        return message_page(StatusCode::NOT_FOUND, TITLE, NO_SUCH_PROVIDER, &brand);
     }
     let ip = client_ip(&parts, &app.config().auth);
     if !app
@@ -209,7 +214,7 @@ async fn start(
         .sign_in_per_ip
         .try_take(&ip_key(ip), Instant::now())
     {
-        return message_page(StatusCode::TOO_MANY_REQUESTS, TITLE, TOO_MANY);
+        return message_page(StatusCode::TOO_MANY_REQUESTS, TITLE, TOO_MANY, &brand);
     }
     let return_to = safe_return_to(query.return_to.as_deref());
     let new = NewFlow {
@@ -220,10 +225,10 @@ async fn start(
     match begin(&app, oidc, &parts.headers, new).await {
         Ok((url, headers)) => (headers, Redirect::to(&url)).into_response(),
         Err(OkfError::NotFound { .. }) => {
-            message_page(StatusCode::NOT_FOUND, TITLE, "No such sign-in provider.")
+            message_page(StatusCode::NOT_FOUND, TITLE, NO_SUCH_PROVIDER, &brand)
         }
         Err(OkfError::Busy { .. }) => {
-            message_page(StatusCode::SERVICE_UNAVAILABLE, TITLE, UNAVAILABLE)
+            message_page(StatusCode::SERVICE_UNAVAILABLE, TITLE, UNAVAILABLE, &brand)
         }
         Err(error) => AppError(error).into_response(),
     }
@@ -252,8 +257,8 @@ enum Done {
 }
 
 /// A message page that also clears the flow cookie.
-fn page(headers: &HeaderMap, status: StatusCode, message: &str) -> Response {
-    let mut response = message_page(status, TITLE, message);
+fn page(brand: &Brand, headers: &HeaderMap, status: StatusCode, message: &str) -> Response {
+    let mut response = message_page(status, TITLE, message, brand);
     append_all(response.headers_mut(), headers);
     response
 }
@@ -270,6 +275,7 @@ async fn callback(
     };
     // Every answer clears the flow cookie: the flow is single use.
     let mut headers = clear_flow(&app);
+    let brand = app.settings().brand();
     let flow =
         cookie(&parts.headers, FLOW_COOKIE).and_then(|id| oidc.flows.take(id, Instant::now()));
     let Some(Flow {
@@ -279,7 +285,7 @@ async fn callback(
         link,
     }) = flow
     else {
-        return page(&headers, StatusCode::BAD_REQUEST, SIGN_IN_RETRY);
+        return page(&brand, &headers, StatusCode::BAD_REQUEST, SIGN_IN_RETRY);
     };
     // The `state` check is this redirect's CSRF guard; openidconnect leaves
     // it to the app. Constant time, like every other secret comparison.
@@ -290,7 +296,7 @@ async fn callback(
             .is_some_and(|state| bool::from(state.as_bytes().ct_eq(secrets.state.as_bytes())));
     // A tuple pattern: the state matched, the provider sent no error, and a code.
     let (true, None, Some(code)) = (state_ok, query.error.as_deref(), query.code) else {
-        return page(&headers, StatusCode::BAD_REQUEST, SIGN_IN_RETRY);
+        return page(&brand, &headers, StatusCode::BAD_REQUEST, SIGN_IN_RETRY);
     };
     let ip = client_ip(&parts, &app.config().auth);
     let identity = match oidc
@@ -299,12 +305,17 @@ async fn callback(
     {
         Ok(identity) => identity,
         Err(OidcError::Discovery { .. }) => {
-            return page(&headers, StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE)
+            return page(
+                &brand,
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                UNAVAILABLE,
+            )
         }
         Err(error) => {
             tracing::info!(provider = %provider, %error, "OIDC sign-in refused");
             audit(&app, None, Method::Oidc, Outcome::Failed, ip).await;
-            return page(&headers, StatusCode::BAD_REQUEST, SIGN_IN_RETRY);
+            return page(&brand, &headers, StatusCode::BAD_REQUEST, SIGN_IN_RETRY);
         }
     };
     let done = match link {
@@ -316,7 +327,7 @@ async fn callback(
             append_all(&mut headers, &session_cookie);
             (headers, Redirect::to(&to)).into_response()
         }
-        Ok(Done::Refused(status, message)) => page(&headers, status, message),
+        Ok(Done::Refused(status, message)) => page(&brand, &headers, status, message),
         Err(error) => {
             let mut response = AppError(error).into_response();
             append_all(response.headers_mut(), &headers);
