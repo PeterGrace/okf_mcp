@@ -27,7 +27,7 @@ use chrono::{DateTime, SubsecRound, TimeDelta, Utc};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use url::{Host, Url};
+use url::{Host, Position, Url};
 
 use crate::app::App;
 use crate::error::OkfError;
@@ -166,6 +166,86 @@ pub fn validate_redirect_uri(uri: &str) -> Result<(), OAuthError> {
         ("http", Some(_)) => refuse("http is allowed only on a loopback host"),
         _ => refuse("must be https (or http on a loopback host)"),
     }
+}
+
+/// Does an authorize request's `redirect_uri` match one the client
+/// registered?
+///
+/// Exact string equality, with one exception RFC 8252 section 7.3 requires:
+/// when both URIs are `http` on a loopback host, the port is ignored, since
+/// a native client (Claude Code, for one) registers a portless URI such as
+/// `http://localhost/callback` and listens on whatever port the operating
+/// system gives it. Everything else must still be identical: the scheme,
+/// the host as written (`localhost` never matches `127.0.0.1`), the path
+/// and the query, and neither may have a fragment. A URI that fails to
+/// parse never matches.
+///
+/// # Arguments
+/// * `registered` - one of the client's redirect URIs.
+/// * `requested` - the request's `redirect_uri`.
+///
+/// # Returns
+/// `true` when the request may use `requested` for this registration.
+///
+/// # Examples
+/// ```
+/// use okf_mcp::oauth::clients::redirect_uri_matches;
+///
+/// let registered = "http://localhost/callback";
+/// assert!(redirect_uri_matches(registered, "http://localhost:54123/callback"));
+/// assert!(!redirect_uri_matches(registered, "http://127.0.0.1:54123/callback"));
+/// assert!(!redirect_uri_matches(
+///     "https://client.example.com/callback",
+///     "https://client.example.com:8443/callback",
+/// ));
+/// ```
+pub fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
+    let (Ok(registered_url), Ok(requested_url)) = (Url::parse(registered), Url::parse(requested))
+    else {
+        return false;
+    };
+    if registered == requested {
+        return true;
+    }
+    // `Option<(&str, &str)>` compares element by element, and two `None`s
+    // are equal, so require a `Some` on the left before comparing.
+    loopback_parts(registered, &registered_url)
+        .is_some_and(|parts| loopback_parts(requested, &requested_url) == Some(parts))
+}
+
+/// What a loopback `http` redirect URI must keep identical to another one
+/// for [`redirect_uri_matches`]: the text before the port (scheme, user
+/// information and host) and after it (path and query).
+///
+/// # Arguments
+/// * `raw` - the URI as written.
+/// * `url` - `raw`, parsed.
+///
+/// # Returns
+/// The two halves, borrowed from `url`; `None` unless `raw` is `http` on a
+/// loopback host, has no fragment, and is written exactly as the parser
+/// would write it apart from its port (so an upper-case host, a `..` path
+/// segment or other text the parser rewrites gets no leniency).
+fn loopback_parts<'url>(raw: &str, url: &'url Url) -> Option<(&'url str, &'url str)> {
+    let loopback_http = url.scheme() == "http"
+        && url.fragment().is_none()
+        && url.host().is_some_and(|host| is_loopback_host(&host));
+    if !loopback_http {
+        return None;
+    }
+    // `Position` slices the parser's serialization: `AfterHost` ends just
+    // before the port's `:` (or where it would be), `AfterPort` starts the
+    // path. (`BeforePort` would be after the `:`, so it is not used.)
+    let before_port = &url[..Position::AfterHost];
+    let after_port = &url[Position::AfterPort..];
+    // What `raw` has between those halves: nothing, or `:` and the port as
+    // written (the parser drops a default `:80`, so this compares `raw`).
+    let port_text = raw.strip_prefix(before_port)?.strip_suffix(after_port)?;
+    let port_ok = port_text.is_empty()
+        || port_text
+            .strip_prefix(':')
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+    port_ok.then_some((before_port, after_port))
 }
 
 /// Client metadata after validation: what both kinds of client keep.
@@ -939,6 +1019,125 @@ mod tests {
                     Err(OAuthError::InvalidRedirectUri(_))
                 ),
                 "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_redirect_uris_match_on_any_port() {
+        for (registered, requested) in [
+            // Claude Code's portless registrations, used on an ephemeral port.
+            (
+                "http://localhost/callback",
+                "http://localhost:54123/callback",
+            ),
+            (
+                "http://127.0.0.1/callback",
+                "http://127.0.0.1:54123/callback",
+            ),
+            ("http://[::1]/callback", "http://[::1]:54123/callback"),
+            // A registered port is not binding on loopback either.
+            (
+                "http://localhost:3000/callback",
+                "http://localhost:54123/callback",
+            ),
+            (
+                "http://127.0.0.1:3000/cb?x=1",
+                "http://127.0.0.1:54123/cb?x=1",
+            ),
+            (
+                "http://localhost:3000/callback",
+                "http://localhost/callback",
+            ),
+            // The default port written out, which the parser drops.
+            ("http://localhost/callback", "http://localhost:80/callback"),
+            // Exact matches still match.
+            ("http://localhost/callback", "http://localhost/callback"),
+            (
+                "https://client.example.com/callback",
+                "https://client.example.com/callback",
+            ),
+        ] {
+            assert!(
+                redirect_uri_matches(registered, requested),
+                "{registered} should accept {requested}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_uris_differing_in_anything_but_a_loopback_port_do_not_match() {
+        for (registered, requested) in [
+            // Another path or query.
+            ("http://localhost/callback", "http://localhost:54123/other"),
+            (
+                "http://localhost/callback",
+                "http://localhost:54123/callback/",
+            ),
+            (
+                "http://localhost/callback",
+                "http://localhost:54123/callback?x=1",
+            ),
+            ("http://localhost/cb?x=1", "http://localhost:54123/cb?x=2"),
+            // Another loopback host spelling, or another case.
+            (
+                "http://localhost/callback",
+                "http://127.0.0.1:54123/callback",
+            ),
+            (
+                "http://127.0.0.1/callback",
+                "http://localhost:54123/callback",
+            ),
+            (
+                "http://127.0.0.1/callback",
+                "http://127.0.0.2:54123/callback",
+            ),
+            (
+                "http://localhost/callback",
+                "http://LOCALHOST:54123/callback",
+            ),
+            // Another scheme.
+            (
+                "http://localhost/callback",
+                "https://localhost:54123/callback",
+            ),
+            (
+                "https://localhost/callback",
+                "https://localhost:54123/callback",
+            ),
+            // Not loopback: the port is exact.
+            (
+                "http://client.example.com/callback",
+                "http://client.example.com:54123/callback",
+            ),
+            (
+                "https://client.example.com/callback",
+                "https://client.example.com:8443/callback",
+            ),
+            // A fragment, user information, or text the parser rewrites.
+            (
+                "http://localhost/callback",
+                "http://localhost:54123/callback#x",
+            ),
+            (
+                "http://localhost/callback",
+                "http://user@localhost:54123/callback",
+            ),
+            (
+                "http://localhost/callback",
+                "http://localhost:54123/x/../callback",
+            ),
+            ("http://localhost/callback", "http://localhost:/callback"),
+            // Unparsable, even when equal.
+            ("not a url", "not a url"),
+            (
+                "http://localhost/callback",
+                "http://localhost:99999/callback",
+            ),
+        ] {
+            assert!(
+                !redirect_uri_matches(registered, requested),
+                "{registered} should refuse {requested}"
             );
         }
     }

@@ -2255,6 +2255,13 @@ is capped at their ceiling and lowered when the ceiling is
 re-reads the ceiling, so a level lowered while the page was open is
 refused, and each page approves at most once.
 
+A redirect URI must match one the client registered exactly, with one
+exception: a loopback `http` URI (`localhost`, `127.0.0.0/8` or `[::1]`)
+matches on any port (RFC 8252 section 7.3), since native clients such as
+Claude Code register `http://localhost/callback` and listen on a port the
+operating system picks. Scheme, host as written, path and query must still
+match, and the token request must repeat the port the authorization used.
+
 Alternatively ("Use a sign-in code instead" on the consent page) an admin
 mints a **sign-in code** that says what the connection may do: its
 catalogs, `read` or `write` access, the default catalog, and the actor its

@@ -461,22 +461,22 @@ mod tests {
     use crate::mcp::testing::TestApp;
     use crate::oauth::state::code_key;
     use crate::oauth::testing::{
-        authorize_query, form, hidden, oauth_app, send, sign_in_code, CLIENT_ID, REDIRECT_URI,
-        RESOURCE, VERIFIER,
+        authorize_query, authorize_query_for, form, hidden, insert_loopback_client, oauth_app,
+        send, sign_in_code, CLIENT_ID, LOOPBACK_CLIENT_ID, LOOPBACK_ON_PORT, LOOPBACK_REDIRECT_URI,
+        REDIRECT_URI, RESOURCE, VERIFIER,
     };
     use crate::store::keys::Access;
 
     /// Runs authorize and consent (code, then Approve from the summary);
     /// returns the `okfac_` code.
     async fn authorization_code(test: &TestApp) -> String {
+        authorization_code_for(test, &authorize_query()).await
+    }
+
+    /// [`authorization_code`] for the authorize request `query`.
+    async fn authorization_code_for(test: &TestApp, query: &str) -> String {
         let code = sign_in_code(test, Access::Read).await;
-        let (_, _, page) = send(
-            test,
-            "GET",
-            &format!("/oauth/authorize?{}", authorize_query()),
-            None,
-        )
-        .await;
+        let (_, _, page) = send(test, "GET", &format!("/oauth/authorize?{query}"), None).await;
         let (pending, csrf) = (hidden(&page, "pending"), hidden(&page, "csrf"));
         let (_, _, summary) = send(
             test,
@@ -658,6 +658,37 @@ mod tests {
             // The code is spent by the failed attempt.
             let (status, _, _) = token(&test, exchange(&code)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: single use");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_loopback_code_exchanges_only_with_the_port_it_was_issued_for() {
+        // Authorize may pick any loopback port (RFC 8252 section 7.3), but
+        // the token request repeats that exact URI (RFC 6749 section 4.1.3).
+        let test = oauth_app().await;
+        insert_loopback_client(&test).await;
+        let query = authorize_query_for(LOOPBACK_CLIENT_ID, LOOPBACK_ON_PORT);
+        let exchange_at = |code: &str, redirect_uri: &str| {
+            form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("client_id", LOOPBACK_CLIENT_ID),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", VERIFIER),
+                ("resource", RESOURCE),
+            ])
+        };
+
+        let code = authorization_code_for(&test, &query).await;
+        let (status, _, body) = token(&test, exchange_at(&code, LOOPBACK_ON_PORT)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(works(&test, &text(&body, "access_token")).await);
+
+        for other in ["http://localhost:54124/callback", LOOPBACK_REDIRECT_URI] {
+            let code = authorization_code_for(&test, &query).await;
+            let (status, _, body) = token(&test, exchange_at(&code, other)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{other}: {body}");
+            assert_eq!(body["error"], "invalid_grant", "{other}");
         }
     }
 
