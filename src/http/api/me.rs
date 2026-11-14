@@ -1456,7 +1456,7 @@ mod tests {
             test.app.pool(),
             SettingKey::MaxKeysPerUser,
             "1",
-            "test",
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await
@@ -1506,7 +1506,7 @@ mod tests {
             test.app.pool(),
             SettingKey::MaxKeysPerUser,
             "2",
-            "test",
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await
@@ -1543,7 +1543,7 @@ mod tests {
             test.app.pool(),
             SettingKey::MaxKeyLifetime,
             "24h",
-            "test",
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await

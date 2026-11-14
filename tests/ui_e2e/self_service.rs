@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use okf_mcp::config::{AuthConfig, Config};
 use okf_mcp::oauth::clients::MAX_UNBOUND_DCR;
+use okf_mcp::store::audit::AuditActor;
 use okf_mcp::store::ceiling;
 use okf_mcp::store::keys::{self as key_rows, Access, CatalogGrant, Grants, NewKey};
 use okf_mcp::store::oauth::clients::{self as client_rows, NewDcrClient};
@@ -26,7 +27,6 @@ use serde_json::json;
 use crate::catalogs::switcher;
 use crate::harness::drive;
 use crate::support::server::{files, TestServer};
-use okf_mcp::store::audit::AuditActor;
 use okf_mcp::store::ceiling::NewEntitlement;
 use okf_mcp::store::users::AdminChange;
 
@@ -395,7 +395,7 @@ async fn the_lifetime_limit_shapes_the_expiry_choices_and_the_longest_is_the_def
         &server.db.pool,
         SettingKey::MaxKeyLifetime,
         "30d",
-        "tester",
+        &AuditActor::cli(),
         Utc::now(),
     )
     .await
@@ -587,7 +587,7 @@ async fn at_the_key_limit_new_key_is_disabled_and_says_why() {
         &server.db.pool,
         SettingKey::MaxKeysPerUser,
         "1",
-        "tester",
+        &AuditActor::cli(),
         Utc::now(),
     )
     .await

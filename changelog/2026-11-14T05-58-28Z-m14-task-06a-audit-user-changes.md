@@ -27,6 +27,20 @@ Issue #396, epic #390. Plan:
   a concurrent `set_admin` (tests
   `an_admins_change_and_a_concurrent_set_admin_both_finish` and
   `an_admins_entitlement_change_and_a_concurrent_set_admin_both_finish`).
+- Migration `0014_audit_row_locks.sql` (review of PR #419): `audit_person`,
+  `audit_team_ref` and `audit_credential` read an existing row without a
+  lock and refresh a stale one only under `FOR NO KEY UPDATE SKIP LOCKED`;
+  every user and team is backfilled with its row, and `users::create`
+  makes the personal team's. Before, every resolution upserted and so
+  locked its row, and two admins acting on each other (invites, email
+  changes, session revokes, each other's personal teams through
+  `team_ref`) deadlocked on two `audit_people` rows. Tests:
+  `admins_inviting_each_other_at_once_both_finish`,
+  `admins_setting_each_others_email_at_once_both_finish`,
+  `admins_ending_each_others_sessions_at_once_both_finish`,
+  `admins_acting_on_each_others_personal_teams_at_once_both_finish`.
+- `tools/agentic/lessons.md`: audit rows are part of the lock order, and
+  resolving one never waits.
 - `users::user_entry(action, user_id, details)`, the entry every
   user-targeted record builds (`user.deleted` now uses it too).
 - Provisioner guards: `users::set_email` and `invite::send_setup` refuse an
@@ -61,4 +75,5 @@ Issue #396, epic #390. Plan:
 - `entitle` reads the previous level from its upsert (`RETURNING xmax = 0`)
   instead of a separate read, which a concurrent entitle could race.
 - Plan corrected with a dated note under Task 6a, and Task 8a's export test
-  counts the fixture's entry.
+  counts the fixture's entry. Later tasks' migrations move up one (Task 5
+  `0015`, Task 9a `0016`, Task 9c `0017`).

@@ -38,6 +38,7 @@ const MEANING = {
     reset_link_ttl: 'Password reset link lifetime',
     product_name: 'Product name in email, the sign-in and consent pages and this console',
     support_contact: 'Email address or https:// URL shown as "Questions? Contact ..." ("none": no line)',
+    audit_retention_days: 'Days audit entries are kept before the daily prune deletes them (30 to 3650)',
 };
 // The settings whose change shows in this console's own shell.
 const BRANDING = new Set(['product_name']);

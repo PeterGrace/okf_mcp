@@ -735,6 +735,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn brand_json_is_public_and_follows_the_settings() {
+        use crate::store::audit::AuditActor;
         use crate::store::settings::{self, SettingKey};
         let test = crate::http::api::testing::app().await;
         let get_brand = || async {
@@ -751,7 +752,7 @@ mod tests {
             test.app.pool(),
             SettingKey::ProductName,
             "Acme Notes",
-            "cli",
+            &AuditActor::cli(),
             chrono::Utc::now(),
         )
         .await
@@ -760,7 +761,7 @@ mod tests {
             test.app.pool(),
             SettingKey::SupportContact,
             "help@example.com",
-            "cli",
+            &AuditActor::cli(),
             chrono::Utc::now(),
         )
         .await

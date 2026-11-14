@@ -1627,7 +1627,7 @@ mod tests {
             (SettingKey::ProductName, "Acme Notes"),
             (SettingKey::SupportContact, "help@example.com"),
         ] {
-            settings::set(test.app.pool(), key, value, "cli", Utc::now())
+            settings::set(test.app.pool(), key, value, &AuditActor::cli(), Utc::now())
                 .await
                 .unwrap();
         }

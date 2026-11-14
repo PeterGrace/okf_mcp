@@ -26,6 +26,7 @@ use crate::keyed_lock::KeyedLocks;
 use crate::oauth::OAuth;
 use crate::oidc::OidcProviders;
 use crate::overlay::Overlays;
+use crate::store::audit;
 use crate::store::oauth::{
     clients as oauth_clients, codes as sign_in_codes, tokens as oauth_tokens,
 };
@@ -57,6 +58,14 @@ const UNBOUND_CLIENT_HOURS: i64 = 24;
 
 /// How long sign-in events are kept (spec "Logging and audit").
 const SIGN_IN_EVENT_RETENTION_DAYS: i64 = 90;
+
+/// How often the poll loop prunes the audit log (plan Decision 12).
+const AUDIT_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// How far past the retention period the audit prune's cut-off lies, so a
+/// small skew between this clock and the database's (whose clock the
+/// append-only trigger uses) never makes it refuse the prune.
+const AUDIT_PRUNE_MARGIN_HOURS: i64 = 1;
 
 /// The state every route and tool shares. Built once by [`App::load`] and
 /// shared as an `Arc<App>`.
@@ -100,6 +109,8 @@ pub struct App {
     // When the OAuth tables were last pruned; `None` until the first pass.
     // A `std` mutex: held only to read or set the instant.
     oauth_pruned: std::sync::Mutex<Option<std::time::Instant>>,
+    // When the audit log was last pruned; `None` until the first pass.
+    audit_pruned: std::sync::Mutex<Option<std::time::Instant>>,
     // The sign-in routes' per-address and per-email limits.
     sign_in_limits: SignInLimits,
     // The configured mail provider (Decision 10), built once at start-up.
@@ -185,6 +196,7 @@ impl App {
             clock_status: RwLock::new(None),
             oauth,
             oauth_pruned: std::sync::Mutex::new(None),
+            audit_pruned: std::sync::Mutex::new(None),
             sign_in_limits: SignInLimits::new(),
             mailer,
             passkeys,
@@ -372,6 +384,7 @@ impl App {
         // Before the catalog list, whose `?` would skip it on a failure.
         self.prune_empty_changesets().await;
         self.prune_oauth().await;
+        self.prune_audit().await;
         let current = self.catalogs();
         let mut next = Catalogs::new();
         // Rebuilt each pass, so a deleted catalog's entry goes with it.
@@ -534,6 +547,32 @@ impl App {
         );
     }
 
+    /// At most once per [`AUDIT_PRUNE_EVERY`], deletes audit entries older
+    /// than the `audit_retention_days` setting plus
+    /// [`AUDIT_PRUNE_MARGIN_HOURS`]. Nothing else deletes entries. Called
+    /// only under `polling`, after the settings reload.
+    ///
+    /// A failure is logged, not returned, and waits for the next daily pass.
+    async fn prune_audit(&self) {
+        let now_instant = std::time::Instant::now();
+        {
+            // A block, so the guard is released before the `.await` below.
+            let mut pruned = self.audit_pruned.lock().expect("audit prune lock poisoned");
+            if pruned.is_some_and(|at| now_instant.duration_since(at) < AUDIT_PRUNE_EVERY) {
+                return;
+            }
+            *pruned = Some(now_instant);
+        }
+        let days = i64::from(self.settings().audit_retention_days);
+        let before =
+            self.clock.now() - TimeDelta::days(days) - TimeDelta::hours(AUDIT_PRUNE_MARGIN_HOURS);
+        log_pruned_retrying(
+            "audit entries past retention",
+            "in a day",
+            audit::prune(&self.pool, before).await,
+        );
+    }
+
     /// Runs [`App::poll`] every `poll_interval` until `shutdown` is cancelled.
     /// A failed pass is logged and the loop goes on.
     ///
@@ -593,17 +632,27 @@ impl App {
     }
 }
 
-/// Logs one OAuth prune's outcome: silent for nothing deleted, `info` for
-/// some, `error` for a failure.
+/// Logs one hourly prune's outcome (see [`log_pruned_retrying`]).
 ///
 /// # Arguments
 /// * `what` - the rows, for the log line.
 /// * `result` - how many were deleted, or the failure.
 fn log_pruned(what: &'static str, result: Result<u64, OkfError>) {
+    log_pruned_retrying(what, "in an hour", result);
+}
+
+/// Logs one prune's outcome: silent for nothing deleted, `info` for some,
+/// `error` for a failure.
+///
+/// # Arguments
+/// * `what` - the rows, for the log line.
+/// * `retry` - when the next pass runs (`"in an hour"`), for a failure.
+/// * `result` - how many were deleted, or the failure.
+fn log_pruned_retrying(what: &'static str, retry: &'static str, result: Result<u64, OkfError>) {
     match result {
         Ok(0) => {}
         Ok(pruned) => tracing::info!(pruned, "deleted {what}"),
-        Err(error) => tracing::error!(%error, "deleting {what} failed; retrying in an hour"),
+        Err(error) => tracing::error!(%error, "deleting {what} failed; retrying {retry}"),
     }
 }
 
@@ -1022,7 +1071,7 @@ mod tests {
             &db.pool,
             settings::SettingKey::MaxKeysPerUser,
             "5",
-            "tester",
+            &audit::AuditActor::cli(),
             Utc::now(),
         )
         .await
@@ -1030,9 +1079,14 @@ mod tests {
         let before_poll = app.settings().max_keys_per_user;
         app.poll().await.unwrap();
         let after_set = app.settings().max_keys_per_user;
-        settings::reset(&db.pool, settings::SettingKey::MaxKeysPerUser)
-            .await
-            .unwrap();
+        settings::reset(
+            &db.pool,
+            settings::SettingKey::MaxKeysPerUser,
+            &audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         app.poll().await.unwrap();
 
         assert_eq!(before_poll, 20, "read from memory, not per call");
@@ -1066,7 +1120,7 @@ mod tests {
             &db.pool,
             settings::SettingKey::PasswordSignIn,
             "off",
-            "tester",
+            &audit::AuditActor::cli(),
             Utc::now(),
         )
         .await
@@ -1094,7 +1148,7 @@ mod tests {
             &db.pool,
             settings::SettingKey::MaxKeysPerUser,
             "5",
-            "tester",
+            &audit::AuditActor::cli(),
             Utc::now(),
         )
         .await
@@ -1321,6 +1375,69 @@ mod tests {
         stale_token(2).await;
         test.app.poll().await.unwrap();
         assert_eq!(count("oauth_tokens").await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn poll_prunes_audit_entries_past_the_retention_setting_at_most_daily() {
+        use crate::store::audit::{Action, AuditActor, Entry, Target};
+        let test = app_with(&[("main", &[])], Config::default()).await;
+        let pool = test.app.pool().clone();
+        settings::set(
+            &pool,
+            settings::SettingKey::AuditRetentionDays,
+            "60",
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let entry_days_ago = |days: i64| {
+            let pool = pool.clone();
+            async move {
+                let mut tx = pool.begin().await.unwrap();
+                audit::record(
+                    &mut tx,
+                    &AuditActor::cli(),
+                    &Entry {
+                        action: Action::SettingCleared,
+                        target: Target::Setting("product_name"),
+                        person: None,
+                        teams: &[],
+                        details: serde_json::json!({}),
+                    },
+                    Utc::now() - TimeDelta::days(days),
+                )
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+            }
+        };
+        let left = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM audit_entries WHERE action = 'setting.cleared'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        entry_days_ago(61).await;
+        entry_days_ago(59).await;
+
+        // The first pass reloads the setting, then prunes by it.
+        test.app.poll().await.unwrap();
+        let after_first = left().await;
+        // Within the day, a new old entry waits for the next daily pass.
+        entry_days_ago(90).await;
+        test.app.poll().await.unwrap();
+
+        assert_eq!(
+            after_first, 1,
+            "61 days is past 60 (plus the hour); 59 is not"
+        );
+        assert_eq!(left().await, 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
