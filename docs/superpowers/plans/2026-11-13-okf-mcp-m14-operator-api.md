@@ -255,7 +255,7 @@ Why each edge, and the shared files to merge with care:
 | `tests/support/server.rs` | `owner_with_password` | 9e |
 | `src/store/mod.rs` | `pub mod audit;` (1), `pub mod gates;` (7b), `pub mod unlocks;` (9a) | 1, 7b, 9a |
 | `src/http/requester.rs` | Create: `ClientIp`, `Requester`, extractors | 1 |
-| `src/http/mod.rs` | `mod requester`; `/ui/brand.json` (2) | 1, 2 |
+| `src/http/mod.rs` | `pub mod requester` (corrected, issue #391); `/ui/brand.json` (2) | 1, 2 |
 | `src/auth.rs` | `Principal.user_id` (1); `provisioner`, MCP refusal (5); `AccessGates`, `Admission`, cache wiring (7b); unlock and maintenance checks (9b) | 1, 5, 7b, 9b |
 | `src/http/console_session.rs` | `ClientIp` insertion (1); `for_session` user id (1); gates (7b) | 1, 7b |
 | `src/store/settings.rs` | `product_name`, `support_contact`, `Brand`, `brand_in` (2); audit, `audit_retention_days` (6d); unlock settings (9a) | 2, 6d, 9a |
@@ -307,7 +307,7 @@ Why each edge, and the shared files to merge with care:
 
 **Files:**
 - Create: `migrations/0012_audit.sql`, `src/store/audit.rs`, `src/http/requester.rs`
-- Modify: `src/store/mod.rs`, `src/http/mod.rs` (`mod requester;`), `src/auth.rs` (`Principal.user_id`, `require_key` inserts `ClientIp`), `src/http/console_session.rs` (`require_principal` inserts `ClientIp`; `client_ip` shares its body), every `Principal { ... }` literal (`user_id: None,`)
+- Modify: `src/store/mod.rs`, `src/http/mod.rs` (`pub mod requester;`: `store::audit` imports `Requester`, so a private module would not compile; *corrected, issue #391, 2026-11-14*), `src/auth.rs` (`Principal.user_id`, `require_key` inserts `ClientIp`), `src/http/console_session.rs` (`require_principal` inserts `ClientIp`; `client_ip` shares its body), every `Principal { ... }` literal (`user_id: None,`)
 
 - [ ] **Step 1: Write the migration**
 
@@ -787,6 +787,8 @@ mod tests {
     }
 }
 ```
+
+> **Corrected (issue #391, 2026-11-14).** As shipped (`src/store/audit.rs`): `record_writes_one_entry_with_its_actor_target_and_teams` first stores the key `k1` it names (`audit_credential` creates no row for a credential id that is in neither `api_keys` nor `sign_in_codes`, so the test's `JOIN audit_credentials` found nothing), and it also checks `testing::entries`; the TRUNCATE check is `TRUNCATE audit_entries CASCADE`, so it is the trigger that refuses it and not the foreign key from `audit_access_counts`, and the test then counts the one surviving entry. The tests build entries with a local `entry(action, target)` helper and struct-update syntax.
 
 And in `src/http/requester.rs`'s tests:
 
@@ -1482,6 +1484,8 @@ pub fn request_ip(extensions: &Extensions, headers: &HeaderMap, config: &AuthCon
 ```
 
 and have `client_ip` call it. In `require_principal`, before each `next.run(request)`, insert `ClientIp(request_ip(request.extensions(), request.headers(), &app.config().auth))`; do the same in `crate::auth::require_key`.
+
+> **Corrected (issue #391, 2026-11-14).** The insertion is one helper, `console_session::insert_client_ip(app: &App, request: &mut Request)`, which `require_principal` (bearer and cookie paths) and `auth::require_key` call; the requester test also checks that the `AuditActor` extractor refuses a request with no principal (403 `Forbidden`). A second test, `both_middlewares_record_the_client_ip_and_the_credentials_user`, puts the real `require_principal` (bearer and cookie) and `require_key` in front of a route that extracts `Requester` and `AuditActor`, and checks the peer address, the source, the `Via` and that `user_id` is set.
 
 In `src/auth.rs`, add to `Principal` (after `user`, before M13's `suspended`):
 

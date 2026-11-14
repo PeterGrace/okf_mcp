@@ -315,6 +315,7 @@ mod tests {
             actor: "a".to_string(),
             kind: CredentialKind::ApiKey,
             user: None,
+            user_id: None,
             suspended: std::sync::Arc::new(
                 suspended
                     .iter()

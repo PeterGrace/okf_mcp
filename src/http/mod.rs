@@ -12,6 +12,7 @@ pub mod limits;
 pub mod oidc;
 pub(crate) mod pages;
 pub mod passkeys;
+pub mod requester;
 pub mod sessions;
 pub mod signin;
 mod ui;

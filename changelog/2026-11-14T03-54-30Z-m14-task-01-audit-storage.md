@@ -1,0 +1,44 @@
+# M14 Task 1: audit storage and the write helper
+
+Issue #391, epic #390. Plan: `docs/superpowers/plans/2026-11-13-okf-mcp-m14-operator-api.md`, Task 1.
+
+## Added
+- Migration `0012_audit.sql`: `audit_people`, `audit_teams`,
+  `audit_credentials`, `audit_entries` and `audit_access_counts`; the
+  functions `audit_person`, `audit_team_ref` and `audit_credential`, which
+  create or refresh an audit row and create nothing for a user deleted
+  meanwhile (`FOR KEY SHARE` on the user); and the append-only trigger,
+  which refuses every `UPDATE`, a `TRUNCATE`, and a `DELETE` of an entry
+  younger than the retention period (`audit_retention_days`, default 400,
+  at least 30).
+- `src/store/audit.rs`: `Source`, `Via`, `AuditActor` (`cli`, `system`,
+  `of`, `stored_label`), the `Action` list (one macro writes the enum,
+  `as_str`, `parse` and `ALL`), `Target`, `Entry`, `record` (one entry in the
+  caller's transaction), `team_ref`, `catalog_teams`, `key_teams`,
+  `forget_person` and `refuse_admin_target`; and the `#[cfg(test)]` reader
+  `audit::testing::entries` that later tasks assert with.
+- `src/http/requester.rs`: `ClientIp`, `Requester` and the axum extractors
+  for `Requester` and `AuditActor` (403 without a principal).
+- `console_session::request_ip` (the body `client_ip` now shares) and
+  `insert_client_ip`, called by `require_principal` (bearer and cookie
+  paths) and `auth::require_key`, so every authenticated request carries
+  its `ClientIp`.
+- `ConsoleSession::for_test()` (tests only).
+- Test `both_middlewares_record_the_client_ip_and_the_credentials_user`:
+  the real middlewares in front of the extractors (beyond the plan's list).
+
+## Changed
+- `Principal` has `user_id: Option<String>`: the key's `user_id` from
+  `From<KeyRecord>`, the user's id from `for_session`, `None` in test
+  literals.
+
+## Notes
+- Nothing calls `record` yet: Tasks 4, 6a-6d and 7a instrument the store.
+  No behaviour a user can see changes, so `docs/operations.md` is left to
+  the tasks that add recorded actions (and Task 10's upgrade note).
+- Plan corrections (dated `Corrected (issue #391)` notes in Task 1): the
+  requester module is `pub mod requester;` (store code reaches it); the
+  first store test stores the key `k1` it names, since `audit_credential`
+  creates no row for a credential that does not exist; the TRUNCATE test
+  uses `CASCADE`, so the trigger, not the foreign key from
+  `audit_access_counts`, is what refuses it.

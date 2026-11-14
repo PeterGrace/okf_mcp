@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, HeaderValue, Method};
+use axum::http::{header, Extensions, HeaderMap, HeaderValue, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
@@ -25,6 +25,7 @@ use crate::app::App;
 use crate::auth::{authenticate, bearer, unauthorized, Principal};
 use crate::config::AuthConfig;
 use crate::error::OkfError;
+use crate::http::requester::ClientIp;
 use crate::http::AppError;
 use crate::store::ceiling;
 use crate::store::passwords::PasswordStamp;
@@ -72,6 +73,18 @@ pub struct ConsoleSession {
     pub expires_at: DateTime<Utc>,
 }
 
+#[cfg(test)]
+impl ConsoleSession {
+    /// A session for tests that only need one to be present.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            id: "test-session".to_string(),
+            csrf: "test-csrf".to_string(),
+            expires_at: Utc::now(),
+        }
+    }
+}
+
 // Written by hand, not derived (Python's `__repr__`), so a stray `{:?}`
 // never prints the id or the token.
 impl std::fmt::Debug for ConsoleSession {
@@ -98,15 +111,43 @@ impl std::fmt::Debug for ConsoleSession {
 /// no header is read at all: a client could write any value there. `None`
 /// without `ConnectInfo` (in-process `oneshot` tests).
 pub fn client_ip(request_parts: &Parts, config: &AuthConfig) -> Option<IpAddr> {
-    let peer = request_parts
-        .extensions
+    request_ip(&request_parts.extensions, &request_parts.headers, config)
+}
+
+/// [`client_ip`] from a request's extensions and headers, for middleware
+/// that holds the whole `Request` rather than its `Parts`.
+///
+/// # Arguments
+/// * `extensions` - the request's extensions (its `ConnectInfo`).
+/// * `headers` - its headers.
+/// * `config` - `[auth]`, for `trusted_proxy_header`.
+///
+/// # Returns
+/// As [`client_ip`].
+pub fn request_ip(
+    extensions: &Extensions,
+    headers: &HeaderMap,
+    config: &AuthConfig,
+) -> Option<IpAddr> {
+    let peer = extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(address)| address.ip());
     // `let ... else`: without a trusted header, the peer is the client.
     let Some(name) = config.trusted_proxy_header.as_deref() else {
         return peer;
     };
-    forwarded_ip(&request_parts.headers, name).or(peer)
+    forwarded_ip(headers, name).or(peer)
+}
+
+/// Records the client address in the request's extensions as a
+/// [`ClientIp`], for the audit log's [`Requester`](crate::http::requester::Requester).
+///
+/// # Arguments
+/// * `app` - the shared state (its `[auth]` config).
+/// * `request` - the request, before it is passed on.
+pub(crate) fn insert_client_ip(app: &App, request: &mut Request) {
+    let ip = request_ip(request.extensions(), request.headers(), &app.config().auth);
+    request.extensions_mut().insert(ClientIp(ip));
 }
 
 /// The last hop of the last `name` header. Earlier entries were written by
@@ -326,6 +367,7 @@ pub async fn require_principal(
         Some(Ok(Some(principal))) => {
             tracing::debug!(key = %principal.key_id, "authenticated");
             request.extensions_mut().insert(principal);
+            insert_client_ip(&app, &mut request);
             return next.run(request).await;
         }
         Some(Ok(None)) => return unauthorized(&app),
@@ -362,6 +404,7 @@ pub async fn require_principal(
         csrf: row.csrf,
         expires_at: row.expires_at,
     });
+    insert_client_ip(&app, &mut request);
     next.run(request).await
 }
 
