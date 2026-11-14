@@ -1805,7 +1805,7 @@ fn contact_line(brand: &Brand) -> Option<String> {
 
 appended to the text (`\n\n{line}\n`) and as one more escaped `<p>` to the HTML. In `enqueue_in`, read the brand on the same connection first: `let brand = settings::brand_in(&mut *conn).await?; let (subject, text, html) = render(template, &brand);`.
 
-> **Corrected (issue #392, 2026-11-14).** `render` adds the contact line itself, after whichever template it rendered (`with_contact` for the text, `html_document(subject, paragraphs, brand)` for the HTML), so a template added later (Task 9a's `Template::Unlocked`) gets it without code of its own. Name-bearing paragraphs go through `escape` in the HTML twin, since the product name is operator text.
+> **Corrected (issue #392, 2026-11-14).** `render` adds the contact line itself, after whichever template it rendered (`with_contact` for the text, `html_document(subject, paragraphs, brand)` for the HTML), so a template added later (Task 9a's `Template::Unlocked`) gets it without code of its own. Name-bearing paragraphs go through `escape` in the HTML twin, since the product name is operator text. Two subjects never said "okf" ("Reset your password", "A sign-in method was added to your account"), but the spec puts the product in every subject, so with a name other than the default they read "Reset your {name} password" and "A sign-in method was added to your {name} account" (`product_words`); with the default `okf` they are unchanged (PR #413 review).
 
 - [ ] **Step 5: Server pages and the console**
 

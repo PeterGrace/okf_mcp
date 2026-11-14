@@ -5,7 +5,7 @@
 //! `support_contact` line when one is set ([`Brand`]).
 
 use crate::oauth::consent::escape;
-use crate::store::settings::Brand;
+use crate::store::settings::{Brand, DEFAULT_PRODUCT_NAME};
 
 /// The setup page's path; the link adds `?token=...`.
 pub const SETUP_PATH: &str = "/account/setup";
@@ -101,6 +101,18 @@ fn contact_line(brand: &Brand) -> Option<String> {
         .map(|contact| format!("Questions? Contact {contact}"))
 }
 
+/// The words that name the product in a subject that did not name it
+/// before branding: empty for the default name, so the default renders
+/// exactly as it always has ("Reset your password"), else the name and a
+/// space ("Reset your Acme Notes password").
+fn product_words(brand: &Brand) -> String {
+    if brand.product_name == DEFAULT_PRODUCT_NAME {
+        String::new()
+    } else {
+        format!("{} ", brand.product_name)
+    }
+}
+
 /// A plain-text body with the contact line, if any, as its last paragraph.
 fn with_contact(text: String, brand: &Brand) -> String {
     match contact_line(brand) {
@@ -168,7 +180,7 @@ pub fn render(template: &Template, brand: &Brand) -> (String, String, String) {
             (subject, text, html)
         }
         Template::Reset { link } => {
-            let subject = "Reset your password".to_string();
+            let subject = format!("Reset your {}password", product_words(brand));
             let asked = format!(
                 "Someone asked to reset the password of your {name} account. Open this \
                  link to choose a new one:"
@@ -190,7 +202,10 @@ pub fn render(template: &Template, brand: &Brand) -> (String, String, String) {
             (subject, text, html)
         }
         Template::MethodAdded { method } => {
-            let subject = "A sign-in method was added to your account".to_string();
+            let subject = format!(
+                "A sign-in method was added to your {}account",
+                product_words(brand)
+            );
             let notice = "If this was not you, reset your password and ask an administrator \
                           to check your account.";
             let added = format!("{method} was added to your {name} account.");
@@ -309,8 +324,21 @@ mod tests {
             },
             Template::Test,
         ];
-        for template in &templates {
+        let subjects = [
+            "Set up your Acme <Notes> account",
+            "Reset your Acme <Notes> password",
+            "A sign-in method was added to your Acme <Notes> account",
+            "Acme <Notes> test email",
+        ];
+        for (template, want) in templates.iter().zip(subjects) {
             let (subject, text, html) = render(template, &acme());
+            // Every subject names the product on its own, so an inbox tells
+            // the products apart.
+            assert_eq!(subject, want, "{template:?}");
+            assert!(
+                html.contains("<title>") && html.contains(&escape(want)),
+                "{template:?}: {html}"
+            );
             assert!(
                 !format!("{subject}{text}{html}").contains("okf"),
                 "{template:?}: {text}"
@@ -328,8 +356,6 @@ mod tests {
                 "{html}"
             );
         }
-        let (subject, _, _) = render(&Template::Test, &acme());
-        assert_eq!(subject, "Acme <Notes> test email");
     }
 
     #[test]

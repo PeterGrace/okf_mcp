@@ -24,6 +24,8 @@
 ## Changed
 
 - Mail: `render(template, brand)` names the product in every subject and body
+  (the reset and "method added" subjects only when the name is not the
+  default, so the default renders as before)
   and appends "Questions? Contact ..." when a contact is set; `enqueue_in`
   reads the brand on the caller's connection, so mail queued by any server or
   the CLI has the stored brand.
