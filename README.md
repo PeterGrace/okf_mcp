@@ -20,6 +20,10 @@ and grants within a ceiling admins set through team member access and
 entitlements, OAuth consent as the signed-in user, and mail through a job
 queue in Postgres (`docs/operations.md`, "Signing in and self-service";
 design: `docs/superpowers/specs/2026-11-12-okf-user-login-design.md`).
+Milestone 13 added team suspension: an operator can suspend a team, whose
+catalogs then refuse every non-admin credential except export until it is
+lifted (`docs/operations.md`, "Suspending a team"; design:
+`docs/superpowers/specs/2026-11-13-okf-team-suspension-design.md`).
 
 Deployed: `https://okf-mcp.k.vsix.me` (every route but `/healthz` needs a
 bearer key), from the image `ghcr.io/hypotheosis/okf-mcp`, with its database
@@ -80,7 +84,7 @@ manage OAuth sign-in codes and the grants they become (see
 Every key, grant and sign-in code belongs to a user (`--user`, required on
 create) and every catalog to a team (`--owner`); creating a user also
 creates its personal team of the same name. Ownership grants no access.
-`okf-mcp user create|list|delete`, `team create|list|add-member|set-role|remove-member|delete`,
+`okf-mcp user create|list|delete`, `team create|list|add-member|set-role|remove-member|delete|suspend|unsuspend`,
 `catalog set-owner`, `key assign` and `oauth code assign` manage them, and
 `okf-mcp unassigned` lists what predates users and teams and has neither
 (`docs/operations.md`, "Users and teams").
@@ -271,7 +275,7 @@ a `LintFailed` error and `a.md` in `lint`'s result, on purpose.
 
 | Tool | Does |
 |---|---|
-| `list_catalogs` | The catalogs the key reaches, and this connection's selection |
+| `list_catalogs` | The catalogs the key reaches, and this connection's selection. A catalog whose owner team is suspended is listed with `suspended` (`{team, notice}`; null otherwise) |
 | `search` | Ranked search across the selected catalogs (`query`, `catalogs`, `type`, `tags`, `status`, `limit` up to 200) |
 | `get_concept` | A concept's frontmatter, body and size; with `links`, its links and backlinks; with `raw`, the file. A body over `concept_outline_chars` comes back as an outline of its headings; `section` returns one section (by heading text or slug), `full` the whole body |
 | `read_document` | The text of an `index.md`, `log.md` or `AGENTS.md` (default `/index.md`) |
@@ -326,7 +330,9 @@ when OAuth is on, and a plain-text body). `/mcp`, the archive routes and
 the key's level does not allow (a `read` key importing) is 403. Those and
 the other route errors have the body `{"error": ..., "message": ...}`; the
 401, the 413, the timeout layer's 503 below and `/healthz`'s own body are the
-exceptions.
+exceptions. A catalog whose owner team is suspended answers every non-admin
+credential with 403 `Suspended` (naming the `catalog`, `team` and `notice`),
+except export (`docs/operations.md`, "Suspending a team").
 
 The import checks the key before it reads the upload. It then reads and checks
 the tarball (400 with every problem for an unreadable or rule-breaking
@@ -375,7 +381,7 @@ Admins manage API keys at `/ui/#/keys` (or `/api/v1/keys`) without a shell
 on the server: list, create (the secret is shown once), revoke, grant and
 ungrant catalogs, the maintenance-report flag, and the user each key
 belongs to. Users and Teams (`/ui/#/users`, `/ui/#/teams`) manage users,
-teams and membership, and `/ui/#/users/unassigned` assigns what predates
+teams, membership and team suspension, and `/ui/#/users/unassigned` assigns what predates
 them. Signed in with an account, My keys, My grants and Account
 (`/ui/#/my-keys`, `/ui/#/my-grants`, `/ui/#/account`) manage the person's
 own keys, grants, sign-in methods and sessions; admins also get Settings
