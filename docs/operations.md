@@ -719,7 +719,7 @@ takes effect at once.
 | `okf-mcp catalog create NAME --owner TEAM [--description TEXT]` | `--owner` is required |
 | `okf-mcp catalog set-owner NAME --team TEAM` | Moves a catalog to another team, or gives a legacy catalog its first owner. Prints `catalog C: owner OLD -> NEW` (`(none)` for a legacy catalog) |
 | `okf-mcp catalog set-member-access NAME --access none\|read\|write` | What members of the owner team reach through their own keys and grants (default `write`). Prints `catalog C: member access OLD -> NEW` |
-| `okf-mcp key create NAME --user USER ...` | `--user` is required; `--actor` still defaults to `NAME` |
+| `okf-mcp key create NAME --user USER [--provisioner] ...` | `--user` is required; `--actor` still defaults to `NAME`. `--provisioner` takes no `--access`, `--all`, `--catalogs`, `--default` or `--maintenance-report` |
 | `okf-mcp key assign ID --user USER [--actor ACTOR]` | Gives a key or an OAuth grant a user, or changes it; access is unchanged. `ID` is an id, or an unambiguous live name (`--actor` narrows it). The only `key` subcommand that also acts on grants. Prints `key ID now belongs to USER` |
 | `okf-mcp oauth code create NAME --user USER ...` | `--user` is required; `--actor` defaults to `NAME` |
 | `okf-mcp oauth code assign ID --user USER` | Gives a sign-in code, in any state, a user. Prints `sign-in code ID now belongs to USER` |
@@ -729,6 +729,53 @@ takes effect at once.
 then the description. `key list`, `oauth grant list` and `oauth code list`
 end with `user U` (`-` when unassigned). Every listing is tab-separated with
 no header row, so `cut -f` works on it.
+
+### Provisioner keys
+
+Create an automation key with `okf-mcp key create signup --provisioner --user alice`,
+or as an every-catalog admin with `POST /api/v1/keys` and
+`{"name":"signup","user":"alice","provisioner":true}`. The console has a
+Provisioner switch in API keys > New key; it disables the catalog-access controls.
+`key list` includes `provisioner yes|no`. The flag is fixed at creation, its
+grant list is empty, and the schema refuses grants on it. It is never self-issued
+or an OAuth grant. Scoped admins cannot manage a provisioner key.
+
+Protect it like an admin key: it can take over any non-admin account by changing
+its email and sending a setup link. It cannot act on admin users: lookup leaves
+them out, detail refuses them, and mutations check the live flag under the user
+row lock. User detail never shows key, grant or sign-in-code lists to a
+provisioner; the user view retains their aggregate count. Administrative state
+changes are audited with its key as actor; metadata reads, unchanged operations
+and refusals do not themselves create use-log entries. Team and catalog
+management remains server-wide, as the allow-list specifies; the admin-target
+refusal applies to named user operations and membership/initial-owner targets.
+
+The explicit allow-list has these 16 method/template pairs (adding a new route
+does not add permission):
+
+| Method | Route |
+|---|---|
+| GET | `/api/v1/users?email=ADDRESS` (email required) |
+| GET | `/api/v1/users/{name}` |
+| POST | `/api/v1/users` |
+| PUT | `/api/v1/users/{name}/email` |
+| POST | `/api/v1/users/{name}/invite` |
+| DELETE | `/api/v1/users/{name}` |
+| GET | `/api/v1/teams/{name}` |
+| POST | `/api/v1/teams` |
+| PUT | `/api/v1/teams/{name}/members/{user}` |
+| DELETE | `/api/v1/teams/{name}/members/{user}` |
+| DELETE | `/api/v1/teams/{name}` |
+| PUT | `/api/v1/teams/{name}/suspension` |
+| POST | `/api/v1/catalogs` |
+| DELETE | `/api/v1/catalogs/{catalog}` |
+| PUT | `/api/v1/catalogs/{catalog}/member-access` |
+| GET | `/api/v1/audit` (own entries; reserved for the audit-reader task) |
+
+Every other API route is refused, including listing all users or teams, managing
+keys or grants, changing settings or admin flags, entitlements and session
+revocation. It reaches no catalog contents: no reads, writes, imports or exports.
+It is not an MCP or archive credential, nor a console sign-in credential.
 
 A shared catalog belongs to a team with several members:
 
@@ -918,6 +965,7 @@ the test checks the flag exists.
 | `okf-mcp team suspend` | `PUT /api/v1/teams/{name}/suspension` | Teams → team → Suspension → Suspend |
 | `okf-mcp team unsuspend` | `PUT /api/v1/teams/{name}/suspension` | Teams → team → Suspension → Lift suspension |
 | `okf-mcp catalog set-owner` | `PUT /api/v1/catalogs/{catalog}/owner` | Catalogs → catalog → Change owner (Assign when unassigned); Users → What is unassigned |
+| `okf-mcp key create --provisioner` | `POST /api/v1/keys` | API keys > New key > Provisioner |
 | `okf-mcp key assign` | `PUT /api/v1/keys/{id}/user` | API keys → key or grant → Assign / Change user; Users → What is unassigned |
 | `okf-mcp oauth code assign` | `PUT /api/v1/oauth/codes/{id}/user` | API keys → sign-in code → Assign / Change user; Users → What is unassigned |
 | `okf-mcp unassigned` | `GET /api/v1/unassigned` | Users → What is unassigned (`/ui/#/users/unassigned`), and the count on the Users link |
@@ -1994,7 +2042,7 @@ ones included, has Assign (unassigned) or Change user.
 | Method and path | Key | Does |
 |---|---|---|
 | `GET /api/v1/keys` | admin | The keys the caller manages, revoked ones included: `id`, `name`, `actor`, `access`, `kind` (`key` or `oauth`), `client_name`, `maintenance_report`, `all_catalogs`, `catalogs`, `catalog_access` (each catalog's level), `default_catalog`, `created_at`, `revoked_at`, `expires_at` (`null`: never), `self_issued`, `user` (`null` when unassigned). Never a secret or hash |
-| `POST /api/v1/keys` | admin | Body `{name, user, access: "read"\|"write"\|"admin", all, catalogs, default_catalog, actor, maintenance_report}` (`user` required; `actor` defaults to `name`). Answers `{key, secret}`. 400 for a bad `access`, 403 for `all` from a scoped caller, 404 for an unreached catalog or an unknown user, 409 for a bad or taken name, no catalogs, or `all` with `catalogs`, 422 for an unknown field or a missing `user` |
+| `POST /api/v1/keys` | admin | Body `{name, user, access: "read"\|"write"\|"admin", all, catalogs, default_catalog, actor, maintenance_report, provisioner}` (`user` required; `actor` defaults to `name`). `access` is required unless `provisioner: true`; a provisioner needs an every-catalog admin and refuses any supplied access, all, catalogs, default or reporting option (409). The returned key includes `provisioner`. Answers `{key, secret}`. 400 for a bad `access`, 403 for `all` from a scoped caller, 404 for an unreached catalog or an unknown user, 409 for a bad or taken name, no catalogs, or `all` with `catalogs`, 422 for an unknown field or a missing `user` |
 | `PATCH /api/v1/keys/{id}` | admin | Body `{maintenance_report: bool}`. 409 for a revoked key, or for enabling reporting on an OAuth grant |
 | `PUT /api/v1/keys/{id}/user` | admin | Body `{user}`. Gives the key or OAuth grant (live or revoked) that user, or changes it; access is unchanged. Answers its view, and its next request runs as that user. 404 for an unmanaged key or an unknown user, 422 without `user` |
 | `POST /api/v1/keys/{id}/revoke` | admin | Refused from the key's next request on. 409 if already revoked |

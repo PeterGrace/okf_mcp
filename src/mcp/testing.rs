@@ -140,6 +140,7 @@ pub(crate) fn principal_with_reporting(
         key_id: key_id.to_string(),
         access,
         maintenance_report,
+        provisioner: false,
         reach: if reach.is_empty() {
             Reach::All
         } else {

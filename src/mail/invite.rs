@@ -51,11 +51,6 @@ pub async fn send_setup(
     actor: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<String, OkfError> {
-    let Some(public_url) = config.public_url.as_deref() else {
-        return Err(OkfError::Refused {
-            reason: "setup links need public_url in the config".to_string(),
-        });
-    };
     // Code without an `App` reads the settings itself (plan Decision 24).
     let policy = settings::load(pool, &config.auth).await?;
     let mut tx = pool.begin().await?;
@@ -65,6 +60,11 @@ pub async fn send_setup(
     // invites deadlock upgrading theirs.
     let (_, is_admin) = users::lock_target(&mut tx, user, RowLock::NoKeyUpdate, actor).await?;
     audit::refuse_admin_target(actor, is_admin, user)?;
+    let Some(public_url) = config.public_url.as_deref() else {
+        return Err(OkfError::Refused {
+            reason: "setup links need public_url in the config".to_string(),
+        });
+    };
     let issued =
         email_tokens::issue_for_user_in(&mut tx, user, Purpose::Setup, policy.setup_link_ttl, now)
             .await?;

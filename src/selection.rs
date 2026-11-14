@@ -301,6 +301,7 @@ mod tests {
             key_id: "k".to_string(),
             access: Access::Read,
             maintenance_report: false,
+            provisioner: false,
             reach: if reach.is_empty() {
                 Reach::All
             } else {

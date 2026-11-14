@@ -162,10 +162,8 @@ impl AuditActor {
             // `settings.updated_by`, never written into an entry.
             label: principal.actor.clone(),
             via,
-            // Task 5 adds `|| principal.provisioner`.
-            operator: principal.access == Access::Admin,
-            // Task 5: `principal.provisioner`.
-            provisioner: false,
+            operator: principal.access == Access::Admin || principal.provisioner,
+            provisioner: principal.provisioner,
             ip: requester.ip,
         }
     }

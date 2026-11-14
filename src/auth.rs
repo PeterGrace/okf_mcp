@@ -89,6 +89,8 @@ pub struct Principal {
     pub access: Access,
     /// Independent opt-in to submit maintenance reports.
     pub maintenance_report: bool,
+    /// A provisioner reaches no catalog and may call only allow-listed API routes.
+    pub provisioner: bool,
     /// Which catalogs it reaches.
     pub reach: Reach,
     /// Its default catalog (design "Catalog selection", step 3).
@@ -272,6 +274,7 @@ impl Principal {
             key_id: format!("{SESSION_KEY_PREFIX}{}", user.name),
             access,
             maintenance_report: false,
+            provisioner: false,
             reach,
             default_catalog: None,
             actor: user.name.clone(),
@@ -321,6 +324,7 @@ impl From<KeyRecord> for Principal {
             key_id: record.id,
             access: record.access,
             maintenance_report: record.maintenance_report,
+            provisioner: record.provisioner,
             reach,
             default_catalog: record.default_catalog,
             actor: record.actor,
@@ -844,6 +848,10 @@ pub async fn require_key(
         None => Ok(None),
     };
     match found {
+        Ok(Some(principal)) if principal.provisioner => AppError(OkfError::Forbidden {
+            reason: "a provisioner key is not an MCP or archive credential".to_string(),
+        })
+        .into_response(),
         Ok(Some(principal)) => {
             tracing::debug!(key = %principal.key_id, "authenticated");
             request.extensions_mut().insert(principal);
@@ -886,6 +894,7 @@ mod tests {
             sha256: Some(keys::hash(key).to_vec()),
             access: Access::Read,
             maintenance_report: false,
+            provisioner: false,
             all_catalogs: false,
             catalogs: vec!["pg".to_string()],
             catalog_access: levels(&["pg"], Access::Read),
@@ -963,6 +972,7 @@ mod tests {
         let writer_without_flag = Principal {
             access: Access::Write,
             maintenance_report: false,
+            provisioner: false,
             ..reporter.clone()
         };
         assert!(matches!(
@@ -1754,6 +1764,7 @@ mod tests {
             key_id: "k".to_string(),
             access,
             maintenance_report: true,
+            provisioner: false,
             reach: Reach::Catalogs(levels(catalogs, access)),
             default_catalog: None,
             actor: "a".to_string(),

@@ -3,7 +3,11 @@
 //! `unassigned` do, over HTTP, with the same `store::users`, `store::teams`
 //! and `store::unassigned` functions.
 //!
-//! Access (plan Decision 3):
+//! Access (plan Decision 3, milestone 14 provisioners):
+//! - the provisioner allow-list permits non-admin account mutations and
+//!   team management, user lookup by email and user/team detail. It never
+//!   lists all users/teams or shows a user's keys and sign-in codes;
+//! - all other routes keep the admin rules below;
 //! - creating, deleting and changing users, teams and memberships, and
 //!   listing what is unassigned, need an admin key that reaches every
 //!   catalog: users and teams are not catalog-scoped; so do suspending a
@@ -44,7 +48,9 @@ use crate::error::OkfError;
 use crate::http::api::keys::{manages, manages_grants, parse_access, KeyView};
 use crate::http::api::me::{SessionList, SessionView, SignInList, SignInView, RECENT_SIGN_INS};
 use crate::http::api::oauth::SignInCodeView;
-use crate::http::api::{require_admin, require_every_catalog, settle};
+use crate::http::api::{
+    require_admin, require_every_catalog, require_manager, require_reader, settle,
+};
 use crate::http::AppError;
 use crate::mail::invite;
 use crate::store::audit::AuditActor;
@@ -415,9 +421,15 @@ async fn list_users(
     Extension(principal): Extension<Arc<Principal>>,
     Query(query): Query<UserQuery>,
 ) -> Result<Json<UserList>, AppError> {
-    require_admin(&principal)?;
+    require_reader(&principal)?;
     // `Option::into_iter` yields the one user or nothing, so both arms
-    // collect into the same `Vec<UserView>`.
+    // collect into the same `Vec<UserRecord>`.
+    if principal.provisioner && query.email.is_none() {
+        return Err(OkfError::Forbidden {
+            reason: "a provisioner looks users up by email".to_string(),
+        }
+        .into());
+    }
     let records = match query.email {
         Some(email) => users::find_record_by_email(app.pool(), &email)
             .await?
@@ -425,7 +437,11 @@ async fn list_users(
             .collect(),
         None => users::list(app.pool()).await?,
     };
-    let users = records.into_iter().map(UserView::from).collect();
+    let users = records
+        .into_iter()
+        .filter(|user| !(principal.provisioner && user.is_admin))
+        .map(UserView::from)
+        .collect();
     Ok(Json(UserList { users }))
 }
 
@@ -443,7 +459,7 @@ async fn create_user(
     actor: AuditActor,
     Json(body): Json<CreateUserBody>,
 ) -> Result<(StatusCode, Json<UserView>), AppError> {
-    require_every_catalog(&principal)?;
+    require_manager(&principal)?;
     let new = NewUser {
         name: &body.name,
         display_name: &body.display_name,
@@ -462,8 +478,36 @@ async fn user_detail(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
     Path(name): Path<String>,
+    actor: AuditActor,
 ) -> Result<Json<UserDetail>, AppError> {
-    require_admin(&principal)?;
+    require_reader(&principal)?;
+    if principal.provisioner {
+        let mut tx = app.pool().begin().await.map_err(OkfError::from)?;
+        let (_, is_admin) = crate::store::audit::lock_people(
+            &mut tx,
+            &actor,
+            &crate::store::audit::People {
+                target: Some((&name, crate::store::audit::RowLock::KeyShare)),
+                ..Default::default()
+            },
+        )
+        .await?
+        .expect("a named target is returned");
+        crate::store::audit::refuse_admin_target(&actor, is_admin, &name)?;
+        let user = users::find(&mut *tx, &name).await?;
+        let entitlements = ceiling::entitlements_in(&mut tx, &name)
+            .await?
+            .into_iter()
+            .map(EntitlementView::from)
+            .collect();
+        tx.commit().await.map_err(OkfError::from)?;
+        return Ok(Json(UserDetail {
+            user: user.into(),
+            keys: Vec::new(),
+            codes: Vec::new(),
+            entitlements,
+        }));
+    }
     let user = users::find(app.pool(), &name).await?;
     // `as_deref` turns the record's `Option<String>` into an `Option<&str>`,
     // comparable with `Some(name)` without allocating.
@@ -471,7 +515,9 @@ async fn user_detail(
     let keys = key_rows::list(app.pool())
         .await?
         .into_iter()
-        .filter(|key| named(key.user.as_deref()) && manages(&principal, key))
+        .filter(|key| {
+            !principal.provisioner && named(key.user.as_deref()) && manages(&principal, key)
+        })
         .map(KeyView::from)
         .collect();
     let now = app.clock().now();
@@ -479,7 +525,8 @@ async fn user_detail(
         .await?
         .into_iter()
         .filter(|code| {
-            named(code.user.as_deref())
+            !principal.provisioner
+                && named(code.user.as_deref())
                 && manages_grants(&principal, code.all_catalogs, &code.catalogs)
         })
         .map(|code| SignInCodeView::new(code, now))
@@ -549,7 +596,7 @@ async fn set_email(
     Path(name): Path<String>,
     Json(body): Json<EmailBody>,
 ) -> Result<Json<UserView>, AppError> {
-    require_every_catalog(&principal)?;
+    require_manager(&principal)?;
     let now = app.clock().now();
     users::set_email(app.pool(), &name, body.email.as_deref(), &actor, now).await?;
     // The address itself is not logged.
@@ -573,7 +620,7 @@ async fn invite_user(
     actor: AuditActor,
     Path(name): Path<String>,
 ) -> Result<(StatusCode, Json<Invited>), AppError> {
-    require_every_catalog(&principal)?;
+    require_manager(&principal)?;
     let now = app.clock().now();
     let email = invite::send_setup(app.pool(), app.config(), &name, &actor, now).await?;
     tracing::info!(user = %name, key = %principal.key_id, actor = %principal.actor,
@@ -738,7 +785,7 @@ async fn delete_user(
     actor: AuditActor,
     Path(name): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    require_every_catalog(&principal)?;
+    require_manager(&principal)?;
     // `false`: the API never deletes the last admin user (the CLI may).
     users::delete(app.pool(), &name, false, &actor, app.clock().now()).await?;
     settle(&app).await;
@@ -777,7 +824,7 @@ async fn create_team(
     actor: AuditActor,
     Json(body): Json<CreateTeamBody>,
 ) -> Result<(StatusCode, Json<TeamView>), AppError> {
-    require_every_catalog(&principal)?;
+    require_manager(&principal)?;
     let new = NewTeam {
         name: &body.name,
         display_name: &body.display_name,
@@ -797,7 +844,7 @@ async fn team_detail(
     Extension(principal): Extension<Arc<Principal>>,
     Path(name): Path<String>,
 ) -> Result<Json<TeamView>, AppError> {
-    require_admin(&principal)?;
+    require_reader(&principal)?;
     Ok(Json(teams::find(app.pool(), &name).await?.into()))
 }
 
@@ -816,7 +863,7 @@ async fn delete_team(
     actor: AuditActor,
     Path(name): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    require_every_catalog(&principal)?;
+    require_manager(&principal)?;
     teams::delete(app.pool(), &name, &actor, app.clock().now()).await?;
     settle(&app).await;
     Ok(StatusCode::NO_CONTENT)
@@ -837,7 +884,7 @@ async fn set_member(
     Path((team, user)): Path<(String, String)>,
     Json(body): Json<MemberBody>,
 ) -> Result<Json<MembershipChanged>, AppError> {
-    require_every_catalog(&principal)?;
+    require_manager(&principal)?;
     let membership = Membership {
         team: &team,
         user: &user,
@@ -866,7 +913,7 @@ async fn remove_member(
     actor: AuditActor,
     Path((team, user)): Path<(String, String)>,
 ) -> Result<Json<TeamView>, AppError> {
-    require_every_catalog(&principal)?;
+    require_manager(&principal)?;
     teams::remove_member(app.pool(), &team, &user, &actor, app.clock().now()).await?;
     settle(&app).await;
     Ok(Json(teams::find(app.pool(), &team).await?.into()))
@@ -894,7 +941,7 @@ async fn set_suspension(
     Path(name): Path<String>,
     Json(body): Json<SuspensionBody>,
 ) -> Result<Json<TeamView>, AppError> {
-    require_every_catalog(&principal)?;
+    require_manager(&principal)?;
     let now = app.clock().now();
     let team = if body.suspended {
         teams::suspend(app.pool(), &name, body.notice.as_deref(), &actor, now).await?

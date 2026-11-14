@@ -576,3 +576,47 @@ async fn a_write_settling_for_one_key_never_cancels_opening_another() {
         .expect("alpha is stored");
     assert_eq!(alpha.user.as_deref(), Some("alice"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admin_creates_a_provisioner_key_that_reaches_no_catalog() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        ui.click("#key-new");
+        ui.fill("#key-form input[name=name]", "signup");
+        ui.select("#key-form select[name=user]", OWNER);
+        ui.click("#key-form input[name=provisioner]");
+        ui.wait_visible("#key-form fieldset.key-reach[disabled]");
+        ui.hold_next("POST", "/api/v1/keys");
+        ui.click_twice("#key-form button[type=submit]");
+        assert_eq!(ui.held_matches(), 1);
+        ui.click("#drawer-close");
+        ui.click("#key-new");
+        ui.wait_visible("#key-form");
+        ui.fill("#key-form input[name=name]", "second-signup");
+        ui.select("#key-form select[name=user]", OWNER);
+        assert!(ui.click_twice("#key-form button[type=submit]"));
+        assert!(ui.click_twice("#key-form input[name=provisioner]"));
+        assert_eq!(
+            ui.held_matches(),
+            1,
+            "reopening must not start a second write"
+        );
+        ui.release_held();
+        ui.wait_visible("#key-secret");
+        ui.click("#key-secret-done");
+        ui.wait_visible("[data-test=key-provisioner-signup]");
+    })
+    .await;
+    if ran {
+        let record = key_rows::list(&server.db.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|k| k.name == "signup")
+            .unwrap();
+        assert!(record.provisioner && !record.all_catalogs && record.catalogs.is_empty());
+    }
+}

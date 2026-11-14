@@ -31,6 +31,7 @@ const PARITY_HEADING: &str = "### CLI, API and console parity";
 /// in one ` --<flag>`, for a flag with its own parity row (milestone 14
 /// Decision 15).
 const COVERED: &[&str] = &[
+    "key create --provisioner",
     "user create",
     "user list",
     "user list --email",
