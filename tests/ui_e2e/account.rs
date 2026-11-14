@@ -24,6 +24,8 @@ use crate::harness::{drive, Ui};
 use crate::oidc_mock::{self as idp, MockIdp};
 use crate::self_service::{console_base, login_server, login_server_with, member, EMAIL, PASSWORD};
 use crate::support::server::TestServer;
+use okf_mcp::store::audit::AuditActor;
+use okf_mcp::store::ceiling::NewEntitlement;
 
 /// The password the first journey changes to.
 const NEW_PASSWORD: &str = "a different long passphrase";
@@ -431,9 +433,18 @@ async fn a_member_unlinks_an_identity_and_sees_their_ceiling_and_sign_ins() {
         // An admin entitles alice to `other` mid-session: the page shows
         // the ceiling /me gives now, not the one she signed in with.
         runtime.block_on(async {
-            ceiling::entitle(&journey_pool, "alice", "other", Access::Read, Utc::now())
-                .await
-                .expect("entitle alice to other");
+            ceiling::entitle(
+                &journey_pool,
+                &NewEntitlement {
+                    user: "alice",
+                    catalog: "other",
+                    access: Access::Read,
+                },
+                &AuditActor::cli(),
+                Utc::now(),
+            )
+            .await
+            .expect("entitle alice to other");
             app.poll().await.expect("poll");
         });
         ui.click("a[data-nav=my-keys]");

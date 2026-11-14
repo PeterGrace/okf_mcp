@@ -16,6 +16,7 @@ use okf_mcp::archive::Files;
 use okf_mcp::clock::SystemClock;
 use okf_mcp::config::Config;
 use okf_mcp::okf::workspace::StoredFile;
+use okf_mcp::store::audit::AuditActor;
 use okf_mcp::store::import::{import, ImportOptions, ImportScope};
 use okf_mcp::store::keys::{self, Access, Grants, NewKey};
 use okf_mcp::store::{catalogs, users};
@@ -57,7 +58,7 @@ pub async fn migrate_with_owner(pool: &PgPool) {
         name: OWNER,
         display_name: "",
     };
-    users::create(pool, &owner, Utc::now())
+    users::create(pool, &owner, &AuditActor::cli(), Utc::now())
         .await
         .expect("create the owner");
 }
@@ -307,11 +308,12 @@ impl TestServer {
                 name,
                 display_name: "",
             },
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await
         .expect("create the user");
-        users::set_email(pool, name, Some(email))
+        users::set_email(pool, name, Some(email), &AuditActor::cli(), Utc::now())
             .await
             .expect("set the email");
         let user = users::find_by_email(pool, email)

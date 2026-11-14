@@ -108,7 +108,9 @@ mod tests {
     use crate::http::requester::Requester;
     use crate::mcp::changesets::{open_changeset, OpenParams};
     use crate::mcp::testing::{pending_entry, PendingEdit, TestApp};
+    use crate::store::audit::AuditActor;
     use crate::store::audit::Source;
+    use crate::store::users::AdminChange;
 
     /// Opens a changeset in `main` as the key `secret` and stores one new
     /// file in it; returns the handle.
@@ -290,9 +292,18 @@ mod tests {
         let theirs = open_as(&test, &keys.write, "systems/gamma.md").await;
         let own = open_as(&test, &keys.write, "systems/delta.md").await;
         let user = crate::db::TEST_USER;
-        crate::store::users::set_admin(test.app.pool(), user, true, false)
-            .await
-            .expect("make the user an admin");
+        crate::store::users::set_admin(
+            test.app.pool(),
+            user,
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("make the user an admin");
         let mut admin = Browser::session_for(&test, user).await;
 
         let mine = format!("/api/v1/changesets/{own}");

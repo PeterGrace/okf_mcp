@@ -600,6 +600,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::http::StatusCode;
+    use chrono::Utc;
     use serde_json::json;
     use sqlx::PgPool;
 
@@ -613,8 +614,10 @@ mod tests {
     use crate::mcp::testing::{app_with, TestApp};
     use crate::oidc::testing::{self as idp, MockIdp, CLIENT_ID, SECRET};
     use crate::oidc::LINK_STARTS_PER_USER;
+    use crate::store::audit::AuditActor;
     use crate::store::identities;
     use crate::store::sign_in_events::{self, Method, Outcome};
+    use crate::store::users::AdminChange;
     use crate::store::{passwords, users};
 
     /// An app with the mock provider as `example`. The client secret comes
@@ -1416,9 +1419,18 @@ mod tests {
         let mut second = Browser::default();
         let query = start(&test, &idp, &mut second).await;
         callback(&test, &mut second, &query["state"]).await;
-        users::set_admin(pool, "alice", true, false)
-            .await
-            .expect("make alice an admin");
+        users::set_admin(
+            pool,
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("make alice an admin");
         let after_admin = second
             .send(&test, "GET", "/api/v1/session", Payload::Empty)
             .await;

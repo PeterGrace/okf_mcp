@@ -11,7 +11,9 @@ use axum::Router;
 use chrono::{TimeDelta, Utc};
 use okf_mcp::config::Config;
 use okf_mcp::oauth::clients::MAX_UNBOUND_DCR;
+use okf_mcp::store::audit::AuditActor;
 use okf_mcp::store::ceiling;
+use okf_mcp::store::ceiling::NewEntitlement;
 use okf_mcp::store::keys::{self as key_rows, Access, Grants, KeyKind, KeyRecord};
 use okf_mcp::store::oauth::clients::{self as client_rows, NewDcrClient};
 use okf_mcp::store::oauth::codes::{self as code_rows, NewSignInCode};
@@ -197,9 +199,18 @@ async fn a_person_signs_in_on_the_way_and_approves_from_their_ceiling() {
         .user_with_password("alice", "alice@example.com", PASSWORD)
         .await;
     for (catalog, access) in [("main", Access::Write), ("other", Access::Read)] {
-        ceiling::entitle(pool, "alice", catalog, access, Utc::now())
-            .await
-            .expect("entitle");
+        ceiling::entitle(
+            pool,
+            &NewEntitlement {
+                user: "alice",
+                catalog,
+                access,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("entitle");
     }
     journey.server.app.poll().await.expect("poll");
     let authorize = journey.authorize(&[]);

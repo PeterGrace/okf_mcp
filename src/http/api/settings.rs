@@ -216,7 +216,9 @@ mod tests {
     };
     use crate::http::api::testing::{Browser, Payload};
     use crate::mcp::testing::TestApp;
+    use crate::store::audit::AuditActor;
     use crate::store::users;
+    use crate::store::users::AdminChange;
     use chrono::Utc;
 
     #[tokio::test]
@@ -322,14 +324,24 @@ mod tests {
                     name,
                     display_name: "",
                 },
+                &AuditActor::cli(),
                 Utc::now(),
             )
             .await
             .expect("create the user");
         }
-        users::set_admin(test.app.pool(), "boss", true, false)
-            .await
-            .expect("make boss an admin");
+        users::set_admin(
+            test.app.pool(),
+            "boss",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("make boss an admin");
         (
             Browser::session_for(test, "plain").await,
             Browser::session_for(test, "boss").await,

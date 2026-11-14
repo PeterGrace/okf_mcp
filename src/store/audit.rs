@@ -805,7 +805,9 @@ mod tests {
             name: "alice",
             display_name: "Alice Example",
         };
-        users::create(&db.pool, &new, now()).await.unwrap();
+        users::create(&db.pool, &new, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let alice = users::find_auth(&db.pool, &user_id(&db.pool, "alice").await)
             .await
             .unwrap()
@@ -836,7 +838,8 @@ mod tests {
             "SELECT row_to_json(e)::text || coalesce(row_to_json(p)::text, '') \
                     || coalesce(row_to_json(c)::text, '') \
              FROM audit_entries e LEFT JOIN audit_people p ON p.id = e.actor_person_id \
-             LEFT JOIN audit_credentials c ON c.id = e.actor_credential_ref",
+             LEFT JOIN audit_credentials c ON c.id = e.actor_credential_ref \
+             WHERE e.action = 'catalog.created'",
         )
         .fetch_one(&db.pool)
         .await
@@ -856,7 +859,9 @@ mod tests {
             name: "alice",
             display_name: "Alice Example",
         };
-        users::create(&db.pool, &new, now()).await.unwrap();
+        users::create(&db.pool, &new, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let alice = user_id(&db.pool, "alice").await;
         // A legacy key's id is its name, and a code's name is the user's
         // choice: both identify alice until they are forgotten.
@@ -944,7 +949,9 @@ mod tests {
             name: "alice",
             display_name: "",
         };
-        users::create(&db.pool, &new, now()).await.unwrap();
+        users::create(&db.pool, &new, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let alice = user_id(&db.pool, "alice").await;
         // A legacy key with no user yet: its audit row has no person.
         store_key(&db.pool, "alice-legacy", None).await;
@@ -986,7 +993,9 @@ mod tests {
             name: "alice",
             display_name: "Alice Example",
         };
-        users::create(&db.pool, &new, now()).await.unwrap();
+        users::create(&db.pool, &new, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let alice = user_id(&db.pool, "alice").await;
         // A legacy key with no user acts: its label names a person.
         store_key(&db.pool, "alice-laptop", None).await;
@@ -1020,7 +1029,8 @@ mod tests {
         let stored: String = sqlx::query_scalar(
             "SELECT row_to_json(e)::text || coalesce(row_to_json(c)::text, '') \
              FROM audit_entries e \
-             LEFT JOIN audit_credentials c ON c.id = e.actor_credential_ref",
+             LEFT JOIN audit_credentials c ON c.id = e.actor_credential_ref \
+             WHERE e.action = 'setting.changed'",
         )
         .fetch_one(&db.pool)
         .await
@@ -1037,7 +1047,9 @@ mod tests {
                 name,
                 display_name: "",
             };
-            users::create(&db.pool, &new, now()).await.unwrap();
+            users::create(&db.pool, &new, &AuditActor::cli(), now())
+                .await
+                .unwrap();
         }
         sqlx::query("UPDATE users SET is_admin = true WHERE name = 'staff'")
             .execute(&db.pool)
@@ -1180,7 +1192,9 @@ mod tests {
             name: "alice",
             display_name: "Alice",
         };
-        users::create(&db.pool, &new, now()).await.unwrap();
+        users::create(&db.pool, &new, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let alice = user_id(&db.pool, "alice").await;
         let mut tx = db.pool.begin().await.unwrap();
         record(
@@ -1198,7 +1212,8 @@ mod tests {
         let (name, display, linked, target_name): (String, String, Option<String>, Option<String>) =
             sqlx::query_as(
                 "SELECT p.name, p.display_name, p.user_id, e.target_name FROM audit_entries e \
-                 JOIN audit_people p ON p.id = e.target_person_id",
+                 JOIN audit_people p ON p.id = e.target_person_id \
+                 ORDER BY e.id DESC LIMIT 1",
             )
             .fetch_one(&db.pool)
             .await
@@ -1257,10 +1272,12 @@ mod tests {
         assert!(early.is_err(), "a recent entry cannot be deleted");
         assert_eq!(late.rows_affected(), 1, "an entry past 400 days can");
         assert!(truncated.is_err(), "TRUNCATE is refused");
-        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_entries")
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
+        // `setting.%`: the fixture user's `user.created` entry is there too.
+        let left: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_entries WHERE action LIKE 'setting.%'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
         assert_eq!(left, 1, "the recent entry survived every attempt");
     }
 
@@ -1282,10 +1299,11 @@ mod tests {
         // The change fails: dropping the transaction rolls both back.
         drop(tx);
 
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_entries")
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_entries WHERE action LIKE 'setting.%'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
         assert_eq!(count, 0);
     }
 

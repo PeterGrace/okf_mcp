@@ -26,6 +26,9 @@ use serde_json::json;
 use crate::catalogs::switcher;
 use crate::harness::drive;
 use crate::support::server::{files, TestServer};
+use okf_mcp::store::audit::AuditActor;
+use okf_mcp::store::ceiling::NewEntitlement;
+use okf_mcp::store::users::AdminChange;
 
 /// alice's password in every journey: long enough, and not a common one.
 pub(crate) const PASSWORD: &str = "correct horse battery staple";
@@ -109,9 +112,18 @@ pub(crate) fn console_base(server: &TestServer) -> String {
 /// If a store call or the poll fails.
 pub(crate) async fn member(server: &TestServer, access: Access) {
     server.user_with_password("alice", EMAIL, PASSWORD).await;
-    ceiling::entitle(&server.db.pool, "alice", "main", access, Utc::now())
-        .await
-        .expect("entitle alice to main");
+    ceiling::entitle(
+        &server.db.pool,
+        &NewEntitlement {
+            user: "alice",
+            catalog: "main",
+            access,
+        },
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("entitle alice to main");
     server.app.poll().await.expect("poll");
 }
 
@@ -254,9 +266,18 @@ async fn a_member_signs_in_from_the_card_and_sees_only_their_pages() {
 async fn a_members_level_follows_the_selected_catalog() {
     let server = login_server().await;
     member(&server, Access::Write).await;
-    ceiling::entitle(&server.db.pool, "alice", "other", Access::Read, Utc::now())
-        .await
-        .expect("entitle alice to other");
+    ceiling::entitle(
+        &server.db.pool,
+        &NewEntitlement {
+            user: "alice",
+            catalog: "other",
+            access: Access::Read,
+        },
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("entitle alice to other");
     server.app.poll().await.expect("poll");
     drive(console_base(&server), |ui| {
         ui.sign_in_password(EMAIL, PASSWORD);
@@ -275,9 +296,18 @@ async fn a_members_level_follows_the_selected_catalog() {
 async fn an_admin_user_signs_in_and_sees_the_full_console() {
     let server = login_server().await;
     member(&server, Access::Read).await;
-    users::set_admin(&server.db.pool, "alice", true, false)
-        .await
-        .expect("make alice an admin");
+    users::set_admin(
+        &server.db.pool,
+        "alice",
+        AdminChange {
+            on: true,
+            allow_last: false,
+        },
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("make alice an admin");
     server.app.poll().await.expect("poll");
     drive(console_base(&server), |ui| {
         ui.sign_in_password(EMAIL, PASSWORD);
@@ -442,7 +472,7 @@ async fn a_ceiling_lowered_during_the_session_shows_on_my_keys_without_a_reload(
         // An admin lowers main to read. The page is not reloaded: My keys
         // is reached through the nav link (a hash change).
         runtime.block_on(async {
-            ceiling::entitle(&pool, "alice", "main", Access::Read, Utc::now())
+            ceiling::entitle(&pool, &NewEntitlement { user: "alice", catalog: "main", access: Access::Read }, &AuditActor::cli(), Utc::now())
                 .await
                 .expect("lower main to read");
             app.poll().await.expect("poll");
@@ -465,7 +495,7 @@ async fn a_ceiling_lowered_during_the_session_shows_on_my_keys_without_a_reload(
         ui.click("#drawer-close");
         // Then main is taken away altogether.
         runtime.block_on(async {
-            ceiling::unentitle(&pool, "alice", "main")
+            ceiling::unentitle(&pool, "alice", "main", &AuditActor::cli(), Utc::now())
                 .await
                 .expect("take main away");
             app.poll().await.expect("poll");
@@ -530,7 +560,7 @@ async fn a_key_the_ceiling_no_longer_allows_is_refused_and_names_the_limit() {
         ui.click("#my-key-form input[name=catalog][value=main]");
         ui.select("#my-key-form select[name=level-main]", "write");
         runtime.block_on(async {
-            ceiling::unentitle(&pool, "alice", "main")
+            ceiling::unentitle(&pool, "alice", "main", &AuditActor::cli(), Utc::now())
                 .await
                 .expect("take main away");
             app.poll().await.expect("poll");
@@ -644,7 +674,7 @@ async fn a_member_revokes_an_oauth_grant() {
         // Signed in with main in her ceiling, then an admin takes it away:
         // the page compares with the ceiling /me gives now.
         runtime.block_on(async {
-            ceiling::unentitle(&pool, "alice", "main")
+            ceiling::unentitle(&pool, "alice", "main", &AuditActor::cli(), Utc::now())
                 .await
                 .expect("take main away");
             app.poll().await.expect("poll");

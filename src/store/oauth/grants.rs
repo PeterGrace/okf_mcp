@@ -266,6 +266,8 @@ mod tests {
     use super::{create_self_issued, NewSelfIssuedGrant};
     use crate::db::test_db;
     use crate::error::OkfError;
+    use crate::store::audit::AuditActor;
+    use crate::store::ceiling::NewEntitlement;
     use crate::store::keys::{self as key_rows, Access, KeyKind};
     use crate::store::oauth::clients::{ClientKind, ClientRecord};
     use crate::store::oauth::codes::insert_test_client;
@@ -297,14 +299,24 @@ mod tests {
                 name: "alice",
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await
         .expect("alice");
         for (catalog, access) in grants {
-            ceiling::entitle(pool, "alice", catalog, *access, now())
-                .await
-                .expect("entitle");
+            ceiling::entitle(
+                pool,
+                &NewEntitlement {
+                    user: "alice",
+                    catalog,
+                    access: *access,
+                },
+                &AuditActor::cli(),
+                now(),
+            )
+            .await
+            .expect("entitle");
         }
         let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE name = 'alice'")
             .fetch_one(pool)

@@ -1017,6 +1017,8 @@ mod tests {
         oauth_app, send, send_as, sign_in_code, user_authorize_query, CLIENT_ID,
         LOOPBACK_CLIENT_ID, LOOPBACK_ON_PORT, PUBLIC_URL, REDIRECT_URI, VERIFIER,
     };
+    use crate::store::audit::AuditActor;
+    use crate::store::ceiling::NewEntitlement;
     use crate::store::ceiling::{self, Ceiling};
     use crate::store::keys::{self as key_rows, Access, KeyKind};
     use crate::store::oauth::codes as code_rows;
@@ -1663,14 +1665,24 @@ mod tests {
                 name,
                 display_name: "",
             },
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await
         .expect("create the user");
         for (catalog, access) in grants {
-            ceiling::entitle(test.app.pool(), name, catalog, *access, Utc::now())
-                .await
-                .expect("entitle");
+            ceiling::entitle(
+                test.app.pool(),
+                &NewEntitlement {
+                    user: name,
+                    catalog,
+                    access: *access,
+                },
+                &AuditActor::cli(),
+                Utc::now(),
+            )
+            .await
+            .expect("entitle");
         }
         Browser::session_for(test, name).await
     }
@@ -1914,9 +1926,18 @@ mod tests {
             .expect("cached")
             .level("main");
 
-        ceiling::entitle(test.app.pool(), "alice", "main", Access::Read, Utc::now())
-            .await
-            .expect("lower");
+        ceiling::entitle(
+            test.app.pool(),
+            &NewEntitlement {
+                user: "alice",
+                catalog: "main",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("lower");
         test.app.poll().await.expect("reload");
         let lowered = test
             .app
@@ -1924,9 +1945,15 @@ mod tests {
             .find_grant(&grant)
             .expect("cached")
             .level("main");
-        ceiling::unentitle(test.app.pool(), "alice", "main")
-            .await
-            .expect("remove");
+        ceiling::unentitle(
+            test.app.pool(),
+            "alice",
+            "main",
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("remove");
         test.app.poll().await.expect("reload");
         let removed = test
             .app
@@ -2036,9 +2063,18 @@ mod tests {
         let test = oauth_app().await;
         let alice = signed_in(&test, "alice", &[("main", Access::Write)]).await;
         let page = user_page(&test, &alice).await;
-        ceiling::entitle(test.app.pool(), "alice", "main", Access::Read, Utc::now())
-            .await
-            .expect("lower");
+        ceiling::entitle(
+            test.app.pool(),
+            &NewEntitlement {
+                user: "alice",
+                catalog: "main",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("lower");
 
         let (status, _, body) = consent_as(
             &test,
@@ -2060,9 +2096,18 @@ mod tests {
         let test = oauth_app().await;
         let alice = signed_in(&test, "alice", &[("main", Access::Read)]).await;
         let page = user_page(&test, &alice).await;
-        ceiling::entitle(test.app.pool(), "alice", "other", Access::Read, Utc::now())
-            .await
-            .expect("widen");
+        ceiling::entitle(
+            test.app.pool(),
+            &NewEntitlement {
+                user: "alice",
+                catalog: "other",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("widen");
 
         let (status, _, _) = consent_as(
             &test,

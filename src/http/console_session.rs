@@ -690,17 +690,29 @@ mod http_tests {
     use crate::http::api::testing::{
         keys, login_app, user_with_password, Browser, Payload, PASSWORD,
     };
+    use crate::store::audit::AuditActor;
     use crate::store::ceiling;
+    use crate::store::ceiling::NewEntitlement;
     use crate::store::keys::Access;
+    use crate::store::users::AdminChange;
     use crate::store::{passwords, user_sessions, users};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_session_reaches_the_api_with_exactly_its_ceiling() {
         let test = login_app().await;
         user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
-        ceiling::entitle(test.app.pool(), "alice", "main", Access::Read, Utc::now())
-            .await
-            .expect("entitle");
+        ceiling::entitle(
+            test.app.pool(),
+            &NewEntitlement {
+                user: "alice",
+                catalog: "main",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("entitle");
         test.app.poll().await.expect("poll");
         let mut browser = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
 
@@ -753,12 +765,30 @@ mod http_tests {
         let test = login_app().await;
         user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
         let now = Utc::now();
-        ceiling::entitle(test.app.pool(), "alice", "main", Access::Write, now)
-            .await
-            .expect("entitle main");
-        ceiling::entitle(test.app.pool(), "alice", "other", Access::Read, now)
-            .await
-            .expect("entitle other");
+        ceiling::entitle(
+            test.app.pool(),
+            &NewEntitlement {
+                user: "alice",
+                catalog: "main",
+                access: Access::Write,
+            },
+            &AuditActor::cli(),
+            now,
+        )
+        .await
+        .expect("entitle main");
+        ceiling::entitle(
+            test.app.pool(),
+            &NewEntitlement {
+                user: "alice",
+                catalog: "other",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            now,
+        )
+        .await
+        .expect("entitle other");
         let mut browser = Browser::session_for(&test, "alice").await;
         let body = serde_json::json!({
             "disposition": "dismissed",
@@ -790,9 +820,18 @@ mod http_tests {
     async fn an_admin_users_session_is_an_admin_on_every_catalog() {
         let test = login_app().await;
         user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
-        users::set_admin(test.app.pool(), "alice", true, false)
-            .await
-            .expect("set admin");
+        users::set_admin(
+            test.app.pool(),
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("set admin");
         test.app.poll().await.expect("poll");
         let mut browser = Browser::signed_in(&test, "alice@example.com", PASSWORD).await;
 
@@ -822,9 +861,18 @@ mod http_tests {
         // exists, so `set_admin` had no session to end.
         let test = login_app().await;
         user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
-        users::set_admin(test.app.pool(), "alice", true, false)
-            .await
-            .expect("set admin");
+        users::set_admin(
+            test.app.pool(),
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("set admin");
         test.app.poll().await.expect("poll");
         let passwords::SignInOutcome::Ok(passwords::Verified { user: checked, .. }) =
             passwords::verify(test.app.pool(), "alice@example.com", PASSWORD, Utc::now())
@@ -834,9 +882,18 @@ mod http_tests {
             panic!("the password was refused");
         };
         assert!(checked.is_admin, "admin when the password was checked");
-        users::set_admin(test.app.pool(), "alice", false, true)
-            .await
-            .expect("clear admin");
+        users::set_admin(
+            test.app.pool(),
+            "alice",
+            AdminChange {
+                on: false,
+                allow_last: true,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("clear admin");
         // What the API's `settle` and the poll loop do after a change.
         test.app.poll().await.expect("poll");
         let (_, session) = super::start_session(&test.app, &checked, None, "okf-test")
@@ -873,9 +930,18 @@ mod http_tests {
             .await
             .json();
 
-        users::set_admin(test.app.pool(), "alice", true, false)
-            .await
-            .expect("set admin");
+        users::set_admin(
+            test.app.pool(),
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("set admin");
         let after = browser
             .send(&test, "GET", "/api/v1/whoami", Payload::Empty)
             .await;
@@ -956,9 +1022,18 @@ mod http_tests {
     async fn a_cookie_never_reaches_mcp_or_the_archive_routes() {
         let test = login_app().await;
         user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
-        users::set_admin(test.app.pool(), "alice", true, false)
-            .await
-            .expect("set admin");
+        users::set_admin(
+            test.app.pool(),
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("set admin");
         // An admin session: every route below would admit an admin key.
         let mut browser = Browser::session_for(&test, "alice").await;
         let initialize = serde_json::json!({
@@ -990,9 +1065,18 @@ mod http_tests {
     async fn the_api_archive_routes_take_a_session_at_its_levels_and_with_csrf() {
         let test = login_app().await;
         user_with_password(&test, "alice", "alice@example.com", Some(PASSWORD)).await;
-        ceiling::entitle(test.app.pool(), "alice", "main", Access::Write, Utc::now())
-            .await
-            .expect("entitle");
+        ceiling::entitle(
+            test.app.pool(),
+            &NewEntitlement {
+                user: "alice",
+                catalog: "main",
+                access: Access::Write,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("entitle");
         let mut writer = Browser::session_for(&test, "alice").await;
 
         let export = writer
@@ -1171,13 +1255,23 @@ mod http_tests {
                 name: "bob",
                 display_name: "",
             },
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await
         .expect("create bob");
-        ceiling::entitle(pool, "bob", "main", Access::Write, Utc::now())
-            .await
-            .expect("entitle");
+        ceiling::entitle(
+            pool,
+            &NewEntitlement {
+                user: "bob",
+                catalog: "main",
+                access: Access::Write,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("entitle");
         let bob_id: String = sqlx::query_scalar("SELECT id FROM users WHERE name = 'bob'")
             .fetch_one(pool)
             .await

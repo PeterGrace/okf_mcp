@@ -1038,6 +1038,7 @@ async fn reset_post(
 mod tests {
     use std::time::Duration;
 
+    use crate::store::audit::AuditActor;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use chrono::Utc;
@@ -1989,7 +1990,14 @@ mod tests {
         let change = || {
             let pool = pool.clone();
             tokio::spawn(async move {
-                users::set_email(&pool, "alice", Some("alice@example.net")).await
+                users::set_email(
+                    &pool,
+                    "alice",
+                    Some("alice@example.net"),
+                    &AuditActor::cli(),
+                    Utc::now(),
+                )
+                .await
             })
         };
         // Each task is queued only once the one before it waits on the row.
@@ -2135,7 +2143,14 @@ mod tests {
                     .await
                     .map(|_| ()),
                     Rival::EmailChange => {
-                        users::set_email(&pool, "alice", Some("alice@example.net")).await
+                        users::set_email(
+                            &pool,
+                            "alice",
+                            Some("alice@example.net"),
+                            &AuditActor::cli(),
+                            Utc::now(),
+                        )
+                        .await
                     }
                 }
             })

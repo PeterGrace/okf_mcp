@@ -3237,6 +3237,14 @@ Run per task: `tools/agentic/gate.sh narrow --lib store::<module>::tests` for ea
 
 The self-service `DELETE /me/sessions/...` keeps calling `user_sessions::revoke_by_prefix` and records nothing: it is the user's own session, not an administrative change. Callers of `users::create` outside the CLI and the API (an OIDC first sign-in, if it creates users: `grep -rn "users::create(" src`) pass `&AuditActor::system("oidc")`.
 
+> **Corrected (issue #396, 2026-11-14).** What shipped differs from the table and the common pattern here:
+> - `invite::send_setup`'s guard reads `SELECT is_admin FROM users WHERE name = $1 FOR NO KEY UPDATE`, not `FOR SHARE`: `email_tokens::issue_for_user_in` locks the same row `FOR NO KEY UPDATE` right after, and two invites each holding `FOR SHARE` would deadlock upgrading. The lock still conflicts with `set_admin`'s `FOR UPDATE`, and the guard runs before the "no email" check, so a provisioner learns nothing about whether an admin has an email.
+> - `users::set_email` locks the user first (`SELECT id, is_admin ... FOR UPDATE`) and refuses a provisioner before its `UPDATE`, not after it as the sketch above shows, so the refusal comes before "Another user has this email".
+> - `user.entitlement_set` and `user.sessions_revoked` are recorded only when something changed (an unchanged level, no session ended), like the rows marked "(when changed)". `entitle` takes `previous` from its own upsert (`RETURNING xmax = 0`: inserted is `null`, updated is the other level), not from a separate read.
+> - Lock order. `audit::record` locks the acting user's row (and its credential's owner, and a personal team's person) `FOR KEY SHARE` through `audit_person`, and `set_admin` locks every admin row `FOR UPDATE` before `server_state`. So every 6a function first calls `users::lock_users(conn, &UserLocks { target: Some((name, RowLock::..)), actor, catalog })` (or `users::lock_target`), which locks the target, the actor's user and credential owner, and a catalog's personal owner in `set_admin`'s order (admin users first, then the rest, each by id), before `server_state` and anything else; `set_admin` calls it after its admin rows. Tests: `an_admins_change_and_a_concurrent_set_admin_both_finish` (`store::users`) and `an_admins_entitlement_change_and_a_concurrent_set_admin_both_finish` (`store::ceiling`), each forced through a held `server_state` row. Tasks 6b and 6c should take their user rows through `lock_users` the same way.
+> - `users::user_entry(action, user_id, details) -> Entry` (`pub(crate)`) builds every user-targeted entry, `user.deleted` included; `ceiling` sets `teams` on it with struct-update syntax. `user_sessions::revoke_by_prefix_in(conn, user_id, id_prefix)` is `pub(crate)`.
+> - `crate::db::test_db()` and `tests/support/server.rs` create their fixture user through `users::create`, so every test database starts with a `user.created` entry (person `test-user`; `tester` in the integration tests). A test that counts the whole log, or every entry of one action, must allow for it: `store::audit`'s tests now filter by action, and Task 8a's export test is corrected below.
+
 Commit:
 
 ```bash
@@ -4608,8 +4616,11 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let lines: Vec<serde_json::Value> = std::str::from_utf8(&bytes).unwrap().lines()
             .map(|line| serde_json::from_str(line).unwrap()).collect();
-        assert_eq!(lines.len(), 1);
+        // The fixture user's own `user.created` entry is the older one
+        // (corrected, issue #396, 2026-11-14: `test_db` records it).
+        assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["action"], "user.created");
+        assert_eq!(lines[0]["target"]["person"], "alice");
     }
 }
 ```
