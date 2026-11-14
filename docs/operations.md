@@ -951,6 +951,18 @@ reading users and teams needs any admin key, so a scoped admin can pick the
 user of a key it creates. For any other admin the console shows these
 controls disabled, or the Unassigned view a note, saying why.
 
+### Audit log
+
+Every change below writes one entry in the change's own transaction: the
+change and its entry commit together, and a change whose entry cannot be
+written fails. An entry names the catalog and belongs to its owner team.
+
+| Action | Recorded when | Details |
+|---|---|---|
+| `catalog.published` | A publish writes at least one revision (one that changes nothing writes none and records nothing). Moves, splits and concept deletes are publishes and are recorded as such | `changeset` (the handle; the diff stays in the catalog's history), `files` (revisions written), `generation_from`, `generation_to` |
+| `catalog.reverted` | A `revert` succeeds: a document's old revision (or its deletion) goes into a changeset. A refused revert records nothing | `path`, `revision`, `changeset` |
+| `catalog.changeset_discarded` | An admin closes another key's changeset (`discard` without `paths`, or `DELETE /api/v1/changesets/{handle}`). A key discarding its own changeset records nothing | `changeset`, `files` (entries dropped), `reason` (`admin`) |
+
 ## Signing in and self-service
 
 People sign in to the console as themselves, with any of three methods: a
@@ -2232,7 +2244,7 @@ one does, never 403.
 |---|---|---|
 | `GET /api/v1/changesets?catalog=` | read | The key's own open changesets; an admin's: every key's. `catalog` is optional (absent or empty: every catalog the key reaches; an unreached one is 404). As `list_changesets`: `changeset`, `catalog`, `key`, `key_name`, `actor`, `created`, `last_change`, `idle`, `paths` |
 | `GET /api/v1/changesets/{handle}/diff` | owner or admin | As `pending_changes`: `{catalog, changeset, files}`, each file with its unified `diff`. 404 for another key's handle; 409 once published or discarded |
-| `DELETE /api/v1/changesets/{handle}` | write (owner) or admin | As `discard` without `paths`: drops every entry and closes the handle for good (`{catalog, changeset, removed, closed}`). 404 for another key's handle; 409 once published or discarded |
+| `DELETE /api/v1/changesets/{handle}` | write (owner) or admin | As `discard` without `paths`: drops every entry and closes the handle for good (`{catalog, changeset, removed, closed}`). An admin closing another key's changeset is recorded in the [audit log](#audit-log). 404 for another key's handle; 409 once published or discarded |
 
 ```sh
 curl -s -X DELETE -H "Authorization: Bearer $OKF_MCP_KEY" \

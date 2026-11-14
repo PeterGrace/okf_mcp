@@ -14,6 +14,7 @@ use crate::app::App;
 use crate::auth::{Principal, Reach};
 use crate::error::OkfError;
 use crate::http::console_session::require_principal;
+use crate::http::requester::Requester;
 use crate::mcp::context::ToolContext;
 use crate::store::keys::Access;
 
@@ -103,11 +104,16 @@ pub(crate) async fn api_headers(mut response: Response) -> Response {
 /// # Arguments
 /// * `app` - the application.
 /// * `principal` - the caller, from `require_principal`.
+/// * `requester` - the request's address and source, for the audit log.
 ///
 /// # Returns
 /// A context acting as `principal`.
-pub(crate) fn context(app: &Arc<App>, principal: Arc<Principal>) -> ToolContext {
-    ToolContext::new(Arc::clone(app), principal, None)
+pub(crate) fn context(
+    app: &Arc<App>,
+    principal: Arc<Principal>,
+    requester: Requester,
+) -> ToolContext {
+    ToolContext::new(Arc::clone(app), principal, None).with_requester(requester)
 }
 
 /// Refuses a key below `admin`, for the admin routes that name no catalog

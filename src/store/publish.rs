@@ -28,6 +28,7 @@ use crate::okf::ops::replay::{replay, ReplayOp};
 use crate::okf::rules;
 use crate::okf::snapshot::Snapshot;
 use crate::overlay::{build_overlay, Overlay};
+use crate::store::audit::{self, Action, AuditActor, Entry, Target};
 use crate::store::catalogs::{self, is_unique_violation};
 use crate::store::changesets::{self, ChangesetRow, ChangesetState, EntryRow};
 use crate::store::documents::{self, Derived, DocumentWrite, RevisionOp, RevisionRecord};
@@ -72,6 +73,20 @@ struct Merged {
     replayed: Vec<String>,
 }
 
+/// What to publish, and as whom the documents record it.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishInput<'a> {
+    /// The open changeset (read without its lock; [`publish`] locks it and
+    /// reads it again).
+    pub changeset: &'a ChangesetRow,
+    /// The publishing key's actor, recorded on every document and revision
+    /// (an admin publishing another key's changeset records its own
+    /// `actor`, not the opener's).
+    pub actor: &'a str,
+    /// Recorded on every revision.
+    pub message: &'a str,
+}
+
 /// The publish's identity: what every row it writes records.
 #[derive(Debug)]
 struct Publication<'a> {
@@ -86,12 +101,10 @@ struct Publication<'a> {
 /// # Arguments
 /// * `app` - the shared state (pool, clock, overlays).
 /// * `state` - the changeset's catalog.
-/// * `changeset` - the open changeset (read without its lock; it is locked
-///   and read again here).
-/// * `actor` - the publishing key's actor, recorded on every document and
-///   revision (an admin publishing another key's changeset records its own
-///   `actor`, not the opener's).
-/// * `message` - recorded on every revision.
+/// * `input` - the changeset, the actor its documents record, and the
+///   message.
+/// * `audit` - who publishes, for the `catalog.published` entry the
+///   publish records in its own transaction when it writes any revision.
 ///
 /// # Returns
 /// The revisions written, lint advice and the replayed paths;
@@ -110,16 +123,21 @@ struct Publication<'a> {
 /// - [`OkfError::CatalogNotSelected`] if the catalog was deleted;
 /// - [`OkfError::Busy`] if the snapshot could not be brought up to date;
 /// - an overlay that no longer applies ([`OkfError::InvalidPath`]);
-/// - [`OkfError::Database`].
+/// - [`OkfError::Database`], the audit entry's included.
 ///
 /// On every error the transaction rolls back and the changeset stays as it was.
 pub async fn publish(
     app: &App,
     state: &CatalogState,
-    changeset: &ChangesetRow,
-    actor: &str,
-    message: &str,
+    input: &PublishInput<'_>,
+    audit: &AuditActor,
 ) -> Result<PublishReport, OkfError> {
+    // Destructuring a struct borrowed by reference copies its `&` fields.
+    let PublishInput {
+        changeset,
+        actor,
+        message,
+    } = *input;
     // Step 1, before any lock: an empty changeset never waits for one.
     if changesets::entries(app.pool(), changeset.id)
         .await?
@@ -174,11 +192,30 @@ pub async fn publish(
         }
         Err(error) => return Err(error),
     };
+    // A publish that wrote no revision changed no document: it is not a
+    // catalog write, so it bumps nothing and records nothing.
     if !revisions.is_empty() {
-        sqlx::query("UPDATE catalogs SET generation = generation + 1 WHERE id = $1")
-            .bind(state.id())
-            .execute(&mut *tx)
-            .await?;
+        let generation: i64 = sqlx::query_scalar(
+            "UPDATE catalogs SET generation = generation + 1 WHERE id = $1 RETURNING generation",
+        )
+        .bind(state.id())
+        .fetch_one(&mut *tx)
+        .await?;
+        let teams = audit::catalog_teams(&mut tx, state.id()).await?;
+        let entry = Entry {
+            action: Action::CatalogPublished,
+            target: Target::Catalog(state.name()),
+            person: None,
+            teams: &teams,
+            // The diff stays in the catalog's history, found by the handle.
+            details: serde_json::json!({
+                "changeset": locked.handle,
+                "files": revisions.len(),
+                "generation_from": generation - 1,
+                "generation_to": generation,
+            }),
+        };
+        audit::record(&mut tx, audit, &entry, now).await?;
     }
     changesets::set_state(&mut tx, locked.id, ChangesetState::Published, now).await?;
     tx.commit().await?;

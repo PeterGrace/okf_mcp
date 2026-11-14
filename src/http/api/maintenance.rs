@@ -13,6 +13,7 @@ use serde::Deserialize;
 use crate::app::App;
 use crate::auth::Principal;
 use crate::http::api;
+use crate::http::requester::Requester;
 use crate::http::AppError;
 use crate::maintenance::types::Disposition;
 use crate::mcp::maintenance::reports::{
@@ -84,10 +85,11 @@ pub(crate) fn routes() -> Router<Arc<App>> {
 async fn list_runs(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path(catalog): Path<String>,
     Query(query): Query<RunsQuery>,
 ) -> Result<Json<MaintenanceResult<Page<RunSummary>>>, AppError> {
-    let ctx = api::context(&app, principal);
+    let ctx = api::context(&app, principal, requester);
     let params = MaintenanceListRunsParams {
         catalog,
         after: query.after,
@@ -103,9 +105,10 @@ async fn list_runs(
 async fn get_run(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path((catalog, run_id)): Path<(String, String)>,
 ) -> Result<Json<MaintenanceResult<RunReport>>, AppError> {
-    let ctx = api::context(&app, principal);
+    let ctx = api::context(&app, principal, requester);
     let params = MaintenanceGetRunParams { catalog, run_id };
     Ok(Json(tools::maintenance_get_run(&ctx, params).await?))
 }
@@ -118,10 +121,11 @@ async fn get_run(
 async fn list_findings(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path(catalog): Path<String>,
     Query(query): Query<FindingsQuery>,
 ) -> Result<Json<MaintenanceResult<Page<FindingRecord>>>, AppError> {
-    let ctx = api::context(&app, principal);
+    let ctx = api::context(&app, principal, requester);
     let params = MaintenanceListFindingsParams {
         catalog,
         after: query.after,
@@ -139,9 +143,10 @@ async fn list_findings(
 async fn get_finding(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path((catalog, finding_id)): Path<(String, String)>,
 ) -> Result<Json<MaintenanceResult<FindingRecord>>, AppError> {
-    let ctx = api::context(&app, principal);
+    let ctx = api::context(&app, principal, requester);
     let params = MaintenanceGetFindingParams {
         catalog,
         finding_id,
@@ -158,11 +163,12 @@ async fn get_finding(
 async fn dispose(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path((catalog, finding_id)): Path<(String, String)>,
     // `Json` reads the body, so it must be the last extractor.
     Json(body): Json<DisposeBody>,
 ) -> Result<Json<MaintenanceResult<FindingRecord>>, AppError> {
-    let ctx = api::context(&app, principal);
+    let ctx = api::context(&app, principal, requester);
     let params = MaintenanceDisposeParams {
         catalog,
         finding_id,
@@ -180,9 +186,10 @@ async fn dispose(
 async fn counts(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path(catalog): Path<String>,
 ) -> Result<Json<MaintenanceResult<FindingCounts>>, AppError> {
-    let ctx = api::context(&app, principal);
+    let ctx = api::context(&app, principal, requester);
     Ok(Json(
         tools::maintenance_finding_counts(&ctx, &catalog).await?,
     ))
