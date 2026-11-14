@@ -20,6 +20,7 @@ use serde::Deserialize;
 use crate::app::App;
 use crate::auth::Principal;
 use crate::http::api::context;
+use crate::http::requester::Requester;
 use crate::http::AppError;
 use crate::mcp::changesets::{
     discard, list_changesets, pending_changes, DiscardParams, Discarded, ListParams, Listed,
@@ -52,9 +53,10 @@ pub(crate) fn routes() -> Router<Arc<App>> {
 async fn list(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Listed>, AppError> {
-    let ctx = context(&app, principal);
+    let ctx = context(&app, principal, requester);
     // `filter` turns `?catalog=` (an empty select) into "every catalog".
     let catalog = query.catalog.filter(|name| !name.is_empty());
     Ok(Json(list_changesets(&ctx, ListParams { catalog }).await?))
@@ -67,9 +69,10 @@ async fn list(
 async fn diff(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path(handle): Path<String>,
 ) -> Result<Json<PendingChanges>, AppError> {
-    let ctx = context(&app, principal);
+    let ctx = context(&app, principal, requester);
     let params = PendingParams { changeset: handle };
     Ok(Json(pending_changes(&ctx, params).await?))
 }
@@ -84,9 +87,10 @@ async fn diff(
 async fn remove(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path(handle): Path<String>,
 ) -> Result<Json<Discarded>, AppError> {
-    let ctx = context(&app, principal);
+    let ctx = context(&app, principal, requester);
     let params = DiscardParams {
         paths: None,
         changeset: handle,
@@ -101,14 +105,20 @@ mod tests {
 
     use crate::http::api::context;
     use crate::http::api::testing::{app, assert_matrix_with, keys, send, Row};
+    use crate::http::requester::Requester;
     use crate::mcp::changesets::{open_changeset, OpenParams};
     use crate::mcp::testing::{pending_entry, PendingEdit, TestApp};
+    use crate::store::audit::Source;
 
     /// Opens a changeset in `main` as the key `secret` and stores one new
     /// file in it; returns the handle.
     async fn open_as(test: &TestApp, secret: &str, path: &str) -> String {
         let principal = test.app.keys().find(secret).expect("a live key");
-        let ctx = context(&test.app, principal);
+        let requester = Requester {
+            ip: None,
+            source: Source::Api,
+        };
+        let ctx = context(&test.app, principal, requester);
         let handle = open_changeset(
             &ctx,
             OpenParams {
@@ -266,6 +276,47 @@ mod tests {
         let unknown = "/api/v1/changesets/no-such-handle/diff";
         let (status, _) = send(&test, "GET", unknown, Some(&keys.admin), None).await;
         assert_eq!(status.as_u16(), 404);
+    }
+
+    /// M14 Task 7a: the REST routes pass the request's source to the
+    /// tools, so an admin session's discard of another key's changeset is
+    /// recorded as the console, and the owner's own is not recorded.
+    #[tokio::test]
+    async fn an_admin_sessions_discard_is_recorded_from_the_console() {
+        use crate::http::api::testing::{Browser, Payload};
+        use crate::store::audit::testing::entries;
+        let test = app().await;
+        let keys = keys(&test).await;
+        let theirs = open_as(&test, &keys.write, "systems/gamma.md").await;
+        let own = open_as(&test, &keys.write, "systems/delta.md").await;
+        let user = crate::db::TEST_USER;
+        crate::store::users::set_admin(test.app.pool(), user, true, false)
+            .await
+            .expect("make the user an admin");
+        let mut admin = Browser::session_for(&test, user).await;
+
+        let mine = format!("/api/v1/changesets/{own}");
+        let (by_owner, _) = send(&test, "DELETE", &mine, Some(&keys.write), None).await;
+        let uri = format!("/api/v1/changesets/{theirs}");
+        let (status, body) = admin
+            .send(&test, "DELETE", &uri, Payload::Empty)
+            .await
+            .parts();
+
+        assert_eq!(by_owner.as_u16(), 200);
+        assert_eq!(status.as_u16(), 200, "{body}");
+        let recorded = entries(test.app.pool(), "catalog.changeset_discarded").await;
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let entry = &recorded[0];
+        assert_eq!(entry.source, "console");
+        assert_eq!(entry.actor_label, "console session");
+        assert_eq!(entry.actor_person.as_deref(), Some(user));
+        assert!(entry.actor_operator);
+        assert_eq!(entry.target.as_deref(), Some("main"));
+        assert_eq!(
+            entry.details,
+            json!({"changeset": theirs, "files": 1, "reason": "admin"})
+        );
     }
 
     #[tokio::test]
