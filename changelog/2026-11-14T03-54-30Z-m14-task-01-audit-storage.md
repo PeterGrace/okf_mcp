@@ -33,6 +33,10 @@ Issue #391, epic #390. Plan: `docs/superpowers/plans/2026-11-13-okf-mcp-m14-oper
   their ids and labels to NULL while the entry and its references survive the
   user's deletion; a key assigned after it was recorded (an audit row with no
   person) is found through `api_keys` and cleared too.
+- Tests `a_key_that_acted_before_it_was_assigned_leaves_no_name_once_its_user_is_forgotten`,
+  `catalog_teams_is_the_owner_teams_audit_id_or_nothing` and
+  `key_teams_is_the_distinct_owners_of_its_grants_and_nothing_else` (review
+  round 2 of PR #412).
 
 ## Changed
 - `Principal` has `user_id: Option<String>`: the key's `user_id` from
@@ -40,6 +44,11 @@ Issue #391, epic #390. Plan: `docs/superpowers/plans/2026-11-13-okf-mcp-m14-oper
   literals.
 
 ## Notes
+- `AuditActor::stored_label` names every key and grant by its kind
+  (`api key`, `oauth grant`), even one with no user: such a key can be
+  assigned a user later, and its label must stay in the mutable
+  `audit_credentials` where `forget_person` can clear it (review round 2 of
+  PR #412; the plan's Decision 17 and Task 1 are corrected).
 - Nothing calls `record` yet: Tasks 4, 6a-6d and 7a instrument the store.
   No behaviour a user can see changes, so `docs/operations.md` is left to
   the tasks that add recorded actions (and Task 10's upgrade note).

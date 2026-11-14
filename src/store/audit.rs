@@ -159,22 +159,21 @@ impl AuditActor {
         }
     }
 
-    /// The entry's immutable `actor_label`: never a person's name. A
-    /// credential of a user is named by its kind (its own label goes to the
-    /// mutable `audit_credentials`); only a key with no user, the CLI's
-    /// operating-system user (operator staff, not an okf-mcp user) and the
-    /// system keep their label.
+    /// The entry's immutable `actor_label`: never a person's name. Every
+    /// key and grant is named by its kind, whether or not it has a user now:
+    /// a key with no user can be assigned one later, and its own label (a
+    /// legacy key's is often a person's device or name) must stay where
+    /// [`forget_person`] can clear it, in the mutable `audit_credentials`.
+    /// Only the CLI's operating-system user (operator staff, not an okf-mcp
+    /// user) and the system keep their label.
     ///
     /// # Returns
     /// The label to store.
     pub fn stored_label(&self) -> String {
-        // Arms are tried in order: a match guard (`if ...`) lets a key or
-        // grant with a user fall through to the plain-label arm without one.
         match self.via {
             Via::Session => "console session".to_string(),
-            Via::Key if self.user_id.is_some() => "api key".to_string(),
-            Via::Grant if self.user_id.is_some() => "oauth grant".to_string(),
-            Via::Key | Via::Grant => self.label.clone(),
+            Via::Key => "api key".to_string(),
+            Via::Grant => "oauth grant".to_string(),
             Via::Cli => format!("cli:{}", self.label),
             Via::System => format!("system:{}", self.label),
         }
@@ -972,6 +971,144 @@ mod tests {
             audit_credentials(&mut db.pool.acquire().await.unwrap()).await,
             [(None, None, None)],
             "found through the live key, though the audit row names no person"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_that_acted_before_it_was_assigned_leaves_no_name_once_its_user_is_forgotten() {
+        let db = test_db().await;
+        let new = NewUser {
+            name: "alice",
+            display_name: "Alice Example",
+        };
+        users::create(&db.pool, &new, now()).await.unwrap();
+        let alice = user_id(&db.pool, "alice").await;
+        // A legacy key with no user acts: its label names a person.
+        store_key(&db.pool, "alice-laptop", None).await;
+        let unassigned = AuditActor {
+            credential: Some("alice-laptop".to_string()),
+            user_id: None,
+            label: "alice-laptop".to_string(),
+            ..admin_actor(&alice)
+        };
+        let mut tx = db.pool.begin().await.unwrap();
+        record(
+            &mut tx,
+            &unassigned,
+            &entry(Action::SettingChanged, Target::Setting("product_name")),
+            now(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        // Then the key is assigned to alice, and alice is forgotten.
+        sqlx::query("UPDATE api_keys SET user_id = $1 WHERE id = 'alice-laptop'")
+            .bind(&alice)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        forget_person(&mut tx, &alice).await.unwrap();
+        tx.commit().await.unwrap();
+
+        // Every stored column of the entry, and every row it refers to.
+        let stored: String = sqlx::query_scalar(
+            "SELECT row_to_json(e)::text || coalesce(row_to_json(c)::text, '') \
+             FROM audit_entries e \
+             LEFT JOIN audit_credentials c ON c.id = e.actor_credential_ref",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!stored.contains("alice"), "{stored}");
+        assert!(stored.contains("\"actor_label\":\"api key\""), "{stored}");
+    }
+
+    /// Creates catalog `name` owned by team `owner` (none for `None`).
+    async fn store_catalog(pool: &PgPool, name: &str, owner: Option<&str>) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO catalogs (name, created_at, owner_team_id) \
+             VALUES ($1, now(), (SELECT id FROM teams WHERE name = $2)) RETURNING id",
+        )
+        .bind(name)
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Grants key `key` the catalogs `catalogs`.
+    async fn grant(pool: &PgPool, key: &str, catalogs: &[i64]) {
+        sqlx::query(
+            "INSERT INTO key_catalogs (key_id, catalog_id) SELECT $1, unnest($2::bigint[])",
+        )
+        .bind(key)
+        .bind(catalogs)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_teams_is_the_owner_teams_audit_id_or_nothing() {
+        let db = test_db().await;
+        let owned = store_catalog(&db.pool, "owned", Some(TEST_TEAM)).await;
+        let orphan = store_catalog(&db.pool, "orphan", None).await;
+        let mut tx = db.pool.begin().await.unwrap();
+        let team = team_ref(&mut tx, TEST_TEAM).await.unwrap();
+
+        let of_owned = catalog_teams(&mut tx, owned).await.unwrap();
+        let of_orphan = catalog_teams(&mut tx, orphan).await.unwrap();
+        let of_unknown = catalog_teams(&mut tx, orphan + 1000).await.unwrap();
+
+        assert_eq!(of_owned, [team]);
+        assert_eq!(of_orphan, Vec::<i64>::new(), "no owner, no team");
+        assert_eq!(of_unknown, Vec::<i64>::new(), "no catalog, no team");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn key_teams_is_the_distinct_owners_of_its_grants_and_nothing_else() {
+        let db = test_db().await;
+        let family = NewTeam {
+            name: "family",
+            display_name: "",
+            owner: TEST_USER,
+        };
+        teams::create(&db.pool, &family, now()).await.unwrap();
+        let staff = NewTeam {
+            name: "staff",
+            ..family
+        };
+        teams::create(&db.pool, &staff, now()).await.unwrap();
+        let mine = store_catalog(&db.pool, "mine", Some(TEST_TEAM)).await;
+        let mine_too = store_catalog(&db.pool, "mine-too", Some(TEST_TEAM)).await;
+        let theirs = store_catalog(&db.pool, "theirs", Some("family")).await;
+        let orphan = store_catalog(&db.pool, "orphan", None).await;
+        let me = user_id(&db.pool, TEST_USER).await;
+        // Two grants with one owner; grants across owners (and one with no
+        // owner); an all-catalogs key with no grants. The key's user also
+        // owns `staff`, which no grant reaches.
+        store_key(&db.pool, "shared", Some(&me)).await;
+        grant(&db.pool, "shared", &[mine, mine_too]).await;
+        store_key(&db.pool, "spread", Some(&me)).await;
+        grant(&db.pool, "spread", &[theirs, mine, orphan]).await;
+        store_key(&db.pool, "everything", Some(&me)).await;
+        let mut tx = db.pool.begin().await.unwrap();
+        let personal = team_ref(&mut tx, TEST_TEAM).await.unwrap();
+        let family_ref = team_ref(&mut tx, "family").await.unwrap();
+        let mut both = vec![personal, family_ref];
+        both.sort_unstable();
+
+        let shared = key_teams(&mut tx, "shared").await.unwrap();
+        let spread = key_teams(&mut tx, "spread").await.unwrap();
+        let everything = key_teams(&mut tx, "everything").await.unwrap();
+
+        assert_eq!(shared, [personal], "one owner, listed once");
+        assert_eq!(spread, both, "each owner once, in id order; no staff");
+        assert_eq!(
+            everything,
+            Vec::<i64>::new(),
+            "an all-catalogs key belongs to no team"
         );
     }
 

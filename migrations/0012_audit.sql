@@ -47,8 +47,9 @@ CREATE TABLE audit_entries (
     actor_credential_ref  bigint REFERENCES audit_credentials (id),
     actor_person_id       bigint REFERENCES audit_people (id),
     -- Never a person's name: 'console session', 'api key', 'oauth grant',
-    -- 'cli:<os user>', 'system:<what>', or the label of a key with no user.
-    -- A credential's own label is in audit_credentials.
+    -- 'cli:<os user>' or 'system:<what>'. A credential's own label is only
+    -- in audit_credentials, even for a key with no user: it may be assigned
+    -- one later, and forget_person must be able to clear it.
     actor_label           text NOT NULL,
     -- An admin credential or a provisioner: owners see "an operator".
     actor_operator        boolean NOT NULL,
