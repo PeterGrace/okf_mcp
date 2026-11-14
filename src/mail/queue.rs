@@ -854,7 +854,7 @@ mod tests {
             &db.pool,
             settings::SettingKey::ProductName,
             "Acme Notes",
-            "cli",
+            &crate::store::audit::AuditActor::cli(),
             now(),
         )
         .await

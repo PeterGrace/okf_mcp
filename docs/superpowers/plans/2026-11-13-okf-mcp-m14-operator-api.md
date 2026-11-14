@@ -3368,7 +3368,18 @@ git commit -m "feat(audit): record key, grant, sign-in code and assignment chang
 
 `set` reads the previous value with `SELECT value FROM server_settings WHERE key = $1 FOR UPDATE` in its transaction. Settings entries belong to no team.
 
+> **Corrected (issue #399, 2026-11-14).** As shipped (`src/store/settings.rs`):
+> - `set` bumps `admin_generation` *before* reading the previous value. `FOR UPDATE` cannot lock a row that does not exist yet, so two first overrides could both read `null`; every settings write takes the `server_state` row lock first, so the read (a new statement under READ COMMITTED) sees the write before it.
+> - Setting the value already stored writes nothing: no row update, no bump (the transaction rolls back), no entry, as the common pattern says for a no-op.
+> - `reset` deletes with `RETURNING value`, so `from` is the override it removed.
+> - `updated_by` is the credential's `actor.label` over REST (as before), but `actor.stored_label()`, `cli:<os user>`, for the command line (it was the literal `cli`), so `settings list` and the entry name the same actor. The private `updated_by(actor)` decides.
+> - What goes into an entry is decided once, by the private `audited_value(key, value)`: `None` for `support_contact`, the stored JSON for every other key. Its `match` lists every key (no `_` arm), so a new setting must choose.
+> - `audit::MAX_RETENTION_DAYS = 3650` is a constant beside `DEFAULT_RETENTION_DAYS` and `MIN_RETENTION_DAYS`.
+> - The REST handlers take `actor: AuditActor` after `Extension(principal)`; the CLI passes `&AuditActor::cli()` to both `set` and `reset` (the `CLI_ACTOR` constant is gone).
+
 - [ ] **Step 2: Write the failing retention tests**
+
+> **Corrected (issue #399, 2026-11-14).** The shipped tests go further than the two below. `audit_retention_is_at_least_30_days_and_defaults_to_400` also refuses `3651`, `-1` and `90d`, accepts `30` and `3650`, and checks the row is stored as a JSON number (the trigger casts it). The settings module adds `set_and_reset_record_one_entry_each_and_nothing_without_a_change`, `a_support_contact_entry_never_holds_the_contact`, `a_failed_audit_write_fails_the_change`, `the_command_line_is_listed_and_recorded_as_its_os_user` and `an_unreadable_stored_retention_falls_back_to_the_default`; the audit module adds the follow-up #414 trigger tests (`a_configured_retention_moves_what_the_log_lets_go`: 60 days stored, 59 kept and 61 deleted; `the_log_keeps_30_days_whatever_the_stored_retention_says`: a hand-stored 10, 20 kept and 31 deleted) and `a_prune_reaching_into_retention_deletes_nothing`; `app::tests::poll_prunes_audit_entries_past_the_retention_setting_at_most_daily` covers the poll. The REST settings tests check the entry's source, actor label and person for a key and a console session.
 
 `src/store/settings.rs`:
 
@@ -3463,6 +3474,8 @@ pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError
 ```
 
 `docs/operations.md`: the Settings table gains `audit_retention_days`; the audit section says entries older than it are deleted daily, and nothing else deletes them.
+
+> **Corrected (issue #399, 2026-11-14).** In `src/app.rs` the margin is a constant, `AUDIT_PRUNE_MARGIN_HOURS = 1`, and the log line goes through `log_pruned_retrying(what, "in a day", result)`; `log_pruned` (the hourly prunes) now calls it with `"in an hour"`, so a failed audit prune does not claim to retry in an hour. `prune_audit` runs after `prune_oauth`, so after the settings reload. Task 6d was the first of 6a to 6d to merge, so it created `docs/operations.md`'s "### Audit log" section (after "### Settings"), with the lead line, the action table and the retention paragraph; later tasks add rows to that table. The console's Settings page got a one-line meaning for `audit_retention_days` (`MEANING` in `pages/settings.js`).
 
 - [ ] **Step 4: Run, gate, commit**
 
@@ -5613,6 +5626,8 @@ mod tests {
 ```
 
 `src/store/settings.rs`: `require_unlock` (default `false`, `true|false|on|off`), `unlock_max_hours` (default 4, 1 to 72), `unlock_notify_owners` (default `true`).
+
+> **Corrected (issue #399, 2026-11-14).** After Task 6d, `SettingKey::ALL` has 10 keys (`audit_retention_days` last), `set(pool, key, value, actor: &AuditActor, now)` and `reset(pool, key, actor, now)` record `setting.changed` / `setting.cleared`, and the private `audited_value(key, value)` decides what an entry's details may hold (its `match` lists every key, so add the three unlock settings to the `Some(value)` arm: none is sensitive). Add their rows to `docs/operations.md`'s "### Settings" table; their changes are already in the "### Audit log" table as `setting.changed` / `setting.cleared`.
 
 - [ ] **Step 3: Run them and see them fail**
 

@@ -1054,6 +1054,7 @@ mod tests {
     };
     use crate::http::console_session::{start_session_with, COOKIE};
     use crate::mcp::testing::{app_with, TestApp};
+    use crate::store::audit::AuditActor;
     use crate::store::settings::{self, SettingKey};
     use crate::store::sign_in_events::{Method, Outcome};
 
@@ -1376,7 +1377,7 @@ mod tests {
             test.app.pool(),
             SettingKey::PasswordSignIn,
             "false",
-            "test",
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await
@@ -2551,7 +2552,7 @@ mod tests {
             (SettingKey::ProductName, "Acme Notes"),
             (SettingKey::SupportContact, "https://example.com/help"),
         ] {
-            settings::set(test.app.pool(), key, value, "cli", Utc::now())
+            settings::set(test.app.pool(), key, value, &AuditActor::cli(), Utc::now())
                 .await
                 .unwrap();
         }

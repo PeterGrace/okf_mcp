@@ -1183,8 +1183,9 @@ mail stays valid until it expires; send a new one to replace it.
 
 Policy and branding settings live in the database, so the Settings page
 changes them without a restart; the config file's `[auth]` table gives each
-policy setting's default. The two branding settings have no config key:
-their defaults are `okf` and `none`.
+policy setting's default. The two branding settings and
+`audit_retention_days` have no config key: their defaults are `okf`, `none`
+and `400`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -1197,6 +1198,7 @@ their defaults are `okf` and `none`.
 | `reset_link_ttl` | `1h` | Password reset link lifetime |
 | `product_name` | `okf` | The product name people see: in every email (subjects and text), the console (sidebar, login card and tab title) and the sign-in, forgot, setup, reset and OAuth consent pages. 1 to 60 characters with no control characters; surrounding spaces are trimmed |
 | `support_contact` | `none` | An email address or an `https://` URL (with a host). When set, every email ends with "Questions? Contact ..." and the server pages show the same line (a URL as a link); `none` shows no line |
+| `audit_retention_days` | `400` | How many days [audit log](#audit-log) entries are kept, `30` to `3650`. A daily pass deletes older ones |
 
 ```sh
 okf-mcp settings list                      # key, value, then "default" or "set by WHO at T"
@@ -1204,6 +1206,7 @@ okf-mcp settings set max_key_lifetime 90d
 okf-mcp settings reset max_key_lifetime    # back to the config file's default
 okf-mcp settings set product_name "Acme Notes"
 okf-mcp settings set support_contact https://example.com/help
+okf-mcp settings set audit_retention_days 730
 ```
 
 A value is checked as its config key is: `true`/`false` (or `on`/`off`), a
@@ -1211,12 +1214,34 @@ whole number, or a duration like `12h` above zero and at most ten years
 (`none` for `max_key_lifetime`); `product_name` and `support_contact` as in
 the table. A bad one is refused, naming the key: 422
 over REST, a non-zero exit on the command line, and an unknown key is clap's
-list of the keys. Each change records who made it (`cli` for the command
-line, the admin's actor over REST and in the console) and reaches every
-server within `poll_interval`. A stored value this server cannot read (from
+list of the keys. Each change records who made it (`cli:<os user>` for the
+command line, the admin's actor over REST and in the console), writes an
+[audit log](#audit-log) entry, and reaches every server within
+`poll_interval`. Setting the value already stored changes and records
+nothing. A stored value this server cannot read (from
 a newer version, or a hand edit) is logged at `warn` and the default used.
 Mail is rendered when it is queued, so a queued mail keeps the brand it was
 queued with; `mail.from` (the sender) stays configuration.
+
+### Audit log
+
+Every change below writes one entry in the change's own transaction.
+
+| Action | Written by | Target | Details |
+|---|---|---|---|
+| `setting.changed` | `settings set`, `PUT /api/v1/settings/{key}` | the setting | `from` (the stored value before, `null` without an override) and `to`; for `support_contact` only `set` (whether a contact is set now), never the address |
+| `setting.cleared` | `settings reset`, `DELETE /api/v1/settings/{key}`, when there was an override | the setting | `from`; nothing for `support_contact` |
+
+Settings entries belong to no team.
+
+The log is append-only: the database refuses any change to an entry, and
+any delete of one younger than `audit_retention_days` (at least 30 days,
+whatever the stored value). At its first poll after starting, and then
+once a day, the server deletes the entries older than
+`audit_retention_days` plus an hour (a margin for clock skew between the
+server and the database); nothing else deletes them. Lowering
+the setting takes effect at the next daily pass; raising it keeps entries
+not yet deleted.
 
 ### Self-service keys and grants
 

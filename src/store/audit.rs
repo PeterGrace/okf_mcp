@@ -10,12 +10,23 @@
 use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, PgPool};
 
 use crate::auth::{CredentialKind, Principal};
 use crate::error::OkfError;
 use crate::http::requester::Requester;
 use crate::store::keys::Access;
+
+/// How many days entries are kept with no `audit_retention_days` override
+/// (the append-only trigger in `migrations/0012_audit.sql` uses the same).
+pub const DEFAULT_RETENTION_DAYS: u32 = 400;
+
+/// The shortest retention: the setting refuses less, and the trigger
+/// keeps entries this long whatever the stored value says.
+pub const MIN_RETENTION_DAYS: u32 = 30;
+
+/// The longest retention the setting takes (ten years; plan Decision 13).
+pub const MAX_RETENTION_DAYS: u32 = 3650;
 
 /// Where a change came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,6 +537,28 @@ pub async fn forget_person(conn: &mut PgConnection, user_id: &str) -> Result<(),
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// Deletes entries older than `before`: the daily retention prune, the one
+/// delete of the log. The append-only trigger refuses the whole statement
+/// if any of those entries is still inside the retention period by the
+/// database's clock, so the caller leaves a margin.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `before` - the cut-off: now, minus the retention, minus a margin.
+///
+/// # Returns
+/// How many entries went (their `audit_access_counts` rows cascade).
+///
+/// # Errors
+/// [`OkfError::Database`], which deletes nothing.
+pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError> {
+    Ok(sqlx::query("DELETE FROM audit_entries WHERE at < $1")
+        .bind(before)
+        .execute(pool)
+        .await?
+        .rows_affected())
 }
 
 /// Refuses a provisioner acting on an admin user (spec Part 4). Store
@@ -1260,6 +1293,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 1, "the recent entry survived every attempt");
+    }
+
+    /// Records one `setting.changed` entry dated `at`, in its own
+    /// transaction.
+    async fn entry_at(pool: &PgPool, at: DateTime<Utc>) -> i64 {
+        let mut tx = pool.begin().await.unwrap();
+        let id = record(
+            &mut tx,
+            &AuditActor::cli(),
+            &entry(Action::SettingChanged, Target::Setting("product_name")),
+            at,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        id
+    }
+
+    /// Tries to delete entry `id` as the prune would: whether the
+    /// append-only trigger let it go.
+    async fn deletes(pool: &PgPool, id: i64) -> bool {
+        sqlx::query("DELETE FROM audit_entries WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_configured_retention_moves_what_the_log_lets_go() {
+        let db = test_db().await;
+        crate::store::settings::set(
+            &db.pool,
+            crate::store::settings::SettingKey::AuditRetentionDays,
+            "60",
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let young = entry_at(&db.pool, Utc::now() - TimeDelta::days(59)).await;
+        let old = entry_at(&db.pool, Utc::now() - TimeDelta::days(61)).await;
+
+        assert!(!deletes(&db.pool, young).await, "59 days is inside 60");
+        assert!(deletes(&db.pool, old).await, "61 days is past 60");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_log_keeps_30_days_whatever_the_stored_retention_says() {
+        let db = test_db().await;
+        // Below what the setting accepts: only a hand edit stores this.
+        sqlx::query(
+            "INSERT INTO server_settings (key, value, updated_at, updated_by) \
+             VALUES ('audit_retention_days', '10', now(), 'hand')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let young = entry_at(&db.pool, Utc::now() - TimeDelta::days(20)).await;
+        let old = entry_at(&db.pool, Utc::now() - TimeDelta::days(31)).await;
+
+        assert!(!deletes(&db.pool, young).await, "the 30-day floor holds");
+        assert!(deletes(&db.pool, old).await, "31 days is past the floor");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prune_deletes_entries_past_retention_and_keeps_the_rest() {
+        let db = test_db().await;
+        let mut tx = db.pool.begin().await.unwrap();
+        let setting = |action| entry(action, Target::Setting("product_name"));
+        record(
+            &mut tx,
+            &AuditActor::cli(),
+            &setting(Action::SettingChanged),
+            Utc::now() - TimeDelta::days(500),
+        )
+        .await
+        .unwrap();
+        record(
+            &mut tx,
+            &AuditActor::cli(),
+            &setting(Action::SettingCleared),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let pruned = prune(
+            &db.pool,
+            Utc::now() - TimeDelta::days(400) - TimeDelta::hours(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(pruned, 1);
+        assert!(testing::entries(&db.pool, "setting.changed")
+            .await
+            .is_empty());
+        assert_eq!(testing::entries(&db.pool, "setting.cleared").await.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prune_reaching_into_retention_deletes_nothing() {
+        let db = test_db().await;
+        entry_at(&db.pool, Utc::now() - TimeDelta::days(500)).await;
+        entry_at(&db.pool, Utc::now() - TimeDelta::days(10)).await;
+
+        let refused = prune(&db.pool, Utc::now()).await;
+
+        assert!(refused.is_err(), "the trigger refuses the whole statement");
+        assert_eq!(testing::entries(&db.pool, "setting.changed").await.len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -12,10 +12,16 @@
 //! | the four other lifetimes | JSON string (humantime) | a duration above zero |
 //! | `product_name` | JSON string | 1 to 60 characters, no control characters (trimmed) |
 //! | `support_contact` | JSON string or `null` | an email address, an `https://` URL, or `none` |
+//! | `audit_retention_days` | JSON number | `30` to `3650` |
 //!
 //! The two branding settings (`product_name`, `support_contact`) have no
 //! `[auth]` config key: their defaults are [`DEFAULT_PRODUCT_NAME`] and no
-//! contact.
+//! contact. Neither has `audit_retention_days` (default
+//! [`audit::DEFAULT_RETENTION_DAYS`]), which the audit log's append-only
+//! trigger reads from the same row (`migrations/0012_audit.sql`).
+//!
+//! [`set`] and [`reset`] record each change in the audit log
+//! (`setting.changed`, `setting.cleared`) in their own transaction.
 //!
 //! One function, `apply`, checks a value both when it is set (a bad one
 //! is refused with 422) and when it is loaded (a row this server cannot
@@ -35,6 +41,7 @@ use sqlx::{PgConnection, PgPool};
 
 use crate::config::{check_auth_duration, AuthConfig, MAX_KEYS_PER_USER_LIMIT};
 use crate::error::OkfError;
+use crate::store::audit::{self, Action, AuditActor, Entry, Target, Via};
 use crate::store::catalogs::bump_admin_generation;
 
 /// The product name with no override.
@@ -90,6 +97,9 @@ pub struct Settings {
     /// An email address or `https://` URL people are pointed to; `None`
     /// shows no contact line.
     pub support_contact: Option<String>,
+    /// How many days audit entries are kept before the daily prune deletes
+    /// them ([`audit::DEFAULT_RETENTION_DAYS`] by default).
+    pub audit_retention_days: u32,
 }
 
 impl Settings {
@@ -112,6 +122,7 @@ impl Settings {
             // Runtime settings only, with no `[auth]` key (spec "My calls").
             product_name: DEFAULT_PRODUCT_NAME.to_string(),
             support_contact: None,
+            audit_retention_days: audit::DEFAULT_RETENTION_DAYS,
         }
     }
 
@@ -158,11 +169,14 @@ pub enum SettingKey {
     /// `support_contact`.
     #[value(name = "support_contact")]
     SupportContact,
+    /// `audit_retention_days`.
+    #[value(name = "audit_retention_days")]
+    AuditRetentionDays,
 }
 
 impl SettingKey {
     /// Every key, in the order `settings list` shows them.
-    pub const ALL: [SettingKey; 9] = [
+    pub const ALL: [SettingKey; 10] = [
         SettingKey::PasswordSignIn,
         SettingKey::MaxKeysPerUser,
         SettingKey::MaxKeyLifetime,
@@ -172,6 +186,7 @@ impl SettingKey {
         SettingKey::ResetLinkTtl,
         SettingKey::ProductName,
         SettingKey::SupportContact,
+        SettingKey::AuditRetentionDays,
     ];
 
     /// The stored name.
@@ -189,6 +204,7 @@ impl SettingKey {
             SettingKey::ResetLinkTtl => "reset_link_ttl",
             SettingKey::ProductName => "product_name",
             SettingKey::SupportContact => "support_contact",
+            SettingKey::AuditRetentionDays => "audit_retention_days",
         }
     }
 
@@ -306,7 +322,22 @@ fn parse_value(key: SettingKey, text: &str) -> Result<Value, String> {
         SettingKey::SupportContact => {
             check_support_contact(text).map(|()| Value::String(text.to_string()))
         }
+        // A JSON number, which the append-only trigger reads too; the range
+        // is `apply`'s.
+        SettingKey::AuditRetentionDays => text
+            .parse::<u32>()
+            .map(Value::from)
+            .map_err(|_| retention_range()),
     }
+}
+
+/// The refusal text for an `audit_retention_days` outside its range.
+fn retention_range() -> String {
+    format!(
+        "audit_retention_days takes a whole number from {} to {}",
+        audit::MIN_RETENTION_DAYS,
+        audit::MAX_RETENTION_DAYS
+    )
 }
 
 /// Applies one stored value to `settings`, after checking it. Used when
@@ -368,6 +399,16 @@ fn apply(settings: &mut Settings, key: SettingKey, value: &Value) -> Result<(), 
                 }
             };
         }
+        SettingKey::AuditRetentionDays => {
+            // `RangeInclusive::contains`: `MIN..=MAX` includes both ends.
+            settings.audit_retention_days = value
+                .as_u64()
+                .and_then(|days| u32::try_from(days).ok())
+                .filter(|days| {
+                    (audit::MIN_RETENTION_DAYS..=audit::MAX_RETENTION_DAYS).contains(days)
+                })
+                .ok_or_else(retention_range)?;
+        }
     }
     Ok(())
 }
@@ -390,6 +431,7 @@ fn display(settings: &Settings, key: SettingKey) -> String {
             .support_contact
             .clone()
             .unwrap_or_else(|| "none".to_string()),
+        SettingKey::AuditRetentionDays => settings.audit_retention_days.to_string(),
     }
 }
 
@@ -471,27 +513,59 @@ pub async fn load(pool: &PgPool, defaults: &AuthConfig) -> Result<Settings, OkfE
     Ok(overlay(defaults, &stored(pool).await?))
 }
 
-/// Overrides one setting, and bumps the administrative generation in the
-/// same transaction.
+/// What `settings list` shows as who wrote an override: the credential's
+/// actor (a session's user name), or `cli:<os user>` for the command line,
+/// as the audit entry's actor label reads.
+fn updated_by(actor: &AuditActor) -> String {
+    match actor.via {
+        Via::Cli | Via::System => actor.stored_label(),
+        Via::Session | Via::Key | Via::Grant => actor.label.clone(),
+    }
+}
+
+/// An entry's details for a setting's value: the stored JSON, except for
+/// `support_contact`, which can be an email address and is never written
+/// into an entry (spec "People in entries"). Every key is listed, so a new
+/// setting must decide which arm it takes.
+fn audited_value(key: SettingKey, value: &Value) -> Option<&Value> {
+    match key {
+        SettingKey::SupportContact => None,
+        SettingKey::PasswordSignIn
+        | SettingKey::MaxKeysPerUser
+        | SettingKey::MaxKeyLifetime
+        | SettingKey::ConsoleSessionIdle
+        | SettingKey::ConsoleSessionAbsolute
+        | SettingKey::SetupLinkTtl
+        | SettingKey::ResetLinkTtl
+        | SettingKey::ProductName
+        | SettingKey::AuditRetentionDays => Some(value),
+    }
+}
+
+/// Overrides one setting, records `setting.changed`, and bumps the
+/// administrative generation, all in one transaction. Setting the value
+/// already stored writes nothing and records nothing.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `key` - which setting.
 /// * `value` - the new value, as text (see the module's table).
-/// * `by` - who is setting it, for `settings list`.
+/// * `actor` - who is setting it: the audit entry's actor, and
+///   `updated_by` for `settings list`.
 /// * `now` - when (server clock).
 ///
 /// # Returns
-/// `Ok(())` once the override is stored.
+/// `Ok(())` once the override is stored (or was already this value).
 ///
 /// # Errors
 /// [`OkfError::LimitExceeded`] with `limit: "setting"` for a value the
-/// setting cannot take (nothing is written); [`OkfError::Database`].
+/// setting cannot take (nothing is written); [`OkfError::Database`],
+/// including a failed audit write, which stores nothing.
 pub async fn set(
     pool: &PgPool,
     key: SettingKey,
     value: &str,
-    by: &str,
+    actor: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<(), OkfError> {
     let json = parse_value(key, value).map_err(invalid)?;
@@ -503,6 +577,20 @@ pub async fn set(
     )
     .map_err(invalid)?;
     let mut tx = pool.begin().await?;
+    // The generation row first: every settings write takes its lock, so
+    // concurrent writes queue here, and the read below (a new statement,
+    // under READ COMMITTED) sees the one before, even when it inserted the
+    // row `FOR UPDATE` alone could not lock.
+    bump_admin_generation(&mut tx).await?;
+    let previous: Option<Value> =
+        sqlx::query_scalar("SELECT value FROM server_settings WHERE key = $1 FOR UPDATE")
+            .bind(key.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+    if previous.as_ref() == Some(&json) {
+        // Unchanged: dropping `tx` rolls the generation bump back.
+        return Ok(());
+    }
     sqlx::query(
         "INSERT INTO server_settings (key, value, updated_at, updated_by) \
          VALUES ($1, $2, $3, $4) \
@@ -512,36 +600,82 @@ pub async fn set(
     .bind(key.as_str())
     .bind(&json)
     .bind(now)
-    .bind(by)
+    .bind(updated_by(actor))
     .execute(&mut *tx)
     .await?;
-    bump_admin_generation(&mut tx).await?;
+    let details = match audited_value(key, &json) {
+        Some(to) => serde_json::json!({"from": previous, "to": to}),
+        // Only whether a contact is set now.
+        None => serde_json::json!({"set": !json.is_null()}),
+    };
+    audit::record(
+        &mut tx,
+        actor,
+        &Entry {
+            action: Action::SettingChanged,
+            target: Target::Setting(key.as_str()),
+            person: None,
+            teams: &[],
+            details,
+        },
+        now,
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
 }
 
 /// Removes a setting's override, so the config default applies again.
-/// Bumps the administrative generation when there was one.
+/// When there was one, records `setting.cleared` and bumps the
+/// administrative generation in the same transaction.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `key` - which setting.
+/// * `actor` - who is resetting it, for the audit entry.
+/// * `now` - when (server clock).
 ///
 /// # Returns
 /// `Ok(())`, whether or not there was an override.
 ///
 /// # Errors
-/// [`OkfError::Database`].
-pub async fn reset(pool: &PgPool, key: SettingKey) -> Result<(), OkfError> {
+/// [`OkfError::Database`], including a failed audit write, which keeps
+/// the override.
+pub async fn reset(
+    pool: &PgPool,
+    key: SettingKey,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
-    let deleted = sqlx::query("DELETE FROM server_settings WHERE key = $1")
-        .bind(key.as_str())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    if deleted > 0 {
-        bump_admin_generation(&mut tx).await?;
-    }
+    // `RETURNING value`: the deleted override, for the entry.
+    let deleted: Option<Value> =
+        sqlx::query_scalar("DELETE FROM server_settings WHERE key = $1 RETURNING value")
+            .bind(key.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+    // `let ... else`: no override, nothing to record or bump.
+    let Some(from) = deleted else {
+        return Ok(());
+    };
+    bump_admin_generation(&mut tx).await?;
+    let details = match audited_value(key, &from) {
+        Some(from) => serde_json::json!({ "from": from }),
+        None => serde_json::json!({}),
+    };
+    audit::record(
+        &mut tx,
+        actor,
+        &Entry {
+            action: Action::SettingCleared,
+            target: Target::Setting(key.as_str()),
+            person: None,
+            teams: &[],
+            details,
+        },
+        now,
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -592,6 +726,17 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    /// An API key's actor labelled `label`, as `AuditActor::of` builds one.
+    fn by(label: &str) -> AuditActor {
+        AuditActor {
+            source: audit::Source::Api,
+            credential: Some("k1".to_string()),
+            label: label.to_string(),
+            via: Via::Key,
+            ..AuditActor::cli()
+        }
+    }
+
     fn defaults() -> AuthConfig {
         AuthConfig {
             max_keys_per_user: 7,
@@ -625,24 +770,42 @@ mod tests {
         let db = test_db().await;
         let start = admin_generation(&db.pool).await.unwrap();
 
-        set(&db.pool, SettingKey::MaxKeysPerUser, "3", "alice", now())
-            .await
-            .unwrap();
-        set(&db.pool, SettingKey::PasswordSignIn, "off", "alice", now())
-            .await
-            .unwrap();
         set(
             &db.pool,
-            SettingKey::ConsoleSessionIdle,
-            "30m",
-            "bob",
+            SettingKey::MaxKeysPerUser,
+            "3",
+            &by("alice"),
             now(),
         )
         .await
         .unwrap();
-        set(&db.pool, SettingKey::MaxKeyLifetime, "90d", "bob", now())
-            .await
-            .unwrap();
+        set(
+            &db.pool,
+            SettingKey::PasswordSignIn,
+            "off",
+            &by("alice"),
+            now(),
+        )
+        .await
+        .unwrap();
+        set(
+            &db.pool,
+            SettingKey::ConsoleSessionIdle,
+            "30m",
+            &by("bob"),
+            now(),
+        )
+        .await
+        .unwrap();
+        set(
+            &db.pool,
+            SettingKey::MaxKeyLifetime,
+            "90d",
+            &by("bob"),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let settings = load(&db.pool, &defaults()).await.unwrap();
         assert_eq!(settings.max_keys_per_user, 3);
@@ -677,9 +840,15 @@ mod tests {
             ..AuthConfig::default()
         };
 
-        set(&db.pool, SettingKey::MaxKeyLifetime, "none", "alice", now())
-            .await
-            .unwrap();
+        set(
+            &db.pool,
+            SettingKey::MaxKeyLifetime,
+            "none",
+            &by("alice"),
+            now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             load(&db.pool, &limited).await.unwrap().max_key_lifetime,
@@ -699,23 +868,51 @@ mod tests {
         let start = admin_generation(&db.pool).await.unwrap();
 
         let refused = [
-            set(&db.pool, SettingKey::MaxKeysPerUser, "1001", "alice", now()).await,
-            set(&db.pool, SettingKey::MaxKeysPerUser, "-1", "alice", now()).await,
+            set(
+                &db.pool,
+                SettingKey::MaxKeysPerUser,
+                "1001",
+                &by("alice"),
+                now(),
+            )
+            .await,
+            set(
+                &db.pool,
+                SettingKey::MaxKeysPerUser,
+                "-1",
+                &by("alice"),
+                now(),
+            )
+            .await,
             set(
                 &db.pool,
                 SettingKey::PasswordSignIn,
                 "maybe",
-                "alice",
+                &by("alice"),
                 now(),
             )
             .await,
-            set(&db.pool, SettingKey::ResetLinkTtl, "0s", "alice", now()).await,
-            set(&db.pool, SettingKey::SetupLinkTtl, "soon", "alice", now()).await,
+            set(
+                &db.pool,
+                SettingKey::ResetLinkTtl,
+                "0s",
+                &by("alice"),
+                now(),
+            )
+            .await,
+            set(
+                &db.pool,
+                SettingKey::SetupLinkTtl,
+                "soon",
+                &by("alice"),
+                now(),
+            )
+            .await,
             set(
                 &db.pool,
                 SettingKey::ConsoleSessionAbsolute,
                 "none",
-                "alice",
+                &by("alice"),
                 now(),
             )
             .await,
@@ -724,7 +921,7 @@ mod tests {
                 &db.pool,
                 SettingKey::ConsoleSessionAbsolute,
                 "1000000years",
-                "alice",
+                &by("alice"),
                 now(),
             )
             .await,
@@ -753,13 +950,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn reset_returns_to_the_default_and_bumps_only_when_there_was_an_override() {
         let db = test_db().await;
-        set(&db.pool, SettingKey::MaxKeysPerUser, "3", "alice", now())
-            .await
-            .unwrap();
+        set(
+            &db.pool,
+            SettingKey::MaxKeysPerUser,
+            "3",
+            &by("alice"),
+            now(),
+        )
+        .await
+        .unwrap();
         let before = admin_generation(&db.pool).await.unwrap();
 
-        reset(&db.pool, SettingKey::MaxKeysPerUser).await.unwrap();
-        reset(&db.pool, SettingKey::MaxKeysPerUser).await.unwrap();
+        reset(&db.pool, SettingKey::MaxKeysPerUser, &by("alice"), now())
+            .await
+            .unwrap();
+        reset(&db.pool, SettingKey::MaxKeysPerUser, &by("alice"), now())
+            .await
+            .unwrap();
 
         assert_eq!(
             load(&db.pool, &defaults()).await.unwrap().max_keys_per_user,
@@ -806,7 +1013,7 @@ mod tests {
         let start = admin_generation(&db.pool).await.unwrap();
         let set_text = |key, value: String| {
             let pool = db.pool.clone();
-            async move { set(&pool, key, &value, "cli", now()).await }
+            async move { set(&pool, key, &value, &by("cli"), now()).await }
         };
 
         let mut refused = Vec::new();
@@ -954,6 +1161,305 @@ mod tests {
         assert_eq!(
             rows.iter().map(|r| r.key).collect::<Vec<_>>(),
             SettingKey::ALL
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn audit_retention_is_at_least_30_days_and_defaults_to_400() {
+        let db = test_db().await;
+        let start = admin_generation(&db.pool).await.unwrap();
+
+        let refused = [
+            set(
+                &db.pool,
+                SettingKey::AuditRetentionDays,
+                "29",
+                &by("alice"),
+                now(),
+            )
+            .await,
+            set(
+                &db.pool,
+                SettingKey::AuditRetentionDays,
+                "3651",
+                &by("alice"),
+                now(),
+            )
+            .await,
+            set(
+                &db.pool,
+                SettingKey::AuditRetentionDays,
+                "-1",
+                &by("alice"),
+                now(),
+            )
+            .await,
+            set(
+                &db.pool,
+                SettingKey::AuditRetentionDays,
+                "90d",
+                &by("alice"),
+                now(),
+            )
+            .await,
+        ];
+        let default = load(&db.pool, &defaults())
+            .await
+            .unwrap()
+            .audit_retention_days;
+        set(
+            &db.pool,
+            SettingKey::AuditRetentionDays,
+            "30",
+            &by("alice"),
+            now(),
+        )
+        .await
+        .unwrap();
+        set(
+            &db.pool,
+            SettingKey::AuditRetentionDays,
+            "3650",
+            &by("alice"),
+            now(),
+        )
+        .await
+        .unwrap();
+        set(
+            &db.pool,
+            SettingKey::AuditRetentionDays,
+            "90",
+            &by("alice"),
+            now(),
+        )
+        .await
+        .unwrap();
+
+        for result in refused {
+            assert!(
+                matches!(
+                    result,
+                    Err(OkfError::LimitExceeded {
+                        limit: "setting",
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+        assert_eq!(default, 400);
+        assert_eq!(
+            Settings::from_config(&AuthConfig::default()).audit_retention_days,
+            audit::DEFAULT_RETENTION_DAYS
+        );
+        assert_eq!(
+            load(&db.pool, &defaults())
+                .await
+                .unwrap()
+                .audit_retention_days,
+            90
+        );
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), start + 3);
+        // The append-only trigger reads the row as a JSON number.
+        let stored: Value = sqlx::query_scalar(
+            "SELECT value FROM server_settings WHERE key = 'audit_retention_days'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, serde_json::json!(90));
+        let rows = list(&db.pool, &defaults()).await.unwrap();
+        let shown = rows
+            .iter()
+            .find(|row| row.key == SettingKey::AuditRetentionDays)
+            .unwrap();
+        assert_eq!(shown.value, "90");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreadable_stored_retention_falls_back_to_the_default() {
+        let db = test_db().await;
+        sqlx::query(
+            "INSERT INTO server_settings (key, value, updated_at, updated_by) \
+             VALUES ('audit_retention_days', '10', now(), 'hand')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let settings = load(&db.pool, &defaults()).await.unwrap();
+
+        assert_eq!(settings.audit_retention_days, audit::DEFAULT_RETENTION_DAYS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_and_reset_record_one_entry_each_and_nothing_without_a_change() {
+        let db = test_db().await;
+        set(
+            &db.pool,
+            SettingKey::MaxKeysPerUser,
+            "3",
+            &by("alice"),
+            now(),
+        )
+        .await
+        .unwrap();
+        let before_same = admin_generation(&db.pool).await.unwrap();
+        // The same value again, spelt the same once stored: no change.
+        set(
+            &db.pool,
+            SettingKey::MaxKeysPerUser,
+            " 3 ",
+            &by("bob"),
+            now(),
+        )
+        .await
+        .unwrap();
+        let after_same = admin_generation(&db.pool).await.unwrap();
+        set(
+            &db.pool,
+            SettingKey::MaxKeysPerUser,
+            "4",
+            &by("alice"),
+            now(),
+        )
+        .await
+        .unwrap();
+        reset(&db.pool, SettingKey::MaxKeysPerUser, &by("alice"), now())
+            .await
+            .unwrap();
+        // No override left: nothing to clear or record.
+        reset(&db.pool, SettingKey::MaxKeysPerUser, &by("alice"), now())
+            .await
+            .unwrap();
+
+        let changed = audit::testing::entries(&db.pool, "setting.changed").await;
+        let cleared = audit::testing::entries(&db.pool, "setting.cleared").await;
+        assert_eq!(after_same, before_same, "an unchanged value bumps nothing");
+        assert_eq!(changed.len(), 2, "{changed:?}");
+        assert_eq!(
+            changed[0].details,
+            serde_json::json!({"from": null, "to": 3})
+        );
+        assert_eq!(changed[1].details, serde_json::json!({"from": 3, "to": 4}));
+        assert_eq!(
+            (
+                changed[0].target_kind.as_str(),
+                changed[0].target.as_deref()
+            ),
+            ("setting", Some("max_keys_per_user"))
+        );
+        assert_eq!(
+            changed[0].actor_label, "api key",
+            "never the key's own label"
+        );
+        assert!(changed[0].teams.is_empty(), "settings belong to no team");
+        assert_eq!(changed[0].person, None);
+        assert_eq!(cleared.len(), 1, "{cleared:?}");
+        assert_eq!(cleared[0].details, serde_json::json!({"from": 4}));
+        assert_eq!(cleared[0].target.as_deref(), Some("max_keys_per_user"));
+        let rows = list(&db.pool, &defaults()).await.unwrap();
+        assert!(rows.iter().all(|row| !row.overridden));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_support_contact_entry_never_holds_the_contact() {
+        let db = test_db().await;
+        let contact = |value: &'static str| {
+            let pool = db.pool.clone();
+            async move {
+                set(
+                    &pool,
+                    SettingKey::SupportContact,
+                    value,
+                    &by("alice"),
+                    now(),
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        contact("help@example.com").await;
+        contact("none").await;
+        contact("https://example.com/help").await;
+        reset(&db.pool, SettingKey::SupportContact, &by("alice"), now())
+            .await
+            .unwrap();
+
+        let changed = audit::testing::entries(&db.pool, "setting.changed").await;
+        let cleared = audit::testing::entries(&db.pool, "setting.cleared").await;
+        assert_eq!(
+            changed
+                .iter()
+                .map(|e| e.details.clone())
+                .collect::<Vec<_>>(),
+            [
+                serde_json::json!({"set": true}),
+                serde_json::json!({"set": false}),
+                serde_json::json!({"set": true}),
+            ]
+        );
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].details, serde_json::json!({}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_audit_write_fails_the_change() {
+        let db = test_db().await;
+        set(
+            &db.pool,
+            SettingKey::MaxKeysPerUser,
+            "3",
+            &by("alice"),
+            now(),
+        )
+        .await
+        .unwrap();
+        let start = admin_generation(&db.pool).await.unwrap();
+        crate::http::api::testing::fail_on(&db.pool, "BEFORE INSERT ON audit_entries FOR EACH ROW")
+            .await;
+
+        let set_refused = set(
+            &db.pool,
+            SettingKey::MaxKeysPerUser,
+            "4",
+            &by("alice"),
+            now(),
+        )
+        .await;
+        let reset_refused = reset(&db.pool, SettingKey::MaxKeysPerUser, &by("alice"), now()).await;
+
+        assert!(set_refused.is_err());
+        assert!(reset_refused.is_err());
+        assert_eq!(
+            load(&db.pool, &defaults()).await.unwrap().max_keys_per_user,
+            3,
+            "both changes rolled back"
+        );
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), start);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_command_line_is_listed_and_recorded_as_its_os_user() {
+        let db = test_db().await;
+        let cli = AuditActor::cli();
+
+        set(&db.pool, SettingKey::MaxKeysPerUser, "3", &cli, now())
+            .await
+            .unwrap();
+
+        let rows = list(&db.pool, &defaults()).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.key == SettingKey::MaxKeysPerUser)
+            .unwrap();
+        let changed = audit::testing::entries(&db.pool, "setting.changed").await;
+        let expected = format!("cli:{}", cli.label);
+        assert_eq!(row.updated_by.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            (changed[0].source.as_str(), changed[0].actor_label.as_str()),
+            ("cli", expected.as_str())
         );
     }
 }
