@@ -1116,6 +1116,7 @@ mod tests {
     use crate::http::console_session::COOKIE;
     use crate::mail::queue as mail_queue;
     use crate::mcp::testing::TestApp;
+    use crate::store::audit::AuditActor;
     use crate::store::ceiling::{self, Ceiling};
     use crate::store::keys::{insert_legacy_test_key, Access, Grants};
     use crate::store::oauth::clients::ClientKind;
@@ -1443,7 +1444,7 @@ mod tests {
             test.app.pool(),
             SettingKey::MaxKeysPerUser,
             "1",
-            "test",
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await
@@ -1493,7 +1494,7 @@ mod tests {
             test.app.pool(),
             SettingKey::MaxKeysPerUser,
             "2",
-            "test",
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await
@@ -1530,7 +1531,7 @@ mod tests {
             test.app.pool(),
             SettingKey::MaxKeyLifetime,
             "24h",
-            "test",
+            &AuditActor::cli(),
             Utc::now(),
         )
         .await

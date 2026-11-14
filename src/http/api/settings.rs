@@ -18,6 +18,7 @@ use crate::clock::format_timestamp;
 use crate::error::OkfError;
 use crate::http::api::{require_admin, require_every_catalog, settle};
 use crate::http::AppError;
+use crate::store::audit::AuditActor;
 use crate::store::settings::{self, SettingKey, SettingRow};
 
 /// One setting as the API shows it.
@@ -167,19 +168,13 @@ async fn list_settings(
 async fn set_setting(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(key): Path<String>,
     Json(body): Json<SettingBody>,
 ) -> Result<Json<SettingView>, AppError> {
     require_every_catalog(&principal)?;
     let key = key_of(&key)?;
-    settings::set(
-        app.pool(),
-        key,
-        &body.value,
-        &principal.actor,
-        app.clock().now(),
-    )
-    .await?;
+    settings::set(app.pool(), key, &body.value, &actor, app.clock().now()).await?;
     // `key` names the setting here, so the credential is logged as `key_id`.
     tracing::info!(setting = key.as_str(), value = %body.value, key_id = %principal.key_id,
                    actor = %principal.actor, "setting changed");
@@ -195,11 +190,12 @@ async fn set_setting(
 async fn reset_setting(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(key): Path<String>,
 ) -> Result<Json<SettingView>, AppError> {
     require_every_catalog(&principal)?;
     let key = key_of(&key)?;
-    settings::reset(app.pool(), key).await?;
+    settings::reset(app.pool(), key, &actor, app.clock().now()).await?;
     tracing::info!(setting = key.as_str(), key_id = %principal.key_id, actor = %principal.actor,
                    "setting reset");
     settle(&app).await;
@@ -216,6 +212,7 @@ mod tests {
     };
     use crate::http::api::testing::{Browser, Payload};
     use crate::mcp::testing::TestApp;
+    use crate::store::audit::testing::entries;
     use crate::store::users;
     use chrono::Utc;
 
@@ -311,6 +308,21 @@ mod tests {
         assert_eq!(back["value"], "20");
         assert_eq!(back["overridden"], false);
         assert_eq!(back["updated_by"], serde_json::Value::Null);
+        let changed = entries(test.app.pool(), "setting.changed").await;
+        let cleared = entries(test.app.pool(), "setting.cleared").await;
+        assert_eq!(changed.len(), 1, "a refused value records nothing");
+        assert_eq!(
+            (
+                changed[0].source.as_str(),
+                changed[0].actor_label.as_str(),
+                changed[0].actor_operator,
+                changed[0].target.as_deref(),
+            ),
+            ("api", "api key", true, Some("max_keys_per_user"))
+        );
+        assert_eq!(changed[0].details, json!({"from": null, "to": 5}));
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].details, json!({"from": 5}));
     }
 
     /// Browsers for user `plain` (no admin) and user `boss` (an admin).
@@ -374,5 +386,16 @@ mod tests {
         assert_eq!(boss_write.as_u16(), 200, "{row}");
         assert_eq!(row["updated_by"], "boss");
         assert_eq!(boss_reset.as_u16(), 200);
+        let changed = entries(test.app.pool(), "setting.changed").await;
+        assert_eq!(changed.len(), 1, "the refused session recorded nothing");
+        assert_eq!(
+            (
+                changed[0].source.as_str(),
+                changed[0].actor_label.as_str(),
+                changed[0].actor_person.as_deref()
+            ),
+            ("console", "console session", Some("boss"))
+        );
+        assert_eq!(entries(test.app.pool(), "setting.cleared").await.len(), 1);
     }
 }
