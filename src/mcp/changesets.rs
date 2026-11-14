@@ -515,7 +515,7 @@ pub(crate) async fn discard(
     ctx: &ToolContext,
     params: DiscardParams,
 ) -> Result<Discarded, OkfError> {
-    use crate::store::audit::{self, Action, Entry, Target};
+    use crate::store::audit::{self, Entry, Target};
     use crate::store::catalogs;
     use crate::store::changesets::{self, ChangesetState};
 

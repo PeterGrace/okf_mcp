@@ -951,7 +951,7 @@ written fails. An entry names the catalog and belongs to its owner team.
 | Action | Recorded when | Details |
 |---|---|---|
 | `catalog.published` | A publish writes at least one revision (one that changes nothing writes none and records nothing). Moves, splits and concept deletes are publishes and are recorded as such | `changeset` (the handle; the diff stays in the catalog's history), `files` (revisions written), `generation_from`, `generation_to` |
-| `catalog.reverted` | `revert` writes a document's old revision into a changeset | `path`, `revision`, `changeset` |
+| `catalog.reverted` | A `revert` succeeds: a document's old revision (or its deletion) goes into a changeset. A refused revert records nothing | `path`, `revision`, `changeset` |
 | `catalog.changeset_discarded` | An admin closes another key's changeset (`discard` without `paths`, or `DELETE /api/v1/changesets/{handle}`). A key discarding its own changeset records nothing | `changeset`, `files` (entries dropped), `reason` (`admin`) |
 
 ## Signing in and self-service
