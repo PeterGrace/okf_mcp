@@ -3210,7 +3210,7 @@ Each task's tests follow one template, using the helper Task 1 adds (`audit::tes
 
 Write one "records one entry" test per row of the task's table (checking `action`, the person or target, `teams` and the `details` keys), one forced-failure test per store module, and one provisioner test per guarded function. The guard reads the target's `is_admin` under a lock `users::set_admin` conflicts with (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE` or `FOR KEY SHARE` on the user row), so it cannot race a promotion.
 
-Run per task: `tools/agentic/gate.sh narrow --lib store::<module>::tests` for each module touched, then `tools/agentic/gate.sh test` (it finds every caller the signature change missed), `fmt`, `lint`. Each task adds its actions to `docs/operations.md`'s new "### Audit log" action table (Task 1 adds no docs; the first of 6a to 6d to merge creates the section with a one-line lead, "Every change below writes one entry in the change's own transaction", and the others add rows).
+Run per task: `tools/agentic/gate.sh narrow --lib store::<module>::tests` for each module touched, then `tools/agentic/gate.sh test` (it finds every caller the signature change missed), `fmt`, `lint`. Each task adds its actions to `docs/operations.md`'s new "### Audit log" action table (Task 1 adds no docs; the first of 6a to 6d to merge creates the section with a one-line lead, "Every change below writes one entry in the change's own transaction", and the others add rows). *(Corrected, issue #400, 2026-11-14: Task 7a created the section, at the end of "## Users and teams", with columns Action, Recorded when, Details; the others add rows to it.)*
 
 ---
 
@@ -3532,6 +3532,8 @@ git commit -m "feat(audit): record settings changes; audit_retention_days and th
 
 (Adapt the helper calls to the module's own: `writer`, `open`, `revert_to`, `discard_paths` exist in its tests; `store_key` makes `root` a stored key so the changeset ownership check sees it.)
 
+> **Corrected (issue #400, 2026-11-14).** The two tests live in the modules that own the helpers: `publish_tests` (`a_publish_records_...`, on its `pg` catalog with `writer-a`; it also publishes a changeset whose only edit is a revert to the current revision, which writes no revision and must record nothing) and `changes_tests` (`a_revert_is_recorded_...`, which also has the owner close a second changeset of its own, unrecorded, and checks the whole `details` of both entries). `mcp::testing::context` takes the principal and connection only. Three more tests: `a_failed_audit_write_fails_the_publish` and `a_failed_audit_write_fails_the_revert_and_the_admins_discard` (`fail_on` the entry insert: the change rolls back), `http::api::changesets::tests::an_admin_sessions_discard_is_recorded_from_the_console` (an admin session's `DELETE /api/v1/changesets/{handle}` is recorded with source `console`, so `api::context` passes the requester), and `mcp::context::tests::a_context_from_a_request_records_its_address_and_source` (`from_parts` reads `ClientIp` and the console session).
+
 - [ ] **Step 2: Run them and see them fail**
 
 Run: `tools/agentic/gate.sh narrow --lib mcp::changesets::tests::a_publish_records`, then `tools/agentic/gate.sh narrow --lib mcp::changesets::tests::a_revert_is_recorded`
@@ -3602,7 +3604,7 @@ pub struct OpAudit {
     /// The action.
     pub action: Action,
     /// Its details; the changeset handle is added.
-    pub details: serde_json::Value,
+    pub details: serde_json::Map<String, serde_json::Value>,
 }
 
 /// [`apply`], recording `audit` in the edit's transaction before it commits.
@@ -3617,6 +3619,8 @@ pub async fn apply_audited<F>(
     op: F,
 ) -> Result<WriteReport, OkfError>
 ```
+
+> **Corrected (issue #400, 2026-11-14).** `OpAudit.details` is a `serde_json::Map`, not a `Value`, so adding `changeset` never meets a non-object (indexing a `Value` that is not an object panics). `revert` builds it with `serde_json::Map::from_iter([("path".to_string(), ..), ("revision".to_string(), ..)])`. A test module that called `apply` through `use super::*` imports `crate::write::apply` itself, since `mcp::changesets` now imports only `apply_audited`.
 
 `apply` becomes `apply_audited(ctx, changeset, by, None, op)`. Before `tx.commit()`, with `Some(entry)`: merge `"changeset": changeset_row.handle` into `entry.details`, read `audit::catalog_teams(&mut tx, state.id())` and record `Target::Catalog(state.name())` with `ctx.audit_actor()`. `revert` calls `apply_audited(.., Some(OpAudit { action: Action::CatalogReverted, details: json!({"path": format!("/{path}"), "revision": revision}) }), ..)`.
 

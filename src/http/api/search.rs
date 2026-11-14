@@ -11,6 +11,7 @@ use serde::Deserialize;
 use crate::app::App;
 use crate::auth::Principal;
 use crate::http::api::context;
+use crate::http::requester::Requester;
 use crate::http::AppError;
 use crate::mcp::search::{run, SearchParams, SearchResult};
 
@@ -61,6 +62,7 @@ fn catalog_names(listed: &str) -> Vec<String> {
 async fn search(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Query(args): Query<SearchArgs>,
 ) -> Result<Json<SearchResult>, AppError> {
     let named = args
@@ -82,7 +84,7 @@ async fn search(
     } else {
         named
     };
-    let ctx = context(&app, principal);
+    let ctx = context(&app, principal, requester);
     let result = run(
         &ctx,
         SearchParams {

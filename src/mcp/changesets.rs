@@ -28,8 +28,9 @@ use crate::okf::ops::OpOutcome;
 use crate::okf::paths::{escapes_root, normpath};
 use crate::okf::rules;
 use crate::okf::workspace::Workspace;
+use crate::store::audit::Action;
 use crate::store::keys::Access;
-use crate::write::{apply, WriteReport};
+use crate::write::{apply_audited, OpAudit, WriteReport};
 
 /// `list_changesets`' arguments.
 // `Deserialize` reads them from the call's JSON; `JsonSchema` gives the tool
@@ -320,6 +321,9 @@ pub struct Published {
 /// * `ctx` - the call's context.
 /// * `params` - the message and the changeset.
 ///
+/// A publish that writes revisions records `catalog.published` in its own
+/// transaction, as the call's [`ToolContext::audit_actor`].
+///
 /// # Returns
 /// The report; `published: false` for a changeset with no entries.
 ///
@@ -340,8 +344,12 @@ pub(crate) async fn publish(
         });
     }
     let Pinned { state, row } = ctx.changeset(&params.changeset, Access::Write).await?;
-    let actor = &ctx.principal().actor;
-    let report = publishing::publish(ctx.app(), &state, &row, actor, message).await?;
+    let input = publishing::PublishInput {
+        changeset: &row,
+        actor: &ctx.principal().actor,
+        message,
+    };
+    let report = publishing::publish(ctx.app(), &state, &input, &ctx.audit_actor()).await?;
     Ok(Published {
         catalog: state.name().to_string(),
         changeset: row.handle,
@@ -487,6 +495,10 @@ fn stored_path(reference: &str) -> Result<String, OkfError> {
 /// run one after the other, and a write queued behind a closing discard is
 /// refused.
 ///
+/// Closing a changeset another key owns (an admin's) records
+/// `catalog.changeset_discarded` in the same transaction; the owner's own
+/// discards are not administrative changes and record nothing.
+///
 /// # Arguments
 /// * `ctx` - the call's context.
 /// * `params` - the paths and the changeset.
@@ -503,6 +515,7 @@ pub(crate) async fn discard(
     ctx: &ToolContext,
     params: DiscardParams,
 ) -> Result<Discarded, OkfError> {
+    use crate::store::audit::{self, Entry, Target};
     use crate::store::catalogs;
     use crate::store::changesets::{self, ChangesetState};
 
@@ -555,6 +568,24 @@ pub(crate) async fn discard(
     discarded.closed = paths.is_none();
     if discarded.closed {
         changesets::set_state(&mut tx, changeset.id, ChangesetState::Discarded, now).await?;
+        // Closing another key's changeset is an admin's administrative
+        // change; an owner closing its own is not recorded.
+        let principal = ctx.principal();
+        if changeset.key_id.as_deref() != Some(principal.key_id.as_str()) {
+            let teams = audit::catalog_teams(&mut tx, state.id()).await?;
+            let entry = Entry {
+                action: Action::CatalogChangesetDiscarded,
+                target: Target::Catalog(state.name()),
+                person: None,
+                teams: &teams,
+                details: serde_json::json!({
+                    "changeset": changeset.handle,
+                    "files": discarded.removed,
+                    "reason": "admin",
+                }),
+            };
+            audit::record(&mut tx, &ctx.audit_actor(), &entry, now).await?;
+        }
     }
     tx.commit().await?;
     app.overlays().forget(changeset.id);
@@ -564,7 +595,8 @@ pub(crate) async fn discard(
 /// Adds a document's content at `revision` (or its deletion, for a
 /// `delete` revision) to the changeset a handle names, as a free edit.
 ///
-/// It goes through [`apply`], so every write rule applies. Sending a path
+/// It goes through [`apply_audited`], so every write rule applies, and
+/// records `catalog.reverted` in the edit's own transaction. Sending a path
 /// the changeset created (never published) back to "absent" leaves no
 /// entry for it, so the report's `touched` is empty.
 ///
@@ -581,7 +613,7 @@ pub(crate) async fn discard(
 /// `write`); [`OkfError::NotFound`] for a
 /// revision the path never had; [`OkfError::Refused`] for content that is
 /// not UTF-8, or a deletion of a path this changeset's view does not hold;
-/// as [`apply`].
+/// as [`apply_audited`].
 pub(crate) async fn revert(
     ctx: &ToolContext,
     params: RevertParams,
@@ -616,7 +648,16 @@ pub(crate) async fn revert(
         })?;
     // `move` hands `path` and `content` to the closure, which `apply` runs
     // on a blocking thread.
-    apply(ctx, &changeset, None, move |ws, _| {
+    // The entry is recorded in the edit's own transaction.
+    let audit = OpAudit {
+        action: Action::CatalogReverted,
+        // `Map::from_iter` builds the JSON object from (key, value) pairs.
+        details: serde_json::Map::from_iter([
+            ("path".to_string(), format!("/{path}").into()),
+            ("revision".to_string(), revision.into()),
+        ]),
+    };
+    apply_audited(ctx, &changeset, None, Some(audit), move |ws, _| {
         match &content {
             Some(text) => ws.write_atomic(&path, text)?,
             None if !ws.remove(&path)? => {
@@ -1223,7 +1264,12 @@ mod publish_tests {
         let state = test.app.catalog("pg").unwrap();
         publish_as(&ctx, &handle, "first").await.unwrap();
 
-        let refused = crate::store::publish::publish(&test.app, &state, &stale, "a", "second")
+        let input = crate::store::publish::PublishInput {
+            changeset: &stale,
+            actor: "a",
+            message: "second",
+        };
+        let refused = crate::store::publish::publish(&test.app, &state, &input, &ctx.audit_actor())
             .await
             .unwrap_err();
 
@@ -1297,6 +1343,79 @@ mod publish_tests {
         // The handle is spent: reading or writing through it is refused.
         let spent = ctx.pin(Some(&handle)).await.unwrap_err();
         assert_eq!(spent.kind(), "Refused");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_publish_records_one_entry_with_the_handle_files_and_generations() {
+        use crate::store::audit::testing::entries;
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
+        body(&ctx, &handle, "/a.md", "# A\n\nNew.\n").await;
+        body(&ctx, &handle, "/infra/x.md", "# X\n\nNew.\n").await;
+        // A changeset whose only edit is the published text (a revert to
+        // the current revision): its publish writes no revision, so it is
+        // no catalog write.
+        let unchanged = open(&ctx).await;
+        let same = RevertParams {
+            path: "/infra/y.md".to_string(),
+            revision: 1,
+            changeset: unchanged.clone(),
+        };
+        revert(&ctx, same).await.unwrap();
+
+        publish_as(&ctx, &handle, "two edits").await.unwrap();
+        let noop = publish_as(&ctx, &unchanged, "nothing").await.unwrap();
+
+        assert!(noop.report.revisions.is_empty(), "{noop:?}");
+        let recorded = entries(test.app.pool(), "catalog.published").await;
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let entry = &recorded[0];
+        assert_eq!(entry.target.as_deref(), Some("pg"));
+        assert_eq!(entry.teams, [crate::db::TEST_TEAM]);
+        assert_eq!(entry.details["changeset"], handle.as_str());
+        assert_eq!(entry.details["files"], 2);
+        let generation: i64 =
+            sqlx::query_scalar("SELECT generation FROM catalogs WHERE name = 'pg'")
+                .fetch_one(test.app.pool())
+                .await
+                .unwrap();
+        assert_eq!(entry.details["generation_to"], generation);
+        assert_eq!(entry.details["generation_from"], generation - 1);
+        assert_eq!(
+            (entry.source.as_str(), entry.actor_label.as_str()),
+            ("api", "api key")
+        );
+        assert!(!entry.actor_operator, "a write key is not an operator");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_audit_write_fails_the_publish() {
+        use crate::http::api::testing::fail_on;
+        let test = pg().await;
+        let ctx = writer(&test, "writer-a", "pg").await;
+        let handle = open(&ctx).await;
+        body(&ctx, &handle, "/a.md", "# A\n\nNew.\n").await;
+        fail_on(
+            test.app.pool(),
+            "BEFORE INSERT ON audit_entries FOR EACH ROW",
+        )
+        .await;
+
+        let refused = publish_as(&ctx, &handle, "edit a").await;
+
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(state_of(&test, &handle).await, ChangesetState::Open);
+        assert_eq!(
+            published_text(&test, "a.md"),
+            NOTE,
+            "the publish rolled back"
+        );
+        let state = test.app.catalog("pg").unwrap();
+        let rows = history::revisions(test.app.pool(), state.id(), "a.md", 5)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "no revision was written");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2182,6 +2301,88 @@ mod changes_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_revert_is_recorded_when_it_is_written_and_an_admins_discard_too() {
+        use crate::mcp::testing::store_key;
+        use crate::store::audit::testing::entries;
+        let test = pg().await;
+        let owner = writer(&test, "writer-a", "pg").await;
+        let handle = open(&owner).await;
+        let kept = open(&owner).await;
+        body(&owner, &handle, "/a.md", "# A\n\nChanged.\n").await;
+        body(&owner, &kept, "/b.md", "# B\n\nChanged.\n").await;
+        store_key(&test, "root").await;
+        let admin = context(
+            &test,
+            principal_as("root", Access::Admin, &[], Some("pg")),
+            None,
+        );
+
+        revert(&owner, revert_to(&handle, "/a.md", 1))
+            .await
+            .unwrap();
+        // The owner's own discards, of some paths or the whole changeset,
+        // are not administrative changes.
+        discard(&owner, discard_paths(&handle, Some(&["/b.md"])))
+            .await
+            .unwrap();
+        discard(&owner, discard_paths(&kept, None)).await.unwrap();
+        let closed = discard(&admin, discard_paths(&handle, None)).await.unwrap();
+
+        let reverted = entries(test.app.pool(), "catalog.reverted").await;
+        let discarded = entries(test.app.pool(), "catalog.changeset_discarded").await;
+        assert_eq!(reverted.len(), 1, "{reverted:?}");
+        assert_eq!(reverted[0].target.as_deref(), Some("pg"));
+        assert_eq!(reverted[0].teams, [crate::db::TEST_TEAM]);
+        assert_eq!(
+            reverted[0].details,
+            serde_json::json!({"path": "/a.md", "revision": 1, "changeset": handle})
+        );
+        assert!(!reverted[0].actor_operator);
+        assert_eq!(discarded.len(), 1, "{discarded:?}");
+        assert_eq!(discarded[0].target.as_deref(), Some("pg"));
+        assert_eq!(discarded[0].teams, [crate::db::TEST_TEAM]);
+        assert_eq!(
+            discarded[0].details,
+            serde_json::json!({"changeset": handle, "files": closed.removed, "reason": "admin"})
+        );
+        assert_eq!(closed.removed, 1, "the reverted a.md");
+        assert!(discarded[0].actor_operator, "an admin key is an operator");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_audit_write_fails_the_revert_and_the_admins_discard() {
+        use crate::http::api::testing::fail_on;
+        use crate::mcp::testing::store_key;
+        let test = pg().await;
+        let owner = writer(&test, "writer-a", "pg").await;
+        let handle = open(&owner).await;
+        body(&owner, &handle, "/a.md", "# A\n\nChanged.\n").await;
+        store_key(&test, "root").await;
+        let admin = context(
+            &test,
+            principal_as("root", Access::Admin, &[], Some("pg")),
+            None,
+        );
+        fail_on(
+            test.app.pool(),
+            "BEFORE INSERT ON audit_entries FOR EACH ROW",
+        )
+        .await;
+
+        let reverted = revert(&owner, revert_to(&handle, "/b.md", 1)).await;
+        let discarded = discard(&admin, discard_paths(&handle, None)).await;
+
+        assert!(reverted.is_err(), "{reverted:?}");
+        assert!(discarded.is_err(), "{discarded:?}");
+        assert_eq!(
+            entry_paths(&test, &handle).await,
+            ["a.md"],
+            "both rolled back"
+        );
+        assert_eq!(state_of(&test, &handle).await, ChangesetState::Open);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn revert_to_a_delete_revision_deletes_and_machinery_stays_refused() {
         let test = pg().await;
         let ctx = writer(&test, "writer-a", "pg").await;
@@ -2409,6 +2610,7 @@ mod restructure_publish_tests {
     use crate::okf::ops::{self, LogKind, Split, DEFAULT_SPLIT_TYPE};
     use crate::store::changesets::ChangesetState;
     use crate::store::history;
+    use crate::write::apply;
 
     const X: &str = "---\ntype: Note\ntitle: X\ndescription: X.\n---\n# X\n";
     const Y: &str = "---\ntype: Note\ntitle: Y\ndescription: Y.\n---\n# Y\n";
