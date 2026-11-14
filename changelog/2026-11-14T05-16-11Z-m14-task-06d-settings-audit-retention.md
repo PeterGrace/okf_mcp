@@ -18,9 +18,9 @@
   written in the change's own transaction. For `support_contact`, which can
   be an email address, a change records only `{"set": bool}` and a reset
   `{}`. Settings entries belong to no team.
-- `docs/operations.md`: the `audit_retention_days` row, and a new
-  "### Audit log" section with the action table (rows for the two settings
-  actions) and the retention rules.
+- `docs/operations.md`: the `audit_retention_days` row, and in the
+  "### Audit log" section (added by Task 7a) the two settings rows and the
+  retention rules.
 - Tests: retention range and default, an unreadable stored retention,
   entries for set and reset (and none for an unchanged value or a reset with
   no override), the support contact kept out of entries, a failed audit

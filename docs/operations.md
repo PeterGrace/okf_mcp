@@ -946,13 +946,25 @@ controls disabled, or the Unassigned view a note, saying why.
 
 Every change below writes one entry in the change's own transaction: the
 change and its entry commit together, and a change whose entry cannot be
-written fails. An entry names the catalog and belongs to its owner team.
+written fails. An entry about a catalog names it and belongs to its owner
+team; a settings entry names the setting and belongs to no team.
 
 | Action | Recorded when | Details |
 |---|---|---|
 | `catalog.published` | A publish writes at least one revision (one that changes nothing writes none and records nothing). Moves, splits and concept deletes are publishes and are recorded as such | `changeset` (the handle; the diff stays in the catalog's history), `files` (revisions written), `generation_from`, `generation_to` |
 | `catalog.reverted` | A `revert` succeeds: a document's old revision (or its deletion) goes into a changeset. A refused revert records nothing | `path`, `revision`, `changeset` |
 | `catalog.changeset_discarded` | An admin closes another key's changeset (`discard` without `paths`, or `DELETE /api/v1/changesets/{handle}`). A key discarding its own changeset records nothing | `changeset`, `files` (entries dropped), `reason` (`admin`) |
+| `setting.changed` | `settings set` or `PUT /api/v1/settings/{key}` changes a setting ([Settings](#settings)). Setting the value already stored records nothing | `from` (the stored value before, `null` without an override) and `to`; for `support_contact` only `set` (whether a contact is set now), never the address |
+| `setting.cleared` | `settings reset` or `DELETE /api/v1/settings/{key}` removes an override (with none, nothing is recorded) | `from`; nothing for `support_contact` |
+
+The log is append-only: the database refuses any change to an entry, and
+any delete of one younger than `audit_retention_days` (at least 30 days,
+whatever the stored value). At its first poll after starting, and then
+once a day, the server deletes the entries older than
+`audit_retention_days` plus an hour (a margin for clock skew between the
+server and the database); nothing else deletes them. Lowering the setting
+takes effect at the next daily pass; raising it keeps the entries not yet
+deleted.
 
 ## Signing in and self-service
 
@@ -1234,26 +1246,6 @@ nothing. A stored value this server cannot read (from
 a newer version, or a hand edit) is logged at `warn` and the default used.
 Mail is rendered when it is queued, so a queued mail keeps the brand it was
 queued with; `mail.from` (the sender) stays configuration.
-
-### Audit log
-
-Every change below writes one entry in the change's own transaction.
-
-| Action | Written by | Target | Details |
-|---|---|---|---|
-| `setting.changed` | `settings set`, `PUT /api/v1/settings/{key}` | the setting | `from` (the stored value before, `null` without an override) and `to`; for `support_contact` only `set` (whether a contact is set now), never the address |
-| `setting.cleared` | `settings reset`, `DELETE /api/v1/settings/{key}`, when there was an override | the setting | `from`; nothing for `support_contact` |
-
-Settings entries belong to no team.
-
-The log is append-only: the database refuses any change to an entry, and
-any delete of one younger than `audit_retention_days` (at least 30 days,
-whatever the stored value). At its first poll after starting, and then
-once a day, the server deletes the entries older than
-`audit_retention_days` plus an hour (a margin for clock skew between the
-server and the database); nothing else deletes them. Lowering
-the setting takes effect at the next daily pass; raising it keeps entries
-not yet deleted.
 
 ### Self-service keys and grants
 
