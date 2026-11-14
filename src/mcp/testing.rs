@@ -78,7 +78,7 @@ pub(crate) async fn app_at(
         catalogs::create(
             &db.pool,
             &crate::store::catalogs::NewCatalog {
-                name: name,
+                name,
                 description: "",
                 owner_team: crate::db::TEST_TEAM,
             },

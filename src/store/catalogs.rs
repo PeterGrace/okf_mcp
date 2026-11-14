@@ -940,7 +940,7 @@ pub(crate) mod tests {
                     create(
                         &db.pool,
                         &NewCatalog {
-                            name: name,
+                            name,
                             description: "",
                             owner_team: TEST_TEAM
                         },

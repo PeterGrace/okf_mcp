@@ -147,7 +147,7 @@ impl TestServer {
             catalogs::create(
                 &db.pool,
                 &okf_mcp::store::catalogs::NewCatalog {
-                    name: name,
+                    name,
                     description: "",
                     owner_team: OWNER,
                 },

@@ -426,7 +426,8 @@ pub struct People<'a> {
 
 /// Takes, `FOR KEY SHARE` and before anything else in a change's
 /// transaction, every user row the change's entry will resolve: the actor
-/// ([`record`] resolves it through `audit_person`), the users it names,
+/// and its key or grant's owner ([`record`] resolves both, through
+/// `audit_person` and `audit_credential`), the users it names,
 /// and the person of each personal team it names (an `audit_teams` row
 /// resolves its person the same way).
 ///
@@ -465,6 +466,7 @@ pub async fn lock_people(
     sqlx::query(
         "SELECT u.id FROM users u \
          WHERE u.id = $1 OR u.name = ANY($2) \
+            OR u.id = (SELECT user_id FROM api_keys WHERE id = $5) \
             OR u.id IN (SELECT personal_of FROM teams WHERE name = ANY($3)) \
             OR u.id IN (SELECT t.personal_of FROM catalogs c \
                         JOIN teams t ON t.id = c.owner_team_id WHERE c.name = ANY($4)) \
@@ -474,6 +476,7 @@ pub async fn lock_people(
     .bind(valid(people.users))
     .bind(valid(people.teams))
     .bind(valid(people.catalogs))
+    .bind(&actor.credential)
     .execute(&mut *conn)
     .await?;
     Ok(())

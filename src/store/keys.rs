@@ -1914,7 +1914,7 @@ mod tests {
             catalogs::create(
                 &db.pool,
                 &crate::store::catalogs::NewCatalog {
-                    name: name,
+                    name,
                     description: "",
                     owner_team: crate::db::TEST_TEAM,
                 },
@@ -2411,7 +2411,7 @@ mod tests {
             catalogs::create(
                 &db.pool,
                 &crate::store::catalogs::NewCatalog {
-                    name: name,
+                    name,
                     description: "",
                     owner_team: crate::db::TEST_TEAM,
                 },
@@ -2612,7 +2612,7 @@ mod tests {
             catalogs::create(
                 &db.pool,
                 &crate::store::catalogs::NewCatalog {
-                    name: name,
+                    name,
                     description: "",
                     owner_team: crate::db::TEST_TEAM,
                 },
