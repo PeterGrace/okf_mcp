@@ -1,7 +1,7 @@
 # okf-mcp team suspension: design
 
 Status: delivered in milestone 13 (epic #362; sub-issues #363-#370; PRs
-#374, #376-#378, #380, #382, #384 and the PR for #370), 2026-11-14 (plan
+#374, #376-#378, #380, #382, #384 and #387), 2026-11-14 (plan
 `docs/superpowers/plans/2026-11-13-okf-mcp-m13-team-suspension.md`). What
 differs from this design is under "What shipped differently" at the end;
 the operator's view is `docs/operations.md`, "Suspending a team".
