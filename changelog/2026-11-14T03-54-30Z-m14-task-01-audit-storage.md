@@ -37,6 +37,9 @@ Issue #391, epic #390. Plan: `docs/superpowers/plans/2026-11-13-okf-mcp-m14-oper
   `catalog_teams_is_the_owner_teams_audit_id_or_nothing` and
   `key_teams_is_the_distinct_owners_of_its_grants_and_nothing_else` (review
   round 2 of PR #412).
+- Test `a_credential_target_of_an_admin_is_marked_operator_without_a_person`
+  (review round 3 of PR #412): `record` sets `target_operator` from the owner
+  of a target key, grant or code as well as from `Entry.person`.
 
 ## Changed
 - `Principal` has `user_id: Option<String>`: the key's `user_id` from

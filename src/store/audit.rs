@@ -374,8 +374,9 @@ pub async fn record(
     // refreshes a row; NULL in, NULL out); the credentials and the target
     // team resolve to their audit ids the same way. The actor's credential
     // label goes to `audit_credentials` (mutable), the entry gets only
-    // `stored_label`. `target_operator`: the target person is an admin user
-    // now, so owners never see who it is.
+    // `stored_label`. `target_operator`: the target person, or the owner of
+    // a target key, grant or code (which `audit_credential` resolves the
+    // same way), is an admin user now, so owners never see who it is.
     Ok(sqlx::query_scalar(
         "INSERT INTO audit_entries (at, action, source, actor_credential_ref, actor_person_id, \
              actor_label, actor_operator, client_ip, target_kind, target_name, target_team_ref, \
@@ -383,7 +384,9 @@ pub async fn record(
          SELECT $1, $2, $3, audit_credential($4, p.actor, $5), p.actor, $6, $7, $8::inet, $9, \
                 $10, audit_team_ref((SELECT id FROM teams WHERE name = $11)), \
                 audit_credential($12, p.target, NULL), p.target, \
-                COALESCE((SELECT is_admin FROM users WHERE id = $13), false), $14, $15 \
+                COALESCE((SELECT bool_or(is_admin) FROM users WHERE id IN ($13, \
+                    (SELECT user_id FROM api_keys WHERE id = $12), \
+                    (SELECT user_id FROM sign_in_codes WHERE id = $12))), false), $14, $15 \
          FROM (SELECT audit_person($16) AS actor, audit_person($13) AS target) p \
          RETURNING id",
     )
@@ -1022,6 +1025,62 @@ mod tests {
         .unwrap();
         assert!(!stored.contains("alice"), "{stored}");
         assert!(stored.contains("\"actor_label\":\"api key\""), "{stored}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_credential_target_of_an_admin_is_marked_operator_without_a_person() {
+        let db = test_db().await;
+        for name in ["staff", "alice"] {
+            let new = NewUser {
+                name,
+                display_name: "",
+            };
+            users::create(&db.pool, &new, now()).await.unwrap();
+        }
+        sqlx::query("UPDATE users SET is_admin = true WHERE name = 'staff'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let staff = user_id(&db.pool, "staff").await;
+        let alice = user_id(&db.pool, "alice").await;
+        store_key(&db.pool, "staff-laptop", Some(&staff)).await;
+        store_code(&db.pool, "staff-phone", &staff).await;
+        store_key(&db.pool, "alice-laptop", Some(&alice)).await;
+        let mut tx = db.pool.begin().await.unwrap();
+        // `Entry.person` is `None` for each: only the credential names its
+        // owner.
+        for target in [
+            Target::Key("staff-laptop"),
+            Target::Code("staff-phone"),
+            Target::Key("alice-laptop"),
+        ] {
+            record(
+                &mut tx,
+                &AuditActor::cli(),
+                &entry(Action::KeyRevoked, target),
+                now(),
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let marked: Vec<(Option<String>, bool)> = sqlx::query_as(
+            "SELECT c.credential_id, e.target_operator FROM audit_entries e \
+             JOIN audit_credentials c ON c.id = e.target_credential_ref ORDER BY e.id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            marked,
+            [
+                (Some("staff-laptop".to_string()), true),
+                (Some("staff-phone".to_string()), true),
+                (Some("alice-laptop".to_string()), false),
+            ],
+            "an admin's key or code hides from owners; a member's does not"
+        );
     }
 
     /// Creates catalog `name` owned by team `owner` (none for `None`).
