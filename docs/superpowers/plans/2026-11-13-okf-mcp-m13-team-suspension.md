@@ -1370,12 +1370,17 @@ Route, beside the other team routes:
 
 Add the route to the module doc comment's access list ("suspending and lifting a team need an admin key that reaches every catalog").
 
+> **Corrected (issue #367, 2026-11-14).** The view fields, body, handler and route shipped as above (`TeamView.suspended_at` and `suspension_notice`, body `{suspended, notice?}` with `deny_unknown_fields`, answer the team; Tasks 6 and 7 can rely on these names). Differences:
+> - The tests import `axum::http::StatusCode` and `teams::MAX_NOTICE_CHARS` (the test module has no `use super::*`). The route test also checks every key below an every-catalog admin (read, write, scoped admin, stranger) gets 403 `Forbidden` and changed nothing, 422 for an unknown field, 409 `Refused` for a notice over the limit and for one holding a NUL, 404 for an unknown team, and that a repeat suspend keeps `suspended_at` while a blank notice clears the old one. A helper `put_suspension` sends the request.
+> - The member test suspends `TEST_TEAM` through the route (so the listing's team is `TEST_TEAM`, as written), sends no `poll` of its own (the route settles), and also covers search and `GET /api/v1/changesets?catalog=main` (403 `Suspended` with the notice), the unfiltered changeset list (empty), the scoped admin (exempt), and then lifts and checks the member is served again and the listing's `suspended` is null.
+> - `store::teams::find`, `lock_team` and `id_of` refuse a name that is not `[a-z0-9-]+` with `UnknownName` before SQL, so a NUL in a team path (`/teams/a%00b/...`) is a 404, never a 500 (part of #339, for every team route, including this one and the CLI). `a_nul_or_malformed_name_in_a_path_is_a_404_never_a_500` now covers the team routes. Read `src/http/api/people.rs` for the shipped code.
+
 - [ ] **Step 4: Run, gate, commit**
 
 Run the two tests, then `tools/agentic/gate.sh test`.
 
 ```bash
-git add src/http/api/people.rs changelog/
+git add src/http/api/people.rs src/store/teams.rs changelog/
 git commit -m "feat(api): PUT /teams/{name}/suspension; teams show their suspension (M13 task 5)"
 ```
 
@@ -1495,7 +1500,7 @@ Expected: "`okf-mcp team suspend` is not a subcommand"; compile error for the va
 and in the API reference table, after the `DELETE /api/v1/teams/{name}/members/{user}` row:
 
 ```markdown
-| `PUT /api/v1/teams/{name}/suspension` | admin, every catalog | Body `{suspended: bool, notice?}`. `true` suspends the team, or replaces the notice of a suspended one (its `suspended_at` is kept); `false` lifts it (no change when active). Answers the team. Its catalogs then refuse every non-admin credential with 403 `Suspended`, except export. 404 for an unknown team, 409 for a notice over 2000 characters, 422 without `suspended` |
+| `PUT /api/v1/teams/{name}/suspension` | admin, every catalog | Body `{suspended: bool, notice?}`. `true` suspends the team, or replaces the notice of a suspended one (its `suspended_at` is kept); `false` lifts it (no change when active). Answers the team. Its catalogs then refuse every non-admin credential with 403 `Suspended`, except export. 404 for an unknown or malformed team name, 409 for a notice over 2000 characters or holding a NUL, 422 without `suspended` or with an unknown field. *(Corrected, issue #367, 2026-11-14.)* |
 ```
 
 Update the `okf-mcp team list` line's documented columns to include `suspended TIME` (`-` when active).

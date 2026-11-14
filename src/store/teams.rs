@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
-use crate::store::catalogs::bump_admin_generation;
+use crate::store::catalogs::{bump_admin_generation, is_valid_name};
 use crate::store::users;
 
 /// A member's role in a team.
@@ -276,8 +276,14 @@ pub async fn list(pool: &PgPool) -> Result<Vec<TeamRecord>, OkfError> {
 /// The team.
 ///
 /// # Errors
-/// [`OkfError::UnknownName`] if there is none; [`OkfError::Database`].
+/// [`OkfError::UnknownName`] if there is none (a malformed name included);
+/// [`OkfError::Database`].
 pub async fn find(pool: &PgPool, name: &str) -> Result<TeamRecord, OkfError> {
+    // A malformed name (a NUL, which Postgres refuses) names no team: the
+    // same 404 as an unknown one, never a database error (issue #339).
+    if !is_valid_name(name) {
+        return Err(unknown(name));
+    }
     let row = sqlx::query_as::<_, TeamRow>(concat!(select_teams!(), " WHERE t.name = $1"))
         .bind(name)
         .fetch_optional(pool)
@@ -573,6 +579,10 @@ struct LockedTeam {
 /// # Errors
 /// [`OkfError::UnknownName`]; [`OkfError::Database`].
 async fn lock_team(conn: &mut PgConnection, name: &str) -> Result<LockedTeam, OkfError> {
+    // As in `find`: a malformed name names no team (issue #339).
+    if !is_valid_name(name) {
+        return Err(unknown(name));
+    }
     let (id, personal_of) = sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT id, personal_of FROM teams WHERE name = $1 FOR UPDATE",
     )
@@ -668,6 +678,10 @@ async fn refuse_last_owner(
 /// # Errors
 /// [`OkfError::UnknownName`]; [`OkfError::Database`].
 pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String, OkfError> {
+    // As in `find`: a malformed name names no team (issue #339).
+    if !is_valid_name(name) {
+        return Err(unknown(name));
+    }
     sqlx::query_scalar("SELECT id FROM teams WHERE name = $1 FOR KEY SHARE")
         .bind(name)
         .fetch_optional(&mut *conn)
