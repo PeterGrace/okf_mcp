@@ -1725,6 +1725,13 @@ git commit -m "feat(console): suspend and lift teams; suspended pills and the Br
 - [ ] **Step 2: `README.md`** status paragraph: "Milestone 13 added team suspension: an operator can suspend a team, whose catalogs then refuse every non-admin credential except export until it is lifted (`docs/operations.md`, "Suspending a team"; design: `docs/superpowers/specs/2026-11-13-okf-team-suspension-design.md`)."
 - [ ] **Step 3: The spec**: add a "What shipped differently" section listing any deviation the tasks recorded (or "None").
 - [ ] **Step 4: The changelog entry** for the milestone, in the format of `changelog/2026-11-13T15-30-24Z-milestone-12-user-login.md`.
+> **Corrected (issue #370, 2026-11-14).** Shipped as above, with these differences:
+> - `docs/operations.md` has no table of error kinds, so the `Suspended` body fields are in the new "Suspending a team" subsection, and the "error table" row is a Troubleshooting row (403 `Suspended`, its fields, export still works, `team unsuspend`).
+> - The MCP tools table is in `README.md` ("Tools"), so `list_catalogs`' `suspended` note is there; the README's "Routes" paragraph also names the 403 `Suspended`, and its command and console summaries name `suspend|unsuspend` and team suspension.
+> - The API reference's endpoint counts went from 87 to 88 and Users and teams from 20 to 21 (Task 5's route; Task 6 added its row but not the counts).
+> - The "Upgrades" line is a bullet that also says `team list`'s display name moved from field 5 to field 6.
+> - Following M12's close-out, Task 8 also wrote its own task changelog (`changelog/<ts>-m13-task-08-docs.md`, same timestamp as the milestone entry). The deferred "provisioner" scope was not filed as an issue: milestone 14's design (PR #375) covers it.
+
 - [ ] **Step 5: Gates and commit**
 
 Run: `tools/agentic/gate.sh fmt`, `tools/agentic/gate.sh lint`, `tools/agentic/gate.sh test`.
