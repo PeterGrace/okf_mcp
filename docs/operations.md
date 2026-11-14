@@ -698,7 +698,7 @@ takes effect at once.
 | Command | Does |
 |---|---|
 | `okf-mcp user create NAME [--display-name TEXT]` | Creates the user and its personal team `NAME` |
-| `okf-mcp user list` | One tab-separated line per user: name, `credentials N` (keys, grants and codes naming it, revoked ones included), `email E` (`-` when unset), `admin yes\|no`, `teams a,b`, then the display name |
+| `okf-mcp user list [--email ADDRESS]` | One tab-separated line per user: name, `credentials N` (keys, grants and codes naming it, revoked ones included), `email E` (`-` when unset), `admin yes\|no`, `teams a,b`, then the display name. `--email` prints only the user with that email, in any letter case, and nothing when no user has it |
 | `okf-mcp user delete NAME` | Deletes a user nothing references, with its personal team (see below) |
 | `okf-mcp user set-admin NAME --on\|--off` | Gives or takes the admin flag: an admin user's console session acts as an admin that reaches every catalog. A change signs the user out of every console session. `--off` for the last admin user is allowed here (operator access), refused over REST |
 | `okf-mcp user set-email NAME EMAIL` (`--clear`) | Sets the email a user signs in and gets mail with (unique, case-insensitive), or clears it. A change ends the user's outstanding emailed links |
@@ -891,12 +891,14 @@ Every admin command for users, teams, assignment, sign-in, settings and
 mail has a REST route and a console control. `tests/admin_parity.rs` fails
 when a `user`, `team`, `settings` or `mail` subcommand, or one of the other
 commands below, has no row here or its row names a route the API reference
-does not document.
+does not document. A row may name a subcommand's flag (`user list --email`);
+the test checks the flag exists.
 
 | CLI | REST | Console |
 |---|---|---|
 | `okf-mcp user create` | `POST /api/v1/users` | Users → New user |
 | `okf-mcp user list` | `GET /api/v1/users` | Users |
+| `okf-mcp user list --email` | `GET /api/v1/users` | Users → the filter box |
 | `okf-mcp user delete` | `DELETE /api/v1/users/{name}` | Users → user → Delete user |
 | `okf-mcp team create` | `POST /api/v1/teams` | Teams → New team |
 | `okf-mcp team list` | `GET /api/v1/teams` | Teams |
@@ -1983,7 +1985,7 @@ admin). Every change takes effect at once. A refusal under the
 
 | Method and path | Key | Does |
 |---|---|---|
-| `GET /api/v1/users` | admin | `{users}`, by name: `name`, `display_name`, `created_at`, `credentials` (keys, grants and codes naming it, whoever manages them), `teams`, `email` (`null` when unset), `is_admin`, `has_password` (never the password or its hash) |
+| `GET /api/v1/users` | admin | `?email=` (optional) answers only the user with that email, in any letter case: zero or one, in the same view; text that cannot be an address finds none, and an unknown parameter is 400. `{users}`, by name: `name`, `display_name`, `created_at`, `credentials` (keys, grants and codes naming it, whoever manages them), `teams`, `email` (`null` when unset), `is_admin`, `has_password` (never the password or its hash) |
 | `POST /api/v1/users` | admin, every catalog | Body `{name, display_name}` (`display_name` optional). Creates the user and its personal team; 201 with the user. 409 for an invalid or taken name, 422 without `name` |
 | `GET /api/v1/users/{name}` | admin | `{user, keys, codes, entitlements}`: the user, the keys, grants and codes naming it that the caller manages, and its entitlements (`[{catalog, access, created_at}]`, by catalog) |
 | `DELETE /api/v1/users/{name}` | admin, every catalog | Deletes the user with its personal team; 204. 409 while something refers to it |
@@ -2438,7 +2440,9 @@ The API keys page (`/ui/#/keys`):
   changes its catalogs. It has no maintenance-reporting switch: a grant never
   reports.
 
-The Users page's user drawer (`/ui/#/users`) has the sign-in controls: the
+The Users page (`/ui/#/users`) has a filter box that narrows the list, as
+you type, to users whose name, display name or email contains the text, in
+any letter case. Its user drawer has the sign-in controls: the
 Admin switch, Email (Save, Clear), "Send setup email", Entitlements, the
 console sessions with Sign out and "Sign out everywhere", and Recent
 sign-ins. A catalog's drawer (`/ui/#/catalogs`) has Team member access. The

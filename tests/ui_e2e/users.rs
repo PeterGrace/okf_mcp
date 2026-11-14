@@ -617,3 +617,53 @@ async fn a_write_that_settles_after_its_user_was_reopened_updates_the_new_drawer
         .expect("alice has the new email");
     assert!(alice.is_admin);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_users_filter_matches_names_and_emails() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let pool = server.app.pool();
+    for (name, display_name) in [("alice", ""), ("bob", "Robert Example")] {
+        users::create(pool, &NewUser { name, display_name }, Utc::now())
+            .await
+            .unwrap();
+    }
+    users::set_email(pool, "bob", Some("robert@example.com"))
+        .await
+        .unwrap();
+    drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/users");
+        ui.wait_visible("[data-test=user-alice]");
+        // An email, in another letter case.
+        ui.fill("#users-filter", "ROBERT@");
+        ui.wait_hidden("[data-test=user-alice]");
+        ui.wait_visible("[data-test=user-bob]");
+        // A display name.
+        ui.fill("#users-filter", "robert ex");
+        ui.wait_visible("[data-test=user-bob]");
+        ui.fill("#users-filter", "nobody");
+        ui.wait_hidden("[data-test=user-bob]");
+        ui.wait_text("#users-table", "No user matches the filter.");
+        ui.fill("#users-filter", "");
+        ui.wait_visible("[data-test=user-alice]");
+        ui.wait_visible("[data-test=user-bob]");
+
+        // A list that answers after the filter changed is drawn through the
+        // newest filter: create carol under the filter "bob", hold the list
+        // read that follows, filter by "car", then let the read answer.
+        ui.fill("#users-filter", "bob");
+        ui.wait_hidden("[data-test=user-alice]");
+        ui.click("#user-new");
+        ui.fill("#user-form input[name=name]", "carol");
+        ui.hold_answer("GET", "/api/v1/users", || {
+            ui.click("#user-form button[type=submit]")
+        });
+        ui.fill("#users-filter", "car");
+        ui.release_held();
+        ui.wait_visible("[data-test=user-carol]");
+        ui.wait_hidden("[data-test=user-bob]");
+        ui.wait_hidden("[data-test=user-alice]");
+    })
+    .await;
+}
