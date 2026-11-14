@@ -160,6 +160,11 @@ mod tests {
             tables,
             [
                 "api_keys",
+                "audit_access_counts",
+                "audit_credentials",
+                "audit_entries",
+                "audit_people",
+                "audit_teams",
                 "catalogs",
                 "changeset_entries",
                 "changesets",

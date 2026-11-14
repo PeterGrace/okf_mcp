@@ -101,6 +101,10 @@ pub struct Principal {
     /// assigned. Display only: it grants nothing, so `reaches` and
     /// `require` never read it.
     pub user: Option<String>,
+    /// The `users.id` of the credential's user (`None` for a legacy key):
+    /// what the audit log and the access gates key people by. It grants
+    /// nothing by itself.
+    pub user_id: Option<String>,
     /// The catalogs suspended when the key cache was loaded, shared by every
     /// principal of that load. Read by [`Principal::require`] (and, from
     /// Task 4 of M13, selection); an admin credential ignores it. Empty for a
@@ -275,6 +279,7 @@ impl Principal {
                 user_id: user.id.clone(),
             },
             user: Some(user.name.clone()),
+            user_id: Some(user.id.clone()),
             suspended,
         }
     }
@@ -321,6 +326,7 @@ impl From<KeyRecord> for Principal {
             actor: record.actor,
             kind,
             user: record.user,
+            user_id: record.user_id,
             // Filled in by the key cache (`principal_of`); a principal
             // built outside it sees nothing suspended.
             suspended: Arc::default(),
@@ -841,6 +847,7 @@ pub async fn require_key(
         Ok(Some(principal)) => {
             tracing::debug!(key = %principal.key_id, "authenticated");
             request.extensions_mut().insert(principal);
+            crate::http::console_session::insert_client_ip(&app, &mut request);
             next.run(request).await
         }
         Ok(None) => unauthorized(&app),
@@ -1685,6 +1692,7 @@ mod tests {
             actor: "a".to_string(),
             kind: CredentialKind::ApiKey,
             user: None,
+            user_id: None,
             suspended,
         }
     }

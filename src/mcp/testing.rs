@@ -144,6 +144,7 @@ pub(crate) fn principal_with_reporting(
         actor: key_id.to_string(),
         kind: CredentialKind::ApiKey,
         user: None,
+        user_id: None,
         suspended: Default::default(),
     })
 }

@@ -255,7 +255,7 @@ Why each edge, and the shared files to merge with care:
 | `tests/support/server.rs` | `owner_with_password` | 9e |
 | `src/store/mod.rs` | `pub mod audit;` (1), `pub mod gates;` (7b), `pub mod unlocks;` (9a) | 1, 7b, 9a |
 | `src/http/requester.rs` | Create: `ClientIp`, `Requester`, extractors | 1 |
-| `src/http/mod.rs` | `mod requester`; `/ui/brand.json` (2) | 1, 2 |
+| `src/http/mod.rs` | `pub mod requester` (corrected, issue #391); `/ui/brand.json` (2) | 1, 2 |
 | `src/auth.rs` | `Principal.user_id` (1); `provisioner`, MCP refusal (5); `AccessGates`, `Admission`, cache wiring (7b); unlock and maintenance checks (9b) | 1, 5, 7b, 9b |
 | `src/http/console_session.rs` | `ClientIp` insertion (1); `for_session` user id (1); gates (7b) | 1, 7b |
 | `src/store/settings.rs` | `product_name`, `support_contact`, `Brand`, `brand_in` (2); audit, `audit_retention_days` (6d); unlock settings (9a) | 2, 6d, 9a |
@@ -307,7 +307,7 @@ Why each edge, and the shared files to merge with care:
 
 **Files:**
 - Create: `migrations/0012_audit.sql`, `src/store/audit.rs`, `src/http/requester.rs`
-- Modify: `src/store/mod.rs`, `src/http/mod.rs` (`mod requester;`), `src/auth.rs` (`Principal.user_id`, `require_key` inserts `ClientIp`), `src/http/console_session.rs` (`require_principal` inserts `ClientIp`; `client_ip` shares its body), every `Principal { ... }` literal (`user_id: None,`)
+- Modify: `src/store/mod.rs`, `src/http/mod.rs` (`pub mod requester;`: `store::audit` imports `Requester`, so a private module would not compile; *corrected, issue #391, 2026-11-14*), `src/auth.rs` (`Principal.user_id`, `require_key` inserts `ClientIp`), `src/http/console_session.rs` (`require_principal` inserts `ClientIp`; `client_ip` shares its body), every `Principal { ... }` literal (`user_id: None,`)
 
 - [ ] **Step 1: Write the migration**
 
@@ -361,8 +361,9 @@ CREATE TABLE audit_entries (
     actor_credential_ref  bigint REFERENCES audit_credentials (id),
     actor_person_id       bigint REFERENCES audit_people (id),
     -- Never a person's name: 'console session', 'api key', 'oauth grant',
-    -- 'cli:<os user>', 'system:<what>', or the label of a key with no user.
-    -- A credential's own label is in audit_credentials.
+    -- 'cli:<os user>' or 'system:<what>'. A credential's own label is only
+    -- in audit_credentials, even for a key with no user: it may be assigned
+    -- one later, and forget_person must be able to clear it.
     actor_label           text NOT NULL,
     -- An admin credential or a provisioner: owners see "an operator".
     actor_operator        boolean NOT NULL,
@@ -788,6 +789,8 @@ mod tests {
 }
 ```
 
+> **Corrected (issue #391, 2026-11-14).** As shipped (`src/store/audit.rs`): `record_writes_one_entry_with_its_actor_target_and_teams` first stores the key `k1` it names (`audit_credential` creates no row for a credential id that is in neither `api_keys` nor `sign_in_codes`, so the test's `JOIN audit_credentials` found nothing), and it also checks `testing::entries`; the TRUNCATE check is `TRUNCATE audit_entries CASCADE`, so it is the trigger that refuses it and not the foreign key from `audit_access_counts`, and the test then counts the one surviving entry. The tests build entries with a local `entry(action, target)` helper and struct-update syntax.
+
 And in `src/http/requester.rs`'s tests:
 
 ```rust
@@ -994,25 +997,26 @@ impl AuditActor {
         }
     }
 
-    /// The entry's immutable `actor_label`: never a person's name. A
-    /// credential of a user is named by its kind (its own label goes to the
-    /// mutable `audit_credentials`); only a key with no user, the CLI's
-    /// operating-system user (operator staff, not an okf-mcp user) and the
-    /// system keep their label.
+    /// The entry's immutable `actor_label`: never a person's name. Every
+    /// key and grant is named by its kind, whether or not it has a user now:
+    /// a key with no user can be assigned one later, and its own label must
+    /// stay where `forget_person` can clear it (`audit_credentials`). Only the
+    /// CLI's operating-system user and the system keep their label.
     ///
     /// # Returns
     /// The label to store.
     pub fn stored_label(&self) -> String {
         match self.via {
             Via::Session => "console session".to_string(),
-            Via::Key if self.user_id.is_some() => "api key".to_string(),
-            Via::Grant if self.user_id.is_some() => "oauth grant".to_string(),
-            Via::Key | Via::Grant => self.label.clone(),
+            Via::Key => "api key".to_string(),
+            Via::Grant => "oauth grant".to_string(),
             Via::Cli => format!("cli:{}", self.label),
             Via::System => format!("system:{}", self.label),
         }
     }
 }
+
+> **Corrected (issue #391, 2026-11-14, PR #412 review round 2).** `stored_label` first kept the label of a key with no user in the entry. Such a key can later be assigned a user (`keys::assign_user_target`), and once that user was forgotten the label (often a person's device name, such as `alice-laptop`) stayed in the immutable `actor_label`. Every key and grant is now stored as `api key` / `oauth grant`; its label lives only in `audit_credentials`, which Task 8a's reader already prefers (`COALESCE(ac.label, e.actor_label)`), so nothing later changes. Test: `a_key_that_acted_before_it_was_assigned_leaves_no_name_once_its_user_is_forgotten`. Task 1 also tests `catalog_teams` and `key_teams` directly (`catalog_teams_is_the_owner_teams_audit_id_or_nothing`, `key_teams_is_the_distinct_owners_of_its_grants_and_nothing_else`).
 
 // One list of actions, so the enum, `as_str` and `ALL` cannot drift apart.
 // `macro_rules!` writes the three from it at compile time.
@@ -1192,7 +1196,9 @@ pub async fn record(
          SELECT $1, $2, $3, audit_credential($4, p.actor, $5), p.actor, $6, $7, $8::inet, $9, $10, \
                 audit_team_ref((SELECT id FROM teams WHERE name = $11)), \
                 audit_credential($12, p.target, NULL), p.target, \
-                COALESCE((SELECT is_admin FROM users WHERE id = $13), false), $14, $15 \
+                COALESCE((SELECT bool_or(is_admin) FROM users WHERE id IN ($13, \
+                    (SELECT user_id FROM api_keys WHERE id = $12), \
+                    (SELECT user_id FROM sign_in_codes WHERE id = $12))), false), $14, $15 \
          FROM (SELECT audit_person($16) AS actor, audit_person($13) AS target) p \
          RETURNING id",
     )
@@ -1482,6 +1488,8 @@ pub fn request_ip(extensions: &Extensions, headers: &HeaderMap, config: &AuthCon
 ```
 
 and have `client_ip` call it. In `require_principal`, before each `next.run(request)`, insert `ClientIp(request_ip(request.extensions(), request.headers(), &app.config().auth))`; do the same in `crate::auth::require_key`.
+
+> **Corrected (issue #391, 2026-11-14).** The insertion is one helper, `console_session::insert_client_ip(app: &App, request: &mut Request)`, which `require_principal` (bearer and cookie paths) and `auth::require_key` call; the requester test also checks that the `AuditActor` extractor refuses a request with no principal (403 `Forbidden`). A second test, `both_middlewares_record_the_client_ip_and_the_credentials_user`, puts the real `require_principal` (bearer and cookie) and `require_key` in front of a route that extracts `Requester` and `AuditActor`, and checks the peer address, the source, the `Via` and that `user_id` is set.
 
 In `src/auth.rs`, add to `Principal` (after `user`, before M13's `suspended`):
 
@@ -6815,8 +6823,8 @@ git commit -m "docs: operator API operations, API reference and close-out (M14 t
 14. **Owners read unlocks** both as `catalog.unlocked` entries (reason removed) and through `GET /api/v1/unlocks?team=` (with the tallies), both through a console session only.
 15. **The parity test learns flag entries** (`user list --email`, `key create --provisioner`), so the two new flags the spec lists under "Surfaces and parity" are enforced like subcommands. `settings set` already covers the new settings keys.
 16. **Owners' scope is an immutable team identity.** *(PR #375 review, 2026-11-13.)* A shared team's name can be reused: delete `family`, create a new `family` for another customer, and a scope by name (`e.teams @> ARRAY[name]`) would show the new owners the old team's retained entries. Entries now store `audit_teams` ids; an `audit_teams` row follows one `teams.id`, a UUID that is never reused, and keeps the name only as a display snapshot. An owner's view is scoped by the one id of the team it owns now; an admin's `team` filter by name may span every team that had it. Tests: Task 1 (`a_team_created_again_under_its_old_name_gets_a_new_audit_id`) and Task 8a (`a_new_team_under_an_old_name_cannot_read_the_old_teams_entries`). The spec's "teams" rule says so too.
-17. **No person's name in an immutable column.** *(PR #375 review, 2026-11-13.)* `Principal::for_session` sets a session's `actor` to the user's name (`src/auth.rs:273` on `4b7fcf1`), a self-issued key's actor label defaults to the key name its user chose, and a legacy key's id is its name (`migrations/0005_key_names.sql`). So `actor_label` holds only a kind (`console session`, `api key`, `oauth grant`), `cli:<os user>`, `system:<what>` or the label of a key with no user (`AuditActor::stored_label`); credential ids and labels live in `audit_credentials`, which `forget_person` clears for the deleted user's credentials (shown as `credential #N`); the admin-read bucket key uses audit ids. Grant names (`grants::grant_name`, which starts with the user's name) are never written into entries. The CLI's operating-system user stays in `actor_label` as the spec decides: it is operator staff, not an okf-mcp user. Tests: Task 1 (`a_session_actor_leaves_no_name_in_the_entry_once_its_user_is_forgotten`) and Task 8a (`a_deleted_session_user_is_named_nowhere_in_the_admin_or_owner_view`, the complete admin and owner records).
-18. **Operator staff as a target are hidden from owners too.** *(PR #375 review, 2026-11-13.)* An unlock's entries name the unlocked admin as their person; owners saw it although the actor read "an operator". `record` sets `target_operator` when the target person is an admin user, and the owner view drops that person (and a credential naming them); for owners the target filter never matches a hidden person or credential and the actor filter never matches an operator's entry, so neither is an identity oracle. Tests: Task 8a (`owners_never_see_an_operators_identity_ip_unlock_reason_or_unlocked_staff`, the whole serialized record and both filters) and Task 9d (the owner's full `GET /api/v1/audit` response, its export and its filters contain no staff name).
+17. **No person's name in an immutable column.** *(PR #375 review, 2026-11-13.)* `Principal::for_session` sets a session's `actor` to the user's name (`src/auth.rs:273` on `4b7fcf1`), a self-issued key's actor label defaults to the key name its user chose, and a legacy key's id is its name (`migrations/0005_key_names.sql`). So `actor_label` holds only a kind (`console session`, `api key`, `oauth grant`), `cli:<os user>`, `system:<what>`, and never the label of any key or grant, even one with no user, since it can be assigned one later (`AuditActor::stored_label`; *corrected, issue #391, 2026-11-14*); credential ids and labels live in `audit_credentials`, which `forget_person` clears for the deleted user's credentials (shown as `credential #N`); the admin-read bucket key uses audit ids. Grant names (`grants::grant_name`, which starts with the user's name) are never written into entries. The CLI's operating-system user stays in `actor_label` as the spec decides: it is operator staff, not an okf-mcp user. Tests: Task 1 (`a_session_actor_leaves_no_name_in_the_entry_once_its_user_is_forgotten`) and Task 8a (`a_deleted_session_user_is_named_nowhere_in_the_admin_or_owner_view`, the complete admin and owner records).
+18. **Operator staff as a target are hidden from owners too.** *(PR #375 review, 2026-11-13.)* An unlock's entries name the unlocked admin as their person; owners saw it although the actor read "an operator". `record` sets `target_operator` when the target person, or the owner of a target key, grant or code, is an admin user *(the credential owner corrected, issue #391, 2026-11-14, PR #412 review round 3; test `a_credential_target_of_an_admin_is_marked_operator_without_a_person`)*, and the owner view drops that person (and a credential naming them); for owners the target filter never matches a hidden person or credential and the actor filter never matches an operator's entry, so neither is an identity oracle. Tests: Task 8a (`owners_never_see_an_operators_identity_ip_unlock_reason_or_unlocked_staff`, the whole serialized record and both filters) and Task 9d (the owner's full `GET /api/v1/audit` response, its export and its filters contain no staff name).
 19. **A credential's owner comes from the credential tables.** *(PR #375 review, round 2, 2026-11-13.)* Entries that target a credential without naming a person (`key.revoked`, `key.catalog_granted`, `key.report_flag_changed`) could create an `audit_credentials` row with no person, so `forget_person` would miss it, and a legacy key whose id is its user's name would stay visible after the user is deleted. `audit_credential` now takes the owner from `api_keys.user_id` or `sign_in_codes.user_id` while the credential exists, and `forget_person` also clears every row still named by the user's keys, grants and codes; Task 4 calls it before deleting the user row, while those exist. No backfill: the table starts empty and every row is made through that function. Test: Task 6c `a_pre_m14_key_that_only_ever_is_a_target_is_forgotten_with_its_user`.
 20. **Admin-read buckets follow the catalog's identity and owner.** *(PR #375 review, round 2, 2026-11-13.)* The bucket was (credential, catalog name, hour), so reads after a transfer to another team, or of a catalog deleted and created again under the same name, counted in the first entry and showed in the wrong team's log. It is now (credential or person audit id, `catalogs.id`, owner `audit_teams` id, hour): one entry per credential, catalog identity, owning team and clock hour. Unlock tallies were checked: they are keyed by unlock id, and an unlock belongs to one `catalogs.id`. Test: Task 7b `a_catalog_moved_or_created_again_within_the_hour_starts_a_new_admin_read_entry`.
 21. **Access records carry ids resolved at admission.** *(PR #375 review, final round, 2026-11-13.)* The background write used to resolve the actor (creating `audit_people` and `audit_credentials` rows from the raw credential id and label) when it ran, so a write delayed past the user's deletion could re-create the forgotten name or credential id. Now the key cache resolves audit ids at load (`ensure_audit_rows`, one row per statement), `ToolContext::admit` builds an `AccessRecord` from them synchronously, and the write inserts with those ids only, creating no person or credential row. Separately, `audit_person` and `audit_credential` lock the user (`FOR KEY SHARE`) and create nothing for a user deleted meanwhile, so no audit write anywhere can undo a deletion. Test: Task 7b `a_write_delayed_past_the_users_deletion_stores_nothing_that_identifies_them`.
