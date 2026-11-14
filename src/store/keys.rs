@@ -1326,6 +1326,7 @@ async fn require_named_grants(conn: &mut PgConnection, id: &str) -> Result<(), O
 mod tests {
     use super::*;
     use crate::db::test_db;
+    use crate::store::audit::AuditActor;
     use chrono::TimeZone;
 
     fn now() -> DateTime<Utc> {
@@ -2180,7 +2181,9 @@ mod tests {
             name: "alice",
             display_name: "",
         };
-        users::create(pool, &new, now()).await.unwrap();
+        users::create(pool, &new, &AuditActor::cli(), now())
+            .await
+            .unwrap();
     }
 
     /// Opens a transaction that deletes `alice` (her personal team first)

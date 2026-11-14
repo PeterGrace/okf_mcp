@@ -23,6 +23,8 @@ use crate::catalogs::switcher;
 use crate::harness::drive;
 use crate::self_service::{console_base, login_server, member, EMAIL, PASSWORD};
 use crate::support::server::{files, TestServer, OWNER};
+use okf_mcp::store::audit::AuditActor;
+use okf_mcp::store::users::AdminChange;
 
 async fn server() -> TestServer {
     TestServer::start(
@@ -103,7 +105,7 @@ async fn a_user_whose_only_key_is_revoked_is_deleted_from_the_console() {
         name: "alice",
         display_name: "",
     };
-    users::create(&server.db.pool, &alice, Utc::now())
+    users::create(&server.db.pool, &alice, &AuditActor::cli(), Utc::now())
         .await
         .expect("create alice");
     key_of(&server, "alice", "alice-laptop", true).await;
@@ -145,7 +147,7 @@ async fn a_delete_clicked_again_while_it_runs_sends_one_request() {
         name: "alice",
         display_name: "",
     };
-    users::create(&server.db.pool, &alice, Utc::now())
+    users::create(&server.db.pool, &alice, &AuditActor::cli(), Utc::now())
         .await
         .expect("create alice");
     key_of(&server, "alice", "alice-laptop", false).await;
@@ -219,7 +221,7 @@ async fn a_last_owner_or_an_owned_catalog_refuses_the_delete_until_cleared() {
             name,
             display_name: "",
         };
-        users::create(pool, &user, Utc::now())
+        users::create(pool, &user, &AuditActor::cli(), Utc::now())
             .await
             .expect("create a user");
     }
@@ -377,7 +379,7 @@ async fn an_admin_sets_an_email_and_the_admin_flag_and_sends_a_setup_email() {
         name: "alice",
         display_name: "",
     };
-    users::create(&server.db.pool, &user, Utc::now())
+    users::create(&server.db.pool, &user, &AuditActor::cli(), Utc::now())
         .await
         .expect("create alice");
     server.app.poll().await.expect("poll");
@@ -426,9 +428,18 @@ async fn clearing_the_last_admin_is_refused_with_the_reason_and_the_drawer_stays
     let server = login_server().await;
     let admin = server.key("console-admin", Access::Admin, &[], None).await;
     server.user_with_password("alice", EMAIL, PASSWORD).await;
-    users::set_admin(&server.db.pool, "alice", true, false)
-        .await
-        .expect("make alice the one admin user");
+    users::set_admin(
+        &server.db.pool,
+        "alice",
+        AdminChange {
+            on: true,
+            allow_last: false,
+        },
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("make alice the one admin user");
     server.app.poll().await.expect("poll");
     let ran = drive(console_base(&server), move |ui| {
         ui.login(&admin);
@@ -677,9 +688,18 @@ async fn a_refusal_whose_reread_fails_keeps_its_reason_and_working_controls() {
     let server = login_server().await;
     let admin = server.key("console-admin", Access::Admin, &[], None).await;
     server.user_with_password("alice", EMAIL, PASSWORD).await;
-    users::set_admin(&server.db.pool, "alice", true, false)
-        .await
-        .expect("make alice the one admin user");
+    users::set_admin(
+        &server.db.pool,
+        "alice",
+        AdminChange {
+            on: true,
+            allow_last: false,
+        },
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("make alice the one admin user");
     server.app.poll().await.expect("poll");
     let ran = drive(console_base(&server), move |ui| {
         ui.login(&admin);
@@ -721,7 +741,7 @@ async fn a_write_that_settles_after_its_user_was_reopened_updates_the_new_drawer
         name: "bob",
         display_name: "",
     };
-    users::create(&server.db.pool, &bob, Utc::now())
+    users::create(&server.db.pool, &bob, &AuditActor::cli(), Utc::now())
         .await
         .expect("create bob");
     server.app.poll().await.expect("poll");
@@ -779,13 +799,24 @@ async fn the_users_filter_matches_names_and_emails() {
     let admin = server.key("console-admin", Access::Admin, &[], None).await;
     let pool = server.app.pool();
     for (name, display_name) in [("alice", ""), ("bob", "Robert Example")] {
-        users::create(pool, &NewUser { name, display_name }, Utc::now())
-            .await
-            .unwrap();
-    }
-    users::set_email(pool, "bob", Some("robert@example.com"))
+        users::create(
+            pool,
+            &NewUser { name, display_name },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
         .await
         .unwrap();
+    }
+    users::set_email(
+        pool,
+        "bob",
+        Some("robert@example.com"),
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
     drive(server.base.clone(), move |ui| {
         ui.login(&admin);
         ui.open("/users");

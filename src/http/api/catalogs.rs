@@ -448,6 +448,8 @@ mod tests {
     };
     use crate::http::archives::tarball_of;
     use crate::mcp::testing::{open, pending_entry, writer, PendingEdit, TestApp};
+    use crate::store::audit::AuditActor;
+    use crate::store::users::AdminChange;
 
     /// One request with a raw body through the whole router; the status,
     /// the headers and the body bytes.
@@ -599,9 +601,18 @@ mod tests {
             )
             .await
             .parts();
-        crate::store::users::set_admin(test.app.pool(), "alice", true, false)
-            .await
-            .expect("make alice an admin");
+        crate::store::users::set_admin(
+            test.app.pool(),
+            "alice",
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("make alice an admin");
         let mut admin = Browser::session_for(&test, "alice").await;
         let (write_admin, answer) = admin
             .send(

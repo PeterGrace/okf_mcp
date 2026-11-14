@@ -11,7 +11,7 @@ Issue #397, epic #390. Plan:
   `catalog.owner_changed`, `catalog.description_changed`,
   `catalog.member_access_changed`, `catalog.deleted` and `catalog.imported`.
   A call that changes nothing records nothing; a refusal records nothing.
-- `audit::lock_people` / `People { users, teams, catalogs }`: takes every
+- `audit::lock_people` / `People { target, users, teams, catalogs }`: takes every
   user row a change's entry will resolve (the actor, named users, a personal
   team's or catalog owner's person) `FOR KEY SHARE` first in its
   transaction, in `users::set_admin`'s order (admins by id, then the rest),
@@ -22,7 +22,7 @@ Issue #397, epic #390. Plan:
   writer of catalog entries.
 - Provisioner guards (they refuse once Task 5 sets
   `AuditActor.provisioner`): `teams::create` (the owner), `set_member` and
-  `remove_member` (the user) read the user with `users::id_and_admin_of` and
+  `remove_member` (the user) read the locked target flag from `audit::lock_people` and
   refuse an admin with `Forbidden`.
 - Tests: one per action (an entry on a change, none without one or on a
   refusal), `a_failed_audit_write_fails_the_{team,catalog,member_access}_change`
@@ -62,6 +62,25 @@ Issue #397, epic #390. Plan:
   reaches SQL (part of #339).
 
 ## Notes
+- Recovery validation on 2026-11-14: `gate.sh fmt` and `lint` passed;
+  `gate.sh test` passed (1949 passed, 0 failed, 17 ignored; library 1689
+  passed, 2 ignored). Dedicated `test-ui` passed all 109 browser journeys.
+  Its first run had one toast-wait timeout; the isolated retry and then
+  the complete browser rerun passed without code changes.
+- The held-row reciprocal suspension regression passed alone (1 test) and
+  in the full suite. Restoring the old upsert resolver made it fail on its
+  bounded audit-row wait (1 failed); the production resolver was restored
+  before final validation. Logs are local under `target/i397-logs/recovery-*`.
+- Recovery on 2026-11-14 integrates Task 6a without discarding its user,
+  invitation, entitlement or session audit behavior. `audit::RowLock` and
+  `People::target` unify both lock helpers and preserve each target lock mode.
+- Review comment 4571925955 is addressed using Task 6a migration 0014: existing
+  reference reads do not update audit rows, and stale refreshes skip locked
+  rows. No redundant audit-row locking is added. The reciprocal suspension
+  regression holds a stale person row while both real team writes finish.
+- Catalog ownership can change after the initial person snapshot; that race
+  can still require a retry. The helper does not guarantee absence of every
+  possible deadlock.
 - The plan's Task 6b has a dated `Corrected (issue #397)` note with every
   divergence: the lock order, the no-change cases, `forced` meaning
   unpublished changes were deleted, and the helpers.

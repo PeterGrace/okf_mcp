@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
-use crate::store::audit::{self, Action, AuditActor, Entry, People, Target};
+use crate::store::audit::{self, Action, AuditActor, Entry, People, RowLock, Target};
 use crate::store::catalogs::{bump_admin_generation, is_valid_name};
 use crate::store::users;
 
@@ -234,19 +234,15 @@ pub async fn create(
 ) -> Result<TeamRecord, OkfError> {
     users::check_name("team", new.name)?;
     let mut tx = pool.begin().await?;
-    audit::lock_people(
-        &mut tx,
-        actor,
-        &People {
-            users: &[new.owner],
-            ..People::default()
-        },
-    )
-    .await?;
+    // The owner, with the actor, before anything else. `FOR KEY SHARE` on the
+    // owner conflicts with `users::set_admin`'s `FOR UPDATE`, so the guard
+    // below cannot race a promotion.
+    let owner = People {
+        target: Some((new.owner, RowLock::KeyShare)),
+        ..People::default()
+    };
+    let (owner_id, owner_is_admin) = lock_user(&mut tx, actor, &owner, new.owner).await?;
     users::check_free(&mut tx, new.name).await?;
-    // `FOR KEY SHARE` on the owner conflicts with `users::set_admin`'s
-    // `FOR UPDATE`, so the guard below cannot race a promotion.
-    let (owner_id, owner_is_admin) = users::id_and_admin_of(&mut tx, new.owner).await?;
     audit::refuse_admin_target(actor, owner_is_admin, new.owner)?;
     let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO teams (name, display_name, created_at) VALUES ($1, $2, $3) RETURNING id",
@@ -371,17 +367,12 @@ pub async fn set_member(
     let mut tx = pool.begin().await?;
     // Users before the team: `users::delete` locks the user and then its
     // teams, so taking them in the other order could deadlock.
-    audit::lock_people(
-        &mut tx,
-        actor,
-        &People {
-            users: &[user],
-            teams: &[team],
-            ..People::default()
-        },
-    )
-    .await?;
-    let (user_id, is_admin) = users::id_and_admin_of(&mut tx, user).await?;
+    let people = People {
+        target: Some((user, RowLock::KeyShare)),
+        teams: &[team],
+        ..People::default()
+    };
+    let (user_id, is_admin) = lock_user(&mut tx, actor, &people, user).await?;
     audit::refuse_admin_target(actor, is_admin, user)?;
     let locked = lock_team(&mut tx, team).await?;
     let (change, action, from) = match current_role(&mut tx, &locked.id, &user_id).await? {
@@ -451,17 +442,12 @@ pub async fn remove_member(
 ) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
     // Users before the team, as in `set_member`.
-    audit::lock_people(
-        &mut tx,
-        actor,
-        &People {
-            users: &[user],
-            teams: &[team],
-            ..People::default()
-        },
-    )
-    .await?;
-    let (user_id, is_admin) = users::id_and_admin_of(&mut tx, user).await?;
+    let people = People {
+        target: Some((user, RowLock::KeyShare)),
+        teams: &[team],
+        ..People::default()
+    };
+    let (user_id, is_admin) = lock_user(&mut tx, actor, &people, user).await?;
     audit::refuse_admin_target(actor, is_admin, user)?;
     let locked = lock_team(&mut tx, team).await?;
     if locked.personal_of.as_deref() == Some(user_id.as_str()) {
@@ -894,6 +880,25 @@ pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String,
         .ok_or_else(|| unknown(name))
 }
 
+/// [`audit::lock_people`] for a change about one user: its id and admin
+/// flag, read under the lock (`FOR KEY SHARE`, which `users::set_admin`'s
+/// `FOR UPDATE` conflicts with, so a guard on the flag cannot race it).
+///
+/// # Errors
+/// [`OkfError::UnknownName`] for an unknown or malformed user;
+/// [`OkfError::Database`].
+async fn lock_user(
+    conn: &mut PgConnection,
+    actor: &AuditActor,
+    people: &People<'_>,
+    user: &str,
+) -> Result<(String, bool), OkfError> {
+    // `lock_people` answers `Some` whenever it is given a target.
+    audit::lock_people(conn, actor, people)
+        .await?
+        .ok_or_else(|| users::unknown(user))
+}
+
 /// One team event to record: [`record_team`]'s input.
 struct TeamEvent<'a> {
     /// What happened.
@@ -946,6 +951,7 @@ fn unknown(name: &str) -> OkfError {
 mod tests {
     use super::*;
     use crate::db::{test_db, TEST_USER};
+    use crate::store::audit::AuditActor;
     use crate::store::users::{self, NewUser};
 
     fn now() -> DateTime<Utc> {
@@ -961,6 +967,7 @@ mod tests {
                 name: "alice",
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await
@@ -1347,6 +1354,7 @@ mod tests {
                 name: "alice",
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await
@@ -1638,6 +1646,7 @@ mod tests {
                 name,
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await
@@ -2198,6 +2207,10 @@ mod tests {
         let db = test_db().await;
         family(&db.pool).await;
         let actor = AuditActor::cli();
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_entries")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         let bad = "fam\0ily";
         let owned_by_bad = NewTeam {
             name: "ops",
@@ -2242,46 +2255,35 @@ mod tests {
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        assert_eq!(entries, 1, "family's team.created only");
+        assert_eq!(entries, before, "malformed operations record nothing");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn reciprocal_suspensions_of_two_admins_personal_teams_both_succeed() {
-        // Admin alice suspends bob's personal team while admin bob suspends
-        // alice's. Each entry resolves both people's `audit_people` rows,
-        // one as the actor and one as the team's person, in opposite orders
-        // unless `record` takes them in one order. Their `audit_people` rows
-        // exist first (as they do after any earlier entry), so each
-        // resolution is an upsert that locks the row.
+        // Hold a stale audit-person row while reciprocal real team writes run.
+        // The former upserts wait for this holder; the read-first, SKIP LOCKED
+        // resolvers must let both writes commit before it is released.
         let db = test_db().await;
-        for name in ["alice", "bob"] {
-            seed_user(&db.pool, name).await;
-            make_admin(&db.pool, name).await;
-        }
-        let alice = session_of(&db.pool, "alice").await;
-        let bob = session_of(&db.pool, "bob").await;
-        suspend(&db.pool, "alice", None, &alice, now())
-            .await
-            .unwrap();
-        suspend(&db.pool, "bob", None, &bob, now()).await.unwrap();
+        let [(alice_name, alice), (bob_name, bob)] = users::tests::two_admins(&db.pool).await;
+        let held = alice.user_id.clone().unwrap();
+        let pool = db.pool.clone();
+        let first = async move {
+            suspend(&pool, &bob_name, None, &alice, now())
+                .await
+                .map(|_| ())
+        };
+        let pool = db.pool.clone();
+        let second = async move {
+            suspend(&pool, &alice_name, None, &bob, now())
+                .await
+                .map(|_| ())
+        };
+        let (by_alice, by_bob) =
+            users::tests::both_finish_while_a_person_is_held(&db.pool, &held, first, second).await;
 
-        for round in 0..50 {
-            for (team, actor) in [("alice", &alice), ("bob", &bob)] {
-                unsuspend(&db.pool, team, actor, now()).await.unwrap();
-            }
-            // `tokio::join!` runs both at once, like `asyncio.gather`.
-            let (by_alice, by_bob) = tokio::time::timeout(LOCK_WAIT, async {
-                tokio::join!(
-                    suspend(&db.pool, "bob", None, &alice, now()),
-                    suspend(&db.pool, "alice", None, &bob, now()),
-                )
-            })
-            .await
-            .expect("the two suspensions do not hang");
-
-            // A deadlock would abort one of them as `Busy`.
-            assert!(by_alice.is_ok(), "round {round}: {by_alice:?}");
-            assert!(by_bob.is_ok(), "round {round}: {by_bob:?}");
-        }
+        by_alice.expect("the first reciprocal suspension commits while the audit row is held");
+        by_bob.expect("the second reciprocal suspension commits while the audit row is held");
+        let entries = audit::testing::entries(&db.pool, "team.suspended").await;
+        assert_eq!(entries.len(), 2, "both actual suspensions are recorded");
     }
 }

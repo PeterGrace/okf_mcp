@@ -7,6 +7,7 @@
 
 use chrono::{TimeDelta, Utc};
 use okf_mcp::config::Config;
+use okf_mcp::store::audit::AuditActor;
 use okf_mcp::store::keys::{self as key_rows, Access, Grants};
 use okf_mcp::store::oauth::clients;
 use okf_mcp::store::oauth::codes::{self, NewSignInCode};
@@ -259,7 +260,7 @@ async fn a_grant_a_code_and_a_catalog_are_assigned_from_the_unassigned_view() {
         name: "alice",
         display_name: "",
     };
-    users::create(&server.db.pool, &alice, Utc::now())
+    users::create(&server.db.pool, &alice, &AuditActor::cli(), Utc::now())
         .await
         .expect("create alice");
     let family = NewTeam {

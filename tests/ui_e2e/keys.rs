@@ -5,6 +5,7 @@
 
 use chrono::{TimeDelta, Utc};
 use okf_mcp::config::Config;
+use okf_mcp::store::audit::AuditActor;
 use okf_mcp::store::keys::{self as key_rows, Access, Grants};
 use okf_mcp::store::oauth::clients;
 use okf_mcp::store::oauth::codes::{self, NewSignInCode};
@@ -19,7 +20,7 @@ async fn alice(server: &TestServer) {
         name: "alice",
         display_name: "Alice Example",
     };
-    users::create(&server.db.pool, &alice, Utc::now())
+    users::create(&server.db.pool, &alice, &AuditActor::cli(), Utc::now())
         .await
         .expect("create alice");
 }

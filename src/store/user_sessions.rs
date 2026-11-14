@@ -25,7 +25,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use chrono::{DateTime, TimeDelta, Utc};
-use sqlx::{PgExecutor, PgPool};
+use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::error::OkfError;
 use crate::keys;
@@ -548,6 +548,30 @@ pub async fn revoke_by_prefix(
     user_id: &str,
     id_prefix: &str,
 ) -> Result<(), OkfError> {
+    // A transaction rolls back when dropped without `commit`, so a refusal
+    // below leaves the sessions as they were.
+    let mut tx = pool.begin().await?;
+    revoke_by_prefix_in(&mut tx, user_id, id_prefix).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// [`revoke_by_prefix`] inside a caller's transaction: the admin route's
+/// `users::end_session_by_prefix`, which holds the user's row and records
+/// the revoke in the same transaction.
+///
+/// # Arguments
+/// * `conn` - the caller's transaction (pass `&mut tx`).
+/// * `user_id` - whose session (another user's prefix matches nothing).
+/// * `id_prefix` - 12 lowercase hex characters.
+///
+/// # Errors
+/// As [`revoke_by_prefix`].
+pub(crate) async fn revoke_by_prefix_in(
+    conn: &mut PgConnection,
+    user_id: &str,
+    id_prefix: &str,
+) -> Result<(), OkfError> {
     let unknown = || OkfError::UnknownName {
         noun: "session",
         name: id_prefix.to_string(),
@@ -560,9 +584,9 @@ pub async fn revoke_by_prefix(
         return Err(unknown());
     }
     // The matches are locked, then deleted only when there is exactly one.
-    // Session rows only, no user row: nothing here can close a lock cycle
-    // with a transaction that takes the user first (`email_tokens`' docs).
-    let mut tx = pool.begin().await?;
+    // Session rows only: nothing here can close a lock cycle with a
+    // transaction that takes the user first (`email_tokens`' docs), and a
+    // caller holding the user's row took it first, in that same order.
     let matched: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT id_hash FROM user_sessions \
          WHERE user_id = $1 AND encode(substring(id_hash FROM 1 FOR 6), 'hex') = $2 \
@@ -570,7 +594,7 @@ pub async fn revoke_by_prefix(
     )
     .bind(user_id)
     .bind(id_prefix)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?;
     // A slice pattern, like matching on `len()` and indexing in one step.
     let [only] = matched.as_slice() else {
@@ -587,9 +611,8 @@ pub async fn revoke_by_prefix(
     };
     sqlx::query("DELETE FROM user_sessions WHERE id_hash = $1")
         .bind(only.as_slice())
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-    tx.commit().await?;
     Ok(())
 }
 

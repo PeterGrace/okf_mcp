@@ -7,11 +7,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
+use serde_json::json;
 use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::auth::{Principal, Reach};
 use crate::error::OkfError;
-use crate::store::audit::{self, Action, AuditActor, People};
+use crate::store::audit::{self, Action, AuditActor, Entry, People, RowLock};
 use crate::store::catalogs::{self, bump_admin_generation, CatalogEvent};
 use crate::store::keys::Access;
 use crate::store::users;
@@ -322,14 +323,26 @@ pub async fn member_access(pool: &PgPool, catalog: &str) -> Result<MemberAccess,
     Ok(MemberAccess::parse(&stored).expect("the schema checks catalogs.member_access"))
 }
 
+/// An entitlement to give: what [`entitle`] is asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewEntitlement<'a> {
+    /// The user's name.
+    pub user: &'a str,
+    /// The catalog's name.
+    pub catalog: &'a str,
+    /// `Read` or `Write`.
+    pub access: Access,
+}
+
 /// Gives a user a catalog at `access`, or changes the level of one already
-/// given, and bumps `admin_generation` when anything changed.
+/// given; when anything changed, bumps `admin_generation` and records
+/// `user.entitlement_set` (in the catalog's owner team's log). An
+/// unchanged level writes and records nothing.
 ///
 /// # Arguments
 /// * `pool` - the database.
-/// * `user` - the user's name.
-/// * `catalog` - the catalog's name.
-/// * `access` - `Read` or `Write`.
+/// * `new` - the user, the catalog and the level.
+/// * `actor` - who, for the audit log.
 /// * `now` - when it is given (server clock); kept when only the level changes.
 ///
 /// # Errors
@@ -338,11 +351,16 @@ pub async fn member_access(pool: &PgPool, catalog: &str) -> Result<MemberAccess,
 /// [`OkfError::Database`].
 pub async fn entitle(
     pool: &PgPool,
-    user: &str,
-    catalog: &str,
-    access: Access,
+    new: &NewEntitlement<'_>,
+    actor: &AuditActor,
     now: DateTime<Utc>,
 ) -> Result<(), OkfError> {
+    // Destructuring copies the fields out (`NewEntitlement` is `Copy`).
+    let NewEntitlement {
+        user,
+        catalog,
+        access,
+    } = *new;
     if access == Access::Admin {
         return Err(OkfError::Refused {
             reason: "an entitlement is read or write; admin comes only from an admin key"
@@ -351,46 +369,78 @@ pub async fn entitle(
     }
     check_names(Some(user), catalog)?;
     let mut tx = pool.begin().await?;
-    // `FOR KEY SHARE` until commit: a concurrent `users::delete` waits.
-    let user_id = users::id_of(&mut tx, user).await?;
+    let user_id = lock_entitlement_users(&mut tx, user, catalog, actor).await?;
     let catalog_id = catalogs::find(&mut *tx, catalog).await?.id;
     // The `WHERE` on the update makes an unchanged level write nothing, so
-    // `rows_affected` is 0 and the generation stays.
-    let written = sqlx::query(
+    // no row comes back. A row that does: `xmax = 0` is Postgres' mark of a
+    // row this statement inserted (an updated row carries this transaction
+    // as its `xmax`). Read in the same statement, it cannot race another
+    // entitle the way a separate SELECT of the old level could.
+    let inserted: Option<bool> = sqlx::query_scalar(
         "INSERT INTO user_catalogs (user_id, catalog_id, access, created_at) \
          VALUES ($1, $2, $3, $4) \
          ON CONFLICT (user_id, catalog_id) DO UPDATE SET access = EXCLUDED.access \
-         WHERE user_catalogs.access <> EXCLUDED.access",
+         WHERE user_catalogs.access <> EXCLUDED.access \
+         RETURNING xmax = 0",
     )
     .bind(&user_id)
     .bind(catalog_id)
     .bind(access.as_str())
     .bind(now)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    if written.rows_affected() != 0 {
-        bump_admin_generation(&mut tx).await?;
-    }
+    // `let ... else`: unchanged (no row) commits nothing and records nothing.
+    let Some(inserted) = inserted else {
+        return Ok(());
+    };
+    bump_admin_generation(&mut tx).await?;
+    // There are two levels, so a changed level was the other one.
+    let previous = match (inserted, access) {
+        (true, _) => None,
+        (false, Access::Write) => Some(Access::Read.as_str()),
+        (false, Access::Read | Access::Admin) => Some(Access::Write.as_str()),
+    };
+    let details = json!({
+        "catalog": catalog,
+        "access": access.as_str(),
+        "previous": previous,
+    });
+    // The entry belongs to the catalog's owner team, as a catalog event does.
+    let teams = audit::catalog_teams(&mut tx, catalog_id).await?;
+    let entry = Entry {
+        teams: &teams,
+        ..users::user_entry(Action::UserEntitlementSet, &user_id, details)
+    };
+    audit::record(&mut tx, actor, &entry, now).await?;
     tx.commit().await?;
     Ok(())
 }
 
-/// Takes a catalog entitlement from a user (not given is a no-op), and
-/// bumps `admin_generation` when one was removed.
+/// Takes a catalog entitlement from a user (not given is a no-op, which
+/// records nothing); when one was removed, bumps `admin_generation` and
+/// records `user.entitlement_removed`.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `user` - the user's name.
 /// * `catalog` - the catalog's name.
+/// * `actor` - who, for the audit log.
+/// * `now` - the server clock.
 ///
 /// # Errors
 /// [`OkfError::UnknownName`] for an unknown user;
 /// [`OkfError::CatalogNotSelected`] for an unknown catalog;
 /// [`OkfError::Database`].
-pub async fn unentitle(pool: &PgPool, user: &str, catalog: &str) -> Result<(), OkfError> {
+pub async fn unentitle(
+    pool: &PgPool,
+    user: &str,
+    catalog: &str,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<(), OkfError> {
     check_names(Some(user), catalog)?;
     let mut tx = pool.begin().await?;
-    let user_id = users::id_of(&mut tx, user).await?;
+    let user_id = lock_entitlement_users(&mut tx, user, catalog, actor).await?;
     let catalog_id = catalogs::find(&mut *tx, catalog).await?.id;
     let removed = sqlx::query("DELETE FROM user_catalogs WHERE user_id = $1 AND catalog_id = $2")
         .bind(&user_id)
@@ -399,9 +449,51 @@ pub async fn unentitle(pool: &PgPool, user: &str, catalog: &str) -> Result<(), O
         .await?;
     if removed.rows_affected() != 0 {
         bump_admin_generation(&mut tx).await?;
+        let details = json!({ "catalog": catalog });
+        // The entry belongs to the catalog's owner team, as a catalog event does.
+        let teams = audit::catalog_teams(&mut tx, catalog_id).await?;
+        let entry = Entry {
+            teams: &teams,
+            ..users::user_entry(Action::UserEntitlementRemoved, &user_id, details)
+        };
+        audit::record(&mut tx, actor, &entry, now).await?;
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Locks the user rows an entitlement change and its entry take: the user
+/// (`FOR KEY SHARE` until commit, so a concurrent `users::delete` waits),
+/// the actor's rows and the catalog's personal owner, if any (its entry's
+/// team), in `audit::lock_people`' order, before `server_state`.
+///
+/// # Arguments
+/// * `conn` - the change's transaction.
+/// * `user` - the user's name.
+/// * `catalog` - the catalog's name.
+/// * `actor` - who acts.
+///
+/// # Returns
+/// The user's id.
+///
+/// # Errors
+/// [`OkfError::UnknownName`]; [`OkfError::Database`].
+async fn lock_entitlement_users(
+    conn: &mut PgConnection,
+    user: &str,
+    catalog: &str,
+    actor: &AuditActor,
+) -> Result<String, OkfError> {
+    let people = People {
+        target: Some((user, RowLock::KeyShare)),
+        catalogs: &[catalog],
+        ..People::default()
+    };
+    // `lock_people` answers `Some` whenever it is given a target.
+    let (user_id, _) = audit::lock_people(conn, actor, &people)
+        .await?
+        .ok_or_else(|| users::unknown(user))?;
+    Ok(user_id)
 }
 
 /// A user's entitlements, by catalog name.
@@ -510,6 +602,7 @@ mod tests {
                     name,
                     display_name: "",
                 },
+                &AuditActor::cli(),
                 now(),
             )
             .await
@@ -638,7 +731,7 @@ mod tests {
             "shared",
             MemberAccess::Read,
             &AuditActor::cli(),
-            Utc::now(),
+            chrono::Utc::now(),
         )
         .await
         .unwrap();
@@ -647,19 +740,46 @@ mod tests {
             "solo",
             MemberAccess::None,
             &AuditActor::cli(),
-            Utc::now(),
+            chrono::Utc::now(),
         )
         .await
         .unwrap();
-        entitle(&db.pool, "bob", "shared", Access::Write, now())
-            .await
-            .unwrap();
-        entitle(&db.pool, "bob", "other", Access::Read, now())
-            .await
-            .unwrap();
-        entitle(&db.pool, "alice", "shared", Access::Read, now())
-            .await
-            .unwrap();
+        entitle(
+            &db.pool,
+            &NewEntitlement {
+                user: "bob",
+                catalog: "shared",
+                access: Access::Write,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        entitle(
+            &db.pool,
+            &NewEntitlement {
+                user: "bob",
+                catalog: "other",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        entitle(
+            &db.pool,
+            &NewEntitlement {
+                user: "alice",
+                catalog: "shared",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             ceiling_of(&db.pool, "alice").await.unwrap(),
@@ -722,20 +842,51 @@ mod tests {
         let generation = || catalogs::admin_generation(&db.pool);
         let before = generation().await.unwrap();
 
-        entitle(&db.pool, "bob", "other", Access::Read, now())
-            .await
-            .unwrap();
-        entitle(&db.pool, "bob", "other", Access::Read, now())
-            .await
-            .unwrap();
+        entitle(
+            &db.pool,
+            &NewEntitlement {
+                user: "bob",
+                catalog: "other",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        entitle(
+            &db.pool,
+            &NewEntitlement {
+                user: "bob",
+                catalog: "other",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let after_entitle = generation().await.unwrap();
-        entitle(&db.pool, "bob", "other", Access::Write, now())
+        entitle(
+            &db.pool,
+            &NewEntitlement {
+                user: "bob",
+                catalog: "other",
+                access: Access::Write,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let listed = entitlements(&db.pool, "bob").await.unwrap();
+        unentitle(&db.pool, "bob", "other", &AuditActor::cli(), now())
             .await
             .unwrap();
-        let listed = entitlements(&db.pool, "bob").await.unwrap();
-        unentitle(&db.pool, "bob", "other").await.unwrap();
         let after_unentitle = generation().await.unwrap();
-        unentitle(&db.pool, "bob", "other").await.unwrap();
+        unentitle(&db.pool, "bob", "other", &AuditActor::cli(), now())
+            .await
+            .unwrap();
 
         assert_eq!(
             after_entitle,
@@ -764,12 +915,42 @@ mod tests {
         let db = test_db().await;
         family(&db.pool).await;
 
-        let admin = entitle(&db.pool, "bob", "other", Access::Admin, now()).await;
-        let nobody = entitle(&db.pool, "carol", "other", Access::Read, now()).await;
-        let nowhere = entitle(&db.pool, "bob", "nope", Access::Read, now()).await;
+        let admin = entitle(
+            &db.pool,
+            &NewEntitlement {
+                user: "bob",
+                catalog: "other",
+                access: Access::Admin,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
+        let nobody = entitle(
+            &db.pool,
+            &NewEntitlement {
+                user: "carol",
+                catalog: "other",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
+        let nowhere = entitle(
+            &db.pool,
+            &NewEntitlement {
+                user: "bob",
+                catalog: "nope",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
         let no_ceiling = ceiling_of(&db.pool, "carol").await;
         let no_list = entitlements(&db.pool, "carol").await;
-        let no_removal = unentitle(&db.pool, "bob", "nope").await;
+        let no_removal = unentitle(&db.pool, "bob", "nope", &AuditActor::cli(), now()).await;
 
         assert!(matches!(admin, Err(OkfError::Refused { .. })), "{admin:?}");
         for refused in [nobody, no_ceiling.map(|_| ()), no_list.map(|_| ())] {
@@ -859,9 +1040,18 @@ mod tests {
             .unwrap();
         moved(pool, "a new owner", &mut last, &bob, shared_write.clone()).await;
 
-        entitle(pool, "bob", "extra", Access::Read, now())
-            .await
-            .unwrap();
+        entitle(
+            pool,
+            &NewEntitlement {
+                user: "bob",
+                catalog: "extra",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let entitled = ceiling(&[("extra", Access::Read), ("shared", Access::Write)]);
         moved(pool, "an entitlement", &mut last, &bob, entitled).await;
 
@@ -891,11 +1081,22 @@ mod tests {
         )
         .await;
 
-        entitle(pool, "bob", "other", Access::Write, now())
+        entitle(
+            pool,
+            &NewEntitlement {
+                user: "bob",
+                catalog: "other",
+                access: Access::Write,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        last = catalogs::admin_generation(pool).await.unwrap();
+        unentitle(pool, "bob", "other", &AuditActor::cli(), now())
             .await
             .unwrap();
-        last = catalogs::admin_generation(pool).await.unwrap();
-        unentitle(pool, "bob", "other").await.unwrap();
         moved(
             pool,
             "removing an entitlement",
@@ -912,13 +1113,23 @@ mod tests {
                 name: "carol",
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await
         .unwrap();
-        entitle(pool, "carol", "other", Access::Read, now())
-            .await
-            .unwrap();
+        entitle(
+            pool,
+            &NewEntitlement {
+                user: "carol",
+                catalog: "other",
+                access: Access::Read,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let carol = id(pool, "carol").await;
         assert!(ceilings(pool).await.unwrap().contains_key(&carol));
         last = catalogs::admin_generation(pool).await.unwrap();
@@ -1003,6 +1214,136 @@ mod tests {
             member_access(&db.pool, "shared").await.unwrap(),
             MemberAccess::Write,
             "the change rolled back"
+        );
+    }
+
+    /// Gives `user` catalog `catalog` at `access`, as the CLI.
+    async fn give(pool: &PgPool, user: &str, catalog: &str, access: Access) {
+        let new = NewEntitlement {
+            user,
+            catalog,
+            access,
+        };
+        entitle(pool, &new, &AuditActor::cli(), now())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn entitle_records_the_level_and_the_one_before_and_nothing_unchanged() {
+        let db = test_db().await;
+        family(&db.pool).await;
+
+        give(&db.pool, "bob", "shared", Access::Read).await;
+        give(&db.pool, "bob", "shared", Access::Read).await;
+        give(&db.pool, "bob", "shared", Access::Write).await;
+        give(&db.pool, "bob", "shared", Access::Read).await;
+
+        let entries = crate::store::audit::testing::entries(&db.pool, "user.entitlement_set").await;
+        assert_eq!(entries.len(), 3, "an unchanged level records nothing");
+        assert!(entries
+            .iter()
+            .all(|entry| entry.person.as_deref() == Some("bob")));
+        assert_eq!(entries[0].target_kind, "user");
+        assert_eq!(entries[0].teams, ["family"], "the catalog's owner team");
+        assert_eq!(
+            entries[0].details,
+            json!({"catalog": "shared", "access": "read", "previous": null})
+        );
+        assert_eq!(
+            entries[1].details,
+            json!({"catalog": "shared", "access": "write", "previous": "read"})
+        );
+        assert_eq!(
+            entries[2].details,
+            json!({"catalog": "shared", "access": "read", "previous": "write"})
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unentitle_records_a_removal_and_nothing_when_none_was_given() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let cli = AuditActor::cli();
+
+        unentitle(&db.pool, "bob", "other", &cli, now())
+            .await
+            .unwrap();
+        give(&db.pool, "bob", "other", Access::Write).await;
+        unentitle(&db.pool, "bob", "other", &cli, now())
+            .await
+            .unwrap();
+        unentitle(&db.pool, "bob", "other", &cli, now())
+            .await
+            .unwrap();
+
+        let entries =
+            crate::store::audit::testing::entries(&db.pool, "user.entitlement_removed").await;
+        assert_eq!(entries.len(), 1, "removing nothing records nothing");
+        assert_eq!(entries[0].person.as_deref(), Some("bob"));
+        assert_eq!(entries[0].teams, [TEST_TEAM], "the catalog's owner team");
+        assert_eq!(entries[0].details, json!({"catalog": "other"}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_audit_write_fails_the_entitlement_change() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        give(&db.pool, "bob", "other", Access::Read).await;
+        crate::http::api::testing::fail_on(&db.pool, "BEFORE INSERT ON audit_entries FOR EACH ROW")
+            .await;
+        let cli = AuditActor::cli();
+        let new = NewEntitlement {
+            user: "bob",
+            catalog: "shared",
+            access: Access::Read,
+        };
+
+        let given = entitle(&db.pool, &new, &cli, now()).await;
+        let taken = unentitle(&db.pool, "bob", "other", &cli, now()).await;
+
+        assert!(given.is_err() && taken.is_err());
+        let left: Vec<String> = entitlements(&db.pool, "bob")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entitlement| entitlement.catalog)
+            .collect();
+        assert_eq!(left, ["other"], "both changes rolled back");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_admins_entitlement_change_and_a_concurrent_set_admin_both_finish() {
+        use crate::store::users::tests::{admin_session_actor, queued_with_set_admin};
+        let db = test_db().await;
+        family(&db.pool).await;
+        let staff = admin_session_actor(&db.pool, "staff").await;
+        let pool = db.pool.clone();
+        let actor = staff.clone();
+        // `solo` belongs to alice's personal team: its entry locks alice too.
+        let given = async move {
+            let new = NewEntitlement {
+                user: "bob",
+                catalog: "solo",
+                access: Access::Read,
+            };
+            entitle(&pool, &new, &actor, now()).await
+        };
+        let pool = db.pool.clone();
+        let taken = async move { unentitle(&pool, "bob", "solo", &staff, now()).await };
+
+        let (entitled, first) = queued_with_set_admin(&db.pool, "alice", given).await;
+        let (unentitled, second) = queued_with_set_admin(&db.pool, "bob", taken).await;
+
+        entitled.expect("the entitlement");
+        first.expect("the first promotion");
+        unentitled.expect("the removal");
+        second.expect("the second promotion");
+        let set = crate::store::audit::testing::entries(&db.pool, "user.entitlement_set").await;
+        assert_eq!(
+            set[0].teams,
+            ["alice"],
+            "the personal team reads as its person"
         );
     }
 }

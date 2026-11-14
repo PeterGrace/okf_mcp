@@ -110,7 +110,8 @@ pub(crate) async fn test_db() -> pg_support::TestDb {
         name: TEST_USER,
         display_name: "",
     };
-    crate::store::users::create(&db.pool, &fixture, chrono::Utc::now())
+    let actor = crate::store::audit::AuditActor::cli();
+    crate::store::users::create(&db.pool, &fixture, &actor, chrono::Utc::now())
         .await
         .expect("create the fixture user");
     db

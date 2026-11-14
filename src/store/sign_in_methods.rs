@@ -48,6 +48,7 @@ mod tests {
 
     use super::*;
     use crate::db::test_db;
+    use crate::store::audit::AuditActor;
     use crate::store::passkeys::{self, testing::passkey_for};
     use crate::store::{passwords, users};
 
@@ -64,6 +65,7 @@ mod tests {
                 name: "alice",
                 display_name: "",
             },
+            &AuditActor::cli(),
             now,
         )
         .await

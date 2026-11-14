@@ -475,6 +475,7 @@ mod tests {
     use super::testing::passkey_for;
     use super::*;
     use crate::db::test_db;
+    use crate::store::audit::AuditActor;
     use crate::store::{passwords, users};
 
     fn now() -> DateTime<Utc> {
@@ -490,6 +491,7 @@ mod tests {
                 name,
                 display_name: "",
             },
+            &AuditActor::cli(),
             now(),
         )
         .await

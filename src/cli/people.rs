@@ -22,14 +22,14 @@ use crate::config::Config;
 use crate::mail::invite;
 use crate::store::audit::AuditActor;
 use crate::store::catalogs;
-use crate::store::ceiling::{self, MemberAccess};
+use crate::store::ceiling::{self, MemberAccess, NewEntitlement};
 use crate::store::keys::{self, KeyKind};
 use crate::store::oauth::codes;
 use crate::store::sign_in_events::{self, SignInEvent};
 use crate::store::teams::{self, MemberChange, Membership, NewTeam, Role, TeamRecord};
 use crate::store::unassigned;
 use crate::store::user_sessions::{self, SessionInfo};
-use crate::store::users::{self, NewUser, UserRecord};
+use crate::store::users::{self, AdminChange, NewUser, UserRecord};
 
 /// Runs `okf-mcp user ...`.
 ///
@@ -39,7 +39,8 @@ use crate::store::users::{self, NewUser, UserRecord};
 ///   `[auth]` defaults under the stored settings (`setup_link_ttl`).
 /// * `command` - which user subcommand.
 /// * `now` - the server clock: `create`'s creation time, an entitlement's
-///   and a setup link's start.
+///   and a setup link's start, and every audit entry's time (each change is
+///   recorded as the operating-system user, `AuditActor::cli`).
 ///
 /// # Returns
 /// The text to print. `user invite` names the address, never the link.
@@ -62,7 +63,7 @@ pub(super) async fn user(
                 name: &name,
                 display_name: &display_name,
             };
-            let created = users::create(pool, &new, now).await?;
+            let created = users::create(pool, &new, &AuditActor::cli(), now).await?;
             // The personal team shares the user's name.
             format!(
                 "created user {} (personal team {})\n",
@@ -95,7 +96,11 @@ pub(super) async fn user(
         UserCommand::SetAdmin { name, on, off: _ } => {
             // `allow_last: true`: operator access may clear the last admin
             // (Decision 16).
-            let previous = users::set_admin(pool, &name, on, true).await?;
+            let change = AdminChange {
+                on,
+                allow_last: true,
+            };
+            let previous = users::set_admin(pool, &name, change, &AuditActor::cli(), now).await?;
             describe_admin_change(&name, previous, on)
         }
         UserCommand::SetEmail {
@@ -103,7 +108,7 @@ pub(super) async fn user(
             email,
             clear: _,
         } => {
-            users::set_email(pool, &name, email.as_deref()).await?;
+            users::set_email(pool, &name, email.as_deref(), &AuditActor::cli(), now).await?;
             match email {
                 Some(email) => format!("{name}: email {email}\n"),
                 None => format!("{name}: email cleared\n"),
@@ -112,7 +117,7 @@ pub(super) async fn user(
         UserCommand::Invite { name } => {
             // Only queues the mail (no mailer, so no mail secret, is needed);
             // a running server's worker sends it.
-            let email = invite::send_setup(pool, config, &name, now).await?;
+            let email = invite::send_setup(pool, config, &name, &AuditActor::cli(), now).await?;
             format!("queued a setup email for {name} to {email}\n")
         }
         UserCommand::Entitle {
@@ -120,11 +125,16 @@ pub(super) async fn user(
             catalog,
             access,
         } => {
-            ceiling::entitle(pool, &name, &catalog, access, now).await?;
+            let new = NewEntitlement {
+                user: &name,
+                catalog: &catalog,
+                access,
+            };
+            ceiling::entitle(pool, &new, &AuditActor::cli(), now).await?;
             format!("{name} may now use {catalog} ({})\n", access.as_str())
         }
         UserCommand::Unentitle { name, catalog } => {
-            ceiling::unentitle(pool, &name, &catalog).await?;
+            ceiling::unentitle(pool, &name, &catalog, &AuditActor::cli(), now).await?;
             format!("{name} may no longer use {catalog} through an entitlement\n")
         }
         UserCommand::Sessions { name } => {
@@ -139,7 +149,7 @@ pub(super) async fn user(
         UserCommand::RevokeSessions { name } => {
             // `end_sessions` locks the user's row first, so a sign-in still
             // committing is ended too (corrected, issue #322).
-            let revoked = users::end_sessions(pool, &name).await?;
+            let revoked = users::end_sessions(pool, &name, &AuditActor::cli(), now).await?;
             format!("revoked {revoked} sessions of {name}\n")
         }
         UserCommand::SignIns { name, limit } => {

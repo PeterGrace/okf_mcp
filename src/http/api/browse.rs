@@ -426,7 +426,9 @@ mod tests {
     use crate::config::Config;
     use crate::http::api::testing::{app, assert_matrix, keys, send, Row, MAIN};
     use crate::mcp::testing::app_with;
+    use crate::store::audit::AuditActor;
     use crate::store::import::{import, ImportOptions, ImportScope};
+    use crate::store::users::AdminChange;
 
     /// The `main` files with `systems/alpha.md`'s last line changed.
     fn edited_main() -> Vec<(&'static str, String)> {
@@ -789,9 +791,18 @@ mod tests {
             .send(&test, "GET", "/api/v1/catalogs/main/export", Payload::Empty)
             .await
             .parts();
-        crate::store::users::set_admin(test.app.pool(), user, true, false)
-            .await
-            .expect("make the user an admin");
+        crate::store::users::set_admin(
+            test.app.pool(),
+            user,
+            AdminChange {
+                on: true,
+                allow_last: false,
+            },
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("make the user an admin");
         let mut admin = Browser::session_for(&test, user).await;
         let (as_admin, answer) = admin.send(&test, "GET", uri, Payload::Empty).await.parts();
 

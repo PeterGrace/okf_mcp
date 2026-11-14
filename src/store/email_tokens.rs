@@ -437,6 +437,7 @@ pub async fn prune(pool: &PgPool, before: DateTime<Utc>) -> Result<u64, OkfError
 mod tests {
     use super::*;
     use crate::db::test_db;
+    use crate::store::audit::AuditActor;
     use crate::store::users::tests::seed_user;
     use chrono::TimeDelta;
 
@@ -637,13 +638,25 @@ mod tests {
             .await
             .unwrap();
 
-        crate::store::users::set_email(&db.pool, "alice", Some("ALICE@example.com"))
-            .await
-            .unwrap();
+        crate::store::users::set_email(
+            &db.pool,
+            "alice",
+            Some("ALICE@example.com"),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let same = peek(&db.pool, &token, Purpose::Setup, now()).await;
-        crate::store::users::set_email(&db.pool, "alice", Some("alice@example.org"))
-            .await
-            .unwrap();
+        crate::store::users::set_email(
+            &db.pool,
+            "alice",
+            Some("alice@example.org"),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let changed = peek(&db.pool, &token, Purpose::Setup, now()).await;
 
         assert!(same.is_ok(), "{same:?}");

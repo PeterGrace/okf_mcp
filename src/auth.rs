@@ -866,6 +866,8 @@ mod tests {
 
     use crate::clock::FixedClock;
     use crate::config::Config;
+    use crate::store::audit::AuditActor;
+    use crate::store::ceiling::NewEntitlement;
     // `oneshot` sends one request through a router without a socket.
     use tower::ServiceExt;
 
@@ -1479,6 +1481,7 @@ mod tests {
                 name: "alice",
                 display_name: "",
             },
+            &AuditActor::cli(),
             now,
         )
         .await
@@ -1615,9 +1618,18 @@ mod tests {
         );
 
         // An entitlement: the higher level wins.
-        ceiling::entitle(&db.pool, "alice", "shared", Access::Write, now)
-            .await
-            .unwrap();
+        ceiling::entitle(
+            &db.pool,
+            &NewEntitlement {
+                user: "alice",
+                catalog: "shared",
+                access: Access::Write,
+            },
+            &AuditActor::cli(),
+            now,
+        )
+        .await
+        .unwrap();
         app.poll().await.unwrap();
         assert_eq!(level(&mine.key, "shared"), Some(Access::Write));
 
@@ -1640,7 +1652,7 @@ mod tests {
         );
 
         // The entitlement goes: back to the team's read.
-        ceiling::unentitle(&db.pool, "alice", "shared")
+        ceiling::unentitle(&db.pool, "alice", "shared", &AuditActor::cli(), Utc::now())
             .await
             .unwrap();
         app.poll().await.unwrap();

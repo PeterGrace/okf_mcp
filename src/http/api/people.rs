@@ -48,12 +48,12 @@ use crate::http::api::{require_admin, require_every_catalog, settle};
 use crate::http::AppError;
 use crate::mail::invite;
 use crate::store::audit::AuditActor;
-use crate::store::ceiling::{self, Entitlement};
+use crate::store::ceiling::{self, Entitlement, NewEntitlement};
 use crate::store::keys::{self as key_rows, Access};
 use crate::store::oauth::codes;
 use crate::store::teams::{self, MemberChange, Membership, NewTeam, Role, TeamRecord};
 use crate::store::unassigned;
-use crate::store::users::{self, NewUser, UserRecord};
+use crate::store::users::{self, AdminChange, NewUser, UserRecord};
 use crate::store::{sign_in_events, user_sessions};
 
 /// One user as the API shows it.
@@ -440,6 +440,7 @@ async fn list_users(
 async fn create_user(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Json(body): Json<CreateUserBody>,
 ) -> Result<(StatusCode, Json<UserView>), AppError> {
     require_every_catalog(&principal)?;
@@ -447,7 +448,7 @@ async fn create_user(
         name: &body.name,
         display_name: &body.display_name,
     };
-    let created = users::create(app.pool(), &new, app.clock().now()).await?;
+    let created = users::create(app.pool(), &new, &actor, app.clock().now()).await?;
     settle(&app).await;
     Ok((StatusCode::CREATED, Json(created.into())))
 }
@@ -515,11 +516,16 @@ async fn entitlement_views(app: &App, name: &str) -> Result<Vec<EntitlementView>
 async fn set_admin(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(name): Path<String>,
     Json(body): Json<AdminBody>,
 ) -> Result<Json<AdminChanged>, AppError> {
     require_every_catalog(&principal)?;
-    let previous = users::set_admin(app.pool(), &name, body.admin, false).await?;
+    let change = AdminChange {
+        on: body.admin,
+        allow_last: false,
+    };
+    let previous = users::set_admin(app.pool(), &name, change, &actor, app.clock().now()).await?;
     tracing::info!(user = %name, previous, admin = body.admin, key = %principal.key_id,
                    actor = %principal.actor, "admin flag set");
     settle(&app).await;
@@ -539,11 +545,13 @@ async fn set_admin(
 async fn set_email(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(name): Path<String>,
     Json(body): Json<EmailBody>,
 ) -> Result<Json<UserView>, AppError> {
     require_every_catalog(&principal)?;
-    users::set_email(app.pool(), &name, body.email.as_deref()).await?;
+    let now = app.clock().now();
+    users::set_email(app.pool(), &name, body.email.as_deref(), &actor, now).await?;
     // The address itself is not logged.
     tracing::info!(user = %name, cleared = body.email.is_none(), key = %principal.key_id,
                    actor = %principal.actor, "email set");
@@ -562,10 +570,12 @@ async fn set_email(
 async fn invite_user(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(name): Path<String>,
 ) -> Result<(StatusCode, Json<Invited>), AppError> {
     require_every_catalog(&principal)?;
-    let email = invite::send_setup(app.pool(), app.config(), &name, app.clock().now()).await?;
+    let now = app.clock().now();
+    let email = invite::send_setup(app.pool(), app.config(), &name, &actor, now).await?;
     tracing::info!(user = %name, key = %principal.key_id, actor = %principal.actor,
                    "setup email requested");
     Ok((StatusCode::ACCEPTED, Json(Invited { name, email })))
@@ -581,6 +591,7 @@ async fn invite_user(
 async fn entitle(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path((name, catalog)): Path<(String, String)>,
     Json(body): Json<EntitlementBody>,
 ) -> Result<Json<Entitlements>, AppError> {
@@ -593,7 +604,12 @@ async fn entitle(
         }
         .into());
     }
-    ceiling::entitle(app.pool(), &name, &catalog, access, app.clock().now()).await?;
+    let new = NewEntitlement {
+        user: &name,
+        catalog: &catalog,
+        access,
+    };
+    ceiling::entitle(app.pool(), &new, &actor, app.clock().now()).await?;
     tracing::info!(user = %name, %catalog, access = access.as_str(), key = %principal.key_id,
                    actor = %principal.actor, "entitlement set");
     settle(&app).await;
@@ -610,10 +626,12 @@ async fn entitle(
 async fn unentitle(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path((name, catalog)): Path<(String, String)>,
 ) -> Result<Json<Entitlements>, AppError> {
     require_every_catalog(&principal)?;
-    ceiling::unentitle(app.pool(), &name, &catalog).await?;
+    let now = app.clock().now();
+    ceiling::unentitle(app.pool(), &name, &catalog, &actor, now).await?;
     tracing::info!(user = %name, %catalog, key = %principal.key_id, actor = %principal.actor,
                    "entitlement removed");
     settle(&app).await;
@@ -650,10 +668,11 @@ async fn list_sessions(
 async fn revoke_sessions(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(name): Path<String>,
 ) -> Result<Json<SessionsRevoked>, AppError> {
     require_every_catalog(&principal)?;
-    let revoked = users::end_sessions(app.pool(), &name).await?;
+    let revoked = users::end_sessions(app.pool(), &name, &actor, app.clock().now()).await?;
     tracing::info!(user = %name, revoked, key = %principal.key_id, actor = %principal.actor,
                    "sessions ended by an admin");
     Ok(Json(SessionsRevoked { name, revoked }))
@@ -672,11 +691,12 @@ async fn revoke_sessions(
 async fn revoke_session(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path((name, id_prefix)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     require_every_catalog(&principal)?;
-    let id = users::id_by_name(app.pool(), &name).await?;
-    user_sessions::revoke_by_prefix(app.pool(), &id, &id_prefix).await?;
+    let now = app.clock().now();
+    users::end_session_by_prefix(app.pool(), &name, &id_prefix, &actor, now).await?;
     tracing::info!(user = %name, key = %principal.key_id, actor = %principal.actor,
                    "session ended by an admin");
     Ok(StatusCode::NO_CONTENT)
@@ -923,6 +943,8 @@ mod tests {
         Browser, Payload, Row,
     };
     use crate::mcp::testing::TestApp;
+    use crate::store::audit::testing::entries;
+    use crate::store::audit::AuditActor;
     use crate::store::ceiling;
     use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
     use crate::store::oauth::codes::{self, NewSignInCode};
@@ -930,6 +952,7 @@ mod tests {
     use crate::store::teams::MAX_NOTICE_CHARS;
     use crate::store::user_sessions::{self, SessionStart};
     use crate::store::users as user_rows;
+    use crate::store::users::AdminChange;
 
     /// The longest a race test waits for a request or a lock waiter.
     const RACE_WAIT: Duration = Duration::from_secs(30);
@@ -970,6 +993,93 @@ mod tests {
         )
         .await;
         assert_eq!(status.as_u16(), 201, "create user {name}: {body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_user_routes_record_their_changes_as_the_api_caller() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        let _first = Browser::session_for(&test, "alice").await;
+        let _second = Browser::session_for(&test, "alice").await;
+        let (_, listed) = send(
+            &test,
+            "GET",
+            "/api/v1/users/alice/sessions",
+            Some(&root),
+            None,
+        )
+        .await;
+        let prefix = listed["sessions"][0]["id_prefix"]
+            .as_str()
+            .expect("a prefix")
+            .to_string();
+        let writes = [
+            (
+                "PUT",
+                "/api/v1/users/alice/email".to_string(),
+                Some(json!({"email": "alice@example.com"})),
+            ),
+            (
+                "DELETE",
+                format!("/api/v1/users/alice/sessions/{prefix}"),
+                None,
+            ),
+            (
+                "PUT",
+                "/api/v1/users/alice/admin".to_string(),
+                Some(json!({"admin": true})),
+            ),
+            (
+                "PUT",
+                "/api/v1/users/alice/entitlements/main".to_string(),
+                Some(json!({"access": "read"})),
+            ),
+            (
+                "DELETE",
+                "/api/v1/users/alice/entitlements/main".to_string(),
+                None,
+            ),
+        ];
+
+        for (method, path, body) in writes {
+            let (status, answer) = send(&test, method, &path, Some(&root), body).await;
+            assert!(status.is_success(), "{method} {path}: {status} {answer}");
+        }
+        // The admin change ended the other session (recorded as the admin
+        // change only); sign alice in again so the bulk revoke ends one.
+        let _third = Browser::session_for(&test, "alice").await;
+        let (status, _) = send(
+            &test,
+            "DELETE",
+            "/api/v1/users/alice/sessions",
+            Some(&root),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        for (action, count) in [
+            ("user.created", 1),
+            ("user.email_changed", 1),
+            ("user.admin_changed", 1),
+            ("user.entitlement_set", 1),
+            ("user.entitlement_removed", 1),
+            ("user.sessions_revoked", 2),
+        ] {
+            let recorded: Vec<_> = entries(test.app.pool(), action)
+                .await
+                .into_iter()
+                .filter(|entry| entry.person.as_deref() == Some("alice"))
+                .collect();
+            assert_eq!(recorded.len(), count, "{action}");
+            assert!(
+                recorded
+                    .iter()
+                    .all(|entry| entry.source == "api" && entry.actor_label == "api key"),
+                "{action}: {recorded:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1210,9 +1320,18 @@ mod tests {
         let root = every_catalog_admin(&test).await;
         user(&test, &root, "alice").await;
         for name in ["alice", TEST_USER] {
-            user_rows::set_admin(test.app.pool(), name, true, false)
-                .await
-                .expect("make an admin");
+            user_rows::set_admin(
+                test.app.pool(),
+                name,
+                AdminChange {
+                    on: true,
+                    allow_last: false,
+                },
+                &AuditActor::cli(),
+                Utc::now(),
+            )
+            .await
+            .expect("make an admin");
         }
         let mut holder = test.app.pool().begin().await.expect("begin");
         sqlx::query("SELECT id FROM users WHERE is_admin FOR UPDATE")
@@ -1325,9 +1444,15 @@ mod tests {
 
         let plain = app().await;
         let plain_root = every_catalog_admin(&plain).await;
-        user_rows::set_email(plain.app.pool(), TEST_USER, Some("tester@example.com"))
-            .await
-            .expect("email");
+        user_rows::set_email(
+            plain.app.pool(),
+            TEST_USER,
+            Some("tester@example.com"),
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .expect("email");
         let (no_url, _) = send(
             &plain,
             "POST",

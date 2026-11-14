@@ -16,6 +16,9 @@ use rustwright::GotoOptions;
 
 use crate::harness::drive;
 use crate::support::server::{files, TestServer};
+use okf_mcp::store::audit::AuditActor;
+use okf_mcp::store::ceiling::NewEntitlement;
+use okf_mcp::store::users::AdminChange;
 
 const PASSWORD: &str = "violet-lantern-orbit-42";
 
@@ -63,16 +66,32 @@ async fn a_setup_link_sets_a_password_and_the_console_shows_the_user() {
             name: "alice",
             display_name: "Alice",
         },
+        &AuditActor::cli(),
         Utc::now(),
     )
     .await
     .expect("create alice");
-    users::set_email(pool, "alice", Some("alice@example.com"))
-        .await
-        .expect("set the email");
-    ceiling::entitle(pool, "alice", "main", Access::Read, Utc::now())
-        .await
-        .expect("entitle");
+    users::set_email(
+        pool,
+        "alice",
+        Some("alice@example.com"),
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("set the email");
+    ceiling::entitle(
+        pool,
+        &NewEntitlement {
+            user: "alice",
+            catalog: "main",
+            access: Access::Read,
+        },
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("entitle");
     server.app.poll().await.expect("poll");
     let alice = users::find_by_email(pool, "alice@example.com")
         .await
@@ -157,9 +176,18 @@ async fn a_refused_password_says_so_and_a_session_survives_a_reload() {
     server
         .user_with_password("bob", "bob@example.com", PASSWORD)
         .await;
-    ceiling::entitle(&server.db.pool, "bob", "main", Access::Write, Utc::now())
-        .await
-        .expect("entitle");
+    ceiling::entitle(
+        &server.db.pool,
+        &NewEntitlement {
+            user: "bob",
+            catalog: "main",
+            access: Access::Write,
+        },
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("entitle");
     server.app.poll().await.expect("poll");
 
     drive(server.base.clone(), move |ui| {
@@ -189,9 +217,18 @@ async fn an_account_sign_in_replaces_a_stored_key_and_sign_out_ends_both() {
     server
         .user_with_password("carol", "carol@example.com", PASSWORD)
         .await;
-    ceiling::entitle(&server.db.pool, "carol", "main", Access::Read, Utc::now())
-        .await
-        .expect("entitle");
+    ceiling::entitle(
+        &server.db.pool,
+        &NewEntitlement {
+            user: "carol",
+            catalog: "main",
+            access: Access::Read,
+        },
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("entitle");
     let key = server
         .key("console-carol", Access::Read, &["main"], Some("main"))
         .await;
@@ -266,9 +303,18 @@ async fn an_admin_session_writes_through_the_console_with_its_csrf_token() {
     server
         .user_with_password("erin", "erin@example.com", PASSWORD)
         .await;
-    users::set_admin(&server.db.pool, "erin", true, false)
-        .await
-        .expect("make erin an admin");
+    users::set_admin(
+        &server.db.pool,
+        "erin",
+        AdminChange {
+            on: true,
+            allow_last: false,
+        },
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("make erin an admin");
     server.app.poll().await.expect("poll");
 
     let ran = drive(server.base.clone(), move |ui| {
@@ -352,16 +398,32 @@ async fn a_setup_link_registers_a_passkey_that_then_signs_in_from_the_sign_in_pa
             name: "alice",
             display_name: "Alice",
         },
+        &AuditActor::cli(),
         Utc::now(),
     )
     .await
     .expect("create alice");
-    users::set_email(pool, "alice", Some("alice@example.com"))
-        .await
-        .expect("set the email");
-    ceiling::entitle(pool, "alice", "main", Access::Read, Utc::now())
-        .await
-        .expect("entitle");
+    users::set_email(
+        pool,
+        "alice",
+        Some("alice@example.com"),
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("set the email");
+    ceiling::entitle(
+        pool,
+        &NewEntitlement {
+            user: "alice",
+            catalog: "main",
+            access: Access::Read,
+        },
+        &AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("entitle");
     server.app.poll().await.expect("poll");
     let alice = users::find_by_email(pool, "alice@example.com")
         .await
