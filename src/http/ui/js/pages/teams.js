@@ -110,14 +110,19 @@ export async function render(main) {
     // was closed and opened again meanwhile); a drawer of another team is
     // left alone. `team` is the server's answer (null after a refusal, so
     // the drawer reads the team again), and `refusal` the refused write's
-    // reason, which the drawer shows until the next write. The drawer's
-    // read number is taken now, as the write settles and before the list
-    // is read again: a later write, or a drawer opened meanwhile, takes a
-    // newer one, so this redraw is dropped if its list read answers late.
+    // reason, which the drawer shows until the next write. When the drawer
+    // shows `name` as the write settles, its read number is taken now,
+    // before the list is read again: a later write, or a drawer opened
+    // meanwhile, takes a newer one, so this redraw is dropped if its list
+    // read answers late. A drawer of another team (shown or still loading)
+    // keeps its number; and with none of `name` shown now, there is nothing
+    // to redraw, since a drawer of `name` opened later reads it afresh.
     async function changed(name, team, { message = null, refusal = null } = {}) {
-        const read = ++reads;
+        const settled = shown;
+        const read = settled?.name === name && settled.ticket.current() ? ++reads : null;
         if (message) toast(message, 'ok');
         if (main.isConnected) await load();
+        if (read === null) return;
         const view = shown;
         if (view?.name === name && view.ticket.current()) {
             await openDetail(name, view.ticket, { known: team, refusal, last: view.last, read });

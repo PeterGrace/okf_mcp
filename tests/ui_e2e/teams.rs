@@ -618,3 +618,50 @@ async fn an_older_writes_late_list_read_never_redraws_over_a_newer_write() {
         .expect("read the team");
     assert_eq!(team.suspension, None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_settling_for_one_team_never_cancels_opening_another() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let family = NewTeam {
+        name: "family",
+        display_name: "",
+        owner: OWNER,
+    };
+    teams::create(&server.db.pool, &family, Utc::now())
+        .await
+        .expect("create a second team");
+    server.app.poll().await.expect("poll");
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/teams");
+        ui.click(&format!("[data-test=team-{OWNER}]"));
+        // A's suspend is held; A's drawer is closed, and B's drawer is
+        // asked for with its read held too.
+        ui.hold_next("PUT", "/suspension");
+        ui.click("#team-suspend");
+        ui.click("#confirm-ok");
+        ui.eval(
+            "() => { window.releaseFirst = window.releaseHeld; }",
+            json!(null),
+        );
+        ui.click("#drawer-close");
+        ui.hold_next("GET", "/teams/family");
+        ui.click("[data-test=team-family]");
+        // A's suspend settles first, then B's read answers: B opens.
+        ui.eval("() => window.releaseFirst()", json!(null));
+        ui.wait_text("#toasts", &format!("Suspended team {OWNER}."));
+        ui.release_held();
+        ui.wait_visible("#drawer");
+        ui.wait_text("#drawer-title", "family");
+        ui.wait_visible("#team-suspend-form");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let team = teams::find(&server.db.pool, OWNER)
+        .await
+        .expect("read the team");
+    assert!(team.suspension.is_some());
+}

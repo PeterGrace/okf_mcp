@@ -528,3 +528,50 @@ async fn an_older_writes_late_table_read_never_redraws_over_a_newer_write() {
     assert_eq!(alpha.user.as_deref(), Some("alice"));
     assert!(alpha.maintenance_report);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_settling_for_one_key_never_cancels_opening_another() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    server.key("alpha", Access::Read, &["main"], None).await;
+    server.key("bravo", Access::Read, &["main"], None).await;
+    alice(&server).await;
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        ui.click("[data-test=key-alpha]");
+        ui.wait_text("#drawer-title", "alpha");
+        // alpha's assign is held; its drawer is closed, and bravo's drawer
+        // is asked for with its users read held too.
+        ui.select("#key-user-select", "alice");
+        ui.hold_next("PUT", "/user");
+        ui.click("#key-assign");
+        ui.eval(
+            "() => { window.releaseFirst = window.releaseHeld; }",
+            serde_json::json!(null),
+        );
+        ui.click("#drawer-close");
+        ui.wait_hidden("#drawer");
+        ui.hold_next("GET", "/api/v1/users");
+        ui.click("[data-test=key-bravo]");
+        // alpha's assign settles first, then bravo's read answers: bravo
+        // opens.
+        ui.eval("() => window.releaseFirst()", serde_json::json!(null));
+        ui.wait_text("#toasts", "alpha now belongs to alice");
+        ui.release_held();
+        ui.wait_visible("#drawer");
+        ui.wait_text("#drawer-title", "bravo");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let keys = key_rows::list(&server.db.pool).await.expect("list keys");
+    let alpha = keys
+        .iter()
+        .find(|key| key.name == "alpha")
+        .expect("alpha is stored");
+    assert_eq!(alpha.user.as_deref(), Some("alice"));
+}

@@ -152,11 +152,11 @@ function userField(users) {
 
 // The Assign (unassigned) or Change user control of a key's or code's
 // drawer. `prefix` ('key' or 'code') starts the control's ids, `path` is
-// the credential's `.../user` route, and `after(updated, draw)` runs with
-// the server's answer and the drawer's draw number, taken as the write
-// settled (see keyDraws); it refreshes the table, and the drawer while its
-// ticket is current.
-function userAssign(main, users, { prefix, row, path, after }) {
+// the credential's `.../user` route, `ticket` the drawer's claim, and
+// `after(updated, draw)` runs with the server's answer and the drawer's
+// draw number, taken as the write settled (see nextDraw); it refreshes the
+// table, and the drawer while its ticket is current.
+function userAssign(main, users, { prefix, row, path, ticket, after }) {
     return h('section', {},
         h('h3', {}, 'User'),
         assignControl({
@@ -165,7 +165,7 @@ function userAssign(main, users, { prefix, row, path, after }) {
             assign: async user => {
                 let updated;
                 try { updated = await api.put(path, { user }); } catch { return; /* toasted */ }
-                const draw = ++keyDraws;
+                const draw = nextDraw(ticket);
                 toast(`${row.name} now belongs to ${user}.`, 'ok');
                 refreshUnassigned();
                 if (prefix === 'key') await keyUserChanged(row.id);
@@ -179,11 +179,21 @@ async function usersOrNull() {
     try { return await namesOf('users'); } catch { return null; }
 }
 
-// Draws of the key or sign-in code drawer, numbered: each opening, and
-// each write as it settles (before the table is read again), takes the
-// next number, and a drawer draws only while its number is the newest, so
-// a write whose table read answers late never redraws over a newer one.
-let keyDraws = 0;
+// Draws of each key or sign-in code drawer, numbered per drawer (by its
+// ticket): its opening, and each of its writes as it settles (before the
+// table is read again), takes the next number, and it draws only while
+// that number is its newest, so a write whose table read answers late
+// never redraws over a newer one. Numbers are per ticket, so a write of
+// a dismissed drawer never cancels another drawer's draw. A WeakMap holds
+// its keys weakly: a dropped ticket's entry goes with it.
+const draws = new WeakMap();
+
+// The next draw number of the drawer `ticket`.
+function nextDraw(ticket) {
+    const draw = (draws.get(ticket) ?? 0) + 1;
+    draws.set(ticket, draw);
+    return draw;
+}
 
 // The users for a drawer drawn again after a write: read again, or, when
 // that fails, the ones it was drawn with (`previous`), so a write's answer
@@ -238,10 +248,10 @@ async function newKey(main, reload) {
 // too. `ticket` is the drawer's claim: a re-render after an action passes
 // the one it was opened with, so it is dropped once the drawer is replaced
 // or dismissed. `previous` is the users the drawer was drawn with (see
-// usersOr), on a re-render, and `draw` its number (see keyDraws).
-async function showKey(main, key, reload, ticket = drawerTicket(main), previous = null, draw = ++keyDraws) {
+// usersOr), on a re-render, and `draw` its number (see nextDraw).
+async function showKey(main, key, reload, ticket = drawerTicket(main), previous = null, draw = nextDraw(ticket)) {
     const users = await usersOr(previous);
-    if (!users || !ticket.current() || draw !== keyDraws) return;
+    if (!users || !ticket.current() || draw !== draws.get(ticket)) return;
     const me = store.whoami;
     const mine = isMine(key);
     const grant = isGrant(key);
@@ -262,7 +272,7 @@ async function showKey(main, key, reload, ticket = drawerTicket(main), previous 
         : grant ? `OAuth grant for ${key.client_name ?? 'an unknown client'}` : `${key.access} key`;
     const base = `/keys/${enc(key.id)}`;
     const user = userAssign(main, users, {
-        prefix: 'key', row: key, path: `${base}/user`,
+        prefix: 'key', row: key, path: `${base}/user`, ticket,
         after: async (updated, draw) => {
             if (main.isConnected) await reload();
             if (ticket.current()) await showKey(main, updated, reload, ticket, users, draw);
@@ -277,7 +287,7 @@ async function showKey(main, key, reload, ticket = drawerTicket(main), previous 
     const change = async (request, message) => {
         try {
             const updated = await request();
-            const draw = ++keyDraws;
+            const draw = nextDraw(ticket);
             toast(message, 'ok');
             if (main.isConnected) await reload();
             if (ticket.current()) await showKey(main, updated, reload, ticket, users, draw);
@@ -411,9 +421,9 @@ async function newCode(main, reload) {
 // One code's drawer: its facts and user, and Revoke while nobody has
 // redeemed it. A redeemed code's grant keeps its own user: change that in
 // the grant's drawer. `ticket`, `previous` and `draw` as for showKey.
-async function showCode(main, code, reload, ticket = drawerTicket(main), previous = null, draw = ++keyDraws) {
+async function showCode(main, code, reload, ticket = drawerTicket(main), previous = null, draw = nextDraw(ticket)) {
     const users = await usersOr(previous);
-    if (!users || !ticket.current() || draw !== keyDraws) return;
+    if (!users || !ticket.current() || draw !== draws.get(ticket)) return;
     const facts = h('dl', { class: 'facts' },
         fact('Id', h('code', {}, code.id)),
         fact('Actor', h('code', {}, code.actor)),
@@ -446,7 +456,7 @@ async function showCode(main, code, reload, ticket = drawerTicket(main), previou
         },
     }, 'Revoke') : null;
     const user = userAssign(main, users, {
-        prefix: 'code', row: code, path: `/oauth/codes/${enc(code.id)}/user`,
+        prefix: 'code', row: code, path: `/oauth/codes/${enc(code.id)}/user`, ticket,
         after: async (updated, draw) => {
             if (main.isConnected) await reload();
             if (ticket.current()) await showCode(main, updated, reload, ticket, users, draw);
