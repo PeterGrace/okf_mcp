@@ -485,3 +485,46 @@ async fn an_assigned_user_shows_when_reading_the_users_again_fails() {
         .and_then(|key| key.user.clone());
     assert_eq!(user.as_deref(), Some("alice"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_writes_late_table_read_never_redraws_over_a_newer_write() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    server.key("alpha", Access::Read, &["main"], None).await;
+    alice(&server).await;
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        ui.click("[data-test=key-alpha]");
+        ui.wait_text("#drawer-title", "alpha");
+        // Reporting is enabled; the table read after it answers late.
+        ui.hold_answer("GET", "/api/v1/keys", || ui.click("#key-report-toggle"));
+        ui.wait_text("#toasts", "alpha may now report");
+        // Meanwhile alpha is given to alice in the same drawer, and drawn.
+        ui.select("#key-user-select", "alice");
+        ui.click("#key-assign");
+        ui.wait_text("#toasts", "alpha now belongs to alice");
+        ui.wait_text("#drawer dl.facts", "alice");
+        // The older write's late table answer must not redraw its answer
+        // (no user change) over the newer one.
+        ui.release_held();
+        let facts = ui.text("#drawer dl.facts");
+        assert!(
+            facts.contains("alice"),
+            "the older write redrew the drawer: {facts}"
+        );
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let keys = key_rows::list(&server.db.pool).await.expect("list keys");
+    let alpha = keys
+        .iter()
+        .find(|key| key.name == "alpha")
+        .expect("alpha is stored");
+    assert_eq!(alpha.user.as_deref(), Some("alice"));
+    assert!(alpha.maintenance_report);
+}

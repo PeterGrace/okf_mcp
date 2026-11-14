@@ -574,3 +574,47 @@ async fn a_written_suspension_shows_when_reading_the_users_again_fails() {
         .expect("read the team");
     assert_eq!(team.suspension, None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_writes_late_list_read_never_redraws_over_a_newer_write() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let team_row = format!("[data-test=team-{OWNER}]");
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/teams");
+        ui.click(&team_row);
+        // The suspend succeeds; the list read after it answers late.
+        ui.fill("#team-suspend-form textarea[name=notice]", "First.");
+        ui.hold_answer("GET", "/api/v1/teams", || {
+            ui.click("#team-suspend");
+            ui.click("#confirm-ok");
+        });
+        // Meanwhile the drawer is opened again (it reads the suspension),
+        // and a lift succeeds and is drawn.
+        ui.click("#drawer-close");
+        ui.click(&team_row);
+        ui.wait_visible("#team-unsuspend:not([disabled])");
+        ui.click("#team-unsuspend");
+        ui.wait_text(
+            "#toasts",
+            &format!("Lifted the suspension of team {OWNER}."),
+        );
+        ui.wait_visible("#team-suspend-form");
+        // The suspend's late list answer must not redraw it as suspended.
+        ui.release_held();
+        let section = ui.text("#team-suspension");
+        assert!(
+            section.contains("Active") && !section.contains("Suspended since"),
+            "the older suspend redrew the drawer: {section}"
+        );
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let team = teams::find(&server.db.pool, OWNER)
+        .await
+        .expect("read the team");
+    assert_eq!(team.suspension, None);
+}

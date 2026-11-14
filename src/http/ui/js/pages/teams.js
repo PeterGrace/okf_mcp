@@ -110,13 +110,17 @@ export async function render(main) {
     // was closed and opened again meanwhile); a drawer of another team is
     // left alone. `team` is the server's answer (null after a refusal, so
     // the drawer reads the team again), and `refusal` the refused write's
-    // reason, which the drawer shows until the next write.
+    // reason, which the drawer shows until the next write. The drawer's
+    // read number is taken now, as the write settles and before the list
+    // is read again: a later write, or a drawer opened meanwhile, takes a
+    // newer one, so this redraw is dropped if its list read answers late.
     async function changed(name, team, { message = null, refusal = null } = {}) {
+        const read = ++reads;
         if (message) toast(message, 'ok');
         if (main.isConnected) await load();
         const view = shown;
         if (view?.name === name && view.ticket.current()) {
-            await openDetail(name, view.ticket, { known: team, refusal, last: view.last });
+            await openDetail(name, view.ticket, { known: team, refusal, last: view.last, read });
         }
     }
 
@@ -131,11 +135,13 @@ export async function render(main) {
     // read again is drawn from `last`, marked as possibly out of date, so
     // the refusal still shows and every control works again, while a part
     // that was read, or a write's answer, is never thrown away for it.
-    // Every read takes the next number in `reads` and only the newest one
-    // draws, so a read that started before a write never draws over the
-    // one after it.
-    async function openDetail(name, ticket = drawerTicket(main), { known = null, refusal = null, last = null } = {}) {
-        const read = ++reads;
+    // Every read has a number from `reads` (the next one, or `read`, which
+    // `changed` took when its write settled) and only the newest draws, so
+    // a read or a write that started before another never draws over it.
+    async function openDetail(name, ticket = drawerTicket(main),
+                              { known = null, refusal = null, last = null, read = ++reads } = {}) {
+        // A redraw already overtaken (another read took a newer number).
+        if (read !== reads) return;
         shown = { name, ticket, last };
         // allSettled, unlike all, waits for both and reports each one's
         // value or failure, so one failed read cannot discard the other.
