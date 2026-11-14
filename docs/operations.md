@@ -699,7 +699,7 @@ takes effect at once.
 |---|---|
 | `okf-mcp user create NAME [--display-name TEXT]` | Creates the user and its personal team `NAME` |
 | `okf-mcp user list [--email ADDRESS]` | One tab-separated line per user: name, `credentials N` (keys, grants and codes naming it, revoked ones included), `email E` (`-` when unset), `admin yes\|no`, `teams a,b`, then the display name. `--email` prints only the user with that email, in any letter case, and nothing when no user has it |
-| `okf-mcp user delete NAME` | Deletes a user nothing references, with its personal team (see below) |
+| `okf-mcp user delete NAME` | Deletes a user with its credentials, sessions and personal team, discarding its open changesets; catalogs and history stay. Prints what went (see below) |
 | `okf-mcp user set-admin NAME --on\|--off` | Gives or takes the admin flag: an admin user's console session acts as an admin that reaches every catalog. A change signs the user out of every console session. `--off` for the last admin user is allowed here (operator access), refused over REST |
 | `okf-mcp user set-email NAME EMAIL` (`--clear`) | Sets the email a user signs in and gets mail with (unique, case-insensitive), or clears it. A change ends the user's outstanding emailed links |
 | `okf-mcp user invite NAME` | Queues a setup email with a single-use link (valid `setup_link_ttl`) to the user's email; an older setup link stops working. Needs `public_url`; prints the address, never the link. It only queues: a running server's mail worker sends it, so the command needs no mail secret |
@@ -786,17 +786,27 @@ columns `NOT NULL` once nothing is unassigned is future work (#296).
 
 ### Deletion rules
 
-Users and teams that something refers to are kept, so the owner of a
-credential or catalog never disappears. Each refusal is a 409 over REST, and
-a non-zero exit naming what still refers to it on the command line:
+Deleting a user takes everything that is only theirs, in one transaction:
+its keys and OAuth grants (revoked ones too), sign-in codes, console
+sessions, passwords, passkeys, sign-in identities, emailed links, sign-in
+events, entitlements, team memberships and personal team. The open
+changesets of its keys and grants are discarded, each with a
+`catalog.changeset_discarded` audit entry. Catalogs, their history (whose
+`actor` text stays as written) and every audit entry are kept; the deletion
+is recorded as `user.deleted`, and from then on the log names the user
+`deleted user #N` and its credentials `credential #N`.
 
-- `user delete` is refused while any key, grant (revoked ones included) or
-  sign-in code names the user, while the user belongs to a team other than
-  its personal team, or while its personal team owns a catalog. Revoked keys
-  and grants are kept, so a user is refused for as long as any of them still
-  names it; `key assign` can move even a revoked key or grant to another
-  user, and a sign-in code nobody redeemed is pruned a week after it
-  expires.
+What a deletion would orphan is refused instead: each refusal is a 409 over
+REST, and a non-zero exit naming the cause on the command line.
+
+- `user delete` is refused while its personal team owns a catalog (delete
+  the catalog or move it with `catalog set-owner` first), while it is the
+  only owner of a shared team (add another owner first), and, over REST and
+  in the console, for the last admin user. The command line has operator
+  access and may delete the last admin user, as it may clear the last admin
+  flag. A user being a plain member of a shared team, or the owner of one
+  with other owners, does not stop the deletion: the membership goes with
+  it.
 - `team delete` is refused for a personal team (it goes with its user) and
   for a team that owns a catalog.
 - `team remove-member` and `team set-role` never remove or demote a team's
@@ -807,7 +817,6 @@ An unknown user or team is a 404 (`{"error": "UnknownName", "message": ...,
 `owner` of a create body; on the command line it is a non-zero exit naming
 it. A create body without its required `user` or `owner` is a 422; on the
 command line a missing `--user` or `--owner` is clap's usage error (exit 2).
-Disabling a user or team instead of deleting it is future work (#297).
 
 ### Suspending a team
 
@@ -1997,7 +2006,7 @@ admin). Every change takes effect at once. A refusal under the
 | `GET /api/v1/users` | admin | `?email=` (optional) answers only the user with that email, in any letter case: zero or one, in the same view; text that cannot be an address finds none, and an unknown parameter is 400. `{users}`, by name: `name`, `display_name`, `created_at`, `credentials` (keys, grants and codes naming it, whoever manages them), `teams`, `email` (`null` when unset), `is_admin`, `has_password` (never the password or its hash) |
 | `POST /api/v1/users` | admin, every catalog | Body `{name, display_name}` (`display_name` optional). Creates the user and its personal team; 201 with the user. 409 for an invalid or taken name, 422 without `name` |
 | `GET /api/v1/users/{name}` | admin | `{user, keys, codes, entitlements}`: the user, the keys, grants and codes naming it that the caller manages, and its entitlements (`[{catalog, access, created_at}]`, by catalog) |
-| `DELETE /api/v1/users/{name}` | admin, every catalog | Deletes the user with its personal team; 204. 409 while something refers to it |
+| `DELETE /api/v1/users/{name}` | admin, every catalog | Deletes the user with its credentials, sessions and personal team (see "Deletion rules"); 204. 409 for a personal team that owns catalogs, the last owner of a shared team, or the last admin user |
 | `PUT /api/v1/users/{name}/admin` | admin, every catalog | Body `{admin: bool}`. Answers `{name, previous, admin}`. A change signs the user out of every console session (they sign in again with the new flag). 409 for clearing the last admin user (only the CLI may), 422 without `admin` |
 | `PUT /api/v1/users/{name}/email` | admin, every catalog | Body `{email}` (`null` clears; the field is required). Answers the user. A change ends the user's outstanding emailed links. 409 "Another user has this email" (in any letter case), 422 for an address that is not one or without `email` |
 | `POST /api/v1/users/{name}/invite` | admin, every catalog | Queues a setup email with a single-use link (replacing any older one) to the user's email; 202 `{name, email}`. 409 without an email or without `public_url` |

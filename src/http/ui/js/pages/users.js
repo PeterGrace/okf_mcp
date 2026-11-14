@@ -9,6 +9,7 @@ import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
 import { drawerTicket } from '../core/drawer.js';
+import { guard, once } from '../core/pending.js';
 import { ago, when } from '../core/format.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
@@ -108,7 +109,10 @@ export async function render(main, rest) {
 
     // The drawer: the user's teams, the credentials this key manages, the
     // account sections (sign-in, entitlements, sessions, sign-ins), and
-    // Delete, disabled with the reason while anything still names the user.
+    // Delete, disabled with the reason while its personal team owns a
+    // catalog. Deleting takes the user's keys, grants and sign-in codes with
+    // it (#379); the server's other refusals (the last owner of a shared
+    // team, the last admin user) are kept in the drawer like any action's.
     // `ticket` is the drawer's claim: a re-render after an action passes
     // the one the drawer was opened with, so once the drawer is replaced or
     // dismissed the late answer is dropped. `refusal` is the reason that
@@ -140,7 +144,7 @@ export async function render(main, rest) {
         const { detail, personal, account, stale } = loaded;
         shown.last = { detail, personal, account };
         const { user, keys, codes } = detail;
-        const reason = deleteReason(user, personal);
+        const reason = deleteReason(personal);
         const changed = async refused => {
             // An admin flag or session change of the signed-in user is
             // shell state (the Administer group, the session itself).
@@ -151,21 +155,25 @@ export async function render(main, rest) {
                 await openDetail(name, view.ticket, { refusal: refused, last: view.last });
             }
         };
-        const remove = h('button', {
-            type: 'button', id: 'user-delete', class: 'danger', disabled: !manager || !!reason,
+        // A pending write keyed by the user (core/pending.js), so a drawer
+        // drawn again while it runs (closed and reopened, or redrawn by
+        // another action) shows Delete disabled and cannot send it twice.
+        const deleting = `user:${name}:delete`;
+        const remove = guard(h('button', {
+            type: 'button', id: 'user-delete', class: 'danger',
             onclick: async () => {
+                const self = name === store.whoami?.user
+                    ? ' This is the user you are signed in as: your own access goes with it.' : '';
                 const ok = await confirmDialog({
                     title: `Delete user ${name}?`,
-                    message: `Its personal team ${name} is deleted with it. This cannot be undone.`,
+                    message: `Its keys, grants and sign-in codes (revoked ones too), console sessions and `
+                        + `personal team ${name} are deleted with it, and its open changesets are discarded. `
+                        + `Catalogs and their history stay. This cannot be undone.${self}`,
                     action: 'Delete',
                 });
-                if (!ok) return;
-                try { await api.del(`/users/${enc(name)}`); } catch { return; }
-                toast(`Deleted user ${name}.`, 'ok');
-                ticket.close();
-                if (main.isConnected) await load();
+                if (ok) await once(deleting, () => removeUser(name));
             },
-        }, 'Delete user');
+        }, 'Delete user'), deleting, manager && !reason);
         ticket.open(name, user.display_name || 'User',
             h('div', { id: 'user-detail' },
                 stale ? h('p', { id: 'user-stale', class: 'error small', role: 'status' },
@@ -191,19 +199,35 @@ export async function render(main, rest) {
                         ? h('p', { id: 'user-delete-reason', class: 'muted small' }, reason || NEEDS_EVERY_CATALOG)
                         : null)));
     }
+
+    // Deletes user `name`. Once it settles, the drawer that shows that user
+    // now (not necessarily the one Delete was clicked in) closes, or, when
+    // the server refused, is drawn again with the reason kept in it.
+    async function removeUser(name) {
+        try {
+            await api.del(`/users/${enc(name)}`);
+        } catch (error) {
+            // Already toasted by api.js; the drawer keeps the reason. The
+            // redraw starts before any other await, so it takes its read
+            // number as the write settles and a later read still wins.
+            const view = shown;
+            const redraw = view?.name === name && view.ticket.current()
+                ? openDetail(name, view.ticket, { refusal: error.message, last: view.last }) : null;
+            await Promise.allSettled([redraw, main.isConnected ? load() : null]);
+            return;
+        }
+        toast(`Deleted user ${name}.`, 'ok');
+        const view = shown;
+        if (view?.name === name && view.ticket.current()) view.ticket.close();
+        if (main.isConnected) await load();
+    }
 }
 
 // Why the server would refuse to delete `user` (whose personal team is
-// `personal`), or '' when it would not.
-function deleteReason(user, personal) {
-    const n = user.credentials;
-    if (n > 0) {
-        return n === 1
-            ? '1 key, grant or sign-in code names this user. Reassign it first.'
-            : `${n} keys, grants or sign-in codes name this user. Reassign them first.`;
-    }
-    const others = user.teams.filter(team => team !== personal.name);
-    if (others.length) return `This user belongs to other teams: ${others.join(', ')}.`;
+// `personal`), as far as the drawer can tell, or '' when it would not. Its
+// keys, grants, sign-in codes and memberships go with it; the last owner of
+// a shared team and the last admin user are the server's to refuse.
+function deleteReason(personal) {
     if (personal.catalogs.length) return `Its personal team owns catalogs: ${personal.catalogs.join(', ')}.`;
     return '';
 }

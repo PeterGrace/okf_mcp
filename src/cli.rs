@@ -266,7 +266,10 @@ pub enum UserCommand {
         #[arg(long, value_name = "ADDRESS")]
         email: Option<String>,
     },
-    /// Delete a user nothing references, with its personal team.
+    /// Delete a user, with its keys, grants, sign-in codes, sessions and
+    /// personal team; catalogs and history stay. Refused while its personal
+    /// team owns a catalog or it is the last owner of a shared team. The
+    /// CLI may delete the last admin user.
     Delete {
         /// Its name.
         name: String,

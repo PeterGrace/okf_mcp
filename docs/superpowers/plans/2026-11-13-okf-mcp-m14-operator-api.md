@@ -65,7 +65,7 @@ Checked against `origin/main` at `4b7fcf1` (all of M13 merged) on 2026-11-14; li
 - axum 0.8.9: inside a nested router's layer, `MatchedPath` holds the full template, outer prefix included (`axum-0.8.9/src/extract/matched_path.rs:278-317`); this server already logs `/api/v1/users/{name}/sessions/{id_prefix}` from it (`src/http/mod.rs:291-302`). `FromRequestParts<S>::from_request_parts(parts, state) -> impl Future + Send` (`axum-core-0.5.6/src/extract/mod.rs:53-63`).
 - `require_principal` inserts `Arc<Principal>` for a bearer credential, and also a `ConsoleSession` for a cookie (`src/http/console_session.rs:313-366`); `require_key` does the same for MCP and the archive routes (`src/auth.rs:829-850`). `client_ip(parts, &config.auth)` honours `trusted_proxy_header` (`src/http/console_session.rs:100-110`). IPs are stored by binding text and casting `$n::inet` (`src/store/sign_in_events.rs:182-191`).
 - `KeyCache::read` loads keys, ceilings, users and (M13) suspended catalogs with `tokio::try_join!` (`src/auth.rs:521-533`); `App::reload_keys_if_changed` reloads keys then settings when `admin_generation` moves (`src/app.rs:428-458`).
-- `users::delete` refuses while any credential names the user, it is in another team, or its personal team owns a catalog; it locks the user, then the personal team (`src/store/users.rs:666-730`). The schema makes `api_keys.user_id`, `sign_in_codes.user_id` and `team_members.user_id` `ON DELETE RESTRICT`, `teams.personal_of` `RESTRICT` (`migrations/0009_users_teams.sql:20`, `:25`, `:35-38`). Postgres names an unnamed column foreign key `<table>_<column>_fkey`. Sessions, passkeys, identities, email tokens, sign-in events and entitlements already cascade (`migrations/0010_user_login.sql`). `changesets.key_id` is `ON DELETE SET NULL` (`migrations/0001_schema.sql:70`).
+- `users::delete` refuses while any credential names the user, it is in another team, or its personal team owns a catalog; it locks the user, then the personal team (`src/store/users.rs:666-730`). *(Corrected, issue #394, 2026-11-14: Task 4 replaced it; see Task 4.)* The schema makes `api_keys.user_id`, `sign_in_codes.user_id` and `team_members.user_id` `ON DELETE RESTRICT`, `teams.personal_of` `RESTRICT` (`migrations/0009_users_teams.sql:20`, `:25`, `:35-38`). Postgres names an unnamed column foreign key `<table>_<column>_fkey`. Sessions, passkeys, identities, email tokens, sign-in events and entitlements already cascade (`migrations/0010_user_login.sql`). `changesets.key_id` is `ON DELETE SET NULL` (`migrations/0001_schema.sql:70`).
 - `users::set_admin` locks every admin row in id order, then the user (`src/store/users.rs:546-559`); `teams::set_member` resolves the user (`FOR KEY SHARE`) before locking the team (`src/store/teams.rs:328-332`).
 - `keys::insert_key` refuses an empty grant list through `resolve_grants` (`src/store/keys.rs:693-698`), and is shared by `create_with_id` and `create_self_issued` (`src/store/keys.rs:377-387`, `:511-556`). There are 48 `NewKey { ... }` literals (M13 added two), so the provisioner gets its own store function instead of a `NewKey` field.
 - `keys::list` selects one row per key (`src/store/keys.rs:735-792`). `manages_grants` is vacuously true for a key with no catalogs and a caller with `Reach::Catalogs` (`src/http/api/keys.rs:219-230`).
@@ -2104,6 +2104,8 @@ git commit -m "feat(users): find a user by email over REST, the CLI and the cons
 - Create: `migrations/0013_user_deletion.sql`
 - Modify: `src/store/users.rs` (`delete`, `DeletedUser`), `src/http/api/people.rs` (`delete_user`), `src/cli/people.rs` (`UserCommand::Delete`), `docs/operations.md` ("Deletion rules", the `user delete` row, the API row)
 
+> **Corrected (issue #394, 2026-11-14).** Task 4 also closes #379, so its files include the console and a journey: `src/http/ui/js/pages/users.js` (Delete is enabled whatever credentials the user holds; the drawer predicts only "its personal team owns catalogs"; the server's other refusals, the last owner of a shared team and the last admin user, are kept in the drawer as `#user-refusal` like any account action's, through a numbered redraw of whichever drawer shows the user when the write settles, a stale-marked one when that read fails; Delete is a pending write `user:<name>:delete` under `guard`/`once`, and the confirmation says the keys, grants and sign-in codes go too) and `tests/ui_e2e/users.rs` (`a_user_whose_only_key_is_revoked_is_deleted_from_the_console`, `a_delete_clicked_again_while_it_runs_sends_one_request`, `a_last_owner_or_an_owned_catalog_refuses_the_delete_until_cleared`, which replace `a_user_holding_a_key_shows_why_it_cannot_be_deleted` and `another_team_or_an_owned_catalog_refuses_the_delete_until_cleared`). The changed `users::delete` signature also reaches two test callers, `src/store/audit.rs` and `src/store/ceiling.rs`, and the CLI's doc in `src/cli.rs`. The user-deletion rows (`user.deleted`, `catalog.changeset_discarded` with `reason: user_deleted`) go in `docs/operations.md`'s "Audit log" table that Task 7a added.
+
 - [ ] **Step 1: Write the migration**
 
 ```sql
@@ -2305,6 +2307,8 @@ ALTER TABLE team_members
     }
 ```
 
+> **Corrected (issue #394, 2026-11-14).** As shipped, the store tests add a sign-in code and a console session to the first test (so it expects `DeletedUser { keys: 2, codes: 1, discarded: 0 }` and checks `sign_in_codes` and `user_sessions` are empty, the entry's `details`, and that no `audit_people` row still names alice); a `reason(result)` helper; `a_provisioner_is_refused_an_admin_user`, `deleting_an_unknown_or_malformed_user_is_unknown_name`, `a_refused_deletion_changes_nothing` (the refusal leaves the user, its code and the generation, and writes no entry) and `id_and_admin_of_reads_the_flag_and_knows_no_stranger`; and every spawned deletion is awaited under `tokio::time::timeout(LOCK_WAIT, ..)` (30 s). The race test needs no catalog. The old `a_user_in_another_team_is_not_deleted`, `a_user_named_by_a_key_is_not_deleted` and `a_user_named_by_a_sign_in_code_is_not_deleted` are gone (those no longer refuse). The REST test's key create answers 200, not 201.
+
 (`delete` takes the admin rows' lock first only when there are admins; the waiting point is the user row. Task 6a later passes an `AuditActor` to `entitle`, `set_admin` and `set_member` too; whichever task merges second updates these test calls.)
 
 `src/http/api/people.rs` (replace the old "refused while a credential names it" test expectations):
@@ -2371,7 +2375,7 @@ const SOLE_OWNED_TEAMS: &str = "\
 /// Lock order: every admin row in id order, then the user (as
 /// [`set_admin`]), then its personal team, then its shared teams in id
 /// order, then its open changesets in id order. A key or code being
-/// created for the user holds it `FOR KEY SHARE` ([`id_of`]); the deletion
+/// created for the user holds it `FOR KEY SHARE` (`id_of`, private, so no doc link); the deletion
 /// waits for it and then deletes it too.
 ///
 /// # Arguments
@@ -2537,6 +2541,8 @@ async fn discard_open_changesets(
 ```
 
 Imports: `use crate::store::audit::{self, Action, AuditActor, Entry, Target};`, `use crate::store::changesets::{self, ChangesetState};`.
+
+> **Corrected (issue #394, 2026-11-14).** As shipped (`src/store/users.rs`): after the refusals, `delete` locks the user's keys and grants (`SELECT id FROM api_keys WHERE user_id = $1 ORDER BY id FOR UPDATE`) before discarding, so a changeset opened by one of them meanwhile (its insert takes `FOR KEY SHARE` on the key) waits and then finds the key gone, instead of committing after the discard and being left open with a NULL `key_id`. `keys` is the length of that list and `codes` a separate count; the quoting closure is a private `quoted(names)` and the `usize` conversion `count_of(rows)`. The doc comment names one more interaction: since Task 7a, a publish records its entry with the publishing key's user held `FOR KEY SHARE` after taking its changeset, so a publish by one of the user's keys already running when the deletion starts can deadlock with it, and Postgres aborts one of the two (`OkfError::Busy`, retryable); neither leaves anything half done. `discard_open_changesets` takes no catalog lock (as `changesets::prune_empty`), so it cannot deadlock with `catalogs::delete`, and does not forget cached overlays (they age out). `id_and_admin_of` also refuses a malformed name before SQL, and carries `#[cfg_attr(not(test), expect(dead_code, reason = ..))]` until Task 6b's guards call it: **Task 6b removes that attribute** (an `expect` that is no longer met is a warning, which `lint` refuses).
 
 Add the reader Task 6b's guards use:
 
