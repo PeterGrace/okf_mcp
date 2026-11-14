@@ -211,7 +211,7 @@ async fn create_catalog(
     // `Json` reads the body, so it must be the last extractor.
     Json(new): Json<NewCatalog>,
 ) -> Result<(StatusCode, Json<CatalogSummary>), AppError> {
-    require_every_catalog(&principal)?;
+    crate::http::api::require_manager(&principal)?;
     let row = catalog_rows::create(
         app.pool(),
         &catalog_rows::NewCatalog {
@@ -415,7 +415,9 @@ async fn delete_catalog(
     Path(catalog): Path<String>,
     Query(query): Query<DeleteQuery>,
 ) -> Result<Json<CatalogDeleted>, AppError> {
-    principal.require(Access::Admin, &catalog)?;
+    if !principal.provisioner {
+        principal.require(Access::Admin, &catalog)?;
+    }
     catalog_rows::delete(app.pool(), &catalog, query.force, &actor, app.clock().now())
         .await
         // The store's hint names the CLI flag; say what HTTP needs.

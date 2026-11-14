@@ -464,18 +464,21 @@ pub enum MailCommand {
 pub struct KeyCreateArgs {
     /// Grouping name (`[A-Za-z0-9._-]+`).
     pub name: String,
-    /// Access level.
-    #[arg(long, value_enum)]
-    pub access: Access,
+    /// Access level (required unless creating a provisioner).
+    #[arg(long, value_enum, required_unless_present = "provisioner")]
+    pub access: Option<Access>,
+    /// Manage non-admin accounts, teams and catalogs, without catalog access.
+    #[arg(long, conflicts_with_all = ["access", "catalogs", "all", "default", "maintenance_report"])]
+    pub provisioner: bool,
     /// Permit maintenance reporting (does not grant write access).
     #[arg(long)]
     pub maintenance_report: bool,
     /// Granted catalogs, comma-separated.
-    // Exactly one of `--catalogs` and `--all`: clap refuses both or neither.
+    // Ordinary keys need catalogs or all; provisioners reach neither.
     #[arg(
         long,
         value_delimiter = ',',
-        required_unless_present = "all",
+        required_unless_present_any = ["all", "provisioner"],
         conflicts_with = "all"
     )]
     pub catalogs: Vec<String>,
@@ -906,24 +909,40 @@ async fn run_catalog(
 async fn run_key(pool: &PgPool, command: KeyCommand, clock: &dyn Clock) -> anyhow::Result<()> {
     match command {
         KeyCommand::Create(args) => {
-            let grants = if args.all {
-                Grants::All
+            let created = if args.provisioner {
+                keys::create_provisioner(
+                    pool,
+                    &keys::NewProvisioner {
+                        name: &args.name,
+                        actor: args.actor.as_deref().unwrap_or(&args.name),
+                        user: &args.user,
+                    },
+                    &crate::store::audit::AuditActor::cli(),
+                    clock.now(),
+                )
+                .await?
             } else {
-                Grants::Catalogs(&args.catalogs)
+                let grants = if args.all {
+                    Grants::All
+                } else {
+                    Grants::Catalogs(&args.catalogs)
+                };
+                let new = NewKey {
+                    name: &args.name,
+                    access: args
+                        .access
+                        .expect("clap requires access without provisioner"),
+                    maintenance_report: args.maintenance_report,
+                    grants,
+                    default_catalog: args.default.as_deref(),
+                    actor: args.actor.as_deref().unwrap_or(&args.name),
+                    user: &args.user,
+                    self_issued: false,
+                    expires_at: None,
+                    levels: &[],
+                };
+                keys::create_with_id(pool, &new, clock.now()).await?
             };
-            let new = NewKey {
-                name: &args.name,
-                access: args.access,
-                maintenance_report: args.maintenance_report,
-                grants,
-                default_catalog: args.default.as_deref(),
-                actor: args.actor.as_deref().unwrap_or(&args.name),
-                user: &args.user,
-                self_issued: false,
-                expires_at: None,
-                levels: &[],
-            };
-            let created = keys::create_with_id(pool, &new, clock.now()).await?;
             println!("{}", created.key);
             eprintln!(
                 "key id: {}\nstore this key now: it is not shown again",
@@ -1034,6 +1053,7 @@ fn format_key_record(key: &keys::KeyRecord) -> String {
         &catalogs,
         &labelled("default", key.default_catalog.as_deref()),
         &format!("maintenance_report {}", key.maintenance_report),
+        &format!("provisioner {}", if key.provisioner { "yes" } else { "no" }),
         &labelled("user", key.user.as_deref()),
     ])
 }
@@ -1307,7 +1327,11 @@ mod tests {
         assert_eq!(args.name, "k");
         assert_eq!(args.user, "alice");
         assert_eq!(
-            (args.access, args.catalogs, args.all),
+            (
+                args.access.expect("ordinary key access"),
+                args.catalogs,
+                args.all
+            ),
             (
                 Access::Write,
                 vec!["pg".to_string(), "work".to_string()],
@@ -1355,7 +1379,8 @@ mod tests {
         let url = Some(db.url.clone());
         let create = KeyCommand::Create(KeyCreateArgs {
             name: "k".to_string(),
-            access: Access::Read,
+            access: Some(Access::Read),
+            provisioner: false,
             maintenance_report: false,
             catalogs: Vec::new(),
             all: true,
@@ -1520,7 +1545,7 @@ mod tests {
         );
         assert!(
             format_key_record(records.iter().find(|record| record.id == old_id).unwrap())
-                .ends_with("\tmaintenance_report false\tuser test-user")
+                .ends_with("\tmaintenance_report false\tprovisioner no\tuser test-user")
         );
         run(
             cli(
@@ -1622,6 +1647,7 @@ mod tests {
             sha256: None,
             access: Access::Write,
             maintenance_report: false,
+            provisioner: false,
             all_catalogs: false,
             catalogs: vec!["pg".to_string(), "work".to_string()],
             catalog_access: [("pg", Access::Write), ("work", Access::Write)]
@@ -1648,7 +1674,7 @@ mod tests {
         assert_eq!(
             format_key_record(&record),
             "claude\tclaude-code-tui\tcredential-id\twrite\tactive\tpg,work\tdefault pg\t\
-             maintenance_report false\tuser -"
+             maintenance_report false\tprovisioner no\tuser -"
         );
         assert!(format_key_record(&assigned).ends_with("\tuser alice"));
     }
@@ -2221,5 +2247,48 @@ mod tests {
         let error = run(cli(None, serve), fixed_now()).await.unwrap_err();
 
         assert!(error.to_string().contains("DATABASE_URL"));
+    }
+    #[test]
+    fn key_create_provisioner_takes_no_grants_or_access() {
+        let ok = Cli::try_parse_from([
+            "okf-mcp",
+            "key",
+            "create",
+            "signup",
+            "--provisioner",
+            "--user",
+            "alice",
+        ]);
+        let with_catalogs = Cli::try_parse_from([
+            "okf-mcp",
+            "key",
+            "create",
+            "signup",
+            "--provisioner",
+            "--catalogs",
+            "main",
+            "--user",
+            "alice",
+        ]);
+        let with_access = Cli::try_parse_from([
+            "okf-mcp",
+            "key",
+            "create",
+            "signup",
+            "--provisioner",
+            "--access",
+            "admin",
+            "--user",
+            "alice",
+        ]);
+        let plain_without_access =
+            Cli::try_parse_from(["okf-mcp", "key", "create", "k", "--all", "--user", "alice"]);
+
+        assert!(ok.is_ok());
+        assert!(with_catalogs.is_err() && with_access.is_err());
+        assert!(
+            plain_without_access.is_err(),
+            "--access is still required without --provisioner"
+        );
     }
 }

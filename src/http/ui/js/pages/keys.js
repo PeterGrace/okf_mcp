@@ -14,6 +14,7 @@
 import { h, pill, fact } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
+import { guard, once } from '../core/pending.js';
 import { toast } from '../core/toast.js';
 import { drawerTicket } from '../core/drawer.js';
 import { when } from '../core/format.js';
@@ -54,6 +55,7 @@ const COLUMNS = [
     { key: 'name', label: 'Name', sort: key => key.name,
       render: key => h('span', { class: 'key-name', 'data-test': `key-${key.name}` }, key.name,
           isMine(key) ? [' ', pill('you', 'info')] : null,
+          key.provisioner ? [' ', h('span', { 'data-test': `key-provisioner-${key.name}` }, pill('provisioner', 'warn'))] : null,
           isGrant(key)
               ? [' ', pill('OAuth', 'info'), ' ', h('span', { class: 'muted small client-name' }, key.client_name ?? 'unknown client')]
               : null) },
@@ -207,19 +209,28 @@ async function newKey(main, reload) {
     const ticket = drawerTicket(main);
     const users = await usersOrNull();
     if (!users || !ticket.current()) return;
+    const provisioner = guard(h('input', { type: 'checkbox', name: 'provisioner', role: 'switch' }), 'key:new', store.whoami.all_catalogs);
+    const reach = h('fieldset', { class: 'key-reach' },
+        h('label', {}, 'Access', h('select', { name: 'access' }, LEVELS.map(level => h('option', { value: level }, level)))),
+        catalogFields(),
+        h('label', {}, h('input', { type: 'checkbox', name: 'maintenance_report', role: 'switch' }), ' May submit maintenance reports'));
+    provisioner.addEventListener('change', () => { reach.disabled = provisioner.checked; });
     const form = h('form', { id: 'key-form' },
         h('label', {}, 'Name', h('input', { name: 'name', required: true, autocomplete: 'off', placeholder: 'letters, digits, . _ -' })),
         h('label', {}, 'Actor', h('input', { name: 'actor', autocomplete: 'off', placeholder: 'defaults to the name' })),
         userField(users),
-        h('label', {}, 'Access', h('select', { name: 'access' }, LEVELS.map(level => h('option', { value: level }, level)))),
-        catalogFields(),
-        h('label', {},
-            h('input', { type: 'checkbox', name: 'maintenance_report', role: 'switch' }), ' May submit maintenance reports'),
-        h('button', { type: 'submit' }, 'Create key'));
+        h('label', {}, provisioner, ' Provisioner (no catalog access)'),
+        reach,
+        guard(h('button', { type: 'submit' }, 'Create key'), 'key:new'));
     form.addEventListener('submit', async event => {
         event.preventDefault();
         const data = new FormData(form);
-        const body = {
+        const body = provisioner.checked ? {
+            name: String(data.get('name') ?? '').trim(),
+            provisioner: true,
+            actor: String(data.get('actor') ?? '').trim() || null,
+            user: String(data.get('user') ?? ''),
+        } : {
             name: String(data.get('name') ?? '').trim(),
             access: String(data.get('access') ?? 'read'),
             ...readGrants(data),
@@ -227,6 +238,7 @@ async function newKey(main, reload) {
             maintenance_report: data.get('maintenance_report') === 'on',
             user: String(data.get('user') ?? ''),
         };
+        await once('key:new', async () => {
         try {
             const created = await api.post('/keys', body);
             // The secret is shown even after navigating away: it exists only now.
@@ -239,6 +251,7 @@ async function newKey(main, reload) {
             });
             if (main.isConnected) await reload();
         } catch { /* the server's reason is toasted; the form stays filled */ }
+        });
     });
     ticket.open('New key', 'The secret is shown once, right after creation.', form);
 }

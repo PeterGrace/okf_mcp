@@ -5,8 +5,12 @@
 
 use std::sync::Arc;
 
-use axum::http::{header, HeaderValue, StatusCode};
+use crate::http::AppError;
+use axum::extract::{MatchedPath, Request};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware;
+use axum::middleware::Next;
+use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::Router;
 
@@ -29,6 +33,8 @@ mod maintenance;
 mod me;
 mod oauth;
 mod people;
+#[cfg(test)]
+mod provisioner_tests;
 mod search;
 mod settings;
 #[cfg(test)]
@@ -65,6 +71,7 @@ pub(crate) fn routes(app: &Arc<App>) -> Router<Arc<App>> {
         .merge(crate::http::oidc::api_routes())
         // `route_layer` covers the routes merged above and runs only when one
         // matched, so an unknown API path stays 404 rather than 401.
+        .route_layer(middleware::from_fn(provisioner_gate))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(app),
             require_principal,
@@ -153,6 +160,93 @@ pub(crate) fn require_every_catalog(principal: &Principal) -> Result<(), OkfErro
                 .to_string(),
         }),
     }
+}
+
+/// Every route a provisioner key may call, as `(method, matched template)`
+/// (spec Part 4). The one list: [`provisioner_gate`] refuses every other
+/// route before its handler runs, so adding a route never widens a
+/// provisioner by accident.
+pub(crate) const PROVISIONER_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/api/v1/users"),
+    ("GET", "/api/v1/users/{name}"),
+    ("POST", "/api/v1/users"),
+    ("PUT", "/api/v1/users/{name}/email"),
+    ("POST", "/api/v1/users/{name}/invite"),
+    ("DELETE", "/api/v1/users/{name}"),
+    ("GET", "/api/v1/teams/{name}"),
+    ("POST", "/api/v1/teams"),
+    ("PUT", "/api/v1/teams/{name}/members/{user}"),
+    ("DELETE", "/api/v1/teams/{name}/members/{user}"),
+    ("DELETE", "/api/v1/teams/{name}"),
+    ("PUT", "/api/v1/teams/{name}/suspension"),
+    ("POST", "/api/v1/catalogs"),
+    ("DELETE", "/api/v1/catalogs/{catalog}"),
+    ("PUT", "/api/v1/catalogs/{catalog}/member-access"),
+    ("GET", "/api/v1/audit"),
+];
+
+/// Whether a provisioner may call this route.
+///
+/// # Arguments
+/// * `method` - the request's method.
+/// * `template` - its matched route (`MatchedPath`), never the literal path.
+///
+/// # Returns
+/// `true` for an allow-listed pair.
+pub(crate) fn provisioner_may(method: &Method, template: &str) -> bool {
+    PROVISIONER_ROUTES
+        .iter()
+        .any(|(allowed, route)| method.as_str() == *allowed && template == *route)
+}
+
+/// axum middleware, inside `require_principal`: refuses a provisioner on
+/// every route that is not in [`PROVISIONER_ROUTES`].
+///
+/// # Returns
+/// The route's response, or 403.
+async fn provisioner_gate(request: Request, next: Next) -> Response {
+    let provisioner = request
+        .extensions()
+        .get::<Arc<Principal>>()
+        .is_some_and(|principal| principal.provisioner);
+    // `MatchedPath` holds the template with the `/api/v1` prefix (verified facts).
+    let allowed = {
+        request
+            .extensions()
+            .get::<MatchedPath>()
+            .is_some_and(|path| provisioner_may(request.method(), path.as_str()))
+    };
+    if provisioner && !allowed {
+        return AppError(OkfError::Forbidden {
+            reason: "a provisioner key may not call this route".to_string(),
+        })
+        .into_response();
+    }
+    next.run(request).await
+}
+
+/// Refuses all but a provisioner or an admin that reaches every catalog:
+/// the writes in [`PROVISIONER_ROUTES`].
+///
+/// # Errors
+/// As [`require_every_catalog`].
+pub(crate) fn require_manager(principal: &Principal) -> Result<(), OkfError> {
+    if principal.provisioner {
+        return Ok(());
+    }
+    require_every_catalog(principal)
+}
+
+/// Refuses all but a provisioner or an admin: the reads in
+/// [`PROVISIONER_ROUTES`].
+///
+/// # Errors
+/// As [`require_admin`].
+pub(crate) fn require_reader(principal: &Principal) -> Result<(), OkfError> {
+    if principal.provisioner {
+        return Ok(());
+    }
+    require_admin(principal)
 }
 
 /// Polls after an administrative change, so the key cache and the catalog

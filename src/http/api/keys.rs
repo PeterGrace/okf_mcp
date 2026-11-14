@@ -46,6 +46,8 @@ pub(crate) struct KeyView {
     pub client_name: Option<String>,
     /// Whether it may submit maintenance reports.
     pub maintenance_report: bool,
+    /// A provisioner reaches no catalog.
+    pub provisioner: bool,
     /// Granted every catalog, present and future.
     pub all_catalogs: bool,
     /// Granted catalogs, sorted (empty with `all_catalogs`).
@@ -78,6 +80,7 @@ impl From<KeyRecord> for KeyView {
             sha256: _,
             access,
             maintenance_report,
+            provisioner,
             all_catalogs,
             catalogs,
             catalog_access,
@@ -103,6 +106,7 @@ impl From<KeyRecord> for KeyView {
             kind: kind.as_str(),
             client_name,
             maintenance_report,
+            provisioner,
             all_catalogs,
             catalogs,
             catalog_access: catalog_access
@@ -158,20 +162,23 @@ struct CreateKeyBody {
     name: String,
     /// `read`, `write` or `admin`. A string, because `Access` has no serde
     /// derive; parsed with `Access::parse`.
-    access: String,
+    access: Option<String>,
+    /// A server-wide automation key, reaching no catalog.
+    #[serde(default)]
+    provisioner: bool,
     /// Grant every catalog, present and future.
     #[serde(default)]
-    all: bool,
+    all: Option<bool>,
     /// The catalogs to grant (without `all`).
     #[serde(default)]
-    catalogs: Vec<String>,
+    catalogs: Option<Vec<String>>,
     /// The default catalog (empty or absent: none).
     default_catalog: Option<String>,
     /// The actor (empty or absent: the name, as the CLI does).
     actor: Option<String>,
     /// May submit maintenance reports.
     #[serde(default)]
-    maintenance_report: bool,
+    maintenance_report: Option<bool>,
     /// The user it belongs to (required; must exist).
     user: String,
 }
@@ -238,7 +245,8 @@ pub(crate) fn manages_grants(
 /// # Returns
 /// As [`manages_grants`] for the record's grants.
 pub(crate) fn manages(principal: &Principal, record: &KeyRecord) -> bool {
-    manages_grants(principal, record.all_catalogs, &record.catalogs)
+    (!record.provisioner || matches!(principal.reach, Reach::All))
+        && manages_grants(principal, record.all_catalogs, &record.catalogs)
 }
 
 /// The grants a caller asks a new credential to have, checked against its
@@ -362,16 +370,67 @@ async fn list_keys(
 async fn create_key(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    audit: crate::store::audit::AuditActor,
     Json(body): Json<CreateKeyBody>,
 ) -> Result<Json<CreatedKeyView>, AppError> {
     require_admin(&principal)?;
-    let access = parse_access(&body.access)?;
+    if body.provisioner {
+        crate::http::api::require_every_catalog(&principal)?;
+        if body.access.is_some()
+            || body.all.is_some()
+            || body.catalogs.is_some()
+            || body.default_catalog.is_some()
+            || body.maintenance_report.is_some()
+        {
+            return Err(OkfError::Refused {
+                reason: "a provisioner key takes no access, catalogs, default or reporting flag"
+                    .to_string(),
+            }
+            .into());
+        }
+        let actor = body
+            .actor
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .unwrap_or(&body.name);
+        let created = key_rows::create_provisioner(
+            app.pool(),
+            &key_rows::NewProvisioner {
+                name: &body.name,
+                actor,
+                user: &body.user,
+            },
+            &audit,
+            app.clock().now(),
+        )
+        .await?;
+        let Json(key) = changed(&app, &principal, &created.id).await?;
+        return Ok(Json(CreatedKeyView {
+            key,
+            secret: created.key,
+        }));
+    }
+    let access = parse_access(
+        body.access
+            .as_deref()
+            .ok_or_else(|| OkfError::LimitExceeded {
+                limit: "access",
+                reason: "access is required without provisioner".to_string(),
+            })?,
+    )?;
+    let catalogs = body.catalogs.unwrap_or_default();
     // `filter` turns `Some("")` (an empty form field) into `None`.
     let default_catalog = body
         .default_catalog
         .as_deref()
         .filter(|name| !name.is_empty());
-    let grants = requested_grants(&principal, body.all, &body.catalogs, default_catalog)?;
+    let grants = requested_grants(
+        &principal,
+        body.all.unwrap_or(false),
+        &catalogs,
+        default_catalog,
+    )?;
     let actor = body
         .actor
         .as_deref()
@@ -381,7 +440,7 @@ async fn create_key(
     let new = NewKey {
         name: &body.name,
         access,
-        maintenance_report: body.maintenance_report,
+        maintenance_report: body.maintenance_report.unwrap_or(false),
         grants,
         default_catalog,
         actor,
@@ -1113,5 +1172,41 @@ mod tests {
         assert_eq!(refused["limit"], "maintenance_report", "{refused}");
         let (_, me) = send(&test, "GET", "/api/v1/whoami", Some(&mine.key), None).await;
         assert_eq!(me["maintenance_report"], false);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_keys_makes_a_provisioner_only_for_an_every_catalog_admin_and_with_no_grants() {
+        let test = app().await;
+        use crate::db::TEST_USER;
+        use crate::http::api::testing::every_catalog_admin;
+        use axum::http::StatusCode;
+        let root = every_catalog_admin(&test).await;
+        let scoped = keys(&test).await;
+        let body = json!({"name": "signup", "provisioner": true, "user": TEST_USER});
+
+        let (denied, _) = send(
+            &test,
+            "POST",
+            "/api/v1/keys",
+            Some(&scoped.admin),
+            Some(body.clone()),
+        )
+        .await;
+        let (mixed, _) = send(
+            &test,
+            "POST",
+            "/api/v1/keys",
+            Some(&root),
+            Some(
+                json!({"name": "s2", "provisioner": true, "catalogs": ["main"], "user": TEST_USER}),
+            ),
+        )
+        .await;
+        let (made, created) = send(&test, "POST", "/api/v1/keys", Some(&root), Some(body)).await;
+
+        assert_eq!(denied, StatusCode::FORBIDDEN);
+        assert_eq!(mixed, StatusCode::CONFLICT);
+        assert_eq!(made, StatusCode::OK);
+        assert_eq!(created["key"]["provisioner"], true);
+        assert!(created["secret"].as_str().unwrap().starts_with("okf_"));
     }
 }

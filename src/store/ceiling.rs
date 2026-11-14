@@ -508,13 +508,26 @@ async fn lock_entitlement_users(
 /// # Errors
 /// [`OkfError::UnknownName`] for an unknown user; [`OkfError::Database`].
 pub async fn entitlements(pool: &PgPool, user: &str) -> Result<Vec<Entitlement>, OkfError> {
-    let user_id = users::id_by_name(pool, user).await?;
+    let mut conn = pool.acquire().await?;
+    entitlements_in(&mut conn, user).await
+}
+
+/// Reads entitlements on the caller's connection, so a guarded detail read
+/// never borrows another pool slot while holding a user row lock.
+///
+/// # Errors
+/// As [`entitlements`].
+pub(crate) async fn entitlements_in(
+    conn: &mut PgConnection,
+    user: &str,
+) -> Result<Vec<Entitlement>, OkfError> {
+    let user_id = users::id_by_name(&mut *conn, user).await?;
     let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
         "SELECT c.name, e.access, e.created_at FROM user_catalogs e \
          JOIN catalogs c ON c.id = e.catalog_id WHERE e.user_id = $1 ORDER BY c.name",
     )
     .bind(&user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(rows
         .into_iter()
@@ -535,10 +548,12 @@ pub async fn entitlements(pool: &PgPool, user: &str) -> Result<Vec<Entitlement>,
 /// * `catalog` - the catalog.
 ///
 /// # Returns
-/// `true` for an admin that reaches every catalog (as M11's people routes
-/// need), today.
+/// `true` for a provisioner or an admin that reaches every catalog.
+/// Entitlement routes separately require an every-catalog admin.
 pub fn may_set_member_access(principal: &Principal, catalog: &str) -> bool {
-    matches!(principal.reach, Reach::All) && principal.level(catalog) == Some(Access::Admin)
+    principal.provisioner
+        || (matches!(principal.reach, Reach::All)
+            && principal.level(catalog) == Some(Access::Admin))
 }
 
 /// Caps a credential's levels by a ceiling.

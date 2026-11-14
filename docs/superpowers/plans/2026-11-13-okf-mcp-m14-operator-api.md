@@ -2596,9 +2596,11 @@ git commit -m "feat(users): deleting a user takes its credentials; catalogs and 
 
 ### Task 5: The provisioner key
 
+> **Corrected (issue #395, 2026-11-14).** Verified migration order against the shipped files: `0014_audit_row_locks.sql` stays unchanged; provisioner is `0015`, unlocks `0016`, maintenance audit `0017`. `create_provisioner` locks the actor, credential owner and target with `audit::lock_people` / `People::target` / `RowLock::KeyShare` before its insert, not `users::id_of` alone, so recording cannot invert user lock order. The gate computes a boolean before awaiting `next.run` (a closure borrowing the request makes the future non-Send). REST creation tracks optional conflicting fields, including explicit false/empty options; user detail explicitly suppresses keys/codes and holds the live target lock through its reads. Scoped admins cannot manage provisioner keys, despite the empty grant list. The invite guard precedes the missing-public-URL refusal. The browser journey must select the required user, perform the guarded write and verify the stored empty reach. `GET /audit` is reserved in the 16-entry list; Task 8a installs its reader. No credential-change store signatures change for Task 6c. `users::find` now accepts `impl PgExecutor`; `ceiling::entitlements_in` is the transaction-connection sibling of the unchanged pool-based `entitlements` API. Provisioner detail passes the transaction connection to both and returns empty credential lists directly, so its live target lock never holds one pool slot while borrowing another.
+
 **Files:**
 - Create: `migrations/0015_provisioner.sql`
-- Modify: `src/store/keys.rs` (`create_provisioner`, `KeyRecord.provisioner`, `list`), `src/auth.rs` (`Principal.provisioner`, `require_key`), `src/store/audit.rs` (`AuditActor::of`), `src/http/api/mod.rs` (allow-list, gate, `require_manager`, `require_reader`), `src/http/api/people.rs`, `src/http/api/catalogs.rs`, `src/store/ceiling.rs` (`may_set_member_access`), `src/http/api/keys.rs` (body, `KeyView.provisioner`), `src/cli.rs` (`KeyCreateArgs`, `run_key`, `format_key_record`), `src/http/ui/js/pages/keys.js`, `tests/admin_parity.rs`, `docs/operations.md`
+- Modify: `src/store/keys.rs` (`create_provisioner`, `KeyRecord.provisioner`, `list`), `src/auth.rs` (`Principal.provisioner`, `require_key`), `src/store/audit.rs` (`AuditActor::of`), `src/http/api/mod.rs` (allow-list, gate, `require_manager`, `require_reader`), `src/http/api/people.rs`, `src/http/api/catalogs.rs`, `src/store/ceiling.rs` (`may_set_member_access`, transaction-aware `entitlements_in`), `src/store/users.rs` (transaction-aware `find`), `src/mail/invite.rs` (guard before public URL check), `src/http/api/keys.rs` (body, `KeyView.provisioner`), `src/cli.rs` (`KeyCreateArgs`, `run_key`, `format_key_record`), `src/http/ui/js/pages/keys.js`, `tests/admin_parity.rs`, `docs/operations.md`
 - Test: `tests/ui_e2e/keys.rs`
 
 - [ ] **Step 1: Write the migration**
@@ -2861,6 +2863,7 @@ async fn an_admin_creates_a_provisioner_key_that_reaches_no_catalog() {
         ui.open("/keys");
         ui.click("#key-new");
         ui.fill("#key-form input[name=name]", "signup");
+        ui.select("#key-form select[name=user]", OWNER);
         ui.click("#key-form input[name=provisioner]");
         ui.wait_visible("#key-form fieldset.key-reach[disabled]");
         ui.click("#key-form button[type=submit]");
@@ -2923,7 +2926,10 @@ pub async fn create_provisioner(
         });
     }
     let mut tx = pool.begin().await?;
-    let user_id = users::id_of(&mut tx, new.user).await?;
+    let user_id = audit::lock_people(
+        &mut tx, audit,
+        &audit::People { target: Some((new.user, audit::RowLock::KeyShare)), ..Default::default() },
+    ).await?.expect("a named target is returned").0;
     let key = crate::keys::generate()?;
     let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO api_keys (name, sha256, access, maintenance_report, all_catalogs, actor, \
@@ -3029,13 +3035,13 @@ async fn provisioner_gate(request: Request, next: Next) -> Response {
         .get::<Arc<Principal>>()
         .is_some_and(|principal| principal.provisioner);
     // `MatchedPath` holds the template with the `/api/v1` prefix (verified facts).
-    let allowed = || {
+    let allowed = {
         request
             .extensions()
             .get::<MatchedPath>()
             .is_some_and(|path| provisioner_may(request.method(), path.as_str()))
     };
-    if provisioner && !allowed() {
+    if provisioner && !allowed {
         return AppError(OkfError::Forbidden {
             reason: "a provisioner key may not call this route".to_string(),
         })

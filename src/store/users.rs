@@ -275,7 +275,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<UserRecord>, OkfError> {
 /// The user called `name`.
 ///
 /// # Arguments
-/// * `pool` - the database.
+/// * `executor` - the database pool or the caller's transaction connection.
 /// * `name` - the user's name.
 ///
 /// # Returns
@@ -283,14 +283,17 @@ pub async fn list(pool: &PgPool) -> Result<Vec<UserRecord>, OkfError> {
 ///
 /// # Errors
 /// [`OkfError::UnknownName`] if there is none; [`OkfError::Database`].
-pub async fn find(pool: &PgPool, name: &str) -> Result<UserRecord, OkfError> {
+pub async fn find<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    name: &str,
+) -> Result<UserRecord, OkfError> {
     // A malformed name (a NUL, which Postgres refuses) names nobody.
     if !is_valid_name(name) {
         return Err(unknown(name));
     }
     sqlx::query_as::<_, UserRecord>(concat!(select_users!(), " WHERE u.name = $1"))
         .bind(name)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?
         .ok_or_else(|| unknown(name))
 }

@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
+use crate::store::audit::{self, Action, AuditActor, Entry, Target};
 use crate::store::catalogs::{self, bump_admin_generation, is_unique_violation};
 use crate::store::users;
 
@@ -161,6 +162,8 @@ pub struct KeyRecord {
     pub access: Access,
     /// Whether this key may submit maintenance reports.
     pub maintenance_report: bool,
+    /// A provisioner reaches no catalog; only the API allow-list is available.
+    pub provisioner: bool,
     /// Granted every catalog.
     pub all_catalogs: bool,
     /// Granted catalogs by name, sorted (empty with `all_catalogs`).
@@ -201,6 +204,7 @@ struct KeyRow {
     sha256: Option<Vec<u8>>,
     access: String,
     maintenance_report: bool,
+    provisioner: bool,
     all_catalogs: bool,
     catalogs: Vec<String>,
     default_catalog: Option<String>,
@@ -334,6 +338,92 @@ fn catalog_levels(new: &NewKey<'_>) -> Result<Vec<Option<&'static str>>, OkfErro
         .collect())
 }
 
+/// A provisioner key to create (spec Part 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewProvisioner<'a> {
+    /// Grouping name, `[A-Za-z0-9._-]+`.
+    pub name: &'a str,
+    /// The actor its changes are recorded as.
+    pub actor: &'a str,
+    /// The user it belongs to (must exist).
+    pub user: &'a str,
+}
+
+/// Creates a provisioner key: no catalogs, no default, `read` (never used:
+/// it reaches nothing), not a reporter, not self-issued. Bumps the
+/// administrative generation and records `key.created`, in one transaction.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `new` - its name, actor and user.
+/// * `audit` - who creates it.
+/// * `now` - the server clock.
+///
+/// # Returns
+/// Its id and the key itself (shown once).
+///
+/// # Errors
+/// [`OkfError::Refused`] for an invalid name or a live name and actor
+/// already taken; [`OkfError::UnknownName`] for an unknown user;
+/// [`OkfError::Io`] if the OS random source fails; [`OkfError::Database`].
+pub async fn create_provisioner(
+    pool: &PgPool,
+    new: &NewProvisioner<'_>,
+    audit: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<CreatedKey, OkfError> {
+    if !is_valid_name(new.name) {
+        return Err(OkfError::Refused {
+            reason: format!(
+                "key name {:?} must be letters, digits, '.', '_' and '-'",
+                new.name
+            ),
+        });
+    }
+    let mut tx = pool.begin().await?;
+    let user_id = audit::lock_people(
+        &mut tx,
+        audit,
+        &audit::People {
+            target: Some((new.user, audit::RowLock::KeyShare)),
+            ..Default::default()
+        },
+    )
+    .await?
+    .expect("a named target is returned")
+    .0;
+    let key = crate::keys::generate()?;
+    let inserted = sqlx::query_scalar::<_, String>(
+        "INSERT INTO api_keys (name, sha256, access, maintenance_report, all_catalogs, actor, \
+                               created_at, user_id, provisioner) \
+         VALUES ($1, $2, 'read', false, false, $3, $4, $5, true) RETURNING id",
+    )
+    .bind(new.name)
+    .bind(crate::keys::hash(&key).as_slice())
+    .bind(new.actor)
+    .bind(now)
+    .bind(&user_id)
+    .fetch_one(&mut *tx)
+    .await;
+    let id = live_name_or(inserted, new.name, new.actor)?;
+    audit::record(
+        &mut tx,
+        audit,
+        &Entry {
+            action: Action::KeyCreated,
+            target: Target::Key(&id),
+            person: Some(&user_id),
+            teams: &[],
+            details: serde_json::json!({"provisioner": true}),
+        },
+        now,
+    )
+    .await?;
+    bump_admin_generation(&mut tx).await?;
+    tx.commit().await?;
+    Ok(CreatedKey { id, key })
+}
+
 /// Creates a key and its grants, and bumps the administrative generation, in
 /// one transaction.
 ///
@@ -449,24 +539,7 @@ async fn insert_key(
     // Only the live name/actor constraint is a user-facing duplicate. A
     // `sha256` UNIQUE violation (a credential-hash collision) remains a
     // database error rather than being mislabeled as a taken name.
-    let id = match inserted {
-        Ok(id) => id,
-        Err(error)
-            if is_unique_violation(&error)
-                && error
-                    .as_database_error()
-                    .and_then(|db_error| db_error.constraint())
-                    == Some("api_keys_live_name_actor") =>
-        {
-            return Err(OkfError::Refused {
-                reason: format!(
-                    "an active key named {:?} with actor {:?} already exists",
-                    new.name, new.actor
-                ),
-            })
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let id = live_name_or(inserted, new.name, new.actor)?;
     // One statement for every grant: `unnest` of two arrays of equal length
     // gives one row per (catalog id, level) pair. A name given twice is one
     // grant (`ON CONFLICT DO NOTHING`); a NULL level is the key's own.
@@ -737,7 +810,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
     // arrays pair up; `COALESCE(g.access, k.access)` resolves a NULL level
     // to the key's own.
     let rows = sqlx::query_as::<_, KeyRow>(
-        "SELECT k.id, k.name, k.sha256, k.access, k.maintenance_report, k.all_catalogs, \
+        "SELECT k.id, k.name, k.sha256, k.access, k.maintenance_report, k.provisioner, k.all_catalogs, \
                 d.name AS default_catalog, k.actor, k.created_at, k.revoked_at, k.expires_at, \
                 k.kind, k.client_id, oc.client_name, u.name AS user, k.user_id, k.self_issued, \
                 COALESCE(array_agg(c.name ORDER BY c.name) FILTER (WHERE c.name IS NOT NULL), \
@@ -771,6 +844,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<KeyRecord>, OkfError> {
                 name: row.name,
                 sha256: row.sha256,
                 access: Access::parse(&row.access).expect("the schema checks api_keys.access"),
+                provisioner: row.provisioner,
                 maintenance_report: row.maintenance_report,
                 all_catalogs: row.all_catalogs,
                 catalogs: row.catalogs,
@@ -822,6 +896,32 @@ pub async fn set_maintenance_report_by_id(
     enabled: bool,
 ) -> Result<String, OkfError> {
     set_maintenance_report_with(pool, Selector::Exact(id), enabled).await
+}
+
+/// Maps only the live-name constraint to a user-facing duplicate refusal.
+fn live_name_or(
+    inserted: Result<String, sqlx::Error>,
+    name: &str,
+    actor: &str,
+) -> Result<String, OkfError> {
+    match inserted {
+        Ok(id) => Ok(id),
+        Err(error)
+            if is_unique_violation(&error)
+                && error
+                    .as_database_error()
+                    .and_then(|db_error| db_error.constraint())
+                    == Some("api_keys_live_name_actor") =>
+        {
+            Err(OkfError::Refused {
+                reason: format!(
+                    "an active key named {:?} with actor {:?} already exists",
+                    name, actor
+                ),
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The body of [`set_maintenance_report_target`] and [`set_maintenance_report_by_id`].
@@ -2930,5 +3030,128 @@ mod tests {
             before + 1,
             "only the revoke bumped"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provisioner_creation_is_audited_or_rolled_back() {
+        let db = test_db().await;
+        let new = NewProvisioner {
+            name: "signup",
+            actor: "signup",
+            user: crate::db::TEST_USER,
+        };
+        let before = catalogs::admin_generation(&db.pool).await.unwrap();
+        crate::http::api::testing::fail_on(&db.pool, "BEFORE INSERT ON audit_entries FOR EACH ROW")
+            .await;
+        assert!(
+            create_provisioner(&db.pool, &new, &AuditActor::cli(), now())
+                .await
+                .is_err()
+        );
+        assert!(list(&db.pool).await.unwrap().is_empty());
+        assert_eq!(catalogs::admin_generation(&db.pool).await.unwrap(), before);
+        crate::http::api::testing::allow(&db.pool, "audit_entries").await;
+        let created = create_provisioner(&db.pool, &new, &AuditActor::cli(), now())
+            .await
+            .unwrap();
+        let entries = crate::store::audit::testing::entries(&db.pool, "key.created").await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].target.as_deref(), Some(created.id.as_str()));
+        assert_eq!(entries[0].details, serde_json::json!({"provisioner": true}));
+        assert!(entries[0].teams.is_empty());
+        assert_eq!(
+            catalogs::admin_generation(&db.pool).await.unwrap(),
+            before + 1
+        );
+        assert!(matches!(
+            create_provisioner(&db.pool, &new, &AuditActor::cli(), now()).await,
+            Err(OkfError::Refused { .. })
+        ));
+        for bad in [
+            NewProvisioner {
+                name: "bad name",
+                ..new
+            },
+            NewProvisioner {
+                user: "unknown",
+                ..new
+            },
+        ] {
+            assert!(
+                create_provisioner(&db.pool, &bad, &AuditActor::cli(), now())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provisioner_key_has_no_grants_and_the_schema_keeps_it_so() {
+        let db = test_db().await;
+        crate::store::catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "main",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+
+        let created = create_provisioner(
+            &db.pool,
+            &NewProvisioner {
+                name: "signup",
+                actor: "signup",
+                user: crate::db::TEST_USER,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        let grant = sqlx::query(
+            "INSERT INTO key_catalogs (key_id, catalog_id) SELECT $1, id FROM catalogs WHERE name = 'main'",
+        )
+        .bind(&created.id)
+        .execute(&db.pool)
+        .await;
+        let flip = sqlx::query("UPDATE api_keys SET provisioner = false WHERE id = $1")
+            .bind(&created.id)
+            .execute(&db.pool)
+            .await;
+        let record = list(&db.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|k| k.id == created.id)
+            .unwrap();
+
+        assert!(record.provisioner);
+        assert!(record.catalogs.is_empty() && !record.all_catalogs);
+        assert!(grant.is_err(), "the trigger refuses a grant");
+        assert!(flip.is_err(), "the flag is fixed at creation");
+        for change in [
+            "access = 'admin'",
+            "all_catalogs = true",
+            "self_issued = true",
+            "maintenance_report = true",
+            "user_id = NULL",
+            "kind = 'oauth'",
+            "default_catalog_id = (SELECT id FROM catalogs WHERE name = 'main')",
+        ] {
+            let result = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE api_keys SET {change} WHERE id = $1"
+            )))
+            .bind(&created.id)
+            .execute(&db.pool)
+            .await;
+            assert!(result.is_err(), "invalid provisioner shape: {change}");
+        }
+        let principal = crate::auth::Principal::from(record);
+        assert!(principal.provisioner && !principal.reaches("main"));
     }
 }
