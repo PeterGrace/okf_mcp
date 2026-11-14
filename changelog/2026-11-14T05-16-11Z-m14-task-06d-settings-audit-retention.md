@@ -6,6 +6,9 @@
   to 3650), stored as a JSON number in the row the audit log's append-only
   trigger already reads. `settings set`, `PUT /api/v1/settings/{key}` and the
   Settings page take it like any other setting.
+- `store::audit::lock_actor(conn, actor)`: takes the user locks `record`
+  will take (the actor and its credential's owner, `FOR KEY SHARE`), so a
+  caller can take them before its own.
 - `store::audit::prune(pool, before)` and the constants
   `DEFAULT_RETENTION_DAYS`, `MIN_RETENTION_DAYS` and `MAX_RETENTION_DAYS`.
 - The daily prune: `App::prune_audit`, run from `poll` after the settings
@@ -43,12 +46,14 @@
 
 ## Notes
 
-- Lock order: `set` and `reset` both bump the administrative generation
-  (locking the `server_state` row) before touching any `server_settings`
-  row. `FOR UPDATE` cannot lock a row that does not exist yet, so this one
-  row serializes every settings write and makes `from` exact. `reset` first
-  deleted before bumping, which deadlocked against a concurrent `set` (PR
-  #416 review); two concurrency tests now cover a set and a reset of one
-  key, one with the interleaving forced.
+- Lock order in `set` and `reset`: the actor's user rows (the new
+  `audit::lock_actor`), then the `server_state` row (bumping the
+  administrative generation), then the `server_settings` row. Users before
+  `server_state` is `users::set_admin`'s order; `server_state` before the
+  setting serializes settings writes and makes `from` exact (`FOR UPDATE`
+  cannot lock a row that does not exist yet). The PR #416 review found two
+  deadlocks that set this order: `reset` deleting before it bumped (against
+  `set`), and the bump coming before `audit::record` locked the admin actor
+  (against `set_admin`). Forced-interleaving tests cover both.
 - The plan (Task 6d, and Task 9a's settings) carries dated
   `Corrected (issue #399)` notes for these differences.

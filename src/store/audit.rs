@@ -422,6 +422,41 @@ pub async fn record(
     .await?)
 }
 
+/// Locks the users [`record`] will lock for `actor`, the acting user and
+/// its credential's owner (`FOR KEY SHARE`, in id order), so a caller can
+/// take them before its own locks. `record` takes them through
+/// `audit_person` and `audit_credential` in the middle of the transaction;
+/// a function that locks a shared row first (`settings::set` and `reset`
+/// bump `server_state`) would then hold it while waiting on a user row,
+/// the reverse of `users::set_admin` (users, then `server_state`), and the
+/// two could deadlock. Called first, this keeps the order users first.
+///
+/// # Arguments
+/// * `conn` - the change's transaction (`&mut tx`), before its other locks.
+/// * `actor` - who will be recorded.
+///
+/// # Returns
+/// `Ok(())` once the rows are locked (none for the CLI or the system).
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn lock_actor(conn: &mut PgConnection, actor: &AuditActor) -> Result<(), OkfError> {
+    if actor.user_id.is_none() && actor.credential.is_none() {
+        return Ok(());
+    }
+    sqlx::query(
+        "SELECT 1 FROM users WHERE id IN ($1, \
+             (SELECT user_id FROM api_keys WHERE id = $2), \
+             (SELECT user_id FROM sign_in_codes WHERE id = $2)) \
+         ORDER BY id FOR KEY SHARE",
+    )
+    .bind(&actor.user_id)
+    .bind(&actor.credential)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// How entries name a team: its `audit_teams` id, which follows the team's
 /// immutable `teams.id`, so a later team with the same name is another id.
 ///

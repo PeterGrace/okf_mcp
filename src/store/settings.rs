@@ -23,9 +23,12 @@
 //! [`set`] and [`reset`] record each change in the audit log
 //! (`setting.changed`, `setting.cleared`) in their own transaction.
 //!
-//! Lock order: every settings write bumps `admin_generation` (locking the
-//! `server_state` row) before it reads or writes any `server_settings` row,
-//! so concurrent writes queue on that one row and never deadlock.
+//! Lock order, the same in [`set`] and [`reset`]: first the users the audit
+//! entry locks (the actor and its credential's owner, through
+//! [`audit::lock_actor`]), then the `server_state` row (bumping
+//! `admin_generation`), then the `server_settings` row. Users before the
+//! generation row is `users::set_admin`'s order too, and the generation row
+//! before the setting serializes settings writes.
 //!
 //! One function, `apply`, checks a value both when it is set (a bad one
 //! is refused with 422) and when it is loaded (a row this server cannot
@@ -581,10 +584,13 @@ pub async fn set(
     )
     .map_err(invalid)?;
     let mut tx = pool.begin().await?;
-    // The generation row first: every settings write takes its lock, so
-    // concurrent writes queue here, and the read below (a new statement,
-    // under READ COMMITTED) sees the one before, even when it inserted the
-    // row `FOR UPDATE` alone could not lock.
+    // Lock order (module docs): the actor's user rows, then the generation
+    // row, then the setting.
+    audit::lock_actor(&mut tx, actor).await?;
+    // Every settings write takes the generation row's lock, so concurrent
+    // writes queue here, and the read below (a new statement, under READ
+    // COMMITTED) sees the one before, even when it inserted the row
+    // `FOR UPDATE` alone could not lock.
     bump_admin_generation(&mut tx).await?;
     let previous: Option<Value> =
         sqlx::query_scalar("SELECT value FROM server_settings WHERE key = $1 FOR UPDATE")
@@ -652,9 +658,11 @@ pub async fn reset(
     now: DateTime<Utc>,
 ) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
-    // The generation row first, as in `set`: every settings write locks it
-    // before any `server_settings` row, so a concurrent set and reset queue
-    // there instead of each holding the row the other waits on (a deadlock).
+    // The same lock order as `set` (module docs): the actor's user rows,
+    // then the generation row, then the setting, so a concurrent set, reset
+    // or `users::set_admin` queue instead of each holding a row the other
+    // waits on (a deadlock).
+    audit::lock_actor(&mut tx, actor).await?;
     bump_admin_generation(&mut tx).await?;
     // `RETURNING value`: the deleted override, for the entry.
     let deleted: Option<Value> =
@@ -1573,5 +1581,134 @@ mod tests {
             );
         }
         assert_eq!(changed.len(), 20, "every round's set changed the value");
+    }
+
+    /// Which settings write [`a_settings_write_and_a_promotion_queue_on_the_admin_row`] races.
+    #[derive(Debug, Clone, Copy)]
+    enum Write {
+        Set,
+        Reset,
+    }
+
+    /// Races a settings write by admin `boss`'s console session against
+    /// `users::set_admin` promoting `alice`, with the interleaving forced:
+    /// a held session row of `alice` stops the promotion after it has
+    /// locked every admin row (`boss`'s included) and before it bumps the
+    /// generation; the settings write is started once the promotion waits,
+    /// and the hold released once both wait. Locking the generation row
+    /// before the actor's user row (as first shipped), the write would hold
+    /// `server_state` and wait on `boss`, the promotion hold `boss` and wait
+    /// on `server_state`: a deadlock Postgres aborts.
+    ///
+    /// # Returns
+    /// The settings write's result and the promotion's.
+    async fn a_settings_write_and_a_promotion_queue_on_the_admin_row(
+        pool: &sqlx::PgPool,
+        write: Write,
+    ) -> (Result<(), OkfError>, Result<bool, OkfError>) {
+        use crate::http::api::testing::wait_for_lock_waiters;
+        use crate::store::users::{self, tests::seed_user};
+        use std::time::Duration;
+        let boss = seed_user(pool, "boss", None).await;
+        let alice = seed_user(pool, "alice", None).await;
+        users::set_admin(pool, "boss", true, false).await.unwrap();
+        set(
+            pool,
+            SettingKey::MaxKeysPerUser,
+            "3",
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        crate::store::user_sessions::create(
+            pool,
+            &alice.id,
+            None,
+            "",
+            Duration::from_secs(3600),
+            now(),
+        )
+        .await
+        .unwrap();
+        let session = AuditActor {
+            source: audit::Source::Console,
+            credential: None,
+            user_id: Some(boss.id.clone()),
+            label: "boss".to_string(),
+            via: Via::Session,
+            operator: true,
+            provisioner: false,
+            ip: None,
+        };
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM user_sessions WHERE user_id = $1 FOR UPDATE")
+            .bind(&alice.id)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        // `tokio::spawn` runs each on its own task (and connection).
+        let promotion = tokio::spawn({
+            let pool = pool.clone();
+            async move { users::set_admin(&pool, "alice", true, false).await }
+        });
+        wait_for_lock_waiters(pool, 1).await;
+        let settings_write = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                match write {
+                    Write::Set => {
+                        set(&pool, SettingKey::MaxKeysPerUser, "4", &session, now()).await
+                    }
+                    Write::Reset => reset(&pool, SettingKey::MaxKeysPerUser, &session, now()).await,
+                }
+            }
+        });
+        wait_for_lock_waiters(pool, 2).await;
+        holder.commit().await.unwrap();
+        let wait = Duration::from_secs(30);
+        let write_result = tokio::time::timeout(wait, settings_write)
+            .await
+            .expect("the settings write finished within 30 s")
+            .expect("the settings task did not panic");
+        let promotion_result = tokio::time::timeout(wait, promotion)
+            .await
+            .expect("the promotion finished within 30 s")
+            .expect("the promotion task did not panic");
+        (write_result, promotion_result)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_admins_setting_change_and_a_concurrent_promotion_both_succeed() {
+        let db = test_db().await;
+
+        let (written, promoted) =
+            a_settings_write_and_a_promotion_queue_on_the_admin_row(&db.pool, Write::Set).await;
+
+        assert!(written.is_ok(), "{written:?}");
+        assert!(matches!(promoted, Ok(false)), "{promoted:?}");
+        let changed = audit::testing::entries(&db.pool, "setting.changed").await;
+        assert_eq!(
+            changed.last().unwrap().actor_person.as_deref(),
+            Some("boss")
+        );
+        assert_eq!(
+            load(&db.pool, &defaults()).await.unwrap().max_keys_per_user,
+            4
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_admins_setting_reset_and_a_concurrent_promotion_both_succeed() {
+        let db = test_db().await;
+
+        let (written, promoted) =
+            a_settings_write_and_a_promotion_queue_on_the_admin_row(&db.pool, Write::Reset).await;
+
+        assert!(written.is_ok(), "{written:?}");
+        assert!(matches!(promoted, Ok(false)), "{promoted:?}");
+        let cleared = audit::testing::entries(&db.pool, "setting.cleared").await;
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].actor_person.as_deref(), Some("boss"));
     }
 }
