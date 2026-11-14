@@ -424,6 +424,12 @@ A new error kind, `UnlockRequired` (403), for operator access without an
 active unlock: `{"error": "UnlockRequired", "message", "catalog"}`, with a
 message that says how to unlock. It is checked after reach, level and
 suspension (milestone 13), and only on a catalog the credential reaches.
+*(Qualified, milestone 13 merged, 2026-11-14: as milestone 13 shipped
+suspension, a tool that picks its catalog through the selection before
+checking its own level (`open_changeset`, `maintenance_dispose`, the
+maintenance work tools) refuses a locked catalog at the selection, so a
+credential below that tool's level gets `UnlockRequired` rather than
+`Forbidden`. Reach is still checked first everywhere.)*
 
 ### Recording and telling the customer
 
@@ -481,10 +487,12 @@ in `docs/operations.md`'s parity table (`tests/admin_parity.rs` enforces it):
 
 ## Order relative to milestone 13
 
-*My call:* milestone 13 (team suspension) merges first. This milestone's
-migrations start at `0012`, the provisioner's allow-list includes
-`PUT /api/v1/teams/{name}/suspension`, and `team.suspended` and
-`team.unsuspended` are instrumented here.
+Milestone 13 (team suspension) has merged (2026-11-14), as planned. This
+milestone's migrations start at `0012`, the provisioner's allow-list
+includes `PUT /api/v1/teams/{name}/suspension`, and `team.suspended` and
+`team.unsuspended` are instrumented here. The plan was checked against what
+milestone 13 shipped ("Verified facts" and its `Corrected (M13 merged)`
+notes).
 
 ## Delivery order (for the plan)
 

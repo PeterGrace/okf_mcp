@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. In this project each task is one GitHub sub-issue and one PR (`github-issue-to-pr`); a lettered task (6a, 6b, ...) is its own sub-issue and PR.
 
-> **Depends on milestone 13 (team suspension, epic #362, sub-issues #363-#370).** This plan assumes the M13 plan (`docs/superpowers/plans/2026-11-13-okf-mcp-m13-team-suspension.md`) is implemented as written before Task 1 starts: migration `0011`, `OkfError::Suspended`, `Principal.suspended`, `Principal::check_not_suspended`, `Principal::require_export`, `require = require_level + check_not_suspended`, the selection rules, `teams::suspend` / `unsuspend` and `PUT /api/v1/teams/{name}/suspension`. Every M13 symbol used below is listed in "Verified facts" as "from the M13 plan, Task N". They are not on `main` yet; the founder revisits this plan's accuracy once M13 delivers. If an M13 symbol shipped under another name, correct this plan first (see Conventions).
+> **Builds on milestone 13 (team suspension, epic #362, sub-issues #363-#370), which has merged** (`main` at `4b7fcf1`). This plan was first written against the M13 plan; it has since been checked against what M13 shipped (the code on `main`, the dated `Corrected` and `Qualified` notes in `docs/superpowers/plans/2026-11-13-okf-mcp-m13-team-suspension.md`, and "What shipped differently" in its spec). Every M13 symbol used below is in "Verified facts" with its file and line on `4b7fcf1`; places that changed because of what M13 shipped carry a dated `Corrected (M13 merged, 2026-11-14)` note. *(Corrected, M13 merged, 2026-11-14: this note assumed the M13 plan "implemented as written".)*
 
 **Goal:** An operator's own tooling can drive okf-mcp safely and leave a trail: the product name people see is the operator's; a user can be found by email and deleted in one call; a narrow "provisioner" key manages accounts, teams and catalogs but can read nothing; every administrative change, catalog write, export and admin read of other people's data is in a stored, append-only audit log that admins read in full and team owners read for their team; and, on a server that turns it on, operator staff must unlock a customer's catalog (with a reason and a time limit) before opening it.
 
@@ -34,41 +34,53 @@
 
 ## Verified facts the code relies on
 
-Checked against `origin/main` at `9a84af6` (v0.15.0) on 2026-11-13, plus the merged M13 plan. Line numbers are on that commit; M13 moves some of them.
+Checked against `origin/main` at `4b7fcf1` (all of M13 merged) on 2026-11-14; line numbers are on that commit. *(Corrected, M13 merged, 2026-11-14: first checked at `9a84af6`, v0.15.0, plus the M13 plan. Facts in files M13 did not touch kept their line numbers; the others were re-read and updated.)*
 
-**From the M13 plan (not yet on `main`):**
-- Migration `0011_team_suspension.sql`, so this milestone's migrations are `0012` to `0016` (M13 plan, Task 1).
-- `teams::suspend(pool, name, notice, now)` and `teams::unsuspend(pool, name)`, each locking the team with `lock_team` and bumping `admin_generation` (M13 plan, Task 1).
-- `OkfError::Suspended { catalog, team, notice }`, kind `"Suspended"`, 403 (M13 plan, Task 2).
-- `Principal.suspended: Arc<Suspensions>`, `Principal::suspension`, `check_not_suspended`, `require_export`, and `require` = private `require_level` + `check_not_suspended`; `KeyCache::from_records(records, ceilings, suspended, now)`; `Principal::for_session(user, ceiling, suspended)`; `Keys::suspensions()` (M13 plan, Task 3). Export calls `require_export` (`src/http/archives.rs`, M13 plan Task 3 Step 4).
-- `selection::resolve` routes named catalogs through `refuse_suspended` and a connection list through `without_suspended`, both calling `principal.check_not_suspended` (M13 plan, Task 4 Step 3); the REST search and `list_changesets` filter with `check_not_suspended` (M13 plan, Task 4 Steps 4 and 5b).
-- `PUT /api/v1/teams/{name}/suspension` (`set_suspension` in `src/http/api/people.rs`, `require_every_catalog`, then `settle`) and `TeamView.suspended_at` / `suspension_notice` (M13 plan, Task 5); `okf-mcp team suspend NAME [--notice]` and `team unsuspend NAME` in `src/cli/people.rs` (M13 plan, Task 6).
+**What M13 shipped (on `main`):**
+- Migration `0011_team_suspension.sql`, so this milestone's migrations are `0012` to `0016`.
+- `teams::suspend(pool: &PgPool, name: &str, notice: Option<&str>, now) -> Result<TeamRecord, OkfError>` and `teams::unsuspend(pool: &PgPool, name: &str) -> Result<TeamRecord, OkfError>` (no `now`) (`src/store/teams.rs:482-504`, `:518-534`). Each opens its own transaction, takes `lock_team` (which returns only `LockedTeam { id, personal_of }`, `:564-569`, `:581-594`), runs one `UPDATE`, bumps `admin_generation` (`unsuspend` only when `rows_affected() > 0`), commits, then answers `find(pool, name)` after the commit. `suspend` keeps the first `suspended_at` with `COALESCE` and does not read whether the team was already suspended. `clean_notice` (`:446-464`, private) runs before the transaction: it trims, turns a blank notice into `None`, and refuses (`Refused`) a notice holding a NUL or over `MAX_NOTICE_CHARS` (2000, `:107`).
+- Malformed team names are unknown: `teams::find` (`:281-286`), `lock_team` (`:581-585`) and `teams::id_of` (`:680-684`) refuse a name that fails `catalogs::is_valid_name` (`[a-z0-9-]+`, `src/store/catalogs.rs:52`) with `UnknownName` before any SQL, so a NUL in a team name is a 404, never a 500 (the team part of #339, M13 issue #367).
+- `TeamRecord.suspension: Option<Suspension { since, notice }>` (`src/store/teams.rs:78-93`, `:111-116`); `SuspendedCatalog { team, notice }` (`:120-125`); `teams::suspended_catalogs(pool)` (`:547-561`).
+- `OkfError::Suspended { catalog, team, notice: Option<String> }`, kind `"Suspended"`, 403; its body adds `catalog`, `team` and `notice` (`null` without one) (`src/error.rs:157`, `:315`, `:413`). `suspended_message` takes `Option<&str>`.
+- `pub type Suspensions = HashMap<String, SuspendedCatalog>` (`src/auth.rs:76`); `Principal.suspended: Arc<Suspensions>` (the last field, `:108`); `Principal::suspension(catalog)` (`:182`); `check_not_suspended(catalog)`, which lets any `access == Admin` principal through (`:195-207`); the private `require_level` (reach, then level, `:151-170`); `require` = `require_level` + `check_not_suspended` (`:223-226`); `require_export` = `require_level(Read, ..)` only (`:237-239`). `Principal::for_session(user: &UserAuth, ceiling: Ceiling, suspended: Arc<Suspensions>)` (`:258-280`; `actor: user.name.clone()` at `:273`). `principal_of(record, ceilings, suspended)` (`:391-421`); `KeyCache::from_records(records, ceilings, suspended: Arc<Suspensions>, now)` (`:438-491`); `KeyCache::read` loads keys, ceilings, users and `teams::suspended_catalogs` in one `tokio::try_join!` of four (`:521-533`); `Keys::suspensions() -> Arc<Suspensions>` (`:667-675`).
+- `console_session::session_principal` builds a session principal in two places, each passing `app.keys().suspensions()` (`src/http/console_session.rs:265-290`).
+- Export calls `principal.require_export(&name)` (`src/http/archives.rs:112`): suspension never blocks it. Import keeps `require(Access::Admin, ..)` (`:184`).
+- Selection: `refuse_suspended` (named catalogs and the default, `src/selection.rs:178-183`) and `without_suspended` (a connection list: drops suspended catalogs, refuses with the first refusal only when none is left, `:198-216`), both calling `principal.check_not_suspended`, inside `resolve` (`:244-287`). Reach is checked first, so a credential that does not reach a catalog never learns it is suspended. *M13 Decision 2, as qualified (#366):* `Principal::require` checks reach, level, then suspension, but a tool that selects its catalog before checking its own level (`open_changeset`, `maintenance_dispose`, the maintenance work tools) refuses a suspended catalog at the selection, so a key below the tool's level gets 403 `Suspended`, not `Forbidden`.
+- `ToolContext::check_connection` goes through `self.select(None)` (`src/mcp/context.rs:158-165`), so a connection whose every listed catalog is suspended is refused with `Suspended` by `list_changesets` without `catalog` and by every changeset handle on that connection (`ToolContext::changeset` calls `check_connection` first, `:360`).
+- The REST search's unnamed list (`src/http/api/search.rs:79`) and `list_changesets`' unnamed list (`src/mcp/changesets.rs:128-130`) filter with `check_not_suspended(name).is_ok()`; a search whose every reached catalog is suspended falls back to the key's default, which is then refused as named.
+- `CatalogSummary::of(name, state, principal)` takes the caller and fills `suspended` (`src/http/api/catalogs.rs:54-73`, `:84`); `POST /api/v1/catalogs`' answer reads `suspended` from `app.keys().suspensions()` after `settle`.
+- `PUT /api/v1/teams/{name}/suspension`: `set_suspension` (`src/http/api/people.rs:835-849`, routed at `:379`), `require_every_catalog`, then `teams::suspend` or `unsuspend`, then `settle`; body `SuspensionBody { suspended, notice? }` with `deny_unknown_fields` (`:306-316`). 404 unknown or malformed team, 409 bad notice, 422 missing `suspended` or unknown field. `TeamView.suspended_at` / `suspension_notice` (`:200-217`).
+- `okf-mcp team suspend NAME [--notice TEXT]` (prints `suspended team NAME`) and `team unsuspend NAME` (prints `lifted the suspension of team NAME`) (`src/cli.rs:385-400`, `src/cli/people.rs:188-197`). `team list` gained a `suspended TIME` cell (`-` when active) after `catalogs`, so the display name moved from field 5 to field 6 (`format_team`, `src/cli/people.rs:427-449`). `COVERED` lists both (`tests/admin_parity.rs:47-48`).
+- `docs/operations.md`'s API reference counts 88 endpoints, "Users and teams" 21 (`docs/operations.md:1872-1880`).
+- Console: `core/api.js` toasts a 403's own message only for `Suspended` (`generic = status === 403 && error !== 'Suspended'`, `src/http/ui/js/core/api.js:54-57`). `pages/browse.js` shows `#browse-suspended` from the tree fetch's `catch (error)` through `showSuspended(view, catalog, body)` (`:58-63`, `:78-88`). The team drawer (`pages/teams.js`) follows `tools/agentic/lessons.md`'s console rules: `openDetail(name, ticket, { known, refusal, last })` numbers its reads and draws only the newest; `changed(name, team, { message, refusal })` redraws whichever drawer shows that team now, taking the draw number as the write settles; its suspension controls are `guard`ed by the pending-write key `team:<name>:suspension` and the PUT runs under `once`; it settles the team and the users read separately (`Promise.allSettled`) and marks only a failed part out of date (`#team-stale`). `pages/keys.js`' key and code drawers got the same numbering: `nextDraw(ticket)` (per-ticket `WeakMap`), `usersOr(previous)`, `showKey(main, key, reload, ticket, previous, draw)` (`:182-203`, `:252`). `pages/catalogs.js`' `memberAccess` (`:158-251`) is the model for a drawer section with one guarded write (`guard`, `once`, `recheck`, a numbered `refresh`, a kept refusal, a section registry so a settled save redraws the drawer that shows that catalog now). The "suspended" pills use `pill('suspended', 'error')` (`core/dom.js`' `pill` has no `danger` kind).
+- Shared test helpers M14 tests should reuse: `mcp::testing::{suspend_catalogs, lift_suspension, stored_secret, cached_principal, SUSPENDED_TEAM, SUSPENSION_NOTICE}` (`src/mcp/testing.rs:344-448`; `suspend_catalogs` creates team `family` owned by `TEST_USER`, moves the named catalogs to it, suspends it and polls; `stored_secret(test, name, access, reach, maintenance_report)` stores an admin-issued key of `TEST_USER` and polls; `cached_principal(test, secret)` is the principal the key cache holds for it) and `http::api::testing::{Expect, assert_answers}` (a status and error kind per request, `src/http/api/testing.rs:220-257`). In `src/auth.rs`' tests, M13's principal helper is `key_on(catalogs, access, suspended)` (`:1678-1690`; note `maintenance_report: true`) with `suspended_on(&[..])` (`:1659-1675`). `selection.rs`' tests build principals with `principal_with(reach, default, suspended)` (`:299`). Because `suspend_catalogs` takes the name `family`, an M14 test that also creates a team `family` must not call it.
+- `tools/agentic/lessons.md` gained, during M13 (PR #384): console write guards by a pending-write key; numbered reads and redraws, with the redraw's number taken as the write settles and scoped to the drawer or object it updates; a failed side read never discarding a write's answer; and "a test that a JSON field is `null` checks the key is there" (`body.get("k") == Some(&Value::Null)`, never `body["k"] == Null`).
 
-**On `main`:**
-- `Principal` has `key_id, access, maintenance_report, reach, default_catalog, actor, kind, user` (user *name*) and no user id (`src/auth.rs:76-99`). `KeyRecord.user_id` exists (`src/store/keys.rs:190-191`); `From<KeyRecord>` drops it (`src/auth.rs:216-243`). A session's user id is in `CredentialKind::Session { user_id }` (`src/auth.rs:67-70`). `grep -rn "Principal {" src tests` finds 12 literals.
-- `Principal::require` is used by administrative routes that read no content: catalog description, member access and delete (`src/http/api/catalogs.rs:244`, `:322`, `:379`), key grants (`src/http/api/keys.rs:281`, `:286`, `:464`, `:481`). Content routes that check access themselves: `src/http/api/browse.rs:328` (a revision read), export and import (`src/http/archives.rs:110`, `:182`), `open_changeset` (`src/mcp/changesets.rs:235`), `ToolContext::changeset` (`src/mcp/context.rs:384`), and the maintenance tools after `ctx.one` (`src/mcp/maintenance/work.rs:90-91`, `reports.rs:76`).
-- `selection::resolve(principal, sources, exists)` and `Sources { argument, connection, server_default }` (`src/selection.rs:54-61`, `:182-188`); `ToolContext::select` builds `Sources` (`src/mcp/context.rs:160-175`).
+**On `main` (unchanged by M13 unless a line number says otherwise):**
+- `Principal` has `key_id, access, maintenance_report, reach, default_catalog, actor, kind, user` (user *name*), M13's `suspended`, and no user id (`src/auth.rs:78-109`). `KeyRecord.user_id` exists (`src/store/keys.rs:190-191`); `From<KeyRecord>` drops it (`src/auth.rs:299-329`). A session's user id is in `CredentialKind::Session { user_id }` (`src/auth.rs:67-71`). `grep -rn "Principal {" src tests` finds 16 lines: 8 struct literals (`src/http/archives.rs:310`, `src/auth.rs:954`, `:963`, `:1020`, `:1679`, `src/selection.rs:300`, `:714`, `src/mcp/testing.rs:128`) plus the definition, `impl` lines and helper signatures; `From<KeyRecord>` and `for_session` build theirs with `Self {`.
+- `Principal::require` is used by administrative routes that read no content: catalog description, member access and delete (`src/http/api/catalogs.rs:260`, `:338`, `:395`), key grants (`src/http/api/keys.rs:281`, `:286`, `:464`, `:481`). Content routes that check access themselves: `src/http/api/browse.rs:328` (a revision read), export (`require_export`) and import (`src/http/archives.rs:112`, `:184`), `open_changeset` (`src/mcp/changesets.rs:243`), `ToolContext::changeset` (`src/mcp/context.rs:386`), and the maintenance tools after `ctx.one` (`src/mcp/maintenance/work.rs:90-91`, `reports.rs:76`); `maintenance_close`'s operator override is `require(Access::Write, ..).is_ok()` (`work.rs:172`).
+- `selection::resolve(principal, sources, exists)` and `Sources { argument, connection, server_default }` (`src/selection.rs:57-64`, `:244-248`); `ToolContext::select` builds `Sources` (`src/mcp/context.rs:177-188`). `grep -rn "Sources {" src tests` finds 25 literals (24 in `selection.rs`' tests).
 - `ToolContext { app, principal, connection, catalogs }`, built by `ToolContext::new` and `from_parts` (`src/mcp/context.rs:51-109`); REST builds one with `api::context(app, principal)` (`src/http/api/mod.rs:109`), 18 callers in `health.rs`, `changesets.rs`, `browse.rs`, `maintenance.rs` and `search.rs`.
 - `require_admin` (`access >= Admin`), `require_every_catalog` (admin and `Reach::All`) and `settle` (`src/http/api/mod.rs:121`, `:140`, `:159`). The API router puts `require_principal` in a `route_layer` (`src/http/api/mod.rs:66-72`) and is nested at `/api/v1` (`src/http/mod.rs:268`).
 - axum 0.8.9: inside a nested router's layer, `MatchedPath` holds the full template, outer prefix included (`axum-0.8.9/src/extract/matched_path.rs:278-317`); this server already logs `/api/v1/users/{name}/sessions/{id_prefix}` from it (`src/http/mod.rs:291-302`). `FromRequestParts<S>::from_request_parts(parts, state) -> impl Future + Send` (`axum-core-0.5.6/src/extract/mod.rs:53-63`).
-- `require_principal` inserts `Arc<Principal>` for a bearer credential, and also a `ConsoleSession` for a cookie (`src/http/console_session.rs:306-359`); `require_key` does the same for MCP and the archive routes (`src/auth.rs:710-731`). `client_ip(parts, &config.auth)` honours `trusted_proxy_header` (`src/http/console_session.rs:100-110`). IPs are stored by binding text and casting `$n::inet` (`src/store/sign_in_events.rs:182-191`).
-- `KeyCache::read` loads keys, ceilings and users with `tokio::try_join!` (`src/auth.rs:418-429`); `App::reload_keys_if_changed` reloads keys then settings when `admin_generation` moves (`src/app.rs:428-458`).
+- `require_principal` inserts `Arc<Principal>` for a bearer credential, and also a `ConsoleSession` for a cookie (`src/http/console_session.rs:313-366`); `require_key` does the same for MCP and the archive routes (`src/auth.rs:829-850`). `client_ip(parts, &config.auth)` honours `trusted_proxy_header` (`src/http/console_session.rs:100-110`). IPs are stored by binding text and casting `$n::inet` (`src/store/sign_in_events.rs:182-191`).
+- `KeyCache::read` loads keys, ceilings, users and (M13) suspended catalogs with `tokio::try_join!` (`src/auth.rs:521-533`); `App::reload_keys_if_changed` reloads keys then settings when `admin_generation` moves (`src/app.rs:428-458`).
 - `users::delete` refuses while any credential names the user, it is in another team, or its personal team owns a catalog; it locks the user, then the personal team (`src/store/users.rs:666-730`). The schema makes `api_keys.user_id`, `sign_in_codes.user_id` and `team_members.user_id` `ON DELETE RESTRICT`, `teams.personal_of` `RESTRICT` (`migrations/0009_users_teams.sql:20`, `:25`, `:35-38`). Postgres names an unnamed column foreign key `<table>_<column>_fkey`. Sessions, passkeys, identities, email tokens, sign-in events and entitlements already cascade (`migrations/0010_user_login.sql`). `changesets.key_id` is `ON DELETE SET NULL` (`migrations/0001_schema.sql:70`).
-- `users::set_admin` locks every admin row in id order, then the user (`src/store/users.rs:546-559`); `teams::set_member` resolves the user (`FOR KEY SHARE`) before locking the team (`src/store/teams.rs:286-290`).
-- `keys::insert_key` refuses an empty grant list through `resolve_grants` (`src/store/keys.rs:693-698`), and is shared by `create_with_id` and `create_self_issued` (`src/store/keys.rs:377-387`, `:511-556`). There are 46 `NewKey { ... }` literals, so the provisioner gets its own store function instead of a `NewKey` field.
+- `users::set_admin` locks every admin row in id order, then the user (`src/store/users.rs:546-559`); `teams::set_member` resolves the user (`FOR KEY SHARE`) before locking the team (`src/store/teams.rs:328-332`).
+- `keys::insert_key` refuses an empty grant list through `resolve_grants` (`src/store/keys.rs:693-698`), and is shared by `create_with_id` and `create_self_issued` (`src/store/keys.rs:377-387`, `:511-556`). There are 48 `NewKey { ... }` literals (M13 added two), so the provisioner gets its own store function instead of a `NewKey` field.
 - `keys::list` selects one row per key (`src/store/keys.rs:735-792`). `manages_grants` is vacuously true for a key with no catalogs and a caller with `Reach::Catalogs` (`src/http/api/keys.rs:219-230`).
-- `CreateKeyBody { name, access, all, catalogs, default_catalog, actor, maintenance_report, user }` (`src/http/api/keys.rs:156-177`); `KeyCreateArgs` requires `--access` and one of `--catalogs` / `--all` (`src/cli.rs:439-469`).
+- `CreateKeyBody { name, access, all, catalogs, default_catalog, actor, maintenance_report, user }` (`src/http/api/keys.rs:156-177`); `KeyCreateArgs` requires `--access` and one of `--catalogs` / `--all` (`src/cli.rs:455-485`).
 - `settings::Settings`, `SettingKey` (7 keys in `ALL`), `parse_value`, `apply`, `display`, `set(pool, key, value, by, now)` and `reset(pool, key)` (`src/store/settings.rs:35`, `:76-110`, `:174`, `:203`, `:246`, `:331`, `:376`). The CLI passes `by = "cli"` (`src/cli/admin.rs:22`, `:50`), the API `principal.actor` (`src/http/api/settings.rs:175-181`). The Settings page renders every row generically and special-cases `password_sign_in` as a boolean (`src/http/ui/js/pages/settings.js:83-99`).
 - Mail is rendered at enqueue time: `queue::enqueue_in` calls `render(template)` (`src/mail/queue.rs:170-177`); `render` hard-codes "okf" in four templates (`src/mail/templates.rs:119-180`). `pages::document(title, body, scripts)` hard-codes `- okf` and the brand line (`src/http/pages.rs:47-80`); `index.html` hard-codes `okf console` and two brand spans (`src/http/ui/index.html:6`, `:16`, `:31`). `ui::routes<S>()` is generic over the state, so it cannot read settings (`src/http/ui.rs:24-31`).
 - `catalogs::create`, `set_owner`, `update_description`, `delete(pool, name, force)` (`src/store/catalogs.rs:76`, `:138`, `:178`, `:267`); `ceiling::set_member_access`, `entitle`, `unentitle` (`src/store/ceiling.rs:247`, `:312`, `:363`); `ceiling::may_set_member_access` is "the one permission hook" (`src/store/ceiling.rs:410-423`); `import::import(pool, catalog, files, &ImportOptions { replace, scope, expect_generation, actor, now })` (`src/store/import.rs:36-48`, `:126`).
-- `store::publish::publish(app, state, changeset, actor, message)` writes revisions, bumps the catalog generation and sets `Published` in one transaction (`src/store/publish.rs:116-186`). MCP `discard` closes a changeset under publish's locks in its own transaction (`src/mcp/changesets.rs:494-553`); `revert` writes through `write::apply` (`src/mcp/changesets.rs:577-640`), whose transaction commits at `src/write.rs:188`.
+- `store::publish::publish(app, state, changeset, actor, message)` writes revisions, bumps the catalog generation and sets `Published` in one transaction (`src/store/publish.rs:116-186`). MCP `discard` closes a changeset under publish's locks in its own transaction (`src/mcp/changesets.rs:502-561`); `revert` writes through `write::apply` (`src/mcp/changesets.rs:585-648`), whose transaction commits at `src/write.rs:188`.
 - `store::export::export(pool, catalog, out)` reads in a read-only `REPEATABLE READ` transaction and compresses after it (`src/store/export.rs:36-71`).
 - Maintenance runs leave `running` in several places: `recover` (`src/store/maintenance/mod.rs:127-139`) and `runs.rs:283`, `:299`, `:529`, `:654`; every transition writes `ended_at` from the server clock. Findings carry `run_id` (`migrations/0006_maintenance.sql:62-80`).
 - The runner turns any `isError` tool result into `RunnerError::Permission` (`src/investigator/contract.rs:205-213`); `RunSummary::exit_code` is 0 only for reasons `completed` and `empty` (`src/investigator/types.rs:108-119`); `kind()` maps errors to reasons (`src/investigator/supervisor.rs:1052-1069`); the supervisor tests fail a tool with `c.fail = Some((tool, error))` (`src/investigator/supervisor_tests.rs:651-675`).
-- `tests/admin_parity.rs`: `COVERED`, `SCANNED_GROUPS = ["user", "team", "settings", "mail"]`, `parity_row` matching the first cell `` `okf-mcp <path>` ``, and the clap walk that splits `path` on spaces (`tests/admin_parity.rs:28-63`, `:84-100`, `:115-130`).
-- Test helpers: `crate::db::test_db()`, `TEST_USER` / `TEST_TEAM` (`src/db.rs:100-110`); `api::testing::{app, keys, every_catalog_admin, send, Browser, fail_on, allow}` (`src/http/api/testing.rs:39`, `:61`, `:101`, `:127`, `:340`, `:506`, `:524`); `Browser::session_for(test, name)` (`:459`). Test catalogs are owned by `TEST_TEAM`, and every `keys()` key belongs to `TEST_USER`.
+- `tests/admin_parity.rs`: `COVERED`, `SCANNED_GROUPS = ["user", "team", "settings", "mail"]`, `parity_row` matching the first cell `` `okf-mcp <path>` ``, and the clap walk that splits `path` on spaces (`tests/admin_parity.rs:28-65`, `:86-102`, `:117-132`).
+- Test helpers: `crate::db::test_db()`, `TEST_USER` / `TEST_TEAM` (`src/db.rs:100-110`); `api::testing::{app, keys, every_catalog_admin, send, Browser, fail_on, allow}` (`src/http/api/testing.rs:39`, `:61`, `:101`, `:127`, `:381`, `:547`, `:565`); `Browser::session_for(test, name)` (`:500`). Test catalogs are owned by `TEST_TEAM`, and every `keys()` key belongs to `TEST_USER`.
 - tokio 1.54 `JoinSet::spawn`, `try_join_next`, `join_next` (`tokio-1.54.1/src/task/join_set.rs:142`, `:296`, `:323`). `tokio-util` is built without its `rt` feature (`Cargo.toml:112`), so there is no `TaskTracker`; `JoinSet` is used instead. chrono 0.4.45 `DurationRound::duration_trunc` (`chrono-0.4.45/src/round.rs:106-159`, re-exported at `lib.rs:574`).
-- `ui_e2e` harness: `drive`, `login`, `sign_in_password`, `open`, `click`, `fill`, `select`, `wait_text`, `wait_visible`, `wait_hidden`, `wait_text_gone` (`tests/ui_e2e/harness.rs:90-236`); `TestServer::key`, `user_with_password`, `reporter_key`, `app` (`tests/support/server.rs:223`, `:302`, `:329`, `:90`); fixture owner `OWNER = "tester"` (`:44`).
+- `ui_e2e` harness: `drive`, `login`, `sign_in_password`, `open`, `click`, `fill`, `select`, `wait_text`, `wait_visible`, `wait_hidden`, `wait_text_gone` (`tests/ui_e2e/harness.rs:90-236`), and the hooks `tools/agentic/lessons.md`' console rules test with: `hold_next`, `hold_answer`, `held_matches`, `release_held`, `fail_next`, `click_twice`, `mark`, `wait_redrawn` (`:248-358`); `TestServer::key`, `user_with_password`, `reporter_key`, `app` (`tests/support/server.rs:223`, `:302`, `:329`, `:90`); fixture owner `OWNER = "tester"` (`:44`).
 
 ## Interfaces shared across tasks
 
@@ -1215,13 +1227,20 @@ pub async fn record(
 /// Its `audit_teams` id.
 ///
 /// # Errors
-/// [`OkfError::UnknownName`]; [`OkfError::Database`].
+/// [`OkfError::UnknownName`] (a malformed name included); [`OkfError::Database`].
 pub async fn team_ref(conn: &mut PgConnection, team: &str) -> Result<i64, OkfError> {
+    let unknown = || OkfError::UnknownName { noun: "team", name: team.to_string() };
+    // As M13 made `teams::find`, `lock_team` and `id_of` do (#339): a
+    // malformed name (a NUL, which Postgres refuses) names no team, so it is
+    // never a database error. *(Corrected, M13 merged, 2026-11-14.)*
+    if !crate::store::catalogs::is_valid_name(team) {
+        return Err(unknown());
+    }
     sqlx::query_scalar("SELECT audit_team_ref(id) FROM teams WHERE name = $1")
         .bind(team)
         .fetch_optional(&mut *conn)
         .await?
-        .ok_or_else(|| OkfError::UnknownName { noun: "team", name: team.to_string() })
+        .ok_or_else(unknown)
 }
 
 /// The `audit_teams` id of a catalog's owner team: what a catalog event
@@ -1464,7 +1483,7 @@ pub fn request_ip(extensions: &Extensions, headers: &HeaderMap, config: &AuthCon
 
 and have `client_ip` call it. In `require_principal`, before each `next.run(request)`, insert `ClientIp(request_ip(request.extensions(), request.headers(), &app.config().auth))`; do the same in `crate::auth::require_key`.
 
-In `src/auth.rs`, add to `Principal` (after `user`):
+In `src/auth.rs`, add to `Principal` (after `user`, before M13's `suspended`):
 
 ```rust
     /// The `users.id` of the credential's user (`None` for a legacy key):
@@ -3057,6 +3076,8 @@ The entitlement routes use the same hook: refuse a provisioner there explicitly 
 
 `keys.js`: in the New key form, a `provisioner` switch before the other controls, which wraps them in `h('fieldset', { class: 'key-reach' }, ...)` and sets `fieldset.disabled = checkbox.checked`; the body sends `{ name, provisioner: true, user }` when checked. In the list's Name column, `key.provisioner ? [' ', h('span', { dataset: { test: `key-provisioner-${key.name}` } }, pill('provisioner', 'warn'))] : null` (through `h()`).
 
+> **Corrected (M13 merged, 2026-11-14).** `newKey` in `pages/keys.js` still submits without a pending-write guard (M13 changed only the key and code drawers: `nextDraw`, `usersOr`, `showKey(main, key, reload, ticket, previous, draw)`). Since this task changes that form, follow `tools/agentic/lessons.md`: mark the submit button and the new `provisioner` switch with `guard(el, 'key:new')` and run the POST under `once('key:new', ...)` (`core/pending.js`, as `pages/catalogs.js`' `memberAccess` and `pages/teams.js`' suspension section do), so a second click while the POST runs creates no second key. Add to the journey: `ui.hold_next("POST", "/api/v1/keys")`, `ui.click_twice("#key-form button[type=submit]")`, `assert_eq!(ui.held_matches(), 1)`, `ui.release_held()`. Leave the key drawer's shape as M13 shipped it; a provisioner key's drawer needs no new control.
+
 `docs/operations.md`: the `key create` row gains `--provisioner`; the parity row
 
 ```markdown
@@ -3205,8 +3226,8 @@ git commit -m "feat(audit): record user, entitlement, invitation and session cha
 | `teams::set_member(pool, &Membership { team, user, role }, actor, now)` | `team.member_added` or `team.role_changed` | `Team`, person = user | `[team_ref]` | `{"role", "from": role\|null}` | user |
 | `teams::remove_member(pool, team, user, actor, now)` | `team.member_removed` | `Team`, person = user | `[team_ref]` | `{}` | user |
 | `teams::delete(pool, name, actor, now)` | `team.deleted` | `Team` | `[team_ref]` (read before the delete) | `{}` | |
-| `teams::suspend(pool, name, notice, actor, now)` (M13 plan, Task 1) | `team.suspended` | `Team` | `[team_ref]` | `{"notice": bool, "already": bool}` | |
-| `teams::unsuspend(pool, name, actor, now)` (M13) | `team.unsuspended` (when lifted) | `Team` | `[team_ref]` | `{}` | |
+| `teams::suspend(pool, name, notice, actor, now)` (was `suspend(pool, name, notice: Option<&str>, now)`, `src/store/teams.rs:482`) | `team.suspended` | `Team` | `[team_ref]` | `{"notice": bool, "already": bool}` | |
+| `teams::unsuspend(pool, name, actor, now)` (was `unsuspend(pool, name)`, with no `now`, `src/store/teams.rs:518`) | `team.unsuspended` (when lifted) | `Team` | `[team_ref]` | `{}` | |
 | `catalogs::create(pool, &NewCatalog { name, description, owner_team }, actor, now)` | `catalog.created` | `Catalog` | `catalog_teams` | `{}` | |
 | `catalogs::set_owner(pool, name, team, actor, now)` | `catalog.owner_changed` | `Catalog` | old and new team refs | `{"from": ref\|null, "to": ref}` | |
 | `catalogs::update_description(pool, name, description, actor, now)` | `catalog.description_changed` (when changed) | `Catalog` | `catalog_teams` | `{"length": n}` (not the text) | |
@@ -3214,7 +3235,15 @@ git commit -m "feat(audit): record user, entitlement, invitation and session cha
 | `ceiling::set_member_access(pool, catalog, access, actor, now)` | `catalog.member_access_changed` (when changed) | `Catalog` | `catalog_teams` | `{"from", "to"}` | |
 | `import::import(pool, catalog, files, &ImportOptions { ..., audit: &AuditActor })` | `catalog.imported` | `Catalog` | `catalog_teams` | `{"replace", "scope", "written": n, "deleted": n, "generation": n}` | |
 
-`team_ref` and `catalog_teams` are read in the change's transaction and return `audit_teams` ids, so a personal team shows as its person and a team deleted and created again under the same name is a different team in the log (Task 1). `teams::delete` records `team.deleted` before deleting the row (the entry's `target_team_ref` is resolved from it). *(Corrected, PR #375 review, 2026-11-13: these were team names and `person:<id>` text.)* M13's `set_suspension` handler and `team suspend` / `unsuspend` commands pass the actor. `catalogs::create` is called from many tests (`grep -rn "catalogs::create(" src tests` finds about 90): the change is mechanical (`&NewCatalog { name, description, owner_team }, &AuditActor::cli(),`).
+`team_ref` and `catalog_teams` are read in the change's transaction and return `audit_teams` ids, so a personal team shows as its person and a team deleted and created again under the same name is a different team in the log (Task 1). `teams::delete` records `team.deleted` before deleting the row (the entry's `target_team_ref` is resolved from it). *(Corrected, PR #375 review, 2026-11-13: these were team names and `person:<id>` text.)* M13's `set_suspension` handler and `team suspend` / `unsuspend` commands pass the actor.
+
+> **Corrected (M13 merged, 2026-11-14).** What M13 shipped, and what the two suspension rows mean against it:
+> - `suspend` and `unsuspend` open their own transaction around `lock_team`, one `UPDATE` and `bump_admin_generation`, and answer `find(pool, name)` after the commit (`src/store/teams.rs:482-534`). Record inside that transaction, after the `UPDATE` and before `commit`; `team_ref(&mut tx, name)` reads the locked team.
+> - `"notice"` is whether the notice *after* `clean_notice` is `Some`: a blank notice is no notice (and clears an old one), so `{"notice": false}` for `--notice "  "`. Never the text.
+> - `"already"` needs the state before the write, which `suspend` does not read today (`COALESCE(suspended_at, $2)` keeps the first time in one statement, and `LockedTeam` holds only `id` and `personal_of`). Read it under the lock: `SELECT suspended_at IS NOT NULL FROM teams WHERE id = $1` after `lock_team`, or `RETURNING` the old value through a subquery; don't widen `lock_team`, which every team write shares.
+> - `unsuspend` gains `actor` *and* `now` (it has no clock today); it records only when `rows_affected() > 0`, the same condition under which it bumps the generation.
+> - `clean_notice` refuses a notice holding a NUL or over 2000 characters (`Refused`) and `lock_team` refuses a malformed or unknown name (`UnknownName`) before anything is written, so a refused call records nothing. Add to the tests: a NUL notice, a 2001-character notice and a name with a NUL each leave no `team.suspended` entry.
+> - Callers to change besides the handler and the CLI arms: `mcp::testing::suspend_catalogs` and `lift_suspension` (`src/mcp/testing.rs:361-392`), and the M13 tests that call `teams::suspend` / `unsuspend` directly (`grep -rn "teams::suspend(\|teams::unsuspend(\|suspend(&\|unsuspend(&" src tests`). `catalogs::create` is called from many tests (`grep -rn "catalogs::create(" src tests` finds about 90): the change is mechanical (`&NewCatalog { name, description, owner_team }, &AuditActor::cli(),`).
 
 Commit:
 
@@ -3604,7 +3633,9 @@ git commit -m "feat(audit): record publishes, reverts and admins' discards (M14 
         let principal = |user: Option<&str>, access| Principal {
             user_id: user.map(str::to_string),
             gates: Arc::clone(&gates),
-            ..writer_on(&["main"], access, Arc::default())
+            // `key_on` opts into reporting; Task 9b exempts reporting keys.
+            maintenance_report: false,
+            ..key_on(&["main"], access, Arc::default())
         };
         let now = Utc::now();
 
@@ -3644,7 +3675,7 @@ git commit -m "feat(audit): record publishes, reverts and admins' discards (M14 
     }
 ```
 
-(`writer_on` is M13's test helper in this module, Task 3 of its plan.)
+(`key_on(catalogs, access, suspended)` is M13's test helper in this module, `src/auth.rs:1678`. *(Corrected, M13 merged, 2026-11-14: M13 shipped it as `key_on`, not the plan's `writer_on`, and it sets `maintenance_report: true`, which Task 9b's `admission` treats as the maintenance runner, so the principal here turns it off.)*)
 
 `src/store/audit.rs`:
 
@@ -4007,6 +4038,8 @@ impl Principal {
 
 `Principal.gates: Arc<AccessGates>` (doc: "The access gates of the cache it came from (shared)"). `KeyCache` gains `gates: Arc<AccessGates>`; `from_records(records, ceilings, suspended, gates, now)`; `principal_of` sets `principal.gates = Arc::clone(gates)`; `KeyCache::read` adds `gates::load(pool)` to its `try_join!`; `Keys::gates() -> Arc<AccessGates>`. `Principal::for_session(user, ceiling, suspended, gates)`; `session_principal` passes `app.keys().gates()`.
 
+> **Corrected (M13 merged, 2026-11-14).** On `main`: `principal_of(record, ceilings, suspended)` (`src/auth.rs:391`) gains `gates: &Arc<AccessGates>` beside `suspended`; `KeyCache::read`'s `try_join!` already holds four reads (keys, ceilings, users, `teams::suspended_catalogs`, `:521-533`), so `gates::load` is the fifth, and `from_records` gets `Arc::new(gates)` as it gets `Arc::new(suspended)`. `Keys::gates()` copies the pointer as `Keys::suspensions()` does (`:667-675`). `session_principal` calls `for_session` in two places (a cached user, and one read from the database, `src/http/console_session.rs:265-290`): both pass `app.keys().gates()` beside `app.keys().suspensions()`. Every test call of `for_session` (`grep -rn "for_session(" src tests`) gains one more `Default::default()`.
+
 `src/store/gates.rs`:
 
 ```rust
@@ -4315,6 +4348,8 @@ And the test helper (`audit::testing`), which resolves the ids with SQL as the c
     }
 ```
 
+> **Corrected (M13 merged, 2026-11-14), open question.** `ToolContext::check_connection` goes through `self.select(None)` (`src/mcp/context.rs:158-165`), and `ToolContext::changeset` calls `check_connection` first (`:360`), as does `list_changesets` without `catalog`. With `admit` inside `select`, a changeset call or a changeset list on a connection that names catalogs would note a read of *every* listed catalog, not only the one the changeset belongs to. Whether that is meant is a design question for the founder, raised on PR #375. Until it is answered, this plan keeps the reading it was written with, admission where a tool reads, so `check_connection` only validates: give `select` a non-admitting body (`fn resolve_call`) that `check_connection` uses, and admit in `select` and in `changeset` (which admits its own catalog) only.
+
 `select` calls `self.admit(name, AccessKind::Read)` for each catalog of a successful selection; `changeset` calls `self.admit(state.name(), if access == Access::Write { AccessKind::Write } else { AccessKind::Read })` after its `require`. The REST revision route (`browse.rs:328`) calls `ctx.admit(&catalog, AccessKind::Read)` after building its context.
 
 `src/app.rs`:
@@ -4450,7 +4485,8 @@ mod tests {
             .map(|entry| entry["action"].as_str().unwrap()).collect();
         assert_eq!(actions, ["team.member_added", "team.created"], "only family's entries");
         assert_eq!(body["entries"][0]["actor"], json!({"kind": "operator"}));
-        assert_eq!(body["entries"][0]["ip"], serde_json::Value::Null);
+        // `get`: `entry["ip"]` is `Null` for a missing key too (lessons.md, M13 #364).
+        assert_eq!(body["entries"][0].get("ip"), Some(&serde_json::Value::Null));
         assert_eq!(not_mine.status, StatusCode::FORBIDDEN);
         assert_eq!(as_member.status, StatusCode::FORBIDDEN);
         assert_eq!(by_key, StatusCode::FORBIDDEN, "owners read through a console session only");
@@ -4601,8 +4637,8 @@ And a store test of the redaction rules (`src/store/audit.rs`):
         let mut tx = db.pool.begin().await.unwrap();
         let family = team_ref(&mut tx, "family").await.unwrap();
         // The actor `AuditActor::of` builds for alice's console session (Task
-        // 1 tests that path; `for_session` gains arguments in M13 and Task
-        // 7b): its label is her name. It acts on a credential whose
+        // 1 tests that path; `for_session` gained an argument in M13 and
+        // gains one in Task 7b): its label is her name. It acts on a credential whose
         // legacy-style id carries the name too.
         let actor = AuditActor {
             source: Source::Console,
@@ -4923,7 +4959,7 @@ impl ListedRow {
 }
 ```
 
-`audit_teams_named(pool, name) -> Vec<i64>` (an admin's `team` filter, which may span teams that had the name): `SELECT t.id FROM audit_teams t LEFT JOIN audit_people p ON p.id = t.person_id WHERE t.name = $1 OR p.name = $1`. An owner's view never uses a name: it is scoped by the one `audit_teams` id of the team it owns now. *(Corrected, PR #375 review, 2026-11-13: this matched entries by the reusable team name.)*
+`audit_teams_named(pool, name) -> Vec<i64>` (an admin's `team` filter, which may span teams that had the name): `SELECT t.id FROM audit_teams t LEFT JOIN audit_people p ON p.id = t.person_id WHERE t.name = $1 OR p.name = $1`. An owner's view never uses a name: it is scoped by the one `audit_teams` id of the team it owns now. *(Corrected, PR #375 review, 2026-11-13: this matched entries by the reusable team name.)* A `team` filter that fails `catalogs::is_valid_name` (a NUL included) matches nothing (an empty list) without reaching SQL, as M13 made every team lookup refuse a malformed name before SQL (#339); `teams::owned_by` below does the same. Test it in the route tests: `GET /api/v1/audit?team=a%00b` is 403 for an owner's session and 200 with no entries for an admin, never a 500. *(Corrected, M13 merged, 2026-11-14.)*
 
 `src/store/teams.rs`:
 
@@ -4934,6 +4970,12 @@ impl ListedRow {
 /// # Errors
 /// [`OkfError::Database`].
 pub async fn owned_by(pool: &PgPool, user_id: &str, team: &str) -> Result<Option<(String, i64)>, OkfError> {
+    // A malformed name (a NUL from `?team=`) owns nothing, never a database
+    // error, as for every team lookup since M13 (#339). *(Corrected, M13
+    // merged, 2026-11-14.)*
+    if !is_valid_name(team) {
+        return Ok(None);
+    }
     Ok(sqlx::query_as(
         "SELECT t.id, audit_team_ref(t.id) FROM teams t \
          JOIN team_members m ON m.team_id = t.id \
@@ -5324,7 +5366,7 @@ Expected: both time out on `#audit-action` / `#audit-team`.
 // Downloads a GET answer as a file with the console's own credential (the
 // bearer key or the session cookie), which a plain link cannot carry.
 export async function download(path, filename) {
-    const response = await request('GET', path, undefined, { raw: true });
+    const response = await request('GET', path, { raw: true });
     const url = URL.createObjectURL(await response.blob());
     const link = h('a', { href: url, download: filename });
     document.body.append(link);
@@ -5334,9 +5376,11 @@ export async function download(path, filename) {
 }
 ```
 
-(Reuse the module's own request function and its error handling; `raw` returns the `Response` without parsing JSON.)
+(Reuse the module's own request function and its error handling; `raw` returns the `Response` without parsing JSON. `request` takes `(method, path, { body, raw, quiet, key })`, so the options are its third argument. *(Corrected, M13 merged, 2026-11-14: was `request('GET', path, undefined, { raw: true })`.)*)
 
 `pages/audit.js`: the page head with, for an admin (`store.whoami` access `admin` reaching every catalog), a team text filter; for a non-admin console session, `#audit-team`, a `select` of `/me`'s `owned_teams` (the page says "You own no team; the audit log shows your teams' entries to their owners" when empty, through `fill()`); `#audit-action` (from the answer's `actions`), actor and target inputs, since and until (`datetime-local`, sent as UTC RFC 3339), and `#audit-export` calling `api.download('/audit/export?' + params, 'audit.jsonl')`. The table `#audit-table` (`listTable`) shows When (`ago`), Action, Actor (`an operator` for `{kind: "operator"}`; else the person, the key id or the label), Target (`user NAME` or `KIND NAME`), Teams, and Details (`JSON.stringify`, `mono small`), with "Load more" using `next_after`. A `catalog.admin_read` row shows `N requests`; a `catalog.maintenance_run` row reads "maintenance ran". Sign-ins are not in the log (they are in `sign_in_events`): for an admin, a `user.*` row's person links to that user's drawer, whose Recent sign-ins lists them. Every conditional cell goes through `h()`.
+
+> **Corrected (M13 merged, 2026-11-14).** The page has no write, but it has overlapping reads, so it follows `tools/agentic/lessons.md`' read rule as M13's drawers do (`pages/teams.js`' `openDetail`, `pages/keys.js`' `nextDraw`): number each load of the table (a filter change, the team picker, Refresh) and draw only the newest answer; a "Load more" answer appends only while its load is still the newest (a filter changed meanwhile drops it). A failed load keeps the rows drawn, marked "may be out of date", with every control usable. Add a journey: hold the answer of a first filter (`ui.hold_answer("GET", "/api/v1/audit?action=user.created", ..)`), choose a second filter whose answer arrives first, release, and check the table shows only the second filter's rows.
 
 `index.html`: an `Audit` link (`data-nav="audit"`, `href="#/audit"`) under the admin links, shown to admins and to sessions that own a team (`shell.js` hides it otherwise); `ui.rs`'s manifest lists `audit`.
 
@@ -5815,7 +5859,11 @@ git commit -m "feat(unlocks): unlock records, settings, error kinds and the owne
         Principal {
             user_id: user.map(str::to_string),
             gates: Arc::new(gates),
-            ..writer_on(&["main"], access, Arc::default())
+            // M13's `key_on` opts into reporting, which `admission` treats as
+            // the maintenance runner; the runner cases below set it back.
+            // *(Corrected, M13 merged, 2026-11-14: was `writer_on`.)*
+            maintenance_report: false,
+            ..key_on(&["main"], access, Arc::default())
         }
     }
 
@@ -5920,7 +5968,7 @@ git commit -m "feat(unlocks): unlock records, settings, error kinds and the owne
     }
 ```
 
-with a `staff_root` helper (create admin user `staff`, an every-catalog admin key for it, poll). And an MCP-side case in `src/selection.rs`: a connection list of `["main", "other"]` where only `other` is unlocked selects `["other"]`, and naming `main` is `UnlockRequired`.
+with a `staff_root` helper (create admin user `staff`, an every-catalog admin key for it, poll). And an MCP-side case in `src/selection.rs`: a connection list of `["main", "other"]` where only `other` is unlocked selects `["other"]`, and naming `main` is `UnlockRequired` (build the principal from M13's `principal_with(reach, default, suspended)`, `src/selection.rs:299`, with `user_id` and `gates` set).
 
 - [ ] **Step 2: Run them and see them fail**
 
@@ -5982,8 +6030,10 @@ Expected: compile errors (`entitled`, `require_unlock`, `Admission::Unlocked`), 
         }
     }
 
-    /// The content gate after reach and level: suspension (M13), then the
-    /// admission. Used by selection, which has already checked reach.
+    /// The content gate at the selection: suspension (M13), then the
+    /// admission. The selection has checked reach but no level: a tool that
+    /// selects first checks its own level after (M13 Decision 2 as
+    /// qualified), so there a lock is refused before a low level is.
     ///
     /// # Errors
     /// [`OkfError::Suspended`]; as [`Self::admission`].
@@ -6011,7 +6061,7 @@ Expected: compile errors (`entitled`, `require_unlock`, `Admission::Unlocked`), 
 
 - `selection.rs`: `Sources` gains `now: DateTime<Utc>` (`ToolContext::select` passes `self.app.clock().now()`; tests pass `Utc::now()`). M13's `refuse_suspended` and `without_suspended` become `refuse_closed` and `without_closed`, calling `principal.check_open(name, Access::Read, sources.now)`: a named catalog that is locked is refused with `UnlockRequired`; a connection list drops it, and is refused with the first refusal only when nothing is left. Update `resolve`'s `# Errors` and the module doc.
 - `http/api/search.rs` and `mcp/changesets.rs` (`list_changesets`): M13's `check_not_suspended(name).is_ok()` filter becomes `check_open(name, Access::Read, now).is_ok()`.
-- `ToolContext::changeset`: `self.principal.require_contents(access, state.name(), self.app.clock().now())?` replaces `require`; `open_changeset` (`mcp/changesets.rs:235`) likewise; the revision route (`browse.rs:328`); `maintenance_close`'s operator override (`work.rs:172`) uses `require_contents(Access::Write, ..).is_ok()`.
+- `ToolContext::changeset`: `self.principal.require_contents(access, state.name(), self.app.clock().now())?` replaces `require`; `open_changeset` (`mcp/changesets.rs:243`) likewise; the revision route (`browse.rs:328`); `maintenance_close`'s operator override (`work.rs:172`) uses `require_contents(Access::Write, ..).is_ok()`.
 - `http/archives.rs`: export keeps M13's `require_export` (reach and read level, suspension ignored), then `principal.admission(&name, Access::Read, now)?`; with `Admission::Unlocked`, `app.note_access(.., AccessKind::Export, ..)`. Import: `require(Access::Admin, ..)` then `admission(&name, Access::Write, now)?`, noted as a write.
 - `App::note_access`: `Admission::Unlocked { unlock_id } => unlocks::tally(&pool, unlock_id, kind).await` (the `record` is not needed for a tally). Tallies are keyed by the unlock's id, and an unlock belongs to one `catalogs.id` (`ON DELETE CASCADE`), so a catalog deleted and created again under the same name never inherits an unlock or its counts; deleting a catalog bumps `admin_generation`, so the cache drops the unlock at once. *(Corrected, PR #375 review, 2026-11-13: checked for the same name-keying defect; none. The unlock id is part of the admission, so it is fixed when the request is admitted; a tally that runs after its catalog (and with it the unlock) was deleted updates nothing, and the unlock's `catalog.unlocked` and `catalog.unlock_ended` entries keep the record.)* In `src/store/unlocks.rs`:
 
@@ -6033,6 +6083,12 @@ pub async fn tally(pool: &PgPool, id: i64, kind: AccessKind) -> Result<(), OkfEr
 ```
 
 - The CLI is unchanged: it works on the database directly (spec: its export and import are audited, `source = cli`, and need no unlock).
+
+> **Corrected (M13 merged, 2026-11-14).** What the M13 selection rules shipped as, and what they mean once `refuse_closed` / `without_closed` call `check_open`:
+> - **Order.** `require_contents` keeps the spec's order (reach, level, suspension, then the unlock). At the selection there is no level check: `open_changeset`, `maintenance_dispose` and the maintenance work tools select first and check their own level after, which M13 qualified for `Suspended` (#366). So for those tools a locked catalog answers 403 `UnlockRequired` to a credential below the tool's level, where `Forbidden` would come first through `require_contents`. Reach is still first everywhere, so a credential that does not reach a catalog never learns it is locked. The spec's "The refusal" carries the same qualification.
+> - **Connections.** `check_connection` goes through `select(None)` (`src/mcp/context.rs:158-165`), so a connection whose every listed catalog is closed (suspended or locked) is refused with the first refusal by `list_changesets` without `catalog` and by every changeset handle on it; a mixed list passes, as M13 shipped for suspension.
+> - **Search.** When every reached catalog is filtered out, the REST search falls back to the key's default (M13), which is then refused as named, with `UnlockRequired` for a locked one.
+> - **Tests.** Extend M13's whole-class tests rather than writing new matrices: `mcp::context::tests::every_selection_path_refuses_or_drops_a_suspended_catalog` and `http::api::browse::tests::every_selection_backed_read_route_refuses_a_suspended_catalog_to_members` have the shape a "locked" twin needs (with `require_unlock` on and an admin key outside its teams), and `http::api::testing::{Expect, assert_answers}` gives a status and error kind per request.
 
 - [ ] **Step 5: Run, gate, commit**
 
@@ -6261,7 +6317,7 @@ pub async fn set_maintenance(
 }
 ```
 
-`src/store/teams.rs`: `owns_catalog(pool, user_id, catalog) -> bool` (the user is an `owner` of the catalog's owner team).
+`src/store/teams.rs`: `owns_catalog(pool, user_id, catalog) -> bool` (the user is an `owner` of the catalog's owner team). It answers `false` for a catalog name that fails `catalogs::is_valid_name` without reaching SQL, so a NUL in the path is never a 500 (the rule M13 applied to every team lookup, #339). *(Corrected, M13 merged, 2026-11-14.)*
 
 `src/http/api/catalogs.rs`:
 
@@ -6321,7 +6377,7 @@ async fn set_maintenance(
 }
 ```
 
-routed as `.route("/catalogs/{catalog}/maintenance", put(set_maintenance))`. `CatalogSummary.maintenance: Switch`, from `principal.gates.maintenance_off.contains(name)` (the cache already holds it).
+routed as `.route("/catalogs/{catalog}/maintenance", put(set_maintenance))`. `CatalogSummary.maintenance: Switch`, from `principal.gates.maintenance_off.contains(name)` (the cache already holds it), filled in `CatalogSummary::of(name, state, principal)`, which since M13 takes the caller and fills `suspended` the same way (`src/http/api/catalogs.rs:84`). *(Corrected, M13 merged, 2026-11-14.)* `POST /api/v1/catalogs` answers with the request's principal, whose gates predate the new catalog; that reads `on`, the default, so it is right without the re-read M13 does for `suspended`.
 
 `src/cli.rs`: `CatalogCommand::SetMaintenance { name: String, #[arg(value_enum)] state: Switch }` ("Let the maintenance runner check a catalog (on, the default) or keep it out (off)"), printing `catalog C: maintenance OLD -> NEW`.
 
@@ -6433,7 +6489,7 @@ Expected: 404; compile errors; the parity failure.
 
 `POST /unlocks` body `{catalog, category, reason, hours?, user?}` (`deny_unknown_fields`; `hours` defaults to `unlock_max_hours`): `require_admin` (a provisioner is refused by the gate); `user` defaults to the caller's own user (403 for a credential with no user: "a key with no user cannot be unlocked; give it a user"); naming another user needs `require_every_catalog`. Calls `unlocks::create` with `UnlockPolicy` from `app.settings()`, then `settle`. 201 with the full `UnlockView`.
 
-`GET /unlocks?catalog=&team=&live=true`: an admin (`require_admin`) sees full views; a console session that owns `team` sees `OwnerUnlockView { id, catalog, category, starts, ends, state, reads, writes, exports, by: "an operator" }` for that team's catalogs (spec: "an operator opened <catalog>: <category>, <start> to <end>, N reads, M writes"); anyone else 403.
+`GET /unlocks?catalog=&team=&live=true`: an admin (`require_admin`) sees full views; a console session that owns `team` (checked with Task 8a's `teams::owned_by`, which answers `None` for a malformed name without reaching SQL; *corrected, M13 merged, 2026-11-14*) sees `OwnerUnlockView { id, catalog, category, starts, ends, state, reads, writes, exports, by: "an operator" }` for that team's catalogs (spec: "an operator opened <catalog>: <category>, <start> to <end>, N reads, M writes"); anyone else 403.
 
 `DELETE /unlocks/{id}`: `require_admin`; ends it (its admin or any admin), `settle`, 200 with the view. 404 for an unknown id; 409 for one already ended or expired.
 
@@ -6610,34 +6666,43 @@ Expected: timeouts on `#browse-locked` and `#catalog-maintenance`.
 
 `components/unlock.js`: `openUnlock(catalog, { onDone })` opens a drawer with `#unlock-form`: a category `select` (the six categories, labelled), a required `reason` text input (`maxlength 500`), `hours` (`type=number`, `min 1`, `max` from the `unlock_max_hours` setting via `GET /settings` when readable, else 4) and Unlock; it posts `/unlocks` without `user` (the caller's own), toasts `Unlocked ${catalog} until ${when(view.expires)}.`, closes and calls `onDone`. All children through `h()`.
 
-`api.js`: a 403 whose body is `UnlockRequired` toasts its own message, and for an admin session shows an Unlock action that calls `openUnlock(body.catalog)` (the generic "cannot do this" stays for other 403s); a 403 with `maintenance: "off"` shows its message.
+`api.js`: a 403 whose body is `UnlockRequired` toasts its own message, and for an admin session shows an Unlock action that calls `openUnlock(body.catalog)` (the generic "cannot do this" stays for other 403s); a 403 with `maintenance: "off"` shows its message. M13 already made one such exception: `const generic = response.status === 403 && errorBody?.error !== 'Suspended'` (`core/api.js:54-57`); widen that test (`Suspended`, `UnlockRequired`, or `errorBody?.maintenance === 'off'`) rather than adding a second branch. *(Corrected, M13 merged, 2026-11-14.)*
 
-`browse.js`: in the tree fetch's `catch`, beside M13's `Suspended` branch:
+`browse.js`: in the tree fetch's `catch (error)`, beside M13's `Suspended` branch (`pages/browse.js:58-63`, which already clears the tree and returns after it):
 
 ```js
-        if (error?.body?.error === 'UnlockRequired') { showLocked(view, where.catalog, error.body); return; }
+        else if (error?.body?.error === 'UnlockRequired') showLocked(view, where.catalog, error.body);
 ```
 
 ```js
-// A catalog an operator must unlock first: the reason, and the Unlock button.
+// A catalog an operator must unlock first (`body` is the 403's error body):
+// the reason, and the Unlock button for an admin user. As showSuspended,
+// every child goes through h() (core/dom.js, issue #302).
 function showLocked(view, catalog, body) {
-    fill(view, h('div', { id: 'browse-locked', class: 'notice' },
+    clear(view).append(h('div', { id: 'browse-locked', class: 'notice', role: 'status' },
         h('h2', {}, `${catalog} is locked`),
         h('p', {}, body.message),
         store.whoami?.admin_user
             ? h('button', { type: 'button', id: 'browse-unlock',
-                            onclick: () => openUnlock(catalog, { onDone: () => render(view, catalog) }) }, 'Unlock')
+                            onclick: () => openUnlock(catalog, { onDone: () => route() }) }, 'Unlock')
             : null));
 }
 ```
 
-(Use the whoami field that says the session is an admin user; `fill()` drops the `null`.)
+(Use the whoami field that says the session is an admin user; `h()` drops the `null`. `route()` from `core/router.js` renders the current hash again; the page's `render` takes `(main, rest)`, not a view and a catalog. *(Corrected, M13 merged, 2026-11-14: follows M13's `showSuspended`, `pages/browse.js:78-88`, with the `.notice` style M13 added to `styles.css` and `role="status"`; browse.js imports `clear`, not `fill`.)*)
 
 `pages/unlocks.js`: `#unlocks-table` with Catalog, User, Category, Reason, From, Until, State, Reads, Writes, Exports, and an End button `[data-test=unlock-end-<catalog>]` for live ones (`confirmDialog`, then `DELETE /unlocks/{id}`); an "Unlock a catalog" button opening `openUnlock` with a catalog picker. For a non-admin session it shows its owned teams' unlocks (`?team=`), redacted, with no End.
 
 `catalogs.js`: in the catalog drawer, a `Maintenance` section with `#catalog-maintenance` (`input type=checkbox role=switch`, checked when `row.maintenance === 'on'`), enabled for an every-catalog admin and for the owner of the catalog's team (`/me`'s `owned_teams` includes `row.owner_team`); toggling `PUT /catalogs/{c}/maintenance` and toasting `Maintenance is on|off for ${name}.`; a muted line: "Lets the maintenance runner check this catalog for stale, bloated and broken notes. Turn it off to keep the runner out."
 
 `settings.js`: a `BOOLEAN_SETTINGS` set (`password_sign_in`, `require_unlock`, `unlock_notify_owners`) replaces the `password_sign_in` special case.
+
+> **Corrected (M13 merged, 2026-11-14).** Every write this task adds follows `tools/agentic/lessons.md`' console rules, which M13 applied to the team drawer and the key drawers (`pages/teams.js`' suspension section, `pages/keys.js`' `nextDraw`); `pages/catalogs.js`' `memberAccess` is the closest model for a drawer section with one guarded write:
+> - **Pending-write keys.** The Unlock form's submit is `guard`ed by `unlock:<catalog>:create` and posts under `once`; each End button by `unlock:<id>:end`; the maintenance switch by `catalog:<name>:maintenance`. A control drawn again while its write runs (a reopened drawer, a refreshed Unlocks table) is drawn disabled.
+> - **Refusals stay.** A refused unlock (409 over `unlock_max_hours`, 403 for a non-admin) keeps its reason in `#unlock-form-error` until the next submit; a refused End keeps its reason beside the row; a refused maintenance write keeps its reason in `#catalog-maintenance-error`. Each is drawn from the last answer even when the read after it fails, marked "may be out of date", with the controls usable.
+> - **Numbered reads.** The Unlocks table's loads and the maintenance section's reads are numbered; only the newest draws. A settled maintenance write redraws the section the catalog drawer shows *now* if it is that catalog's (a registry like `shownMemberAccess`), taking its draw number as the write settles and only while that drawer shows that catalog, so it never cancels another catalog's drawer while it loads.
+> - **Side reads.** The Unlock form's `GET /settings` (for `max`) and the Unlocks page's catalog picker are side reads: when one fails, fall back (4 hours; a free-text catalog) and never lose a write's answer.
+> - **Journeys** (add to `tests/ui_e2e/unlocks.rs`): `ui.hold_next("PUT", "/api/v1/catalogs/main/maintenance")`, `ui.click_twice("#catalog-maintenance")`, close and reopen the drawer, `assert_eq!(ui.held_matches(), 1)`; `ui.hold_next("POST", "/api/v1/unlocks")` with `click_twice` on the form's submit; `ui.fail_next("PUT", "/api/v1/catalogs/main/maintenance", 403, ..)` then `ui.fail_next` on the follow-up GET, checking `#catalog-maintenance-error` is visible (`ui.wait_visible`, not only `wait_text`) and the switch is enabled; and `ui.hold_answer` on a first Unlocks load that settles after a second.
 
 `index.html` and `ui.rs`: the `Unlocks` nav link and manifest entry (admins, and owners of a team).
 
@@ -6663,6 +6728,8 @@ git commit -m "feat(console): unlock a locked catalog, the Unlocks page and the 
   - "Upgrades": migrations `0012` to `0016`; `0013` changes three foreign keys to `CASCADE` (deleting a user now deletes its credentials); all others are additive; `require_unlock` is off until an operator turns it on.
   - "Troubleshooting": `UnlockRequired` on a key with no user (assign it a user); `maintenance_off` from the runner.
   - Check every new route has an API reference row and every new subcommand a parity row (`tools/agentic/gate.sh narrow --test admin_parity`).
+  - The API reference's counts (`docs/operations.md`, "### API reference" lead). M13 left them at 88 endpoints, "Users and teams" 21. This milestone adds six: `GET /api/v1/audit` and `GET /api/v1/audit/export` (8a), `PUT /api/v1/catalogs/{catalog}/maintenance` (9c), and `POST /api/v1/unlocks`, `GET /api/v1/unlocks`, `DELETE /api/v1/unlocks/{id}` (9d), so 94, with "Catalogs and import/export" 9 to 10 and two new areas in the lead's list, Audit (2) and Unlocks (3); "Users and teams" stays 21 (Tasks 3 to 5 change existing routes only). Recount from the router before writing them: a task may have added or merged a route since. `/ui/brand.json` (Task 2) is not under `/api/v1` and not counted. *(Corrected, M13 merged, 2026-11-14: the plan named no counts; M13 Task 8 found them stale.)*
+  - "Upgrades" already has M13's bullet on `team list` (the display name moved from field 5 to field 6); M14 changes no `team list` column, so a script that parses it needs nothing new.
 - [ ] **Step 2: `README.md`** status paragraph: "Milestone 14 added the operator API: branding, finding and deleting users, provisioner keys, a stored audit log readable by team owners, and unlock-before-access for operator staff (`docs/operations.md`; design: `docs/superpowers/specs/2026-11-13-okf-operator-api-design.md`)."
 - [ ] **Step 3: The spec**: set its status to "Delivered" and add "What shipped differently", listing this plan's Decisions 1 to 12 that the spec did not already state, and every dated correction the tasks recorded.
 - [ ] **Step 4: The milestone changelog**, in the format of the milestone 12 one.
@@ -6690,14 +6757,14 @@ git commit -m "docs: operator API operations, API reference and close-out (M14 t
 7. **`MaintenanceOff` is its own variant with kind `Forbidden`**: the spec says the runner is refused with `Forbidden`, and the runner must tell that refusal from a revoked key to skip the catalog. The body's `"maintenance": "off"` is the marker; it is the one variant whose kind is not its name.
 8. **The maintenance exemption covers reads only** (and the reporting tools, which need only read): a reporting key with write access gets no exemption for writes. The opt-out applies whatever the key's grants and whatever `require_unlock`.
 9. **Provisioner admin-target refusals are in the store**, under the row locks `users::set_admin` conflicts with, not in the handlers, so a promotion racing a provisioner's email change cannot let it take over an admin. A provisioner's lookup by email hides admin users rather than answering 403, so it cannot probe who is an admin by email.
-10. **The provisioner is its own store function** (`create_provisioner`), not a `NewKey` field: it skips grant resolution, which refuses an empty grant list, and 46 `NewKey` literals stay as they are.
+10. **The provisioner is its own store function** (`create_provisioner`), not a `NewKey` field: it skips grant resolution, which refuses an empty grant list, and 48 `NewKey` literals stay as they are (46 when planned; M13 added two).
 11. **The Users page gets a filter box.** The spec says "the Users page's filter box matches emails too (no new control)", but the page has no filter box today; the plan adds one (name, display name and email), the smallest control that meets the goal.
 12. **Retention runs daily with an hour's margin**, and the trigger compares against the database clock: the margin keeps a small skew between the two clocks from refusing the prune.
 13. **`unlock_max_hours` is 1 to 72**, `audit_retention_days` 30 to 3650 (the spec gives only the defaults and the minimum).
 14. **Owners read unlocks** both as `catalog.unlocked` entries (reason removed) and through `GET /api/v1/unlocks?team=` (with the tallies), both through a console session only.
 15. **The parity test learns flag entries** (`user list --email`, `key create --provisioner`), so the two new flags the spec lists under "Surfaces and parity" are enforced like subcommands. `settings set` already covers the new settings keys.
 16. **Owners' scope is an immutable team identity.** *(PR #375 review, 2026-11-13.)* A shared team's name can be reused: delete `family`, create a new `family` for another customer, and a scope by name (`e.teams @> ARRAY[name]`) would show the new owners the old team's retained entries. Entries now store `audit_teams` ids; an `audit_teams` row follows one `teams.id`, a UUID that is never reused, and keeps the name only as a display snapshot. An owner's view is scoped by the one id of the team it owns now; an admin's `team` filter by name may span every team that had it. Tests: Task 1 (`a_team_created_again_under_its_old_name_gets_a_new_audit_id`) and Task 8a (`a_new_team_under_an_old_name_cannot_read_the_old_teams_entries`). The spec's "teams" rule says so too.
-17. **No person's name in an immutable column.** *(PR #375 review, 2026-11-13.)* `Principal::for_session` sets a session's `actor` to the user's name (`src/auth.rs:191`), a self-issued key's actor label defaults to the key name its user chose, and a legacy key's id is its name (`migrations/0005_key_names.sql`). So `actor_label` holds only a kind (`console session`, `api key`, `oauth grant`), `cli:<os user>`, `system:<what>` or the label of a key with no user (`AuditActor::stored_label`); credential ids and labels live in `audit_credentials`, which `forget_person` clears for the deleted user's credentials (shown as `credential #N`); the admin-read bucket key uses audit ids. Grant names (`grants::grant_name`, which starts with the user's name) are never written into entries. The CLI's operating-system user stays in `actor_label` as the spec decides: it is operator staff, not an okf-mcp user. Tests: Task 1 (`a_session_actor_leaves_no_name_in_the_entry_once_its_user_is_forgotten`) and Task 8a (`a_deleted_session_user_is_named_nowhere_in_the_admin_or_owner_view`, the complete admin and owner records).
+17. **No person's name in an immutable column.** *(PR #375 review, 2026-11-13.)* `Principal::for_session` sets a session's `actor` to the user's name (`src/auth.rs:273` on `4b7fcf1`), a self-issued key's actor label defaults to the key name its user chose, and a legacy key's id is its name (`migrations/0005_key_names.sql`). So `actor_label` holds only a kind (`console session`, `api key`, `oauth grant`), `cli:<os user>`, `system:<what>` or the label of a key with no user (`AuditActor::stored_label`); credential ids and labels live in `audit_credentials`, which `forget_person` clears for the deleted user's credentials (shown as `credential #N`); the admin-read bucket key uses audit ids. Grant names (`grants::grant_name`, which starts with the user's name) are never written into entries. The CLI's operating-system user stays in `actor_label` as the spec decides: it is operator staff, not an okf-mcp user. Tests: Task 1 (`a_session_actor_leaves_no_name_in_the_entry_once_its_user_is_forgotten`) and Task 8a (`a_deleted_session_user_is_named_nowhere_in_the_admin_or_owner_view`, the complete admin and owner records).
 18. **Operator staff as a target are hidden from owners too.** *(PR #375 review, 2026-11-13.)* An unlock's entries name the unlocked admin as their person; owners saw it although the actor read "an operator". `record` sets `target_operator` when the target person is an admin user, and the owner view drops that person (and a credential naming them); for owners the target filter never matches a hidden person or credential and the actor filter never matches an operator's entry, so neither is an identity oracle. Tests: Task 8a (`owners_never_see_an_operators_identity_ip_unlock_reason_or_unlocked_staff`, the whole serialized record and both filters) and Task 9d (the owner's full `GET /api/v1/audit` response, its export and its filters contain no staff name).
 19. **A credential's owner comes from the credential tables.** *(PR #375 review, round 2, 2026-11-13.)* Entries that target a credential without naming a person (`key.revoked`, `key.catalog_granted`, `key.report_flag_changed`) could create an `audit_credentials` row with no person, so `forget_person` would miss it, and a legacy key whose id is its user's name would stay visible after the user is deleted. `audit_credential` now takes the owner from `api_keys.user_id` or `sign_in_codes.user_id` while the credential exists, and `forget_person` also clears every row still named by the user's keys, grants and codes; Task 4 calls it before deleting the user row, while those exist. No backfill: the table starts empty and every row is made through that function. Test: Task 6c `a_pre_m14_key_that_only_ever_is_a_target_is_forgotten_with_its_user`.
 20. **Admin-read buckets follow the catalog's identity and owner.** *(PR #375 review, round 2, 2026-11-13.)* The bucket was (credential, catalog name, hour), so reads after a transfer to another team, or of a catalog deleted and created again under the same name, counted in the first entry and showed in the wrong team's log. It is now (credential or person audit id, `catalogs.id`, owner `audit_teams` id, hour): one entry per credential, catalog identity, owning team and clock hour. Unlock tallies were checked: they are keyed by unlock id, and an unlock belongs to one `catalogs.id`. Test: Task 7b `a_catalog_moved_or_created_again_within_the_hour_starts_a_new_admin_read_entry`.
