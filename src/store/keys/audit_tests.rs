@@ -278,6 +278,152 @@ async fn credential_change_locks_actor_before_credential_and_generation() {
         .unwrap();
 }
 
+/// Each variant changes only one side of lock_credential_people's comparison.
+#[derive(Clone, Copy)]
+enum SnapshotChange {
+    Owner,
+    Grants,
+}
+
+/// Pauses a revoke after its snapshot, commits a competing change using an
+/// unrelated actor, then checks that only the competing change survives.
+async fn assert_snapshot_mismatch_refuses_revoke(change: SnapshotChange) {
+    let db = test_db().await;
+    let alice = seed_user(&db.pool, "alice", None).await;
+    seed_user(&db.pool, "bob", None).await;
+    let competing_actor = AuditActor::system("competing-credential-change");
+    for name in ["main", "other"] {
+        catalogs::create(
+            &db.pool,
+            &catalogs::NewCatalog {
+                name,
+                description: "",
+                owner_team: TEST_TEAM,
+            },
+            &competing_actor,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    }
+    let names = ["main".to_string()];
+    let created = create_with_id(
+        &db.pool,
+        &key("snapshot-mismatch", Grants::Catalogs(&names)),
+        &competing_actor,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let before_generation = generation(&db.pool).await;
+    let before_entries: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_entries")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let mut actor = AuditActor::system("waiting-credential-change");
+    actor.user_id = Some(alice.id.clone());
+    let mut holder = db.pool.begin().await.unwrap();
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(&alice.id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let pool = db.pool.clone();
+    let id = created.id.clone();
+    let mut changing =
+        tokio::spawn(async move { revoke_by_id(&pool, &id, &actor, Utc::now()).await });
+    let competing = tokio::time::timeout(Duration::from_secs(10), async {
+        // Seeing this specific backend blocked by our holder in lock_people
+        // proves both snapshots have been read; no scheduling sleeps decide
+        // when the competing change may run.
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                   AND $1 = ANY(pg_blocking_pids(pid)) \
+                   AND query = 'SELECT is_admin FROM users WHERE id = $1 FOR KEY SHARE')",
+            )
+            .bind(holder_pid)
+            .fetch_one(&db.pool)
+            .await?;
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        match change {
+            SnapshotChange::Owner => {
+                assign_user_by_id(&db.pool, &created.id, "bob", &competing_actor, Utc::now()).await
+            }
+            SnapshotChange::Grants => {
+                grant_by_id(&db.pool, &created.id, "other", &competing_actor, Utc::now()).await
+            }
+        }
+    })
+    .await;
+    // Release the holder and drain the spawned task before asserting, even
+    // when synchronization or the competing change timed out/failed.
+    holder.rollback().await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), &mut changing).await;
+    if result.is_err() {
+        changing.abort();
+        tokio::time::timeout(Duration::from_secs(10), changing)
+            .await
+            .expect("aborted revoke task must finish")
+            .expect_err("revoke task must have been cancelled");
+    }
+    competing
+        .expect("revoke must block on its actor and the competing change must commit")
+        .expect("competing credential change must succeed");
+    let outcome = result
+        .expect("revoke must finish after releasing its actor")
+        .expect("revoke task must not panic");
+    assert!(
+        matches!(&outcome, Err(OkfError::Refused { reason })
+            if reason == "credential changed while locking; retry the request"),
+        "snapshot mismatch must refuse the revoke for retry, got {outcome:?}"
+    );
+    let record = list(&db.pool).await.unwrap().pop().unwrap();
+    assert!(
+        record.revoked_at.is_none(),
+        "refused revoke must not mutate the key"
+    );
+    assert!(!record.maintenance_report);
+    assert_eq!(record.access, Access::Write);
+    let (expected_user, expected_catalogs, competing_action) = match change {
+        SnapshotChange::Owner => ("bob", vec!["main"], "key.user_assigned"),
+        SnapshotChange::Grants => (TEST_USER, vec!["main", "other"], "key.catalog_granted"),
+    };
+    assert_eq!(record.user.as_deref(), Some(expected_user));
+    assert_eq!(record.catalogs, expected_catalogs);
+    assert_eq!(generation(&db.pool).await, before_generation + 1);
+    assert!(entries(&db.pool, "key.revoked").await.is_empty());
+    assert_eq!(entries(&db.pool, competing_action).await.len(), 1);
+    let after_entries: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_entries")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_entries,
+        before_entries + 1,
+        "only the competing change may record"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_snapshot_mismatch_refuses_revoke_without_mutation_audit_or_generation_bump() {
+    assert_snapshot_mismatch_refuses_revoke(SnapshotChange::Owner).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grant_snapshot_mismatch_refuses_revoke_without_mutation_audit_or_generation_bump() {
+    assert_snapshot_mismatch_refuses_revoke(SnapshotChange::Grants).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_absent_legacy_reference_first_resolution_can_wait() {
     let db = test_db().await;
