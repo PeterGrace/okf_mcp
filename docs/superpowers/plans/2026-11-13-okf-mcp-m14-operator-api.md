@@ -4348,7 +4348,39 @@ And the test helper (`audit::testing`), which resolves the ids with SQL as the c
     }
 ```
 
-> **Corrected (M13 merged, 2026-11-14), open question.** `ToolContext::check_connection` goes through `self.select(None)` (`src/mcp/context.rs:158-165`), and `ToolContext::changeset` calls `check_connection` first (`:360`), as does `list_changesets` without `catalog`. With `admit` inside `select`, a changeset call or a changeset list on a connection that names catalogs would note a read of *every* listed catalog, not only the one the changeset belongs to. Whether that is meant is a design question for the founder, raised on PR #375. Until it is answered, this plan keeps the reading it was written with, admission where a tool reads, so `check_connection` only validates: give `select` a non-admitting body (`fn resolve_call`) that `check_connection` uses, and admit in `select` and in `changeset` (which admits its own catalog) only.
+> **Corrected (M13 merged, 2026-11-14); Decision 23 (user, 2026-11-14).** `ToolContext::check_connection` goes through `self.select(None)` (`src/mcp/context.rs:158-165`), and `ToolContext::changeset` calls `check_connection` first (`:360`), as does `list_changesets` without `catalog`. With `admit` inside `select`, a changeset call or a changeset list on a connection that names catalogs would note a read of *every* listed catalog. The founder decided: **only the catalog actually read is admitted and recorded.** `check_connection` only validates: give `select` a non-admitting body (`fn resolve_call`) that `check_connection` uses; `select` admits what it selects for a tool that reads it, and `changeset` admits its own catalog only. `list_changesets` without `catalog` admits nothing (it reads no catalog's content).
+
+Test, in `src/mcp/changesets.rs`' tests (move Step 1's `staff_root` helper, in `http::api::browse`'s tests, to `mcp::testing` so both modules share it):
+
+```rust
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changeset_call_on_a_multi_catalog_connection_records_one_admin_read() {
+        let test = crate::mcp::testing::app_with(
+            &[("main", &[("index.md", "# Main\n")]), ("other", &[("index.md", "# Other\n")])],
+            Config::default(),
+        )
+        .await;
+        // An every-catalog admin key of `staff`, outside both catalogs' owner team.
+        let secret = crate::mcp::testing::staff_root(&test).await;
+        let ctx = crate::mcp::testing::context(
+            &test,
+            crate::mcp::testing::cached_principal(&test, &secret),
+            Some(&["main", "other"]),
+        );
+        let row = crate::mcp::testing::open_at(&test, &ctx, "main", Utc::now()).await;
+
+        ctx.changeset(&row.handle, Access::Read).await.unwrap();
+        list_changesets(&ctx, ListParams { catalog: None }).await.unwrap();
+        test.app.settle_access().await;
+
+        let reads = crate::store::audit::testing::entries(test.app.pool(), "catalog.admin_read").await;
+        assert_eq!(reads.len(), 1, "only the changeset's own catalog: {reads:?}");
+        assert_eq!(reads[0].target.as_deref(), Some("main"));
+        assert_eq!(reads[0].requests, Some(1), "the connection check and the list record nothing");
+    }
+```
+
+Run it with `tools/agentic/gate.sh narrow --lib mcp::changesets` in Step 6.
 
 `select` calls `self.admit(name, AccessKind::Read)` for each catalog of a successful selection; `changeset` calls `self.admit(state.name(), if access == Access::Write { AccessKind::Write } else { AccessKind::Read })` after its `require`. The REST revision route (`browse.rs:328`) calls `ctx.admit(&catalog, AccessKind::Read)` after building its context.
 
@@ -6085,7 +6117,7 @@ pub async fn tally(pool: &PgPool, id: i64, kind: AccessKind) -> Result<(), OkfEr
 - The CLI is unchanged: it works on the database directly (spec: its export and import are audited, `source = cli`, and need no unlock).
 
 > **Corrected (M13 merged, 2026-11-14).** What the M13 selection rules shipped as, and what they mean once `refuse_closed` / `without_closed` call `check_open`:
-> - **Order.** `require_contents` keeps the spec's order (reach, level, suspension, then the unlock). At the selection there is no level check: `open_changeset`, `maintenance_dispose` and the maintenance work tools select first and check their own level after, which M13 qualified for `Suspended` (#366). So for those tools a locked catalog answers 403 `UnlockRequired` to a credential below the tool's level, where `Forbidden` would come first through `require_contents`. Reach is still first everywhere, so a credential that does not reach a catalog never learns it is locked. The spec's "The refusal" carries the same qualification.
+> - **Order.** `require_contents` keeps the spec's order (reach, level, suspension, then the unlock). At the selection there is no level check: `open_changeset`, `maintenance_dispose` and the maintenance work tools select first and check their own level after, which M13 qualified for `Suspended` (#366). So for those tools a locked catalog answers 403 `UnlockRequired` to a credential below the tool's level, where `Forbidden` would come first through `require_contents`. Reach is still first everywhere, so a credential that does not reach a catalog never learns it is locked. The founder confirmed this order (Decision 24, 2026-11-14); the spec's "The refusal" carries the same qualification.
 > - **Connections.** `check_connection` goes through `select(None)` (`src/mcp/context.rs:158-165`), so a connection whose every listed catalog is closed (suspended or locked) is refused with the first refusal by `list_changesets` without `catalog` and by every changeset handle on it; a mixed list passes, as M13 shipped for suspension.
 > - **Search.** When every reached catalog is filtered out, the REST search falls back to the key's default (M13), which is then refused as named, with `UnlockRequired` for a locked one.
 > - **Tests.** Extend M13's whole-class tests rather than writing new matrices: `mcp::context::tests::every_selection_path_refuses_or_drops_a_suspended_catalog` and `http::api::browse::tests::every_selection_backed_read_route_refuses_a_suspended_catalog_to_members` have the shape a "locked" twin needs (with `require_unlock` on and an admin key outside its teams), and `http::api::testing::{Expect, assert_answers}` gives a status and error kind per request.
@@ -6770,3 +6802,5 @@ git commit -m "docs: operator API operations, API reference and close-out (M14 t
 20. **Admin-read buckets follow the catalog's identity and owner.** *(PR #375 review, round 2, 2026-11-13.)* The bucket was (credential, catalog name, hour), so reads after a transfer to another team, or of a catalog deleted and created again under the same name, counted in the first entry and showed in the wrong team's log. It is now (credential or person audit id, `catalogs.id`, owner `audit_teams` id, hour): one entry per credential, catalog identity, owning team and clock hour. Unlock tallies were checked: they are keyed by unlock id, and an unlock belongs to one `catalogs.id`. Test: Task 7b `a_catalog_moved_or_created_again_within_the_hour_starts_a_new_admin_read_entry`.
 21. **Access records carry ids resolved at admission.** *(PR #375 review, final round, 2026-11-13.)* The background write used to resolve the actor (creating `audit_people` and `audit_credentials` rows from the raw credential id and label) when it ran, so a write delayed past the user's deletion could re-create the forgotten name or credential id. Now the key cache resolves audit ids at load (`ensure_audit_rows`, one row per statement), `ToolContext::admit` builds an `AccessRecord` from them synchronously, and the write inserts with those ids only, creating no person or credential row. Separately, `audit_person` and `audit_credential` lock the user (`FOR KEY SHARE`) and create nothing for a user deleted meanwhile, so no audit write anywhere can undo a deletion. Test: Task 7b `a_write_delayed_past_the_users_deletion_stores_nothing_that_identifies_them`.
 22. **Access records carry the catalog's identity and scope from admission.** *(PR #375 review, final round, 2026-11-13.)* The write used to look the catalog up by name when it ran: a read before a transfer was scoped to the new owner, and a read of a catalog deleted (or deleted and created again) before the write was dropped or merged into the replacement. `AccessRecord.scope` (`catalogs.id`, owner `audit_teams` id) is taken from the key cache at admission, the entry's `details.catalog_id` names the identity, and the bucket key uses it. Unlock tallies were already keyed by an unlock id fixed at admission. Tests: Task 7b `a_read_admitted_before_a_transfer_stays_with_the_old_owner` and `a_read_of_a_catalog_deleted_or_replaced_before_it_is_written_keeps_its_identity`.
+23. **Only the catalog actually read is recorded.** *(User, 2026-11-14, after M13 merged.)* M13 routed `check_connection` through `select(None)`, which every changeset call and `list_changesets` without `catalog` use. Admissions and admin-read records happen only where a tool reads a catalog's content (a changeset call: the changeset's own catalog); `check_connection` validates the connection and admits nothing. Test: Task 7b `a_changeset_call_on_a_multi_catalog_connection_records_one_admin_read` (a changeset on `main`, a connection of `main` and `other`: exactly one `catalog.admin_read`, for `main`).
+24. **Selection-first tools refuse a lock before their own level check.** *(User, 2026-11-14.)* As M13 shipped for `Suspended` (its Decision 2 as qualified), `open_changeset`, `maintenance_dispose` and the maintenance work tools refuse `UnlockRequired` at the selection, after reach and before their own level check; `require_contents` keeps reach, level, suspension, unlock. Task 9b; the spec's "The refusal" says so.

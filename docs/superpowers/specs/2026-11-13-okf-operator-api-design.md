@@ -424,7 +424,8 @@ A new error kind, `UnlockRequired` (403), for operator access without an
 active unlock: `{"error": "UnlockRequired", "message", "catalog"}`, with a
 message that says how to unlock. It is checked after reach, level and
 suspension (milestone 13), and only on a catalog the credential reaches.
-*(Qualified, milestone 13 merged, 2026-11-14: as milestone 13 shipped
+*(Qualified, milestone 13 merged, 2026-11-14; confirmed by the founder,
+2026-11-14: as milestone 13 shipped
 suspension, a tool that picks its catalog through the selection before
 checking its own level (`open_changeset`, `maintenance_dispose`, the
 maintenance work tools) refuses a locked catalog at the selection, so a
