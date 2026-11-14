@@ -382,6 +382,22 @@ pub enum TeamCommand {
         /// Its name.
         name: String,
     },
+    /// Suspend a team: its catalogs stop answering non-admin credentials
+    /// (export still works) until `team unsuspend`. Repeating it replaces
+    /// the notice and keeps the first suspension time.
+    Suspend {
+        /// The team.
+        name: String,
+        /// What its members are told (at most 2000 characters; none when
+        /// left out or blank).
+        #[arg(long)]
+        notice: Option<String>,
+    },
+    /// Lift a team's suspension (no change when it is not suspended).
+    Unsuspend {
+        /// The team.
+        name: String,
+    },
 }
 
 /// `okf-mcp settings ...`.

@@ -1505,6 +1505,8 @@ and in the API reference table, after the `DELETE /api/v1/teams/{name}/members/{
 
 Update the `okf-mcp team list` line's documented columns to include `suspended TIME` (`-` when active).
 
+> **Corrected (issue #368, 2026-11-14).** The subcommands, the `team()` arms, the `format_team` cell, the parity rows and the API row shipped as written (the API row was not yet in `docs/operations.md`; this task added it). Differences: the tests run the commands through the test module's `okf(&db, &[...])` helper, which parses them with clap as the binary does (the module has no `now()` helper), and the list check asserts the exact cell `suspended <the stored since>` rather than `suspended 2026-`, then that the lifted team lists `suspended -`. A second test, `team_suspend_without_a_notice_and_its_refusals`, covers a missing notice, unknown and NUL names for both subcommands (`UnknownName`), and a long or NUL notice (`Refused`, leaving the suspension unchanged). `team_membership_round_trip` expects the new `suspended -` cell. Read `src/cli/people.rs` for the shipped code.
+
 - [ ] **Step 4: Run, gate, commit**
 
 Run both tests, then `tools/agentic/gate.sh lint`.
@@ -1713,6 +1715,7 @@ git commit -m "feat(console): suspend and lift teams; suspended pills and the Br
   - In the error table, a `Suspended` row: 403, when, and its body fields (`catalog`, `team`, `notice`).
   - In the MCP tools table, note `list_catalogs`' `suspended` field; in the API reference, note `GET /api/v1/catalogs`' `suspended` field and `GET /api/v1/teams`' `suspended_at` and `suspension_notice`.
   - In "Upgrades", one line: migration `0011` is additive.
+  - In "Users and teams"' command table, rows for `okf-mcp team suspend NAME [--notice TEXT]` (prints `suspended team NAME`; repeating it replaces the notice and keeps the first time) and `okf-mcp team unsuspend NAME` (prints `lifted the suspension of team NAME`; no change when active). *(Corrected, issue #368, 2026-11-14: Task 6 added the parity rows, the API row and the `team list` column only.)*
 - [ ] **Step 2: `README.md`** status paragraph: "Milestone 13 added team suspension: an operator can suspend a team, whose catalogs then refuse every non-admin credential except export until it is lifted (`docs/operations.md`, "Suspending a team"; design: `docs/superpowers/specs/2026-11-13-okf-team-suspension-design.md`)."
 - [ ] **Step 3: The spec**: add a "What shipped differently" section listing any deviation the tasks recorded (or "None").
 - [ ] **Step 4: The changelog entry** for the milestone, in the format of `changelog/2026-11-13T15-30-24Z-milestone-12-user-login.md`.

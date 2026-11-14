@@ -140,15 +140,17 @@ pub(super) async fn user(
 /// # Arguments
 /// * `pool` - the migrated database.
 /// * `command` - which team subcommand.
-/// * `now` - the creation time for `create` and new memberships.
+/// * `now` - the creation time for `create` and new memberships, and the
+///   suspension time for `suspend` of an active team.
 ///
 /// # Returns
 /// The text to print.
 ///
 /// # Errors
 /// The store's refusal (an invalid or taken name, the last owner, a
-/// personal team, a team that owns a catalog), an unknown team or user, or
-/// a database error.
+/// personal team, a team that owns a catalog, a notice over 2000 characters
+/// or holding a NUL), an unknown or malformed team name, an unknown user,
+/// or a database error.
 pub(super) async fn team(
     pool: &PgPool,
     command: TeamCommand,
@@ -182,6 +184,16 @@ pub(super) async fn team(
         TeamCommand::Delete { name } => {
             teams::delete(pool, &name).await?;
             format!("deleted team {name}\n")
+        }
+        TeamCommand::Suspend { name, notice } => {
+            // `as_deref` turns `Option<String>` into `Option<&str>`, the
+            // borrowed form the store takes, without copying the text.
+            teams::suspend(pool, &name, notice.as_deref(), now).await?;
+            format!("suspended team {name}\n")
+        }
+        TeamCommand::Unsuspend { name } => {
+            teams::unsuspend(pool, &name).await?;
+            format!("lifted the suspension of team {name}\n")
         }
     })
 }
@@ -404,8 +416,8 @@ fn format_sign_in(event: &SignInEvent) -> String {
 }
 
 /// One `team list` line, tab-separated: name, `personal U` (`-` for a
-/// shared team), `members U(role),...`, `catalogs C1,C2`, then the
-/// free-text display name last.
+/// shared team), `members U(role),...`, `catalogs C1,C2`, `suspended TIME`
+/// (`-` when active), then the free-text display name last.
 ///
 /// # Arguments
 /// * `team` - the team.
@@ -423,6 +435,15 @@ fn format_team(team: &TeamRecord) -> String {
         &labelled("personal", team.personal_of.as_deref()),
         &labelled("members", comma_list(&members).as_deref()),
         &labelled("catalogs", comma_list(&team.catalogs).as_deref()),
+        &labelled(
+            "suspended",
+            // `map` formats the time only when there is a suspension;
+            // `as_deref` then lends the `String` out as the `&str` cell.
+            team.suspension
+                .as_ref()
+                .map(|suspension| format_timestamp(suspension.since))
+                .as_deref(),
+        ),
         &team.display_name,
     ])
 }
@@ -567,15 +588,92 @@ mod tests {
         assert_eq!(again, "bob is already member of team family\n");
         assert_eq!(promoted, "bob is now owner of team family\n");
         assert_eq!(removed, "removed alice from team family\n");
-        assert!(
-            listed.contains("family\tpersonal -\tmembers bob(owner)\tcatalogs -\t\n"),
-            "{listed}"
-        );
-        assert!(
-            listed.contains("alice\tpersonal alice\tmembers alice(owner)\tcatalogs -\t\n"),
-            "{listed}"
-        );
+        let family_row = "family\tpersonal -\tmembers bob(owner)\tcatalogs -\tsuspended -\t\n";
+        let alice_row = "alice\tpersonal alice\tmembers alice(owner)\tcatalogs -\tsuspended -\t\n";
+        assert!(listed.contains(family_row), "{listed}");
+        assert!(listed.contains(alice_row), "{listed}");
         assert_eq!(deleted, "deleted team family\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn team_suspend_and_unsuspend_print_and_list_the_state() {
+        let db = test_db().await;
+        let team_name = crate::db::TEST_TEAM;
+
+        let suspended = okf(&db, &["team", "suspend", team_name, "--notice", "Paused."])
+            .await
+            .unwrap();
+        let record = teams::find(&db.pool, team_name).await.unwrap();
+        let listed = okf(&db, &["team", "list"]).await.unwrap();
+        let lifted = okf(&db, &["team", "unsuspend", team_name]).await.unwrap();
+        let listed_after = okf(&db, &["team", "list"]).await.unwrap();
+        let lifted_again = okf(&db, &["team", "unsuspend", team_name]).await.unwrap();
+
+        assert_eq!(suspended, format!("suspended team {team_name}\n"));
+        let suspension = record.suspension.expect("the team is suspended");
+        assert_eq!(suspension.notice.as_deref(), Some("Paused."));
+        assert!(
+            listed.contains(&format!(
+                "\tcatalogs -\tsuspended {}\t",
+                format_timestamp(suspension.since)
+            )),
+            "{listed}"
+        );
+        assert_eq!(
+            lifted,
+            format!("lifted the suspension of team {team_name}\n")
+        );
+        assert!(listed_after.contains("\tsuspended -\t"), "{listed_after}");
+        assert!(!listed_after.contains("suspended 2"), "{listed_after}");
+        // Lifting an active team changes nothing and still succeeds, as
+        // over REST.
+        assert_eq!(lifted_again, lifted);
+        let after = teams::find(&db.pool, team_name).await.unwrap();
+        assert_eq!(after.suspension, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn team_suspend_without_a_notice_and_its_refusals() {
+        let db = test_db().await;
+        let team_name = crate::db::TEST_TEAM;
+        let too_long = "x".repeat(teams::MAX_NOTICE_CHARS + 1);
+
+        let bare = okf(&db, &["team", "suspend", team_name]).await.unwrap();
+        let unknown = okf(&db, &["team", "suspend", "nobody"]).await;
+        let malformed = okf(&db, &["team", "suspend", "a\0b"]).await;
+        let unknown_lift = okf(&db, &["team", "unsuspend", "nobody"]).await;
+        let malformed_lift = okf(&db, &["team", "unsuspend", "a\0b"]).await;
+        let long = okf(&db, &["team", "suspend", team_name, "--notice", &too_long]).await;
+        let nul = okf(&db, &["team", "suspend", team_name, "--notice", "a\0b"]).await;
+
+        assert_eq!(bare, format!("suspended team {team_name}\n"));
+        let record = teams::find(&db.pool, team_name).await.unwrap();
+        assert_eq!(record.suspension.map(|s| s.notice), Some(None));
+        // A malformed name takes the unknown name's path, never a database
+        // error; the store's error says which name it did not find.
+        for refused in [unknown, malformed, unknown_lift, malformed_lift] {
+            let error = refused.unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<crate::error::OkfError>(),
+                    Some(crate::error::OkfError::UnknownName { .. })
+                ),
+                "{error}"
+            );
+        }
+        for refused in [long, nul] {
+            let error = refused.unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<crate::error::OkfError>(),
+                    Some(crate::error::OkfError::Refused { .. })
+                ),
+                "{error}"
+            );
+        }
+        // The refused notices left the earlier suspension as it was.
+        let after = teams::find(&db.pool, team_name).await.unwrap();
+        assert_eq!(after.suspension.map(|s| s.notice), Some(None));
     }
 
     #[tokio::test(flavor = "multi_thread")]
