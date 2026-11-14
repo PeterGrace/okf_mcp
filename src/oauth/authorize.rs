@@ -45,6 +45,7 @@ use crate::store::keys::Access;
 use crate::store::oauth::clients::{ClientKind, ClientRecord};
 use crate::store::oauth::codes::{self as code_rows, SignInCodeRecord};
 use crate::store::oauth::grants::{self as grant_rows, NewSelfIssuedGrant};
+use crate::store::settings::Brand;
 use crate::store::users::UserAuth;
 
 /// The message for every unusable sign-in code, so the page never says
@@ -197,6 +198,7 @@ fn claim_consent(consent: Option<&mut UserConsent>, posted: Option<&str>, fresh:
 /// sign-in code included, to the client.
 ///
 /// # Arguments
+/// * `brand` - the product name and support contact, for the error page.
 /// * `redirect_uri` - the request's URI, matched against the client's
 ///   (see [`clients::redirect_uri_matches`]).
 /// * `pairs` - `code`, or `error` and `error_description`.
@@ -206,6 +208,7 @@ fn claim_consent(consent: Option<&mut UserConsent>, posted: Option<&str>, fresh:
 /// # Returns
 /// The redirect.
 fn back_to_client(
+    brand: &Brand,
     redirect_uri: &str,
     pairs: &[(&str, &str)],
     state: Option<&str>,
@@ -217,6 +220,7 @@ fn back_to_client(
         return consent::error_page(
             StatusCode::BAD_REQUEST,
             "The client's redirect URI is invalid.",
+            brand,
         );
     };
     {
@@ -235,23 +239,26 @@ fn back_to_client(
 /// An OAuth error sent back to the client.
 ///
 /// # Arguments
+/// * `brand` - the product name and support contact (see
+///   [`back_to_client`]).
 /// * `redirect_uri` - the request's URI, matched against the client's
 ///   (see [`clients::redirect_uri_matches`]).
 /// * `state` - the client's `state`, echoed if it sent one.
 /// * `issuer` - this server's issuer.
-/// * `code` - the OAuth error code.
-/// * `description` - its `error_description`.
+/// * `(code, description)` - the OAuth error code and its
+///   `error_description`.
 ///
 /// # Returns
 /// The redirect.
 fn error_to_client(
+    brand: &Brand,
     redirect_uri: &str,
     state: Option<&str>,
     issuer: &str,
-    code: &str,
-    description: &str,
+    (code, description): (&str, &str),
 ) -> Response {
     back_to_client(
+        brand,
         redirect_uri,
         &[("error", code), ("error_description", description)],
         state,
@@ -432,6 +439,7 @@ fn chosen_levels(
 /// * `pending_id`, `pending` - the request; its `consent` is set.
 /// * `user` - the signed-in user's name.
 /// * `error` - a message, if the page is shown again.
+/// * `brand` - the product name and support contact.
 ///
 /// # Returns
 /// The page, or the expired page if `pending` is on the code path.
@@ -440,9 +448,10 @@ fn user_consent_page(
     pending: &PendingAuthorization,
     user: &str,
     error: Option<&str>,
+    brand: &Brand,
 ) -> Response {
     let Some(consent) = pending.consent.as_ref() else {
-        return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED);
+        return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED, brand);
     };
     consent::user_page(
         &view(pending_id, pending),
@@ -453,6 +462,7 @@ fn user_consent_page(
             code_href: &code_href(&pending.query),
         },
         error,
+        brand,
     )
 }
 
@@ -542,15 +552,16 @@ async fn authorize(
     // parameter, `client_id`, is then the error page. `map` unwraps the
     // `Query` tuple struct; a rejection becomes the all-`None` default.
     let query = query.map(|Query(query)| query).unwrap_or_default();
+    let brand = app.settings().brand();
     let (client, redirect_uri) = match trusted_client(&app, oauth, &query).await {
         Ok(trusted) => trusted,
-        Err((status, message)) => return consent::error_page(status, message),
+        Err((status, message)) => return consent::error_page(status, message, &brand),
     };
     // From here on, errors go back to the client.
     let issuer = oauth.settings.issuer.as_str();
     let state = query.state.as_deref();
     let back = |code: &str, description: &str| {
-        error_to_client(redirect_uri, state, issuer, code, description)
+        error_to_client(&brand, redirect_uri, state, issuer, (code, description))
     };
     // 3. The rest, in the spec's order.
     if query.response_type.as_deref() != Some("code") {
@@ -586,7 +597,7 @@ async fn authorize(
         match signed_in_user(&app, &headers).await {
             Ok(Some(user)) => Some(user),
             Ok(None) => return to_sign_in(&query_string),
-            Err(error) => return server_error(&error),
+            Err(error) => return server_error(&error, &brand),
         }
     };
     let consent = match &user {
@@ -594,14 +605,14 @@ async fn authorize(
             Ok(consent) => Some(consent),
             // Deleted since the session was read: as if signed out.
             Err(OkfError::UnknownName { .. }) => return to_sign_in(&query_string),
-            Err(error) => return server_error(&error),
+            Err(error) => return server_error(&error, &brand),
         },
         None => None,
     };
     // 5. A pending authorization, and its first page.
     let (pending_id, csrf) = match (keys::generate_with(""), keys::generate_with("")) {
         (Ok(id), Ok(csrf)) => (id, csrf),
-        (Err(error), _) | (_, Err(error)) => return server_error(&error),
+        (Err(error), _) | (_, Err(error)) => return server_error(&error, &brand),
     };
     let pending = PendingAuthorization {
         csrf,
@@ -616,8 +627,8 @@ async fn authorize(
         query: query_string,
     };
     let page = match &user {
-        Some(user) => user_consent_page(&pending_id, &pending, &user.name, None),
-        None => consent::code_page(&view(&pending_id, &pending), None),
+        Some(user) => user_consent_page(&pending_id, &pending, &user.name, None, &brand),
+        None => consent::code_page(&view(&pending_id, &pending), None, &brand),
     };
     // `insert` is `false` when the bounded map is full: an unauthenticated
     // GET must not grow memory without limit.
@@ -625,6 +636,7 @@ async fn authorize(
         return consent::error_page(
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many sign-ins are in progress. Try again in a few minutes.",
+            &brand,
         );
     }
     page
@@ -640,27 +652,29 @@ async fn consent_post(
     let Some(oauth) = app.oauth() else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let brand = app.settings().brand();
     // Another site's page posting this form into the person's browser
     // (with its own pending id and token) is refused before anything else.
     if cross_site(&headers) {
-        return consent::error_page(StatusCode::FORBIDDEN, CROSS_SITE);
+        return consent::error_page(StatusCode::FORBIDDEN, CROSS_SITE, &brand);
     }
     let now = Instant::now();
     if !oauth.consent_limit.try_take(now) {
         return consent::error_page(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many sign-in attempts. Wait a minute.",
+            &brand,
         );
     }
     let Ok(Form(form)) = form else {
-        return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED);
+        return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED, &brand);
     };
     // A signed-in Approve spends its page's nonce; the replacement is made
     // here, outside the lock, because making it can fail.
     let mut fresh = if form.action == "consent" {
         match keys::generate_with("") {
             Ok(nonce) => Some(nonce),
-            Err(error) => return server_error(&error),
+            Err(error) => return server_error(&error, &brand),
         }
     } else {
         None
@@ -684,7 +698,7 @@ async fn consent_post(
     });
     // `Some(Some(_))`: the entry is live (outer) and the token matched (inner).
     let Some(Some((pending, decided, claimed))) = pending else {
-        return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED);
+        return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED, &brand);
     };
     // The sign-in code steps belong to the code path only: on the user
     // path, the code is reached through the link, a fresh GET.
@@ -693,11 +707,11 @@ async fn consent_post(
         "deny" => {
             oauth.pending.remove(&form.pending);
             error_to_client(
+                &brand,
                 &pending.redirect_uri,
                 pending.state.as_deref(),
                 &oauth.settings.issuer,
-                "access_denied",
-                "the person signing in denied access",
+                ("access_denied", "the person signing in denied access"),
             )
         }
         "code" if code_path => {
@@ -705,22 +719,29 @@ async fn consent_post(
             check_code(&app, oauth, &form.pending, &pending, presented).await
         }
         "approve" if code_path => match decided {
-            Approval::NoCode => consent::code_page(&view(&form.pending, &pending), None),
+            Approval::NoCode => consent::code_page(&view(&form.pending, &pending), None, &brand),
             // Nothing changes: the latest summary still approves.
-            Approval::Stale => consent::code_page(&view(&form.pending, &pending), Some(STALE)),
+            Approval::Stale => {
+                consent::code_page(&view(&form.pending, &pending), Some(STALE), &brand)
+            }
             Approval::Current(code_id) => {
                 approve(&app, oauth, &form.pending, &pending, &code_id).await
             }
         },
         // `claimed`: on the user path, with this page's current nonce.
         "consent" if claimed => consent_as_user(&app, oauth, &form, &pending, &headers).await,
-        _ => consent::error_page(StatusCode::BAD_REQUEST, EXPIRED),
+        _ => consent::error_page(StatusCode::BAD_REQUEST, EXPIRED, &brand),
     }
 }
 
 /// Counts a failed attempt and answers step 1 again, or drops the request
 /// at [`MAX_FAILED_ATTEMPTS`].
-fn failed_attempt(oauth: &OAuth, pending_id: &str, pending: &PendingAuthorization) -> Response {
+fn failed_attempt(
+    oauth: &OAuth,
+    pending_id: &str,
+    pending: &PendingAuthorization,
+    brand: &Brand,
+) -> Response {
     let attempts = oauth.pending.update(pending_id, Instant::now(), |pending| {
         pending.failed_attempts = pending.failed_attempts.saturating_add(1);
         pending.accepted = None;
@@ -728,11 +749,15 @@ fn failed_attempt(oauth: &OAuth, pending_id: &str, pending: &PendingAuthorizatio
     });
     match attempts {
         Some(attempts) if attempts < MAX_FAILED_ATTEMPTS => {
-            consent::code_page(&view(pending_id, pending), Some(BAD_CODE))
+            consent::code_page(&view(pending_id, pending), Some(BAD_CODE), brand)
         }
         Some(_) | None => {
             oauth.pending.remove(pending_id);
-            consent::error_page(StatusCode::BAD_REQUEST, "Too many wrong sign-in codes.")
+            consent::error_page(
+                StatusCode::BAD_REQUEST,
+                "Too many wrong sign-in codes.",
+                brand,
+            )
         }
     }
 }
@@ -746,11 +771,12 @@ async fn check_code(
     pending: &PendingAuthorization,
     presented: &str,
 ) -> Response {
+    let brand = app.settings().brand();
     match code_rows::find_live(app.pool(), presented, app.clock().now()).await {
         Ok(Some(record)) => {
             let summary_nonce = match keys::generate_with("") {
                 Ok(nonce) => nonce,
-                Err(error) => return server_error(&error),
+                Err(error) => return server_error(&error, &brand),
             };
             let accepted = AcceptedCode {
                 code_id: record.id.clone(),
@@ -760,16 +786,17 @@ async fn check_code(
                 pending.accepted = Some(accepted);
             });
             if stored.is_none() {
-                return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED);
+                return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED, &brand);
             }
             consent::summary_page(
                 &view(pending_id, pending),
                 &summary(&record),
                 &summary_nonce,
+                &brand,
             )
         }
-        Ok(None) => failed_attempt(oauth, pending_id, pending),
-        Err(error) => server_error(&error),
+        Ok(None) => failed_attempt(oauth, pending_id, pending, &brand),
+        Err(error) => server_error(&error, &brand),
     }
 }
 
@@ -782,13 +809,15 @@ async fn approve(
     pending: &PendingAuthorization,
     code_id: &str,
 ) -> Response {
-    let grant_id =
-        match code_rows::redeem(app.pool(), code_id, &pending.client, app.clock().now()).await {
-            Ok(grant_id) => grant_id,
-            // Expired, revoked or redeemed meanwhile (another approve won).
-            Err(OkfError::Refused { .. }) => return failed_attempt(oauth, pending_id, pending),
-            Err(error) => return server_error(&error),
-        };
+    let brand = app.settings().brand();
+    let grant_id = match code_rows::redeem(app.pool(), code_id, &pending.client, app.clock().now())
+        .await
+    {
+        Ok(grant_id) => grant_id,
+        // Expired, revoked or redeemed meanwhile (another approve won).
+        Err(OkfError::Refused { .. }) => return failed_attempt(oauth, pending_id, pending, &brand),
+        Err(error) => return server_error(&error, &brand),
+    };
     finish(app, oauth, pending_id, pending, grant_id).await
 }
 
@@ -812,6 +841,7 @@ async fn finish(
 ) -> Response {
     // The request is spent once the grant exists, whatever happens next.
     oauth.pending.remove(pending_id);
+    let brand = app.settings().brand();
     // Creating the grant bumped admin_generation, so this loads it into the
     // key cache before the client's token request can arrive.
     if let Err(error) = app.poll().await {
@@ -822,7 +852,7 @@ async fn finish(
         new_id(),
     ) {
         (Ok(code), Ok(family_id)) => (code, family_id),
-        (Err(error), _) | (_, Err(error)) => return server_error(&error),
+        (Err(error), _) | (_, Err(error)) => return server_error(&error, &brand),
     };
     // A full map refuses the code; the grant stays and can be revoked, and
     // the person starts again from their client.
@@ -844,9 +874,11 @@ async fn finish(
         return consent::error_page(
             StatusCode::SERVICE_UNAVAILABLE,
             "The server is busy. Start again from your client in a minute.",
+            &brand,
         );
     }
     back_to_client(
+        &brand,
         &pending.redirect_uri,
         &[("code", &code)],
         pending.state.as_deref(),
@@ -876,13 +908,14 @@ async fn consent_as_user(
     pending: &PendingAuthorization,
     headers: &HeaderMap,
 ) -> Response {
+    let brand = app.settings().brand();
     let Some(consent) = pending.consent.as_ref() else {
-        return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED);
+        return consent::error_page(StatusCode::BAD_REQUEST, EXPIRED, &brand);
     };
     // Every refusal below ends the request: the page cannot be trusted again.
     let refuse = |message| {
         oauth.pending.remove(&form.pending);
-        consent::error_page(StatusCode::BAD_REQUEST, message)
+        consent::error_page(StatusCode::BAD_REQUEST, message, &brand)
     };
     let Some(session_id) = cookie(headers, COOKIE) else {
         return refuse(SIGNED_OUT);
@@ -890,12 +923,18 @@ async fn consent_as_user(
     let user = match signed_in_user(app, headers).await {
         Ok(Some(user)) if user.id == consent.user_id => user,
         Ok(_) => return refuse(SIGNED_OUT),
-        Err(error) => return server_error(&error),
+        Err(error) => return server_error(&error, &brand),
     };
     let chosen = match chosen_levels(&form.choices, &consent.offered) {
         Ok(chosen) => chosen,
         Err(Choice::Empty) => {
-            return user_consent_page(&form.pending, pending, &user.name, Some(NOTHING_CHOSEN))
+            return user_consent_page(
+                &form.pending,
+                pending,
+                &user.name,
+                Some(NOTHING_CHOSEN),
+                &brand,
+            );
         }
         Err(Choice::Tampered) => {
             tracing::warn!(
@@ -911,7 +950,13 @@ async fn consent_as_user(
         .as_deref()
         .filter(|name| !name.is_empty());
     if default_catalog.is_some_and(|name| !chosen.contains_key(name)) {
-        return user_consent_page(&form.pending, pending, &user.name, Some(DEFAULT_NOT_CHOSEN));
+        return user_consent_page(
+            &form.pending,
+            pending,
+            &user.name,
+            Some(DEFAULT_NOT_CHOSEN),
+            &brand,
+        );
     }
     let new = NewSelfIssuedGrant {
         user_id: &user.id,
@@ -928,7 +973,7 @@ async fn consent_as_user(
         Err(OkfError::Refused { .. } | OkfError::CatalogNotSelected { .. }) => {
             return refuse(CHANGED)
         }
-        Err(error) => return server_error(&error),
+        Err(error) => return server_error(&error, &brand),
     };
     tracing::info!(
         user = %user.name,
@@ -940,11 +985,12 @@ async fn consent_as_user(
 }
 
 /// A 500 error page; the details go to the log only.
-fn server_error(error: &OkfError) -> Response {
+fn server_error(error: &OkfError, brand: &Brand) -> Response {
     tracing::error!(%error, "consent failed");
     consent::error_page(
         StatusCode::INTERNAL_SERVER_ERROR,
         "The server could not complete sign-in.",
+        brand,
     )
 }
 
@@ -974,6 +1020,7 @@ mod tests {
     use crate::store::ceiling::{self, Ceiling};
     use crate::store::keys::{self as key_rows, Access, KeyKind};
     use crate::store::oauth::codes as code_rows;
+    use crate::store::settings::{self, SettingKey};
     use crate::store::user_sessions;
     use crate::store::users::{self, NewUser};
 
@@ -1568,6 +1615,41 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert!(headers.get("location").is_none());
             assert!(page.contains("Cannot connect"));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consent_pages_name_the_product_and_show_the_contact() {
+        let test = oauth_app().await;
+        for (key, value) in [
+            (SettingKey::ProductName, "Acme Notes"),
+            (SettingKey::SupportContact, "help@example.com"),
+        ] {
+            settings::set(test.app.pool(), key, value, "cli", Utc::now())
+                .await
+                .unwrap();
+        }
+        test.app.poll().await.unwrap();
+
+        let (_, _, unknown_client) = send(&test, "GET", "/oauth/authorize", None).await;
+        let (_, _, malformed) = send(
+            &test,
+            "POST",
+            "/oauth/authorize",
+            Some("action=code".into()),
+        )
+        .await;
+
+        for page in [unknown_client, malformed] {
+            assert!(
+                page.contains("<title>Cannot connect - Acme Notes</title>"),
+                "{page}"
+            );
+            assert!(
+                page.contains("Questions? Contact help@example.com</p>"),
+                "{page}"
+            );
+            assert!(!page.contains("okf"), "{page}");
         }
     }
 

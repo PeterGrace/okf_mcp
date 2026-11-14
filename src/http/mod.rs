@@ -176,6 +176,24 @@ async fn healthz(State(app): State<Arc<App>>) -> Response {
     (status, Json(health)).into_response()
 }
 
+/// `GET /ui/brand.json`: the product name and support contact
+/// (`{"product_name": ..., "support_contact": ... or null}`), for the console
+/// shell before anyone signs in. Public: the sign-in page shows both anyway.
+/// `no-cache`, so a changed setting shows on the next load.
+///
+/// # Arguments
+/// * `app` - the shared state.
+///
+/// # Returns
+/// The branding settings as JSON.
+async fn brand(State(app): State<Arc<App>>) -> Response {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-cache")],
+        Json(app.settings().brand()),
+    )
+        .into_response()
+}
+
 /// rmcp's streamable HTTP service over the app: one [`OkfServer`] per
 /// session, the configured `Host` names, sessions closed after
 /// `session_idle_timeout`, and every session ended when `shutdown` is.
@@ -259,7 +277,14 @@ pub fn router(app: Arc<App>, shutdown: &CancellationToken) -> Router {
     } else {
         open
     };
+    // `/ui/brand.json` reads the settings, so it is routed here, beside
+    // `ui::routes` (which has no state), with the console's headers.
+    let brand = Router::new().route(
+        "/ui/brand.json",
+        get(brand).layer(middleware::map_response(ui::security_headers)),
+    );
     open.merge(ui::routes())
+        .merge(brand)
         .merge(signin::routes(&app))
         // The API applies `require_principal` (a bearer credential or a
         // console session cookie) itself, inside its header layer, so even
@@ -705,6 +730,57 @@ mod tests {
         let response = slow.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn brand_json_is_public_and_follows_the_settings() {
+        use crate::store::settings::{self, SettingKey};
+        let test = crate::http::api::testing::app().await;
+        let get_brand = || async {
+            let response = router(Arc::clone(&test.app), &CancellationToken::new())
+                .oneshot(Request::get("/ui/brand.json").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let headers = response.headers().clone();
+            (response.status(), headers, json_body(response).await)
+        };
+        let (status, headers, before) = get_brand().await;
+
+        settings::set(
+            test.app.pool(),
+            SettingKey::ProductName,
+            "Acme Notes",
+            "cli",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        settings::set(
+            test.app.pool(),
+            SettingKey::SupportContact,
+            "help@example.com",
+            "cli",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        test.app.poll().await.unwrap();
+        let (_, _, after) = get_brand().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["cache-control"], "no-cache");
+        assert_eq!(
+            headers["content-security-policy"],
+            ui::CONTENT_SECURITY_POLICY
+        );
+        assert_eq!(
+            before,
+            serde_json::json!({"product_name": "okf", "support_contact": null})
+        );
+        assert_eq!(
+            after,
+            serde_json::json!({"product_name": "Acme Notes", "support_contact": "help@example.com"})
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

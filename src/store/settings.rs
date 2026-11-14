@@ -10,6 +10,12 @@
 //! | `max_keys_per_user` | JSON number | `0` to `1000` |
 //! | `max_key_lifetime` | JSON string (humantime) or `null` | a duration such as `90d`, or `none` |
 //! | the four other lifetimes | JSON string (humantime) | a duration above zero |
+//! | `product_name` | JSON string | 1 to 60 characters, no control characters (trimmed) |
+//! | `support_contact` | JSON string or `null` | an email address, an `https://` URL, or `none` |
+//!
+//! The two branding settings (`product_name`, `support_contact`) have no
+//! `[auth]` config key: their defaults are [`DEFAULT_PRODUCT_NAME`] and no
+//! contact.
 //!
 //! One function, `apply`, checks a value both when it is set (a bad one
 //! is refused with 422) and when it is loaded (a row this server cannot
@@ -23,14 +29,45 @@ use chrono::{DateTime, Utc};
 // humantime is the crate humantime_serde parses config durations with;
 // `re` re-exports it, so the formats match without another dependency.
 use humantime_serde::re::humantime;
+use serde::Serialize;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use crate::config::{check_auth_duration, AuthConfig, MAX_KEYS_PER_USER_LIMIT};
 use crate::error::OkfError;
 use crate::store::catalogs::bump_admin_generation;
 
-/// The effective sign-in policy: config defaults with overrides applied.
+/// The product name with no override.
+pub const DEFAULT_PRODUCT_NAME: &str = "okf";
+
+/// The longest product name, in characters.
+pub const MAX_PRODUCT_NAME_CHARS: usize = 60;
+
+/// The longest support contact URL, in characters (an email address is
+/// held to `users::check_email`'s 254).
+const MAX_SUPPORT_URL_CHARS: usize = 500;
+
+/// What people see the server as: the two branding settings. Serialized as
+/// `GET /ui/brand.json` answers it (`support_contact` is `null` when unset).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Brand {
+    /// The product name.
+    pub product_name: String,
+    /// The support contact (an email address or `https://` URL), if set.
+    pub support_contact: Option<String>,
+}
+
+// `Default` by hand: a derived one would make the product name empty.
+impl Default for Brand {
+    fn default() -> Self {
+        Self {
+            product_name: DEFAULT_PRODUCT_NAME.to_string(),
+            support_contact: None,
+        }
+    }
+}
+
+/// The effective settings: config defaults with overrides applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// Whether `/signin` offers email and password.
@@ -47,6 +84,12 @@ pub struct Settings {
     pub setup_link_ttl: Duration,
     /// Password-reset link lifetime.
     pub reset_link_ttl: Duration,
+    /// The product name in mail, server pages and the console
+    /// ([`DEFAULT_PRODUCT_NAME`] by default).
+    pub product_name: String,
+    /// An email address or `https://` URL people are pointed to; `None`
+    /// shows no contact line.
+    pub support_contact: Option<String>,
 }
 
 impl Settings {
@@ -66,6 +109,20 @@ impl Settings {
             console_session_absolute: defaults.console_session_absolute,
             setup_link_ttl: defaults.setup_link_ttl,
             reset_link_ttl: defaults.reset_link_ttl,
+            // Runtime settings only, with no `[auth]` key (spec "My calls").
+            product_name: DEFAULT_PRODUCT_NAME.to_string(),
+            support_contact: None,
+        }
+    }
+
+    /// The branding settings.
+    ///
+    /// # Returns
+    /// A copy of the product name and support contact.
+    pub fn brand(&self) -> Brand {
+        Brand {
+            product_name: self.product_name.clone(),
+            support_contact: self.support_contact.clone(),
         }
     }
 }
@@ -95,11 +152,17 @@ pub enum SettingKey {
     /// `reset_link_ttl`.
     #[value(name = "reset_link_ttl")]
     ResetLinkTtl,
+    /// `product_name`.
+    #[value(name = "product_name")]
+    ProductName,
+    /// `support_contact`.
+    #[value(name = "support_contact")]
+    SupportContact,
 }
 
 impl SettingKey {
     /// Every key, in the order `settings list` shows them.
-    pub const ALL: [SettingKey; 7] = [
+    pub const ALL: [SettingKey; 9] = [
         SettingKey::PasswordSignIn,
         SettingKey::MaxKeysPerUser,
         SettingKey::MaxKeyLifetime,
@@ -107,6 +170,8 @@ impl SettingKey {
         SettingKey::ConsoleSessionAbsolute,
         SettingKey::SetupLinkTtl,
         SettingKey::ResetLinkTtl,
+        SettingKey::ProductName,
+        SettingKey::SupportContact,
     ];
 
     /// The stored name.
@@ -122,6 +187,8 @@ impl SettingKey {
             SettingKey::ConsoleSessionAbsolute => "console_session_absolute",
             SettingKey::SetupLinkTtl => "setup_link_ttl",
             SettingKey::ResetLinkTtl => "reset_link_ttl",
+            SettingKey::ProductName => "product_name",
+            SettingKey::SupportContact => "support_contact",
         }
     }
 
@@ -170,6 +237,44 @@ fn duration(key: SettingKey, text: &str) -> Result<Duration, String> {
     Ok(parsed)
 }
 
+/// A product name as stored: trimmed, 1 to [`MAX_PRODUCT_NAME_CHARS`]
+/// characters, no control characters (a NUL, which Postgres refuses, or a
+/// line break in a mail subject).
+fn check_product_name(text: &str) -> Result<&str, String> {
+    let name = text.trim();
+    // `chars().count()`: characters, not bytes (`len()` counts UTF-8 bytes).
+    let length = name.chars().count();
+    if length == 0 || length > MAX_PRODUCT_NAME_CHARS || name.chars().any(char::is_control) {
+        return Err(format!(
+            "product_name takes 1 to {MAX_PRODUCT_NAME_CHARS} characters with no control \
+             characters"
+        ));
+    }
+    Ok(name)
+}
+
+/// A support contact: one plain email address, or an `https://` URL with a
+/// host, with no whitespace or control characters (the URL parser would
+/// silently drop a tab or line break, which would then be stored).
+fn check_support_contact(text: &str) -> Result<(), String> {
+    let refuse =
+        || format!("support_contact takes an email address, an https:// URL or none, not {text:?}");
+    if text.starts_with("https://") {
+        let clean = text.chars().count() <= MAX_SUPPORT_URL_CHARS
+            && !text.chars().any(|c| c.is_whitespace() || c.is_control());
+        // `is_some_and`: the URL parses and has a non-empty host.
+        let has_host = url::Url::parse(text)
+            .ok()
+            .is_some_and(|url| url.host_str().is_some_and(|host| !host.is_empty()));
+        return if clean && has_host {
+            Ok(())
+        } else {
+            Err(refuse())
+        };
+    }
+    crate::store::users::check_email(text).map_err(|_| refuse())
+}
+
 /// Turns the text [`set`] was given into the JSON to store.
 fn parse_value(key: SettingKey, text: &str) -> Result<Value, String> {
     let text = text.trim();
@@ -194,6 +299,13 @@ fn parse_value(key: SettingKey, text: &str) -> Result<Value, String> {
         | SettingKey::SetupLinkTtl
         | SettingKey::ResetLinkTtl => duration(key, text)
             .map(|parsed| Value::String(humantime::format_duration(parsed).to_string())),
+        SettingKey::ProductName => {
+            check_product_name(text).map(|name| Value::String(name.to_string()))
+        }
+        SettingKey::SupportContact if text == "none" => Ok(Value::Null),
+        SettingKey::SupportContact => {
+            check_support_contact(text).map(|()| Value::String(text.to_string()))
+        }
     }
 }
 
@@ -238,6 +350,24 @@ fn apply(settings: &mut Settings, key: SettingKey, value: &Value) -> Result<(), 
         }
         SettingKey::SetupLinkTtl => settings.setup_link_ttl = as_duration(value)?,
         SettingKey::ResetLinkTtl => settings.reset_link_ttl = as_duration(value)?,
+        SettingKey::ProductName => {
+            let text = value
+                .as_str()
+                .ok_or_else(|| "product_name must be a string".to_string())?;
+            settings.product_name = check_product_name(text)?.to_string();
+        }
+        SettingKey::SupportContact => {
+            settings.support_contact = match value {
+                Value::Null => None,
+                other => {
+                    let text = other
+                        .as_str()
+                        .ok_or_else(|| "support_contact must be a string or null".to_string())?;
+                    check_support_contact(text)?;
+                    Some(text.to_string())
+                }
+            };
+        }
     }
     Ok(())
 }
@@ -255,6 +385,11 @@ fn display(settings: &Settings, key: SettingKey) -> String {
         SettingKey::ConsoleSessionAbsolute => format(settings.console_session_absolute),
         SettingKey::SetupLinkTtl => format(settings.setup_link_ttl),
         SettingKey::ResetLinkTtl => format(settings.reset_link_ttl),
+        SettingKey::ProductName => settings.product_name.clone(),
+        SettingKey::SupportContact => settings
+            .support_contact
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
     }
 }
 
@@ -285,6 +420,30 @@ fn overlay(defaults: &AuthConfig, rows: &[StoredSetting]) -> Settings {
         }
     }
     settings
+}
+
+/// The branding settings, read inside the caller's connection or
+/// transaction, so a mail queued from the CLI or from any server has the
+/// brand stored now. A stored value this server cannot read falls back to
+/// the default, as in [`load`].
+///
+/// # Arguments
+/// * `conn` - the caller's connection or transaction (`&mut tx`).
+///
+/// # Returns
+/// The product name and support contact.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn brand_in(conn: &mut PgConnection) -> Result<Brand, OkfError> {
+    let rows = sqlx::query_as::<_, StoredSetting>(
+        "SELECT key, value, updated_at, updated_by FROM server_settings \
+         WHERE key IN ('product_name', 'support_contact')",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    // The `[auth]` defaults do not matter here: neither key has one.
+    Ok(overlay(&AuthConfig::default(), &rows).brand())
 }
 
 /// Every stored override.
@@ -638,6 +797,139 @@ mod tests {
             crate::config::DEFAULT_CONSOLE_SESSION_ABSOLUTE
         );
         assert!(session.is_ok(), "{session:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn product_name_and_support_contact_are_validated_and_listed() {
+        let db = test_db().await;
+        let defaults = AuthConfig::default();
+        let start = admin_generation(&db.pool).await.unwrap();
+        let set_text = |key, value: String| {
+            let pool = db.pool.clone();
+            async move { set(&pool, key, &value, "cli", now()).await }
+        };
+
+        let mut refused = Vec::new();
+        for (key, value) in [
+            (SettingKey::ProductName, "  ".to_string()),
+            (SettingKey::ProductName, "x".repeat(61)),
+            (SettingKey::ProductName, "Acme\u{7}".to_string()),
+            (SettingKey::ProductName, "Acme\0Notes".to_string()),
+            (SettingKey::SupportContact, "http://example.com".to_string()),
+            (SettingKey::SupportContact, "https://".to_string()),
+            (
+                SettingKey::SupportContact,
+                "https://exa\tmple.com".to_string(),
+            ),
+            (
+                SettingKey::SupportContact,
+                format!("https://example.com/{}", "x".repeat(500)),
+            ),
+            (SettingKey::SupportContact, "help@".to_string()),
+            (
+                SettingKey::SupportContact,
+                "help desk@example.com".to_string(),
+            ),
+        ] {
+            refused.push((value.clone(), set_text(key, value).await));
+        }
+        // Sixty characters, multibyte ones counted as one each.
+        set_text(SettingKey::ProductName, "\u{e9}".repeat(60))
+            .await
+            .unwrap();
+        set_text(SettingKey::ProductName, " Acme Notes ".to_string())
+            .await
+            .unwrap();
+        set_text(
+            SettingKey::SupportContact,
+            "https://example.com/help".to_string(),
+        )
+        .await
+        .unwrap();
+
+        for (value, result) in refused {
+            assert!(
+                matches!(
+                    result,
+                    Err(OkfError::LimitExceeded {
+                        limit: "setting",
+                        ..
+                    })
+                ),
+                "{value:?}: {result:?}"
+            );
+        }
+        assert_eq!(admin_generation(&db.pool).await.unwrap(), start + 3);
+        let loaded = load(&db.pool, &defaults).await.unwrap();
+        assert_eq!(
+            loaded.brand(),
+            Brand {
+                product_name: "Acme Notes".to_string(),
+                support_contact: Some("https://example.com/help".to_string()),
+            }
+        );
+        let mut conn = db.pool.acquire().await.unwrap();
+        assert_eq!(brand_in(&mut conn).await.unwrap(), loaded.brand());
+        let rows = list(&db.pool, &defaults).await.unwrap();
+        let shown = |key| {
+            rows.iter()
+                .find(|row| row.key == key)
+                .map(|row| row.value.clone())
+        };
+        assert_eq!(
+            shown(SettingKey::ProductName).as_deref(),
+            Some("Acme Notes")
+        );
+        assert_eq!(
+            shown(SettingKey::SupportContact).as_deref(),
+            Some("https://example.com/help")
+        );
+
+        set_text(SettingKey::SupportContact, "help@example.com".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            brand_in(&mut conn)
+                .await
+                .unwrap()
+                .support_contact
+                .as_deref(),
+            Some("help@example.com")
+        );
+        set_text(SettingKey::SupportContact, "none".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            load(&db.pool, &defaults).await.unwrap().support_contact,
+            None
+        );
+    }
+
+    #[test]
+    fn the_defaults_are_okf_and_no_contact() {
+        let settings = Settings::from_config(&AuthConfig::default());
+
+        assert_eq!(settings.product_name, "okf");
+        assert_eq!(settings.support_contact, None);
+        assert_eq!(settings.brand(), Brand::default());
+        assert_eq!(display(&settings, SettingKey::SupportContact), "none");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreadable_stored_brand_falls_back_to_the_default() {
+        let db = test_db().await;
+        // A hand edit: a control character and a plain-http contact.
+        sqlx::query(
+            "INSERT INTO server_settings (key, value, updated_at, updated_by) VALUES \
+             ('product_name', '\"Acme\\u0007\"', now(), 'hand'), \
+             ('support_contact', '\"http://example.com\"', now(), 'hand')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let mut conn = db.pool.acquire().await.unwrap();
+
+        assert_eq!(brand_in(&mut conn).await.unwrap(), Brand::default());
     }
 
     #[tokio::test(flavor = "multi_thread")]
