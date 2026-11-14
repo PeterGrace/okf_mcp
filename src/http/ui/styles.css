@@ -83,6 +83,7 @@ main { padding: 1.75rem 2.25rem; min-width: 0; }
 .page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 1.25rem; }
 .page-head .actions { display: flex; gap: .5rem; }
 .page-head button { width: auto; margin: 0; }
+.page-head input[type=search] { width: 16rem; margin: 0; }
 
 /* tiles, segments, tables, pills */
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .75rem; margin-bottom: 1.25rem; }
