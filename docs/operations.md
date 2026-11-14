@@ -955,13 +955,16 @@ controls disabled, or the Unassigned view a note, saying why.
 
 Every change below writes one entry in the change's own transaction: the
 change and its entry commit together, and a change whose entry cannot be
-written fails. An entry names the catalog and belongs to its owner team.
+written fails. A catalog entry names the catalog and belongs to its owner
+team; a user entry names the user only through its audit person, which
+reads `deleted user #N` once the user is deleted.
 
 | Action | Recorded when | Details |
 |---|---|---|
 | `catalog.published` | A publish writes at least one revision (one that changes nothing writes none and records nothing). Moves, splits and concept deletes are publishes and are recorded as such | `changeset` (the handle; the diff stays in the catalog's history), `files` (revisions written), `generation_from`, `generation_to` |
 | `catalog.reverted` | A `revert` succeeds: a document's old revision (or its deletion) goes into a changeset. A refused revert records nothing | `path`, `revision`, `changeset` |
-| `catalog.changeset_discarded` | An admin closes another key's changeset (`discard` without `paths`, or `DELETE /api/v1/changesets/{handle}`). A key discarding its own changeset records nothing | `changeset`, `files` (entries dropped), `reason` (`admin`) |
+| `catalog.changeset_discarded` | An admin closes another key's changeset (`discard` without `paths`, or `DELETE /api/v1/changesets/{handle}`), or a user deletion discards an open changeset of one of the user's keys (the entry's person is that user). A key discarding its own changeset records nothing | `changeset`, `files` (entries dropped), `reason` (`admin` or `user_deleted`) |
+| `user.deleted` | A user is deleted (`user delete`, `DELETE /api/v1/users/{name}`, the console). A refused deletion records nothing | `keys` (keys and grants deleted), `codes` (sign-in codes deleted), `changesets_discarded` |
 
 ## Signing in and self-service
 
