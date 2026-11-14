@@ -78,7 +78,7 @@ fn asset(path: &str) -> Response {
 }
 
 /// Adds the CSP, `nosniff` and `no-referrer` to every console response.
-async fn security_headers(mut response: Response) -> Response {
+pub(crate) async fn security_headers(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_SECURITY_POLICY,

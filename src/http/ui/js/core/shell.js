@@ -1,5 +1,5 @@
 // The signed-in identity in the shell: who, which catalogs, which groups,
-// and the unassigned count on the Users link.
+// and the unassigned count on the Users link; and the operator's brand.
 // Pages that change keys or catalogs call refreshIdentity() afterwards, and
 // those that assign a user or owner call refreshUnassigned().
 import { $, h } from './dom.js';
@@ -100,4 +100,24 @@ export async function refreshUnassigned() {
     const total = rows ? rows.keys.length + rows.codes.length + rows.catalogs.length : 0;
     badge.textContent = String(total);
     badge.hidden = total === 0;
+}
+
+let brandTicket = 0;
+
+// The operator's product name (Settings: product_name) on the login card, in
+// the sidebar and in the tab title, from the public /ui/brand.json. Called at
+// boot (before anyone signs in) and after the setting is saved or reset.
+// textContent only. Only the newest call writes: a boot read answering late
+// never draws over a newer save's. On any failure the page keeps what it
+// shows (index.html's "okf" until the first answer).
+export async function applyBrand() {
+    const mine = ++brandTicket;
+    let brand = null;
+    try {
+        const response = await fetch('/ui/brand.json', { cache: 'no-store' });
+        if (response.ok) brand = await response.json();
+    } catch { /* keep the current name */ }
+    if (mine !== brandTicket || !brand?.product_name) return;
+    document.title = `${brand.product_name} console`;
+    for (const el of document.querySelectorAll('.brand')) el.textContent = brand.product_name;
 }

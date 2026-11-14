@@ -1,4 +1,4 @@
-// Settings (admin): the policy settings (each its effective value, and
+// Settings (admin): the policy and branding settings (each its effective value, and
 // whether the database overrides the config file's default; Save and
 // Reset), the configured OIDC providers and the mail provider (read-only:
 // they live in the config file, and no secret is ever sent), Send test
@@ -22,7 +22,7 @@ import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
 import { ago, when } from '../core/format.js';
-import { canAdministerPeople } from '../core/shell.js';
+import { applyBrand, canAdministerPeople } from '../core/shell.js';
 import { guard, once } from '../core/pending.js';
 import { listTable } from '../components/list-table.js';
 import { confirmDialog } from '../components/confirm.js';
@@ -36,7 +36,11 @@ const MEANING = {
     console_session_absolute: 'Console session absolute timeout',
     setup_link_ttl: 'Setup link lifetime',
     reset_link_ttl: 'Password reset link lifetime',
+    product_name: 'Product name in email, the sign-in and consent pages and this console',
+    support_contact: 'Email address or https:// URL shown as "Questions? Contact ..." ("none": no line)',
 };
+// The settings whose change shows in this console's own shell.
+const BRANDING = new Set(['product_name']);
 // GET /mail/queue's statuses, as pill kinds.
 const MAIL_STATUS_KIND = { pending: 'info', sending: 'info', retrying: 'warn', failed: 'error' };
 // The statuses a mail may be retried from (queue::retry takes Failed and
@@ -48,7 +52,7 @@ export async function render(main) {
     const head = h('header', { class: 'page-head' },
         h('div', {},
             h('h1', {}, 'Settings'),
-            h('p', { class: 'muted' }, 'Sign-in and self-service policy, the sign-in providers and mail, and the mail queue.')));
+            h('p', { class: 'muted' }, 'Sign-in and self-service policy, branding, the sign-in providers and mail, and the mail queue.')));
     if (!store.can('admin')) {
         fill(main, head, h('p', { class: 'muted', id: 'settings-denied' }, 'Settings need an admin.'));
         return;
@@ -73,6 +77,8 @@ export async function render(main) {
         try {
             toast(message(await request()), 'ok');
             refusals.delete(control);
+            // The shell shows the product name: draw the saved one.
+            if (BRANDING.has(control)) applyBrand();
         } catch (error) {
             refusals.set(control, error.message);
         }
@@ -186,7 +192,7 @@ export async function render(main) {
         manager ? null : h('p', { class: 'muted small', id: 'settings-readonly' },
             'Changing settings or the mail queue needs an admin key that reaches every catalog.'),
         h('section', { class: 'account-section', id: 'settings-policy' }, h('h2', {}, 'Policy'),
-            h('p', { class: 'muted small' }, 'The config file\'s [auth] table gives the defaults; a value saved here overrides it until Reset.'),
+            h('p', { class: 'muted small' }, 'The config file\'s [auth] table gives the defaults (product_name is okf and support_contact none); a value saved here overrides it until Reset.'),
             settingsStale,
             settings),
         h('section', { class: 'account-section' }, h('h2', {}, 'Sign-in providers'), providers),

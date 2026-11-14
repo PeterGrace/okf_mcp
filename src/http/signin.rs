@@ -34,6 +34,7 @@ use crate::mail::queue as mail_queue;
 use crate::mail::{self, Template, RESET_PATH, SETUP_PATH};
 use crate::store::email_tokens::{self, Purpose};
 use crate::store::passwords::{self, NewPassword, PasswordStamp, SignInOutcome};
+use crate::store::settings::Brand;
 use crate::store::sign_in_events::{self, Attempt, Method, Outcome};
 use crate::store::user_sessions::{self, SessionStart};
 use crate::store::users::{self, UserAuth};
@@ -238,13 +239,11 @@ pub(crate) fn sign_in_html(view: &SignInView) -> String {
 }
 
 /// `/signin` with `status`; the passkey script only when offered.
-fn sign_in_response(status: StatusCode, view: &SignInView) -> Response {
+fn sign_in_response(status: StatusCode, view: &SignInView, brand: &Brand) -> Response {
     let scripts: &[&str] = if view.passkey { &[PASSKEY_SCRIPT] } else { &[] };
-    pages::scripted_page(
+    pages::respond(
         status,
-        "Sign in",
-        &sign_in_html(view),
-        scripts,
+        pages::document("Sign in", &sign_in_html(view), scripts, brand),
         CONTENT_SECURITY_POLICY,
     )
 }
@@ -256,10 +255,16 @@ fn sign_in_response(status: StatusCode, view: &SignInView) -> Response {
 /// * `status` - the status.
 /// * `title` - the heading and title (escaped).
 /// * `message` - the message (escaped).
+/// * `brand` - the product name and support contact.
 ///
 /// # Returns
 /// The page, under the console CSP.
-pub(crate) fn message_page(status: StatusCode, title: &str, message: &str) -> Response {
+pub(crate) fn message_page(
+    status: StatusCode,
+    title: &str,
+    message: &str,
+    brand: &Brand,
+) -> Response {
     let body = format!(
         r#"        <h1>{title}</h1>
         <p class="consent-error" id="signin-message" role="alert">{message}</p>
@@ -267,7 +272,7 @@ pub(crate) fn message_page(status: StatusCode, title: &str, message: &str) -> Re
         title = escape(title),
         message = escape(message),
     );
-    pages::page(status, title, &body, CONTENT_SECURITY_POLICY)
+    pages::page(status, title, &body, CONTENT_SECURITY_POLICY, brand)
 }
 
 /// `GET /signin`'s query.
@@ -282,7 +287,7 @@ async fn sign_in_page(State(app): State<Arc<App>>, Query(query): Query<SignInQue
     let mut view = sign_in_view(&app, safe_return_to(query.return_to.as_deref()));
     // Only a known notice is shown: the page never echoes text from its URL.
     view.notice = (query.notice.as_deref() == Some("reset")).then_some(PASSWORD_CHANGED);
-    sign_in_response(StatusCode::OK, &view)
+    sign_in_response(StatusCode::OK, &view, &app.settings().brand())
 }
 
 /// `POST /signin`'s form. No `Debug`: it holds a password. Every field
@@ -307,11 +312,14 @@ async fn sign_in_post(
     parts: Parts,
     form: Result<Form<SignInForm>, FormRejection>,
 ) -> Response {
-    if !app.settings().password_sign_in {
+    // One read of the settings for the whole request.
+    let settings = app.settings();
+    if !settings.password_sign_in {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let brand = settings.brand();
     if cross_site(&parts.headers) {
-        return message_page(StatusCode::FORBIDDEN, "Sign in", CROSS_SITE);
+        return message_page(StatusCode::FORBIDDEN, "Sign in", CROSS_SITE, &brand);
     }
     // `unwrap_or_default`: a body that is not a form is an empty form.
     let form = form.map(|Form(form)| form).unwrap_or_default();
@@ -324,7 +332,7 @@ async fn sign_in_post(
     {
         let mut view = sign_in_view(&app, return_to);
         view.error = Some(TOO_MANY);
-        return sign_in_response(StatusCode::TOO_MANY_REQUESTS, &view);
+        return sign_in_response(StatusCode::TOO_MANY_REQUESTS, &view, &brand);
     }
     // One normalized address for the check and the audit lookup. One that
     // cannot be anyone's (`None`: a NUL, a control character, too long, ...)
@@ -357,7 +365,7 @@ async fn sign_in_post(
                     .await;
                     let mut view = sign_in_view(&app, return_to);
                     view.error = Some(SIGN_IN_FAILED);
-                    sign_in_response(StatusCode::UNAUTHORIZED, &view)
+                    sign_in_response(StatusCode::UNAUTHORIZED, &view, &brand)
                 }
                 Err(error) => AppError(error).into_response(),
             };
@@ -375,7 +383,7 @@ async fn sign_in_post(
     audit(&app, user_id.as_deref(), Method::Password, outcome, ip).await;
     let mut view = sign_in_view(&app, return_to);
     view.error = Some(SIGN_IN_FAILED);
-    sign_in_response(StatusCode::UNAUTHORIZED, &view)
+    sign_in_response(StatusCode::UNAUTHORIZED, &view, &brand)
 }
 
 /// Signs a verified user in (a password sign-in): starts a session, ends
@@ -585,12 +593,13 @@ fn forgot_html(sent: bool) -> String {
 }
 
 /// `GET /signin/forgot`.
-async fn forgot_page() -> Response {
+async fn forgot_page(State(app): State<Arc<App>>) -> Response {
     pages::page(
         StatusCode::OK,
         "Forgot your password?",
         &forgot_html(false),
         CONTENT_SECURITY_POLICY,
+        &app.settings().brand(),
     )
 }
 
@@ -608,8 +617,14 @@ async fn forgot_post(
     parts: Parts,
     form: Result<Form<ForgotForm>, FormRejection>,
 ) -> Response {
+    let brand = app.settings().brand();
     if cross_site(&parts.headers) {
-        return message_page(StatusCode::FORBIDDEN, "Forgot your password?", CROSS_SITE);
+        return message_page(
+            StatusCode::FORBIDDEN,
+            "Forgot your password?",
+            CROSS_SITE,
+            &brand,
+        );
     }
     let now = Instant::now();
     let limits = app.sign_in_limits();
@@ -619,6 +634,7 @@ async fn forgot_post(
             StatusCode::TOO_MANY_REQUESTS,
             "Forgot your password?",
             TOO_MANY,
+            &brand,
         );
     }
     // `normalize_email`: the same normalized address as `/signin`; one that
@@ -645,6 +661,7 @@ async fn forgot_post(
         "Check your email",
         &forgot_html(true),
         CONTENT_SECURITY_POLICY,
+        &brand,
     )
 }
 
@@ -684,9 +701,11 @@ struct TokenQuery {
 
 /// The answer to an emailed link that does not work: 410 for an expired,
 /// used or unknown one, else the error.
-fn link_error(error: OkfError) -> Response {
+fn link_error(error: OkfError, brand: &Brand) -> Response {
     match error {
-        OkfError::Gone { .. } => message_page(StatusCode::GONE, "Link expired", LINK_EXPIRED),
+        OkfError::Gone { .. } => {
+            message_page(StatusCode::GONE, "Link expired", LINK_EXPIRED, brand)
+        }
         other => AppError(other).into_response(),
     }
 }
@@ -761,13 +780,11 @@ pub(crate) fn setup_html(view: &SetupView<'_>) -> String {
 }
 
 /// The setup page with `status`.
-fn setup_response(status: StatusCode, view: &SetupView<'_>) -> Response {
+fn setup_response(status: StatusCode, view: &SetupView<'_>, brand: &Brand) -> Response {
     let scripts: &[&str] = if view.passkey { &[PASSKEY_SCRIPT] } else { &[] };
-    pages::scripted_page(
+    pages::respond(
         status,
-        "Set up your account",
-        &setup_html(view),
-        scripts,
+        pages::document("Set up your account", &setup_html(view), scripts, brand),
         CONTENT_SECURITY_POLICY,
     )
 }
@@ -775,6 +792,7 @@ fn setup_response(status: StatusCode, view: &SetupView<'_>) -> Response {
 /// `GET /account/setup?token=...`.
 async fn setup_page(State(app): State<Arc<App>>, Query(query): Query<TokenQuery>) -> Response {
     let return_to = safe_return_to(query.return_to.as_deref());
+    let brand = app.settings().brand();
     match email_tokens::peek(app.pool(), &query.token, Purpose::Setup, app.clock().now()).await {
         Ok(user) => setup_response(
             StatusCode::OK,
@@ -785,8 +803,9 @@ async fn setup_page(State(app): State<Arc<App>>, Query(query): Query<TokenQuery>
                 error: None,
                 passkey: offers_passkeys(&app),
             },
+            &brand,
         ),
-        Err(error) => link_error(error),
+        Err(error) => link_error(error, &brand),
     }
 }
 
@@ -808,21 +827,28 @@ async fn setup_post(
     parts: Parts,
     form: Result<Form<NewPasswordForm>, FormRejection>,
 ) -> Response {
+    let brand = app.settings().brand();
     if cross_site(&parts.headers) {
-        return message_page(StatusCode::FORBIDDEN, "Set up your account", CROSS_SITE);
+        return message_page(
+            StatusCode::FORBIDDEN,
+            "Set up your account",
+            CROSS_SITE,
+            &brand,
+        );
     }
     let Ok(Form(form)) = form else {
         return message_page(
             StatusCode::BAD_REQUEST,
             "Set up your account",
             "Open the link from your email again.",
+            &brand,
         );
     };
     let return_to = safe_return_to(form.return_to.as_deref());
     let now = app.clock().now();
     let user = match email_tokens::peek(app.pool(), &form.token, Purpose::Setup, now).await {
         Ok(user) => user,
-        Err(error) => return link_error(error),
+        Err(error) => return link_error(error, &brand),
     };
     if let Err(problem) = check_new_password(&form.password, &form.confirm) {
         let view = SetupView {
@@ -832,14 +858,14 @@ async fn setup_post(
             error: Some(&problem),
             passkey: offers_passkeys(&app),
         };
-        return setup_response(StatusCode::UNPROCESSABLE_ENTITY, &view);
+        return setup_response(StatusCode::UNPROCESSABLE_ENTITY, &view, &brand);
     }
     // The session starts in the link's transaction, so a reset cannot
     // replace the password between the setup and the session, and the
     // committed setup always reaches the browser with its cookie.
     let used = match use_link(&app, &parts, &form.token, Purpose::Setup, &form.password).await {
         Ok(used) => used,
-        Err(error) => return link_error(error),
+        Err(error) => return link_error(error, &brand),
     };
     // `unwrap_or_default`: a setup link always starts a session; an empty
     // header map would only mean no cookie to send.
@@ -941,20 +967,22 @@ fn reset_html(token: &str, error: Option<&str>) -> String {
 }
 
 /// The reset page with `status`.
-fn reset_response(status: StatusCode, token: &str, error: Option<&str>) -> Response {
+fn reset_response(status: StatusCode, token: &str, error: Option<&str>, brand: &Brand) -> Response {
     pages::page(
         status,
         "Choose a new password",
         &reset_html(token, error),
         CONTENT_SECURITY_POLICY,
+        brand,
     )
 }
 
 /// `GET /account/reset?token=...`.
 async fn reset_page(State(app): State<Arc<App>>, Query(query): Query<TokenQuery>) -> Response {
+    let brand = app.settings().brand();
     match email_tokens::peek(app.pool(), &query.token, Purpose::Reset, app.clock().now()).await {
-        Ok(_) => reset_response(StatusCode::OK, &query.token, None),
-        Err(error) => link_error(error),
+        Ok(_) => reset_response(StatusCode::OK, &query.token, None, &brand),
+        Err(error) => link_error(error, &brand),
     }
 }
 
@@ -965,25 +993,33 @@ async fn reset_post(
     parts: Parts,
     form: Result<Form<NewPasswordForm>, FormRejection>,
 ) -> Response {
+    let brand = app.settings().brand();
     if cross_site(&parts.headers) {
-        return message_page(StatusCode::FORBIDDEN, "Choose a new password", CROSS_SITE);
+        return message_page(
+            StatusCode::FORBIDDEN,
+            "Choose a new password",
+            CROSS_SITE,
+            &brand,
+        );
     }
     let Ok(Form(form)) = form else {
         return message_page(
             StatusCode::BAD_REQUEST,
             "Choose a new password",
             "Open the link from your email again.",
+            &brand,
         );
     };
     let now = app.clock().now();
     if let Err(error) = email_tokens::peek(app.pool(), &form.token, Purpose::Reset, now).await {
-        return link_error(error);
+        return link_error(error, &brand);
     }
     if let Err(problem) = check_new_password(&form.password, &form.confirm) {
         return reset_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             &form.token,
             Some(&problem),
+            &brand,
         );
     }
     // A reset signs nobody in: the person signs in with the new password,
@@ -991,7 +1027,7 @@ async fn reset_post(
     let LinkUsed { user, ended, .. } =
         match use_link(&app, &parts, &form.token, Purpose::Reset, &form.password).await {
             Ok(used) => used,
-            Err(error) => return link_error(error),
+            Err(error) => return link_error(error, &brand),
         };
     // The notice was queued in the reset's transaction (`use_link`).
     tracing::info!(user = %user.id, ended, "password reset; every session ended");
@@ -2505,6 +2541,57 @@ mod tests {
             let scripts = usize::from(path == "/signin");
             assert_eq!(reply.text().matches("<script").count(), scripts, "{path}");
             assert_eq!(reply.text().contains(PASSKEY_SCRIPT), path == "/signin");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_sign_in_page_names_the_product_and_shows_the_contact() {
+        let test = login_app().await;
+        for (key, value) in [
+            (SettingKey::ProductName, "Acme Notes"),
+            (SettingKey::SupportContact, "https://example.com/help"),
+        ] {
+            settings::set(test.app.pool(), key, value, "cli", Utc::now())
+                .await
+                .unwrap();
+        }
+        test.app.poll().await.unwrap();
+
+        // The sign-in and forgot pages, a link page (an unknown link's
+        // message page) and a refused form post's message page.
+        let mut browser = Browser::default();
+        let mut replies = Vec::new();
+        for path in [
+            "/signin",
+            "/signin/forgot",
+            "/account/setup?token=nope",
+            "/account/reset?token=nope",
+        ] {
+            replies.push((path, browser.send(&test, "GET", path, Payload::Empty).await));
+        }
+        // No password fields: the form is refused before the token is read.
+        let refused = browser
+            .send(
+                &test,
+                "POST",
+                "/account/reset",
+                Payload::Form(vec![("token", "x".to_string())]),
+            )
+            .await;
+        replies.push(("POST /account/reset", refused));
+
+        for (path, reply) in replies {
+            let text = reply.text();
+            assert!(
+                text.contains("<p class=\"brand\">Acme Notes</p>"),
+                "{path}: {text}"
+            );
+            assert!(text.contains(" - Acme Notes</title>"), "{path}: {text}");
+            assert!(
+                text.contains("Questions? Contact <a href=\"https://example.com/help\">"),
+                "{path}: {text}"
+            );
+            assert!(!text.contains("okf"), "{path}: {text}");
         }
     }
 

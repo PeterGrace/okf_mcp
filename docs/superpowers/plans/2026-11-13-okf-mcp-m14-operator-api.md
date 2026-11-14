@@ -1657,6 +1657,8 @@ async fn the_product_name_set_on_the_settings_page_brands_the_console() {
 
 (Use the module's own `server()` helper; if the toast text after saving differs, wait for the one the page shows today.)
 
+> **Corrected (issue #392, 2026-11-14).** `ui.open("/health")` only changes the URL's hash, so it never reloads the page and cannot show that the shell reads the brand at boot. The shipped journey (`tests/ui_e2e/settings.rs`, with the module's `login_server()` and `console_base()`) saves `product_name`, waits for the source cell to read `override`, checks the sidebar and the title follow the save without a reload, then reloads (`ui.page.reload`, guarded by `ui.mark` / `ui.wait_redrawn`) and checks the sidebar, the login card and the title again. The settings test also refuses a NUL, an `https://` URL with no host, with a tab or over 500 characters, and an address with a space; route tests `http::signin::tests::every_sign_in_page_names_the_product_and_shows_the_contact`, `oauth::authorize::tests::consent_pages_name_the_product_and_show_the_contact` and `mail::queue::tests::a_mail_is_rendered_with_the_brand_stored_when_it_is_queued` check the threading end to end.
+
 - [ ] **Step 2: Run them and see them fail**
 
 Run: `tools/agentic/gate.sh narrow --lib store::settings::tests`, `tools/agentic/gate.sh narrow --lib mail::templates::tests`, `tools/agentic/gate.sh narrow --lib http::pages::tests`, `tools/agentic/gate.sh narrow --lib http::tests::brand_json`
@@ -1768,6 +1770,8 @@ fn check_support_contact(text: &str) -> Result<(), String> {
 }
 ```
 
+> **Corrected (issue #392, 2026-11-14).** `check_support_contact` also refuses an `https://` URL longer than 500 characters or holding whitespace or a control character: the URL parser silently drops a tab or line break, which would then have been stored as typed. `Brand` derives `Serialize`, so `/ui/brand.json` answers `Json(app.settings().brand())`.
+
 And the reader the mail queue uses, so a mail always has the current brand whoever enqueues it (CLI or server):
 
 ```rust
@@ -1800,6 +1804,8 @@ fn contact_line(brand: &Brand) -> Option<String> {
 ```
 
 appended to the text (`\n\n{line}\n`) and as one more escaped `<p>` to the HTML. In `enqueue_in`, read the brand on the same connection first: `let brand = settings::brand_in(&mut *conn).await?; let (subject, text, html) = render(template, &brand);`.
+
+> **Corrected (issue #392, 2026-11-14).** `render` adds the contact line itself, after whichever template it rendered (`with_contact` for the text, `html_document(subject, paragraphs, brand)` for the HTML), so a template added later (Task 9a's `Template::Unlocked`) gets it without code of its own. Name-bearing paragraphs go through `escape` in the HTML twin, since the product name is operator text. Two subjects never said "okf" ("Reset your password", "A sign-in method was added to your account"), but the spec puts the product in every subject, so with a name other than the default they read "Reset your {name} password" and "A sign-in method was added to your {name} account" (`product_words`); with the default `okf` they are unchanged (PR #413 review).
 
 - [ ] **Step 5: Server pages and the console**
 
@@ -1836,6 +1842,8 @@ async fn brand(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
 
 routed as `.route("/ui/brand.json", get(brand))` in the open routes (with the UI's security headers layer if `ui::routes` applies one: reuse `ui::security_headers`).
 
+> **Corrected (issue #392, 2026-11-14).** Shipped signatures (every caller passes `&app.settings().brand()`, read once per request): `pages::document(title, body, scripts, brand)`; `pages::page(status, title, body, csp, brand)`; `scripted_page` is gone (six arguments) and replaced by `pages::respond(status, document: String, csp)`, which the two pages that load the passkey script call with their own `document(...)`; `signin::message_page(status, title, message, brand)`; `consent::code_page(view, error, brand)`, `summary_page(view, grant, nonce, brand)`, `user_page(view, user, error, brand)`, `error_page(status, message, brand)`; in `oauth/authorize.rs`, `back_to_client(brand, ..)`, `error_to_client(brand, redirect_uri, state, issuer, (code, description))`, `user_consent_page(.., brand)`, `failed_attempt(.., brand)` and `server_error(error, brand)`. The server pages' contact line is `<p class="muted small support" id="support-contact">`. `/ui/brand.json` is `no-cache`, under `ui::security_headers` (now `pub(crate)`), merged beside `ui::routes()`.
+
 `src/http/ui/js/core/shell.js`, at boot, before the login check:
 
 ```js
@@ -1851,6 +1859,8 @@ async function applyBrand() {
 ```
 
 `index.html` keeps `okf` as the text shown until the fetch answers.
+
+> **Corrected (issue #392, 2026-11-14).** `applyBrand` is exported from `core/shell.js` and numbered (only the newest call writes, so a late boot answer never draws over a newer save's). `main.js` calls it at boot without awaiting it, so the brand never holds up signing in, and `pages/settings.js` calls it after a successful save or reset of `product_name`, so the shell follows the change without a reload. A non-2xx answer keeps what the page shows.
 
 - [ ] **Step 6: Docs**
 
@@ -5855,6 +5865,8 @@ pub async fn create(
 `end(pool, id, actor, now)`: `UPDATE unlocks SET ended_at = $2 WHERE id = $1 AND ended_at IS NULL AND expires_at > $2 RETURNING catalog_id`; none is `Refused` ("unlock N has already ended or expired") or `NotFound` for an unknown id; records `catalog.unlock_ended` (`{"unlock": id}`), bumps the generation. `find(pool, id)`, `list(pool, filter)` (newest first; the `team` filter matches the catalog's current owner team), `live(pool, now) -> Vec<LiveUnlock>` (`ended_at IS NULL AND expires_at > now AND user_id IS NOT NULL`). (`tally` comes in Task 9b, with `AccessKind` from Task 7b.)
 
 `Template::Unlocked { catalog, category, until }` (name `"unlocked"`): subject `An operator opened {catalog}`; body `An operator of {product} opened your team's catalog {catalog} for {category} until {until} (UTC). The operator's reads and writes are counted and shown in the audit log of your team. If you did not expect this, contact {support or "the operator"}.` No staff name, no reason.
+
+> **Corrected (issue #392, 2026-11-14).** Since Task 2, `render(template, brand: &Brand)` takes the brand (`queue::enqueue_in` reads it with `settings::brand_in` on the caller's connection), names the product as `brand.product_name`, and appends "Questions? Contact {contact}" to every template's text and HTML when `support_contact` is set. So the Unlocked arm takes `{product}` from `brand.product_name`, and its own "contact {support or the operator}" sentence repeats the contact the closing line already gives; keep it only for the no-contact case or drop it. Escape every paragraph holding the product name in the HTML twin. `SettingKey::ALL` has 9 keys after Task 2.
 
 `docs/operations.md`: Settings rows for the three unlock settings; error rows for `UnlockRequired` (403, `catalog`) and the maintenance `Forbidden` (403, `catalog`, `maintenance: "off"`).
 

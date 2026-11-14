@@ -36,6 +36,7 @@ use super::{render, Mail, MailError, Mailer, Template};
 use crate::app::App;
 use crate::clock::Clock;
 use crate::error::OkfError;
+use crate::store::settings;
 use crate::store::users::check_email;
 
 /// The apalis queue (`apalis.jobs.job_type`). Set explicitly: apalis's
@@ -174,7 +175,10 @@ pub async fn enqueue_in(
     now: DateTime<Utc>,
 ) -> Result<(), OkfError> {
     check_email(to)?;
-    let (subject, text, html) = render(template);
+    // The brand stored now, read on the same connection: whoever queues the
+    // mail (a server or the CLI), it names the product the operator set.
+    let brand = settings::brand_in(&mut *conn).await?;
+    let (subject, text, html) = render(template, &brand);
     let job = SendMail {
         mail: Mail {
             to: to.to_string(),
@@ -824,6 +828,49 @@ mod tests {
             Err(OkfError::LimitExceeded { limit: "email", .. })
         ));
         assert!(list(&db.pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mail_is_rendered_with_the_brand_stored_when_it_is_queued() {
+        // The subject a queued mail to `to` was rendered with.
+        async fn stored_subject(pool: &PgPool, to: &str) -> String {
+            sqlx::query_scalar::<_, String>(
+                "SELECT convert_from(job, 'UTF8')::jsonb -> 'mail' ->> 'subject' \
+                 FROM apalis.jobs \
+                 WHERE convert_from(job, 'UTF8')::jsonb -> 'mail' ->> 'to' = $1",
+            )
+            .bind(to)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+        let db = test_db().await;
+        enqueue(&db.pool, "alice@example.com", &Template::Test, now())
+            .await
+            .unwrap();
+        let before = stored_subject(&db.pool, "alice@example.com").await;
+
+        settings::set(
+            &db.pool,
+            settings::SettingKey::ProductName,
+            "Acme Notes",
+            "cli",
+            now(),
+        )
+        .await
+        .unwrap();
+        // Inside a caller's transaction too.
+        let mut tx = db.pool.begin().await.unwrap();
+        enqueue_in(&mut tx, "bob@example.com", &Template::Test, now())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(before, "okf test email");
+        assert_eq!(
+            stored_subject(&db.pool, "bob@example.com").await,
+            "Acme Notes test email"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

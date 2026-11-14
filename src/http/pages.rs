@@ -1,10 +1,14 @@
 //! Server-rendered HTML shared by the OAuth consent pages and the sign-in
 //! pages (plan Decision 14): one document shell, one escaper, one response
 //! builder with the security headers, and the `return_to` check. There is
-//! no template engine; every piece of text goes through [`escape`].
+//! no template engine; every piece of text goes through [`escape`]. Every
+//! page names the product and shows the support contact as the branding
+//! settings say ([`Brand`]); callers pass `&app.settings().brand()`.
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+
+use crate::store::settings::Brand;
 
 /// Where a sign-in goes when it was given no usable `return_to`.
 pub(crate) const DEFAULT_RETURN_TO: &str = "/ui/";
@@ -34,6 +38,22 @@ pub(crate) fn escape(text: &str) -> String {
     escaped
 }
 
+/// The closing support line of a page, or nothing without a contact. An
+/// `https://` URL is a link; an email address is plain text.
+fn contact_line(brand: &Brand) -> String {
+    brand
+        .support_contact
+        .as_deref()
+        .map_or_else(String::new, |contact| {
+            let shown = if contact.starts_with("https://") {
+                format!("<a href=\"{0}\">{0}</a>", escape(contact))
+            } else {
+                escape(contact)
+            };
+            format!("\n        <p class=\"muted small support\" id=\"support-contact\">Questions? Contact {shown}</p>")
+        })
+}
+
 /// The HTML document around a page body.
 ///
 /// # Arguments
@@ -41,10 +61,12 @@ pub(crate) fn escape(text: &str) -> String {
 /// * `body` - the page body, already escaped where needed.
 /// * `scripts` - paths of same-origin module scripts to load, in order;
 ///   empty for a page that runs no script (consent).
+/// * `brand` - the product name (in the title and the brand line) and the
+///   support contact (a line after the body), escaped here.
 ///
 /// # Returns
 /// The whole document.
-pub(crate) fn document(title: &str, body: &str, scripts: &[&str]) -> String {
+pub(crate) fn document(title: &str, body: &str, scripts: &[&str], brand: &Brand) -> String {
     // `map(...).collect::<String>()` concatenates one line per script.
     let scripts: String = scripts
         .iter()
@@ -62,7 +84,7 @@ pub(crate) fn document(title: &str, body: &str, scripts: &[&str]) -> String {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
-    <title>{title} - okf</title>
+    <title>{title} - {product}</title>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap">
     <link rel="stylesheet" href="/ui/vendor/pico.min.css">
     <link rel="stylesheet" href="/ui/styles.css">
@@ -71,52 +93,55 @@ pub(crate) fn document(title: &str, body: &str, scripts: &[&str]) -> String {
 {scripts}</head>
 <body>
     <main class="login-card consent-card">
-        <p class="brand">okf</p>
-{body}
+        <p class="brand">{product}</p>
+{body}{contact}
     </main>
 </body>
 </html>
 "#,
         title = escape(title),
+        product = escape(&brand.product_name),
+        contact = contact_line(brand),
     )
 }
 
-/// A page that runs no script: [`scripted_page`] with no scripts.
+/// A page that runs no script: [`respond`] with a [`document`] that loads
+/// no script.
 ///
 /// # Arguments
 /// * `status` - the HTTP status.
 /// * `title` - the page title.
 /// * `body` - the page body.
 /// * `csp` - the Content-Security-Policy.
+/// * `brand` - the product name and support contact.
 ///
 /// # Returns
 /// The response.
-pub(crate) fn page(status: StatusCode, title: &str, body: &str, csp: &str) -> Response {
-    scripted_page(status, title, body, &[], csp)
+pub(crate) fn page(
+    status: StatusCode,
+    title: &str,
+    body: &str,
+    csp: &str,
+    brand: &Brand,
+) -> Response {
+    respond(status, document(title, body, &[], brand), csp)
 }
 
-/// A page with its security headers: `text/html`, `no-store`,
+/// A [`document`] with its security headers: `text/html`, `no-store`,
 /// `no-referrer` (an emailed link's token must not leak to another site),
-/// `nosniff` and `csp`.
+/// `nosniff` and `csp`. A page that loads scripts builds its document with
+/// them and answers through this.
 ///
 /// # Arguments
 /// * `status` - the HTTP status.
-/// * `title` - the page title.
-/// * `body` - the page body.
-/// * `scripts` - same-origin module scripts (see [`document`]).
+/// * `document` - the whole HTML document ([`document`]).
 /// * `csp` - the Content-Security-Policy.
 ///
 /// # Returns
 /// The response, or a bare 500 (logged) if `csp` is not a header value,
 /// which would be a bug: the policies are built from constants and parsed
 /// URLs.
-pub(crate) fn scripted_page(
-    status: StatusCode,
-    title: &str,
-    body: &str,
-    scripts: &[&str],
-    csp: &str,
-) -> Response {
+pub(crate) fn respond(status: StatusCode, document: String, csp: &str) -> Response {
     // `let ... else`: bind the header value, or answer 500 and stop.
     let Ok(csp) = HeaderValue::from_str(csp) else {
         tracing::error!("a page's CSP is not a header value");
@@ -140,7 +165,7 @@ pub(crate) fn scripted_page(
             ),
             (header::CONTENT_SECURITY_POLICY, csp),
         ],
-        document(title, body, scripts),
+        document,
     )
         .into_response()
 }
@@ -192,9 +217,14 @@ mod tests {
 
     #[test]
     fn a_document_loads_only_the_scripts_it_is_given_as_modules() {
-        let bare = document("t", "<p>x</p>", &[]);
+        let bare = document("t", "<p>x</p>", &[], &Brand::default());
         assert!(!bare.contains("<script"), "{bare}");
-        let scripted = document("t", "<p>x</p>", &["/ui/js/signin/passkey.js"]);
+        let scripted = document(
+            "t",
+            "<p>x</p>",
+            &["/ui/js/signin/passkey.js"],
+            &Brand::default(),
+        );
         assert!(
             scripted.contains(r#"<script type="module" src="/ui/js/signin/passkey.js"></script>"#)
         );
@@ -202,8 +232,57 @@ mod tests {
     }
 
     #[test]
+    fn a_page_names_the_product_and_links_the_contact() {
+        let brand = Brand {
+            product_name: "Acme <Notes>".to_string(),
+            support_contact: Some("https://example.com/help?a=1&b=\"2\"".to_string()),
+        };
+        let mail = Brand {
+            product_name: "Acme Notes".to_string(),
+            support_contact: Some("help@example.com".to_string()),
+        };
+
+        let html = document("Sign in", "<p>x</p>", &[], &brand);
+        let plain = document("Sign in", "<p>x</p>", &[], &mail);
+        let default = document("Sign in", "<p>x</p>", &[], &Brand::default());
+
+        assert!(
+            html.contains("<title>Sign in - Acme &lt;Notes&gt;</title>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<p class=\"brand\">Acme &lt;Notes&gt;</p>"),
+            "{html}"
+        );
+        let link = "https://example.com/help?a=1&amp;b=&quot;2&quot;";
+        assert!(
+            html.contains(&format!(
+                "Questions? Contact <a href=\"{link}\">{link}</a></p>"
+            )),
+            "{html}"
+        );
+        assert!(!html.contains("okf"), "{html}");
+        assert!(
+            plain.contains("Questions? Contact help@example.com</p>") && !plain.contains("<a "),
+            "{plain}"
+        );
+        assert!(
+            default.contains("<title>Sign in - okf</title>"),
+            "{default}"
+        );
+        assert!(default.contains("<p class=\"brand\">okf</p>"), "{default}");
+        assert!(!default.contains("Questions?"), "{default}");
+    }
+
+    #[test]
     fn pages_carry_the_security_headers_and_the_given_policy() {
-        let response = page(StatusCode::GONE, "Gone", "<p>x</p>", "default-src 'self'");
+        let response = page(
+            StatusCode::GONE,
+            "Gone",
+            "<p>x</p>",
+            "default-src 'self'",
+            &Brand::default(),
+        );
         let headers = response.headers();
         assert_eq!(response.status(), StatusCode::GONE);
         assert_eq!(headers["cache-control"], "no-store");
@@ -215,7 +294,13 @@ mod tests {
 
     #[test]
     fn a_policy_that_is_not_a_header_value_is_a_bare_500() {
-        let response = page(StatusCode::OK, "t", "<p>x</p>", "default-src\n'self'");
+        let response = page(
+            StatusCode::OK,
+            "t",
+            "<p>x</p>",
+            "default-src\n'self'",
+            &Brand::default(),
+        );
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
