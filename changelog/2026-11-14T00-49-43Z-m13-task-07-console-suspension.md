@@ -14,6 +14,7 @@ Issue #369, epic #362. Plan: `docs/superpowers/plans/2026-11-13-okf-mcp-m13-team
 - `core/api.js`: a 403 `Suspended` toasts its own message (catalog, team and notice) instead of "Your key/account cannot do this.".
 - The Teams drawer follows the console rules in `tools/agentic/lessons.md`: suspension writes are guarded by a pending-write key (`guard`/`once`), a refused write shows its reason in the drawer, a failed re-read draws the last answer marked as possibly out of date, only the newest read draws, and a settled write redraws whichever drawer shows its team now. Membership changes use the same redraw. The list's reads are numbered too.
 - The plan's Task 7 has a dated correction note.
+- Review of PR #384: the team drawer settles the team and the users one by one (`Promise.allSettled`), so a failed users read after a successful suspend or lift no longer throws the PUT's answer away and redraws the old state; only the failed part is marked out of date. Same class in `pages/keys.js`: a key's or sign-in code's drawer redrawn after a write fell silent when the users read failed (the drawer kept showing the old user); it now falls back to the users it was drawn with (`usersOr`). Journeys `teams::a_written_suspension_shows_when_reading_the_users_again_fails` and `keys::an_assigned_user_shows_when_reading_the_users_again_fails`, both revert-checked. A rule for the class in `tools/agentic/lessons.md`.
 
 ## Notes
 

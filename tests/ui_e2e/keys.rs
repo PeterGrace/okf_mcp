@@ -452,3 +452,36 @@ async fn a_late_assign_never_replaces_a_newer_drawer_or_reopens_a_dismissed_one(
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_assigned_user_shows_when_reading_the_users_again_fails() {
+    let server = server().await;
+    let admin = server
+        .key("console-admin", Access::Admin, &["main"], Some("main"))
+        .await;
+    server.key("alpha", Access::Read, &["main"], None).await;
+    alice(&server).await;
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/keys");
+        ui.click("[data-test=key-alpha]");
+        ui.wait_text("#drawer-title", "alpha");
+        // The assign succeeds, and the users read for the redrawn drawer
+        // fails: the drawer still shows the user the PUT answered.
+        ui.select("#key-user-select", "alice");
+        ui.fail_next("GET", "/api/v1/users", 503, "the server is unavailable");
+        ui.click("#key-assign");
+        ui.wait_text("#toasts", "alpha now belongs to alice");
+        ui.wait_text("#drawer dl.facts", "alice");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let keys = key_rows::list(&server.db.pool).await.expect("list keys");
+    let user = keys
+        .iter()
+        .find(|key| key.name == "alpha")
+        .and_then(|key| key.user.clone());
+    assert_eq!(user.as_deref(), Some("alice"));
+}

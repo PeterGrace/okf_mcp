@@ -529,3 +529,48 @@ async fn a_refused_lift_keeps_its_reason_and_a_late_read_never_draws_over_a_newe
         .expect("read the team");
     assert_eq!(team.suspension, None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_written_suspension_shows_when_reading_the_users_again_fails() {
+    let server = server().await;
+    let admin = server.key("console-admin", Access::Admin, &[], None).await;
+    let ran = drive(server.base.clone(), move |ui| {
+        ui.login(&admin);
+        ui.open("/teams");
+        ui.click(&format!("[data-test=team-{OWNER}]"));
+        // The suspend succeeds, and the drawer's read of the users after it
+        // fails: the drawer shows the suspension the PUT answered, noting
+        // only that the users may be out of date.
+        ui.fill("#team-suspend-form textarea[name=notice]", "Paused.");
+        ui.fail_next("GET", "/api/v1/users", 503, "the server is unavailable");
+        ui.click("#team-suspend");
+        ui.click("#confirm-ok");
+        ui.wait_text("#toasts", &format!("Suspended team {OWNER}."));
+        ui.wait_text("#team-suspension-notice", "Paused.");
+        ui.wait_visible("#team-unsuspend:not([disabled])");
+        ui.wait_visible("#team-stale");
+        ui.wait_text("#team-stale", "users");
+        // The same for a lift.
+        ui.fail_next("GET", "/api/v1/users", 503, "the server is unavailable");
+        ui.click("#team-unsuspend");
+        ui.wait_text(
+            "#toasts",
+            &format!("Lifted the suspension of team {OWNER}."),
+        );
+        ui.wait_visible("#team-suspend-form");
+        ui.wait_visible("#team-stale");
+        // The next good read clears the note.
+        ui.click("#drawer-close");
+        ui.click(&format!("[data-test=team-{OWNER}]"));
+        ui.wait_visible("#team-suspend-form");
+        ui.wait_hidden("#team-stale");
+    })
+    .await;
+    if !ran {
+        return;
+    }
+    let team = teams::find(&server.db.pool, OWNER)
+        .await
+        .expect("read the team");
+    assert_eq!(team.suspension, None);
+}

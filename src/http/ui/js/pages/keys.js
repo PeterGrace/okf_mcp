@@ -177,6 +177,13 @@ async function usersOrNull() {
     try { return await namesOf('users'); } catch { return null; }
 }
 
+// The users for a drawer drawn again after a write: read again, or, when
+// that fails, the ones it was drawn with (`previous`), so a write's answer
+// is never left undrawn because an unrelated read failed.
+async function usersOr(previous) {
+    return (await usersOrNull()) ?? previous;
+}
+
 // The create form, in the drawer.
 async function newKey(main, reload) {
     const ticket = drawerTicket(main);
@@ -222,9 +229,10 @@ async function newKey(main, reload) {
 // revoke. A revoked key keeps only its user control: history is attributed
 // too. `ticket` is the drawer's claim: a re-render after an action passes
 // the one it was opened with, so it is dropped once the drawer is replaced
-// or dismissed.
-async function showKey(main, key, reload, ticket = drawerTicket(main)) {
-    const users = await usersOrNull();
+// or dismissed. `previous` is the users the drawer was drawn with (see
+// usersOr), on a re-render.
+async function showKey(main, key, reload, ticket = drawerTicket(main), previous = null) {
+    const users = await usersOr(previous);
     if (!users || !ticket.current()) return;
     const me = store.whoami;
     const mine = isMine(key);
@@ -249,7 +257,7 @@ async function showKey(main, key, reload, ticket = drawerTicket(main)) {
         prefix: 'key', row: key, path: `${base}/user`,
         after: async updated => {
             if (main.isConnected) await reload();
-            if (ticket.current()) await showKey(main, updated, reload, ticket);
+            if (ticket.current()) await showKey(main, updated, reload, ticket, users);
         },
     });
     if (key.revoked_at) {
@@ -263,7 +271,7 @@ async function showKey(main, key, reload, ticket = drawerTicket(main)) {
             const updated = await request();
             toast(message, 'ok');
             if (main.isConnected) await reload();
-            if (ticket.current()) await showKey(main, updated, reload, ticket);
+            if (ticket.current()) await showKey(main, updated, reload, ticket, users);
         } catch { /* toasted */ }
     };
     let grants;
@@ -393,9 +401,9 @@ async function newCode(main, reload) {
 
 // One code's drawer: its facts and user, and Revoke while nobody has
 // redeemed it. A redeemed code's grant keeps its own user: change that in
-// the grant's drawer. `ticket` as for showKey.
-async function showCode(main, code, reload, ticket = drawerTicket(main)) {
-    const users = await usersOrNull();
+// the grant's drawer. `ticket` and `previous` as for showKey.
+async function showCode(main, code, reload, ticket = drawerTicket(main), previous = null) {
+    const users = await usersOr(previous);
     if (!users || !ticket.current()) return;
     const facts = h('dl', { class: 'facts' },
         fact('Id', h('code', {}, code.id)),
@@ -432,7 +440,7 @@ async function showCode(main, code, reload, ticket = drawerTicket(main)) {
         prefix: 'code', row: code, path: `/oauth/codes/${enc(code.id)}/user`,
         after: async updated => {
             if (main.isConnected) await reload();
-            if (ticket.current()) await showCode(main, updated, reload, ticket);
+            if (ticket.current()) await showCode(main, updated, reload, ticket, users);
         },
     });
     ticket.open(code.name, 'Sign-in code', facts, user,

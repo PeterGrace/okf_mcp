@@ -126,25 +126,29 @@ export async function render(main) {
     // one the drawer was opened with, so once the drawer is replaced or
     // dismissed the late answer is dropped. `known` is the team as a write
     // answered it (no read needed), `refusal` the reason the last write was
-    // refused, and `last` what the drawer showed before: when reading the
-    // team again fails, the drawer is drawn from it, marked as possibly out
-    // of date, so the refusal still shows and every control works again.
+    // refused, and `last` what the drawer showed before. The team and the
+    // users (for Add member) are settled one by one: a part that cannot be
+    // read again is drawn from `last`, marked as possibly out of date, so
+    // the refusal still shows and every control works again, while a part
+    // that was read, or a write's answer, is never thrown away for it.
     // Every read takes the next number in `reads` and only the newest one
     // draws, so a read that started before a write never draws over the
     // one after it.
     async function openDetail(name, ticket = drawerTicket(main), { known = null, refusal = null, last = null } = {}) {
         const read = ++reads;
         shown = { name, ticket, last };
-        let loaded;
-        try {
-            const [team, users] = await Promise.all([known ?? api.get(`/teams/${enc(name)}`), namesOf('users')]);
-            loaded = { team, users, stale: false };
-        } catch {
-            if (!last) return;   // the first load: no drawer to keep (toasted)
-            loaded = { ...last, stale: true };
-        }
+        // allSettled, unlike all, waits for both and reports each one's
+        // value or failure, so one failed read cannot discard the other.
+        const [teamRead, usersRead] = await Promise.allSettled([
+            known ?? api.get(`/teams/${enc(name)}`), namesOf('users')]);
+        const teamStale = teamRead.status === 'rejected';
+        const usersStale = usersRead.status === 'rejected';
+        // A part that failed with nothing shown before: no drawer to keep
+        // (toasted).
+        if ((teamStale || usersStale) && !last) return;
+        const team = teamStale ? last.team : teamRead.value;
+        const users = usersStale ? last.users : usersRead.value;
         if (read !== reads || !ticket.current()) return;
-        const { team, users, stale } = loaded;
         shown.last = { team, users };
         const base = `/teams/${enc(team.name)}/members`;
         const members = h('ul', { class: 'grant-list', id: 'team-members' }, team.members.map(member => {
@@ -206,8 +210,10 @@ export async function render(main) {
             },
         }, 'Delete team');
         ticket.open(team.name, team.display_name || (team.personal_of ? 'Personal team' : 'Team'),
-            stale ? h('p', { id: 'team-stale', class: 'error small', role: 'status' },
-                'Could not read this team again, so what is shown may be out of date.') : null,
+            teamStale || usersStale ? h('p', { id: 'team-stale', class: 'error small', role: 'status' },
+                teamStale
+                    ? 'Could not read this team again, so what is shown may be out of date.'
+                    : 'Could not read the users again, so the users to add may be out of date.') : null,
             h('dl', { class: 'facts', id: 'team-detail' },
                 h('dt', {}, 'Catalogs'), h('dd', {}, team.catalogs.length ? team.catalogs.join(', ') : '-'),
                 h('dt', {}, 'Created'), h('dd', {}, when(team.created_at))),
