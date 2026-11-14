@@ -20,6 +20,7 @@ use super::{labelled, tab_row, TeamCommand, UserCommand};
 use crate::clock::format_timestamp;
 use crate::config::Config;
 use crate::mail::invite;
+use crate::store::audit::AuditActor;
 use crate::store::catalogs;
 use crate::store::ceiling::{self, MemberAccess};
 use crate::store::keys::{self, KeyKind};
@@ -44,9 +45,10 @@ use crate::store::users::{self, NewUser, UserRecord};
 /// The text to print. `user invite` names the address, never the link.
 ///
 /// # Errors
-/// The store's refusal (an invalid or taken name, a user something still
-/// names, an email another user has or that is not one, an `admin`
-/// entitlement, an invite without an email or `public_url`), an unknown
+/// The store's refusal (an invalid or taken name, a user whose personal
+/// team owns a catalog or who is a shared team's last owner, an email
+/// another user has or that is not one, an `admin` entitlement, an invite
+/// without an email or `public_url`), an unknown
 /// user or catalog, or a database error.
 pub(super) async fn user(
     pool: &PgPool,
@@ -79,8 +81,14 @@ pub(super) async fn user(
             lines(users::list(pool).await?.iter().map(format_user))
         }
         UserCommand::Delete { name } => {
-            users::delete(pool, &name).await?;
-            format!("deleted user {name}\n")
+            // `allow_last_admin: true`: operator access may delete the last
+            // admin user, as it may clear the last admin flag.
+            let deleted = users::delete(pool, &name, true, &AuditActor::cli(), now).await?;
+            format!(
+                "deleted user {name} ({} key(s) and grant(s), {} sign-in code(s), \
+                 {} open changeset(s) discarded)\n",
+                deleted.keys, deleted.codes, deleted.discarded
+            )
         }
         // `off: _` ignores the field: clap made `--on` and `--off` exclusive
         // and required one, so `on` alone decides.
@@ -562,7 +570,11 @@ mod tests {
             "alice\tcredentials 0\temail -\tadmin no\tteams alice\tAlice Example\n\
              test-user\tcredentials 0\temail -\tadmin no\tteams test-user\t\n"
         );
-        assert_eq!(deleted, "deleted user alice\n");
+        assert_eq!(
+            deleted,
+            "deleted user alice (0 key(s) and grant(s), 0 sign-in code(s), \
+             0 open changeset(s) discarded)\n"
+        );
         assert!(!after.contains("alice"), "{after}");
     }
 
@@ -884,7 +896,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn deleting_a_user_with_a_key_fails_and_says_why() {
+    async fn deleting_a_user_takes_its_keys_and_may_delete_the_last_admin() {
         let db = test_db().await;
         okf(&db, &["user", "create", "alice"]).await.unwrap();
         okf(
@@ -895,11 +907,19 @@ mod tests {
         )
         .await
         .unwrap();
+        okf(&db, &["user", "set-admin", "alice", "--on"])
+            .await
+            .unwrap();
 
-        let refused = okf(&db, &["user", "delete", "alice"]).await;
+        let deleted = okf(&db, &["user", "delete", "alice"]).await.unwrap();
+        let keys = okf(&db, &["key", "list"]).await.unwrap();
 
-        let message = refused.unwrap_err().to_string();
-        assert!(message.contains("name it"), "{message}");
+        assert_eq!(
+            deleted,
+            "deleted user alice (1 key(s) and grant(s), 0 sign-in code(s), \
+             0 open changeset(s) discarded)\n"
+        );
+        assert!(!keys.contains("alice"), "{keys}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

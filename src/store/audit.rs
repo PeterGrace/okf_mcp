@@ -908,7 +908,9 @@ mod tests {
             .await
             .unwrap();
         }
-        users::delete(&db.pool, "alice").await.unwrap();
+        users::delete(&db.pool, "alice", false, &AuditActor::cli(), now())
+            .await
+            .unwrap();
 
         assert_eq!(
             audit_credentials(&mut db.pool.acquire().await.unwrap()).await,

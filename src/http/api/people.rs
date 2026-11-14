@@ -47,6 +47,7 @@ use crate::http::api::oauth::SignInCodeView;
 use crate::http::api::{require_admin, require_every_catalog, settle};
 use crate::http::AppError;
 use crate::mail::invite;
+use crate::store::audit::AuditActor;
 use crate::store::ceiling::{self, Entitlement};
 use crate::store::keys::{self as key_rows, Access};
 use crate::store::oauth::codes;
@@ -700,23 +701,26 @@ async fn list_sign_ins(
     Ok(Json(SignInList { sign_ins }))
 }
 
-/// `DELETE /users/{name}`: deletes a user that nothing names, with its
-/// personal team.
+/// `DELETE /users/{name}`: deletes a user with its keys, grants, sign-in
+/// codes, sessions, memberships and personal team; its open changesets are
+/// discarded. Catalogs and their history stay (`users::delete`).
 ///
 /// # Returns
 /// 204.
 ///
 /// # Errors
 /// 403 unless the key is an admin reaching every catalog; 404 for an unknown
-/// user; 409 while a credential names it, it is in another team, or its
-/// personal team owns a catalog; 500 for a database failure.
+/// user; 409 for a personal team that owns catalogs, the last owner of a
+/// shared team, or the last admin user; 500 for a database failure.
 async fn delete_user(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(name): Path<String>,
 ) -> Result<StatusCode, AppError> {
     require_every_catalog(&principal)?;
-    users::delete(app.pool(), &name).await?;
+    // `false`: the API never deletes the last admin user (the CLI may).
+    users::delete(app.pool(), &name, false, &actor, app.clock().now()).await?;
     settle(&app).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1726,6 +1730,54 @@ mod tests {
         assert_eq!(deleted.as_u16(), 204);
         assert_eq!(gone.as_u16(), 404);
         assert_eq!(error["error"], "UnknownName");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_user_over_rest_takes_its_keys_and_refuses_the_last_admin() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        user(&test, &root, "alice").await;
+        let (created, key) = send(
+            &test,
+            "POST",
+            "/api/v1/keys",
+            Some(&root),
+            Some(
+                json!({"name": "alice-k", "access": "read", "catalogs": ["main"], "user": "alice"}),
+            ),
+        )
+        .await;
+        // Not `{key}`: the answer holds the secret.
+        assert_eq!(created.as_u16(), 200, "{}", key["error"]);
+        sqlx::query("UPDATE users SET is_admin = (name = 'alice')")
+            .execute(test.app.pool())
+            .await
+            .unwrap();
+
+        let (last, body) = send(&test, "DELETE", "/api/v1/users/alice", Some(&root), None).await;
+        sqlx::query("UPDATE users SET is_admin = true WHERE name = $1")
+            .bind(TEST_USER)
+            .execute(test.app.pool())
+            .await
+            .unwrap();
+        let (deleted, _) = send(&test, "DELETE", "/api/v1/users/alice", Some(&root), None).await;
+        let (_, keys) = send(&test, "GET", "/api/v1/keys", Some(&root), None).await;
+        let (gone, _) = send(&test, "GET", "/api/v1/users/alice", Some(&root), None).await;
+
+        assert_eq!(last, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["message"].to_string().contains("last admin user"),
+            "{body}"
+        );
+        assert_eq!(deleted, StatusCode::NO_CONTENT);
+        assert!(!keys.to_string().contains("alice-k"), "{keys}");
+        assert_eq!(gone, StatusCode::NOT_FOUND);
+        let source: String =
+            sqlx::query_scalar("SELECT source FROM audit_entries WHERE action = 'user.deleted'")
+                .fetch_one(test.app.pool())
+                .await
+                .unwrap();
+        assert_eq!(source, "api");
     }
 
     #[tokio::test]

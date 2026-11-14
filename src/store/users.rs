@@ -8,7 +8,9 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
+use crate::store::audit::{self, Action, AuditActor, Entry, Target};
 use crate::store::catalogs::{bump_admin_generation, is_unique_violation, is_valid_name};
+use crate::store::changesets::{self, ChangesetState};
 use crate::store::user_sessions;
 
 /// A user to create.
@@ -685,58 +687,128 @@ pub async fn auth_by_id(pool: &PgPool) -> Result<HashMap<String, UserAuth>, OkfE
         .collect())
 }
 
-/// Deletes a user that nothing references, with its personal team, and
-/// bumps the administrative generation (spec "Deletion").
+/// What a user deletion removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeletedUser {
+    /// Keys and OAuth grants, revoked ones included.
+    pub keys: i64,
+    /// Sign-in codes, in every state.
+    pub codes: i64,
+    /// Open changesets of those keys and grants, discarded.
+    pub discarded: i64,
+}
+
+/// The shared teams whose only owner is `$1`, by name.
+const SOLE_OWNED_TEAMS: &str = "\
+    SELECT t.name FROM team_members m JOIN teams t ON t.id = m.team_id \
+    WHERE m.user_id = $1 AND m.role = 'owner' AND t.personal_of IS NULL \
+      AND NOT EXISTS (SELECT 1 FROM team_members o \
+                      WHERE o.team_id = t.id AND o.role = 'owner' AND o.user_id <> $1) \
+    ORDER BY t.name";
+
+/// Deletes a user and everything that is only theirs, in one transaction
+/// (spec Part 3): its keys, grants and sign-in codes (revoked ones too),
+/// sessions, sign-in methods, emailed links, entitlements, memberships and
+/// personal team. Its keys' open changesets are discarded and audited.
+/// Catalogs, their history (whose `actor` text stays) and every audit entry
+/// are kept; the user's `audit_people` row becomes `deleted user #N`.
+///
+/// Lock order: every admin row in id order, then the user (as
+/// [`set_admin`]), then its personal team, then its shared teams in id
+/// order, then its keys and grants in id order, then their open changesets
+/// in id order. A key or code being created for the user holds the user
+/// `FOR KEY SHARE` (`id_of`); the deletion waits for it and then deletes
+/// it too. A changeset being opened by one of its keys waits for the key's
+/// lock and then finds the key gone. A publish by one of its keys that is
+/// already running when the deletion starts may make Postgres abort one of
+/// the two as a deadlock ([`OkfError::Busy`], retryable): the publish holds
+/// its changeset and records its entry under the user's `FOR KEY SHARE`.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `name` - the user's name.
+/// * `allow_last_admin` - lets the last admin user go (the CLI, with
+///   operator access; never the API).
+/// * `actor` - who, for the audit log; a provisioner is refused an admin.
+/// * `now` - the server clock.
+///
+/// # Returns
+/// What went.
 ///
 /// # Errors
-/// [`OkfError::UnknownName`]; [`OkfError::Refused`] while a key, grant or
-/// code names the user, it belongs to another team, or its personal team
-/// owns a catalog; [`OkfError::Database`].
-pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError> {
+/// [`OkfError::UnknownName`] (a malformed name included);
+/// [`OkfError::Forbidden`] for a provisioner and an admin user;
+/// [`OkfError::Refused`] naming the catalogs its personal team owns, the
+/// shared teams it is the only owner of, or that it is the last admin user;
+/// [`OkfError::Busy`] for a deadlock; [`OkfError::Database`].
+pub async fn delete(
+    pool: &PgPool,
+    name: &str,
+    allow_last_admin: bool,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<DeletedUser, OkfError> {
+    // A malformed name (a NUL, which Postgres refuses) names nobody.
+    if !is_valid_name(name) {
+        return Err(unknown(name));
+    }
+    // Dropping `tx` without `commit()` (any `?` or early return) rolls back.
     let mut tx = pool.begin().await?;
-    // `FOR UPDATE` holds the row so a credential created concurrently waits
-    // (its foreign-key check takes `FOR KEY SHARE`) and then fails cleanly.
-    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE name = $1 FOR UPDATE")
-        .bind(name)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| unknown(name))?;
-    // Lock the personal team too: a catalog assigned to it concurrently takes
+    // As in `set_admin`: an admin cleared concurrently drops out of the list
+    // before it is counted.
+    let admins: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM users WHERE is_admin ORDER BY id FOR UPDATE")
+            .fetch_all(&mut *tx)
+            .await?;
+    // `FOR UPDATE` holds the row, so a credential or membership created
+    // concurrently (its foreign-key check takes `FOR KEY SHARE`) waits.
+    let (user_id, is_admin): (String, bool) =
+        sqlx::query_as("SELECT id, is_admin FROM users WHERE name = $1 FOR UPDATE")
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| unknown(name))?;
+    audit::refuse_admin_target(actor, is_admin, name)?;
+    // The personal team: a catalog assigned to it concurrently takes
     // `FOR KEY SHARE` on this row, so either it waits for this delete (and
-    // then fails its foreign-key check), or this waits for it to commit and
-    // the count below sees the catalog. Without the lock the count could miss
-    // it, and the team's DELETE would fail as a database error, not a 409.
-    // (`Option`: every user has one, but a missing row should not panic.)
+    // then fails its foreign-key check), or this waits for it and the
+    // listing below sees the catalog. (`Option`: every user has one, but a
+    // missing row should not panic.)
     let team_id: Option<String> =
         sqlx::query_scalar("SELECT id FROM teams WHERE personal_of = $1 FOR UPDATE")
             .bind(&user_id)
             .fetch_optional(&mut *tx)
             .await?;
-    // A tuple destructures the three columns of the one row, like Python's
-    // `a, b, c = row`.
-    let (credentials, other_teams, owned): (i64, i64, i64) = sqlx::query_as(
-        "SELECT (SELECT count(*) FROM api_keys WHERE user_id = $1) \
-              + (SELECT count(*) FROM sign_in_codes WHERE user_id = $1), \
-                (SELECT count(*) FROM team_members m JOIN teams t ON t.id = m.team_id \
-                 WHERE m.user_id = $1 AND t.personal_of IS DISTINCT FROM $1), \
-                (SELECT count(*) FROM catalogs WHERE owner_team_id = $2)",
+    // Its shared teams, so no owner is added or removed while we count.
+    sqlx::query(
+        "SELECT t.id FROM teams t JOIN team_members m ON m.team_id = t.id \
+         WHERE m.user_id = $1 AND t.personal_of IS NULL ORDER BY t.id FOR UPDATE OF t",
     )
     .bind(&user_id)
-    .bind(&team_id)
-    .fetch_one(&mut *tx)
+    .execute(&mut *tx)
     .await?;
-    let blocker = if credentials > 0 {
+    let owned: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM catalogs WHERE owner_team_id = $1 ORDER BY name")
+            .bind(&team_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let sole: Vec<String> = sqlx::query_scalar(SOLE_OWNED_TEAMS)
+        .bind(&user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    let blocker = if !owned.is_empty() {
         Some(format!(
-            "{credentials} key(s), grant(s) or sign-in code(s) name it"
+            "its personal team owns catalog(s) {}; delete them or move them to another team \
+             first (catalog set-owner)",
+            quoted(&owned)
         ))
-    } else if other_teams > 0 {
-        Some(format!("it belongs to {other_teams} other team(s)"))
-    } else if owned > 0 {
-        Some(format!("its personal team owns {owned} catalog(s)"))
+    } else if !sole.is_empty() {
+        Some(format!(
+            "it is the last owner of team(s) {}; add another owner first",
+            quoted(&sole)
+        ))
+    } else if is_admin && !allow_last_admin && admins.len() <= 1 {
+        Some("it is the last admin user; make another user an admin first".to_string())
     } else {
         None
     };
@@ -745,21 +817,172 @@ pub async fn delete(pool: &PgPool, name: &str) -> Result<(), OkfError> {
             reason: format!("user {name:?} cannot be deleted: {what}"),
         });
     }
-    // Memberships cascade with the team; the team row goes before the user
-    // row because `teams.personal_of` restricts the user's delete.
+    // Its keys and grants, so none opens a changeset after the discard
+    // below (opening one takes `FOR KEY SHARE` on its key).
+    let keys: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM api_keys WHERE user_id = $1 ORDER BY id FOR UPDATE")
+            .bind(&user_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM sign_in_codes WHERE user_id = $1")
+        .bind(&user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let discarded = discard_open_changesets(&mut tx, &user_id, actor, now).await?;
+    let deleted = DeletedUser {
+        keys: count_of(keys.len()),
+        codes,
+        discarded,
+    };
+    // Recorded while the user row exists, so the entry's person resolves.
+    audit::record(
+        &mut tx,
+        actor,
+        &Entry {
+            action: Action::UserDeleted,
+            target: Target::User(&user_id),
+            person: None,
+            teams: &[],
+            details: serde_json::json!({
+                "keys": deleted.keys,
+                "codes": deleted.codes,
+                "changesets_discarded": deleted.discarded,
+            }),
+        },
+        now,
+    )
+    .await?;
+    // The team row goes before the user row, because `teams.personal_of`
+    // restricts the user's delete; its memberships cascade with it.
     if let Some(team_id) = &team_id {
         sqlx::query("DELETE FROM teams WHERE id = $1")
             .bind(team_id)
             .execute(&mut *tx)
             .await?;
     }
+    // Before the user row goes: it finds the user's credentials through
+    // `api_keys` and `sign_in_codes`, which that delete cascades.
+    audit::forget_person(&mut tx, &user_id).await?;
+    // Cascades: keys (and their grants and tokens), codes, memberships,
+    // sessions, passkeys, identities, emailed links, entitlements, events.
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(&user_id)
         .execute(&mut *tx)
         .await?;
     bump_admin_generation(&mut tx).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(deleted)
+}
+
+/// Names for a refusal, each quoted: `"a", "b"`.
+fn quoted(names: &[String]) -> String {
+    // `{:?}` of a string quotes (and escapes) it.
+    names
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A row count as the `i64` the summary reports.
+fn count_of(rows: usize) -> i64 {
+    // `try_from`: a `usize` into an `i64` cannot fail for any real count.
+    i64::try_from(rows).unwrap_or(i64::MAX)
+}
+
+/// Discards the open changesets of `user_id`'s keys and grants (else their
+/// `key_id` would become NULL and leave them open with no owner), with one
+/// `catalog.changeset_discarded` entry each. Like `changesets::prune_empty`
+/// it runs without the catalog lock, so it cannot deadlock with
+/// `catalogs::delete` (catalog, then changesets); the changeset row lock is
+/// what a publish or discard of the same changeset waits on. A cached
+/// overlay of a discarded changeset ages out of the cache on its own.
+///
+/// # Arguments
+/// * `conn` - the deletion's transaction, holding the user's keys.
+/// * `user_id` - the user being deleted.
+/// * `actor` - who, for the entries.
+/// * `now` - the server clock.
+///
+/// # Returns
+/// How many were discarded.
+///
+/// # Errors
+/// [`OkfError::Database`].
+async fn discard_open_changesets(
+    conn: &mut PgConnection,
+    user_id: &str,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
+) -> Result<i64, OkfError> {
+    // Each row: id, handle, catalog id, catalog name, entry count.
+    let open: Vec<(i64, String, i64, String, i64)> = sqlx::query_as(
+        "SELECT c.id, c.handle, c.catalog_id, cat.name, \
+                (SELECT count(*) FROM changeset_entries e WHERE e.changeset_id = c.id) \
+         FROM changesets c JOIN api_keys k ON k.id = c.key_id \
+                           JOIN catalogs cat ON cat.id = c.catalog_id \
+         WHERE k.user_id = $1 AND c.state = 'open' ORDER BY c.id FOR UPDATE OF c",
+    )
+    .bind(user_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (id, handle, catalog_id, catalog, files) in &open {
+        changesets::set_state(conn, *id, ChangesetState::Discarded, now).await?;
+        let teams = audit::catalog_teams(conn, *catalog_id).await?;
+        audit::record(
+            conn,
+            actor,
+            &Entry {
+                action: Action::CatalogChangesetDiscarded,
+                target: Target::Catalog(catalog),
+                person: Some(user_id),
+                teams: &teams,
+                details: serde_json::json!({
+                    "changeset": handle,
+                    "files": files,
+                    "reason": "user_deleted",
+                }),
+            },
+            now,
+        )
+        .await?;
+    }
+    Ok(count_of(open.len()))
+}
+
+/// The id and admin flag of the user called `name`, inside a caller's
+/// transaction, held `FOR KEY SHARE` as [`id_of`] holds it. `set_admin`
+/// takes `FOR UPDATE` on the same row, so the flag cannot change before the
+/// caller commits: a provisioner guard on it cannot race a promotion.
+///
+/// # Arguments
+/// * `conn` - the caller's transaction (pass `&mut tx`).
+/// * `name` - the user's name.
+///
+/// # Returns
+/// Its `users.id` and whether it is an admin user.
+///
+/// # Errors
+/// [`OkfError::UnknownName`] (a malformed name included);
+/// [`OkfError::Database`].
+// Task 6b's provisioner guards call it; until then only the tests do.
+// `expect` (unlike `allow`) warns once it is used, so the line goes then.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "M14 Task 6b's guards are its first callers")
+)]
+pub(crate) async fn id_and_admin_of(
+    conn: &mut PgConnection,
+    name: &str,
+) -> Result<(String, bool), OkfError> {
+    if !is_valid_name(name) {
+        return Err(unknown(name));
+    }
+    sqlx::query_as("SELECT id, is_admin FROM users WHERE name = $1 FOR KEY SHARE")
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| unknown(name))
 }
 
 #[cfg(test)]
@@ -768,7 +991,11 @@ pub(crate) mod tests {
     use super::*;
     use crate::db::test_db;
     use crate::store::catalogs::{self, tests::until_a_lock_is_awaited};
+    use crate::store::keys::{self as key_rows, Access, Grants, NewKey};
     use crate::store::teams;
+
+    /// How long a race test waits for a held lock to be released.
+    const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Gives `team` a catalog, `shared`.
     pub(crate) async fn seed_catalog_owned_by(pool: &PgPool, team: &str) {
@@ -1311,6 +1538,67 @@ pub(crate) mod tests {
         assert_eq!(users[0].credentials, 0);
     }
 
+    /// A key of `user` on catalog `shared`; revoked when `revoked`.
+    async fn key_for(pool: &PgPool, user: &str, name: &str, revoked: bool) -> String {
+        let catalogs = ["shared".to_string()];
+        let created = key_rows::create_with_id(
+            pool,
+            &NewKey {
+                name,
+                access: Access::Write,
+                maintenance_report: false,
+                grants: Grants::Catalogs(&catalogs),
+                default_catalog: None,
+                actor: name,
+                user,
+                self_issued: false,
+                expires_at: None,
+                levels: &[],
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        if revoked {
+            key_rows::revoke_by_id(pool, &created.id, now())
+                .await
+                .unwrap();
+        }
+        created.id
+    }
+
+    /// Gives `user` one unredeemed sign-in code.
+    async fn code_for(pool: &PgPool, user: &str) {
+        sqlx::query(
+            "INSERT INTO sign_in_codes \
+                 (name, sha256, access, all_catalogs, actor, created_at, expires_at, user_id) \
+             VALUES ('laptop', decode(repeat('cd', 32), 'hex'), 'read', true, 'laptop', \
+                     now(), now() + interval '1 hour', \
+                     (SELECT id FROM users WHERE name = $1))",
+        )
+        .bind(user)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The single number `sql` answers.
+    async fn count(pool: &PgPool, sql: &str) -> i64 {
+        // `AssertSqlSafe`: the text is a test's own constant, not input.
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_string()))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The reason of a refused deletion.
+    fn reason(result: Result<DeletedUser, OkfError>) -> String {
+        match result {
+            Err(OkfError::Refused { reason }) => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unreferenced_user_is_deleted_with_its_personal_team() {
         let db = test_db().await;
@@ -1319,8 +1607,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        delete(&db.pool, "alice").await.unwrap();
+        let deleted = delete(&db.pool, "alice", false, &AuditActor::cli(), now())
+            .await
+            .unwrap();
 
+        assert_eq!(deleted, DeletedUser::default());
         assert!(matches!(
             find(&db.pool, "alice").await,
             Err(OkfError::UnknownName { .. })
@@ -1336,100 +1627,234 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_user_in_another_team_is_not_deleted() {
+    async fn deleting_a_user_removes_its_credentials_and_keeps_the_history() {
         let db = test_db().await;
-        create(&db.pool, &alice(), now()).await.unwrap();
+        seed_user(&db.pool, "alice", Some("alice@example.com")).await;
+        let family = teams::NewTeam {
+            name: "family",
+            display_name: "",
+            owner: crate::db::TEST_USER,
+        };
+        teams::create(&db.pool, &family, now()).await.unwrap();
+        teams::set_member(&db.pool, "family", "alice", teams::Role::Member, now())
+            .await
+            .unwrap();
+        seed_catalog_owned_by(&db.pool, "family").await;
+        key_for(&db.pool, "alice", "alice-laptop", false).await;
+        key_for(&db.pool, "alice", "alice-old", true).await;
+        code_for(&db.pool, "alice").await;
+        seed_session(&db.pool, &id_by_name(&db.pool, "alice").await.unwrap()).await;
+        crate::store::ceiling::entitle(&db.pool, "alice", "shared", Access::Read, now())
+            .await
+            .unwrap();
+        // A revision alice's key wrote: history keeps its actor text.
+        sqlx::query(
+            "INSERT INTO revisions (catalog_id, path, revision, op, content, executable, actor, \
+                                    message, created_at) \
+             SELECT id, 'a.md', 1, 'create', 'x', false, 'alice-laptop', 'm', $1 \
+             FROM catalogs WHERE name = 'shared'",
+        )
+        .bind(now())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let deleted = delete(&db.pool, "alice", false, &AuditActor::cli(), now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            deleted,
+            DeletedUser {
+                keys: 2,
+                codes: 1,
+                discarded: 0
+            }
+        );
+        assert!(matches!(
+            find(&db.pool, "alice").await,
+            Err(OkfError::UnknownName { .. })
+        ));
+        for table in [
+            "api_keys",
+            "sign_in_codes",
+            "user_catalogs",
+            "user_sessions",
+        ] {
+            let sql = format!("SELECT count(*) FROM {table}");
+            assert_eq!(count(&db.pool, &sql).await, 0, "{table}");
+        }
+        assert_eq!(
+            count(&db.pool, "SELECT count(*) FROM teams WHERE name = 'alice'").await,
+            0
+        );
+        assert_eq!(
+            teams::find(&db.pool, "family").await.unwrap().members.len(),
+            1
+        );
+        assert_eq!(
+            teams::find(&db.pool, "family").await.unwrap().catalogs,
+            ["shared"]
+        );
+        assert_eq!(
+            count(
+                &db.pool,
+                "SELECT count(*) FROM revisions WHERE actor = 'alice-laptop'"
+            )
+            .await,
+            1
+        );
+        let (person, details): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT p.name, e.details FROM audit_entries e \
+             JOIN audit_people p ON p.id = e.target_person_id \
+             WHERE e.action = 'user.deleted'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(person.starts_with("deleted user #"), "{person}");
+        assert_eq!(
+            details,
+            serde_json::json!({"keys": 2, "codes": 1, "changesets_discarded": 0})
+        );
+        assert_eq!(
+            count(
+                &db.pool,
+                "SELECT count(*) FROM audit_people WHERE name = 'alice' OR user_id IS NOT NULL \
+                 AND user_id NOT IN (SELECT id FROM users)"
+            )
+            .await,
+            0,
+            "no audit row names alice or points at her"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_users_open_changesets_are_discarded_and_audited() {
+        let db = test_db().await;
+        seed_user(&db.pool, "alice", None).await;
+        seed_catalog_owned_by(&db.pool, crate::db::TEST_TEAM).await;
+        let key = key_for(&db.pool, "alice", "alice-laptop", false).await;
+        let catalog_id: i64 = sqlx::query_scalar("SELECT id FROM catalogs WHERE name = 'shared'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+        let changeset = changesets::open(&mut tx, catalog_id, &key, "alice-laptop", now())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let deleted = delete(&db.pool, "alice", false, &AuditActor::cli(), now())
+            .await
+            .unwrap();
+
+        assert_eq!(deleted.discarded, 1);
+        let state: String = sqlx::query_scalar("SELECT state FROM changesets WHERE id = $1")
+            .bind(changeset.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "discarded");
+        let (target, teams, details): (Option<String>, Vec<i64>, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT target_name, teams, details FROM audit_entries \
+                 WHERE action = 'catalog.changeset_discarded'",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(target.as_deref(), Some("shared"));
+        assert_eq!(teams.len(), 1, "the catalog's owner team");
+        assert_eq!(details["changeset"], changeset.handle);
+        assert_eq!(details["files"], 0);
+        assert_eq!(details["reason"], "user_deleted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deletion_is_refused_for_owned_catalogs_a_sole_owner_and_the_last_admin() {
+        let db = test_db().await;
+        seed_user(&db.pool, "alice", None).await;
+        seed_catalog_owned_by(&db.pool, "alice").await;
+        let owns = delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await;
+        catalogs::delete(&db.pool, "shared", true).await.unwrap();
+        teams::create(&db.pool, &family_owned_by_alice(), now())
+            .await
+            .unwrap();
+        let sole = delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await;
         teams::set_member(
             &db.pool,
-            crate::db::TEST_TEAM,
-            "alice",
-            teams::Role::Member,
+            "family",
+            crate::db::TEST_USER,
+            teams::Role::Owner,
             now(),
         )
         .await
         .unwrap();
+        set_admin(&db.pool, "alice", true, true).await.unwrap();
+        let last_admin = delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await;
+        let by_the_cli = delete(&db.pool, "alice", true, &AuditActor::cli(), now()).await;
 
-        let refused = delete(&db.pool, "alice").await;
-
-        assert!(
-            matches!(refused, Err(OkfError::Refused { .. })),
-            "{refused:?}"
+        assert!(reason(owns).contains("catalog(s) \"shared\""));
+        assert!(reason(sole).contains("last owner of team(s) \"family\""));
+        assert!(reason(last_admin).contains("last admin user"));
+        assert!(by_the_cli.is_ok(), "the CLI may delete the last admin");
+        assert_eq!(
+            teams::find(&db.pool, "family").await.unwrap().members.len(),
+            1,
+            "the other owner stays"
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn deleting_an_unknown_user_is_unknown_name() {
+    async fn a_provisioner_is_refused_an_admin_user() {
         let db = test_db().await;
-        let missing = delete(&db.pool, "nobody").await;
-        assert!(matches!(
-            missing,
-            Err(OkfError::UnknownName { noun: "user", .. })
-        ));
-    }
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_user_named_by_a_key_is_not_deleted() {
-        let db = test_db().await;
-        create(&db.pool, &alice(), now()).await.unwrap();
-        sqlx::query(
-            "INSERT INTO api_keys (name, sha256, access, all_catalogs, actor, created_at, user_id) \
-             VALUES ('k', decode(repeat('ab', 32), 'hex'), 'read', true, 'k', now(), \
-                     (SELECT id FROM users WHERE name = 'alice'))",
-        )
-        .execute(&db.pool)
-        .await
-        .unwrap();
-        let generation = catalogs::admin_generation(&db.pool).await.unwrap();
+        seed_user(&db.pool, "alice", None).await;
+        set_admin(&db.pool, "alice", true, true).await.unwrap();
+        let provisioner = AuditActor {
+            provisioner: true,
+            ..AuditActor::cli()
+        };
 
-        let refused = delete(&db.pool, "alice").await;
+        let refused = delete(&db.pool, "alice", true, &provisioner, now()).await;
 
         assert!(
-            matches!(&refused, Err(OkfError::Refused { reason }) if reason.contains("key(s)")),
+            matches!(refused, Err(OkfError::Forbidden { .. })),
             "{refused:?}"
         );
-        assert_unchanged(&db.pool, 1, generation).await;
+        assert!(find(&db.pool, "alice").await.unwrap().is_admin);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_user_named_by_a_sign_in_code_is_not_deleted() {
+    async fn deleting_an_unknown_or_malformed_user_is_unknown_name() {
         let db = test_db().await;
-        create(&db.pool, &alice(), now()).await.unwrap();
-        sqlx::query(
-            "INSERT INTO sign_in_codes \
-                 (name, sha256, access, all_catalogs, actor, created_at, expires_at, user_id) \
-             VALUES ('laptop', decode(repeat('cd', 32), 'hex'), 'read', true, 'laptop', \
-                     now(), now() + interval '1 hour', \
-                     (SELECT id FROM users WHERE name = 'alice'))",
-        )
-        .execute(&db.pool)
-        .await
-        .unwrap();
-        let generation = catalogs::admin_generation(&db.pool).await.unwrap();
-
-        let refused = delete(&db.pool, "alice").await;
-
-        assert!(
-            matches!(&refused, Err(OkfError::Refused { reason }) if reason.contains("code(s)")),
-            "{refused:?}"
-        );
-        assert_unchanged(&db.pool, 1, generation).await;
+        for name in ["nobody", "a\0b"] {
+            let missing = delete(&db.pool, name, false, &AuditActor::cli(), now()).await;
+            assert!(
+                matches!(missing, Err(OkfError::UnknownName { noun: "user", .. })),
+                "{name:?}: {missing:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_user_whose_personal_team_owns_a_catalog_is_not_deleted() {
+    async fn a_refused_deletion_changes_nothing() {
         let db = test_db().await;
         create(&db.pool, &alice(), now()).await.unwrap();
         seed_catalog_owned_by(&db.pool, "alice").await;
+        code_for(&db.pool, "alice").await;
         let generation = catalogs::admin_generation(&db.pool).await.unwrap();
 
-        let refused = delete(&db.pool, "alice").await;
+        let refused = delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await;
 
-        assert!(
-            matches!(&refused, Err(OkfError::Refused { reason }) if reason.contains("catalog")),
-            "{refused:?}"
-        );
-        assert_unchanged(&db.pool, 0, generation).await;
+        assert!(reason(refused).contains("catalog"));
+        assert_unchanged(&db.pool, 1, generation).await;
         let team = teams::find(&db.pool, "alice").await.unwrap();
         assert_eq!(team.catalogs, ["shared"]);
+        assert_eq!(
+            count(&db.pool, "SELECT count(*) FROM audit_entries").await,
+            0
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1451,19 +1876,121 @@ pub(crate) mod tests {
         // blocks on the personal team's row, which the assignment's
         // foreign-key check holds `FOR KEY SHARE`.
         let pool = db.pool.clone();
-        let deleting = tokio::spawn(async move { delete(&pool, "alice").await });
+        let deleting =
+            tokio::spawn(
+                async move { delete(&pool, "alice", false, &AuditActor::cli(), now()).await },
+            );
         until_a_lock_is_awaited(&db.pool).await;
 
         assigning.commit().await.unwrap();
-        let outcome = deleting.await.unwrap();
+        let outcome = tokio::time::timeout(LOCK_WAIT, deleting)
+            .await
+            .expect("the delete waited for the assignment for too long")
+            .unwrap();
 
-        assert!(
-            matches!(&outcome, Err(OkfError::Refused { reason }) if reason.contains("catalog")),
-            "{outcome:?}"
-        );
+        assert!(reason(outcome).contains("catalog"));
         assert_eq!(
             teams::find(&db.pool, "alice").await.unwrap().catalogs,
             ["shared"]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_created_while_deletion_waits_is_deleted_with_the_user() {
+        let db = test_db().await;
+        seed_user(&db.pool, "alice", None).await;
+        // A key creation in flight holds alice `FOR KEY SHARE` (`id_of`).
+        let mut creating = db.pool.begin().await.unwrap();
+        id_of(&mut creating, "alice").await.unwrap();
+        let pool = db.pool.clone();
+        let deletion =
+            tokio::spawn(
+                async move { delete(&pool, "alice", false, &AuditActor::cli(), now()).await },
+            );
+        until_a_lock_is_awaited(&db.pool).await;
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, sha256, access, all_catalogs, actor, created_at, \
+                                   user_id) \
+             SELECT 'late', 'late', sha256('late'::bytea), 'read', false, 'late', $1, id \
+             FROM users WHERE name = 'alice'",
+        )
+        .bind(now())
+        .execute(&mut *creating)
+        .await
+        .unwrap();
+        creating.commit().await.unwrap();
+
+        let deleted = tokio::time::timeout(LOCK_WAIT, deletion)
+            .await
+            .expect("the delete waited for the key creation for too long")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            deleted.keys, 1,
+            "the waiting deletion saw the committed key"
+        );
+        assert_eq!(count(&db.pool, "SELECT count(*) FROM api_keys").await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changeset_opened_while_deletion_waits_is_discarded_with_the_user() {
+        let db = test_db().await;
+        seed_user(&db.pool, "alice", None).await;
+        seed_catalog_owned_by(&db.pool, crate::db::TEST_TEAM).await;
+        let key = key_for(&db.pool, "alice", "alice-laptop", false).await;
+        let catalog_id: i64 = sqlx::query_scalar("SELECT id FROM catalogs WHERE name = 'shared'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        // An open in flight holds the key `FOR KEY SHARE` (its foreign-key
+        // check) until it commits.
+        let mut opening = db.pool.begin().await.unwrap();
+        let changeset = changesets::open(&mut opening, catalog_id, &key, "alice-laptop", now())
+            .await
+            .unwrap();
+        let pool = db.pool.clone();
+        let deletion =
+            tokio::spawn(
+                async move { delete(&pool, "alice", false, &AuditActor::cli(), now()).await },
+            );
+        until_a_lock_is_awaited(&db.pool).await;
+        opening.commit().await.unwrap();
+
+        let deleted = tokio::time::timeout(LOCK_WAIT, deletion)
+            .await
+            .expect("the delete waited for the open for too long")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            deleted.discarded, 1,
+            "the waiting deletion saw the changeset"
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM changesets WHERE id = $1")
+            .bind(changeset.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state, "discarded",
+            "no changeset is left open without a key"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn id_and_admin_of_reads_the_flag_and_knows_no_stranger() {
+        let db = test_db().await;
+        let alice = seed_user(&db.pool, "alice", None).await;
+        set_admin(&db.pool, "alice", true, true).await.unwrap();
+        let mut tx = db.pool.begin().await.unwrap();
+
+        let found = id_and_admin_of(&mut tx, "alice").await.unwrap();
+        let stranger = id_and_admin_of(&mut tx, "nobody").await;
+        let malformed = id_and_admin_of(&mut tx, "a\0b").await;
+
+        assert_eq!(found, (alice.id, true));
+        assert!(matches!(stranger, Err(OkfError::UnknownName { .. })));
+        assert!(matches!(malformed, Err(OkfError::UnknownName { .. })));
     }
 }
