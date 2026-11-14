@@ -27,6 +27,13 @@ pub(crate) const RESOURCE: &str = "https://okf.example.com/mcp";
 pub(crate) const CLIENT_ID: &str = "test-client";
 /// The test client's one redirect URI.
 pub(crate) const REDIRECT_URI: &str = "https://client.example.com/callback";
+/// A second DCR client, registered by [`insert_loopback_client`].
+pub(crate) const LOOPBACK_CLIENT_ID: &str = "loopback-client";
+/// Its one redirect URI: loopback `http` with no port, as Claude Code
+/// registers it.
+pub(crate) const LOOPBACK_REDIRECT_URI: &str = "http://localhost/callback";
+/// [`LOOPBACK_REDIRECT_URI`] on the ephemeral port a native client sends.
+pub(crate) const LOOPBACK_ON_PORT: &str = "http://localhost:54123/callback";
 /// A valid S256 challenge (RFC 7636 appendix B, a published vector).
 pub(crate) const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 /// The verifier of [`CHALLENGE`].
@@ -50,6 +57,24 @@ pub(crate) async fn oauth_app() -> TestApp {
     // fixed test id goes in through the store's plain-SQL helper.
     insert_test_client(test.app.pool(), CLIENT_ID, ClientKind::Dcr, REDIRECT_URI).await;
     test
+}
+
+/// Registers the DCR client [`LOOPBACK_CLIENT_ID`] with the portless
+/// [`LOOPBACK_REDIRECT_URI`].
+///
+/// # Arguments
+/// * `test` - the app ([`oauth_app`]).
+///
+/// # Panics
+/// If the insert fails: a broken test setup.
+pub(crate) async fn insert_loopback_client(test: &TestApp) {
+    insert_test_client(
+        test.app.pool(),
+        LOOPBACK_CLIENT_ID,
+        ClientKind::Dcr,
+        LOOPBACK_REDIRECT_URI,
+    )
+    .await;
 }
 
 /// A live sign-in code: `access` on `main`, actor `example-actor`.
@@ -86,7 +111,22 @@ pub(crate) async fn sign_in_code(test: &TestApp, access: Access) -> String {
 /// # Returns
 /// The encoded query, without the `?`.
 pub(crate) fn authorize_query() -> String {
-    format!("{}&signin=code", user_authorize_query())
+    authorize_query_for(CLIENT_ID, REDIRECT_URI)
+}
+
+/// [`authorize_query`] for another client or redirect URI.
+///
+/// # Arguments
+/// * `client_id` - the request's `client_id`.
+/// * `redirect_uri` - the request's `redirect_uri`.
+///
+/// # Returns
+/// The encoded query, without the `?`.
+pub(crate) fn authorize_query_for(client_id: &str, redirect_uri: &str) -> String {
+    format!(
+        "{}&signin=code",
+        user_authorize_query_for(client_id, redirect_uri)
+    )
 }
 
 /// A valid authorization request's query string for a signed-in person:
@@ -96,10 +136,22 @@ pub(crate) fn authorize_query() -> String {
 /// # Returns
 /// The encoded query, without the `?`.
 pub(crate) fn user_authorize_query() -> String {
+    user_authorize_query_for(CLIENT_ID, REDIRECT_URI)
+}
+
+/// [`user_authorize_query`] for another client or redirect URI.
+///
+/// # Arguments
+/// * `client_id` - the request's `client_id`.
+/// * `redirect_uri` - the request's `redirect_uri`.
+///
+/// # Returns
+/// The encoded query, without the `?`.
+fn user_authorize_query_for(client_id: &str, redirect_uri: &str) -> String {
     form(&[
         ("response_type", "code"),
-        ("client_id", CLIENT_ID),
-        ("redirect_uri", REDIRECT_URI),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
         ("state", "xyz"),
         ("code_challenge", CHALLENGE),
         ("code_challenge_method", "S256"),

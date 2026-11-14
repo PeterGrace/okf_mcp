@@ -197,7 +197,8 @@ fn claim_consent(consent: Option<&mut UserConsent>, posted: Option<&str>, fresh:
 /// sign-in code included, to the client.
 ///
 /// # Arguments
-/// * `redirect_uri` - an exact match of one of the client's URIs.
+/// * `redirect_uri` - the request's URI, matched against the client's
+///   (see [`clients::redirect_uri_matches`]).
 /// * `pairs` - `code`, or `error` and `error_description`.
 /// * `state` - the client's `state`, echoed if it sent one.
 /// * `issuer` - this server's issuer (RFC 9207).
@@ -210,8 +211,8 @@ fn back_to_client(
     state: Option<&str>,
     issuer: &str,
 ) -> Response {
-    // Registration (Task 3) parsed every redirect URI, so this cannot fail;
-    // a failure is answered as an error page rather than a panic.
+    // `redirect_uri_matches` parsed the URI before trusting it, so this
+    // cannot fail; a failure is answered as an error page rather than a panic.
     let Ok(mut target) = url::Url::parse(redirect_uri) else {
         return consent::error_page(
             StatusCode::BAD_REQUEST,
@@ -234,7 +235,8 @@ fn back_to_client(
 /// An OAuth error sent back to the client.
 ///
 /// # Arguments
-/// * `redirect_uri` - an exact match of one of the client's URIs.
+/// * `redirect_uri` - the request's URI, matched against the client's
+///   (see [`clients::redirect_uri_matches`]).
 /// * `state` - the client's `state`, echoed if it sent one.
 /// * `issuer` - this server's issuer.
 /// * `code` - the OAuth error code.
@@ -259,8 +261,9 @@ fn error_to_client(
 
 /// The page view of a pending authorization.
 fn view(pending_id: &str, pending: &PendingAuthorization) -> PageView {
-    // The URI matched one the client registered, and registration (or the
-    // CIMD fetch) parsed it, so the fallbacks never show.
+    // `redirect_uri_matches` parsed the URI before trusting it, so the
+    // fallbacks never show. The origin is the request's, port included, so
+    // `form-action` allows the redirect to a loopback client's live port.
     let parsed = url::Url::parse(&pending.redirect_uri).ok();
     let redirect_origin = parsed
         .as_ref()
@@ -467,7 +470,8 @@ async fn new_consent(app: &App, user: &UserAuth) -> Result<UserConsent, OkfError
     })
 }
 
-/// The trusted half of a request: its client and exact redirect URI.
+/// The trusted half of a request: its client and its redirect URI, as
+/// [`clients::redirect_uri_matches`] accepts it.
 ///
 /// # Returns
 /// The client and the redirect URI.
@@ -504,12 +508,16 @@ async fn trusted_client<'q>(
             ));
         }
     };
-    // 2. Its exact redirect URI: string equality, no prefix or pattern.
-    let Some(redirect_uri) = query
-        .redirect_uri
-        .as_deref()
-        .filter(|uri| client.redirect_uris.iter().any(|known| known == uri))
-    else {
+    // 2. Its redirect URI: string equality, no prefix or pattern, except
+    // that a loopback `http` URI may name any port (RFC 8252 section 7.3).
+    // The request's URI, port included, is what is kept: the redirect goes
+    // there, and the token request must repeat it exactly.
+    let Some(redirect_uri) = query.redirect_uri.as_deref().filter(|uri| {
+        client
+            .redirect_uris
+            .iter()
+            .any(|known| clients::redirect_uri_matches(known, uri))
+    }) else {
         return Err((
             StatusCode::BAD_REQUEST,
             "The request's redirect URI is not one the client registered.",
@@ -959,8 +967,9 @@ mod tests {
     use crate::oauth::pkce;
     use crate::oauth::state::code_key;
     use crate::oauth::testing::{
-        authorize_query, form, hidden, hidden_inputs, oauth_app, send, send_as, sign_in_code,
-        user_authorize_query, CLIENT_ID, PUBLIC_URL, REDIRECT_URI, VERIFIER,
+        authorize_query, authorize_query_for, form, hidden, hidden_inputs, insert_loopback_client,
+        oauth_app, send, send_as, sign_in_code, user_authorize_query, CLIENT_ID,
+        LOOPBACK_CLIENT_ID, LOOPBACK_ON_PORT, PUBLIC_URL, REDIRECT_URI, VERIFIER,
     };
     use crate::store::ceiling::{self, Ceiling};
     use crate::store::keys::{self as key_rows, Access, KeyKind};
@@ -1075,6 +1084,89 @@ mod tests {
             assert!(page.contains("Cannot connect"), "{query}");
             assert!(!page.contains("attacker.example.com"), "{query}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_portless_loopback_registration_accepts_any_port_and_redirects_there() {
+        let test = oauth_app().await;
+        insert_loopback_client(&test).await;
+        let code = sign_in_code(&test, Access::Read).await;
+
+        let (status, headers, page) = send(
+            &test,
+            "GET",
+            &format!(
+                "/oauth/authorize?{}",
+                authorize_query_for(LOOPBACK_CLIENT_ID, LOOPBACK_ON_PORT)
+            ),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{page}");
+        // `form-action` names the request's origin, port included, or the
+        // browser would block the redirect after Approve.
+        let csp = |headers: &HeaderMap| {
+            headers["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(csp(&headers).contains("form-action 'self' http://localhost:54123;"));
+        let (pending, csrf) = (hidden(&page, "pending"), hidden(&page, "csrf"));
+        let (status, headers, summary) = post(
+            &test,
+            &[
+                ("pending", &pending),
+                ("csrf", &csrf),
+                ("action", "code"),
+                ("sign_in_code", &code),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(csp(&headers).contains("form-action 'self' http://localhost:54123;"));
+        let (status, headers, _) = approve_from(&test, &summary).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let target = location(&headers);
+        assert_eq!(target.port(), Some(54123));
+        assert!(target.as_str().starts_with(LOOPBACK_ON_PORT));
+        let issued = param(&target, "code").expect("a code");
+        let stored = test
+            .app
+            .oauth()
+            .expect("oauth on")
+            .codes
+            .update(&code_key(&issued), Instant::now(), |code| code.clone())
+            .expect("the code is stored");
+        assert_eq!(stored.redirect_uri, LOOPBACK_ON_PORT, "kept with its port");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_loopback_registration_refuses_anything_but_another_port() {
+        let test = oauth_app().await;
+        insert_loopback_client(&test).await;
+        for redirect_uri in [
+            "http://localhost:54123/other",
+            "http://127.0.0.1:54123/callback",
+            "https://localhost:54123/callback",
+            "http://localhost.example.com:54123/callback",
+        ] {
+            let query = authorize_query_for(LOOPBACK_CLIENT_ID, redirect_uri);
+
+            let (status, headers, page) =
+                send(&test, "GET", &format!("/oauth/authorize?{query}"), None).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{redirect_uri}");
+            assert!(headers.get("location").is_none(), "{redirect_uri}");
+            assert!(page.contains("Cannot connect"), "{redirect_uri}");
+        }
+        // An `https` registration's port stays exact.
+        let query = query_with("redirect_uri", "https://client.example.com:8443/callback");
+        let (status, headers, _) =
+            send(&test, "GET", &format!("/oauth/authorize?{query}"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(headers.get("location").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

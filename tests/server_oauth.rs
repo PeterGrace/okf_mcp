@@ -107,6 +107,52 @@ async fn a_cimd_client_discovers_consents_and_calls_a_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cimd_client_with_a_portless_loopback_redirect_uri_connects_on_its_port() {
+    // Claude Code's metadata document lists `http://127.0.0.1/callback`
+    // (and `http://localhost/callback`) with no port, then sends the port
+    // it is listening on (RFC 8252 section 7.3).
+    let server = server().await;
+    let host = CimdHost::start_registering("http://127.0.0.1/callback").await;
+    let client = OAuthClient::new(&server, &host.client_id, &host.redirect_uri);
+    let resource = client.discover().await.resource;
+    assert!(
+        url::Url::parse(&host.redirect_uri)
+            .expect("URL")
+            .port()
+            .is_some(),
+        "the request names a port the document does not"
+    );
+
+    // `authorize` checks the redirect goes to `host.redirect_uri`, port
+    // included; `exchange` repeats that URI exactly.
+    let code = client
+        .authorize(
+            &sign_in_code(&server, Access::Read, &["main"]).await,
+            &resource,
+        )
+        .await;
+    let tokens = client.exchange(&code, &resource).await;
+    assert_eq!(tokens.status, 200, "{}", tokens.body);
+    assert_eq!(
+        catalogs_of(&server, &tokens.access()).await,
+        vec!["main".to_string()]
+    );
+
+    // The token request may not drop the port the code was issued for.
+    let code = client
+        .authorize(
+            &sign_in_code(&server, Access::Read, &["main"]).await,
+            &resource,
+        )
+        .await;
+    let refused = client
+        .exchange_at(&code, &resource, "http://127.0.0.1/callback")
+        .await;
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    assert_eq!(refused.body["error"], "invalid_grant");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dcr_client_does_the_same() {
     let server = server().await;
 

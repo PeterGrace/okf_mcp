@@ -54,6 +54,25 @@ impl CimdHost {
     /// # Returns
     /// The host's client id and redirect URI.
     pub async fn start() -> Self {
+        Self::serve(None).await
+    }
+
+    /// Starts a host whose document registers `registered` as its one
+    /// redirect URI instead, as Claude Code's registers a portless loopback
+    /// URI. The returned `redirect_uri` is still the host's own.
+    ///
+    /// # Arguments
+    /// * `registered` - the redirect URI the document lists.
+    ///
+    /// # Returns
+    /// The host's client id and redirect URI.
+    pub async fn start_registering(registered: &str) -> Self {
+        Self::serve(Some(registered)).await
+    }
+
+    /// [`CimdHost::start`], listing `registered` (or the host's own
+    /// redirect URI when `None`) in the document.
+    async fn serve(registered: Option<&str>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -63,7 +82,7 @@ impl CimdHost {
         let document = serde_json::json!({
             "client_id": client_id,
             "client_name": "Example CIMD Client",
-            "redirect_uris": [redirect_uri],
+            "redirect_uris": [registered.unwrap_or(&redirect_uri)],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
@@ -345,11 +364,17 @@ impl OAuthClient {
 
     /// Exchanges an authorization code with this client's verifier.
     pub async fn exchange(&self, code: &str, resource: &str) -> TokenAnswer {
+        self.exchange_at(code, resource, &self.redirect_uri).await
+    }
+
+    /// [`OAuthClient::exchange`], naming `redirect_uri` instead of this
+    /// client's.
+    pub async fn exchange_at(&self, code: &str, resource: &str, redirect_uri: &str) -> TokenAnswer {
         self.token(&[
             ("grant_type", "authorization_code"),
             ("code", code),
             ("client_id", &self.client_id),
-            ("redirect_uri", &self.redirect_uri),
+            ("redirect_uri", redirect_uri),
             ("code_verifier", &self.verifier),
             ("resource", resource),
         ])
