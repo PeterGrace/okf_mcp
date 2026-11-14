@@ -2244,4 +2244,44 @@ mod tests {
             .unwrap();
         assert_eq!(entries, 1, "family's team.created only");
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reciprocal_suspensions_of_two_admins_personal_teams_both_succeed() {
+        // Admin alice suspends bob's personal team while admin bob suspends
+        // alice's. Each entry resolves both people's `audit_people` rows,
+        // one as the actor and one as the team's person, in opposite orders
+        // unless `record` takes them in one order. Their `audit_people` rows
+        // exist first (as they do after any earlier entry), so each
+        // resolution is an upsert that locks the row.
+        let db = test_db().await;
+        for name in ["alice", "bob"] {
+            seed_user(&db.pool, name).await;
+            make_admin(&db.pool, name).await;
+        }
+        let alice = session_of(&db.pool, "alice").await;
+        let bob = session_of(&db.pool, "bob").await;
+        suspend(&db.pool, "alice", None, &alice, now())
+            .await
+            .unwrap();
+        suspend(&db.pool, "bob", None, &bob, now()).await.unwrap();
+
+        for round in 0..50 {
+            for (team, actor) in [("alice", &alice), ("bob", &bob)] {
+                unsuspend(&db.pool, team, actor, now()).await.unwrap();
+            }
+            // `tokio::join!` runs both at once, like `asyncio.gather`.
+            let (by_alice, by_bob) = tokio::time::timeout(LOCK_WAIT, async {
+                tokio::join!(
+                    suspend(&db.pool, "bob", None, &alice, now()),
+                    suspend(&db.pool, "alice", None, &bob, now()),
+                )
+            })
+            .await
+            .expect("the two suspensions do not hang");
+
+            // A deadlock would abort one of them as `Busy`.
+            assert!(by_alice.is_ok(), "round {round}: {by_alice:?}");
+            assert!(by_bob.is_ok(), "round {round}: {by_bob:?}");
+        }
+    }
 }
