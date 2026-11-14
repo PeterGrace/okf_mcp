@@ -111,6 +111,10 @@ main { padding: 1.75rem 2.25rem; min-width: 0; }
 .pill-error { background: var(--error-soft); color: var(--error); }
 .pill-info { background: var(--accent-soft); color: var(--accent); }
 .pill-muted { background: var(--surface-2); color: var(--fg-muted); }
+/* a page-level notice, such as a suspended catalog's on Browse */
+.notice { background: var(--warn-soft); border-left: 3px solid var(--warn); border-radius: var(--radius-sm);
+    padding: .75rem 1rem; }
+.notice h2 { font-size: 1.05rem; margin-bottom: .5rem; }
 
 /* drawer, dialogs, toasts */
 .drawer-scrim { position: fixed; inset: 0; background: rgba(0,0,0,.25); z-index: 20; }

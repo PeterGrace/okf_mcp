@@ -1691,6 +1691,12 @@ function showSuspended(view, catalog, body) {
 ```
 
 
+> **Corrected (issue #369, 2026-11-14).** Steps 3, 5 and 6 shipped as written. Differences:
+> - `core/dom.js`'s `pill` has no `danger` kind (only `ok`, `warn`, `error`, `info`, `muted`), so both "suspended" pills use `error`.
+> - Step 4's section is a function, `suspensionSection(team, refusal)` inside `render` in `pages/teams.js`, and follows `tools/agentic/lessons.md`'s console rules, which the plan's code did not: the Suspend button, the notice and Lift are `guard`ed by the pending-write key `team:<name>:suspension` and the PUT runs under `once`, so they stay disabled while it runs, in a drawer closed and opened again meanwhile too; a refused write shows its reason in `#team-suspension-error` until the next write. To make that work the drawer took `pages/users.js`'s shape: `openDetail(name, ticket, { known, refusal, last })` (was `openDetail(name, known, ticket)`) numbers its reads and draws only the newest, and when reading the team again fails it draws from the last answer with `#team-stale` ("may be out of date"), so the reason and the controls still come back; `changed(name, team, { message, refusal })` (was `changed(team, message, ticket)`) redraws whichever drawer shows that team now, through that drawer's own ticket, and the membership controls use it too. The list's `load()` numbers its reads as well. The suspended state reads "Suspended since <when>."; the active one says what suspending does. Read `src/http/ui/js/pages/teams.js` for the shipped code.
+> - Step 6's notice uses a `.notice` rule added to `src/http/ui/styles.css` (it existed only in `signin.css`), with `role="status"`.
+> - Step 1's first journey waits for "Suspended since", also checks the catalog pill's `title` is the notice, and checks the stored suspension (no notice) afterwards. The member journey also checks the toast is the 403's own message (not "cannot do this") and follows the link to export a copy. Two more journeys cover the lessons: `a_suspension_write_runs_once_and_settles_in_a_reopened_drawer` (`hold_next`, `click_twice`, a redrawn Lift) and `a_refused_lift_keeps_its_reason_and_a_late_read_never_draws_over_a_newer_one` (`fail_next` on the PUT and the follow-up GET, then `hold_answer` on a refused lift's read that settles after a successful one).
+
 - [ ] **Step 7: Run, gate, commit**
 
 Run: `tools/agentic/gate.sh test-ui`, then `tools/agentic/gate.sh lint`.

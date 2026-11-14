@@ -1,7 +1,7 @@
 // Catalogs: the catalogs this key reaches, with their owner teams. Admins
 // edit descriptions and delete; an admin key that reaches every catalog
 // also creates them and changes their owner (plan Decision 3).
-import { $, h, fill } from '../core/dom.js';
+import { $, h, fill, pill } from '../core/dom.js';
 import { api, enc } from '../core/api.js';
 import { store } from '../core/store.js';
 import { toast } from '../core/toast.js';
@@ -18,7 +18,13 @@ export async function render(main) {
     const creator = admin && store.whoami.all_catalogs;
     const columns = [
         { key: 'name', label: 'Name', sort: row => row.name,
-          render: row => h('code', { dataset: { catalog: row.name } }, row.name) },
+          render: row => h('code', { dataset: { catalog: row.name } }, row.name,
+              // `suspended` is {team, notice} while its owner team is suspended.
+              row.suspended
+                  ? [' ', h('span', { dataset: { test: `catalog-suspended-${row.name}` },
+                                     title: row.suspended.notice ?? `Team ${row.suspended.team} is suspended.` },
+                            pill('suspended', 'error'))]
+                  : null) },
         { key: 'description', label: 'Description',
           render: row => row.description || h('span', { class: 'muted' }, '-') },
         { key: 'owner_team', label: 'Owner', sort: row => row.owner_team ?? '',

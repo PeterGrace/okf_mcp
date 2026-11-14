@@ -51,7 +51,10 @@ async function request(method, path, { body, raw = false, quiet = false, key } =
         try { errorBody = await response.json(); } catch { /* not JSON */ }
         const error = new ApiError(response.status, errorBody);
         const denied = store.key ? 'Your key cannot do this.' : 'Your account cannot do this.';
-        if (!quiet) toast(response.status === 403 ? denied : error.message, 'error');
+        // A suspended team's 403 carries its own message (the catalog, the
+        // team and the operator's notice): show it, not "cannot do this".
+        const generic = response.status === 403 && errorBody?.error !== 'Suspended';
+        if (!quiet) toast(generic ? denied : error.message, 'error');
         throw error;
     }
     if (raw) return response;
