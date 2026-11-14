@@ -10,7 +10,9 @@
 //!   team and lifting its suspension (`PUT /teams/{name}/suspension`,
 //!   milestone 13);
 //! - listing and reading users and teams needs any admin key, so a scoped
-//!   admin can pick the user of a key it creates;
+//!   admin can pick the user of a key it creates; `GET /users?email=`
+//!   (milestone 14) narrows the list to the user with that email, in any
+//!   letter case (zero or one), under the same rule;
 //! - a user's detail shows only the keys, grants and codes the caller
 //!   manages (`api::keys`' rule), so it reveals no credential outside a
 //!   scoped admin's reach;
@@ -29,7 +31,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
@@ -100,6 +102,15 @@ impl From<UserRecord> for UserView {
             has_password,
         }
     }
+}
+
+/// `GET /users`' query.
+#[derive(Debug, Default, Deserialize)]
+// An unknown parameter (`?mail=`, a typo) is a 400, never the whole list.
+#[serde(deny_unknown_fields)]
+struct UserQuery {
+    /// Only the user with this email address (any letter case).
+    email: Option<String>,
 }
 
 /// `GET /users`' answer.
@@ -389,20 +400,31 @@ fn change_name(change: MemberChange) -> &'static str {
     }
 }
 
-/// `GET /users`: every user.
+/// `GET /users`: every user, or with `?email=` only the user with that
+/// email address (any letter case): zero or one, in the same view.
+///
+/// # Returns
+/// 200 with the users, by name.
 ///
 /// # Errors
-/// 403 below admin; 500 for a database failure.
+/// 400 for an unknown query parameter; 403 below admin; 500 for a database
+/// failure.
 async fn list_users(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    Query(query): Query<UserQuery>,
 ) -> Result<Json<UserList>, AppError> {
     require_admin(&principal)?;
-    let users = users::list(app.pool())
-        .await?
-        .into_iter()
-        .map(UserView::from)
-        .collect();
+    // `Option::into_iter` yields the one user or nothing, so both arms
+    // collect into the same `Vec<UserView>`.
+    let records = match query.email {
+        Some(email) => users::find_record_by_email(app.pool(), &email)
+            .await?
+            .into_iter()
+            .collect(),
+        None => users::list(app.pool()).await?,
+    };
+    let users = records.into_iter().map(UserView::from).collect();
     Ok(Json(UserList { users }))
 }
 
@@ -933,6 +955,50 @@ mod tests {
         )
         .await;
         assert_eq!(status.as_u16(), 201, "create user {name}: {body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn users_by_email_answers_zero_or_one_and_needs_an_admin() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+        let scoped = keys(&test).await;
+        user(&test, &root, "alice").await;
+        user(&test, &root, "bob").await;
+        let (set, _) = send(
+            &test,
+            "PUT",
+            "/api/v1/users/alice/email",
+            Some(&root),
+            Some(json!({"email": "Alice@Example.com"})),
+        )
+        .await;
+        assert_eq!(set, StatusCode::OK);
+
+        let get = |uri: &'static str, key: String| {
+            let test = &test;
+            async move { send(test, "GET", uri, Some(&key), None).await }
+        };
+        let (_, every) = get("/api/v1/users", root.clone()).await;
+        let (found, one) = get("/api/v1/users?email=ALICE@example.com", root.clone()).await;
+        let (_, by_scoped) = get("/api/v1/users?email=alice@example.com", scoped.admin).await;
+        let (_, none) = get("/api/v1/users?email=nobody@example.com", root.clone()).await;
+        let (_, malformed) = get("/api/v1/users?email=not%20an%20address%00", root.clone()).await;
+        let (refused, _) = get("/api/v1/users?email=alice@example.com", scoped.write).await;
+        let (typo, _) = get("/api/v1/users?mail=alice@example.com", root.clone()).await;
+
+        assert_eq!(found, StatusCode::OK);
+        let alice = every["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|listed| listed["name"] == "alice")
+            .unwrap();
+        assert_eq!(one["users"], json!([alice]));
+        assert_eq!(by_scoped["users"], json!([alice]));
+        assert_eq!(none["users"], json!([]));
+        assert_eq!(malformed["users"], json!([]));
+        assert_eq!(refused, StatusCode::FORBIDDEN);
+        assert_eq!(typo, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

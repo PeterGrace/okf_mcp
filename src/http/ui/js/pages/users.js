@@ -42,8 +42,22 @@ export async function render(main, rest) {
         { key: 'teams', label: 'Teams', render: user => user.teams.join(', ') },
         { key: 'created_at', label: 'Created', sort: user => user.created_at, render: user => ago(user.created_at) },
     ];
-    const table = listTable(columns, [], { onRow: user => openDetail(user.name), empty: 'No users yet.' });
+    // The filter box narrows the rows already loaded (name, display name or
+    // email, any letter case); it never reads from the server. The table
+    // keeps the filter and applies it on every redraw, so a list that
+    // answers after the text changed is drawn through the newest filter.
+    const filter = h('input', { type: 'search', id: 'users-filter', placeholder: 'Filter by name or email',
+                                'aria-label': 'Filter users', autocomplete: 'off' });
+    const table = listTable(columns, [], {
+        onRow: user => openDetail(user.name),
+        empty: () => (filter.value.trim() ? 'No user matches the filter.' : 'No users yet.'),
+    });
     table.id = 'users-table';
+    filter.addEventListener('input', () => {
+        const text = filter.value.trim().toLowerCase();
+        table.setFilter(text ? user => [user.name, user.display_name, user.email ?? '']
+            .some(value => value.toLowerCase().includes(text)) : null);
+    });
     // fill(), not native append: the note is null for a manager (issue #302).
     fill(main,
         h('header', { class: 'page-head' },
@@ -52,6 +66,7 @@ export async function render(main, rest) {
                 h('p', { class: 'muted' }, 'The people keys, grants and sign-in codes belong to. ',
                     h('a', { href: '#/users/unassigned', id: 'unassigned-link' }, 'What is unassigned'))),
             h('div', { class: 'actions' },
+                filter,
                 h('button', { type: 'button', id: 'user-new', disabled: !manager, onclick: openCreate }, 'New user'))),
         table,
         manager ? null : h('p', { class: 'muted small' }, NEEDS_EVERY_CATALOG));

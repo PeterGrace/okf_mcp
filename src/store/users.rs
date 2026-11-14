@@ -607,6 +607,39 @@ pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<UserAuth
     .await?)
 }
 
+/// The user whose email is `email`, compared case-insensitively, as the
+/// user list shows it. Backs `GET /api/v1/users?email=` and
+/// `okf-mcp user list --email`.
+///
+/// # Arguments
+/// * `pool` - the database.
+/// * `email` - the address as typed (surrounding whitespace is ignored).
+///
+/// # Returns
+/// The user, or `None` (emails are unique in any letter case, so at most
+/// one). Text that cannot be an address is `None` too.
+///
+/// # Errors
+/// [`OkfError::Database`].
+pub async fn find_record_by_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<UserRecord>, OkfError> {
+    // As in `find_by_email`: text no address can be (a NUL, which Postgres
+    // refuses) never reaches SQL, so it answers like an unknown address.
+    let email = email.trim();
+    if !is_lookup_email(email) {
+        return Ok(None);
+    }
+    // `$1::citext` makes the comparison case-insensitive (see `find_by_email`).
+    Ok(
+        sqlx::query_as::<_, UserRecord>(concat!(select_users!(), " WHERE u.email = $1::citext"))
+            .bind(email)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
 /// The user with id `user_id`.
 ///
 /// # Arguments
@@ -854,6 +887,27 @@ pub(crate) mod tests {
             find_by_email(&db.pool, "alice@example.com").await.unwrap(),
             None
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn find_record_by_email_ignores_letter_case_and_finds_none_for_others() {
+        let db = test_db().await;
+        seed_user(&db.pool, "alice", Some("Alice@Example.com")).await;
+        seed_user(&db.pool, "bob", Some("robert@example.com")).await;
+
+        let found = find_record_by_email(&db.pool, " alice@EXAMPLE.com ")
+            .await
+            .unwrap();
+        let none = find_record_by_email(&db.pool, "bob@example.com")
+            .await
+            .unwrap();
+        let malformed = find_record_by_email(&db.pool, "not an address\0")
+            .await
+            .unwrap();
+
+        assert_eq!(found, Some(find(&db.pool, "alice").await.unwrap()));
+        assert_eq!(none, None);
+        assert_eq!(malformed, None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
