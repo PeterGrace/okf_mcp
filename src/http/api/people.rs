@@ -51,7 +51,7 @@ use crate::store::audit::AuditActor;
 use crate::store::ceiling::{self, Entitlement, NewEntitlement};
 use crate::store::keys::{self as key_rows, Access};
 use crate::store::oauth::codes;
-use crate::store::teams::{self, MemberChange, NewTeam, Role, TeamRecord};
+use crate::store::teams::{self, MemberChange, Membership, NewTeam, Role, TeamRecord};
 use crate::store::unassigned;
 use crate::store::users::{self, AdminChange, NewUser, UserRecord};
 use crate::store::{sign_in_events, user_sessions};
@@ -774,6 +774,7 @@ async fn list_teams(
 async fn create_team(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Json(body): Json<CreateTeamBody>,
 ) -> Result<(StatusCode, Json<TeamView>), AppError> {
     require_every_catalog(&principal)?;
@@ -782,7 +783,7 @@ async fn create_team(
         display_name: &body.display_name,
         owner: &body.owner,
     };
-    let created = teams::create(app.pool(), &new, app.clock().now()).await?;
+    let created = teams::create(app.pool(), &new, &actor, app.clock().now()).await?;
     settle(&app).await;
     Ok((StatusCode::CREATED, Json(created.into())))
 }
@@ -812,10 +813,11 @@ async fn team_detail(
 async fn delete_team(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(name): Path<String>,
 ) -> Result<StatusCode, AppError> {
     require_every_catalog(&principal)?;
-    teams::delete(app.pool(), &name).await?;
+    teams::delete(app.pool(), &name, &actor, app.clock().now()).await?;
     settle(&app).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -830,12 +832,18 @@ async fn delete_team(
 async fn set_member(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     // Two path parameters arrive as a tuple, in the order of the pattern.
     Path((team, user)): Path<(String, String)>,
     Json(body): Json<MemberBody>,
 ) -> Result<Json<MembershipChanged>, AppError> {
     require_every_catalog(&principal)?;
-    let change = teams::set_member(app.pool(), &team, &user, body.role, app.clock().now()).await?;
+    let membership = Membership {
+        team: &team,
+        user: &user,
+        role: body.role,
+    };
+    let change = teams::set_member(app.pool(), &membership, &actor, app.clock().now()).await?;
     settle(&app).await;
     Ok(Json(MembershipChanged {
         change: change_name(change),
@@ -855,10 +863,11 @@ async fn set_member(
 async fn remove_member(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path((team, user)): Path<(String, String)>,
 ) -> Result<Json<TeamView>, AppError> {
     require_every_catalog(&principal)?;
-    teams::remove_member(app.pool(), &team, &user).await?;
+    teams::remove_member(app.pool(), &team, &user, &actor, app.clock().now()).await?;
     settle(&app).await;
     Ok(Json(teams::find(app.pool(), &team).await?.into()))
 }
@@ -881,14 +890,16 @@ async fn remove_member(
 async fn set_suspension(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(name): Path<String>,
     Json(body): Json<SuspensionBody>,
 ) -> Result<Json<TeamView>, AppError> {
     require_every_catalog(&principal)?;
+    let now = app.clock().now();
     let team = if body.suspended {
-        teams::suspend(app.pool(), &name, body.notice.as_deref(), app.clock().now()).await?
+        teams::suspend(app.pool(), &name, body.notice.as_deref(), &actor, now).await?
     } else {
-        teams::unsuspend(app.pool(), &name).await?
+        teams::unsuspend(app.pool(), &name, &actor, now).await?
     };
     settle(&app).await;
     Ok(Json(team.into()))
@@ -2515,5 +2526,28 @@ mod tests {
             relisted["catalogs"][0].get("suspended"),
             Some(&serde_json::Value::Null)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_team_change_over_rest_records_the_calling_key() {
+        let test = app().await;
+        let root = every_catalog_admin(&test).await;
+
+        let (suspended, _) =
+            put_suspension(&test, &root, json!({"suspended": true, "notice": "x"})).await;
+        let (lifted, _) = put_suspension(&test, &root, json!({"suspended": false})).await;
+        let (again, _) = put_suspension(&test, &root, json!({"suspended": false})).await;
+
+        assert_eq!([suspended, lifted, again], [200, 200, 200]);
+        let pool = test.app.pool();
+        let on = crate::store::audit::testing::entries(pool, "team.suspended").await;
+        let off = crate::store::audit::testing::entries(pool, "team.unsuspended").await;
+        assert_eq!((on.len(), off.len()), (1, 1), "{on:?} {off:?}");
+        for entry in [&on[0], &off[0]] {
+            assert_eq!(entry.source, "api");
+            assert_eq!(entry.actor_label, "api key");
+            assert!(entry.actor_operator, "an every-catalog admin key");
+            assert_eq!(entry.target.as_deref(), Some(TEST_TEAM));
+        }
     }
 }

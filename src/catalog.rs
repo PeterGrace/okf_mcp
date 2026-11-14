@@ -440,6 +440,7 @@ mod tests {
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "t",
+            audit: &crate::store::audit::AuditActor::cli(),
             now: Utc::now(),
         };
         import(pool, "pg", files(entries), &options).await.unwrap();
@@ -448,9 +449,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn load_builds_the_snapshot_of_the_live_documents() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         // A plain link: `okf.py` does not count an image embed (`![..](..)`) as a link.
         let entries: &[(&str, &[u8])] = &[
             ("a.md", b"---\ntype: Note\n---\n[logo](logo.png)\n"),
@@ -472,9 +482,12 @@ mod tests {
         let db = test_db().await;
         catalogs::create(
             &db.pool,
-            "pg",
-            "pgrace's world",
-            crate::db::TEST_TEAM,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "pgrace's world",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
             Utc::now(),
         )
         .await
@@ -490,6 +503,7 @@ mod tests {
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "t",
+            audit: &crate::store::audit::AuditActor::cli(),
             now: imported,
         };
         let entries = files(&[("a.md", b"# A\n"), ("b.txt", b"b\n")]);
@@ -505,9 +519,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn loaded_keeps_the_workspace_and_each_path_s_revision() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         // Typed, so the byte strings of different lengths share one type.
         let first: &[(&str, &[u8])] = &[("a.md", b"# A\n"), ("logo.png", b"\x89PNG\0")];
         let second: &[(&str, &[u8])] = &[("a.md", b"# A2\n"), ("logo.png", b"\x89PNG\0")];
@@ -535,9 +558,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn refresh_swaps_in_a_new_snapshot_only_when_the_catalog_changed() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         import_into(&db.pool, &[("a.md", b"# Old\n")], false).await;
         let state = CatalogState::load(&db.pool, "pg").await.unwrap();
         let before = state.current();
@@ -560,9 +592,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_refreshes_build_and_swap_once() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         let state = CatalogState::load(&db.pool, "pg").await.unwrap();
         import_into(&db.pool, &[("a.md", b"# New\n")], false).await;
 
@@ -582,11 +623,28 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_deleted_catalog_cannot_be_refreshed() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
-            .await
-            .unwrap();
+        let catalog = catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         let state = CatalogState::load(&db.pool, "pg").await.unwrap();
-        catalogs::delete(&db.pool, "pg", false).await.unwrap();
+        catalogs::delete(
+            &db.pool,
+            "pg",
+            false,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
 
         let result = state.refresh(&db.pool).await;
 
@@ -597,10 +655,27 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn build_names_a_catalog_deleted_before_it_read() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
-            .await
-            .unwrap();
-        catalogs::delete(&db.pool, "pg", false).await.unwrap();
+        let catalog = catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        catalogs::delete(
+            &db.pool,
+            "pg",
+            false,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
 
         let result = build(&db.pool, catalog.id, "pg").await;
 
@@ -614,9 +689,18 @@ mod tests {
     async fn lint_flags_a_stamp_later_than_the_documents_last_revision() {
         let db = test_db().await;
         let imported = Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap();
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, imported)
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            imported,
+        )
+        .await
+        .unwrap();
         let later = "---\ntype: Note\ngenerated: { by: t, at: 2026-11-02T12:10:00Z }\n---\nBody\n";
         let earlier =
             "---\ntype: Note\ngenerated: { by: t, at: 2026-11-02T11:00:00Z }\n---\nBody\n";
@@ -625,6 +709,7 @@ mod tests {
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "t",
+            audit: &crate::store::audit::AuditActor::cli(),
             now: imported,
         };
         let entries = files(&[

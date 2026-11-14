@@ -10,10 +10,11 @@ use sqlx::PgPool;
 use crate::config::Config;
 use crate::error::OkfError;
 use crate::mail::{link, queue, Template, SETUP_PATH};
+use crate::store::audit::RowLock;
 use crate::store::audit::{self, Action, AuditActor};
 use crate::store::email_tokens::{self, Purpose};
 use crate::store::settings;
-use crate::store::users::{self, RowLock};
+use crate::store::users;
 
 /// Issues a setup link for `user`, queues the setup email and records
 /// `user.invited`, in one transaction under the user's row lock: the link
@@ -24,7 +25,7 @@ use crate::store::users::{self, RowLock};
 ///
 /// The user's row is locked first (`FOR NO KEY UPDATE`, which conflicts
 /// with the `FOR UPDATE` of `users::set_admin`; with the actor's rows, as
-/// `users::lock_users` orders them), and a provisioner is
+/// `audit::lock_people` orders them), and a provisioner is
 /// refused an admin user before anything else is read, so whether an admin
 /// has an email is never told to it.
 ///
@@ -59,7 +60,7 @@ pub async fn send_setup(
     let policy = settings::load(pool, &config.auth).await?;
     let mut tx = pool.begin().await?;
     // The lock `issue_for_user_in` takes next, taken here first (with the
-    // actor's rows, in `users::lock_users`' order) so the guard reads the
+    // actor's rows, in `audit::lock_people`' order) so the guard reads the
     // flag under it. A weaker lock first and this one after would let two
     // invites deadlock upgrading theirs.
     let (_, is_admin) = users::lock_target(&mut tx, user, RowLock::NoKeyUpdate, actor).await?;

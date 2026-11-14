@@ -230,15 +230,38 @@ async fn a_last_owner_or_an_owned_catalog_refuses_the_delete_until_cleared() {
         display_name: "",
         owner: "alice",
     };
-    teams::create(pool, &family, Utc::now())
-        .await
-        .expect("create a team");
-    teams::set_member(pool, "family", "carol", Role::Member, Utc::now())
-        .await
-        .expect("add carol");
-    catalogs::create(pool, "bobs", "", "bob", Utc::now())
-        .await
-        .expect("create bob's catalog");
+    teams::create(
+        pool,
+        &family,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("create a team");
+    teams::set_member(
+        pool,
+        &okf_mcp::store::teams::Membership {
+            team: "family",
+            user: "carol",
+            role: Role::Member,
+        },
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("add carol");
+    catalogs::create(
+        pool,
+        &okf_mcp::store::catalogs::NewCatalog {
+            name: "bobs",
+            description: "",
+            owner_team: "bob",
+        },
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("create bob's catalog");
     server.app.poll().await.expect("poll");
     let ran = drive(server.base.clone(), move |ui| {
         ui.login(&admin);

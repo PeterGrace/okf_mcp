@@ -126,6 +126,7 @@ async fn the_links_tab_shows_backlinks_and_a_revision_opens_its_diff() {
         scope: ImportScope::Everything,
         expect_generation: None,
         actor: "editor",
+        audit: &okf_mcp::store::audit::AuditActor::cli(),
         now: Utc::now(),
     };
     let edited = ALPHA.replace("Nothing yet.", "Two settings.");

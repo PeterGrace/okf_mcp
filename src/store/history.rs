@@ -108,15 +108,25 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn revisions_come_newest_first_and_outlive_a_delete() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
-            .await
-            .unwrap();
+        let catalog = catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         for (version, replace) in [("one", false), ("two", true)] {
             let options = ImportOptions {
                 replace,
                 scope: ImportScope::Everything,
                 expect_generation: None,
                 actor: "tester",
+                audit: &crate::store::audit::AuditActor::cli(),
                 now: Utc::now(),
             };
             let text = format!("# {version}\n");
@@ -128,6 +138,7 @@ mod tests {
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "tester",
+            audit: &crate::store::audit::AuditActor::cli(),
             now: Utc::now(),
         };
         import(&db.pool, "pg", files(&[("b.md", "# B\n")]), &options)
@@ -154,9 +165,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn content_at_reads_one_revision_or_its_deletion() {
         let db = test_db().await;
-        let catalog = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, Utc::now())
-            .await
-            .unwrap();
+        let catalog = catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         let rounds: [(&[(&str, &str)], bool); 2] = [
             (&[("a.md", "# One\n"), ("b.md", "# B\n")], false),
             (&[("b.md", "# B\n")], true),
@@ -167,6 +187,7 @@ mod tests {
                 scope: ImportScope::Everything,
                 expect_generation: None,
                 actor: "tester",
+                audit: &crate::store::audit::AuditActor::cli(),
                 now: Utc::now(),
             };
             import(&db.pool, "pg", files(entries), &options)

@@ -171,6 +171,7 @@ async fn replacement_import_race(submit: bool) {
                 scope: ImportScope::Everything,
                 expect_generation: None,
                 actor: "importer",
+                audit: &crate::store::audit::AuditActor::cli(),
                 now: t0() + Duration::seconds(1),
             },
         )

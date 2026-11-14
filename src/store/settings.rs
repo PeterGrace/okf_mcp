@@ -25,7 +25,7 @@
 //!
 //! Lock order, the same in [`set`] and [`reset`]: first the users the audit
 //! entry locks (the actor and its credential's owner, through
-//! [`audit::lock_actor`]), then the `server_state` row (bumping
+//! [`audit::lock_people`], admins first), then the `server_state` row (bumping
 //! `admin_generation`), then the `server_settings` row. Users before the
 //! generation row is `users::set_admin`'s order too, and the generation row
 //! before the setting serializes settings writes.
@@ -586,7 +586,7 @@ pub async fn set(
     let mut tx = pool.begin().await?;
     // Lock order (module docs): the actor's user rows, then the generation
     // row, then the setting.
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(&mut tx, actor, &audit::People::default()).await?;
     // Every settings write takes the generation row's lock, so concurrent
     // writes queue here, and the read below (a new statement, under READ
     // COMMITTED) sees the one before, even when it inserted the row
@@ -662,7 +662,7 @@ pub async fn reset(
     // then the generation row, then the setting, so a concurrent set, reset
     // or `users::set_admin` queue instead of each holding a row the other
     // waits on (a deadlock).
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(&mut tx, actor, &audit::People::default()).await?;
     bump_admin_generation(&mut tx).await?;
     // `RETURNING value`: the deleted override, for the entry.
     let deleted: Option<Value> =

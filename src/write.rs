@@ -682,6 +682,7 @@ mod tests {
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "t",
+            audit: &crate::store::audit::AuditActor::cli(),
             now: Utc::now(),
         };
         let republished = files(&[("a.md", "# Changed\n"), ("AGENTS.md", "# Agents\n")]);

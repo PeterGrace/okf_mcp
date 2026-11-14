@@ -422,39 +422,128 @@ pub async fn record(
     .await?)
 }
 
-/// Locks the users [`record`] will lock for `actor`, the acting user and
-/// its credential's owner (`FOR KEY SHARE`, in id order), so a caller can
-/// take them before its own locks. `record` takes them through
-/// `audit_person` and `audit_credential` in the middle of the transaction;
-/// a function that locks a shared row first (`settings::set` and `reset`
-/// bump `server_state`) would then hold it while waiting on a user row,
-/// the reverse of `users::set_admin` (users, then `server_state`), and the
-/// two could deadlock. Called first, this keeps the order users first.
+/// How a change locks its target user's row ([`People::target`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLock {
+    /// `FOR UPDATE`: the change writes the row's key-adjacent columns or
+    /// must exclude `users::set_admin` (an email, the admin flag).
+    Update,
+    /// `FOR NO KEY UPDATE`: the change ends or replaces the user's child
+    /// rows (sessions, emailed links).
+    NoKeyUpdate,
+    /// `FOR KEY SHARE`: the change only needs the user to stay (an
+    /// entitlement), as `users::id_of` holds it.
+    KeyShare,
+}
+
+/// The users a change locks besides its actor, by where they come from:
+/// [`lock_people`]'s input. A name in `users`, `teams` or `catalogs` that
+/// is unknown or malformed locks nothing (the change's own lookups refuse
+/// it); an unknown or malformed `target` is refused here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct People<'a> {
+    /// The user the change is about, by name, and how its row is locked;
+    /// [`lock_people`] answers its id and admin flag.
+    pub target: Option<(&'a str, RowLock)>,
+    /// Other users by name (a member, an owner), held `FOR KEY SHARE`.
+    pub users: &'a [&'a str],
+    /// Teams by name, for the user whose personal team each is.
+    pub teams: &'a [&'a str],
+    /// Catalogs by name, for the user whose personal team owns each.
+    pub catalogs: &'a [&'a str],
+}
+
+/// Locks, before anything else in a change's transaction, every user row
+/// the change and its entry will lock: the actor and its credential's
+/// owner ([`record`] resolves both), the target (in its [`RowLock`] mode),
+/// the users it names, and the person of each personal team it names
+/// directly or as a catalog's owner ([`team_ref`] and [`catalog_teams`]
+/// resolve them). Every other user is held `FOR KEY SHARE`.
+///
+/// The one order every writer of user rows takes (`tools/agentic/lessons.md`):
+/// users first, then teams, then catalogs and changesets, then the
+/// `server_state` generation row; and among users the order of
+/// `users::set_admin` and `users::delete`, every admin by id, then the
+/// others by id. The rows are read without a lock to sort them, then locked
+/// one by one; the target's admin flag is read again under its lock.
 ///
 /// # Arguments
-/// * `conn` - the change's transaction (`&mut tx`), before its other locks.
-/// * `actor` - who will be recorded.
+/// * `conn` - the change's transaction (`&mut tx`).
+/// * `actor` - who.
+/// * `people` - the target and the other users, teams and catalogs.
 ///
 /// # Returns
-/// `Ok(())` once the rows are locked (none for the CLI or the system).
+/// The target's `users.id` and admin flag under its lock, or `None`
+/// without a target.
 ///
 /// # Errors
+/// [`OkfError::UnknownName`] for a malformed or unknown target;
 /// [`OkfError::Database`].
-pub async fn lock_actor(conn: &mut PgConnection, actor: &AuditActor) -> Result<(), OkfError> {
-    if actor.user_id.is_none() && actor.credential.is_none() {
-        return Ok(());
+pub async fn lock_people(
+    conn: &mut PgConnection,
+    actor: &AuditActor,
+    people: &People<'_>,
+) -> Result<Option<(String, bool)>, OkfError> {
+    use crate::store::catalogs::is_valid_name;
+    use crate::store::users::unknown;
+    let target = people.target.map(|(name, _)| name);
+    // A malformed name (a NUL, which Postgres refuses) names nobody: the
+    // target is refused, and the others are left out, so the change's own
+    // lookup answers "unknown", never a 500.
+    if let Some(name) = target.filter(|name| !is_valid_name(name)) {
+        return Err(unknown(name));
     }
-    sqlx::query(
-        "SELECT 1 FROM users WHERE id IN ($1, \
-             (SELECT user_id FROM api_keys WHERE id = $2), \
-             (SELECT user_id FROM sign_in_codes WHERE id = $2)) \
-         ORDER BY id FOR KEY SHARE",
+    let valid = |names: &[&str]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|name| is_valid_name(name))
+            .map(|name| name.to_string())
+            .collect()
+    };
+    // Each row: id, admin flag, whether it is the target. `COALESCE`:
+    // `name = NULL` is NULL without a target.
+    let rows: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT u.id, u.is_admin, COALESCE(u.name = $1, false) FROM users u \
+         WHERE u.name = $1 OR u.id = $2 OR u.name = ANY($3) \
+            OR u.id = (SELECT user_id FROM api_keys WHERE id = $4) \
+            OR u.id = (SELECT user_id FROM sign_in_codes WHERE id = $4) \
+            OR u.id IN (SELECT personal_of FROM teams WHERE name = ANY($5)) \
+            OR u.id IN (SELECT t.personal_of FROM catalogs c \
+                        JOIN teams t ON t.id = c.owner_team_id WHERE c.name = ANY($6)) \
+         ORDER BY u.is_admin DESC, u.id",
     )
+    .bind(target)
     .bind(&actor.user_id)
+    .bind(valid(people.users))
     .bind(&actor.credential)
-    .execute(&mut *conn)
+    .bind(valid(people.teams))
+    .bind(valid(people.catalogs))
+    .fetch_all(&mut *conn)
     .await?;
-    Ok(())
+    let mut locked = None;
+    for (id, _, is_target) in &rows {
+        let sql = match people.target {
+            Some((_, RowLock::Update)) if *is_target => {
+                "SELECT is_admin FROM users WHERE id = $1 FOR UPDATE"
+            }
+            Some((_, RowLock::NoKeyUpdate)) if *is_target => {
+                "SELECT is_admin FROM users WHERE id = $1 FOR NO KEY UPDATE"
+            }
+            _ => "SELECT is_admin FROM users WHERE id = $1 FOR KEY SHARE",
+        };
+        let is_admin: Option<bool> = sqlx::query_scalar(sql)
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        // A row deleted meanwhile is skipped; a deleted target is unknown.
+        if let (true, Some(is_admin)) = (*is_target, is_admin) {
+            locked = Some((id.clone(), is_admin));
+        }
+    }
+    match (target, locked) {
+        (Some(name), None) => Err(unknown(name)),
+        (_, locked) => Ok(locked),
+    }
 }
 
 /// How entries name a team: its `audit_teams` id, which follows the team's
@@ -844,12 +933,18 @@ mod tests {
             display_name: "",
             owner: TEST_USER,
         };
-        teams::create(&db.pool, &family, now()).await.unwrap();
+        teams::create(&db.pool, &family, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let mut tx = db.pool.begin().await.unwrap();
         let first = team_ref(&mut tx, "family").await.unwrap();
         tx.commit().await.unwrap();
-        teams::delete(&db.pool, "family").await.unwrap();
-        teams::create(&db.pool, &family, now()).await.unwrap();
+        teams::delete(&db.pool, "family", &AuditActor::cli(), Utc::now())
+            .await
+            .unwrap();
+        teams::create(&db.pool, &family, &AuditActor::cli(), now())
+            .await
+            .unwrap();
 
         let mut tx = db.pool.begin().await.unwrap();
         let second = team_ref(&mut tx, "family").await.unwrap();
@@ -1215,12 +1310,16 @@ mod tests {
             display_name: "",
             owner: TEST_USER,
         };
-        teams::create(&db.pool, &family, now()).await.unwrap();
+        teams::create(&db.pool, &family, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let staff = NewTeam {
             name: "staff",
             ..family
         };
-        teams::create(&db.pool, &staff, now()).await.unwrap();
+        teams::create(&db.pool, &staff, &AuditActor::cli(), now())
+            .await
+            .unwrap();
         let mine = store_catalog(&db.pool, "mine", Some(TEST_TEAM)).await;
         let mine_too = store_catalog(&db.pool, "mine-too", Some(TEST_TEAM)).await;
         let theirs = store_catalog(&db.pool, "theirs", Some("family")).await;

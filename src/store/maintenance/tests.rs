@@ -22,10 +22,19 @@ pub(super) fn actor(id: &str) -> Actor {
 }
 
 pub(super) async fn setup(pool: &PgPool, paths: &[&str]) -> i64 {
-    let catalog = catalogs::create(pool, "pg", "", crate::db::TEST_TEAM, t0())
-        .await
-        .unwrap()
-        .id;
+    let catalog = catalogs::create(
+        pool,
+        &crate::store::catalogs::NewCatalog {
+            name: "pg",
+            description: "",
+            owner_team: crate::db::TEST_TEAM,
+        },
+        &crate::store::audit::AuditActor::cli(),
+        t0(),
+    )
+    .await
+    .unwrap()
+    .id;
     for path in paths {
         revision(pool, catalog, path, 1, t0(), "---\ntype: Note\n---\nBody\n").await;
     }
@@ -2271,10 +2280,27 @@ async fn maintenance_deleted_catalog_identity_cannot_replay() {
     )
     .await
     .unwrap();
-    catalogs::delete(&db.pool, "pg", true).await.unwrap();
-    let recreated = catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, t0())
-        .await
-        .unwrap();
+    catalogs::delete(
+        &db.pool,
+        "pg",
+        true,
+        &crate::store::audit::AuditActor::cli(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    let recreated = catalogs::create(
+        &db.pool,
+        &crate::store::catalogs::NewCatalog {
+            name: "pg",
+            description: "",
+            owner_team: crate::db::TEST_TEAM,
+        },
+        &crate::store::audit::AuditActor::cli(),
+        t0(),
+    )
+    .await
+    .unwrap();
     assert_ne!(recreated.id, catalog);
     assert!(runs::claim(
         &db.pool,

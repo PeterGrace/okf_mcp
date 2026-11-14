@@ -9,7 +9,7 @@ use serde_json::json;
 use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
-use crate::store::audit::{self, Action, AuditActor, Entry, Target};
+use crate::store::audit::{self, Action, AuditActor, Entry, People, RowLock, Target};
 use crate::store::catalogs::{bump_admin_generation, is_unique_violation, is_valid_name};
 use crate::store::changesets::{self, ChangesetState};
 use crate::store::user_sessions;
@@ -195,13 +195,8 @@ pub async fn create(
     // A transaction rolls back when `tx` is dropped without `commit`, so
     // every early `?` return below undoes the rows inserted before it.
     let mut tx = pool.begin().await?;
-    // The acting user's rows before anything else (`lock_users`).
-    let actor_only = UserLocks {
-        target: None,
-        actor,
-        catalog: None,
-    };
-    lock_users(&mut tx, &actor_only).await?;
+    // The acting user's rows before anything else (`audit::lock_people`).
+    audit::lock_people(&mut tx, actor, &People::default()).await?;
     check_free(&mut tx, new.name).await?;
     let inserted = sqlx::query_scalar::<_, String>(
         "INSERT INTO users (name, display_name, created_at) VALUES ($1, $2, $3) RETURNING id",
@@ -370,7 +365,7 @@ pub async fn id_by_name<'e>(
 /// `user_sessions::start` takes on the same row, so a session whose insert
 /// is still uncommitted when this starts is waited for and then ended too;
 /// one that starts later is a sign-in after the sign-out. Lock order: the
-/// user's row (with the actor's, `lock_users`), then its sessions
+/// user's row (with the actor's, `audit::lock_people`), then its sessions
 /// (`email_tokens`' module docs).
 ///
 /// # Arguments
@@ -448,109 +443,8 @@ pub async fn end_session_by_prefix(
     Ok(())
 }
 
-/// How a change locks its target user's row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RowLock {
-    /// `FOR UPDATE`: the change writes the row's key-adjacent columns or
-    /// must exclude `set_admin` (an email, the admin flag).
-    Update,
-    /// `FOR NO KEY UPDATE`: the change ends or replaces the user's child
-    /// rows (sessions, emailed links).
-    NoKeyUpdate,
-    /// `FOR KEY SHARE`: the change only needs the user to stay (an
-    /// entitlement), as [`id_of`] holds it.
-    KeyShare,
-}
-
-/// The user rows one change locks before anything else.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct UserLocks<'a> {
-    /// The user the change is about, by name, and how it is locked.
-    pub target: Option<(&'a str, RowLock)>,
-    /// Who acts: its user and its credential's owner, which
-    /// [`audit::record`] holds `FOR KEY SHARE` when it resolves them.
-    pub actor: &'a AuditActor,
-    /// A catalog whose owner team may be a personal team: its person, which
-    /// [`audit::catalog_teams`] holds `FOR KEY SHARE` too.
-    pub catalog: Option<&'a str>,
-}
-
-/// Locks every user row a change and its audit entry will lock, in the
-/// one order every user write takes them: admin users first, then the
-/// rest, each in id order, as [`set_admin`] locks every admin row in id
-/// order before its target. Callers take these before any other row, and
-/// before `server_state` (`bump_admin_generation`), so a later
-/// [`audit::record`] only re-takes locks the transaction holds: a change
-/// recorded as an admin cannot wait on that admin's row while holding a
-/// row `set_admin` waits on.
-///
-/// The rows are read without a lock to sort them, then locked one by one;
-/// the target's admin flag is read again under its lock.
-///
-/// # Arguments
-/// * `conn` - the change's transaction (pass `&mut tx`).
-/// * `locks` - the rows and the target's lock.
-///
-/// # Returns
-/// The target's id and admin flag (under its lock), or `None` without a
-/// target.
-///
-/// # Errors
-/// [`OkfError::UnknownName`] for a malformed or unknown target name;
-/// [`OkfError::Database`].
-pub(crate) async fn lock_users(
-    conn: &mut PgConnection,
-    locks: &UserLocks<'_>,
-) -> Result<Option<(String, bool)>, OkfError> {
-    let target = locks.target.map(|(name, _)| name);
-    // A malformed name (a NUL, which Postgres refuses) names nobody.
-    if let Some(name) = target.filter(|name| !is_valid_name(name)) {
-        return Err(unknown(name));
-    }
-    // Each row: id, admin flag, whether it is the target.
-    // `COALESCE(.., false)`: `name = NULL` is NULL without a target.
-    let rows: Vec<(String, bool, bool)> = sqlx::query_as(
-        "SELECT id, is_admin, COALESCE(name = $1, false) FROM users \
-         WHERE name = $1 OR id = $2 \
-            OR id = (SELECT user_id FROM api_keys WHERE id = $3) \
-            OR id = (SELECT user_id FROM sign_in_codes WHERE id = $3) \
-            OR id = (SELECT t.personal_of FROM catalogs c \
-                     JOIN teams t ON t.id = c.owner_team_id WHERE c.name = $4) \
-         ORDER BY is_admin DESC, id",
-    )
-    .bind(target)
-    .bind(&locks.actor.user_id)
-    .bind(&locks.actor.credential)
-    .bind(locks.catalog)
-    .fetch_all(&mut *conn)
-    .await?;
-    let mut locked = None;
-    for (id, _, is_target) in &rows {
-        let sql = match locks.target {
-            Some((_, RowLock::Update)) if *is_target => {
-                "SELECT is_admin FROM users WHERE id = $1 FOR UPDATE"
-            }
-            Some((_, RowLock::NoKeyUpdate)) if *is_target => {
-                "SELECT is_admin FROM users WHERE id = $1 FOR NO KEY UPDATE"
-            }
-            _ => "SELECT is_admin FROM users WHERE id = $1 FOR KEY SHARE",
-        };
-        let is_admin: Option<bool> = sqlx::query_scalar(sql)
-            .bind(id)
-            .fetch_optional(&mut *conn)
-            .await?;
-        // A row deleted meanwhile is skipped; a deleted target is unknown.
-        if let (true, Some(is_admin)) = (*is_target, is_admin) {
-            locked = Some((id.clone(), is_admin));
-        }
-    }
-    match (target, locked) {
-        (Some(name), None) => Err(unknown(name)),
-        (_, locked) => Ok(locked),
-    }
-}
-
-/// `lock_users` for a change with a target: its id and admin flag.
+/// Locks a change's target user and every other user row it will lock
+/// ([`audit::lock_people`] with a target): its id and admin flag.
 ///
 /// # Arguments
 /// * `conn` - the change's transaction.
@@ -562,20 +456,21 @@ pub(crate) async fn lock_users(
 /// The target's id and admin flag, under its lock.
 ///
 /// # Errors
-/// As `lock_users`.
+/// As [`audit::lock_people`].
 pub(crate) async fn lock_target(
     conn: &mut PgConnection,
     name: &str,
     lock: RowLock,
     actor: &AuditActor,
 ) -> Result<(String, bool), OkfError> {
-    let locks = UserLocks {
+    let people = People {
         target: Some((name, lock)),
-        actor,
-        catalog: None,
+        ..People::default()
     };
-    // `lock_users` answers `Some` whenever it is given a target.
-    lock_users(conn, &locks).await?.ok_or_else(|| unknown(name))
+    // `lock_people` answers `Some` whenever it is given a target.
+    audit::lock_people(conn, actor, &people)
+        .await?
+        .ok_or_else(|| unknown(name))
 }
 
 /// An audit entry about one user (plan Task 6a): the user is the target,
@@ -681,7 +576,7 @@ pub(crate) fn is_lookup_email(email: &str) -> bool {
 /// nothing.
 ///
 /// The user's row is locked (`FOR UPDATE`, which `set_admin` also takes)
-/// with the actor's rows before anything else (`lock_users`), so a
+/// with the actor's rows before anything else (`audit::lock_people`), so a
 /// provisioner's refusal of an admin user cannot race a promotion.
 ///
 /// # Arguments
@@ -778,7 +673,7 @@ pub struct AdminChange {
 /// with `false`), so every route that changes the flag ends the sessions.
 ///
 /// Every admin row is locked first, in id order, then the user's row and
-/// the actor's (`lock_users`), then `server_state`: two
+/// the actor's (`audit::lock_people`), then `server_state`: two
 /// concurrent "off" calls on the last two admins serialize, and the second
 /// sees only one admin left. (A concurrent "on" for another user is not
 /// counted until it commits, which only ever refuses more, never less.)
@@ -1214,41 +1109,6 @@ async fn discard_open_changesets(
     Ok(count_of(open.len()))
 }
 
-/// The id and admin flag of the user called `name`, inside a caller's
-/// transaction, held `FOR KEY SHARE` as [`id_of`] holds it. `set_admin`
-/// takes `FOR UPDATE` on the same row, so the flag cannot change before the
-/// caller commits: a provisioner guard on it cannot race a promotion.
-///
-/// # Arguments
-/// * `conn` - the caller's transaction (pass `&mut tx`).
-/// * `name` - the user's name.
-///
-/// # Returns
-/// Its `users.id` and whether it is an admin user.
-///
-/// # Errors
-/// [`OkfError::UnknownName`] (a malformed name included);
-/// [`OkfError::Database`].
-// Task 6b's provisioner guards call it; until then only the tests do.
-// `expect` (unlike `allow`) warns once it is used, so the line goes then.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "M14 Task 6b's guards are its first callers")
-)]
-pub(crate) async fn id_and_admin_of(
-    conn: &mut PgConnection,
-    name: &str,
-) -> Result<(String, bool), OkfError> {
-    if !is_valid_name(name) {
-        return Err(unknown(name));
-    }
-    sqlx::query_as("SELECT id, is_admin FROM users WHERE name = $1 FOR KEY SHARE")
-        .bind(name)
-        .fetch_optional(&mut *conn)
-        .await?
-        .ok_or_else(|| unknown(name))
-}
-
 #[cfg(test)]
 // `pub(crate)` so `teams::tests` shares the seeding helpers below.
 pub(crate) mod tests {
@@ -1264,9 +1124,18 @@ pub(crate) mod tests {
 
     /// Gives `team` a catalog, `shared`.
     pub(crate) async fn seed_catalog_owned_by(pool: &PgPool, team: &str) {
-        catalogs::create(pool, "shared", "", team, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "shared",
+                description: "",
+                owner_team: team,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
     }
 
     /// Makes catalog `shared` belong to the team named `$1`, by writing
@@ -1927,9 +1796,14 @@ pub(crate) mod tests {
         create(&db.pool, &alice(), &AuditActor::cli(), now())
             .await
             .unwrap();
-        teams::create(&db.pool, &family_owned_by_alice(), now())
-            .await
-            .unwrap();
+        teams::create(
+            &db.pool,
+            &family_owned_by_alice(),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let clash = create(
             &db.pool,
@@ -1980,9 +1854,14 @@ pub(crate) mod tests {
             .unwrap();
         let mut tx = db.pool.begin().await.unwrap();
         check_free(&mut tx, "family").await.unwrap();
-        teams::create(&db.pool, &family_owned_by_alice(), now())
-            .await
-            .unwrap();
+        teams::create(
+            &db.pool,
+            &family_owned_by_alice(),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let inserted = sqlx::query_scalar::<_, String>(
             "INSERT INTO teams (name, created_at) VALUES ('family', now()) RETURNING id",
@@ -2009,12 +1888,11 @@ pub(crate) mod tests {
         };
         let team = family_owned_by_alice();
 
-        let actor = AuditActor::cli();
-
         // `tokio::join!` runs both futures concurrently, like `asyncio.gather`.
+        let actor = AuditActor::cli();
         let (made_user, made_team) = tokio::join!(
             create(&db.pool, &user, &actor, now()),
-            teams::create(&db.pool, &team, now()),
+            teams::create(&db.pool, &team, &actor, now()),
         );
 
         let refused = [made_user.is_err(), made_team.is_err()];
@@ -2141,10 +2019,21 @@ pub(crate) mod tests {
             display_name: "",
             owner: crate::db::TEST_USER,
         };
-        teams::create(&db.pool, &family, now()).await.unwrap();
-        teams::set_member(&db.pool, "family", "alice", teams::Role::Member, now())
+        teams::create(&db.pool, &family, &AuditActor::cli(), now())
             .await
             .unwrap();
+        teams::set_member(
+            &db.pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: "alice",
+                role: teams::Role::Member,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         seed_catalog_owned_by(&db.pool, "family").await;
         key_for(&db.pool, "alice", "alice-laptop", false).await;
         key_for(&db.pool, "alice", "alice-old", true).await;
@@ -2292,16 +2181,26 @@ pub(crate) mod tests {
         seed_user(&db.pool, "alice", None).await;
         seed_catalog_owned_by(&db.pool, "alice").await;
         let owns = delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await;
-        catalogs::delete(&db.pool, "shared", true).await.unwrap();
-        teams::create(&db.pool, &family_owned_by_alice(), now())
+        catalogs::delete(&db.pool, "shared", true, &AuditActor::cli(), Utc::now())
             .await
             .unwrap();
+        teams::create(
+            &db.pool,
+            &family_owned_by_alice(),
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let sole = delete(&db.pool, "alice", false, &AuditActor::cli(), now()).await;
         teams::set_member(
             &db.pool,
-            "family",
-            crate::db::TEST_USER,
-            teams::Role::Owner,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: crate::db::TEST_USER,
+                role: teams::Role::Owner,
+            },
+            &AuditActor::cli(),
             now(),
         )
         .await
@@ -2403,9 +2302,18 @@ pub(crate) mod tests {
         create(&db.pool, &alice(), &AuditActor::cli(), now())
             .await
             .unwrap();
-        catalogs::create(&db.pool, "shared", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "shared",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let mut assigning = db.pool.begin().await.unwrap();
         sqlx::query(OWN_SHARED)
             .bind("alice")
@@ -2516,33 +2424,6 @@ pub(crate) mod tests {
             state, "discarded",
             "no changeset is left open without a key"
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn id_and_admin_of_reads_the_flag_and_knows_no_stranger() {
-        let db = test_db().await;
-        let alice = seed_user(&db.pool, "alice", None).await;
-        set_admin(
-            &db.pool,
-            "alice",
-            AdminChange {
-                on: true,
-                allow_last: true,
-            },
-            &AuditActor::cli(),
-            now(),
-        )
-        .await
-        .unwrap();
-        let mut tx = db.pool.begin().await.unwrap();
-
-        let found = id_and_admin_of(&mut tx, "alice").await.unwrap();
-        let stranger = id_and_admin_of(&mut tx, "nobody").await;
-        let malformed = id_and_admin_of(&mut tx, "a\0b").await;
-
-        assert_eq!(found, (alice.id, true));
-        assert!(matches!(stranger, Err(OkfError::UnknownName { .. })));
-        assert!(matches!(malformed, Err(OkfError::UnknownName { .. })));
     }
 
     /// The CLI's admin-flag change (it may clear the last admin).

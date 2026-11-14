@@ -628,6 +628,7 @@ mod tests {
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "editor",
+            audit: &crate::store::audit::AuditActor::cli(),
             now: Utc::now(),
         };
         import(test.app.pool(), "main", files(&entries), &options)

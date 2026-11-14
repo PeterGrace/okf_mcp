@@ -12,10 +12,10 @@ use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::auth::{Principal, Reach};
 use crate::error::OkfError;
-use crate::store::audit::{self, Action, AuditActor, Entry};
-use crate::store::catalogs::{self, bump_admin_generation};
+use crate::store::audit::{self, Action, AuditActor, Entry, People, RowLock};
+use crate::store::catalogs::{self, bump_admin_generation, CatalogEvent};
 use crate::store::keys::Access;
-use crate::store::users::{self, RowLock, UserLocks};
+use crate::store::users;
 
 /// Catalog name to the highest level a user's self-issued credentials may
 /// have there: `Read` or `Write`, never `Admin`.
@@ -232,42 +232,68 @@ pub(crate) async fn ceiling_in(
     Ok(one_ceiling(ceiling_rows(conn, Some(user_id)).await?))
 }
 
-/// Sets what members of a catalog's owning team may reach, and bumps
-/// `admin_generation` when it changes.
+/// Sets what members of a catalog's owning team may reach, and records
+/// `catalog.member_access_changed` and bumps `admin_generation` when it
+/// changes.
 ///
 /// # Arguments
 /// * `pool` - the database.
 /// * `catalog` - the catalog's name.
 /// * `access` - the new value.
+/// * `actor` - who, for the audit log.
+/// * `now` - the server clock.
 ///
 /// # Returns
 /// The value it had before.
 ///
 /// # Errors
-/// [`OkfError::CatalogNotSelected`] for an unknown catalog;
-/// [`OkfError::Database`].
+/// [`OkfError::CatalogNotSelected`] for an unknown (or malformed) catalog;
+/// [`OkfError::Database`], a failed audit write included.
 pub async fn set_member_access(
     pool: &PgPool,
     catalog: &str,
     access: MemberAccess,
+    actor: &AuditActor,
+    now: DateTime<Utc>,
 ) -> Result<MemberAccess, OkfError> {
     check_names(None, catalog)?;
     let mut tx = pool.begin().await?;
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            catalogs: &[catalog],
+            ..People::default()
+        },
+    )
+    .await?;
     // As in `catalogs::set_owner`: the subquery reads the row as it was,
     // under its row lock, so this returns the value it replaced.
-    let previous: Option<String> = sqlx::query_scalar(
+    let previous: Option<(i64, String)> = sqlx::query_as(
         "UPDATE catalogs c SET member_access = $2 \
          FROM (SELECT id, member_access FROM catalogs WHERE name = $1 FOR UPDATE) old \
-         WHERE c.id = old.id RETURNING old.member_access",
+         WHERE c.id = old.id RETURNING c.id, old.member_access",
     )
     .bind(catalog)
     .bind(access.as_str())
     .fetch_optional(&mut *tx)
     .await?;
-    let previous = previous.ok_or_else(|| unknown_catalog(catalog))?;
+    let (catalog_id, previous) = previous.ok_or_else(|| unknown_catalog(catalog))?;
     let previous =
         MemberAccess::parse(&previous).expect("the schema checks catalogs.member_access");
     if previous != access {
+        catalogs::record_catalog(
+            &mut tx,
+            actor,
+            CatalogEvent {
+                action: Action::CatalogMemberAccessChanged,
+                catalog_id,
+                catalog,
+                details: serde_json::json!({"from": previous.as_str(), "to": access.as_str()}),
+            },
+            now,
+        )
+        .await?;
         bump_admin_generation(&mut tx).await?;
     }
     tx.commit().await?;
@@ -439,7 +465,7 @@ pub async fn unentitle(
 /// Locks the user rows an entitlement change and its entry take: the user
 /// (`FOR KEY SHARE` until commit, so a concurrent `users::delete` waits),
 /// the actor's rows and the catalog's personal owner, if any (its entry's
-/// team), in `users::lock_users`' order, before `server_state`.
+/// team), in `audit::lock_people`' order, before `server_state`.
 ///
 /// # Arguments
 /// * `conn` - the change's transaction.
@@ -458,13 +484,13 @@ async fn lock_entitlement_users(
     catalog: &str,
     actor: &AuditActor,
 ) -> Result<String, OkfError> {
-    let locks = UserLocks {
+    let people = People {
         target: Some((user, RowLock::KeyShare)),
-        actor,
-        catalog: Some(catalog),
+        catalogs: &[catalog],
+        ..People::default()
     };
-    // `lock_users` answers `Some` whenever it is given a target.
-    let (user_id, _) = users::lock_users(conn, &locks)
+    // `lock_people` answers `Some` whenever it is given a target.
+    let (user_id, _) = audit::lock_people(conn, actor, &people)
         .await?
         .ok_or_else(|| users::unknown(user))?;
     Ok(user_id)
@@ -587,18 +613,38 @@ mod tests {
             display_name: "",
             owner: "alice",
         };
-        teams::create(pool, &team, now()).await.unwrap();
-        teams::set_member(pool, "family", "bob", Role::Member, now())
+        teams::create(pool, &team, &AuditActor::cli(), now())
             .await
             .unwrap();
+        teams::set_member(
+            pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: "bob",
+                role: Role::Member,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         for (catalog, owner) in [
             ("shared", "family"),
             ("solo", "alice"),
             ("other", TEST_TEAM),
         ] {
-            catalogs::create(pool, catalog, "", owner, now())
-                .await
-                .unwrap();
+            catalogs::create(
+                pool,
+                &crate::store::catalogs::NewCatalog {
+                    name: catalog,
+                    description: "",
+                    owner_team: owner,
+                },
+                &AuditActor::cli(),
+                now(),
+            )
+            .await
+            .unwrap();
         }
     }
 
@@ -680,12 +726,24 @@ mod tests {
         let db = test_db().await;
         family(&db.pool).await;
 
-        set_member_access(&db.pool, "shared", MemberAccess::Read)
-            .await
-            .unwrap();
-        set_member_access(&db.pool, "solo", MemberAccess::None)
-            .await
-            .unwrap();
+        set_member_access(
+            &db.pool,
+            "shared",
+            MemberAccess::Read,
+            &AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        set_member_access(
+            &db.pool,
+            "solo",
+            MemberAccess::None,
+            &AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         entitle(
             &db.pool,
             &NewEntitlement {
@@ -739,13 +797,32 @@ mod tests {
         family(&db.pool).await;
         let before = catalogs::admin_generation(&db.pool).await.unwrap();
 
-        let first = set_member_access(&db.pool, "shared", MemberAccess::Read)
-            .await
-            .unwrap();
-        let again = set_member_access(&db.pool, "shared", MemberAccess::Read)
-            .await
-            .unwrap();
-        let unknown = set_member_access(&db.pool, "nope", MemberAccess::Read).await;
+        let first = set_member_access(
+            &db.pool,
+            "shared",
+            MemberAccess::Read,
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let again = set_member_access(
+            &db.pool,
+            "shared",
+            MemberAccess::Read,
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let unknown = set_member_access(
+            &db.pool,
+            "nope",
+            MemberAccess::Read,
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await;
 
         assert_eq!((first, again), (MemberAccess::Write, MemberAccess::Read));
         assert_eq!(
@@ -917,12 +994,23 @@ mod tests {
         let mut last = catalogs::admin_generation(pool).await.unwrap();
         let shared_write = ceiling(&[("shared", Access::Write)]);
 
-        teams::remove_member(pool, "family", "bob").await.unwrap();
-        moved(pool, "leaving the team", &mut last, &bob, Ceiling::new()).await;
-
-        teams::set_member(pool, "family", "bob", Role::Member, now())
+        teams::remove_member(pool, "family", "bob", &AuditActor::cli(), Utc::now())
             .await
             .unwrap();
+        moved(pool, "leaving the team", &mut last, &bob, Ceiling::new()).await;
+
+        teams::set_member(
+            pool,
+            &crate::store::teams::Membership {
+                team: "family",
+                user: "bob",
+                role: Role::Member,
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         moved(
             pool,
             "joining the team",
@@ -932,13 +1020,24 @@ mod tests {
         )
         .await;
 
-        catalogs::create(pool, "extra", "", "family", now())
-            .await
-            .unwrap();
+        catalogs::create(
+            pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "extra",
+                description: "",
+                owner_team: "family",
+            },
+            &AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let both = ceiling(&[("extra", Access::Write), ("shared", Access::Write)]);
         moved(pool, "a new catalog of the team", &mut last, &bob, both).await;
 
-        catalogs::set_owner(pool, "extra", TEST_TEAM).await.unwrap();
+        catalogs::set_owner(pool, "extra", TEST_TEAM, &AuditActor::cli(), Utc::now())
+            .await
+            .unwrap();
         moved(pool, "a new owner", &mut last, &bob, shared_write.clone()).await;
 
         entitle(
@@ -956,14 +1055,22 @@ mod tests {
         let entitled = ceiling(&[("extra", Access::Read), ("shared", Access::Write)]);
         moved(pool, "an entitlement", &mut last, &bob, entitled).await;
 
-        set_member_access(pool, "shared", MemberAccess::Read)
-            .await
-            .unwrap();
+        set_member_access(
+            pool,
+            "shared",
+            MemberAccess::Read,
+            &AuditActor::cli(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         let lowered = ceiling(&[("extra", Access::Read), ("shared", Access::Read)]);
         moved(pool, "member access", &mut last, &bob, lowered).await;
 
         // The entitlement to `extra` cascades with the catalog.
-        catalogs::delete(pool, "extra", false).await.unwrap();
+        catalogs::delete(pool, "extra", false, &AuditActor::cli(), Utc::now())
+            .await
+            .unwrap();
         let shared_read = ceiling(&[("shared", Access::Read)]);
         moved(
             pool,
@@ -1057,6 +1164,57 @@ mod tests {
         assert!(may_set_member_access(&every, "pg"));
         assert!(!may_set_member_access(&scoped, "pg"));
         assert!(!may_set_member_access(&writer, "pg"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_member_access_records_a_change_and_none_for_no_change() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        let actor = AuditActor::cli();
+
+        set_member_access(&db.pool, "shared", MemberAccess::Read, &actor, now())
+            .await
+            .unwrap();
+        set_member_access(&db.pool, "shared", MemberAccess::Read, &actor, now())
+            .await
+            .unwrap();
+        let bad_name =
+            set_member_access(&db.pool, "sh\0ared", MemberAccess::None, &actor, now()).await;
+
+        assert!(matches!(bad_name, Err(OkfError::CatalogNotSelected { .. })));
+        let changed =
+            crate::store::audit::testing::entries(&db.pool, "catalog.member_access_changed").await;
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0].target.as_deref(), Some("shared"));
+        assert_eq!(changed[0].teams, ["family"]);
+        assert_eq!(
+            changed[0].details,
+            serde_json::json!({"from": "write", "to": "read"})
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_audit_write_fails_the_member_access_change() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        crate::http::api::testing::fail_on(&db.pool, "BEFORE INSERT ON audit_entries FOR EACH ROW")
+            .await;
+
+        let refused = set_member_access(
+            &db.pool,
+            "shared",
+            MemberAccess::None,
+            &AuditActor::cli(),
+            now(),
+        )
+        .await;
+
+        assert!(refused.is_err());
+        assert_eq!(
+            member_access(&db.pool, "shared").await.unwrap(),
+            MemberAccess::Write,
+            "the change rolled back"
+        );
     }
 
     /// Gives `user` catalog `catalog` at `access`, as the CLI.

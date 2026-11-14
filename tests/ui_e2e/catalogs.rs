@@ -117,9 +117,14 @@ async fn an_admin_changes_a_catalogs_owner_and_a_scoped_admin_cannot() {
         display_name: "",
         owner: OWNER,
     };
-    teams::create(&server.db.pool, &family, Utc::now())
-        .await
-        .expect("create a team");
+    teams::create(
+        &server.db.pool,
+        &family,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("create a team");
     let ran = drive(server.base.clone(), move |ui| {
         // A scoped admin sees the owner, but the control is disabled.
         ui.login(&scoped);
@@ -469,15 +474,38 @@ async fn member_access_read_makes_a_team_catalog_read_only_for_its_members() {
         display_name: "",
         owner: OWNER,
     };
-    teams::create(pool, &family, Utc::now())
-        .await
-        .expect("create a team");
-    teams::set_member(pool, "family", "alice", Role::Member, Utc::now())
-        .await
-        .expect("add alice");
-    okf_mcp::store::catalogs::create(pool, "shared", "", "family", Utc::now())
-        .await
-        .expect("create the team's catalog");
+    teams::create(
+        pool,
+        &family,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("create a team");
+    teams::set_member(
+        pool,
+        &okf_mcp::store::teams::Membership {
+            team: "family",
+            user: "alice",
+            role: Role::Member,
+        },
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("add alice");
+    okf_mcp::store::catalogs::create(
+        pool,
+        &okf_mcp::store::catalogs::NewCatalog {
+            name: "shared",
+            description: "",
+            owner_team: "family",
+        },
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("create the team's catalog");
     server.app.poll().await.expect("poll");
     let admin = server.key("console-admin", Access::Admin, &[], None).await;
     let ran = drive(console_base(&server), move |ui| {

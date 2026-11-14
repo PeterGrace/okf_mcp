@@ -1516,6 +1516,7 @@ mod publish_tests {
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "t",
+            audit: &crate::store::audit::AuditActor::cli(),
             now: Utc::now(),
         };
         let republished = files(&[
@@ -1707,6 +1708,7 @@ mod publish_tests {
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "cli",
+            audit: &crate::store::audit::AuditActor::cli(),
             now: Utc::now(),
         };
         import(test.app.pool(), "pg", files(&incoming), &options)
@@ -1985,6 +1987,7 @@ mod changes_tests {
             scope: ImportScope::Everything,
             expect_generation: None,
             actor: "tester",
+            audit: &crate::store::audit::AuditActor::cli(),
             now: Utc::now(),
         };
         import(test.app.pool(), "pg", files(entries), &options)

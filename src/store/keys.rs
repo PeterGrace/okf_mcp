@@ -1373,9 +1373,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn list_shows_a_grant_with_its_kind_and_client_and_no_hash() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "main",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let names = ["main".to_string()];
         let key = create(
             &db.pool,
@@ -1426,12 +1435,30 @@ mod tests {
         let db = test_db().await;
         // Read first: the fixture user already bumped the generation.
         let start = catalogs::admin_generation(&db.pool).await.unwrap();
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
-        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "work",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         // "pg" twice: one grant.
         let names = ["work".to_string(), "pg".to_string(), "pg".to_string()];
 
@@ -1470,9 +1497,18 @@ mod tests {
         let db = test_db().await;
         // Read first: the fixture user already bumped the generation.
         let start = catalogs::admin_generation(&db.pool).await.unwrap();
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let pg = ["pg".to_string()];
         let missing = ["pg".to_string(), "nope".to_string()];
         create(&db.pool, &new_key("a", Grants::All, None), now())
@@ -1519,12 +1555,30 @@ mod tests {
         let db = test_db().await;
         // Read first: the fixture user already bumped the generation.
         let start = catalogs::admin_generation(&db.pool).await.unwrap();
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
-        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "work",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let pg = ["pg".to_string()];
         create(
             &db.pool,
@@ -1588,19 +1642,45 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn deleting_a_catalog_clears_it_as_a_default() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         create(&db.pool, &new_key("k", Grants::All, Some("pg")), now())
             .await
             .unwrap();
         let unknown_default =
             create(&db.pool, &new_key("j", Grants::All, Some("nope")), now()).await;
 
-        catalogs::delete(&db.pool, "pg", false).await.unwrap();
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::delete(
+            &db.pool,
+            "pg",
+            false,
+            &crate::store::audit::AuditActor::cli(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         // A re-created catalog of the same name is not the old default.
         assert_eq!(list(&db.pool).await.unwrap()[0].default_catalog, None);
@@ -1613,9 +1693,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn names_group_actors_and_revoked_pairs_can_be_reissued() {
         let db = test_db().await;
-        let work_catalog = catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        let work_catalog = catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "work",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let terminal = NewKey {
             name: "claude",
             access: Access::Write,
@@ -1748,9 +1837,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn an_exact_id_wins_over_a_colliding_group_name() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "work",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let work = ["work".to_string()];
         let by_id = create_with_id(
             &db.pool,
@@ -1814,9 +1912,18 @@ mod tests {
         // and actor, so name resolution would pick it; by id nothing may.
         let db = test_db().await;
         for name in ["work", "extra"] {
-            catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, now())
-                .await
-                .unwrap();
+            catalogs::create(
+                &db.pool,
+                &crate::store::catalogs::NewCatalog {
+                    name,
+                    description: "",
+                    owner_team: crate::db::TEST_TEAM,
+                },
+                &crate::store::audit::AuditActor::cli(),
+                now(),
+            )
+            .await
+            .unwrap();
         }
         insert_legacy_test_key(&db.pool, "legacy", Access::Write, "terminal", now()).await;
         let snapshot = list(&db.pool)
@@ -1865,9 +1972,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_legacy_id_uses_active_name_resolution_after_rotation() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "work", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "work",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         insert_legacy_test_key(&db.pool, "legacy", Access::Write, "terminal", now()).await;
 
         let work = ["work".to_string()];
@@ -1950,12 +2066,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn key_commands_by_name_act_on_the_key_and_never_on_a_grant_of_that_name() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
-        catalogs::create(&db.pool, "other", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "main",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "other",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let client = crate::store::oauth::testing::insert_client(
             &db.pool,
             "https://client.example.com/client.json",
@@ -2156,9 +2290,18 @@ mod tests {
     async fn assign_by_name_reaches_grants_and_a_shared_name_is_ambiguous() {
         // Arrange: a grant named `laptop`, then a key of the same name.
         let db = test_db().await;
-        catalogs::create(&db.pool, "main", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "main",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let client = crate::store::oauth::testing::insert_client(
             &db.pool,
             "https://client.example.com/client.json",
@@ -2268,9 +2411,18 @@ mod tests {
     async fn a_key_has_a_level_per_catalog_and_a_new_grant_takes_the_keys_own() {
         let db = test_db().await;
         for name in ["pg", "work", "docs"] {
-            catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, now())
-                .await
-                .unwrap();
+            catalogs::create(
+                &db.pool,
+                &crate::store::catalogs::NewCatalog {
+                    name,
+                    description: "",
+                    owner_team: crate::db::TEST_TEAM,
+                },
+                &crate::store::audit::AuditActor::cli(),
+                now(),
+            )
+            .await
+            .unwrap();
         }
         let names = ["pg".to_string(), "work".to_string()];
         let read_work = [CatalogGrant {
@@ -2310,9 +2462,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn levels_are_refused_outside_the_grants_above_the_key_or_on_an_admin_key() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let names = ["pg".to_string()];
         let level = |catalog: &str, access: Access| CatalogGrant {
             catalog: catalog.to_string(),
@@ -2365,9 +2526,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_self_issued_key_names_its_catalogs_and_is_never_admin_or_a_reporter() {
         let db = test_db().await;
-        catalogs::create(&db.pool, "pg", "", crate::db::TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "pg",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
         let names = ["pg".to_string()];
         let mine = NewKey {
             self_issued: true,
@@ -2442,9 +2612,18 @@ mod tests {
     async fn a_self_issued_key_stays_within_its_rules_after_creation() {
         let db = test_db().await;
         for name in ["pg", "work"] {
-            catalogs::create(&db.pool, name, "", crate::db::TEST_TEAM, now())
-                .await
-                .unwrap();
+            catalogs::create(
+                &db.pool,
+                &crate::store::catalogs::NewCatalog {
+                    name,
+                    description: "",
+                    owner_team: crate::db::TEST_TEAM,
+                },
+                &crate::store::audit::AuditActor::cli(),
+                now(),
+            )
+            .await
+            .unwrap();
         }
         let names = ["pg".to_string()];
         let mine = NewKey {
@@ -2512,9 +2691,18 @@ mod tests {
 
     /// Creates catalog `main` and returns its name and a read level on it.
     async fn main_read(pool: &PgPool) -> ([String; 1], [CatalogGrant; 1]) {
-        catalogs::create(pool, "main", "", crate::db::TEST_TEAM, now())
-            .await
-            .expect("catalog");
+        catalogs::create(
+            pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "main",
+                description: "",
+                owner_team: crate::db::TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .expect("catalog");
         (
             ["main".to_string()],
             [CatalogGrant {

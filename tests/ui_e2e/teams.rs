@@ -268,9 +268,14 @@ async fn a_grant_a_code_and_a_catalog_are_assigned_from_the_unassigned_view() {
         display_name: "",
         owner: "alice",
     };
-    teams::create(&server.db.pool, &family, Utc::now())
-        .await
-        .expect("create a team");
+    teams::create(
+        &server.db.pool,
+        &family,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("create a team");
     let grant = seed_unassigned(&server).await;
     // Quoted: a grant's name has dots.
     let grant_row = format!("[data-test=\"assign-key-{grant}\"]");
@@ -394,6 +399,7 @@ async fn a_member_sees_the_notice_on_browse_with_a_link_to_export() {
         &server.db.pool,
         OWNER,
         Some("Paused for review."),
+        &okf_mcp::store::audit::AuditActor::cli(),
         Utc::now(),
     )
     .await
@@ -479,9 +485,15 @@ async fn a_suspension_write_runs_once_and_settles_in_a_reopened_drawer() {
 async fn a_refused_lift_keeps_its_reason_and_a_late_read_never_draws_over_a_newer_one() {
     let server = server().await;
     let admin = server.key("console-admin", Access::Admin, &[], None).await;
-    teams::suspend(&server.db.pool, OWNER, Some("Paused."), Utc::now())
-        .await
-        .expect("suspend the owner team");
+    teams::suspend(
+        &server.db.pool,
+        OWNER,
+        Some("Paused."),
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("suspend the owner team");
     server.app.poll().await.expect("poll");
     let ran = drive(server.base.clone(), move |ui| {
         ui.login(&admin);
@@ -629,9 +641,14 @@ async fn a_write_settling_for_one_team_never_cancels_opening_another() {
         display_name: "",
         owner: OWNER,
     };
-    teams::create(&server.db.pool, &family, Utc::now())
-        .await
-        .expect("create a second team");
+    teams::create(
+        &server.db.pool,
+        &family,
+        &okf_mcp::store::audit::AuditActor::cli(),
+        Utc::now(),
+    )
+    .await
+    .expect("create a second team");
     server.app.poll().await.expect("poll");
     let ran = drive(server.base.clone(), move |ui| {
         ui.login(&admin);

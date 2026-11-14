@@ -25,6 +25,7 @@ use crate::clock::{format_timestamp, Clock};
 use crate::config::Config;
 use crate::db;
 use crate::http;
+use crate::store::audit::AuditActor;
 use crate::store::catalogs;
 use crate::store::ceiling::MemberAccess;
 use crate::store::export;
@@ -691,6 +692,7 @@ pub async fn run(cli: Cli, clock: Arc<dyn Clock>) -> anyhow::Result<()> {
                 },
                 expect_generation,
                 actor: &actor,
+                audit: &AuditActor::cli(),
                 now: clock.now(),
             };
             let report = import::import(&pool, &catalog, files, &options).await?;
@@ -845,11 +847,23 @@ async fn run_catalog(
             description,
             owner,
         } => {
-            let catalog = catalogs::create(pool, &name, &description, &owner, clock.now()).await?;
+            let new = catalogs::NewCatalog {
+                name: &name,
+                description: &description,
+                owner_team: &owner,
+            };
+            let catalog = catalogs::create(pool, &new, &AuditActor::cli(), clock.now()).await?;
             println!("created catalog {}", catalog.name);
         }
         CatalogCommand::Update { name, description } => {
-            let previous = catalogs::update_description(pool, &name, &description).await?;
+            let previous = catalogs::update_description(
+                pool,
+                &name,
+                &description,
+                &AuditActor::cli(),
+                clock.now(),
+            )
+            .await?;
             // `{:?}` quotes the text, so an empty description shows as `""`.
             println!("updated catalog {name} description: {previous:?} -> {description:?}");
         }
@@ -859,13 +873,19 @@ async fn run_catalog(
             }
         }
         CatalogCommand::SetOwner { name, team } => {
-            print!("{}", people::set_owner(pool, &name, &team).await?);
+            print!(
+                "{}",
+                people::set_owner(pool, &name, &team, clock.now()).await?
+            );
         }
         CatalogCommand::SetMemberAccess { name, access } => {
-            print!("{}", people::set_member_access(pool, &name, access).await?);
+            print!(
+                "{}",
+                people::set_member_access(pool, &name, access, clock.now()).await?
+            );
         }
         CatalogCommand::Delete { name, force } => {
-            catalogs::delete(pool, &name, force).await?;
+            catalogs::delete(pool, &name, force, &AuditActor::cli(), clock.now()).await?;
             println!("deleted catalog {name}");
         }
     }

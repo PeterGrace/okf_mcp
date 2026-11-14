@@ -120,9 +120,18 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        catalogs::create(&db.pool, "owned", "", TEST_TEAM, now())
-            .await
-            .unwrap();
+        catalogs::create(
+            &db.pool,
+            &crate::store::catalogs::NewCatalog {
+                name: "owned",
+                description: "",
+                owner_team: TEST_TEAM,
+            },
+            &crate::store::audit::AuditActor::cli(),
+            now(),
+        )
+        .await
+        .unwrap();
 
         let found = list(&db.pool).await.unwrap();
 

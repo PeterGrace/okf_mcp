@@ -20,6 +20,7 @@ use crate::clock::format_timestamp;
 use crate::error::OkfError;
 use crate::http::{archives, AppError};
 use crate::mcp::catalogs::SuspensionInfo;
+use crate::store::audit::AuditActor;
 use crate::store::catalogs as catalog_rows;
 use crate::store::ceiling::{self, MemberAccess};
 use crate::store::keys::Access;
@@ -206,19 +207,23 @@ async fn list_catalogs(
 async fn create_catalog(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     // `Json` reads the body, so it must be the last extractor.
     Json(new): Json<NewCatalog>,
 ) -> Result<(StatusCode, Json<CatalogSummary>), AppError> {
     require_every_catalog(&principal)?;
     let row = catalog_rows::create(
         app.pool(),
-        &new.name,
-        &new.description,
-        &new.owner,
+        &catalog_rows::NewCatalog {
+            name: &new.name,
+            description: &new.description,
+            owner_team: &new.owner,
+        },
+        &actor,
         app.clock().now(),
     )
     .await?;
-    // Catalog rows record no actor (nor does the CLI); the log line does.
+    // The audit log records the change (`catalog.created`); so does the log line.
     tracing::info!(catalog = %row.name, key = %principal.key_id, actor = %principal.actor,
                    "catalog created");
     settle(&app).await;
@@ -254,12 +259,19 @@ async fn create_catalog(
 async fn update_catalog(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(catalog): Path<String>,
     Json(change): Json<DescriptionChange>,
 ) -> Result<Json<DescriptionChanged>, AppError> {
     principal.require(Access::Admin, &catalog)?;
-    let previous =
-        catalog_rows::update_description(app.pool(), &catalog, &change.description).await?;
+    let previous = catalog_rows::update_description(
+        app.pool(),
+        &catalog,
+        &change.description,
+        &actor,
+        app.clock().now(),
+    )
+    .await?;
     tracing::info!(%catalog, key = %principal.key_id, actor = %principal.actor,
                    "catalog description changed");
     settle(&app).await;
@@ -281,11 +293,19 @@ async fn update_catalog(
 async fn set_owner(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(catalog): Path<String>,
     Json(change): Json<OwnerChange>,
 ) -> Result<Json<OwnerChanged>, AppError> {
     require_every_catalog(&principal)?;
-    let previous = catalog_rows::set_owner(app.pool(), &catalog, &change.team).await?;
+    let previous = catalog_rows::set_owner(
+        app.pool(),
+        &catalog,
+        &change.team,
+        &actor,
+        app.clock().now(),
+    )
+    .await?;
     tracing::info!(%catalog, key = %principal.key_id, actor = %principal.actor,
                    "catalog owner changed");
     settle(&app).await;
@@ -354,6 +374,7 @@ async fn member_access(
 async fn set_member_access(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(catalog): Path<String>,
     Json(body): Json<MemberAccessBody>,
 ) -> Result<Json<MemberAccessChanged>, AppError> {
@@ -367,7 +388,8 @@ async fn set_member_access(
         path: "access".to_string(),
         reason: format!("must be none, read or write, not {:?}", body.access),
     })?;
-    let previous = ceiling::set_member_access(app.pool(), &catalog, access).await?;
+    let previous =
+        ceiling::set_member_access(app.pool(), &catalog, access, &actor, app.clock().now()).await?;
     tracing::info!(%catalog, previous = previous.as_str(), access = access.as_str(),
                    key = %principal.key_id, actor = %principal.actor, "member access set");
     settle(&app).await;
@@ -389,11 +411,12 @@ async fn set_member_access(
 async fn delete_catalog(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    actor: AuditActor,
     Path(catalog): Path<String>,
     Query(query): Query<DeleteQuery>,
 ) -> Result<Json<CatalogDeleted>, AppError> {
     principal.require(Access::Admin, &catalog)?;
-    catalog_rows::delete(app.pool(), &catalog, query.force)
+    catalog_rows::delete(app.pool(), &catalog, query.force, &actor, app.clock().now())
         .await
         // The store's hint names the CLI flag; say what HTTP needs.
         .map_err(|error| match error {
@@ -1068,5 +1091,33 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catalog_change_over_rest_records_the_calling_key() {
+        let test = app().await;
+        let keys = keys(&test).await;
+
+        let (status, _) = send(
+            &test,
+            "PATCH",
+            "/api/v1/catalogs/main",
+            Some(&keys.admin),
+            Some(json!({ "description": "The main catalog" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let changed =
+            crate::store::audit::testing::entries(test.app.pool(), "catalog.description_changed")
+                .await;
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0].source, "api");
+        assert_eq!(changed[0].actor_label, "api key");
+        assert_eq!(
+            changed[0].actor_person.as_deref(),
+            Some(crate::db::TEST_USER)
+        );
+        assert_eq!(changed[0].target.as_deref(), Some("main"));
     }
 }
