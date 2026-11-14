@@ -25,8 +25,7 @@ catalogs then refuse every non-admin credential except export until it is
 lifted (`docs/operations.md`, "Suspending a team"; design:
 `docs/superpowers/specs/2026-11-13-okf-team-suspension-design.md`).
 
-Deployed: `https://okf-mcp.k.vsix.me` (every route but `/healthz` needs a
-bearer key), from the image `ghcr.io/hypotheosis/okf-mcp`, with its database
+Deployed (every route but `/healthz` needs a bearer key) from the image `ghcr.io/hypotheosis/okf-mcp`, with its database
 backed up continuously and a restore drill done.
 
 The library reads a catalog into an in-memory `Snapshot` and runs `okf.py`'s
