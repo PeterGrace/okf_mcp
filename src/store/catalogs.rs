@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::error::OkfError;
-use crate::store::audit::{self, Action, AuditActor, Entry, Target};
+use crate::store::audit::{self, Action, AuditActor, Entry, People, Target};
 use crate::store::teams;
 
 /// The first key of every catalog lock (`okf` in ASCII), separating this
@@ -104,7 +104,15 @@ pub async fn create(
     let mut tx = pool.begin().await?;
     // `&mut tx` is a `&mut Transaction`, which Rust converts to the
     // `&mut PgConnection` the helper takes (deref coercion).
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            teams: &[owner_team],
+            ..People::default()
+        },
+    )
+    .await?;
     let team_id = teams::id_of(&mut tx, owner_team).await?;
     // `RETURNING` cannot run the owner subquery of `select_catalogs!` on the
     // new row, but the owner's name is the one just resolved: hand it back
@@ -177,7 +185,17 @@ pub async fn set_owner(
 ) -> Result<Option<String>, OkfError> {
     check_name(name)?;
     let mut tx = pool.begin().await?;
-    audit::lock_actor(&mut tx, actor).await?;
+    // The new owner's person, and the old one's (through the catalog).
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            teams: &[team],
+            catalogs: &[name],
+            ..People::default()
+        },
+    )
+    .await?;
     let team_id = teams::id_of(&mut tx, team).await?;
     // As in `update_description`: the subquery reads the row as it was
     // before the `UPDATE`, under its row lock, so this returns the owner it
@@ -257,7 +275,15 @@ pub async fn update_description(
 ) -> Result<String, OkfError> {
     check_name(name)?;
     let mut tx = pool.begin().await?;
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            catalogs: &[name],
+            ..People::default()
+        },
+    )
+    .await?;
     // A subquery reads the row as it was before the `UPDATE` (one
     // statement sees one snapshot), so this returns the old text; the row
     // lock the `UPDATE` takes keeps two updates from both reading the same.
@@ -374,7 +400,15 @@ pub async fn delete(
     now: DateTime<Utc>,
 ) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            catalogs: &[name],
+            ..People::default()
+        },
+    )
+    .await?;
     let catalog = find(&mut *tx, name).await?;
     lock(&mut tx, catalog.id).await?;
     // A delete that waited on the lock may find the row already gone. The

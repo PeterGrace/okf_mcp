@@ -411,31 +411,71 @@ pub async fn record(
     .await?)
 }
 
-/// Takes the acting user's row `FOR KEY SHARE` for the rest of the
-/// transaction, as [`record`] will when it resolves the actor: call it
-/// first in a change's transaction, so the user row is locked before any
-/// team, catalog or changeset row (`tools/agentic/lessons.md`: the user row
-/// first). Recording the actor only at the end would lock the user last,
-/// and a deletion of that user (the user, then its teams and changesets)
-/// could deadlock with the change. Nothing for an actor with no user (the
-/// CLI, the system, a legacy key).
+/// The users a change names besides its actor, by where they come from:
+/// [`lock_people`]'s input. Every name is optional to the lock (an unknown
+/// or malformed one locks nothing; the change's own lookups refuse it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct People<'a> {
+    /// Users by name (a member, an owner).
+    pub users: &'a [&'a str],
+    /// Teams by name, for the user whose personal team each is.
+    pub teams: &'a [&'a str],
+    /// Catalogs by name, for the user whose personal team owns each.
+    pub catalogs: &'a [&'a str],
+}
+
+/// Takes, `FOR KEY SHARE` and before anything else in a change's
+/// transaction, every user row the change's entry will resolve: the actor
+/// ([`record`] resolves it through `audit_person`), the users it names,
+/// and the person of each personal team it names (an `audit_teams` row
+/// resolves its person the same way).
+///
+/// One lock order for every writer of user rows
+/// (`tools/agentic/lessons.md`): users first, then teams, catalogs and
+/// changesets, then the `server_state` generation row; and among users the
+/// order `users::set_admin` and `users::delete` take them in, every admin by
+/// id, then the others by id. Resolving a user only when the entry is
+/// written would lock it after the team or catalog, and a deletion or admin
+/// change of that user (the user, then its teams or the generation) could
+/// deadlock with the change.
 ///
 /// # Arguments
 /// * `conn` - the change's transaction (`&mut tx`).
 /// * `actor` - who.
+/// * `people` - the other users, teams and catalogs the change names.
 ///
 /// # Errors
 /// [`OkfError::Database`].
-pub async fn lock_actor(conn: &mut PgConnection, actor: &AuditActor) -> Result<(), OkfError> {
-    // `if let` runs the block only for `Some`, binding the id inside it.
-    if let Some(user_id) = &actor.user_id {
-        // No row (the user was deleted meanwhile) is not an error here:
-        // `record` then stores no person for it (plan Decision 21).
-        sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR KEY SHARE")
-            .bind(user_id)
-            .execute(&mut *conn)
-            .await?;
-    }
+pub async fn lock_people(
+    conn: &mut PgConnection,
+    actor: &AuditActor,
+    people: &People<'_>,
+) -> Result<(), OkfError> {
+    // A malformed name (a NUL, which Postgres refuses) names nobody: leave
+    // it out, so the change's own lookup answers "unknown", not a 500.
+    let valid = |names: &[&str]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|name| crate::store::catalogs::is_valid_name(name))
+            .map(|name| name.to_string())
+            .collect()
+    };
+    // `ORDER BY ... FOR KEY SHARE` locks the rows in the sorted order:
+    // admins first, by id, then everyone else, by id.
+    sqlx::query(
+        "SELECT u.id FROM users u \
+         WHERE u.id = $1 OR u.name = ANY($2) \
+            OR u.id IN (SELECT personal_of FROM teams WHERE name = ANY($3)) \
+            OR u.id IN (SELECT t.personal_of FROM catalogs c \
+                        JOIN teams t ON t.id = c.owner_team_id WHERE c.name = ANY($4)) \
+         ORDER BY u.is_admin DESC, u.id FOR KEY SHARE OF u",
+    )
+    .bind(&actor.user_id)
+    .bind(valid(people.users))
+    .bind(valid(people.teams))
+    .bind(valid(people.catalogs))
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 

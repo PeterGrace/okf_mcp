@@ -11,6 +11,7 @@ Each rule below records a real bug the review bot found in an earlier PR, mostly
 - **Admin level and ceiling come from the key cache on every request**, never from a value read at sign-in.
 
 - **Every race test that holds a lock or waits on another task has a timeout** (`tokio::time::timeout`, about 30 s) and fails with a message naming what it waited for. A hung test once stalled a task for 12 hours. Run gates through `tools/agentic/gate.sh`, which enforces a hard timeout. Release held locks on every path, including assertion failures (use a guard or drop the connection).
+- **An audit entry locks users: lock them first.** `audit::record` resolves the actor and every person it names (a personal team's too) with `FOR KEY SHARE`, so recording at the end of a change locks those users after its team, catalog or changeset rows, and a concurrent user deletion or `set_admin` deadlocks with it. Call `audit::lock_people(&mut tx, actor, &People { users, teams, catalogs })` first in the transaction: it locks them all in `set_admin`'s order (admins by id, then the rest). Test with the user held `FOR UPDATE`, the change queued, and the deletion's next lock taken under a timeout (found while building issue #397).
 
 ## Inputs and errors
 - **Normalize user text before it reaches SQL.** Postgres rejects NUL, so a NUL becomes a 500. Use `users::normalize_email` and `users::is_lookup_email`. A malformed value must take the same path as "unknown", with the same status, the same body and the same cost.

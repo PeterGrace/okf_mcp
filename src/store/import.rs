@@ -12,7 +12,7 @@ use crate::okf::analysis::lint::{lint, LintReport};
 use crate::okf::rules::is_machinery;
 use crate::okf::snapshot::Snapshot;
 use crate::okf::workspace::{MemWorkspace, StoredFile};
-use crate::store::audit::{self, Action, AuditActor};
+use crate::store::audit::{self, Action, AuditActor, People};
 use crate::store::catalogs::{self, CatalogEvent};
 use crate::store::documents::{self, Derived, DocumentWrite, RevisionRecord};
 
@@ -138,7 +138,15 @@ pub async fn import(
     let now = options.now;
     // Dropping `tx` without `commit()` (any `?` or early `return`) rolls back.
     let mut tx = pool.begin().await?;
-    audit::lock_actor(&mut tx, options.audit).await?;
+    audit::lock_people(
+        &mut tx,
+        options.audit,
+        &People {
+            catalogs: &[catalog],
+            ..People::default()
+        },
+    )
+    .await?;
     let found = catalogs::find(&mut *tx, catalog).await?;
     catalogs::lock(&mut tx, found.id).await?;
     // A delete holding the lock may have removed (or replaced) the catalog

@@ -11,9 +11,11 @@ Issue #397, epic #390. Plan:
   `catalog.owner_changed`, `catalog.description_changed`,
   `catalog.member_access_changed`, `catalog.deleted` and `catalog.imported`.
   A call that changes nothing records nothing; a refusal records nothing.
-- `audit::lock_actor`: takes the acting user's row `FOR KEY SHARE` first in a
-  change's transaction, so the user is locked before any team, catalog or
-  changeset row (the order a user deletion takes them in).
+- `audit::lock_people` / `People { users, teams, catalogs }`: takes every
+  user row a change's entry will resolve (the actor, named users, a personal
+  team's or catalog owner's person) `FOR KEY SHARE` first in its
+  transaction, in `users::set_admin`'s order (admins by id, then the rest),
+  so users are locked before any team, catalog or `server_state` row.
 - `teams::Membership { team, user, role }` and `catalogs::NewCatalog { name,
   description, owner_team }`, the input structs of `set_member` and
   `catalogs::create`; `catalogs::record_catalog` / `CatalogEvent`, the shared
@@ -28,6 +30,7 @@ Issue #397, epic #390. Plan:
   `a_provisioner_cannot_make_an_admin_an_owner_or_change_an_admins_membership`,
   `a_provisioners_membership_change_waits_for_a_promotion_in_flight`,
   `a_recorded_change_locks_the_users_it_names_before_the_team`,
+  `an_admins_change_to_another_admin_takes_admins_in_set_admins_order`,
   `a_malformed_catalog_name_is_unknown_and_never_reaches_sql`, and two REST
   tests that an entry records the calling key (`source` `api`).
 - `docs/operations.md`: the thirteen actions in the "Audit log" table.
@@ -47,8 +50,6 @@ Issue #397, epic #390. Plan:
   `ceiling::set_member_access(pool, catalog, access, actor, now)`, and
   `ImportOptions.audit`. The CLI passes `AuditActor::cli()`; the REST team,
   suspension, catalog and import handlers take the `AuditActor` extractor.
-- `lock_team` and `teams::id_of` lock a personal team's user before the team,
-  because an entry about the team resolves that person.
 - Suspending a team already suspended with the same notice, giving a catalog
   to its current owner, and setting a description to its current text no
   longer write or bump the administrative generation.

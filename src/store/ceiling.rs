@@ -11,7 +11,7 @@ use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::auth::{Principal, Reach};
 use crate::error::OkfError;
-use crate::store::audit::{self, Action, AuditActor};
+use crate::store::audit::{self, Action, AuditActor, People};
 use crate::store::catalogs::{self, bump_admin_generation, CatalogEvent};
 use crate::store::keys::Access;
 use crate::store::users;
@@ -257,7 +257,15 @@ pub async fn set_member_access(
 ) -> Result<MemberAccess, OkfError> {
     check_names(None, catalog)?;
     let mut tx = pool.begin().await?;
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            catalogs: &[catalog],
+            ..People::default()
+        },
+    )
+    .await?;
     // As in `catalogs::set_owner`: the subquery reads the row as it was,
     // under its row lock, so this returns the value it replaced.
     let previous: Option<(i64, String)> = sqlx::query_as(

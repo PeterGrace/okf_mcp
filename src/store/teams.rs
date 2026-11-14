@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
 use crate::error::OkfError;
-use crate::store::audit::{self, Action, AuditActor, Entry, Target};
+use crate::store::audit::{self, Action, AuditActor, Entry, People, Target};
 use crate::store::catalogs::{bump_admin_generation, is_valid_name};
 use crate::store::users;
 
@@ -234,7 +234,15 @@ pub async fn create(
 ) -> Result<TeamRecord, OkfError> {
     users::check_name("team", new.name)?;
     let mut tx = pool.begin().await?;
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            users: &[new.owner],
+            ..People::default()
+        },
+    )
+    .await?;
     users::check_free(&mut tx, new.name).await?;
     // `FOR KEY SHARE` on the owner conflicts with `users::set_admin`'s
     // `FOR UPDATE`, so the guard below cannot race a promotion.
@@ -363,7 +371,16 @@ pub async fn set_member(
     let mut tx = pool.begin().await?;
     // Users before the team: `users::delete` locks the user and then its
     // teams, so taking them in the other order could deadlock.
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            users: &[user],
+            teams: &[team],
+            ..People::default()
+        },
+    )
+    .await?;
     let (user_id, is_admin) = users::id_and_admin_of(&mut tx, user).await?;
     audit::refuse_admin_target(actor, is_admin, user)?;
     let locked = lock_team(&mut tx, team).await?;
@@ -434,7 +451,16 @@ pub async fn remove_member(
 ) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
     // Users before the team, as in `set_member`.
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            users: &[user],
+            teams: &[team],
+            ..People::default()
+        },
+    )
+    .await?;
     let (user_id, is_admin) = users::id_and_admin_of(&mut tx, user).await?;
     audit::refuse_admin_target(actor, is_admin, user)?;
     let locked = lock_team(&mut tx, team).await?;
@@ -496,7 +522,15 @@ pub async fn delete(
     now: DateTime<Utc>,
 ) -> Result<(), OkfError> {
     let mut tx = pool.begin().await?;
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            teams: &[name],
+            ..People::default()
+        },
+    )
+    .await?;
     let locked = lock_team(&mut tx, name).await?;
     if locked.personal_of.is_some() {
         return Err(OkfError::Refused {
@@ -595,7 +629,15 @@ pub async fn suspend(
 ) -> Result<TeamRecord, OkfError> {
     let notice = clean_notice(notice)?;
     let mut tx = pool.begin().await?;
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            teams: &[name],
+            ..People::default()
+        },
+    )
+    .await?;
     let locked = lock_team(&mut tx, name).await?;
     // The state before the write, under the team's lock.
     let (already, previous_notice): (bool, Option<String>) = sqlx::query_as(
@@ -659,7 +701,15 @@ pub async fn unsuspend(
     now: DateTime<Utc>,
 ) -> Result<TeamRecord, OkfError> {
     let mut tx = pool.begin().await?;
-    audit::lock_actor(&mut tx, actor).await?;
+    audit::lock_people(
+        &mut tx,
+        actor,
+        &People {
+            teams: &[name],
+            ..People::default()
+        },
+    )
+    .await?;
     let locked = lock_team(&mut tx, name).await?;
     let lifted = sqlx::query(
         "UPDATE teams SET suspended_at = NULL, suspension_notice = NULL \
@@ -727,11 +777,9 @@ struct LockedTeam {
 /// team run one at a time (the last-owner check cannot race), and so a
 /// concurrent catalog assignment to it waits for a delete.
 ///
-/// Lock order: a caller that also needs a user resolves it first
-/// ([`users::id_of`], `FOR KEY SHARE`), because `users::delete` locks the
-/// user and then its personal team. For the same reason a personal team's
-/// user is locked here before the team ([`lock_team_person`]): recording an
-/// entry about the team resolves that person under `FOR KEY SHARE`.
+/// Lock order: a caller locks every user it needs first
+/// ([`audit::lock_people`], which includes a personal team's person),
+/// because `users::delete` locks the user and then its teams.
 ///
 /// # Errors
 /// [`OkfError::UnknownName`]; [`OkfError::Database`].
@@ -740,7 +788,6 @@ async fn lock_team(conn: &mut PgConnection, name: &str) -> Result<LockedTeam, Ok
     if !is_valid_name(name) {
         return Err(unknown(name));
     }
-    let person = lock_team_person(conn, name).await?;
     let (id, personal_of) = sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT id, personal_of FROM teams WHERE name = $1 FOR UPDATE",
     )
@@ -748,41 +795,7 @@ async fn lock_team(conn: &mut PgConnection, name: &str) -> Result<LockedTeam, Ok
     .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(|| unknown(name))?;
-    // A team's `personal_of` never changes; a different one means the team
-    // was deleted and another made under its name meanwhile.
-    if personal_of != person {
-        return Err(OkfError::Busy {
-            reason: format!("team {name:?} was replaced while it was being locked"),
-        });
-    }
     Ok(LockedTeam { id, personal_of })
-}
-
-/// Locks the user whose personal team `name` is, if it is one, `FOR KEY
-/// SHARE`, before the caller locks the team: the order `users::delete`
-/// takes them in (the user, then its personal team). Without it, an audit
-/// entry naming the team (whose `audit_teams` row resolves that person)
-/// would lock the user after the team and could deadlock with the user's
-/// deletion.
-///
-/// # Arguments
-/// * `conn` - the caller's transaction.
-/// * `name` - a valid team name.
-///
-/// # Returns
-/// The `users.id` whose personal team it is, or `None` for a shared team
-/// (or no team; the caller's lock then finds none).
-///
-/// # Errors
-/// [`OkfError::Database`].
-async fn lock_team_person(conn: &mut PgConnection, name: &str) -> Result<Option<String>, OkfError> {
-    Ok(sqlx::query_scalar(
-        "SELECT u.id FROM users u WHERE u.id = (SELECT personal_of FROM teams WHERE name = $1) \
-         FOR KEY SHARE",
-    )
-    .bind(name)
-    .fetch_optional(&mut *conn)
-    .await?)
 }
 
 /// The user's role in the team, or `None` if it is not a member.
@@ -874,9 +887,6 @@ pub(crate) async fn id_of(conn: &mut PgConnection, name: &str) -> Result<String,
     if !is_valid_name(name) {
         return Err(unknown(name));
     }
-    // The person before the team, as in `lock_team`: a catalog entry's
-    // teams resolve a personal team's person.
-    lock_team_person(conn, name).await?;
     sqlx::query_scalar("SELECT id FROM teams WHERE name = $1 FOR KEY SHARE")
         .bind(name)
         .fetch_optional(&mut *conn)
@@ -2085,5 +2095,62 @@ mod tests {
         ] {
             race_with_deleting_alice(change).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_admins_change_to_another_admin_takes_admins_in_set_admins_order() {
+        let db = test_db().await;
+        family(&db.pool).await;
+        seed_user(&db.pool, "staff").await;
+        make_admin(&db.pool, "alice").await;
+        make_admin(&db.pool, "staff").await;
+        // `users::set_admin` locks every admin `FOR UPDATE` in id order, then
+        // bumps the generation. Make the acting admin the later id, so a
+        // change that locked its actor first would hold the second admin
+        // while waiting on the first.
+        let (alice, staff) = (
+            user_id(&db.pool, "alice").await,
+            user_id(&db.pool, "staff").await,
+        );
+        let (actor, target, first, second) = if alice > staff {
+            ("alice", "staff", staff, alice)
+        } else {
+            ("staff", "alice", alice, staff)
+        };
+        let session = session_of(&db.pool, actor).await;
+        let mut promoting = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(&first)
+            .execute(&mut *promoting)
+            .await
+            .unwrap();
+        let pool = db.pool.clone();
+        let changing = tokio::spawn(async move {
+            let member = membership("family", target, Role::Owner);
+            set_member(&pool, &member, &session, now()).await
+        });
+        tokio::time::timeout(
+            LOCK_WAIT,
+            crate::store::catalogs::tests::until_a_lock_is_awaited(&db.pool),
+        )
+        .await
+        .expect("the change waits on the first admin");
+
+        // A deadlock makes Postgres abort one side; the timeout bounds a hang.
+        let second_lock = tokio::time::timeout(
+            LOCK_WAIT,
+            sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+                .bind(&second)
+                .execute(&mut *promoting),
+        )
+        .await
+        .expect("the second admin's lock does not hang");
+        assert!(second_lock.is_ok(), "{second_lock:?}");
+        promoting.rollback().await.unwrap();
+        let changed = tokio::time::timeout(LOCK_WAIT, changing)
+            .await
+            .expect("the change finishes")
+            .unwrap();
+        assert!(changed.is_ok(), "{changed:?}");
     }
 }
