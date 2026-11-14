@@ -27,6 +27,7 @@ use crate::okf::ops::{OpContext, OpOutcome};
 use crate::okf::rules;
 use crate::okf::workspace::{MemWorkspace, StoredFile};
 use crate::overlay::Overlay;
+use crate::store::audit::{self, Action, Entry, Target};
 use crate::store::changesets::{self, ChangesetState, EntryRow};
 use crate::store::keys::Access;
 
@@ -45,6 +46,17 @@ pub struct WriteReport {
     pub message: String,
     /// `okf.py`'s notes (a non-kebab-case name, a folder index created).
     pub notes: Vec<String>,
+}
+
+/// An audit entry an edit records in its own transaction (a revert).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpAudit {
+    /// The action.
+    pub action: Action,
+    /// Its details; [`apply_audited`] adds the changeset handle as
+    /// `changeset`. A map, not any JSON value, so an entry's details are
+    /// always an object.
+    pub details: serde_json::Map<String, serde_json::Value>,
 }
 
 /// One path the edit touched: its normalized name and what it holds now
@@ -106,6 +118,33 @@ pub async fn apply<F>(
     ctx: &ToolContext,
     changeset: &str,
     by: Option<&str>,
+    op: F,
+) -> Result<WriteReport, OkfError>
+where
+    F: FnOnce(&MemWorkspace, &OpContext<'_>) -> Result<OpOutcome, OkfError> + Send + 'static,
+{
+    apply_audited(ctx, changeset, by, None, op).await
+}
+
+/// [`apply`], recording `audit` (if any) in the edit's transaction before
+/// it commits, against the changeset's catalog and as the call's
+/// [`ToolContext::audit_actor`]: the edit and its entry commit together or
+/// not at all.
+///
+/// # Arguments
+/// * `ctx`, `changeset`, `by`, `op` - as [`apply`].
+/// * `audit` - the entry to record; `None` records nothing.
+///
+/// # Returns
+/// As [`apply`].
+///
+/// # Errors
+/// As [`apply`]; [`OkfError::Database`] from the entry.
+pub async fn apply_audited<F>(
+    ctx: &ToolContext,
+    changeset: &str,
+    by: Option<&str>,
+    audit: Option<OpAudit>,
     op: F,
 ) -> Result<WriteReport, OkfError>
 where
@@ -184,6 +223,26 @@ where
             }
             Err(_) => {}
         }
+    }
+    // `if let Some(..)`: only an audited edit records an entry.
+    if let Some(OpAudit {
+        action,
+        mut details,
+    }) = audit
+    {
+        details.insert(
+            "changeset".to_string(),
+            changeset_row.handle.as_str().into(),
+        );
+        let teams = audit::catalog_teams(&mut tx, state.id()).await?;
+        let entry = Entry {
+            action,
+            target: Target::Catalog(state.name()),
+            person: None,
+            teams: &teams,
+            details: serde_json::Value::Object(details),
+        };
+        audit::record(&mut tx, &ctx.audit_actor(), &entry, now).await?;
     }
     tx.commit().await?;
     // The version moved, so the cached overlay is stale; dropping it now

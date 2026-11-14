@@ -14,6 +14,7 @@ use crate::app::App;
 use crate::auth::Principal;
 use crate::error::OkfError;
 use crate::http::api;
+use crate::http::requester::Requester;
 use crate::http::AppError;
 use crate::mcp::reports::{
     self as tools, CatalogParam, Links, LinksParams, Lint, LintParams, Oldest, OldestParams,
@@ -91,9 +92,10 @@ pub(crate) fn routes() -> Router<Arc<App>> {
 async fn health(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path(catalog): Path<String>,
 ) -> Result<Json<HealthCounts>, AppError> {
-    let ctx = api::context(&app, principal);
+    let ctx = api::context(&app, principal, requester);
     let named = Some(catalog);
     // `try_join!` polls the four reports at once (each runs on its own
     // blocking thread) and returns the first error, like
@@ -162,10 +164,11 @@ async fn health(
 async fn report(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path((catalog, name)): Path<(String, String)>,
     Query(query): Query<ReportQuery>,
 ) -> Result<Json<Report>, AppError> {
-    let ctx = api::context(&app, principal);
+    let ctx = api::context(&app, principal, requester);
     let catalog = Some(catalog);
     let n = Some(query.n.unwrap_or(DEFAULT_ROWS).clamp(1, MAX_ROWS));
     // A string has no closed set of values, so this `match` needs the `_` arm.

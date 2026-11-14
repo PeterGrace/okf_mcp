@@ -10,8 +10,10 @@ use crate::app::{App, Catalogs};
 use crate::auth::Principal;
 use crate::catalog::CatalogState;
 use crate::error::OkfError;
+use crate::http::requester::Requester;
 use crate::overlay::View;
 use crate::selection::{connection_catalogs, in_scope, resolve, Selection, Sources};
+use crate::store::audit::{AuditActor, Source};
 use crate::store::changesets::{self, ChangesetRow, ChangesetState};
 use crate::store::keys::Access;
 
@@ -55,6 +57,8 @@ pub struct ToolContext {
     // Taken once per call, so the names `select` checks are the states the
     // tool then reads, even if the poll loop swaps the map meanwhile.
     catalogs: Arc<Catalogs>,
+    // The request's address and source, for the audit log.
+    requester: Requester,
 }
 
 impl ToolContext {
@@ -67,7 +71,9 @@ impl ToolContext {
     ///   `?catalogs=`), if it names any.
     ///
     /// # Returns
-    /// The context, over the catalog map as of now.
+    /// The context, over the catalog map as of now, for a request with no
+    /// known address from an API credential; [`ToolContext::with_requester`]
+    /// sets the request's own.
     pub fn new(app: Arc<App>, principal: Arc<Principal>, connection: Option<Vec<String>>) -> Self {
         let catalogs = app.catalogs();
         Self {
@@ -75,7 +81,33 @@ impl ToolContext {
             principal,
             connection,
             catalogs,
+            requester: Requester {
+                ip: None,
+                source: Source::Api,
+            },
         }
+    }
+
+    /// The same context, for a request with this address and source.
+    ///
+    /// # Arguments
+    /// * `requester` - the request's address and source.
+    ///
+    /// # Returns
+    /// The context.
+    // `mut self` takes the context by value and changes it before handing it
+    // back, so calls chain: `ToolContext::new(..).with_requester(..)`.
+    pub fn with_requester(mut self, requester: Requester) -> Self {
+        self.requester = requester;
+        self
+    }
+
+    /// Who this call is, for the audit log.
+    ///
+    /// # Returns
+    /// The principal with the request's address and source.
+    pub fn audit_actor(&self) -> AuditActor {
+        AuditActor::of(&self.principal, &self.requester)
     }
 
     /// The context of the HTTP request rmcp handed the tool.
@@ -101,11 +133,10 @@ impl ToolContext {
             .ok_or_else(|| OkfError::Forbidden {
                 reason: "the request carries no API key".to_string(),
             })?;
-        Ok(Self::new(
-            Arc::clone(app),
-            principal,
-            connection_catalogs(parts),
-        ))
+        Ok(
+            Self::new(Arc::clone(app), principal, connection_catalogs(parts))
+                .with_requester(Requester::of(parts)),
+        )
     }
 
     /// The shared state.
@@ -834,5 +865,34 @@ mod tests {
             Err(OkfError::CatalogNotSelected { .. })
         ));
         assert!(on(&root, Some(&["pg"])).check_connection().is_ok());
+    }
+
+    /// M14 Task 7a: a tool call's audit actor carries the request's
+    /// address and source, as the auth layer left them in its extensions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_context_from_a_request_records_its_address_and_source() {
+        use std::net::IpAddr;
+
+        use crate::http::console_session::ConsoleSession;
+        use crate::http::requester::ClientIp;
+        use crate::store::audit::Source;
+
+        let test = app_with(&[("pg", &[])], Config::default()).await;
+        let ip: IpAddr = "192.0.2.4".parse().unwrap();
+        let (parts, ()) = axum::http::Request::builder()
+            .extension(principal(&[], None))
+            .extension(ClientIp(Some(ip)))
+            .extension(ConsoleSession::for_test())
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let from_request = ToolContext::from_parts(&test.app, &parts).unwrap();
+        let bare = context(&test, principal(&[], None), None);
+
+        let actor = from_request.audit_actor();
+        assert_eq!((actor.ip, actor.source), (Some(ip), Source::Console));
+        let actor = bare.audit_actor();
+        assert_eq!((actor.ip, actor.source), (None, Source::Api));
     }
 }

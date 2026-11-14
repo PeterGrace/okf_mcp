@@ -19,6 +19,7 @@ use crate::auth::Principal;
 use crate::catalog::Loaded;
 use crate::error::OkfError;
 use crate::http::api::context;
+use crate::http::requester::Requester;
 use crate::http::AppError;
 use crate::mcp::blocking;
 use crate::mcp::changesets::unified_diff;
@@ -164,9 +165,10 @@ fn kind_name(kind: DocKind, path: &str) -> Option<&'static str> {
 async fn tree(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path(catalog): Path<String>,
 ) -> Result<Json<Tree>, AppError> {
-    let ctx = context(&app, principal);
+    let ctx = context(&app, principal, requester);
     let state = ctx.one(Some(&catalog))?;
     let loaded = state.current();
     let documents = loaded
@@ -197,10 +199,11 @@ async fn tree(
 async fn concept(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path((catalog, path)): Path<(String, String)>,
     Query(query): Query<FullQuery>,
 ) -> Result<Json<ConceptView>, AppError> {
-    let ctx = context(&app, principal);
+    let ctx = context(&app, principal, requester);
     let concept = get_concept(
         &ctx,
         GetConceptParams {
@@ -263,9 +266,10 @@ fn with_html(mut concept: Concept, loaded: &Loaded) -> ConceptView {
 async fn links(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path((catalog, path)): Path<(String, String)>,
 ) -> Result<Json<ConceptLinks>, AppError> {
-    let ctx = context(&app, principal);
+    let ctx = context(&app, principal, requester);
     let concept = get_concept(
         &ctx,
         GetConceptParams {
@@ -296,10 +300,11 @@ async fn links(
 async fn revisions(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path((catalog, path)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<History>, AppError> {
-    let ctx = context(&app, principal);
+    let ctx = context(&app, principal, requester);
     let found = history(
         &ctx,
         HistoryParams {
@@ -321,12 +326,13 @@ async fn revisions(
 async fn revision(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path((catalog, revision, path)): Path<(String, i32, String)>,
 ) -> Result<Json<RevisionView>, AppError> {
     // This reads the store directly, so it checks access itself (before the
     // principal moves into the context).
     principal.require(Access::Read, &catalog)?;
-    let ctx = context(&app, principal);
+    let ctx = context(&app, principal, requester);
     // `history` resolves the path as the History tab spelled it (`.md`
     // optional) and answers 404 for a path that never existed.
     let found = history(
@@ -377,9 +383,10 @@ async fn revision(
 async fn document(
     State(app): State<Arc<App>>,
     Extension(principal): Extension<Arc<Principal>>,
+    requester: Requester,
     Path((catalog, path)): Path<(String, String)>,
 ) -> Result<Json<DocumentView>, AppError> {
-    let ctx = context(&app, principal);
+    let ctx = context(&app, principal, requester);
     let document = read_document(
         &ctx,
         ReadDocumentParams {
